@@ -137,47 +137,7 @@ pub fn session_returns(
         )));
     }
 
-    let tickers = bars.column("ticker")?.str()?;
-    let timestamps = bars.column("timestamp")?.i64()?;
-    let closes = bars.column("close_price")?.cast(&DataType::Float64)?;
-    let closes = closes.f64()?;
-    if tickers.null_count() > 0 || timestamps.null_count() > 0 {
-        return Err(IntradayError::Shape(
-            "every bar must name its ticker and its instant".to_string(),
-        ));
-    }
-
-    // Closes are placed at their own bar index rather than pushed in arrival order, so a gap stays
-    // a gap. Keyed by session as well as ticker: a return must never cross the overnight boundary.
-    let mut closes_by_key: BTreeMap<(SessionDate, String), Vec<Option<f64>>> = BTreeMap::new();
-    for ((ticker, timestamp), close) in tickers
-        .into_no_null_iter()
-        .zip(timestamps.into_no_null_iter())
-        .zip(closes)
-    {
-        let Some(close) = close.filter(|price| price.is_finite() && *price > 0.0) else {
-            continue;
-        };
-        let Some(instant) = chrono::DateTime::from_timestamp_millis(timestamp) else {
-            continue;
-        };
-        let session = SessionDate::at(instant);
-        let session_hours = hours
-            .get(&session)
-            .copied()
-            .unwrap_or_else(SessionHours::regular);
-        let eastern = eastern_datetime(instant);
-        let minute = eastern.time().hour() * 60 + eastern.time().minute();
-        let Some(index) = session_hours.bar_index(minute, interval_minutes) else {
-            continue;
-        };
-        let slots = closes_by_key
-            .entry((session, ticker.to_string()))
-            .or_insert_with(|| vec![None; session_hours.bars(interval_minutes)]);
-        if let Some(slot) = slots.get_mut(index) {
-            *slot = Some(close);
-        }
-    }
+    let closes_by_key = place_by_bar(bars, "close_price", interval_minutes, hours)?;
 
     let mut by_session: BTreeMap<SessionDate, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
     for ((session, ticker), prices) in closes_by_key {
@@ -205,6 +165,92 @@ pub fn session_returns(
         .into_iter()
         .map(|(session, by_ticker)| SessionReturns { session, by_ticker })
         .collect())
+}
+
+/// Places one price column at each bar's own index within its session.
+///
+/// Indexing by bar rather than by arrival order is what keeps a gap a gap: a name that did not
+/// print leaves an empty slot instead of letting its neighbours close over the hole.
+fn place_by_bar(
+    bars: &DataFrame,
+    column: &str,
+    interval_minutes: u32,
+    hours: &BTreeMap<SessionDate, SessionHours>,
+) -> Result<BTreeMap<(SessionDate, String), Vec<Option<f64>>>, IntradayError> {
+    let tickers = bars.column("ticker")?.str()?;
+    let timestamps = bars.column("timestamp")?.i64()?;
+    let prices = bars.column(column)?.cast(&DataType::Float64)?;
+    let prices = prices.f64()?;
+    if tickers.null_count() > 0 || timestamps.null_count() > 0 {
+        return Err(IntradayError::Shape(
+            "every bar must name its ticker and its instant".to_string(),
+        ));
+    }
+
+    let mut placed: BTreeMap<(SessionDate, String), Vec<Option<f64>>> = BTreeMap::new();
+    for ((ticker, timestamp), price) in tickers
+        .into_no_null_iter()
+        .zip(timestamps.into_no_null_iter())
+        .zip(prices)
+    {
+        let Some(price) = price.filter(|value| value.is_finite() && *value > 0.0) else {
+            continue;
+        };
+        let Some(instant) = chrono::DateTime::from_timestamp_millis(timestamp) else {
+            continue;
+        };
+        let session = SessionDate::at(instant);
+        let session_hours = hours
+            .get(&session)
+            .copied()
+            .unwrap_or_else(SessionHours::regular);
+        let eastern = eastern_datetime(instant);
+        let minute = eastern.time().hour() * 60 + eastern.time().minute();
+        let Some(index) = session_hours.bar_index(minute, interval_minutes) else {
+            continue;
+        };
+        let slots = placed
+            .entry((session, ticker.to_string()))
+            .or_insert_with(|| vec![None; session_hours.bars(interval_minutes)]);
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = Some(price);
+        }
+    }
+    Ok(placed)
+}
+
+/// Volume-weighted average price at each bar, by session and name.
+///
+/// **VWAP rather than the close, deliberately.** A bar's close is whichever side of the spread the
+/// last trade hit; its volume-weighted average is drawn from every trade in the bar and does not sit
+/// on one side. Measured over the whole universe the two differ by about nine basis points, which is
+/// the effective spread [`bounce`] recovers — so reading a spread off closes prices half of it in.
+pub fn session_vwaps(
+    bars: &DataFrame,
+    interval: BarInterval,
+    hours: &BTreeMap<SessionDate, SessionHours>,
+) -> Result<BTreeMap<SessionDate, BTreeMap<String, Vec<Option<f64>>>>, IntradayError> {
+    let (interval_minutes, unit) = interval.massive_timespan();
+    if unit != "minute" {
+        return Err(IntradayError::Shape(format!(
+            "intraday prices need a minute cadence, got {interval}"
+        )));
+    }
+    let placed = place_by_bar(
+        bars,
+        "volume_weighted_average_price",
+        interval_minutes,
+        hours,
+    )?;
+
+    let mut by_session: BTreeMap<SessionDate, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
+    for ((session, ticker), prices) in placed {
+        by_session
+            .entry(session)
+            .or_default()
+            .insert(ticker, prices);
+    }
+    Ok(by_session)
 }
 
 /// Sample autocorrelation of a series at `lag`, or `None` when it is not estimable.
@@ -481,6 +527,84 @@ mod tests {
         (0..count)
             .map(|index| Some(if index % 2 == 0 { size } else { -size }))
             .collect()
+    }
+
+    /// Rows carrying a volume-weighted price as well as a close, which is what the archive holds
+    /// and what the convergence measurement reads.
+    fn priced_frame(rows: &[(&str, i64, f64, f64)]) -> DataFrame {
+        DataFrame::new(vec![
+            Column::new(
+                "ticker".into(),
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "timestamp".into(),
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "close_price".into(),
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "volume_weighted_average_price".into(),
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// VWAP is placed at each bar's own index, and a bar that did not print leaves a hole rather
+    /// than letting its neighbours close over it.
+    #[test]
+    fn test_vwaps_are_placed_by_bar_and_keep_their_gaps() {
+        let bars = priced_frame(&[
+            ("AAA", eastern_bar(2026, 6, 1, 9, 30), 100.0, 100.5),
+            // 09:35 never printed.
+            ("AAA", eastern_bar(2026, 6, 1, 9, 40), 102.0, 101.5),
+        ]);
+
+        let vwaps = session_vwaps(&bars, BarInterval::FiveMinute, &regular_hours()).unwrap();
+        let placed = &vwaps[&session_of(2026, 6, 1)]["AAA"];
+
+        assert_eq!(placed[0], Some(100.5));
+        assert_eq!(placed[1], None, "09:35 did not print");
+        assert_eq!(placed[2], Some(101.5));
+        assert_eq!(placed.len(), 78);
+    }
+
+    /// The VWAP column is read, not the close. Reading closes would price half the effective spread
+    /// into every reading taken from this frame.
+    #[test]
+    fn test_vwaps_read_the_volume_weighted_column_not_the_close() {
+        let bars = priced_frame(&[("AAA", eastern_bar(2026, 6, 1, 9, 30), 100.0, 200.0)]);
+
+        let vwaps = session_vwaps(&bars, BarInterval::FiveMinute, &regular_hours()).unwrap();
+
+        assert_eq!(vwaps[&session_of(2026, 6, 1)]["AAA"][0], Some(200.0));
+    }
+
+    /// A daily cadence has no intraday grid to index bars against.
+    #[test]
+    fn test_vwaps_refuse_a_daily_cadence() {
+        let bars = priced_frame(&[("AAA", eastern_bar(2026, 6, 1, 9, 30), 100.0, 100.5)]);
+        assert!(session_vwaps(&bars, BarInterval::OneDay, &regular_hours()).is_err());
+    }
+
+    /// A half-day closes at 13:00, and post-market prints must not enter the price grid either.
+    #[test]
+    fn test_vwaps_respect_an_early_close() {
+        let session = session_of(2026, 11, 27);
+        let bars = priced_frame(&[
+            ("AAA", eastern_bar(2026, 11, 27, 12, 55), 100.0, 100.5),
+            ("AAA", eastern_bar(2026, 11, 27, 14, 0), 120.0, 120.5),
+        ]);
+        let mut hours = BTreeMap::new();
+        hours.insert(session, SessionHours::new(9 * 60 + 30, 13 * 60).unwrap());
+
+        let vwaps = session_vwaps(&bars, BarInterval::FiveMinute, &hours).unwrap();
+        let placed = &vwaps[&session]["AAA"];
+
+        assert_eq!(placed.iter().flatten().count(), 1, "only the 12:55 print");
     }
 
     /// The whole reason this module exists: a five-minute return must never be an overnight one.

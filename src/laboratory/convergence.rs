@@ -204,7 +204,7 @@ pub struct Observed(u32);
 impl Observed {
     const _FITS: () = assert!(HORIZONS <= u32::BITS as usize);
 
-    fn mark(&mut self, horizon: usize) {
+    pub(crate) fn mark(&mut self, horizon: usize) {
         if (1..=HORIZONS).contains(&horizon) {
             self.0 |= 1 << (horizon - 1);
         }
@@ -241,14 +241,23 @@ pub struct Entry {
 
 impl Entry {
     /// Where this entry stands at `horizon`, or `None` if it could not be read there.
-    fn at(&self, horizon: usize) -> Option<Resolution> {
-        match self.resolution {
-            Resolution::Converged(step) | Resolution::Stopped(step) if step <= horizon => {
-                Some(self.resolution)
-            }
-            _ if self.observed.contains(horizon) => Some(Resolution::Unresolved),
-            _ => None,
+    /// The pair this entry contributes to a curve, without its identity.
+    fn state(&self) -> (Resolution, Observed) {
+        (self.resolution, self.observed)
+    }
+}
+
+/// Where one entry stands at `horizon`, or `None` where it was never priced there.
+///
+/// An entry that resolved before `horizon` keeps its resolution: the question each horizon asks is
+/// what has become of the cohort by then, not what is happening at that instant.
+fn state_at(resolution: Resolution, observed: Observed, horizon: usize) -> Option<Resolution> {
+    match resolution {
+        Resolution::Converged(step) | Resolution::Stopped(step) if step <= horizon => {
+            Some(resolution)
         }
+        _ if observed.contains(horizon) => Some(Resolution::Unresolved),
+        _ => None,
     }
 }
 
@@ -411,7 +420,7 @@ fn follow(
 }
 
 /// A fit window holding a move too large to be one distribution, which the screen also refuses.
-fn breaks(window: &[f64]) -> bool {
+pub(crate) fn breaks(window: &[f64]) -> bool {
     worst_session_move(window).is_some_and(|logarithmic_return| {
         logarithmic_return.abs() > MAXIMUM_SESSION_LOGARITHMIC_RETURN
     })
@@ -461,11 +470,19 @@ pub fn without_reentry(mut entries: Vec<Entry>) -> Vec<Entry> {
 
 /// Where a cohort stands at each horizon from one to [`HORIZONS`].
 pub fn curves(entries: &[Entry]) -> Vec<Curve> {
+    curves_of(&entries.iter().map(Entry::state).collect::<Vec<_>>())
+}
+
+/// The same curve over any entries carrying a resolution and what they were priced at.
+///
+/// Shared with the intraday measurement, whose horizons are bars rather than sessions: the shape of
+/// the question is identical and only the unit of the horizon differs.
+pub fn curves_of(states: &[(Resolution, Observed)]) -> Vec<Curve> {
     (1..=HORIZONS)
         .map(|horizon| {
-            let standing: Vec<Resolution> = entries
+            let standing: Vec<Resolution> = states
                 .iter()
-                .filter_map(|entry| entry.at(horizon))
+                .filter_map(|(resolution, observed)| state_at(*resolution, *observed, horizon))
                 .collect();
             let share = |count: usize| {
                 if standing.is_empty() {
