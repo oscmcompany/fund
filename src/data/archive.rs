@@ -481,6 +481,22 @@ fn intraday_sessions_to_request(
         .collect()
 }
 
+/// The sessions a pass requests, which the scope decides.
+///
+/// A symbol repair asks for the whole window. The set difference above answers "is there a
+/// partition here", and a partition missing one name answers yes — so filtering by it would request
+/// nothing at all and report success.
+fn intraday_sessions_for(
+    scope: &IntradayScope,
+    expected: &[SessionDate],
+    present: &BTreeSet<SessionDate>,
+) -> Vec<SessionDate> {
+    match scope {
+        IntradayScope::MissingSessions => intraday_sessions_to_request(expected, present),
+        IntradayScope::Symbols(_) => expected.to_vec(),
+    }
+}
+
 /// Symbols fetched at once.
 ///
 /// The vendor imposes no rate limit worth pacing against — 25 sequential requests measured at
@@ -488,10 +504,26 @@ fn intraday_sessions_to_request(
 /// respecting theirs, and keeps a failure to a handful of symbols rather than the whole chunk.
 const INTRADAY_CONCURRENCY: usize = 8;
 
-/// Fetches and writes every intraday partition in `[window_start, window_end]` the archive lacks.
+/// What an intraday pass is for, and it decides which sessions get requested.
 ///
-/// A set difference like [`archive_missing_sessions`], and scoped to `interval` throughout, so a
-/// five-minute pass neither sees nor writes the daily partitions beside it.
+/// The two variants exist because session presence cannot answer whether a *symbol* is present: a
+/// partition written while one name's fetch failed, or before that name cleared the universe
+/// screen, is indistinguishable from a complete one. So repairing a symbol has to ignore the set
+/// difference that repairing a session relies on.
+pub enum IntradayScope {
+    /// Every name the daily archive screens in, for the sessions the archive has no partition for.
+    MissingSessions,
+    /// An explicit set of names, across every session in the window regardless of what is present.
+    ///
+    /// The partition merge keys on `(ticker, bar_interval, timestamp)`, so re-requesting a session
+    /// that already holds other names adds these and leaves those untouched.
+    Symbols(BTreeSet<Ticker>),
+}
+
+/// Fetches and writes intraday partitions across `[window_start, window_end]`, per `scope`.
+///
+/// Scoped to `interval` throughout, so a five-minute pass neither sees nor writes the daily
+/// partitions beside it.
 pub async fn archive_intraday_sessions(
     s3_client: &S3Client,
     massive: &MassiveClient,
@@ -499,10 +531,11 @@ pub async fn archive_intraday_sessions(
     interval: BarInterval,
     window_start: SessionDate,
     window_end: SessionDate,
+    scope: &IntradayScope,
 ) -> Result<ArchiveSummary, ArchiveError> {
     let expected = expected_sessions(window_start, window_end);
     let present = present_sessions(s3_client, bucket, interval, window_start, window_end).await?;
-    let requested = intraday_sessions_to_request(&expected, &present);
+    let requested = intraday_sessions_for(scope, &expected, &present);
 
     info!(
         %window_start,
@@ -511,7 +544,7 @@ pub async fn archive_intraday_sessions(
         expected = expected.len(),
         present = present.len(),
         requested = requested.len(),
-        "Scanned the intraday archive for gaps"
+        "Planned an intraday pass"
     );
 
     let mut summary = ArchiveSummary {
@@ -519,7 +552,16 @@ pub async fn archive_intraday_sessions(
         ..Default::default()
     };
     for chunk in requested.chunks(INTRADAY_CHUNK_SESSIONS) {
-        archive_intraday_chunk(s3_client, massive, bucket, interval, chunk, &mut summary).await?;
+        archive_intraday_chunk(
+            s3_client,
+            massive,
+            bucket,
+            interval,
+            chunk,
+            scope,
+            &mut summary,
+        )
+        .await?;
     }
 
     if summary.symbols_failed > 0 {
@@ -549,12 +591,13 @@ async fn archive_intraday_chunk(
     bucket: &str,
     interval: BarInterval,
     chunk: &[SessionDate],
+    scope: &IntradayScope,
     summary: &mut ArchiveSummary,
 ) -> Result<(), ArchiveError> {
     let (Some(first), Some(last)) = (chunk.first(), chunk.last()) else {
         return Ok(());
     };
-    let universe = universe_over(s3_client, bucket, chunk).await?;
+    let universe = universe_over(s3_client, bucket, chunk, scope).await?;
     let undescribed = chunk.len() - universe.described.len();
     if undescribed > 0 {
         // Left absent so the next pass retries, rather than written from a universe that never
@@ -696,6 +739,7 @@ async fn universe_over(
     s3_client: &S3Client,
     bucket: &str,
     sessions: &[SessionDate],
+    scope: &IntradayScope,
 ) -> Result<Universe, ArchiveError> {
     let daily = bar_archive_prefix(BarInterval::OneDay);
     let mut universe = Universe::default();
@@ -708,6 +752,11 @@ async fn universe_over(
             continue;
         };
         universe.described.insert(*session);
+        // An explicit set reads the partition above for `described` and skips only the screen,
+        // which a hand-picked universe has already answered.
+        let IntradayScope::MissingSessions = scope else {
+            continue;
+        };
         let screened = frame
             .lazy()
             .filter(
@@ -721,6 +770,9 @@ async fn universe_over(
         universe
             .symbols
             .extend(tickers.into_iter().flatten().filter_map(Ticker::new));
+    }
+    if let IntradayScope::Symbols(symbols) = scope {
+        universe.symbols = symbols.clone();
     }
     Ok(universe)
 }
@@ -1201,6 +1253,41 @@ mod tests {
         let daily = sessions_to_request(&expected, &present);
         assert_eq!(daily.len(), 5, "{daily:?}");
         assert!(daily.contains(&session(2026, 6, 5)), "{daily:?}");
+    }
+
+    /// A partition holding some of its names is indistinguishable from a complete one, so the set
+    /// difference that repairs a *session* cannot repair a *symbol* — it would request nothing and
+    /// report success. This is the failure that left CBOE absent from 202 partitions that all
+    /// existed.
+    #[test]
+    fn test_a_symbol_repair_requests_the_whole_window() {
+        let expected = expected_sessions(session(2026, 6, 1), session(2026, 6, 5));
+        // Every session is already held, which is exactly the state a symbol repair runs against.
+        let present: BTreeSet<SessionDate> = expected.iter().copied().collect();
+
+        let missing = intraday_sessions_for(&IntradayScope::MissingSessions, &expected, &present);
+        assert!(
+            missing.is_empty(),
+            "a session scan sees nothing to do: {missing:?}"
+        );
+
+        let symbols = IntradayScope::Symbols(
+            [Ticker::new("CBOE").expect("CBOE is a usable ticker")]
+                .into_iter()
+                .collect(),
+        );
+        let repaired = intraday_sessions_for(&symbols, &expected, &present);
+        assert_eq!(
+            repaired,
+            vec![
+                session(2026, 6, 1),
+                session(2026, 6, 2),
+                session(2026, 6, 3),
+                session(2026, 6, 4),
+                session(2026, 6, 5),
+            ],
+            "a symbol repair ignores what is present and asks for all five"
+        );
     }
 
     /// 2026-06-01 is a Monday, so the week runs Mon-Fri 1..=5 and the weekend is 6-7.
