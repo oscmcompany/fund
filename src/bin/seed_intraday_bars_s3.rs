@@ -2,17 +2,21 @@
 //!
 //! Reads and repairs `data/equity/bars/interval=<cadence>/`. No database is touched.
 
+use std::collections::BTreeSet;
+
 use chrono::NaiveDate;
 use tracing::{error, info};
 
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
-use fund::common::types::{BarInterval, SessionDate};
-use fund::data::archive;
+use fund::common::types::{BarInterval, SessionDate, Ticker};
+use fund::data::archive::{self, IntradayScope};
 
-const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE]\n\
+const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE] [SYMBOLS]\n\
                      Dates are Eastern calendar dates, inclusive: YYYY-MM-DD.\n\
-                     CADENCE is five_minute (default) or one_minute.";
+                     CADENCE is five_minute (default) or one_minute.\n\
+                     SYMBOLS is a comma-separated list; supplying it fetches only those names and\n\
+                     requests every session in the window rather than only the absent ones.";
 
 /// What the archive is filled with unless told otherwise.
 ///
@@ -24,16 +28,20 @@ struct Parameters {
     start: SessionDate,
     end: SessionDate,
     interval: BarInterval,
+    scope: IntradayScope,
 }
 
 impl Parameters {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (start, end, cadence) = match arguments {
-            [start, end] => (start, end, None),
-            [start, end, cadence] => (start, end, Some(cadence)),
+        let (start, end, cadence, symbols) = match arguments {
+            [start, end] => (start, end, None, None),
+            [start, end, cadence] => (start, end, Some(cadence), None),
+            // Positional after the cadence, so repairing named symbols means stating the cadence
+            // rather than having it inferred from an argument that could be either.
+            [start, end, cadence, symbols] => (start, end, Some(cadence), Some(symbols)),
             _ => {
                 return Err(format!(
-                    "Expected two dates and an optional cadence\n{USAGE}"
+                    "Expected two dates, an optional cadence and an optional symbol list\n{USAGE}"
                 ))
             }
         };
@@ -57,12 +65,40 @@ impl Parameters {
             }
         };
 
+        let scope = match symbols {
+            None => IntradayScope::MissingSessions,
+            Some(raw) => IntradayScope::Symbols(parse_symbols(raw)?),
+        };
+
         Ok(Self {
             start,
             end,
             interval,
+            scope,
         })
     }
+}
+
+/// Parses the comma-separated symbol list into validated tickers.
+///
+/// Refuses an unparseable name rather than skipping it: a typo that silently narrows the universe
+/// looks exactly like a name the vendor has no data for, and the run would report success.
+fn parse_symbols(raw: &str) -> Result<BTreeSet<Ticker>, String> {
+    let mut symbols = BTreeSet::new();
+    for candidate in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let ticker = Ticker::new(candidate).ok_or_else(|| {
+            format!("SYMBOLS contains an unusable ticker: {candidate:?}\n{USAGE}")
+        })?;
+        symbols.insert(ticker);
+    }
+    if symbols.is_empty() {
+        return Err(format!("SYMBOLS must name at least one ticker\n{USAGE}"));
+    }
+    Ok(symbols)
 }
 
 /// Parses an Eastern calendar date, which is what a session is.
@@ -117,8 +153,9 @@ async fn main() {
 
 /// Repairs the intraday archive over the requested window.
 ///
-/// Only the sessions the bucket is missing are fetched, so re-running over a repaired range costs
-/// one listing and nothing else.
+/// Without `SYMBOLS` only the sessions the bucket is missing are fetched, so re-running over a
+/// repaired range costs one listing and nothing else. With it every session in the window is
+/// requested, because a partition missing one name is indistinguishable from a complete one.
 async fn run(
     parameters: &Parameters,
 ) -> Result<archive::ArchiveSummary, Box<dyn std::error::Error>> {
@@ -127,11 +164,20 @@ async fn run(
     let massive = MassiveClient::from_env()?;
     let s3_client = fund::common::aws::s3_client().await;
 
+    let symbols = match &parameters.scope {
+        IntradayScope::MissingSessions => "the screened universe".to_string(),
+        IntradayScope::Symbols(symbols) => symbols
+            .iter()
+            .map(Ticker::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+    };
     info!(
         bucket,
         start = %parameters.start,
         end = %parameters.end,
         interval = %parameters.interval,
+        symbols,
         "Seeding the intraday bar archive from Massive"
     );
 
@@ -142,6 +188,7 @@ async fn run(
         parameters.interval,
         parameters.start,
         parameters.end,
+        &parameters.scope,
     )
     .await?)
 }
@@ -199,5 +246,64 @@ mod tests {
     fn test_a_single_session_window_is_allowed() {
         let parameters = Parameters::parse(&arguments(&["2026-08-20", "2026-08-20"])).unwrap();
         assert_eq!(parameters.start, parameters.end);
+    }
+
+    #[test]
+    fn test_omitting_symbols_scans_for_missing_sessions() {
+        let parameters = Parameters::parse(&arguments(&["2026-08-01", "2026-08-20"])).unwrap();
+        assert!(matches!(parameters.scope, IntradayScope::MissingSessions));
+
+        let parameters =
+            Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "five_minute"])).unwrap();
+        assert!(matches!(parameters.scope, IntradayScope::MissingSessions));
+    }
+
+    #[test]
+    fn test_a_symbol_list_is_parsed_and_trimmed() {
+        let parameters = Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            " CBOE , CME,ICE ",
+        ]))
+        .unwrap();
+
+        let IntradayScope::Symbols(symbols) = parameters.scope else {
+            panic!("a symbol list must produce a symbol scope");
+        };
+        let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
+        assert_eq!(named, vec!["CBOE", "CME", "ICE"]);
+    }
+
+    /// Refused rather than skipped. A typo silently narrowing the universe looks exactly like a name
+    /// the vendor has no data for, and the run would report success having fetched less than asked.
+    #[test]
+    fn test_an_unusable_symbol_list_is_refused() {
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "CBOE,,,"
+        ]))
+        .is_ok());
+        assert!(
+            Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "five_minute", ""]))
+                .is_err()
+        );
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "  ,  "
+        ]))
+        .is_err());
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "CBOE",
+            "extra"
+        ]))
+        .is_err());
     }
 }
