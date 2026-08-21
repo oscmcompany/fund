@@ -12,11 +12,12 @@ use fund::common::massive::MassiveClient;
 use fund::common::types::{BarInterval, SessionDate, Ticker};
 use fund::data::archive::{self, IntradayScope};
 
-const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE] [SYMBOLS]\n\
+const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [SYMBOLS]]\n\
                      Dates are Eastern calendar dates, inclusive: YYYY-MM-DD.\n\
                      CADENCE is five_minute (default) or one_minute.\n\
-                     SYMBOLS is a comma-separated list; supplying it fetches only those names and\n\
-                     requests every session in the window rather than only the absent ones.";
+                     SYMBOLS is a comma-separated list, and naming it requires naming CADENCE too.\n\
+                     Supplying it fetches only those names and requests every session in the\n\
+                     window rather than only the absent ones.";
 
 /// What the archive is filled with unless told otherwise.
 ///
@@ -81,22 +82,16 @@ impl Parameters {
 
 /// Parses the comma-separated symbol list into validated tickers.
 ///
-/// Refuses an unparseable name rather than skipping it: a typo that silently narrows the universe
-/// looks exactly like a name the vendor has no data for, and the run would report success.
+/// Refuses every unusable component, an empty one included, rather than skipping it: a list that
+/// silently loses a name produces a partial repair the run then reports as success. `split` always
+/// yields at least one component, so an empty argument is refused here too.
 fn parse_symbols(raw: &str) -> Result<BTreeSet<Ticker>, String> {
     let mut symbols = BTreeSet::new();
-    for candidate in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
+    for candidate in raw.split(',').map(str::trim) {
         let ticker = Ticker::new(candidate).ok_or_else(|| {
             format!("SYMBOLS contains an unusable ticker: {candidate:?}\n{USAGE}")
         })?;
         symbols.insert(ticker);
-    }
-    if symbols.is_empty() {
-        return Err(format!("SYMBOLS must name at least one ticker\n{USAGE}"));
     }
     Ok(symbols)
 }
@@ -279,13 +274,22 @@ mod tests {
     /// the vendor has no data for, and the run would report success having fetched less than asked.
     #[test]
     fn test_an_unusable_symbol_list_is_refused() {
+        // The typo that matters: an operator who meant three names gets two, and a partial repair
+        // reports success.
         assert!(Parameters::parse(&arguments(&[
             "2026-08-01",
             "2026-08-20",
             "five_minute",
-            "CBOE,,,"
+            "CBOE,,ICE"
         ]))
-        .is_ok());
+        .is_err());
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "CBOE,"
+        ]))
+        .is_err());
         assert!(
             Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "five_minute", ""]))
                 .is_err()

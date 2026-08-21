@@ -544,7 +544,7 @@ pub async fn archive_intraday_sessions(
         expected = expected.len(),
         present = present.len(),
         requested = requested.len(),
-        "Scanned the intraday archive for gaps"
+        "Planned an intraday pass"
     );
 
     let mut summary = ArchiveSummary {
@@ -752,10 +752,8 @@ async fn universe_over(
             continue;
         };
         universe.described.insert(*session);
-        // An explicit set still reads the daily partition above, because `described` is what keeps
-        // an intraday partition from being written for a session nothing describes. Only the screen
-        // is skipped: a hand-picked universe has already answered the question the screen asks, and
-        // applying a discovery threshold to it drops names that were chosen deliberately.
+        // An explicit set reads the partition above for `described` and skips only the screen,
+        // which a hand-picked universe has already answered.
         let IntradayScope::MissingSessions = scope else {
             continue;
         };
