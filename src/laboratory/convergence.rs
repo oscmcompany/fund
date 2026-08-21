@@ -241,10 +241,6 @@ pub struct Entry {
 
 impl Entry {
     /// Where this entry stands at `horizon`, or `None` if it could not be read there.
-    fn at(&self, horizon: usize) -> Option<Resolution> {
-        state_at(self.resolution, self.observed, horizon)
-    }
-
     /// The pair this entry contributes to a curve, without its identity.
     fn state(&self) -> (Resolution, Observed) {
         (self.resolution, self.observed)
@@ -424,7 +420,7 @@ fn follow(
 }
 
 /// A fit window holding a move too large to be one distribution, which the screen also refuses.
-fn breaks(window: &[f64]) -> bool {
+pub(crate) fn breaks(window: &[f64]) -> bool {
     worst_session_move(window).is_some_and(|logarithmic_return| {
         logarithmic_return.abs() > MAXIMUM_SESSION_LOGARITHMIC_RETURN
     })

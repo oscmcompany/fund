@@ -529,6 +529,84 @@ mod tests {
             .collect()
     }
 
+    /// Rows carrying a volume-weighted price as well as a close, which is what the archive holds
+    /// and what the convergence measurement reads.
+    fn priced_frame(rows: &[(&str, i64, f64, f64)]) -> DataFrame {
+        DataFrame::new(vec![
+            Column::new(
+                "ticker".into(),
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "timestamp".into(),
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "close_price".into(),
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "volume_weighted_average_price".into(),
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// VWAP is placed at each bar's own index, and a bar that did not print leaves a hole rather
+    /// than letting its neighbours close over it.
+    #[test]
+    fn test_vwaps_are_placed_by_bar_and_keep_their_gaps() {
+        let bars = priced_frame(&[
+            ("AAA", eastern_bar(2026, 6, 1, 9, 30), 100.0, 100.5),
+            // 09:35 never printed.
+            ("AAA", eastern_bar(2026, 6, 1, 9, 40), 102.0, 101.5),
+        ]);
+
+        let vwaps = session_vwaps(&bars, BarInterval::FiveMinute, &regular_hours()).unwrap();
+        let placed = &vwaps[&session_of(2026, 6, 1)]["AAA"];
+
+        assert_eq!(placed[0], Some(100.5));
+        assert_eq!(placed[1], None, "09:35 did not print");
+        assert_eq!(placed[2], Some(101.5));
+        assert_eq!(placed.len(), 78);
+    }
+
+    /// The VWAP column is read, not the close. Reading closes would price half the effective spread
+    /// into every reading taken from this frame.
+    #[test]
+    fn test_vwaps_read_the_volume_weighted_column_not_the_close() {
+        let bars = priced_frame(&[("AAA", eastern_bar(2026, 6, 1, 9, 30), 100.0, 200.0)]);
+
+        let vwaps = session_vwaps(&bars, BarInterval::FiveMinute, &regular_hours()).unwrap();
+
+        assert_eq!(vwaps[&session_of(2026, 6, 1)]["AAA"][0], Some(200.0));
+    }
+
+    /// A daily cadence has no intraday grid to index bars against.
+    #[test]
+    fn test_vwaps_refuse_a_daily_cadence() {
+        let bars = priced_frame(&[("AAA", eastern_bar(2026, 6, 1, 9, 30), 100.0, 100.5)]);
+        assert!(session_vwaps(&bars, BarInterval::OneDay, &regular_hours()).is_err());
+    }
+
+    /// A half-day closes at 13:00, and post-market prints must not enter the price grid either.
+    #[test]
+    fn test_vwaps_respect_an_early_close() {
+        let session = session_of(2026, 11, 27);
+        let bars = priced_frame(&[
+            ("AAA", eastern_bar(2026, 11, 27, 12, 55), 100.0, 100.5),
+            ("AAA", eastern_bar(2026, 11, 27, 14, 0), 120.0, 120.5),
+        ]);
+        let mut hours = BTreeMap::new();
+        hours.insert(session, SessionHours::new(9 * 60 + 30, 13 * 60).unwrap());
+
+        let vwaps = session_vwaps(&bars, BarInterval::FiveMinute, &hours).unwrap();
+        let placed = &vwaps[&session]["AAA"];
+
+        assert_eq!(placed.iter().flatten().count(), 1, "only the 12:55 print");
+    }
+
     /// The whole reason this module exists: a five-minute return must never be an overnight one.
     #[test]
     fn test_a_return_never_spans_two_sessions() {

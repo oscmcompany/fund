@@ -5,8 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::common::types::SessionDate;
-use crate::laboratory::convergence::{Closes, Observed, Resolution, Selection, HORIZONS};
-use crate::models::tide::TideError;
+use crate::laboratory::convergence::{breaks, Closes, Observed, Resolution, Selection, HORIZONS};
 use crate::portfolio::screen::{
     logarithmic_returns, pearson_correlation, SpreadModel, CONVERGENCE_Z_SCORE,
     CORRELATION_MAXIMUM, CORRELATION_MINIMUM, CORRELATION_WINDOW_SESSIONS, ENTRY_Z_SCORE,
@@ -15,10 +14,8 @@ use crate::portfolio::screen::{
 
 /// Bars between the reading an entry fires on and the first bar it is judged at.
 ///
-/// **One, not zero, and this is the load-bearing choice.** A dislocation measured at bar `k` that
-/// "converges" at bar `k + 1` is the spread oscillating, not the pair closing: the same artefact
-/// that made five-minute persistence read eighteen standard errors from zero and vanish when a
-/// single bar was skipped. Resolution therefore starts one bar after the entry.
+/// One, not zero: a dislocation that "converges" at the very next bar is the spread oscillating
+/// rather than the pair closing.
 pub const RESOLUTION_SKIP: usize = 1;
 
 /// One pair opened at one bar of one session, and what became of it before the close.
@@ -30,9 +27,11 @@ pub struct IntradayEntry {
     pub long: String,
     pub short: String,
     pub entry_z_score: f64,
-    /// The spread's z-score at the last bar it could be priced at, which is where the book would
-    /// have flattened it.
-    pub exit_z_score: Option<f64>,
+    /// The spread's z-score at the last bar of the session it could be priced at.
+    ///
+    /// Read to the session's end rather than to the horizon cap, because that is where the book
+    /// flattens; stopping at the cap would measure a hundred minutes and call it a session.
+    pub final_z_score: Option<f64>,
     pub resolution: Resolution,
     pub observed: Observed,
 }
@@ -71,6 +70,12 @@ pub fn entries_in_session(
             else {
                 continue;
             };
+            // The same guard the daily measurement applies. A corporate-action-sized move inside
+            // the window corrupts the fit it is the whole basis of, in both cohorts, so it is
+            // checked before the correlation screen rather than as part of it.
+            if breaks(&first_window) || breaks(&second_window) {
+                continue;
+            }
             if let Selection::Screened = selection {
                 let correlation = pearson_correlation(
                     &logarithmic_returns(&first_window),
@@ -160,9 +165,12 @@ fn follow(
     let entry_bar = entry_bar?;
     let stop_at = entry_z_score + STOP_LOSS_WIDENING;
 
+    // Walked to the end of the session, independently of the resolution walk below: the book holds
+    // to the close whatever the rules did in between, so the drift statistic must see that bar.
+    let final_z_score = (entry_bar + RESOLUTION_SKIP + 1..bars).rev().find_map(z_at);
+
     let mut observed = Observed::default();
     let mut resolution = Resolution::Unresolved;
-    let mut exit_z_score = None;
     for horizon in 1..=HORIZONS {
         // `+ horizon` after the skip, so horizon one is the first bar the skip has not hidden.
         // Writing `+ horizon - 1` here judged the adjacent bar and defeated the constant entirely.
@@ -172,7 +180,6 @@ fn follow(
         }
         let Some(z_score) = z_at(bar) else { continue };
         observed.mark(horizon);
-        exit_z_score = Some(z_score);
         if z_score <= CONVERGENCE_Z_SCORE {
             resolution = Resolution::Converged(horizon);
             break;
@@ -189,7 +196,7 @@ fn follow(
         long: long.to_string(),
         short: short.to_string(),
         entry_z_score,
-        exit_z_score,
+        final_z_score,
         resolution,
         observed,
     })
@@ -202,12 +209,10 @@ pub fn mean_entry_z_score(entries: &[IntradayEntry]) -> Option<f64> {
     })
 }
 
-/// How far the spread travelled, in fitted standard deviations, between entry and the last bar.
+/// How far the spread travelled, in fitted standard deviations, between entry and the session's end.
 ///
-/// **The statistic the intraday horizon can actually answer.** Full convergence asks a spread
-/// dislocated by daily sigma to close entirely within a hundred minutes, which is many times a
-/// typical intraday move, so the binary resolution reads zero whatever the pairs do. Negative drift
-/// is movement toward the fitted mean.
+/// Negative is movement toward the fitted mean. Reported instead of a convergence rate because a
+/// threshold set in daily sigma is not reachable inside one session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Drift {
     /// Mean over sessions of each session's own mean drift.
@@ -222,16 +227,14 @@ pub struct Drift {
 
 /// Measures drift with one reading per session.
 ///
-/// **Aggregated by session deliberately.** A session contributes thousands of entries drawn from
-/// one universe over one set of hours, so they move together; treating them as independent divides
-/// by the square root of a number far larger than the information present and reports a regime as a
-/// discovery. The same correction the five-minute baselines needed.
+/// Aggregated by session because a session's entries are drawn from one universe over one set of
+/// hours and move together; per-entry errors would divide by far more than the information present.
 pub fn drift(entries: &[IntradayEntry]) -> Option<Drift> {
     let mut by_session: BTreeMap<SessionDate, Vec<f64>> = BTreeMap::new();
     let mut toward = 0_usize;
     let mut counted = 0_usize;
     for entry in entries {
-        let Some(exit) = entry.exit_z_score else {
+        let Some(exit) = entry.final_z_score else {
             continue;
         };
         let travelled = exit - entry.entry_z_score;
@@ -488,8 +491,10 @@ mod tests {
 
         assert!(!entries.is_empty());
         for entry in &entries {
-            assert!(entry.entry_z_score >= ENTRY_Z_SCORE);
-            assert!(entry.entry_z_score <= ENTRY_Z_SCORE_CAP);
+            // Literals, not the constants the entry logic reads: an expectation derived from the
+            // value under test moves with it and can never fail.
+            assert!(entry.entry_z_score >= 2.0);
+            assert!(entry.entry_z_score <= 5.0);
         }
     }
 
@@ -509,10 +514,119 @@ mod tests {
             Selection::Unscreened,
         );
 
+        // Exactly one, not at most one: `<= 1` also passes a fixture that stopped opening at all.
+        assert_eq!(entries.len(), 1, "one pair yields one entry per session");
+    }
+
+    fn entry_with(session: SessionDate, entry: f64, final_z: Option<f64>) -> IntradayEntry {
+        IntradayEntry {
+            session,
+            entry_bar: 0,
+            long: "LONG".to_string(),
+            short: "SHORT".to_string(),
+            entry_z_score: entry,
+            final_z_score: final_z,
+            resolution: Resolution::Unresolved,
+            observed: Observed::default(),
+        }
+    }
+
+    /// An entry the session ran out under carries no travel, and counting it as zero drift would
+    /// pull the mean toward a null nothing measured.
+    #[test]
+    fn test_drift_ignores_entries_that_were_never_priced_again() {
+        let session = session_of(2026, 6, 1);
+        assert_eq!(drift(&[entry_with(session, 2.5, None)]), None);
+        assert_eq!(drift(&[]), None);
+    }
+
+    /// One session gives no spread between sessions to take a standard error from, and reporting
+    /// zero there would make a single day read as infinitely significant.
+    #[test]
+    fn test_drift_needs_more_than_one_session() {
+        let session = session_of(2026, 6, 1);
+        let entries = vec![
+            entry_with(session, 2.5, Some(2.0)),
+            entry_with(session, 2.5, Some(2.2)),
+        ];
+        assert_eq!(drift(&entries), None);
+    }
+
+    /// The mean is over sessions, not over entries: a session with a thousand entries must not
+    /// outvote one with ten, which is what treating entries as independent would do.
+    #[test]
+    fn test_drift_weights_sessions_not_entries() {
+        let busy = session_of(2026, 6, 1);
+        let quiet = session_of(2026, 6, 2);
+        let mut entries = vec![entry_with(quiet, 2.5, Some(3.5))];
+        // Ten entries in one session, all travelling -1.0.
+        entries.extend((0..10).map(|_| entry_with(busy, 2.5, Some(1.5))));
+
+        let reading = drift(&entries).expect("two sessions");
+
+        // Session means are -1.0 and +1.0, so the mean over sessions is zero. Weighted by entries
+        // it would have been about -0.82.
         assert!(
-            entries.len() <= 1,
-            "got {} entries for one pair",
-            entries.len()
+            reading.mean.abs() < 1e-12,
+            "expected the two sessions to cancel, got {}",
+            reading.mean
+        );
+        assert_eq!(reading.sessions, 2);
+        assert_eq!(reading.entries, 11);
+    }
+
+    /// The share counts entries whose spread moved toward the mean, which is the population check
+    /// on a mean one large move could otherwise carry.
+    #[test]
+    fn test_share_converging_counts_entries_moving_toward_the_mean() {
+        let first = session_of(2026, 6, 1);
+        let second = session_of(2026, 6, 2);
+        let entries = vec![
+            entry_with(first, 2.5, Some(2.0)),
+            entry_with(first, 2.5, Some(3.0)),
+            entry_with(second, 2.5, Some(2.0)),
+            entry_with(second, 2.5, Some(2.5)),
+        ];
+
+        let reading = drift(&entries).expect("two sessions");
+
+        // Two of four fell, one rose, one was unchanged — unchanged is not toward the mean.
+        assert!((reading.share_converging - 0.5).abs() < 1e-12);
+    }
+
+    /// A window carrying a corporate-action-sized move corrupts the fit it is the whole basis of,
+    /// so the pair must be dropped before anything is fitted on it.
+    #[test]
+    fn test_a_window_with_a_structural_break_is_refused() {
+        let mut frame_rows = daily_frame(0.01);
+        // A ten-for-one split leaves a -230% log return in the window.
+        let closes = frame_rows
+            .column("close_price")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .enumerate()
+            .map(|(index, price)| if index > 60 { price / 10.0 } else { price })
+            .collect::<Vec<f64>>();
+        frame_rows
+            .with_column(Column::new("close_price".into(), closes))
+            .unwrap();
+        let closes = Closes::from_frame(&frame_rows).unwrap();
+        let prices = pair_prices(3.0, 10, Some(8));
+
+        let entries = entries_in_session(
+            &closes,
+            &prices,
+            &universe(),
+            session_of(2026, 6, 1),
+            closes.sessions() - 1,
+            Selection::Unscreened,
+        );
+
+        assert!(
+            entries.is_empty(),
+            "a window containing a split must not be fitted on"
         );
     }
 

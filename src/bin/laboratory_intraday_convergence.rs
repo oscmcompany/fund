@@ -57,7 +57,9 @@ impl Parameters {
             [session, lookback, universe] => (
                 session,
                 positive(lookback, "LOOKBACK_DAYS")?,
-                positive(universe, "UNIVERSE")? as usize,
+                usize::try_from(positive(universe, "UNIVERSE")?).map_err(|_| {
+                    format!("UNIVERSE is larger than this platform can index\n{USAGE}")
+                })?,
             ),
             _ => return Err(format!("Expected an end session\n{USAGE}")),
         };
@@ -233,7 +235,7 @@ fn report(selection: Selection, entries: &[IntradayEntry]) {
                 0.0
             };
             println!(
-                "\n  drift from entry to last bar: {:+.5} sigma  se {:.5}  {ratio:+.2} standard \
+                "\n  drift from entry to the session end: {:+.5} sigma  se {:.5}  {ratio:+.2} standard \
                  errors  over {} sessions ({} entries)",
                 reading.mean, reading.standard_error, reading.sessions, reading.entries
             );
