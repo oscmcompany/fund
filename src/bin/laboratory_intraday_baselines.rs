@@ -1,15 +1,18 @@
 //! Measures what a five-minute bar predicts about the next one, and whether bounce explains it.
 //!
-//! Trains nothing. Every measurement is inside a single session, so no result here is an overnight
-//! return wearing an intraday label.
+//! Trains nothing, and measures inside a session so no reading is an overnight return.
 
 use chrono::NaiveDate;
-use tracing::{error, info};
+use std::collections::BTreeMap;
 
+use chrono::Timelike;
+use tracing::{error, info, warn};
+
+use fund::common::alpaca::{AlpacaCredentials, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::types::{BarInterval, SessionDate};
 use fund::laboratory::dataset;
-use fund::laboratory::intraday::{self, BounceReading, SessionReturns};
+use fund::laboratory::intraday::{self, BounceReading, SessionHours, SessionReturns};
 use fund::laboratory::metrics;
 use fund::laboratory::predictor::{
     evaluate, Momentum, Panel, Persistence, Predictor, RandomRanking,
@@ -122,7 +125,8 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
     )
     .await?;
 
-    let sessions = intraday::session_returns(&dataset.bars)?;
+    let hours = session_hours(parameters).await?;
+    let sessions = intraday::session_returns(&dataset.bars, BarInterval::FiveMinute, &hours)?;
     if sessions.is_empty() {
         return Err("the window produced no intraday returns".into());
     }
@@ -138,6 +142,40 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
     report_bounce(&sessions);
     report_baselines(&sessions);
     Ok(())
+}
+
+/// The exchange's published hours for every session in the window.
+///
+/// From the calendar rather than assumed, because a half-day closes at 13:00 and a fixed 16:00
+/// would read three hours of post-market prints as regular bars.
+async fn session_hours(
+    parameters: &Parameters,
+) -> Result<BTreeMap<SessionDate, SessionHours>, Box<dyn std::error::Error>> {
+    let client = TradingClient::from_env(AlpacaCredentials::from_env()?);
+    let start = parameters.session.date() - chrono::Duration::days(parameters.lookback_days);
+    let days = client
+        .fetch_calendar(start, parameters.session.date())
+        .await?;
+
+    let mut hours = BTreeMap::new();
+    let mut early = 0_usize;
+    for day in days {
+        let open = day.session_open().hour() * 60 + day.session_open().minute();
+        let close = day.session_close().hour() * 60 + day.session_close().minute();
+        let Some(published) = SessionHours::new(open, close) else {
+            continue;
+        };
+        if published != SessionHours::regular() {
+            early += 1;
+        }
+        hours.insert(SessionDate::from_date(day.session_date()), published);
+    }
+    info!(
+        sessions = hours.len(),
+        irregular = early,
+        "Read the exchange calendar"
+    );
+    Ok(hours)
 }
 
 /// Prints the bounce reading, which decides whether anything below it can be believed.
@@ -156,7 +194,10 @@ fn report_bounce(sessions: &[SessionReturns]) {
 
     println!("\nbid-ask bounce, over {measured} name-sessions");
     println!("  lag-1 autocorrelation  {lag_one:+.4}");
-    println!("  lag-2 autocorrelation  {lag_two:+.4}");
+    match lag_two {
+        Some(value) => println!("  lag-2 autocorrelation  {value:+.4}"),
+        None => println!("  lag-2 autocorrelation  not estimable"),
+    }
     println!("  share negative at lag-1 {share_negative:.4}");
     match roll_spread {
         Some(spread) => println!("  Roll effective spread   {:.4}%", spread * 100.0),
@@ -190,24 +231,36 @@ fn report_baselines(sessions: &[SessionReturns]) {
         }
     }
 
-    println!("\nbaselines, information coefficient pooled over every bar in the window");
+    println!("\nbaselines, one information coefficient per session");
     for (name, predictor) in &predictors {
-        // Pooled at the bar level rather than averaging each session's own average, so a thin
-        // session carries the weight of the readings it actually contributed.
+        // One reading per session, not one per bar. Bars within a session overlap in the names and
+        // history they read, and this module's own finding is that they are serially dependent, so
+        // pooling them and dividing by the square root of their count overstates significance.
         let mut readings: Vec<Option<f64>> = Vec::new();
+        let mut skipped = 0_usize;
         for session in sessions {
-            let Ok(frame) = intraday::panel_frame(session) else {
-                continue;
-            };
-            let Ok(panel) = Panel::from_frame_of(&frame, "intraday_return") else {
-                continue;
-            };
-            readings.extend(
-                evaluate(predictor.as_ref(), &panel)
-                    .sessions
-                    .iter()
-                    .map(|metrics| metrics.information_coefficient),
-            );
+            let panel = intraday::panel_frame(session)
+                .map_err(|error| error.to_string())
+                .and_then(|frame| {
+                    Panel::from_frame_of(&frame, intraday::INTRADAY_RETURN_COLUMN)
+                        .map_err(|error| error.to_string())
+                });
+            match panel {
+                Ok(panel) => readings.push(
+                    evaluate(predictor.as_ref(), &panel)
+                        .information_coefficient
+                        .map(|distribution| distribution.mean),
+                ),
+                // Named rather than dropped: a silently skipped session leaves the row below
+                // looking complete over a window it did not cover.
+                Err(error) => {
+                    skipped += 1;
+                    warn!(%error, session = %session.session(), "Skipped a session");
+                }
+            }
+        }
+        if skipped > 0 {
+            println!("  ({skipped} sessions skipped; see the log)");
         }
         match metrics::summarize(readings.into_iter()) {
             Some(distribution) => {
@@ -217,11 +270,11 @@ fn report_baselines(sessions: &[SessionReturns]) {
                     0.0
                 };
                 println!(
-                    "  {name:<12} {:+.5}  se {:.5}  {ratio:+.2} standard errors  over {} bars",
+                    "  {name:<20} {:+.5}  se {:.5}  {ratio:+.2} standard errors  over {} sessions",
                     distribution.mean, distribution.standard_error, distribution.sessions
                 );
             }
-            None => println!("  {name:<12} not measurable over this window"),
+            None => println!("  {name:<20} not measurable over this window"),
         }
     }
 }
