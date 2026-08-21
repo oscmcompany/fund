@@ -137,47 +137,7 @@ pub fn session_returns(
         )));
     }
 
-    let tickers = bars.column("ticker")?.str()?;
-    let timestamps = bars.column("timestamp")?.i64()?;
-    let closes = bars.column("close_price")?.cast(&DataType::Float64)?;
-    let closes = closes.f64()?;
-    if tickers.null_count() > 0 || timestamps.null_count() > 0 {
-        return Err(IntradayError::Shape(
-            "every bar must name its ticker and its instant".to_string(),
-        ));
-    }
-
-    // Closes are placed at their own bar index rather than pushed in arrival order, so a gap stays
-    // a gap. Keyed by session as well as ticker: a return must never cross the overnight boundary.
-    let mut closes_by_key: BTreeMap<(SessionDate, String), Vec<Option<f64>>> = BTreeMap::new();
-    for ((ticker, timestamp), close) in tickers
-        .into_no_null_iter()
-        .zip(timestamps.into_no_null_iter())
-        .zip(closes)
-    {
-        let Some(close) = close.filter(|price| price.is_finite() && *price > 0.0) else {
-            continue;
-        };
-        let Some(instant) = chrono::DateTime::from_timestamp_millis(timestamp) else {
-            continue;
-        };
-        let session = SessionDate::at(instant);
-        let session_hours = hours
-            .get(&session)
-            .copied()
-            .unwrap_or_else(SessionHours::regular);
-        let eastern = eastern_datetime(instant);
-        let minute = eastern.time().hour() * 60 + eastern.time().minute();
-        let Some(index) = session_hours.bar_index(minute, interval_minutes) else {
-            continue;
-        };
-        let slots = closes_by_key
-            .entry((session, ticker.to_string()))
-            .or_insert_with(|| vec![None; session_hours.bars(interval_minutes)]);
-        if let Some(slot) = slots.get_mut(index) {
-            *slot = Some(close);
-        }
-    }
+    let closes_by_key = place_by_bar(bars, "close_price", interval_minutes, hours)?;
 
     let mut by_session: BTreeMap<SessionDate, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
     for ((session, ticker), prices) in closes_by_key {
@@ -205,6 +165,92 @@ pub fn session_returns(
         .into_iter()
         .map(|(session, by_ticker)| SessionReturns { session, by_ticker })
         .collect())
+}
+
+/// Places one price column at each bar's own index within its session.
+///
+/// Indexing by bar rather than by arrival order is what keeps a gap a gap: a name that did not
+/// print leaves an empty slot instead of letting its neighbours close over the hole.
+fn place_by_bar(
+    bars: &DataFrame,
+    column: &str,
+    interval_minutes: u32,
+    hours: &BTreeMap<SessionDate, SessionHours>,
+) -> Result<BTreeMap<(SessionDate, String), Vec<Option<f64>>>, IntradayError> {
+    let tickers = bars.column("ticker")?.str()?;
+    let timestamps = bars.column("timestamp")?.i64()?;
+    let prices = bars.column(column)?.cast(&DataType::Float64)?;
+    let prices = prices.f64()?;
+    if tickers.null_count() > 0 || timestamps.null_count() > 0 {
+        return Err(IntradayError::Shape(
+            "every bar must name its ticker and its instant".to_string(),
+        ));
+    }
+
+    let mut placed: BTreeMap<(SessionDate, String), Vec<Option<f64>>> = BTreeMap::new();
+    for ((ticker, timestamp), price) in tickers
+        .into_no_null_iter()
+        .zip(timestamps.into_no_null_iter())
+        .zip(prices)
+    {
+        let Some(price) = price.filter(|value| value.is_finite() && *value > 0.0) else {
+            continue;
+        };
+        let Some(instant) = chrono::DateTime::from_timestamp_millis(timestamp) else {
+            continue;
+        };
+        let session = SessionDate::at(instant);
+        let session_hours = hours
+            .get(&session)
+            .copied()
+            .unwrap_or_else(SessionHours::regular);
+        let eastern = eastern_datetime(instant);
+        let minute = eastern.time().hour() * 60 + eastern.time().minute();
+        let Some(index) = session_hours.bar_index(minute, interval_minutes) else {
+            continue;
+        };
+        let slots = placed
+            .entry((session, ticker.to_string()))
+            .or_insert_with(|| vec![None; session_hours.bars(interval_minutes)]);
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = Some(price);
+        }
+    }
+    Ok(placed)
+}
+
+/// Volume-weighted average price at each bar, by session and name.
+///
+/// **VWAP rather than the close, deliberately.** A bar's close is whichever side of the spread the
+/// last trade hit; its volume-weighted average is drawn from every trade in the bar and does not sit
+/// on one side. Measured over the whole universe the two differ by about nine basis points, which is
+/// the effective spread [`bounce`] recovers — so reading a spread off closes prices half of it in.
+pub fn session_vwaps(
+    bars: &DataFrame,
+    interval: BarInterval,
+    hours: &BTreeMap<SessionDate, SessionHours>,
+) -> Result<BTreeMap<SessionDate, BTreeMap<String, Vec<Option<f64>>>>, IntradayError> {
+    let (interval_minutes, unit) = interval.massive_timespan();
+    if unit != "minute" {
+        return Err(IntradayError::Shape(format!(
+            "intraday prices need a minute cadence, got {interval}"
+        )));
+    }
+    let placed = place_by_bar(
+        bars,
+        "volume_weighted_average_price",
+        interval_minutes,
+        hours,
+    )?;
+
+    let mut by_session: BTreeMap<SessionDate, BTreeMap<String, Vec<Option<f64>>>> = BTreeMap::new();
+    for ((session, ticker), prices) in placed {
+        by_session
+            .entry(session)
+            .or_default()
+            .insert(ticker, prices);
+    }
+    Ok(by_session)
 }
 
 /// Sample autocorrelation of a series at `lag`, or `None` when it is not estimable.

@@ -8,6 +8,7 @@ pub mod export;
 pub mod forecast;
 pub mod information;
 pub mod intraday;
+pub mod intraday_convergence;
 pub mod journal;
 pub mod metrics;
 pub mod predictor;
