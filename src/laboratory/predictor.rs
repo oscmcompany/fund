@@ -36,9 +36,17 @@ impl Panel {
     /// Returns must be unscaled: standardizing is monotone so it leaves the rank correlation alone,
     /// but it moves the decile spread into scaled units and can flip the sign every name is judged on.
     pub fn from_frame(frame: &DataFrame) -> Result<Self, PanelError> {
+        Self::from_frame_of(frame, "daily_return")
+    }
+
+    /// Builds a panel whose per-period return lives in `returns_column`.
+    ///
+    /// The time axis is periods, not necessarily days: the intraday path passes five-minute returns
+    /// under their own name so a bar-to-bar return is never carried in a column called daily.
+    pub fn from_frame_of(frame: &DataFrame, returns_column: &str) -> Result<Self, PanelError> {
         let tickers = frame.column("ticker")?.str()?;
         let timestamps = frame.column("timestamp")?.i64()?;
-        let returns = frame.column("daily_return")?.cast(&DataType::Float64)?;
+        let returns = frame.column(returns_column)?.cast(&DataType::Float64)?;
         let returns = returns.f64()?;
         if tickers.null_count() > 0 || timestamps.null_count() > 0 {
             return Err(PanelError::Shape(
