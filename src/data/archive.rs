@@ -558,6 +558,7 @@ pub async fn archive_intraday_sessions(
             interval,
             chunk,
             scope,
+            &present,
             &mut summary,
         )
         .await?;
@@ -584,6 +585,10 @@ pub async fn archive_intraday_sessions(
 }
 
 /// One chunk: derive the universe, fan out over it, then write a partition per session.
+///
+/// `present` is the sessions the archive already holds a partition for, which a symbol repair needs
+/// in order *not* to write one — see [`writable_sessions`].
+#[allow(clippy::too_many_arguments)]
 async fn archive_intraday_chunk(
     s3_client: &S3Client,
     massive: &MassiveClient,
@@ -591,6 +596,7 @@ async fn archive_intraday_chunk(
     interval: BarInterval,
     chunk: &[SessionDate],
     scope: &IntradayScope,
+    present: &BTreeSet<SessionDate>,
     summary: &mut ArchiveSummary,
 ) -> Result<(), ArchiveError> {
     let (Some(first), Some(last)) = (chunk.first(), chunk.last()) else {
@@ -704,17 +710,41 @@ async fn archive_intraday_chunk(
 
     let mut writable = Vec::new();
     for (session, bars_for_session) in by_session {
-        // A bar dated outside the chunk is a vendor answering beyond the range asked for. Writing it
-        // would put rows in a partition this pass never claimed and never verified.
-        // Skipped when the daily archive could not describe the session: a partition written from a
-        // universe that never covered it would look complete and never be revisited.
-        if !universe.described.contains(&session) {
+        if !writable_sessions(session, scope, &universe.described, present) {
             continue;
         }
         writable.push((session, bars::bars_to_dataframe(&bars_for_session)?));
     }
 
     write_partitions(s3_client, bucket, interval, writable, summary).await
+}
+
+/// Whether this pass may write the partition for `session`.
+///
+/// Two refusals, and the second is what a symbol repair needs. A session the *daily* archive cannot
+/// describe is skipped because a partition written from a universe that never covered it would look
+/// complete and never be revisited — that also drops a bar dated outside the chunk, which is the
+/// vendor answering beyond the range asked for.
+///
+/// A symbol repair additionally refuses to *create* a partition. It requests the whole window on
+/// purpose, since a partition short one name looks complete, but it fetches only the named symbols —
+/// so writing where nothing existed produces a partition holding those names and nothing else, which
+/// then reads as present to [`intraday_sessions_to_request`] and is never filled. Repairing the
+/// 2026-08-21 gap manufactured exactly that: an absent session became one short 1,335 names. An
+/// absent session needs [`IntradayScope::MissingSessions`], which fetches the whole universe.
+fn writable_sessions(
+    session: SessionDate,
+    scope: &IntradayScope,
+    described: &BTreeSet<SessionDate>,
+    present: &BTreeSet<SessionDate>,
+) -> bool {
+    if !described.contains(&session) {
+        return false;
+    }
+    match scope {
+        IntradayScope::MissingSessions => true,
+        IntradayScope::Symbols(_) => present.contains(&session),
+    }
 }
 
 /// Partitions written at once.
@@ -1757,6 +1787,65 @@ mod tests {
             BTreeSet::from([Ticker::new("CBOE").unwrap()]),
             "OBDC turns over $49.2M, just under the floor; SNDL clears $60M and fails on price"
         );
+    }
+
+    /// The bug this cost a backfill to find. A symbol repair fetches only the named symbols, so
+    /// writing where no partition existed leaves one holding those names and nothing else — which
+    /// then reads as present and is never filled. Repairing 2026-08-21 turned an absent session into
+    /// one short 1,335 names.
+    #[test]
+    fn test_a_symbol_repair_never_creates_a_partition() {
+        let session = session(2026, 8, 21);
+        let described = BTreeSet::from([session]);
+        let absent = BTreeSet::new();
+        let repair = IntradayScope::Symbols(tickers(&["CBOE", "NVDA"]));
+
+        assert!(
+            !writable_sessions(session, &repair, &described, &absent),
+            "a repair must leave an absent session absent, so the session scan still fetches it"
+        );
+        assert!(
+            writable_sessions(
+                session,
+                &IntradayScope::MissingSessions,
+                &described,
+                &absent
+            ),
+            "the whole-universe pass is the one that may create it"
+        );
+    }
+
+    /// The repair still writes where a partition exists — that is the merge it is for.
+    #[test]
+    fn test_a_symbol_repair_writes_into_a_partition_that_exists() {
+        let session = session(2026, 8, 20);
+        let described = BTreeSet::from([session]);
+        let present = BTreeSet::from([session]);
+        let repair = IntradayScope::Symbols(tickers(&["CBOE"]));
+
+        assert!(writable_sessions(session, &repair, &described, &present));
+    }
+
+    /// An undescribed session is refused whatever the scope, because nothing can say what a
+    /// complete partition for it would hold.
+    #[test]
+    fn test_an_undescribed_session_is_never_written() {
+        let session = session(2026, 8, 20);
+        let described = BTreeSet::new();
+        let present = BTreeSet::from([session]);
+
+        assert!(!writable_sessions(
+            session,
+            &IntradayScope::MissingSessions,
+            &described,
+            &present
+        ));
+        assert!(!writable_sessions(
+            session,
+            &IntradayScope::Symbols(tickers(&["CBOE"])),
+            &described,
+            &present
+        ));
     }
 
     fn scan_of(entries: &[(SessionDate, SessionCoverage)]) -> SymbolScan {
