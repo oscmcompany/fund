@@ -1,6 +1,6 @@
 //! The Alpaca integration: credentials, the trading API, and the market data API.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
@@ -27,7 +27,8 @@ const HEADER_SECRET_KEY: &str = "APCA-API-SECRET-KEY";
 /// Failures reaching or interpreting an Alpaca endpoint.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    /// The request never produced a response: connection refused, timed out, TLS failure.
+    /// The request produced no usable response: connection refused, timed out, TLS failure, or a
+    /// body that did not arrive intact.
     #[error("Alpaca request failed: {0}")]
     Request(#[from] reqwest::Error),
     /// Alpaca answered with a non-success status.
@@ -36,6 +37,26 @@ pub enum ClientError {
     /// Alpaca answered successfully with something that could not be interpreted.
     #[error("Alpaca response could not be parsed: {0}")]
     Parse(String),
+}
+
+impl ClientError {
+    /// Whether another attempt could succeed where this one did not.
+    ///
+    /// A body that did not arrive and a body that is not JSON are one error to `reqwest`, so both
+    /// land in [`ClientError::Request`] and both are retried. [`ClientError::Parse`] is what this
+    /// module raises about a response it *did* read whole, which repeating cannot change.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ClientError::Api { status, .. } => *status == 429 || (500..600).contains(status),
+            ClientError::Request(_) => true,
+            ClientError::Parse(_) => false,
+        }
+    }
+}
+
+/// Pause before a page's next attempt, growing with the attempt number.
+fn page_retry_delay(attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_millis(250 << attempt.min(4))
 }
 
 /// Builds the shared HTTP client.
@@ -2001,6 +2022,110 @@ impl std::fmt::Display for PriceSource {
     }
 }
 
+/// Rows per quote page. The endpoint's maximum.
+const QUOTES_PAGE_SIZE: usize = 10_000;
+
+/// Page bound for the quote cursor, so a token that never clears cannot loop forever.
+///
+/// Ten million quotes for one name over one session, against a measured worst case of 904,543
+/// (XLI, 2026-08-20). Generous because the tail is nothing like the median: the same session's
+/// quote counts ranged from 7,337 to that, and the count tracks price level and tick size rather
+/// than dollar volume.
+const QUOTES_PAGE_LIMIT: usize = 1_000;
+
+/// One tick of the consolidated quote stream, carrying no ticker.
+///
+/// Its own type rather than an [`EquityQuote`] because a single name-session runs to most of a
+/// million of these, and cloning a [`Ticker`] into every one is an allocation per row for a field
+/// the caller named in the request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuoteTick {
+    timestamp: DateTime<Utc>,
+    bid_price: f64,
+    ask_price: f64,
+    bid_size: i32,
+    ask_size: i32,
+}
+
+impl QuoteTick {
+    /// Constructs a `QuoteTick`, refusing a book no spread can be read off.
+    ///
+    /// `None` rather than an error because these are refused in bulk and counted, not reported one
+    /// by one: a crossed consolidated book is ordinary around the open, where 20 of AAPL's first
+    /// 30,126 quotes on 2026-08-20 were crossed.
+    pub fn new(
+        timestamp: DateTime<Utc>,
+        bid_price: f64,
+        ask_price: f64,
+        bid_size: i32,
+        ask_size: i32,
+    ) -> Option<Self> {
+        let usable = |price: f64| price.is_finite() && price > 0.0;
+        if !usable(bid_price) || !usable(ask_price) || bid_price > ask_price {
+            return None;
+        }
+        if bid_size < 0 || ask_size < 0 {
+            return None;
+        }
+        Some(Self {
+            timestamp,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+        })
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn bid_size(&self) -> i32 {
+        self.bid_size
+    }
+
+    pub fn ask_size(&self) -> i32 {
+        self.ask_size
+    }
+
+    /// The quoted width of the book.
+    pub fn spread(&self) -> f64 {
+        self.ask_price - self.bid_price
+    }
+
+    /// The midpoint, which [`QuoteTick::new`] has already established is a positive price.
+    pub fn mid_price(&self) -> f64 {
+        (self.bid_price + self.ask_price) / 2.0
+    }
+}
+
+/// Attempts per quote page before the fetch gives up on the whole symbol.
+///
+/// Four, because the page is the unit that fails: one session of AAPL is 118 pages and a single
+/// dropped connection anywhere in the chain used to cost the name. Bounded rather than generous —
+/// a page that fails four times running is not a blip.
+const QUOTES_PAGE_ATTEMPTS: usize = 4;
+
+/// One page and what it took to get it.
+struct FetchedPage {
+    page: QuotesResponse,
+    retries: usize,
+}
+
+/// What one quote fetch moved, which is the only trace of it that survives.
+///
+/// The ticks themselves are handed to the caller's fold and dropped; these counts are what remains
+/// to say whether the fold saw a whole session. `rejected` is the tally [`QuoteTick::new`] refused,
+/// and `retries` is how many pages had to be asked for twice — a run where it climbs is a feed
+/// degrading, which no other number here would show.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuoteFetch {
+    pub received: usize,
+    pub rejected: usize,
+    pub pages: usize,
+    pub retries: usize,
+}
+
 /// Rows per corporate-actions page. The endpoint's maximum.
 const CORPORATE_ACTIONS_PAGE_SIZE: usize = 1_000;
 
@@ -2014,6 +2139,47 @@ const CORPORATE_ACTIONS_PAGE_LIMIT: usize = 200;
 /// feed, so a recent window excludes it without being told to.
 const BOUNDARY_ACTION_TYPES: &str =
     "name_change,spin_off,rights_distribution,unit_split,reorganization";
+
+/// The historical-quotes envelope: rows keyed by symbol, plus the cursor.
+///
+/// `quotes` is absent rather than empty when a window holds none, which a name that had not listed
+/// yet produces for every session before it did.
+#[derive(Debug, Deserialize)]
+struct QuotesResponse {
+    quotes: Option<HashMap<String, Vec<HistoricalQuotePayload>>>,
+    next_page_token: Option<String>,
+}
+
+/// One row of the historical quote stream, in the feed's own abbreviations.
+///
+/// Only the five fields a spread is read off are taken. The exchange codes, condition flags, and
+/// tape identifier are parsed past: the SIP feed returns the consolidated best bid and offer, so
+/// the venue behind each side is not what this measures.
+#[derive(Debug, Deserialize)]
+struct HistoricalQuotePayload {
+    #[serde(rename = "t")]
+    timestamp: Option<DateTime<Utc>>,
+    #[serde(rename = "bp", default)]
+    bid_price: f64,
+    #[serde(rename = "ap", default)]
+    ask_price: f64,
+    #[serde(rename = "bs", default)]
+    bid_size: i32,
+    #[serde(rename = "as", default)]
+    ask_size: i32,
+}
+
+impl HistoricalQuotePayload {
+    fn into_tick(self) -> Option<QuoteTick> {
+        QuoteTick::new(
+            self.timestamp?,
+            self.bid_price,
+            self.ask_price,
+            self.bid_size,
+            self.ask_size,
+        )
+    }
+}
 
 /// The corporate-actions envelope: categories keyed by name, plus the cursor.
 #[derive(Debug, Deserialize)]
@@ -2292,6 +2458,130 @@ impl MarketDataClient {
 
         Err(ClientError::Parse(format!(
             "corporate action pagination did not end within {CORPORATE_ACTIONS_PAGE_LIMIT} pages"
+        )))
+    }
+
+    /// Fetches one page, retrying the page itself while the failure is transient.
+    ///
+    /// Retried here rather than by the caller because the caller's unit is the whole symbol: AAPL
+    /// is 118 pages over one session, so restarting it to recover one dropped connection discards
+    /// 117 pages of work and gives the largest names both the highest failure odds and the dearest
+    /// recovery. The token identifies the page, so resuming at it is exact.
+    async fn quote_page(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+        ticker: &Ticker,
+        page: usize,
+    ) -> Result<FetchedPage, ClientError> {
+        let mut retries = 0usize;
+        let mut last_error = None;
+        for attempt in 0..QUOTES_PAGE_ATTEMPTS {
+            let outcome = match error_for_status(self.get(url).query(query).send().await?).await {
+                // Kept as `Request` rather than flattened to `Parse`. A connection dropped part-way
+                // through a body arrives here, and calling that unparseable cost twelve names their
+                // retries on the first real run.
+                Ok(response) => response
+                    .json::<QuotesResponse>()
+                    .await
+                    .map_err(ClientError::Request),
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(page) => return Ok(FetchedPage { page, retries }),
+                Err(error) if error.is_transient() => {
+                    retries += 1;
+                    debug!(%ticker, page, attempt, %error, "Retrying a quote page");
+                    last_error = Some(error);
+                    tokio::time::sleep(page_retry_delay(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // The last real failure, not a summary of them. Reporting exhaustion as a parse error would
+        // tell the caller a transport fault is permanent, which is the bug this retry exists for.
+        Err(last_error.expect("a failed attempt records its error"))
+    }
+
+    /// Streams one symbol's quotes over `[start, end)` through `accept`, oldest first.
+    ///
+    /// A fold rather than a `Vec` because the volume forbids collecting: AAPL alone printed 846,305
+    /// quotes on 2026-08-20, which is 110MB of JSON, and the archive wants a dozen numbers out of
+    /// it. Each page is dropped once `accept` has seen it, so peak memory is one page.
+    ///
+    /// Ticks arrive in ascending time order, which every time-weighted fold downstream depends on,
+    /// and unusable books are refused here so `accept` only ever sees a quote worth weighing.
+    pub async fn fetch_quotes<F>(
+        &self,
+        ticker: &Ticker,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        mut accept: F,
+    ) -> Result<QuoteFetch, ClientError>
+    where
+        F: FnMut(QuoteTick),
+    {
+        let url = format!("{}/v2/stocks/quotes", self.base_url);
+        let start_text = start.to_rfc3339();
+        let end_text = end.to_rfc3339();
+        let page_size = QUOTES_PAGE_SIZE.to_string();
+        let feed = self.feed.as_str();
+
+        let mut fetch = QuoteFetch::default();
+        let mut page_token: Option<String> = None;
+
+        for _ in 1..=QUOTES_PAGE_LIMIT {
+            let mut query: Vec<(&str, &str)> = vec![
+                ("symbols", ticker.as_str()),
+                ("start", start_text.as_str()),
+                ("end", end_text.as_str()),
+                ("limit", page_size.as_str()),
+                ("feed", feed),
+                // Stated rather than inherited. The fold weighs each quote by the time until the
+                // next one, so a descending page would silently weigh every tick at zero.
+                ("sort", "asc"),
+            ];
+            if let Some(token) = page_token.as_deref() {
+                query.push(("page_token", token));
+            }
+
+            let payload = self
+                .quote_page(&url, &query, ticker, fetch.pages + 1)
+                .await?;
+            fetch.retries += payload.retries;
+            let payload = payload.page;
+
+            fetch.pages += 1;
+            let rows = payload
+                .quotes
+                .and_then(|mut symbols| symbols.remove(ticker.as_str()))
+                .unwrap_or_default();
+            fetch.received += rows.len();
+            for row in rows {
+                match row.into_tick() {
+                    Some(tick) => accept(tick),
+                    None => fetch.rejected += 1,
+                }
+            }
+
+            let Some(token) = payload.next_page_token else {
+                if fetch.rejected > 0 {
+                    // Ordinary around the open and not worth a warning, but the ratio is the only
+                    // signal that would distinguish a bad feed day from a normal one.
+                    debug!(
+                        %ticker,
+                        rejected = fetch.rejected,
+                        received = fetch.received,
+                        "Dropped quotes no spread can be read off"
+                    );
+                }
+                return Ok(fetch);
+            };
+            page_token = Some(token);
+        }
+
+        Err(ClientError::Parse(format!(
+            "{ticker} quote pagination did not end within {QUOTES_PAGE_LIMIT} pages"
         )))
     }
 
@@ -4107,5 +4397,241 @@ mod tests {
         assert!(boundary_for(&boundaries, "SPCX").is_some());
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    fn quote_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        (
+            Utc.with_ymd_and_hms(2026, 8, 20, 13, 30, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 20, 20, 0, 0).unwrap(),
+        )
+    }
+
+    /// Collects what the fold would have seen, which no production caller does — the whole point of
+    /// the streaming signature is that a name-session's ticks never exist all at once.
+    async fn collect_quotes(base_url: String) -> (Vec<QuoteTick>, Result<QuoteFetch, ClientError>) {
+        let (start, end) = quote_window();
+        let mut ticks = Vec::new();
+        let fetch = client(base_url)
+            .fetch_quotes(&ticker("AAPL"), start, end, |tick| ticks.push(tick))
+            .await;
+        (ticks, fetch)
+    }
+
+    #[tokio::test]
+    async fn test_quote_pagination_folds_every_page_in_order() {
+        let mut server = mockito::Server::new_async().await;
+        let second = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "page_token".into(),
+                "page-two".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"quotes":{"AAPL":[
+                    {"t":"2026-08-20T13:30:02Z","bp":100.02,"ap":100.06,"bs":3,"as":4}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+        let first = server
+            .mock("GET", mockito::Matcher::Any)
+            // Pinned because the fold weighs each quote by the time until the next one, so a
+            // descending page would weigh every tick at zero and read as a session with no book.
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("sort".into(), "asc".into()),
+                mockito::Matcher::UrlEncoded("feed".into(), "iex".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"quotes":{"AAPL":[
+                    {"t":"2026-08-20T13:30:00Z","bp":100.00,"ap":100.05,"bs":1,"as":2}
+                ]},"next_page_token":"page-two"}"#,
+            )
+            .create_async()
+            .await;
+
+        let (ticks, fetch) = collect_quotes(server.url()).await;
+        let fetch = fetch.expect("both pages must parse");
+
+        assert_eq!(fetch.received, 2);
+        assert_eq!(fetch.rejected, 0);
+        assert_eq!(fetch.pages, 2);
+        assert_eq!(ticks.len(), 2);
+        assert!(ticks[0].timestamp() < ticks[1].timestamp());
+        assert_eq!(ticks[0].bid_size(), 1);
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// A crossed consolidated book is ordinary around the open — 20 of AAPL's first 30,126 quotes
+    /// on 2026-08-20 were crossed — so these are counted rather than raised, and never reach a fold
+    /// that would read a negative spread off them.
+    #[tokio::test]
+    async fn test_books_no_spread_can_be_read_off_are_counted_not_delivered() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"quotes":{"AAPL":[
+                    {"t":"2026-08-20T13:30:00Z","bp":100.10,"ap":100.05,"bs":1,"as":2},
+                    {"t":"2026-08-20T13:30:01Z","bp":0,"ap":100.05,"bs":1,"as":2},
+                    {"t":"2026-08-20T13:30:02Z","bp":100.00,"ap":100.05,"bs":-1,"as":2},
+                    {"bp":100.00,"ap":100.05,"bs":1,"as":2},
+                    {"t":"2026-08-20T13:30:04Z","bp":100.00,"ap":100.05,"bs":1,"as":2}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let (ticks, fetch) = collect_quotes(server.url()).await;
+        let fetch = fetch.expect("a page of mostly unusable books still parses");
+
+        assert_eq!(fetch.received, 5);
+        assert_eq!(fetch.rejected, 4, "crossed, zero, signed size, undated");
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].spread(), 100.05 - 100.00);
+        mock.assert_async().await;
+    }
+
+    /// The endpoint omits `quotes` entirely rather than returning it empty, which every session
+    /// before a name listed produces.
+    #[tokio::test]
+    async fn test_a_window_with_no_quotes_is_an_empty_fold_rather_than_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"quotes":null,"next_page_token":null}"#)
+            .create_async()
+            .await;
+
+        let (ticks, fetch) = collect_quotes(server.url()).await;
+        let fetch = fetch.expect("an empty window is an answer");
+
+        assert_eq!(
+            fetch,
+            QuoteFetch {
+                received: 0,
+                rejected: 0,
+                pages: 1,
+                retries: 0
+            }
+        );
+        assert!(ticks.is_empty());
+        mock.assert_async().await;
+    }
+
+    /// The first real run lost twelve names to `error decoding response body` — a connection
+    /// dropped part-way through a page — because this arrived as [`ClientError::Parse`], which the
+    /// archive treats as permanent and never retries. It is a transport failure and must say so.
+    #[tokio::test]
+    async fn test_a_body_that_does_not_arrive_intact_is_a_transport_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"quotes":{"AAPL":[{"t":"2026-08-20T13:30:00Z","#)
+            .expect(QUOTES_PAGE_ATTEMPTS)
+            .create_async()
+            .await;
+
+        let (_, fetch) = collect_quotes(server.url()).await;
+
+        assert!(
+            matches!(fetch, Err(ClientError::Request(_))),
+            "a truncated body is transport, not content: {fetch:?}"
+        );
+        // Exhausting the page's attempts must still report the transport failure itself, so the
+        // symbol-level retry above it can act on it.
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_only_a_throttle_or_a_server_fault_is_worth_asking_again_for() {
+        let api = |status| ClientError::Api {
+            status,
+            body: String::new(),
+        };
+        assert!(api(429).is_transient(), "throttled");
+        assert!(api(503).is_transient(), "server fault");
+        assert!(!api(403).is_transient(), "an entitlement");
+        assert!(!api(422).is_transient(), "a malformed window");
+        assert!(!ClientError::Parse("page limit".to_string()).is_transient());
+    }
+
+    /// AAPL is 118 pages over one session, so restarting the symbol to recover one dropped
+    /// connection discards 117 pages. The token names the page, so resuming at it is exact — and
+    /// the ticks either side of the failure must both survive.
+    #[tokio::test]
+    async fn test_a_dropped_page_is_retried_without_losing_the_pages_before_it() {
+        let mut server = mockito::Server::new_async().await;
+        let second = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "page_token".into(),
+                "page-two".into(),
+            ))
+            .with_status(500)
+            .with_body("upstream fell over")
+            .expect(1)
+            .create_async()
+            .await;
+        let recovered = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "page_token".into(),
+                "page-two".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"quotes":{"AAPL":[
+                    {"t":"2026-08-20T13:30:02Z","bp":100.02,"ap":100.06,"bs":3,"as":4}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+        let first = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"quotes":{"AAPL":[
+                    {"t":"2026-08-20T13:30:00Z","bp":100.00,"ap":100.05,"bs":1,"as":2}
+                ]},"next_page_token":"page-two"}"#,
+            )
+            .create_async()
+            .await;
+
+        let (ticks, fetch) = collect_quotes(server.url()).await;
+        let fetch = fetch.expect("a retried page must not fail the symbol");
+
+        assert_eq!(fetch.retries, 1, "the 500 was retried");
+        assert_eq!(fetch.pages, 2, "a retry is not a second page");
+        assert_eq!(ticks.len(), 2, "page one's tick survived the failure");
+        first.assert_async().await;
+        second.assert_async().await;
+        recovered.assert_async().await;
+    }
+
+    #[test]
+    fn test_a_locked_book_is_usable_and_a_crossed_one_is_not() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 20, 13, 30, 0).unwrap();
+        let locked = QuoteTick::new(at, 100.0, 100.0, 1, 1).expect("a locked book is legal");
+        assert_eq!(locked.spread(), 0.0);
+        assert_eq!(locked.mid_price(), 100.0);
+        assert_eq!(QuoteTick::new(at, 100.1, 100.0, 1, 1), None, "crossed");
+        assert_eq!(
+            QuoteTick::new(at, f64::NAN, 100.0, 1, 1),
+            None,
+            "non-finite"
+        );
     }
 }

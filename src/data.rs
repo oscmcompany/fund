@@ -11,6 +11,7 @@ pub mod calendar;
 pub mod details;
 pub mod export;
 pub mod purge;
+pub mod quotes;
 pub mod splits;
 pub mod truncate;
 pub mod universe;
