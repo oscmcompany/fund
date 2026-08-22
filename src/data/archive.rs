@@ -2,7 +2,7 @@
 //!
 //! One partition per session and cadence under `data/equity/bars/interval=/year=/month=/day=/`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -508,6 +508,7 @@ const INTRADAY_CONCURRENCY: usize = 8;
 /// partition written while one name's fetch failed, or before that name cleared the universe
 /// screen, is indistinguishable from a complete one. So repairing a symbol has to ignore the set
 /// difference that repairing a session relies on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntradayScope {
     /// Every name the daily archive screens in, for the sessions the archive has no partition for.
     MissingSessions,
@@ -701,6 +702,7 @@ async fn archive_intraday_chunk(
         );
     }
 
+    let mut writable = Vec::new();
     for (session, bars_for_session) in by_session {
         // A bar dated outside the chunk is a vendor answering beyond the range asked for. Writing it
         // would put rows in a partition this pass never claimed and never verified.
@@ -709,18 +711,67 @@ async fn archive_intraday_chunk(
         if !universe.described.contains(&session) {
             continue;
         }
-        let frame = bars::bars_to_dataframe(&bars_for_session)?;
-        let rows = frame.height();
-        match write_partition(s3_client, bucket, interval, session, frame).await {
-            Ok(()) => {
+        writable.push((session, bars::bars_to_dataframe(&bars_for_session)?));
+    }
+
+    write_partitions(s3_client, bucket, interval, writable, summary).await
+}
+
+/// Partitions written at once.
+///
+/// Concurrency is safe by construction rather than by scheduling: each write is a compare-and-swap
+/// on the object's ETag, so a racing pass is rejected with a `412` and retried instead of being
+/// silently clobbered. Bounded because the frames are held in memory until their write lands.
+const INTRADAY_WRITE_CONCURRENCY: usize = 8;
+
+/// Writes one partition per session, several at a time, folding the outcomes into `summary`.
+///
+/// Split out from the chunk because a repair pass over a full window is dominated by this loop:
+/// #1100 measured roughly twenty-five minutes for one ticker over 1,254 sessions, essentially all of
+/// it a sequential read-merge-write per partition.
+async fn write_partitions(
+    s3_client: &S3Client,
+    bucket: &str,
+    interval: BarInterval,
+    partitions: Vec<(SessionDate, DataFrame)>,
+    summary: &mut ArchiveSummary,
+) -> Result<(), ArchiveError> {
+    let mut queued = partitions.into_iter();
+    let mut writes = tokio::task::JoinSet::new();
+
+    loop {
+        while writes.len() < INTRADAY_WRITE_CONCURRENCY {
+            let Some((session, frame)) = queued.next() else {
+                break;
+            };
+            let client = s3_client.clone();
+            let bucket = bucket.to_string();
+            let rows = frame.height();
+            writes.spawn(async move {
+                let written = write_partition(&client, &bucket, interval, session, frame).await;
+                (session, rows, written)
+            });
+        }
+        let Some(finished) = writes.join_next().await else {
+            break;
+        };
+        match finished {
+            Ok((_, rows, Ok(()))) => {
                 summary.sessions_written += 1;
                 summary.bars_written += rows;
             }
-            Err(ArchiveError::Contended { key, attempts }) => {
+            Ok((session, _, Err(ArchiveError::Contended { key, attempts }))) => {
                 warn!(key, attempts, %session, "Partition contended; the next pass will retry it");
                 summary.sessions_failed.push(session);
             }
-            Err(error) => return Err(error),
+            Ok((_, _, Err(error))) => return Err(error),
+            Err(error) => {
+                return Err(ArchiveError::Write {
+                    bucket: bucket.to_string(),
+                    key: bar_archive_prefix(interval),
+                    message: format!("a partition write task did not complete: {error}"),
+                })
+            }
         }
     }
     Ok(())
@@ -798,6 +849,184 @@ fn screen_partition(
         .flatten()
         .filter_map(Ticker::new)
         .collect())
+}
+
+/// Sessions scanned at once.
+///
+/// Two reads a session against S3, and the scan is read-only, so this bounds our own concurrency
+/// rather than protecting anything. A full archive sweep is ~2,500 reads and sequential it is
+/// twenty minutes of latency for no work.
+const SCAN_CONCURRENCY: usize = 16;
+
+/// Which names each intraday partition lacks against the daily universe for its own session.
+///
+/// The difference [`intraday_sessions_to_request`] cannot express: a partition written while one
+/// symbol's fetch failed is present, non-empty, and short a name. See
+/// `session_gap_scan_cannot_see_a_symbol` for the incident that motivated it.
+///
+/// `floor` is a parameter rather than the archive's own pin because this reads and never writes, so
+/// it cannot leave an inconsistent partition behind. Scanning at a floor *wider* than the one the
+/// archive was ingested at reports names that were never fetched, which is a backfill list rather
+/// than a fault — that is how the archive gets widened after a screen change.
+pub async fn scan_intraday_symbols(
+    s3_client: &S3Client,
+    bucket: &str,
+    interval: BarInterval,
+    window_start: SessionDate,
+    window_end: SessionDate,
+    floor: LiquidityFloor,
+) -> Result<SymbolScan, ArchiveError> {
+    let sessions = expected_sessions(window_start, window_end);
+    info!(
+        %window_start,
+        %window_end,
+        interval = %interval,
+        sessions = sessions.len(),
+        "Scanning intraday partitions for symbol-level gaps"
+    );
+
+    let mut queued = sessions.into_iter();
+    let mut scans = tokio::task::JoinSet::new();
+    let mut coverage = BTreeMap::new();
+
+    loop {
+        while scans.len() < SCAN_CONCURRENCY {
+            let Some(session) = queued.next() else { break };
+            let client = s3_client.clone();
+            let bucket = bucket.to_string();
+            scans.spawn(async move {
+                let coverage = session_coverage(&client, &bucket, interval, session, floor).await;
+                (session, coverage)
+            });
+        }
+        let Some(finished) = scans.join_next().await else {
+            break;
+        };
+        match finished {
+            Ok((session, result)) => {
+                coverage.insert(session, result?);
+            }
+            Err(error) => {
+                return Err(ArchiveError::Read {
+                    bucket: bucket.to_string(),
+                    key: bar_archive_prefix(interval),
+                    message: format!("a scan task did not complete: {error}"),
+                })
+            }
+        }
+    }
+
+    Ok(SymbolScan { coverage })
+}
+
+/// One session's coverage: read the daily partition, screen it, and difference the intraday one.
+async fn session_coverage(
+    s3_client: &S3Client,
+    bucket: &str,
+    interval: BarInterval,
+    session: SessionDate,
+    floor: LiquidityFloor,
+) -> Result<SessionCoverage, ArchiveError> {
+    let daily_key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
+    let Some(daily) = read_partition(s3_client, bucket, &daily_key).await? else {
+        return Ok(SessionCoverage::Undescribed);
+    };
+    let expected = screen_partition(daily, floor)?;
+
+    let intraday_key = date_partitioned_key(&bar_archive_prefix(interval), session.date());
+    let Some(intraday) = read_partition(s3_client, bucket, &intraday_key).await? else {
+        return Ok(SessionCoverage::Absent);
+    };
+    let present = partition_tickers(&intraday)?;
+
+    let missing: BTreeSet<Ticker> = expected.difference(&present).cloned().collect();
+    Ok(if missing.is_empty() {
+        SessionCoverage::Complete
+    } else {
+        SessionCoverage::Partial(missing)
+    })
+}
+
+/// The distinct tickers a partition holds, unscreened.
+///
+/// The record of what was fetched, which is what a coverage scan compares a screen against.
+fn partition_tickers(frame: &DataFrame) -> Result<BTreeSet<Ticker>, ArchiveError> {
+    let tickers = frame.column("ticker")?.str()?;
+    Ok(tickers
+        .into_iter()
+        .flatten()
+        .filter_map(Ticker::new)
+        .collect())
+}
+
+/// Whether one session's intraday partition holds every name the daily archive screens in.
+///
+/// Four states rather than a boolean, because the repairs differ and only the first two are visible
+/// to a scan that works by set difference over sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCoverage {
+    /// The daily archive has no partition for this session, so completeness is unanswerable.
+    Undescribed,
+    /// No intraday partition at all — what [`intraday_sessions_to_request`] already finds.
+    Absent,
+    /// Every screened name is present.
+    Complete,
+    /// A partition exists and is short these names, which is the hole nothing downstream can see.
+    Partial(BTreeSet<Ticker>),
+}
+
+/// How many sessions fell into each coverage state.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScanCounts {
+    pub undescribed: usize,
+    pub absent: usize,
+    pub complete: usize,
+    pub partial: usize,
+}
+
+/// Per-session coverage across a window, and the symbols a repair pass should be given.
+#[derive(Debug, Default)]
+pub struct SymbolScan {
+    coverage: BTreeMap<SessionDate, SessionCoverage>,
+}
+
+impl SymbolScan {
+    pub fn coverage(&self) -> &BTreeMap<SessionDate, SessionCoverage> {
+        &self.coverage
+    }
+
+    /// Every name missing from at least one partition, which is what [`IntradayScope::Symbols`]
+    /// takes.
+    ///
+    /// A union rather than a per-session list because the repair requests its symbols across the
+    /// whole window anyway — a name missing from one session costs nothing extra to ask for on the
+    /// others, and the merge leaves what is already there untouched.
+    pub fn missing_symbols(&self) -> BTreeSet<Ticker> {
+        self.coverage
+            .values()
+            .filter_map(|coverage| match coverage {
+                SessionCoverage::Partial(missing) => Some(missing),
+                SessionCoverage::Undescribed
+                | SessionCoverage::Absent
+                | SessionCoverage::Complete => None,
+            })
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    pub fn counts(&self) -> ScanCounts {
+        let mut counts = ScanCounts::default();
+        for coverage in self.coverage.values() {
+            match coverage {
+                SessionCoverage::Undescribed => counts.undescribed += 1,
+                SessionCoverage::Absent => counts.absent += 1,
+                SessionCoverage::Complete => counts.complete += 1,
+                SessionCoverage::Partial(_) => counts.partial += 1,
+            }
+        }
+        counts
+    }
 }
 
 /// The names to fetch, and the sessions the daily archive could actually describe.
@@ -1527,6 +1756,125 @@ mod tests {
             screened,
             BTreeSet::from([Ticker::new("CBOE").unwrap()]),
             "OBDC turns over $49.2M, just under the floor; SNDL clears $60M and fails on price"
+        );
+    }
+
+    fn scan_of(entries: &[(SessionDate, SessionCoverage)]) -> SymbolScan {
+        SymbolScan {
+            coverage: entries.iter().cloned().collect(),
+        }
+    }
+
+    fn tickers(names: &[&str]) -> BTreeSet<Ticker> {
+        names
+            .iter()
+            .map(|name| Ticker::new(name).expect("a valid test ticker"))
+            .collect()
+    }
+
+    /// The whole point of the task: a partition that exists and is short two names reads as
+    /// `Partial`, where the session-level scan sees only that a partition is there.
+    #[test]
+    fn test_a_partition_short_two_names_is_partial_not_complete() {
+        let expected = tickers(&["AAPL", "CBOE", "MSFT", "NVDA"]);
+        let present = tickers(&["AAPL", "MSFT"]);
+
+        let missing: BTreeSet<Ticker> = expected.difference(&present).cloned().collect();
+
+        assert_eq!(missing, tickers(&["CBOE", "NVDA"]));
+    }
+
+    /// An extra name is not a gap. The archive over-fetches by unioning the screened universe
+    /// across a chunk, so every partition holds names its own session did not screen in — treating
+    /// that as a difference in either direction would report the whole archive as broken.
+    #[test]
+    fn test_a_partition_holding_more_than_the_screen_expects_is_complete() {
+        let coverage = SessionCoverage::Complete;
+        let expected = tickers(&["AAPL"]);
+        let present = tickers(&["AAPL", "MSFT", "NVDA"]);
+
+        let missing: BTreeSet<Ticker> = expected.difference(&present).cloned().collect();
+
+        assert!(missing.is_empty());
+        assert_eq!(coverage, SessionCoverage::Complete);
+    }
+
+    /// A repair is given the union across the window, and only from partitions that exist. An
+    /// absent session contributes nothing: it is repaired by fetching the session, not the symbol.
+    #[test]
+    fn test_missing_symbols_unions_partials_and_ignores_every_other_state() {
+        let scan = scan_of(&[
+            (session(2026, 8, 17), SessionCoverage::Undescribed),
+            (session(2026, 8, 18), SessionCoverage::Absent),
+            (session(2026, 8, 19), SessionCoverage::Complete),
+            (
+                session(2026, 8, 20),
+                SessionCoverage::Partial(tickers(&["CBOE", "NVDA"])),
+            ),
+            (
+                session(2026, 8, 21),
+                SessionCoverage::Partial(tickers(&["NVDA", "TW"])),
+            ),
+        ]);
+
+        assert_eq!(scan.missing_symbols(), tickers(&["CBOE", "NVDA", "TW"]));
+        assert_eq!(
+            scan.counts(),
+            ScanCounts {
+                undescribed: 1,
+                absent: 1,
+                complete: 1,
+                partial: 2,
+            }
+        );
+    }
+
+    /// A clean archive asks for no repair at all, so the pass it would drive is skipped rather than
+    /// requesting every session in the window for an empty symbol set.
+    #[test]
+    fn test_a_clean_scan_names_no_symbols() {
+        let scan = scan_of(&[
+            (session(2026, 8, 20), SessionCoverage::Complete),
+            (session(2026, 8, 21), SessionCoverage::Complete),
+        ]);
+
+        assert!(scan.missing_symbols().is_empty());
+        assert_eq!(scan.counts().complete, 2);
+    }
+
+    /// `Absent` and `Partial` must stay distinguishable: the first is a session the existing scan
+    /// already repairs, the second is one it reports as complete forever.
+    #[test]
+    fn test_an_absent_partition_is_not_an_empty_partial() {
+        let scan = scan_of(&[
+            (session(2026, 8, 20), SessionCoverage::Absent),
+            (
+                session(2026, 8, 21),
+                SessionCoverage::Partial(tickers(&["CBOE"])),
+            ),
+        ]);
+
+        let counts = scan.counts();
+        assert_eq!(counts.absent, 1);
+        assert_eq!(counts.partial, 1);
+        assert_eq!(scan.missing_symbols(), tickers(&["CBOE"]));
+    }
+
+    #[test]
+    fn test_partition_tickers_reads_distinct_names_without_screening_them() {
+        let partition = df![
+            "ticker" => ["CBOE", "CBOE", "OBDC", "SNDL"],
+            "close_price" => [290.0_f64, 291.0, 11.3, 1.50],
+            "volume" => [900_000_i64, 800_000, 4_350_000, 40_000_000],
+        ]
+        .unwrap();
+
+        let held = partition_tickers(&partition).unwrap();
+
+        assert_eq!(
+            held,
+            tickers(&["CBOE", "OBDC", "SNDL"]),
+            "the screen belongs to the daily side of the comparison, not this one"
         );
     }
 

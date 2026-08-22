@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
-use fund::common::types::{BarInterval, SessionDate, Ticker};
+use fund::common::types::{BarInterval, LiquidityFloor, SessionDate, Ticker};
 use fund::data::archive::{self, IntradayScope};
 
 const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [SYMBOLS]]\n\
@@ -17,7 +17,10 @@ const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [
                      CADENCE is five_minute (default) or one_minute.\n\
                      SYMBOLS is a comma-separated list, and naming it requires naming CADENCE too.\n\
                      Supplying it fetches only those names and requests every session in the\n\
-                     window rather than only the absent ones.";
+                     window rather than only the absent ones.\n\
+                     SYMBOLS may instead be one of two words:\n\
+                       scan    report which names each partition lacks, and write nothing\n\
+                       repair  scan, then fetch the names the scan reported";
 
 /// What the archive is filled with unless told otherwise.
 ///
@@ -25,11 +28,25 @@ const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [
 /// five: 95.8% of names clear 99% of regular-session buckets at five, against 33.2% at one.
 const DEFAULT_CADENCE: BarInterval = BarInterval::FiveMinute;
 
+/// What the run does, which the `SYMBOLS` argument selects.
+///
+/// `Scan` writes nothing, so it is the safe way to size a repair before one rewrites a partition
+/// per session across the window.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// Fetch, per the scope: the absent sessions, or an explicit set of names across all of them.
+    Seed(IntradayScope),
+    /// Report per-session coverage and stop.
+    Scan,
+    /// Report per-session coverage, then fetch whatever names it reported missing.
+    Repair,
+}
+
 struct Parameters {
     start: SessionDate,
     end: SessionDate,
     interval: BarInterval,
-    scope: IntradayScope,
+    mode: Mode,
 }
 
 impl Parameters {
@@ -66,16 +83,20 @@ impl Parameters {
             }
         };
 
-        let scope = match symbols {
-            None => IntradayScope::MissingSessions,
-            Some(raw) => IntradayScope::Symbols(parse_symbols(raw)?),
+        // The two words are checked before the symbol parser, which would otherwise reject them as
+        // unusable tickers -- both are valid ticker shapes, so the order is what separates them.
+        let mode = match symbols.map(String::as_str) {
+            None => Mode::Seed(IntradayScope::MissingSessions),
+            Some("scan") => Mode::Scan,
+            Some("repair") => Mode::Repair,
+            Some(raw) => Mode::Seed(IntradayScope::Symbols(parse_symbols(raw)?)),
         };
 
         Ok(Self {
             start,
             end,
             interval,
-            scope,
+            mode,
         })
     }
 }
@@ -156,10 +177,35 @@ async fn run(
 ) -> Result<archive::ArchiveSummary, Box<dyn std::error::Error>> {
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
-    let massive = MassiveClient::from_env()?;
     let s3_client = fund::common::aws::s3_client().await;
 
-    let symbols = match &parameters.scope {
+    let scope = match &parameters.mode {
+        Mode::Seed(scope) => scope.clone(),
+        Mode::Scan | Mode::Repair => {
+            let scan = archive::scan_intraday_symbols(
+                &s3_client,
+                &bucket,
+                parameters.interval,
+                parameters.start,
+                parameters.end,
+                LiquidityFloor::CURRENT,
+            )
+            .await?;
+            report(&scan);
+            if parameters.mode == Mode::Scan {
+                return Ok(archive::ArchiveSummary::default());
+            }
+            let missing = scan.missing_symbols();
+            if missing.is_empty() {
+                println!("Nothing to repair.");
+                return Ok(archive::ArchiveSummary::default());
+            }
+            IntradayScope::Symbols(missing)
+        }
+    };
+
+    let massive = MassiveClient::from_env()?;
+    let symbols = match &scope {
         IntradayScope::MissingSessions => "the screened universe".to_string(),
         IntradayScope::Symbols(symbols) => symbols
             .iter()
@@ -183,9 +229,46 @@ async fn run(
         parameters.interval,
         parameters.start,
         parameters.end,
-        &parameters.scope,
+        &scope,
     )
     .await?)
+}
+
+/// Prints the scan: the counts, then every session that is short a name.
+///
+/// Per-session as well as the union, because the two answer different questions — the union is what
+/// the repair takes, while one session short fifty names and fifty sessions short one are the same
+/// union and very different faults.
+fn report(scan: &archive::SymbolScan) {
+    let counts = scan.counts();
+    println!(
+        "scanned {} sessions: {} complete, {} partial, {} absent, {} undescribed",
+        counts.complete + counts.partial + counts.absent + counts.undescribed,
+        counts.complete,
+        counts.partial,
+        counts.absent,
+        counts.undescribed
+    );
+
+    for (session, coverage) in scan.coverage() {
+        match coverage {
+            archive::SessionCoverage::Partial(missing) => {
+                let names: Vec<&str> = missing.iter().map(Ticker::as_str).collect();
+                println!("  {session}: short {} — {}", names.len(), names.join(","));
+            }
+            archive::SessionCoverage::Absent => println!("  {session}: no partition"),
+            archive::SessionCoverage::Undescribed => {
+                println!("  {session}: no daily partition to screen against")
+            }
+            archive::SessionCoverage::Complete => {}
+        }
+    }
+
+    let missing = scan.missing_symbols();
+    println!(
+        "{} distinct names missing from at least one session",
+        missing.len()
+    );
 }
 
 #[cfg(test)]
@@ -246,11 +329,60 @@ mod tests {
     #[test]
     fn test_omitting_symbols_scans_for_missing_sessions() {
         let parameters = Parameters::parse(&arguments(&["2026-08-01", "2026-08-20"])).unwrap();
-        assert!(matches!(parameters.scope, IntradayScope::MissingSessions));
+        assert!(matches!(
+            parameters.mode,
+            Mode::Seed(IntradayScope::MissingSessions)
+        ));
 
         let parameters =
             Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "five_minute"])).unwrap();
-        assert!(matches!(parameters.scope, IntradayScope::MissingSessions));
+        assert!(matches!(
+            parameters.mode,
+            Mode::Seed(IntradayScope::MissingSessions)
+        ));
+    }
+
+    /// Both words are valid ticker shapes, so only the order of the match separates them from a
+    /// one-name repair list. A `scan` parsed as a ticker would fetch a symbol that does not exist
+    /// and report a clean run.
+    #[test]
+    fn test_the_two_mode_words_are_modes_and_not_tickers() {
+        let scan = Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "scan",
+        ]))
+        .unwrap();
+        assert_eq!(scan.mode, Mode::Scan);
+
+        let repair = Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "repair",
+        ]))
+        .unwrap();
+        assert_eq!(repair.mode, Mode::Repair);
+    }
+
+    /// The words are exact, so a name that merely contains one is still a ticker. `SCAN` is a
+    /// plausible symbol and must not silently become a mode.
+    #[test]
+    fn test_a_ticker_resembling_a_mode_word_is_still_a_ticker() {
+        let parameters = Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "SCAN",
+        ]))
+        .unwrap();
+
+        let Mode::Seed(IntradayScope::Symbols(symbols)) = parameters.mode else {
+            panic!("an uppercase name must parse as a symbol list");
+        };
+        let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
+        assert_eq!(named, vec!["SCAN"]);
     }
 
     #[test]
@@ -263,7 +395,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let IntradayScope::Symbols(symbols) = parameters.scope else {
+        let Mode::Seed(IntradayScope::Symbols(symbols)) = parameters.mode else {
             panic!("a symbol list must produce a symbol scope");
         };
         let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
