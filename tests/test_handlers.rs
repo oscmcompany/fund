@@ -15,6 +15,7 @@ use fund::common::alpaca::{
 };
 use fund::common::journal::Journal;
 use fund::common::types::CloseReason;
+use fund::common::types::LiquidityFloor;
 use fund::common::types::{BarInterval, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
@@ -165,9 +166,13 @@ fn universe_of(tickers: &[&str]) -> Universe {
     let assets = TradableAssets::from_sets(symbols.clone(), symbols);
     let liquidity: Vec<LiquidityRow> = tickers
         .iter()
-        .map(|raw| LiquidityRow::new(ticker(raw), 100.0, 5_000_000.0))
+        .map(|raw| LiquidityRow::new(ticker(raw), 100.0, 500_000_000.0))
         .collect();
-    Universe::build(&assets, &liquidity)
+    Universe::build(
+        &assets,
+        &liquidity,
+        LiquidityFloor::new(10.0, 50_000_000.0).expect("test floor must be valid"),
+    )
 }
 
 /// The whole entry half, end to end: history from the database, prices and orders from Alpaca, the

@@ -8,6 +8,7 @@ use std::path::Path;
 
 use polars::prelude::*;
 
+use crate::common::types::LiquidityFloor;
 use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{
     apply_scaling, clean_data, demean_target, encode_categoricals, engineer_features,
@@ -140,8 +141,7 @@ fn build_mapping(data: &DataFrame, column: &str) -> Result<CategoryMapping, Tide
 /// cleaning.
 pub fn filter_training_bars(
     data: DataFrame,
-    minimum_close_price: f64,
-    minimum_volume: f64,
+    floor: LiquidityFloor,
 ) -> Result<DataFrame, TideError> {
     let close_prices = data.column("close_price")?.cast(&DataType::Float64)?;
     let close_prices = close_prices.f64()?;
@@ -154,8 +154,9 @@ pub fn filter_training_bars(
         .zip(volumes)
         .zip(tickers)
         .map(|((close_price, volume), ticker)| {
-            close_price.is_some_and(|value| value >= minimum_close_price)
-                && volume.is_some_and(|value| value >= minimum_volume)
+            close_price
+                .zip(volume)
+                .is_some_and(|(price, shares)| floor.admits(price, price * shares))
                 && ticker
                     .is_some_and(|value| !value.chars().any(|character| character.is_lowercase()))
         })
@@ -235,6 +236,13 @@ pub fn write_artifact_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pinned to literals rather than `LiquidityFloor::CURRENT`, so these tests fail if the screen
+    /// changes rather than moving with it.
+    fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> LiquidityFloor {
+        LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
+            .expect("test floor must be valid")
+    }
 
     /// The fraction the trainer runs with, so the tests exercise the split production uses.
     fn training_fraction() -> TrainingFraction {
@@ -436,11 +444,11 @@ mod tests {
             Column::new("ticker".into(), vec!["AAA", "AAA", "BBB"]),
             Column::new("timestamp".into(), vec![0_i64, 86_400_000, 0]),
             Column::new("close_price".into(), vec![0.5_f64, 1.0, 250.0]),
-            Column::new("volume".into(), vec![100_000.0_f64, 100_000.0, 50_000.0]),
+            Column::new("volume".into(), vec![100_000.0_f64, 100_000.0, 200.0]),
         ])
         .unwrap();
 
-        let filtered = filter_training_bars(data, 1.0, 100_000.0).unwrap();
+        let filtered = filter_training_bars(data, floor(1.0, 100_000.0)).unwrap();
         assert_eq!(filtered.height(), 1);
         let tickers: Vec<&str> = filtered
             .column("ticker")
@@ -460,6 +468,29 @@ mod tests {
         assert_eq!(close, vec![1.0]);
     }
 
+    /// The second threshold is notional, not share count. HIGH trades 200 shares at $250 and is
+    /// admitted; LOW trades 4,000 at $12 and is not, though it moves twenty times the shares.
+    #[test]
+    fn test_filter_training_bars_screens_on_dollars_not_shares() {
+        let data = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["HIGH", "LOW"]),
+            Column::new("timestamp".into(), vec![0_i64, 0]),
+            Column::new("close_price".into(), vec![250.0_f64, 12.0]),
+            Column::new("volume".into(), vec![200.0_f64, 4_000.0]),
+        ])
+        .unwrap();
+
+        let filtered = filter_training_bars(data, floor(1.0, 48_001.0)).unwrap();
+        let tickers: Vec<&str> = filtered
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(tickers, vec!["HIGH"]);
+    }
+
     #[test]
     fn test_filter_training_bars_drops_lowercase_tickers() {
         // Tickers containing lowercase letters are distinct instruments that would collide
@@ -475,7 +506,7 @@ mod tests {
         ])
         .unwrap();
 
-        let filtered = filter_training_bars(data, 1.0, 100_000.0).unwrap();
+        let filtered = filter_training_bars(data, floor(1.0, 100_000.0)).unwrap();
         let tickers: Vec<&str> = filtered
             .column("ticker")
             .unwrap()

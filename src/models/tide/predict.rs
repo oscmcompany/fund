@@ -1,7 +1,10 @@
 //! Running the TiDE model: from stored market history to rows in `equity_predictions`.
 //!
-//! Applies the same liquidity thresholds training does, read from [`crate::common::types`] so a
-//! drift cannot train the scaler on dynamics the service never predicts.
+//! The [`crate::common::types::LiquidityFloor`] is passed in and the artifact does not record the
+//! one it was fitted against, so an artifact older than the current floor is served under a screen
+//! it never saw. [`filter_to_trained_tickers`] is what bounds that: it intersects against the
+//! artifact's own vocabulary, so a stale floor narrows the served set rather than handing the
+//! scaler a name it never trained on.
 
 use burn::backend::NdArray;
 use chrono::{DateTime, Utc};
@@ -10,7 +13,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::common::types::{EquityPrediction, SessionDate, Ticker};
+use crate::common::types::{EquityPrediction, LiquidityFloor, SessionDate, Ticker};
 
 use crate::models::tide::artifact::ModelState;
 use crate::models::tide::data::{Data, DatasetKind};
@@ -180,16 +183,16 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
     Ok(names)
 }
 
-/// Drops tickers whose trailing averages fall below the liquidity thresholds.
+/// Drops tickers whose trailing averages fall below `floor`.
 ///
-/// **Both bounds are inclusive**, matching [`crate::models::tide::fit::filter_training_bars`]: an
-/// exclusive test here would train on a ticker and then refuse to predict for it at exactly the
-/// threshold. [`crate::data::universe::LiquidityRow`] screens price on the window's *minimum*, which
-/// is the stricter test, so every name the universe admits still reaches this one.
+/// Screens the *average* close where [`crate::data::universe::LiquidityRow`] screens the window's
+/// minimum, which is the stricter test, so every name the universe admits still reaches this one.
+/// Both bounds are inclusive, as in [`LiquidityFloor::admits`] — polars needs the thresholds as
+/// expressions, so this is one of the two screens that cannot call it and has a boundary test
+/// instead.
 pub fn filter_equity_bars(
     data: DataFrame,
-    minimum_average_close_price: f64,
-    minimum_average_volume: f64,
+    floor: LiquidityFloor,
 ) -> Result<DataFrame, PredictionError> {
     let before_count = data.height();
 
@@ -199,15 +202,14 @@ pub fn filter_equity_bars(
         .group_by([col("ticker")])
         .agg([
             col("close_price").mean().alias("average_close_price"),
-            col("volume")
-                .cast(DataType::Float64)
+            (col("close_price") * col("volume").cast(DataType::Float64))
                 .mean()
-                .alias("average_volume"),
+                .alias("average_dollar_volume"),
         ])
         .filter(
             col("average_close_price")
-                .gt_eq(lit(minimum_average_close_price))
-                .and(col("average_volume").gt_eq(lit(minimum_average_volume))),
+                .gt_eq(lit(floor.minimum_close_price()))
+                .and(col("average_dollar_volume").gt_eq(lit(floor.minimum_dollar_volume()))),
         )
         .select([col("ticker")])
         .collect()
@@ -606,6 +608,13 @@ pub async fn load_predictions_between(
 mod tests {
     use super::*;
 
+    /// Pinned to literals rather than `LiquidityFloor::CURRENT`, so these tests fail if the screen
+    /// changes rather than moving with it.
+    fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> LiquidityFloor {
+        LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
+            .expect("test floor must be valid")
+    }
+
     /// A scaler over `daily_return` alone, which is all `unscale_and_sort_quantiles` reads.
     ///
     /// Built through the validated constructor, so a future tightening of the `Scaler` contract
@@ -634,10 +643,12 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, 10.0, 1_000_000.0).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
         assert_eq!(result.height(), 4);
     }
 
+    /// The price floor is the only thing dropping PENNY here: it turns over $140M a session, well
+    /// clear of the notional threshold, and still fails on a $5.50 average close.
     #[test]
     fn test_filter_equity_bars_below_close_threshold() {
         let data = DataFrame::new(vec![
@@ -646,12 +657,12 @@ mod tests {
             Column::new("close_price".into(), vec![5.0, 6.0, 200.0, 210.0]),
             Column::new(
                 "volume".into(),
-                vec![2_000_000i64, 3_000_000, 5_000_000, 4_000_000],
+                vec![20_000_000i64, 30_000_000, 5_000_000, 4_000_000],
             ),
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, 10.0, 1_000_000.0).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
         assert_eq!(result.height(), 2);
         let tickers: Vec<&str> = result
             .column("ticker")
@@ -663,17 +674,23 @@ mod tests {
         assert!(tickers.iter().all(|ticker| *ticker == "GOOG"));
     }
 
+    /// LOW moves 3.5 million shares a session against GOOG's 4.5 million and is still the one
+    /// dropped, because at $12 that is $42M of notional. A share-count screen kept it and dropped
+    /// names like GOOG that cost more.
     #[test]
-    fn test_filter_equity_bars_below_volume_threshold() {
+    fn test_filter_equity_bars_below_dollar_volume_threshold() {
         let data = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["LOW", "LOW", "GOOG", "GOOG"]),
             Column::new("timestamp".into(), vec![1000i64, 2000, 1000, 2000]),
-            Column::new("close_price".into(), vec![50.0, 60.0, 200.0, 210.0]),
-            Column::new("volume".into(), vec![100i64, 200, 5_000_000, 4_000_000]),
+            Column::new("close_price".into(), vec![12.0, 12.0, 200.0, 210.0]),
+            Column::new(
+                "volume".into(),
+                vec![3_000_000i64, 4_000_000, 5_000_000, 4_000_000],
+            ),
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, 10.0, 1_000_000.0).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
         assert_eq!(result.height(), 2);
         let tickers: Vec<&str> = result
             .column("ticker")
@@ -691,25 +708,17 @@ mod tests {
     /// exactly $10.00 was admitted to the universe, trained on, and dropped at inference.
     #[test]
     fn test_filter_equity_bars_keeps_a_ticker_exactly_at_both_thresholds() {
-        use crate::common::types::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-
         // Two bars either side of each threshold, so the averages land on it exactly rather than
-        // near it: (9 + 11)/2 = 10.00 and (500k + 1.5M)/2 = 1,000,000.
+        // near it: (8 + 12)/2 = 10.00 and ($40M + $60M)/2 = $50,000,000.
         let data = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["EDGE", "EDGE"]),
             Column::new("timestamp".into(), vec![1000i64, 2000]),
-            Column::new(
-                "close_price".into(),
-                vec![MINIMUM_CLOSE_PRICE - 1.0, MINIMUM_CLOSE_PRICE + 1.0],
-            ),
-            Column::new(
-                "volume".into(),
-                vec![(MINIMUM_VOLUME / 2.0) as i64, (MINIMUM_VOLUME * 1.5) as i64],
-            ),
+            Column::new("close_price".into(), vec![8.0, 12.0]),
+            Column::new("volume".into(), vec![5_000_000i64, 5_000_000]),
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
 
         assert_eq!(
             result.height(),
@@ -728,7 +737,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, 10.0, 1_000_000.0).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
         assert_eq!(result.height(), 0);
     }
 
@@ -1203,7 +1212,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, 10.0, 1_000_000.0).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
         assert_eq!(result.height(), 0);
     }
 
@@ -1217,7 +1226,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, 10.0, 1_000_000.0).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
         assert_eq!(result.height(), 1);
     }
 

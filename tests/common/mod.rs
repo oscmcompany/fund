@@ -275,16 +275,31 @@ pub async fn seed_correlated_bars(pool: &PgPool, tickers: &[&str], sessions: i64
 
 /// Inserts one daily bar for a ticker at a specific date, for gap and alignment tests.
 pub async fn seed_bar(pool: &PgPool, ticker: &str, date: SessionDate, close: f64) {
+    seed_bar_with_volume(pool, ticker, date, close, 5_000_000).await;
+}
+
+/// [`seed_bar`] with the share count spelled out, for the liquidity aggregates that read it.
+pub async fn seed_bar_with_volume(
+    pool: &PgPool,
+    ticker: &str,
+    date: SessionDate,
+    close: f64,
+    volume: i64,
+) {
     let timestamp = session_close(date);
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
-         VALUES ($1, 'one_day', $2, $3, $3, $3, $3, 5000000) \
-         ON CONFLICT (ticker, bar_interval, timestamp) DO UPDATE SET close_price = EXCLUDED.close_price",
+         VALUES ($1, 'one_day', $2, $3, $3, $3, $3, $4) \
+         ON CONFLICT (ticker, bar_interval, timestamp) \
+         DO UPDATE SET open_price = EXCLUDED.open_price, high_price = EXCLUDED.high_price, \
+                       low_price = EXCLUDED.low_price, close_price = EXCLUDED.close_price, \
+                       volume = EXCLUDED.volume",
     )
     .bind(ticker)
     .bind(timestamp)
     .bind(close)
+    .bind(volume)
     .execute(pool)
     .await
     .expect("Failed to seed an equity bar");

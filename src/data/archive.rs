@@ -15,9 +15,7 @@ use tracing::{info, warn};
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
-use crate::common::types::{
-    BarInterval, EquityBar, SessionDate, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME,
-};
+use crate::common::types::{BarInterval, EquityBar, LiquidityFloor, SessionDate, Ticker};
 use crate::data::{bars, boundaries, splits};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
@@ -728,8 +726,12 @@ async fn archive_intraday_chunk(
     Ok(())
 }
 
-/// The names that traded across `sessions`, read from the daily archive and screened as the model
-/// screens them.
+/// The names that traded across `sessions`, read from the daily archive and screened per session.
+///
+/// **A fetch universe, deliberately wider than any study population.** Screened session by session
+/// rather than on a trailing average, so a name that traded heavily on one day is fetched for the
+/// chunk. That is the safe direction for an archive: an unfetched bar cannot be recovered later,
+/// and every study screens again on its own terms when it reads.
 ///
 /// **Survivorship-free by construction.** The daily partitions are whole-market and were written on
 /// the day, so a name that has since delisted is still present in the sessions it traded. Taking the
@@ -757,24 +759,45 @@ async fn universe_over(
         let IntradayScope::MissingSessions = scope else {
             continue;
         };
-        let screened = frame
-            .lazy()
-            .filter(
-                col("close_price")
-                    .gt_eq(lit(MINIMUM_CLOSE_PRICE))
-                    .and(col("volume").gt_eq(lit(MINIMUM_VOLUME))),
-            )
-            .select([col("ticker")])
-            .collect()?;
-        let tickers = screened.column("ticker")?.str()?;
+        // Pinned rather than threaded up: the archive is one shared object per session, so
+        // widening the floor means backfilling it rather than reconfiguring a caller.
         universe
             .symbols
-            .extend(tickers.into_iter().flatten().filter_map(Ticker::new));
+            .extend(screen_partition(frame, LiquidityFloor::CURRENT)?);
     }
     if let IntradayScope::Symbols(symbols) = scope {
         universe.symbols = symbols.clone();
     }
     Ok(universe)
+}
+
+/// The names in one daily partition that clear the liquidity thresholds.
+///
+/// Notional is the per-row product, not a trailing average, because a partition is one session and
+/// there is no window to average over — the runtime screen in [`crate::data::universe`] is the one
+/// that smooths.
+fn screen_partition(
+    frame: DataFrame,
+    floor: LiquidityFloor,
+) -> Result<BTreeSet<Ticker>, ArchiveError> {
+    let screened = frame
+        .lazy()
+        .filter(
+            col("close_price")
+                .gt_eq(lit(floor.minimum_close_price()))
+                .and(
+                    (col("close_price") * col("volume").cast(DataType::Float64))
+                        .gt_eq(lit(floor.minimum_dollar_volume())),
+                ),
+        )
+        .select([col("ticker")])
+        .collect()?;
+    let tickers = screened.column("ticker")?.str()?;
+    Ok(tickers
+        .into_iter()
+        .flatten()
+        .filter_map(Ticker::new)
+        .collect())
 }
 
 /// The names to fetch, and the sessions the daily archive could actually describe.
@@ -1481,6 +1504,29 @@ mod tests {
         assert_eq!(
             without_data, 1,
             "the unrequested 06-03 must not stand in for the empty 06-02"
+        );
+    }
+
+    /// The intraday repair universe is screened on notional, at the three names' measured figures.
+    /// CBOE moves 900,000 shares and is in it; OBDC moves nearly five times as many and is not. The
+    /// retired share-count floor answered both the other way round, and OBDC is the one the archive
+    /// spent its five-minute fetches on.
+    #[test]
+    fn test_the_partition_screen_counts_dollars_not_shares() {
+        let partition = df![
+            "ticker" => ["CBOE", "OBDC", "SNDL"],
+            "close_price" => [290.0_f64, 11.3, 1.50],
+            "volume" => [900_000_i64, 4_350_000, 40_000_000],
+        ]
+        .unwrap();
+
+        let screened =
+            screen_partition(partition, LiquidityFloor::new(10.0, 50_000_000.0).unwrap()).unwrap();
+
+        assert_eq!(
+            screened,
+            BTreeSet::from([Ticker::new("CBOE").unwrap()]),
+            "OBDC turns over $49.2M, just under the floor; SNDL clears $60M and fails on price"
         );
     }
 

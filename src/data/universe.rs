@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
 use crate::common::journal::{Journal, Observation, UniverseRefreshed};
-use crate::common::types::{BarInterval, SessionDate, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use crate::common::types::{BarInterval, LiquidityFloor, SessionDate, Ticker};
 use crate::data::cache::DailyCache;
 
 /// Trailing window over which liquidity is averaged.
@@ -32,28 +32,29 @@ pub enum UniverseError {
 
 /// One ticker's liquidity over the trailing window.
 ///
-/// Price is summarised by its minimum and volume by its average. A price is a level, so one that
-/// ever fell below the floor disqualifies the name; volume is a flow, where one quiet session says
-/// nothing about tradability.
+/// Price is summarised by its minimum and dollar volume by its average. A price is a level, so one
+/// that ever fell below the floor disqualifies the name; dollar volume is a flow, where one quiet
+/// session says nothing about tradability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiquidityRow {
     ticker: Ticker,
     minimum_close_price: f64,
-    average_volume: f64,
+    average_dollar_volume: f64,
 }
 
 impl LiquidityRow {
-    pub fn new(ticker: Ticker, minimum_close_price: f64, average_volume: f64) -> Self {
+    pub fn new(ticker: Ticker, minimum_close_price: f64, average_dollar_volume: f64) -> Self {
         Self {
             ticker,
             minimum_close_price,
-            average_volume,
+            average_dollar_volume,
         }
     }
 
-    /// Whether this ticker clears both liquidity thresholds.
-    fn is_liquid(&self) -> bool {
-        self.minimum_close_price >= MINIMUM_CLOSE_PRICE && self.average_volume >= MINIMUM_VOLUME
+    /// Whether this ticker clears `floor`, screening price on the window's minimum rather than its
+    /// average, which is the stricter of the two.
+    fn is_liquid(&self, floor: LiquidityFloor) -> bool {
+        floor.admits(self.minimum_close_price, self.average_dollar_volume)
     }
 }
 
@@ -72,15 +73,19 @@ pub struct Universe {
 impl Universe {
     /// Composes the three filters, all of which are necessary.
     ///
-    /// Alpaca must permit it, we must hold bars for it, and it must clear the same liquidity
-    /// thresholds the model trained on — a universe wider than the training population means
-    /// predicting on names the scaler never saw.
-    pub fn build(assets: &TradableAssets, liquidity: &[LiquidityRow]) -> Self {
+    /// Alpaca must permit it, we must hold bars for it, and it must clear `floor` — which has to be
+    /// the floor the model was fitted against, because a universe wider than the training
+    /// population means predicting on names the scaler never saw.
+    pub fn build(
+        assets: &TradableAssets,
+        liquidity: &[LiquidityRow],
+        floor: LiquidityFloor,
+    ) -> Self {
         let mut tickers = Vec::new();
         let mut shortable = HashSet::new();
 
         for row in liquidity {
-            if !row.is_liquid() {
+            if !row.is_liquid(floor) {
                 continue;
             }
             if !assets.is_tradable(&row.ticker) {
@@ -142,11 +147,12 @@ impl Universe {
     }
 }
 
-/// Reads per-ticker minimum close and average volume over the trailing window.
+/// Reads per-ticker minimum close and average dollar volume over the trailing window.
 ///
 /// Read over daily bars specifically: the liquidity thresholds are calibrated on daily dynamics,
-/// and averaging intraday bars would compare a per-minute volume against a per-day threshold and
-/// reject the entire universe.
+/// and averaging intraday bars would compare a per-bar notional against a per-day threshold and
+/// reject the entire universe. The product is taken per session and then averaged, because the
+/// average of a product is not the product of the averages once price and volume move together.
 pub async fn load_liquidity(
     pool: &PgPool,
     as_of: SessionDate,
@@ -156,7 +162,7 @@ pub async fn load_liquidity(
         r#"
         SELECT ticker AS "ticker!",
                MIN(close_price) AS "minimum_close_price!",
-               AVG(volume::double precision) AS "average_volume!"
+               AVG(close_price * volume::double precision) AS "average_dollar_volume!"
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
@@ -172,7 +178,7 @@ pub async fn load_liquidity(
         .into_iter()
         .filter_map(|row| {
             Ticker::new(&row.ticker).map(|ticker| {
-                LiquidityRow::new(ticker, row.minimum_close_price, row.average_volume)
+                LiquidityRow::new(ticker, row.minimum_close_price, row.average_dollar_volume)
             })
         })
         .collect())
@@ -182,14 +188,19 @@ pub async fn load_liquidity(
 ///
 /// Warmed by the pre-open handler and refreshed on demand by anything that finds it cold, so a
 /// restart mid-session repopulates rather than trading an empty universe until the next morning.
-#[derive(Default)]
+/// The floor is held here rather than passed per call, so every rebuild within a process screens
+/// the same way.
 pub struct UniverseCache {
     inner: DailyCache<Universe>,
+    floor: LiquidityFloor,
 }
 
 impl UniverseCache {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(floor: LiquidityFloor) -> Self {
+        Self {
+            inner: DailyCache::default(),
+            floor,
+        }
     }
 
     /// Returns today's universe, rebuilding it if the cache is cold or was filled on an earlier
@@ -217,7 +228,7 @@ impl UniverseCache {
                 || async {
                     let assets = client.fetch_tradable_assets().await?;
                     let liquidity = load_liquidity(pool, today).await?;
-                    let universe = Universe::build(&assets, &liquidity);
+                    let universe = Universe::build(&assets, &liquidity, self.floor);
 
                     info!(
                         alpaca_tradable = assets.tradable_count(),
@@ -244,7 +255,10 @@ impl UniverseCache {
                             Observation::UniverseRefreshed(UniverseRefreshed {
                                 alpaca_tradable: assets.tradable_count(),
                                 alpaca_shortable: assets.shortable_count(),
-                                liquid: liquidity.iter().filter(|row| row.is_liquid()).count(),
+                                liquid: liquidity
+                                    .iter()
+                                    .filter(|row| row.is_liquid(self.floor))
+                                    .count(),
                                 universe_size: universe.len(),
                                 admitted,
                                 removed,
@@ -274,6 +288,12 @@ mod tests {
         Ticker::new(raw).expect("test ticker must be valid")
     }
 
+    /// Pinned to literals rather than `LiquidityFloor::CURRENT`, so these tests fail if the screen
+    /// changes rather than moving with it.
+    fn floor() -> LiquidityFloor {
+        LiquidityFloor::new(10.0, 50_000_000.0).expect("test floor must be valid")
+    }
+
     fn assets() -> TradableAssets {
         TradableAssets::from_sets(
             HashSet::from([
@@ -288,12 +308,12 @@ mod tests {
     }
 
     fn liquid(symbol: &str) -> LiquidityRow {
-        LiquidityRow::new(ticker(symbol), 100.0, 5_000_000.0)
+        LiquidityRow::new(ticker(symbol), 100.0, 500_000_000.0)
     }
 
     #[test]
     fn test_build_keeps_liquid_tradable_tickers() {
-        let universe = Universe::build(&assets(), &[liquid("AAPL"), liquid("MSFT")]);
+        let universe = Universe::build(&assets(), &[liquid("AAPL"), liquid("MSFT")], floor());
         assert_eq!(universe.tickers(), &[ticker("AAPL"), ticker("MSFT")]);
         assert_eq!(universe.len(), 2);
     }
@@ -302,7 +322,7 @@ mod tests {
     /// not enter the universe even though nothing about it is wrong.
     #[test]
     fn test_build_excludes_tickers_without_history() {
-        let universe = Universe::build(&assets(), &[liquid("AAPL")]);
+        let universe = Universe::build(&assets(), &[liquid("AAPL")], floor());
         assert!(!universe.tickers().contains(&ticker("NVDA")));
     }
 
@@ -310,7 +330,7 @@ mod tests {
     /// a delisting produces.
     #[test]
     fn test_build_excludes_tickers_alpaca_will_not_trade() {
-        let universe = Universe::build(&assets(), &[liquid("AAPL"), liquid("GONE")]);
+        let universe = Universe::build(&assets(), &[liquid("AAPL"), liquid("GONE")], floor());
         assert!(!universe.tickers().contains(&ticker("GONE")));
     }
 
@@ -318,28 +338,43 @@ mod tests {
     /// expensive-but-untraded name are each excluded for their own reason.
     #[test]
     fn test_build_applies_both_liquidity_thresholds() {
-        let cheap = LiquidityRow::new(ticker("PENNY"), MINIMUM_CLOSE_PRICE - 0.01, 50_000_000.0);
-        let thin = LiquidityRow::new(ticker("THIN"), 500.0, MINIMUM_VOLUME - 1.0);
+        let cheap = LiquidityRow::new(ticker("PENNY"), 9.99, 900_000_000.0);
+        let thin = LiquidityRow::new(ticker("THIN"), 500.0, 49_999_999.0);
 
-        let universe = Universe::build(&assets(), &[liquid("AAPL"), cheap, thin]);
+        let universe = Universe::build(&assets(), &[liquid("AAPL"), cheap, thin], floor());
 
         assert_eq!(universe.tickers(), &[ticker("AAPL")]);
     }
 
     #[test]
     fn test_thresholds_are_inclusive_at_the_boundary() {
-        let exactly_at_threshold =
-            LiquidityRow::new(ticker("AAPL"), MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME);
-        let universe = Universe::build(&assets(), &[exactly_at_threshold]);
+        let exactly_at_threshold = LiquidityRow::new(ticker("AAPL"), 10.0, 50_000_000.0);
+        let universe = Universe::build(&assets(), &[exactly_at_threshold], floor());
         assert_eq!(universe.len(), 1, "the threshold itself must pass");
+    }
+
+    /// The reason the screen counts dollars. CBOE trades ~1M shares a day at ~$290, which is $290M
+    /// of notional and under the retired one-million-share floor on most sessions; a $12 name at
+    /// four million shares is $48M and was admitted by it. The old screen inverted both.
+    #[test]
+    fn test_dollar_volume_admits_expensive_names_and_drops_cheap_heavy_ones() {
+        let expensive = LiquidityRow::new(ticker("MSFT"), 290.0, 290_000_000.0);
+        let cheap_and_heavy = LiquidityRow::new(ticker("NVDA"), 12.0, 48_000_000.0);
+
+        let universe = Universe::build(&assets(), &[expensive, cheap_and_heavy], floor());
+
+        assert_eq!(universe.tickers(), &[ticker("MSFT")]);
     }
 
     /// The short leg needs both Alpaca flags. A tradable-but-not-shortable name stays in the
     /// universe for the long leg and is excluded from the shortable subset.
     #[test]
     fn test_shortable_is_a_subset_of_tradable() {
-        let universe =
-            Universe::build(&assets(), &[liquid("AAPL"), liquid("MSFT"), liquid("NVDA")]);
+        let universe = Universe::build(
+            &assets(),
+            &[liquid("AAPL"), liquid("MSFT"), liquid("NVDA")],
+            floor(),
+        );
         assert!(universe.is_shortable(&ticker("AAPL")));
         assert!(universe.is_shortable(&ticker("MSFT")));
         assert!(
@@ -352,8 +387,11 @@ mod tests {
 
     #[test]
     fn test_tickers_are_sorted_and_stable() {
-        let universe =
-            Universe::build(&assets(), &[liquid("NVDA"), liquid("AAPL"), liquid("MSFT")]);
+        let universe = Universe::build(
+            &assets(),
+            &[liquid("NVDA"), liquid("AAPL"), liquid("MSFT")],
+            floor(),
+        );
         assert_eq!(
             universe.tickers(),
             &[ticker("AAPL"), ticker("MSFT"), ticker("NVDA")]
@@ -362,15 +400,15 @@ mod tests {
 
     #[test]
     fn test_empty_inputs_produce_an_empty_universe() {
-        assert!(Universe::build(&assets(), &[]).is_empty());
-        assert!(Universe::build(&TradableAssets::default(), &[liquid("AAPL")]).is_empty());
+        assert!(Universe::build(&assets(), &[], floor()).is_empty());
+        assert!(Universe::build(&TradableAssets::default(), &[liquid("AAPL")], floor()).is_empty());
     }
 
     #[tokio::test]
     async fn test_cache_serves_installed_universe_without_fetching() {
-        let cache = UniverseCache::new();
+        let cache = UniverseCache::new(floor());
         let now = "2026-06-10T14:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let universe = Universe::build(&assets(), &[liquid("AAPL")]);
+        let universe = Universe::build(&assets(), &[liquid("AAPL")], floor());
         cache.install(now, universe).await;
 
         // Unreachable client and pool: a cache hit must touch neither.

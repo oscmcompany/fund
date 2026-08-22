@@ -140,7 +140,7 @@ impl ServiceState {
             artifact_prefix,
             model_version,
             calendar_cache: CalendarCache::new(),
-            universe_cache: UniverseCache::new(),
+            universe_cache: UniverseCache::new(crate::common::types::LiquidityFloor::CURRENT),
             close_history_cache: CloseHistoryCache::new(),
             split_table_cache: SplitTableCache::new(),
             boundary_table_cache: BoundaryTableCache::new(),
@@ -513,12 +513,9 @@ async fn run_inference(
 
     let consolidated = predict::consolidate_data(equity_bars, equity_details)
         .map_err(|error| at("consolidate")(error.to_string()))?;
-    let filtered = predict::filter_equity_bars(
-        consolidated,
-        crate::common::types::MINIMUM_CLOSE_PRICE,
-        crate::common::types::MINIMUM_VOLUME,
-    )
-    .map_err(|error| at("filter_bars")(error.to_string()))?;
+    let filtered =
+        predict::filter_equity_bars(consolidated, crate::common::types::LiquidityFloor::CURRENT)
+            .map_err(|error| at("filter_bars")(error.to_string()))?;
     let trained = predict::filter_to_trained_tickers(filtered, model_state)
         .map_err(|error| at("filter_tickers")(error.to_string()))?;
 
