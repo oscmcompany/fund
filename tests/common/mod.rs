@@ -292,7 +292,9 @@ pub async fn seed_bar_with_volume(
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
          VALUES ($1, 'one_day', $2, $3, $3, $3, $3, $4) \
          ON CONFLICT (ticker, bar_interval, timestamp) \
-         DO UPDATE SET close_price = EXCLUDED.close_price, volume = EXCLUDED.volume",
+         DO UPDATE SET open_price = EXCLUDED.open_price, high_price = EXCLUDED.high_price, \
+                       low_price = EXCLUDED.low_price, close_price = EXCLUDED.close_price, \
+                       volume = EXCLUDED.volume",
     )
     .bind(ticker)
     .bind(timestamp)

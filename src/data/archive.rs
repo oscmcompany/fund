@@ -726,8 +726,12 @@ async fn archive_intraday_chunk(
     Ok(())
 }
 
-/// The names that traded across `sessions`, read from the daily archive and screened as the model
-/// screens them.
+/// The names that traded across `sessions`, read from the daily archive and screened per session.
+///
+/// **A fetch universe, deliberately wider than any study population.** Screened session by session
+/// rather than on a trailing average, so a name that traded heavily on one day is fetched for the
+/// chunk. That is the safe direction for an archive: an unfetched bar cannot be recovered later,
+/// and every study screens again on its own terms when it reads.
 ///
 /// **Survivorship-free by construction.** The daily partitions are whole-market and were written on
 /// the day, so a name that has since delisted is still present in the sessions it traded. Taking the
@@ -755,9 +759,8 @@ async fn universe_over(
         let IntradayScope::MissingSessions = scope else {
             continue;
         };
-        // Pinned rather than threaded up to the caller. The intraday archive is one shared object
-        // per session, not a per-study artifact, so two seeds run at different floors would leave a
-        // partition nothing can describe; widening the floor means backfilling, not reconfiguring.
+        // Pinned rather than threaded up: the archive is one shared object per session, so
+        // widening the floor means backfilling it rather than reconfiguring a caller.
         universe
             .symbols
             .extend(screen_partition(frame, LiquidityFloor::CURRENT)?);

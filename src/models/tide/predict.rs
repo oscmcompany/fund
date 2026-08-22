@@ -1,7 +1,10 @@
 //! Running the TiDE model: from stored market history to rows in `equity_predictions`.
 //!
-//! Screens against the same [`crate::common::types::LiquidityFloor`] the fit was given, so a drift
-//! cannot train the scaler on dynamics the service never predicts.
+//! The [`crate::common::types::LiquidityFloor`] is passed in and the artifact does not record the
+//! one it was fitted against, so an artifact older than the current floor is served under a screen
+//! it never saw. [`filter_to_trained_tickers`] is what bounds that: it intersects against the
+//! artifact's own vocabulary, so a stale floor narrows the served set rather than handing the
+//! scaler a name it never trained on.
 
 use burn::backend::NdArray;
 use chrono::{DateTime, Utc};
