@@ -9,7 +9,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::common::aws::date_partitioned_key;
-use crate::common::types::{BarInterval, SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use crate::common::types::{BarInterval, LiquidityFloor, SessionDate};
 use crate::data::{adjust, archive, bars, details, truncate};
 use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
@@ -223,7 +223,7 @@ async fn read_window(
 
     let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
     let consolidated = consolidate_data(equity_bars, equity_details)?;
-    let filtered = filter_training_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
+    let filtered = filter_training_bars(consolidated, LiquidityFloor::CURRENT)?;
 
     let fingerprint = fingerprint_of(
         &filtered,

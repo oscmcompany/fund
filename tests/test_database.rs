@@ -416,9 +416,41 @@ async fn test_liquidity_reports_the_window_low_not_its_average() {
         vec![universe::LiquidityRow::new(
             ticker("AAAA"),
             1.38,
-            5_000_000.0
+            53_380_000.0
         )],
         "the averaged close would have reported 10.676 and passed the floor"
+    );
+}
+
+/// Dollar volume is the per-session product averaged, never the averaged price times the averaged
+/// share count. The two coincide whenever volume is flat and diverge exactly when it is not — a
+/// name whose heavy sessions are its cheap ones is the case the screen has to get right.
+#[tokio::test]
+#[serial]
+async fn test_liquidity_averages_the_session_product_not_the_product_of_averages() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    for (offset, close, volume) in [(-1, 100.0, 1_000_000), (0, 10.0, 100_000_000)] {
+        common::seed_bar_with_volume(
+            &pool,
+            "AAAA",
+            today.plus_calendar_days(offset),
+            close,
+            volume,
+        )
+        .await;
+    }
+
+    let liquidity = universe::load_liquidity(&pool, today).await.unwrap();
+
+    assert_eq!(
+        liquidity,
+        vec![universe::LiquidityRow::new(
+            ticker("AAAA"),
+            10.0,
+            550_000_000.0
+        )],
+        "the product of the averages would have reported 2,777,500,000"
     );
 }
 

@@ -8,18 +8,55 @@ use rust_decimal::Decimal;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-/// Liquidity thresholds defining the modeled and served equity universe.
+/// The boundary of the modeled and served equity universe: the price and daily notional a name
+/// must clear.
 ///
-/// Training applies them per row and inference per ticker average; both sides must use the same
-/// values, or the scaler and model learn dynamics the service never predicts.
-///
-/// The *comparison* has to match too, and matching values are not enough on their own. All three
-/// readers — `filter_training_bars`, `filter_equity_bars`, and `LiquidityRow::is_liquid` — admit the
-/// threshold itself, so a ticker averaging exactly $10.00 is in the universe, in the training set,
-/// and predicted for. Each has a boundary test, because this is the kind of skew that costs one
-/// character and shows up only at the edge of the population.
-pub const MINIMUM_CLOSE_PRICE: f64 = 10.0;
-pub const MINIMUM_VOLUME: f64 = 1_000_000.0;
+/// One value rather than two arguments, because the pair is meaningless apart and every screen
+/// compares against both. Volume is counted in dollars traded, never in shares: a share count is a
+/// liquidity measure divided by price, so it excludes expensive names that trade freely.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiquidityFloor {
+    minimum_close_price: f64,
+    minimum_dollar_volume: f64,
+}
+
+impl LiquidityFloor {
+    /// The floor every path uses until a caller declares its own.
+    ///
+    /// Both figures are conventions rather than measurements, and the notional one drifts with the
+    /// market it screens: it admitted 20.6% of priced names in 2022 and 23.0% in 2026, as
+    /// market-wide dollar volume nearly doubled.
+    pub const CURRENT: Self = Self {
+        minimum_close_price: 10.0,
+        minimum_dollar_volume: 50_000_000.0,
+    };
+
+    /// Returns `None` unless both bounds are finite and non-negative; zero admits everything.
+    pub fn new(minimum_close_price: f64, minimum_dollar_volume: f64) -> Option<Self> {
+        let usable = |bound: f64| bound.is_finite() && bound >= 0.0;
+        (usable(minimum_close_price) && usable(minimum_dollar_volume)).then_some(Self {
+            minimum_close_price,
+            minimum_dollar_volume,
+        })
+    }
+
+    /// Whether a name trading at `close_price` on `dollar_volume` is inside the universe.
+    ///
+    /// Both bounds are inclusive, and this is the only place that comparison is written. Every
+    /// screen that reached for the constants separately was free to differ on the boundary, and the
+    /// one that did admitted a name to training and then refused to predict for it.
+    pub fn admits(&self, close_price: f64, dollar_volume: f64) -> bool {
+        close_price >= self.minimum_close_price && dollar_volume >= self.minimum_dollar_volume
+    }
+
+    pub fn minimum_close_price(&self) -> f64 {
+        self.minimum_close_price
+    }
+
+    pub fn minimum_dollar_volume(&self) -> f64 {
+        self.minimum_dollar_volume
+    }
+}
 
 /// Serializes a [`Decimal`] as a JSON number rather than a quoted string.
 ///
@@ -1366,6 +1403,53 @@ mod tests {
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
+    }
+
+    /// Both bounds admit the threshold itself. Every screen defers to this comparison, so an
+    /// exclusive test here would admit a name to training and then refuse to predict for it.
+    #[test]
+    fn test_a_floor_admits_a_name_sitting_exactly_on_it() {
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
+
+        assert!(floor.admits(10.0, 50_000_000.0));
+        assert!(!floor.admits(9.99, 50_000_000.0));
+        assert!(!floor.admits(10.0, 49_999_999.0));
+    }
+
+    /// The two bounds are independent, which is what makes an expensive thin name and a cheap heavy
+    /// one each excluded for their own reason.
+    #[test]
+    fn test_each_bound_rejects_on_its_own() {
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
+
+        assert!(!floor.admits(500.0, 30_000_000.0), "expensive but untraded");
+        assert!(
+            !floor.admits(2.0, 900_000_000.0),
+            "heavily traded but cheap"
+        );
+        assert!(floor.admits(290.0, 261_000_000.0));
+    }
+
+    #[test]
+    fn test_a_floor_refuses_a_bound_that_is_not_a_usable_number() {
+        assert!(LiquidityFloor::new(-1.0, 50_000_000.0).is_none());
+        assert!(LiquidityFloor::new(10.0, f64::NAN).is_none());
+        assert!(LiquidityFloor::new(10.0, f64::INFINITY).is_none());
+        assert!(
+            LiquidityFloor::new(0.0, 0.0).is_some(),
+            "a floor of zero admits everything, which is a screen and not an error"
+        );
+    }
+
+    /// The shipped floor is what every path screens against until a caller declares its own, so a
+    /// change to it changes the traded universe and must be a deliberate edit rather than a drift.
+    #[test]
+    fn test_the_current_floor_is_ten_dollars_and_fifty_million() {
+        assert_eq!(LiquidityFloor::CURRENT.minimum_close_price(), 10.0);
+        assert_eq!(
+            LiquidityFloor::CURRENT.minimum_dollar_volume(),
+            50_000_000.0
+        );
     }
 
     #[derive(Serialize, Deserialize)]
