@@ -1279,10 +1279,8 @@ pub enum QuoteScope {
     ScreenedUniverse(LiquidityFloor),
     /// An explicit set of names, folded only into sessions that *already* have a partition.
     ///
-    /// Two things this repairs, and the second is the one that recurs: a name whose fetch failed,
-    /// and a name a widened screen now admits. Task 4 replaces the price floor with a spread bound
-    /// and task 6 makes the floor a declared rank — both add names to sessions already seeded, and
-    /// without this each of them would mean refetching whole sessions.
+    /// Repairs both a name whose fetch failed and a name a widened screen now admits, without
+    /// refetching the sessions those names are missing from.
     Symbols(BTreeSet<Ticker>),
 }
 
@@ -1326,12 +1324,16 @@ pub async fn archive_quote_sessions(
         "Planned a quote pass"
     );
     if let QuoteScope::Symbols(symbols) = scope {
-        let unsummarized = sessions.len() - requested.len();
-        if unsummarized > 0 {
-            // Named rather than counted silently: a repair that quietly skips most of its window
-            // looks identical to one that had nothing to do.
+        let unsummarized: Vec<SessionDate> = sessions
+            .iter()
+            .copied()
+            .filter(|session| !present.contains(session))
+            .collect();
+        if !unsummarized.is_empty() {
+            // Dated, not counted: a repair that skips most of its window looks identical to one
+            // that had nothing to do, and a count cannot say which sessions to seed.
             warn!(
-                unsummarized,
+                sessions = ?unsummarized,
                 symbols = symbols.len(),
                 "Some offered sessions have no quote partition to repair; seed them first"
             );

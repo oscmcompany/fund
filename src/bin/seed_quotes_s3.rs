@@ -51,14 +51,16 @@ struct Parameters {
 
 impl Parameters {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (start, end, stride, symbols, mode) = match arguments {
-            [start, end] => (start, end, None, None, None),
-            [start, end, stride] => (start, end, Some(stride), None, None),
+        // `named` pairs the symbol list with its mode, because a mode without symbols is not a
+        // state the arguments can express and should not be a branch anyone has to read.
+        let (start, end, stride, named) = match arguments {
+            [start, end] => (start, end, None, None),
+            [start, end, stride] => (start, end, Some(stride), None),
             // Positional after the stride, so measuring named symbols means stating the stride
             // rather than having it inferred from an argument that could be either.
-            [start, end, stride, symbols] => (start, end, Some(stride), Some(symbols), None),
+            [start, end, stride, symbols] => (start, end, Some(stride), Some((symbols, None))),
             [start, end, stride, symbols, mode] => {
-                (start, end, Some(stride), Some(symbols), Some(mode))
+                (start, end, Some(stride), Some((symbols, Some(mode))))
             }
             _ => {
                 return Err(format!(
@@ -84,18 +86,20 @@ impl Parameters {
                 })?,
         };
 
-        // Trimmed before matching, so a whitespace-padded mode word is not read as something else.
-        let mode = match (symbols.map(|raw| raw.trim()), mode.map(|raw| raw.trim())) {
-            (None, None) => Mode::Archive,
-            (None, Some(_)) => {
-                return Err(format!("MODE requires a symbol list to act on\n{USAGE}"))
-            }
-            (Some(raw), None) | (Some(raw), Some("measure")) => Mode::Measure(parse_symbols(raw)?),
-            (Some(raw), Some("repair")) => Mode::Repair(parse_symbols(raw)?),
-            (Some(_), Some(other)) => {
-                return Err(format!(
-                    "MODE must be measure or repair, got {other:?}\n{USAGE}"
-                ))
+        let mode = match named {
+            None => Mode::Archive,
+            Some((symbols, mode)) => {
+                let symbols = parse_symbols(symbols)?;
+                // Trimmed before matching, so a padded mode word is not read as an unknown one.
+                match mode.map(|raw| raw.trim()) {
+                    None | Some("measure") => Mode::Measure(symbols),
+                    Some("repair") => Mode::Repair(symbols),
+                    Some(other) => {
+                        return Err(format!(
+                            "MODE must be measure or repair, got {other:?}\n{USAGE}"
+                        ))
+                    }
+                }
             }
         };
 
@@ -411,16 +415,17 @@ mod tests {
         .is_err());
     }
 
-    /// A mode with nothing to act on is a mistake worth refusing rather than a no-op: the caller
-    /// meant to name symbols and did not.
+    /// A mode names what to do with a symbol list, so the two travel together and "a mode with no
+    /// symbols" is not a state the arguments can express. What is left to refuse is a sixth one.
     #[test]
-    fn test_a_mode_without_symbols_is_refused() {
+    fn test_arguments_past_the_mode_are_refused() {
         assert!(Parameters::parse(&arguments(&[
             "2026-08-03",
             "2026-08-21",
             "21",
-            "",
-            "repair"
+            "AAPL",
+            "repair",
+            "extra"
         ]))
         .is_err());
     }
