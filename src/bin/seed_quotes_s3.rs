@@ -19,11 +19,16 @@ const USAGE: &str = "Usage: seed_quotes_s3 START_DATE END_DATE [STRIDE [SYMBOLS 
                      STRIDE samples every Nth trading session from START_DATE (default 1).\n\
                      A stride that is a multiple of 5 samples one weekday forever; 21 does not.\n\
                      SYMBOLS is a comma-separated list, and naming it requires naming STRIDE too.\n\
-                     MODE applies only with SYMBOLS, and is one of two reserved lowercase words:\n\
+                     SYMBOLS may instead be the reserved lowercase word `all`, matched exactly so\n\
+                     an uppercase name of the same spelling is still a ticker:\n\
+                       all      every name the daily archive holds, every sampled session,\n\
+                                widening any session already summarized rather than skipping it\n\
+                     MODE applies only with a symbol list, and is one of two reserved words:\n\
                        measure  print what those names read and write nothing (the default)\n\
                        repair   fold them into the sessions that already have a partition\n\
                      A repair never creates a partition: one holding only the named symbols would\n\
-                     read as a complete session to every later pass.";
+                     read as a complete session to every later pass. `all` may, because what it\n\
+                     writes is the whole market.";
 
 /// Sessions between samples unless told otherwise, which is every session.
 const DEFAULT_STRIDE: usize = 1;
@@ -36,6 +41,8 @@ const DEFAULT_STRIDE: usize = 1;
 enum Mode {
     /// Fold the screened universe for every sampled session and write both cadences.
     Archive,
+    /// Fold every name the daily archive holds, widening sessions already summarized.
+    WholeMarket,
     /// Fold only these names and print what they read, touching no partition.
     Measure(BTreeSet<Ticker>),
     /// Fold only these names into the sampled sessions that already have a partition.
@@ -88,6 +95,15 @@ impl Parameters {
 
         let mode = match named {
             None => Mode::Archive,
+            // Matched before the symbol parser, and exactly: `ALL` is a valid ticker shape, so
+            // order is what separates the reserved word from a name spelled the same way.
+            Some((symbols, None)) if symbols.trim() == "all" => Mode::WholeMarket,
+            Some((symbols, Some(mode))) if symbols.trim() == "all" => {
+                return Err(format!(
+                    "MODE applies to a symbol list, not to `all`, got {:?}\n{USAGE}",
+                    mode.trim()
+                ))
+            }
             Some((symbols, mode)) => {
                 let symbols = parse_symbols(symbols)?;
                 // Trimmed before matching, so a padded mode word is not read as an unknown one.
@@ -237,6 +253,7 @@ async fn run(
             return Ok(None);
         }
         Mode::Archive => QuoteScope::ScreenedUniverse(LiquidityFloor::CURRENT),
+        Mode::WholeMarket => QuoteScope::WholeMarket,
         Mode::Repair(symbols) => QuoteScope::Symbols(symbols.clone()),
     };
 
@@ -417,6 +434,35 @@ mod tests {
 
     /// A mode names what to do with a symbol list, so the two travel together and "a mode with no
     /// symbols" is not a state the arguments can express. What is left to refuse is a sixth one.
+    /// The word is what widens the archive past its own screen, and `ALL` is a valid ticker shape,
+    /// so the lowercase form has to be matched exactly and before the symbol parser sees it.
+    #[test]
+    fn test_all_is_a_reserved_word_and_its_uppercase_is_a_ticker() {
+        let widening = Parameters::parse(&arguments(&["2026-08-17", "2026-08-21", "1", " all "]))
+            .expect("a trimmed reserved word parses");
+        assert_eq!(widening.mode, Mode::WholeMarket);
+
+        let named = Parameters::parse(&arguments(&["2026-08-17", "2026-08-21", "1", "ALL"]))
+            .expect("uppercase stays a ticker");
+        let Mode::Measure(symbols) = named.mode else {
+            panic!("an uppercase name must not widen the archive");
+        };
+        assert!(symbols.contains(&Ticker::new("ALL").unwrap()));
+    }
+
+    /// A mode says what to do with named symbols, and `all` is not a list of them.
+    #[test]
+    fn test_a_mode_alongside_all_is_refused() {
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-17",
+            "2026-08-21",
+            "1",
+            "all",
+            "repair"
+        ]))
+        .is_err());
+    }
+
     #[test]
     fn test_arguments_past_the_mode_are_refused() {
         assert!(Parameters::parse(&arguments(&[

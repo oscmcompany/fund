@@ -505,7 +505,7 @@ fn intraday_sessions_for(
 ) -> Vec<SessionDate> {
     match scope {
         IntradayScope::MissingSessions => intraday_sessions_to_request(expected, present),
-        IntradayScope::Symbols(_) => expected.to_vec(),
+        IntradayScope::Symbols(_) | IntradayScope::WholeMarket => expected.to_vec(),
     }
 }
 
@@ -518,19 +518,24 @@ const INTRADAY_CONCURRENCY: usize = 8;
 
 /// What an intraday pass is for, and it decides which sessions get requested.
 ///
-/// The two variants exist because session presence cannot answer whether a *symbol* is present: a
-/// partition written while one name's fetch failed, or before that name cleared the universe
-/// screen, is indistinguishable from a complete one. So repairing a symbol has to ignore the set
-/// difference that repairing a session relies on.
+/// Session presence cannot answer whether a *symbol* is present: a partition written while one
+/// name's fetch failed is indistinguishable from a complete one. So the variants that repair a
+/// symbol have to ignore the set difference that filling a missing session relies on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntradayScope {
-    /// Every name the daily archive screens in, for the sessions the archive has no partition for.
+    /// Every name the daily archive holds, for the sessions the archive has no partition for.
     MissingSessions,
     /// An explicit set of names, across every session in the window regardless of what is present.
     ///
     /// The partition merge keys on `(ticker, bar_interval, timestamp)`, so re-requesting a session
     /// that already holds other names adds these and leaves those untouched.
     Symbols(BTreeSet<Ticker>),
+    /// Every name the daily archive holds, across every session in the window.
+    ///
+    /// What [`IntradayScope::MissingSessions`] cannot express: a partition that exists but is
+    /// narrower than the daily archive it was built beside. Unlike a symbol repair this may create
+    /// a partition, because the one it creates is the whole market rather than a named handful.
+    WholeMarket,
 }
 
 /// Fetches and writes intraday partitions across `[window_start, window_end]`, per `scope`.
@@ -747,7 +752,7 @@ async fn archive_intraday_chunk(
 ///
 /// An undescribed session is refused whatever the scope, because nothing can say what a complete
 /// partition for it would hold. A symbol repair additionally refuses to *create* one: it fetches
-/// only the named symbols, so an absent session needs [`IntradayScope::MissingSessions`] instead.
+/// only the named symbols, so an absent session needs a whole-market scope instead.
 fn writable_sessions(
     session: SessionDate,
     scope: &IntradayScope,
@@ -758,7 +763,9 @@ fn writable_sessions(
         return false;
     }
     match scope {
-        IntradayScope::MissingSessions => true,
+        // Both fetch every name the daily partition holds, so a partition either creates whole or
+        // is merged into whole; neither can leave one that only looks complete.
+        IntradayScope::MissingSessions | IntradayScope::WholeMarket => true,
         IntradayScope::Symbols(_) => present.contains(&session),
     }
 }
@@ -824,12 +831,12 @@ async fn write_partitions(
     Ok(())
 }
 
-/// The names that traded across `sessions`, read from the daily archive and screened per session.
+/// The names that traded across `sessions`, read from the daily archive and not screened.
 ///
-/// **A fetch universe, deliberately wider than any study population.** Screened session by session
-/// rather than on a trailing average, so a name that traded heavily on one day is fetched for the
-/// chunk. That is the safe direction for an archive: an unfetched bar cannot be recovered later,
-/// and every study screens again on its own terms when it reads.
+/// **Unscreened on purpose, matching the daily archive it is read from.** An unfetched bar cannot be
+/// recovered later and every study screens on its own terms when it reads, so the only screen that
+/// can cost anything here is one applied too early. A liquidity floor at ingest also made widening
+/// it a backfill rather than a setting, which is a bill this archive has now paid twice.
 ///
 /// **Survivorship-free by construction.** The daily partitions are whole-market and were written on
 /// the day, so a name that has since delisted is still present in the sessions it traded. Taking the
@@ -852,16 +859,12 @@ async fn universe_over(
             continue;
         };
         universe.described.insert(*session);
-        // An explicit set reads the partition above for `described` and skips only the screen,
-        // which a hand-picked universe has already answered.
-        let IntradayScope::MissingSessions = scope else {
+        // An explicit set reads the partition above only for `described`; it has already answered
+        // which names it wants.
+        if matches!(scope, IntradayScope::Symbols(_)) {
             continue;
-        };
-        // Pinned rather than threaded up: the archive is one shared object per session, so
-        // widening the floor means backfilling it rather than reconfiguring a caller.
-        universe
-            .symbols
-            .extend(screen_partition(frame, LiquidityFloor::CURRENT)?);
+        }
+        universe.symbols.extend(partition_tickers(&frame)?);
     }
     if let IntradayScope::Symbols(symbols) = scope {
         universe.symbols = symbols.clone();
@@ -1277,6 +1280,12 @@ pub struct QuoteArchiveSummary {
 pub enum QuoteScope {
     /// Every name the daily archive screens in, for the sessions that have no summary yet.
     ScreenedUniverse(LiquidityFloor),
+    /// Every name the daily archive holds, across every session in the window.
+    ///
+    /// The screen decides what is fetched, so a spread it excluded cannot be read back off the
+    /// archive — this is how a name outside it gets measured at all. May write over an existing
+    /// session, unlike [`QuoteScope::Symbols`], because what it writes is the whole market.
+    WholeMarket,
     /// An explicit set of names, folded only into sessions that *already* have a partition.
     ///
     /// Repairs both a name whose fetch failed and a name a widened screen now admits, without
@@ -1395,6 +1404,9 @@ fn quote_sessions_for(
         .filter(|session| match scope {
             QuoteScope::ScreenedUniverse(_) => !present.contains(session),
             QuoteScope::Symbols(_) => present.contains(session),
+            // Neither filter: widening a session already summarized is the whole point, and a
+            // session with nothing in it is answered whole rather than skipped.
+            QuoteScope::WholeMarket => true,
         })
         .collect()
 }
@@ -1418,21 +1430,24 @@ async fn archive_quote_session(
     };
 
     let universe = match scope {
-        QuoteScope::ScreenedUniverse(floor) => {
+        // Taken as given rather than intersected with the daily partition: a name that did not
+        // trade answers with no quotes and produces no summary, which is the same outcome.
+        QuoteScope::Symbols(symbols) => symbols.clone(),
+        QuoteScope::ScreenedUniverse(_) | QuoteScope::WholeMarket => {
             let key =
                 date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
             let Some(daily) = read_partition(s3_client, bucket, &key).await? else {
                 // Left unwritten so a later pass retries, rather than summarized against a universe
                 // that never included whatever traded only on the session the daily archive lacks.
-                warn!(%session, "No daily partition to screen against; leaving the session unsummarized");
+                warn!(%session, "No daily partition to read a universe from; leaving the session unsummarized");
                 summary.sessions_without_data += 1;
                 return Ok(());
             };
-            screen_partition(daily, *floor)?
+            match scope {
+                QuoteScope::ScreenedUniverse(floor) => screen_partition(daily, *floor)?,
+                _ => partition_tickers(&daily)?,
+            }
         }
-        // Taken as given rather than intersected with the daily partition: a name that did not
-        // trade answers with no quotes and produces no summary, which is the same outcome.
-        QuoteScope::Symbols(symbols) => symbols.clone(),
     };
     if universe.is_empty() {
         summary.sessions_without_data += 1;
@@ -1896,6 +1911,52 @@ mod tests {
             );
             assert_eq!(date_from_partitioned_key(&quotes), Some(date));
         }
+    }
+
+    /// A whole-market pass exists to widen partitions that already exist, so unlike the other two
+    /// it filters on nothing. Skipping the present ones would make it a no-op against a seeded
+    /// archive, which is exactly the state it is run against.
+    #[test]
+    fn test_a_whole_market_quote_pass_takes_every_session_offered() {
+        let sessions = [
+            session(2026, 8, 17),
+            session(2026, 8, 18),
+            session(2026, 8, 19),
+        ];
+        let present: BTreeSet<SessionDate> = [session(2026, 8, 18)].into_iter().collect();
+
+        assert_eq!(
+            quote_sessions_for(&QuoteScope::WholeMarket, &sessions, &present),
+            sessions.to_vec()
+        );
+    }
+
+    /// The same asymmetry on the bar side: a named repair may not create a partition because it
+    /// would hold only those names, while a whole-market pass may because its partition is whole.
+    #[test]
+    fn test_a_whole_market_bar_pass_may_create_a_partition_where_a_repair_may_not() {
+        let described: BTreeSet<SessionDate> = [session(2026, 8, 19)].into_iter().collect();
+        let absent = BTreeSet::new();
+
+        assert!(writable_sessions(
+            session(2026, 8, 19),
+            &IntradayScope::WholeMarket,
+            &described,
+            &absent
+        ));
+        assert!(!writable_sessions(
+            session(2026, 8, 19),
+            &IntradayScope::Symbols(tickers(&["AAPL"])),
+            &described,
+            &absent
+        ));
+        // Undescribed refuses both: nothing can say what a complete partition would hold.
+        assert!(!writable_sessions(
+            session(2026, 8, 20),
+            &IntradayScope::WholeMarket,
+            &described,
+            &absent
+        ));
     }
 
     /// The two scopes want opposite session sets, and getting it backwards is the defect #1102 was
