@@ -831,17 +831,11 @@ async fn write_partitions(
     Ok(())
 }
 
-/// The names that traded across `sessions`, read from the daily archive and not screened.
+/// Every name the daily archive holds across `sessions`, unscreened.
 ///
-/// **Unscreened on purpose, matching the daily archive it is read from.** An unfetched bar cannot be
-/// recovered later and every study screens on its own terms when it reads, so the only screen that
-/// can cost anything here is one applied too early. A liquidity floor at ingest also made widening
-/// it a backfill rather than a setting, which is a bill this archive has now paid twice.
-///
-/// **Survivorship-free by construction.** The daily partitions are whole-market and were written on
-/// the day, so a name that has since delisted is still present in the sessions it traded. Taking the
-/// list from today's market instead would sample only the survivors — and a pair that blew up is
-/// exactly the one a convergence study must not drop.
+/// Survivorship-free by construction: the partitions are whole-market and were written on the day,
+/// so a name that has since delisted is still there in the sessions it traded. Taking the list from
+/// today's market instead would sample only the survivors.
 async fn universe_over(
     s3_client: &S3Client,
     bucket: &str,
@@ -1423,8 +1417,8 @@ async fn archive_quote_session(
     summary: &mut QuoteArchiveSummary,
 ) -> Result<(), ArchiveError> {
     let Some((open, close)) = quotes::trading_hours(calendar, session) else {
-        // A holiday, or a date the fetched calendar does not reach. Neither is a fault, and both
-        // are why the pass counts them rather than failing.
+        // A date the calendar does not publish. Counted rather than fatal, so one unusable session
+        // does not cost the rest of the window.
         summary.sessions_without_data += 1;
         return Ok(());
     };

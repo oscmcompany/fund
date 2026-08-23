@@ -21,9 +21,11 @@ const USAGE: &str = "Usage: seed_quotes_s3 START_DATE END_DATE [STRIDE [SYMBOLS 
                      SYMBOLS is a comma-separated list, and naming it requires naming STRIDE too.\n\
                      SYMBOLS may instead be the reserved lowercase word `all`, matched exactly so\n\
                      an uppercase name of the same spelling is still a ticker:\n\
-                       all      every name the daily archive holds, every sampled session,\n\
-                                widening any session already summarized rather than skipping it\n\
-                     MODE applies only with a symbol list, and is one of two reserved words:\n\
+                       all      every name the daily archive holds, for every sampled session it\n\
+                                can describe, widening one already summarized rather than\n\
+                                skipping it; a session the daily archive is missing is left alone\n\
+                     MODE applies only with a symbol list, and is one of two reserved lowercase\n\
+                     words, matched exactly on the same terms as `all`:\n\
                        measure  print what those names read and write nothing (the default)\n\
                        repair   fold them into the sessions that already have a partition\n\
                      A repair never creates a partition: one holding only the named symbols would\n\
@@ -199,7 +201,14 @@ async fn main() {
             );
             // Non-zero on an incomplete pass, because the partition it wrote reads as complete to
             // everything downstream and the exit code is the only signal automation sees.
-            if summary.symbols_failed > 0 || !summary.sessions_failed.is_empty() {
+            //
+            // `sessions_without_data` counts here where it would not on the bar path: the sample
+            // is drawn from the published calendar, so a session that answers with nothing is a
+            // missing daily partition or an empty fold, never a holiday.
+            if summary.symbols_failed > 0
+                || !summary.sessions_failed.is_empty()
+                || summary.sessions_without_data > 0
+            {
                 eprintln!(
                     "Incomplete: re-run the affected sessions with the missing symbols and `repair`"
                 );
