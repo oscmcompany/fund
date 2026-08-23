@@ -169,7 +169,9 @@ pub struct ArchiveSummary {
     pub sessions_written: usize,
     /// Sessions that were requested and returned no bars — holidays, and anything Massive lacks.
     pub sessions_without_data: usize,
-    /// Sessions whose request failed outright, carried rather than fatal.
+    /// Sessions whose fetch or write failed, carried rather than fatal.
+    ///
+    /// A caller that treats a non-empty list as success will report a pass that wrote nothing.
     pub sessions_failed: Vec<SessionDate>,
     /// Bars written across every partition this pass touched.
     pub bars_written: usize,
@@ -818,7 +820,12 @@ async fn write_partitions(
                 warn!(key, attempts, %session, "Partition contended; the next pass will retry it");
                 summary.sessions_failed.push(session);
             }
-            Ok((_, _, Err(error))) => return Err(error),
+            // Carried for the same reason contention is: one session's write says nothing about the
+            // next one's, and a systemic fault has already failed the chunk's universe read.
+            Ok((session, _, Err(error))) => {
+                warn!(%error, %session, "Partition write failed; the next pass will retry it");
+                summary.sessions_failed.push(session);
+            }
             Err(error) => {
                 return Err(ArchiveError::Write {
                     bucket: bucket.to_string(),
@@ -1565,7 +1572,11 @@ async fn write_quote_partitions(
                 summary.sessions_failed.push(session);
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                warn!(%error, %session, "Quote partition write failed; the next pass will retry it");
+                summary.sessions_failed.push(session);
+                return Ok(());
+            }
         }
     }
 
