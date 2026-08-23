@@ -1014,6 +1014,169 @@ impl EquityQuote {
     }
 }
 
+/// A rate in hundredths of a percent, which is what every spread and cost figure is quoted in.
+///
+/// A type rather than an `f64` because the same spread is `0.0001` as a fraction and `1.0` as basis
+/// points, and nothing about a bare float says which was meant. Non-negative: the rates this carries
+/// are widths and costs, and [`EquityQuote::new`] has already refused the crossed book that would
+/// produce a negative one.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct BasisPoints(f64);
+
+impl BasisPoints {
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value))
+    }
+
+    /// The rate `numerator / denominator` expressed in basis points.
+    ///
+    /// `None` on a denominator of zero rather than an infinity, so a midpoint that should never
+    /// have been zero fails where it is computed instead of downstream of it.
+    pub fn from_ratio(numerator: f64, denominator: f64) -> Option<Self> {
+        if denominator == 0.0 {
+            return None;
+        }
+        Self::new(numerator / denominator * 10_000.0)
+    }
+
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BasisPoints {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:.2}bp", self.0)
+    }
+}
+
+/// What the quoted book looked like for one name over one bar, folded from the ticks.
+///
+/// Every average here is weighted by how long the quote prevailed rather than by how many times it
+/// printed, because quote traffic is dominated by flickering that no order ever interacts with. The
+/// two denominators travel with the averages for that reason: `quote_count` is how many updates
+/// arrived and `covered_seconds` is how much of the bar a quote was standing at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuoteSummary {
+    ticker: Ticker,
+    bar_interval: BarInterval,
+    /// UTC timestamp of the period this summary opens, matching the bar it describes.
+    timestamp: DateTime<Utc>,
+    quoted_spread_mean: f64,
+    quoted_spread_basis_points_mean: BasisPoints,
+    quoted_spread_basis_points_median: BasisPoints,
+    quoted_spread_basis_points_ninetieth_percentile: BasisPoints,
+    bid_size_mean: f64,
+    ask_size_mean: f64,
+    quote_count: i64,
+    covered_seconds: f64,
+}
+
+impl QuoteSummary {
+    /// Constructs a `QuoteSummary`, rejecting a fold that cannot have come from real quotes.
+    ///
+    /// A bar nothing was quoted across has no summary rather than a zero-weighted one, so
+    /// `covered_seconds` must be positive; `quote_count` may be zero, which is an illiquid name
+    /// still showing the quote it posted in an earlier bar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ticker: Ticker,
+        bar_interval: BarInterval,
+        timestamp: DateTime<Utc>,
+        quoted_spread_mean: f64,
+        quoted_spread_basis_points_mean: BasisPoints,
+        quoted_spread_basis_points_median: BasisPoints,
+        quoted_spread_basis_points_ninetieth_percentile: BasisPoints,
+        bid_size_mean: f64,
+        ask_size_mean: f64,
+        quote_count: i64,
+        covered_seconds: f64,
+    ) -> Result<Self, InconsistentRecordError> {
+        for (name, value) in [
+            ("mean quoted spread", quoted_spread_mean),
+            ("mean bid size", bid_size_mean),
+            ("mean ask size", ask_size_mean),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(reject(format!(
+                    "{name} {value} is not a non-negative number"
+                )));
+            }
+        }
+        if !covered_seconds.is_finite() || covered_seconds <= 0.0 {
+            return Err(reject(format!(
+                "covered seconds {covered_seconds} is not a positive number"
+            )));
+        }
+        if quote_count < 0 {
+            return Err(reject(format!("quote count {quote_count} is negative")));
+        }
+        if quoted_spread_basis_points_median > quoted_spread_basis_points_ninetieth_percentile {
+            return Err(reject(format!(
+                "median spread {quoted_spread_basis_points_median} exceeds the ninetieth percentile {quoted_spread_basis_points_ninetieth_percentile}"
+            )));
+        }
+
+        Ok(Self {
+            ticker,
+            bar_interval,
+            timestamp,
+            quoted_spread_mean,
+            quoted_spread_basis_points_mean,
+            quoted_spread_basis_points_median,
+            quoted_spread_basis_points_ninetieth_percentile,
+            bid_size_mean,
+            ask_size_mean,
+            quote_count,
+            covered_seconds,
+        })
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn bar_interval(&self) -> BarInterval {
+        self.bar_interval
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn quoted_spread_mean(&self) -> f64 {
+        self.quoted_spread_mean
+    }
+
+    pub fn quoted_spread_basis_points_mean(&self) -> BasisPoints {
+        self.quoted_spread_basis_points_mean
+    }
+
+    pub fn quoted_spread_basis_points_median(&self) -> BasisPoints {
+        self.quoted_spread_basis_points_median
+    }
+
+    pub fn quoted_spread_basis_points_ninetieth_percentile(&self) -> BasisPoints {
+        self.quoted_spread_basis_points_ninetieth_percentile
+    }
+
+    pub fn bid_size_mean(&self) -> f64 {
+        self.bid_size_mean
+    }
+
+    pub fn ask_size_mean(&self) -> f64 {
+        self.ask_size_mean
+    }
+
+    pub fn quote_count(&self) -> i64 {
+        self.quote_count
+    }
+
+    pub fn covered_seconds(&self) -> f64 {
+        self.covered_seconds
+    }
+}
+
 /// The most recent trade in a symbol, as one snapshot reported it.
 ///
 /// The timestamp is not optional because the last trade is what the pass prices on whenever the
@@ -1883,6 +2046,53 @@ mod tests {
         assert!(quote(103.0, 102.0, 5, 5).is_err(), "crossed book");
         assert!(quote(f64::NAN, 102.0, 5, 5).is_err(), "non-finite bid");
         assert!(quote(100.0, 102.0, -1, 5).is_err(), "negative size");
+    }
+
+    #[test]
+    fn test_basis_points_converts_a_ratio_and_refuses_an_unusable_one() {
+        // AAPL midday on 2026-08-20: a nine-cent book on a $317 midpoint.
+        let measured = BasisPoints::from_ratio(0.09, 317.455).unwrap();
+        assert!((measured.value() - 2.835).abs() < 0.001, "{measured}");
+        assert_eq!(BasisPoints::from_ratio(0.01, 0.0), None, "zero midpoint");
+        assert_eq!(BasisPoints::new(-0.5), None, "a width is not signed");
+        assert_eq!(BasisPoints::new(f64::NAN), None, "non-finite");
+    }
+
+    fn summary(
+        median: f64,
+        ninetieth: f64,
+        quote_count: i64,
+        covered_seconds: f64,
+    ) -> Result<QuoteSummary, InconsistentRecordError> {
+        QuoteSummary::new(
+            ticker("AAPL"),
+            BarInterval::FiveMinute,
+            Utc::now(),
+            0.09,
+            BasisPoints::new(2.84).unwrap(),
+            BasisPoints::new(median).unwrap(),
+            BasisPoints::new(ninetieth).unwrap(),
+            480.0,
+            80.0,
+            quote_count,
+            covered_seconds,
+        )
+    }
+
+    /// Zero arrivals is an illiquid name still showing an earlier bar's quote, which is a real
+    /// reading. Zero covered seconds is a bar nothing was quoted across, which is not a reading at
+    /// all — every average in it would be a division by zero wearing a number's clothes.
+    #[test]
+    fn test_summary_separates_no_arrivals_from_no_coverage() {
+        assert!(summary(2.5, 6.0, 0, 300.0).is_ok(), "no arrivals");
+        assert!(summary(2.5, 6.0, 12, 0.0).is_err(), "no coverage");
+        assert!(summary(2.5, 6.0, -1, 300.0).is_err(), "negative count");
+    }
+
+    #[test]
+    fn test_summary_refuses_quantiles_out_of_order() {
+        assert!(summary(6.0, 2.5, 12, 300.0).is_err());
+        assert!(summary(2.5, 2.5, 12, 300.0).is_ok(), "a flat book ties");
     }
 
     #[test]

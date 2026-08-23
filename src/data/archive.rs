@@ -15,8 +15,11 @@ use tracing::{info, warn};
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
-use crate::common::types::{BarInterval, EquityBar, LiquidityFloor, SessionDate, Ticker};
-use crate::data::{bars, boundaries, splits};
+use crate::common::types::{
+    BarInterval, EquityBar, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
+};
+use crate::data::calendar::TradingCalendar;
+use crate::data::{bars, boundaries, quotes, splits};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
 /// cadence, and a key built without one collides with every other cadence of the same session.
@@ -216,7 +219,7 @@ fn sessions_to_request(
         .collect()
 }
 
-/// Sessions the archive already holds within `[start, end]`.
+/// Sessions the bar archive already holds within `[start, end]`.
 async fn present_sessions(
     s3_client: &S3Client,
     bucket: &str,
@@ -226,7 +229,18 @@ async fn present_sessions(
 ) -> Result<BTreeSet<SessionDate>, ArchiveError> {
     // Scoped to the cadence being repaired. Listing the whole bar tree would count an intraday
     // partition as a daily session already present, and the gap scan would stop fetching it.
-    let prefix = bar_archive_prefix(interval);
+    present_partitions(s3_client, bucket, &bar_archive_prefix(interval), start, end).await
+}
+
+/// Sessions that have a partition under `prefix` within `[start, end]`.
+async fn present_partitions(
+    s3_client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    start: SessionDate,
+    end: SessionDate,
+) -> Result<BTreeSet<SessionDate>, ArchiveError> {
+    let prefix = prefix.to_string();
     let mut present = BTreeSet::new();
     let mut pages = s3_client
         .list_objects_v2()
@@ -1203,6 +1217,294 @@ fn merge_or_replace(
     }
 }
 
+/// Root of the quote-summary archive, beside the bars rather than under them.
+///
+/// `data/equity/bars` is Massive's and this is Alpaca's. One prefix for both would put two vendors'
+/// opinions of the same session under one key, and make whichever job ran second the one that
+/// mattered.
+pub const QUOTE_ARCHIVE_PREFIX: &str = "data/equity/quotes";
+
+/// The archive prefix for one summary cadence, hive-partitioned like the bars.
+pub fn quote_archive_prefix(interval: BarInterval) -> String {
+    format!("{QUOTE_ARCHIVE_PREFIX}/interval={interval}")
+}
+
+/// Names folded at once.
+///
+/// Eight because the endpoint's throughput is the ceiling rather than ours: measured at roughly
+/// 100,000 quotes a second on 2026-08-20, and thirty-two concurrent fetches moved no more than
+/// eight did. More concurrency buys only memory, since each fold holds its session's observations.
+const QUOTE_CONCURRENCY: usize = 8;
+
+/// Attempts per symbol before a session gives up on it.
+///
+/// The second line of defence, not the first: [`MarketDataClient::fetch_quotes`] already retries
+/// the individual page, so what reaches here has failed a page four times running. Load-bearing for
+/// the same reason the intraday one is — nothing downstream can tell a session summarized without
+/// one of its names from a complete one.
+const QUOTE_SYMBOL_ATTEMPTS: usize = 3;
+
+/// What one quote-archiving pass accomplished.
+///
+/// Its own type rather than [`ArchiveSummary`], because the units differ where it matters:
+/// `quotes_folded` counts ticks that were fetched and discarded, and it is the number that decides
+/// whether a backfill is affordable. A session yields roughly 79 summaries per name and hundreds of
+/// thousands of quotes to produce them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuoteArchiveSummary {
+    /// Sessions with no summary yet, and therefore requested.
+    pub sessions_requested: usize,
+    /// Sessions whose summaries were written.
+    pub sessions_written: usize,
+    /// Sessions that could not be summarized: a holiday, or one the daily archive cannot describe.
+    pub sessions_without_data: usize,
+    /// Sessions whose write lost a race, carried rather than fatal.
+    pub sessions_failed: Vec<SessionDate>,
+    /// Summary rows written across both cadences.
+    pub summaries_written: usize,
+    /// Symbols whose quotes could not be fetched after every attempt.
+    pub symbols_failed: usize,
+    /// Quotes folded and discarded, which is what the pass actually cost.
+    pub quotes_folded: usize,
+}
+
+/// Folds the quoted book for every session in `sessions` the archive has no summary for.
+///
+/// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
+/// bounded to one session's hours, so there is nothing to gain by holding a chunk of them.
+///
+/// Regular hours only, taken from the calendar so an early close is 3.5 hours rather than 6.5. The
+/// overnight book is an order of magnitude wider and would swamp any session mean it entered.
+pub async fn archive_quote_sessions(
+    s3_client: &S3Client,
+    market_data: &MarketDataClient,
+    calendar: &TradingCalendar,
+    bucket: &str,
+    sessions: &[SessionDate],
+    floor: LiquidityFloor,
+) -> Result<QuoteArchiveSummary, ArchiveError> {
+    let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
+        return Ok(QuoteArchiveSummary::default());
+    };
+    let present = present_partitions(
+        s3_client,
+        bucket,
+        &quote_archive_prefix(BarInterval::OneDay),
+        *first,
+        *last,
+    )
+    .await?;
+    let requested: Vec<SessionDate> = sessions
+        .iter()
+        .copied()
+        .filter(|session| !present.contains(session))
+        .collect();
+
+    info!(
+        window_start = %first,
+        window_end = %last,
+        offered = sessions.len(),
+        present = present.len(),
+        requested = requested.len(),
+        "Planned a quote pass"
+    );
+
+    let mut summary = QuoteArchiveSummary {
+        sessions_requested: requested.len(),
+        ..Default::default()
+    };
+    for session in requested {
+        archive_quote_session(
+            s3_client,
+            market_data,
+            calendar,
+            bucket,
+            session,
+            floor,
+            &mut summary,
+        )
+        .await?;
+    }
+
+    if summary.symbols_failed > 0 {
+        // Warned separately, because this is the outcome nothing re-requests: the partition exists,
+        // so the next pass reads the session as present and never looks inside it.
+        warn!(
+            symbols_failed = summary.symbols_failed,
+            "Some symbols are absent from the summaries this pass wrote; re-run those sessions to repair them"
+        );
+    }
+    info!(
+        sessions_requested = summary.sessions_requested,
+        sessions_written = summary.sessions_written,
+        sessions_without_data = summary.sessions_without_data,
+        sessions_failed = summary.sessions_failed.len(),
+        summaries_written = summary.summaries_written,
+        symbols_failed = summary.symbols_failed,
+        quotes_folded = summary.quotes_folded,
+        "Quote archive updated"
+    );
+    Ok(summary)
+}
+
+/// One session: screen the universe, fold every name's book, write both cadences.
+#[allow(clippy::too_many_arguments)]
+async fn archive_quote_session(
+    s3_client: &S3Client,
+    market_data: &MarketDataClient,
+    calendar: &TradingCalendar,
+    bucket: &str,
+    session: SessionDate,
+    floor: LiquidityFloor,
+    summary: &mut QuoteArchiveSummary,
+) -> Result<(), ArchiveError> {
+    let Some((open, close)) = quotes::trading_hours(calendar, session) else {
+        // A holiday, or a date the fetched calendar does not reach. Neither is a fault, and both
+        // are why the pass counts them rather than failing.
+        summary.sessions_without_data += 1;
+        return Ok(());
+    };
+
+    let daily_key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
+    let Some(daily) = read_partition(s3_client, bucket, &daily_key).await? else {
+        // Left unwritten so a later pass retries, rather than summarized against a universe that
+        // never included whatever traded only on the session the daily archive is missing.
+        warn!(%session, "No daily partition to screen against; leaving the session unsummarized");
+        summary.sessions_without_data += 1;
+        return Ok(());
+    };
+    let universe = screen_partition(daily, floor)?;
+    if universe.is_empty() {
+        summary.sessions_without_data += 1;
+        return Ok(());
+    }
+
+    info!(%session, %open, %close, universe = universe.len(), "Folding a session's quoted book");
+    let folded = fold_universe(market_data, session, open, close, &universe, summary).await;
+    if folded.is_empty() {
+        summary.sessions_without_data += 1;
+        return Ok(());
+    }
+    write_quote_partitions(s3_client, bucket, session, folded, summary).await
+}
+
+/// Fans out over the universe, folding each name's session and keeping only the summaries.
+async fn fold_universe(
+    market_data: &MarketDataClient,
+    session: SessionDate,
+    open: DateTime<Utc>,
+    close: DateTime<Utc>,
+    universe: &BTreeSet<Ticker>,
+    summary: &mut QuoteArchiveSummary,
+) -> Vec<QuoteSummary> {
+    let mut pending: Vec<Ticker> = universe.iter().cloned().collect();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut folded: Vec<QuoteSummary> = Vec::new();
+
+    loop {
+        while tasks.len() < QUOTE_CONCURRENCY {
+            let Some(ticker) = pending.pop() else { break };
+            let client = market_data.clone();
+            tasks.spawn(async move {
+                let mut last_error = None;
+                for attempt in 0..QUOTE_SYMBOL_ATTEMPTS {
+                    match quotes::fold_session(&client, &ticker, session, open, close).await {
+                        Ok(folded) => return Ok(folded),
+                        Err(error) => {
+                            if !error.is_transient() {
+                                return Err((ticker, error));
+                            }
+                            last_error = Some(error);
+                        }
+                    }
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                }
+                Err((
+                    ticker,
+                    last_error.expect("a failed attempt records its error"),
+                ))
+            });
+        }
+        let Some(finished) = tasks.join_next().await else {
+            break;
+        };
+        match finished {
+            Ok(Ok((summaries, fetch))) => {
+                summary.quotes_folded += fetch.received;
+                folded.extend(summaries);
+            }
+            // One symbol's failure costs that symbol, not the session — the other names are already
+            // fetched, and discarding them would mean paying for them twice.
+            Ok(Err((ticker, error))) => {
+                summary.symbols_failed += 1;
+                warn!(%ticker, %session, %error, "A symbol's quote fetch failed; continuing the session");
+            }
+            Err(error) => {
+                summary.symbols_failed += 1;
+                warn!(%error, %session, "A quote fold task did not complete");
+            }
+        }
+    }
+    folded
+}
+
+/// Writes a session's summaries, one partition per cadence, five-minute first.
+///
+/// The order is the recovery rule, not a preference. Presence is read off the daily prefix, so a
+/// pass that dies between the two writes leaves the session looking absent and the next pass redoes
+/// both — where the reverse order would mark it done with its intraday half missing.
+async fn write_quote_partitions(
+    s3_client: &S3Client,
+    bucket: &str,
+    session: SessionDate,
+    folded: Vec<QuoteSummary>,
+    summary: &mut QuoteArchiveSummary,
+) -> Result<(), ArchiveError> {
+    let mut intraday: Vec<QuoteSummary> = Vec::new();
+    let mut daily: Vec<QuoteSummary> = Vec::new();
+    let mut unexpected = 0usize;
+    for row in folded {
+        match row.bar_interval() {
+            BarInterval::FiveMinute => intraday.push(row),
+            BarInterval::OneDay => daily.push(row),
+            // The fold emits exactly the two cadences above; a third is this module's own bug.
+            BarInterval::OneMinute => unexpected += 1,
+        }
+    }
+    if unexpected > 0 {
+        warn!(unexpected, %session, "Discarded quote summaries at a cadence the archive has no prefix for");
+    }
+
+    let mut written = 0usize;
+    for (interval, rows) in [
+        (BarInterval::FiveMinute, intraday),
+        (BarInterval::OneDay, daily),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        let frame = quotes::summaries_to_dataframe(&rows)?;
+        let key = date_partitioned_key(&quote_archive_prefix(interval), session.date());
+        match write_merged(s3_client, bucket, key, frame, |existing, fetched, key| {
+            merge_or_replace(existing, fetched, key)
+        })
+        .await
+        {
+            Ok(()) => written += rows.len(),
+            Err(ArchiveError::Contended { key, attempts }) => {
+                warn!(key, attempts, %session, "Quote partition contended; the next pass will retry it");
+                summary.sessions_failed.push(session);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    summary.sessions_written += 1;
+    summary.summaries_written += written;
+    Ok(())
+}
+
 /// Fetches the whole splits table and writes it, keeping each row's earliest `first_seen`.
 ///
 /// Not a gap scan like [`archive_missing_sessions`], because there are no gaps to find: the feed
@@ -1509,6 +1811,31 @@ mod tests {
             date_partitioned_key(&bar_archive_prefix(BarInterval::FiveMinute), date),
             "data/equity/bars/interval=five_minute/year=2026/month=08/day=19/data.parquet"
         );
+    }
+
+    /// Quotes are Alpaca's opinion and bars are Massive's. A shared key would put two vendors'
+    /// accounts of one session at one address, and the date inverse must still read the tail so a
+    /// listing recovers the session.
+    #[test]
+    fn test_quote_partitions_sit_beside_the_bars_rather_than_among_them() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 19).expect("test date must be valid");
+
+        assert_eq!(
+            date_partitioned_key(&quote_archive_prefix(BarInterval::OneDay), date),
+            "data/equity/quotes/interval=one_day/year=2026/month=08/day=19/data.parquet"
+        );
+        assert_eq!(
+            date_partitioned_key(&quote_archive_prefix(BarInterval::FiveMinute), date),
+            "data/equity/quotes/interval=five_minute/year=2026/month=08/day=19/data.parquet"
+        );
+        for interval in BarInterval::ALL {
+            let quotes = date_partitioned_key(&quote_archive_prefix(interval), date);
+            assert_ne!(
+                quotes,
+                date_partitioned_key(&bar_archive_prefix(interval), date)
+            );
+            assert_eq!(date_from_partitioned_key(&quotes), Some(date));
+        }
     }
 
     /// Two cadences of one session must not collide, which is the whole reason the segment exists.
