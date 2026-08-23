@@ -67,11 +67,12 @@ impl SpreadAccumulator {
         self.observations.push((spread_basis_points, seconds));
     }
 
-    /// Takes everything `other` accumulated, leaving it empty.
+    /// Takes everything `other` accumulated, consuming it.
     ///
     /// How the session figure is built: it is the merge of its own buckets rather than a second
-    /// pass, so the two cadences cannot disagree about the session they describe.
-    fn absorb(&mut self, other: &mut Self) {
+    /// pass, so the two cadences cannot disagree about the session they describe. By value rather
+    /// than by `&mut`, so a bucket cannot be absorbed twice and double-count itself.
+    fn absorb(&mut self, mut other: Self) {
         self.covered_seconds += other.covered_seconds;
         self.spread_weighted += other.spread_weighted;
         self.spread_basis_points_weighted += other.spread_basis_points_weighted;
@@ -233,7 +234,7 @@ impl SessionFold {
             {
                 summaries.push(summary);
             }
-            session.absorb(&mut bucket);
+            session.absorb(bucket);
         }
         summaries.extend(session.summarize(
             &self.ticker,

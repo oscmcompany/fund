@@ -2467,6 +2467,31 @@ impl MarketDataClient {
     /// is 118 pages over one session, so restarting it to recover one dropped connection discards
     /// 117 pages of work and gives the largest names both the highest failure odds and the dearest
     /// recovery. The token identifies the page, so resuming at it is exact.
+    /// One attempt at one page, with every failure mode expressed as the returned error.
+    ///
+    /// Separated from the retry loop so there is one place an attempt can fail from. A connection
+    /// reset during `send` is the same transport fault as a body that arrives truncated, and the
+    /// two have to be indistinguishable here or only one of them gets retried.
+    async fn attempt_quote_page(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> Result<QuotesResponse, ClientError> {
+        let response = self
+            .get(url)
+            .query(query)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        // `Request`, not `Parse`: calling a dropped body unparseable cost twelve names their
+        // retries on the first real run.
+        error_for_status(response)
+            .await?
+            .json::<QuotesResponse>()
+            .await
+            .map_err(ClientError::Request)
+    }
+
     async fn quote_page(
         &self,
         url: &str,
@@ -2477,17 +2502,9 @@ impl MarketDataClient {
         let mut retries = 0usize;
         let mut last_error = None;
         for attempt in 0..QUOTES_PAGE_ATTEMPTS {
-            let outcome = match error_for_status(self.get(url).query(query).send().await?).await {
-                // Kept as `Request` rather than flattened to `Parse`. A connection dropped part-way
-                // through a body arrives here, and calling that unparseable cost twelve names their
-                // retries on the first real run.
-                Ok(response) => response
-                    .json::<QuotesResponse>()
-                    .await
-                    .map_err(ClientError::Request),
-                Err(error) => Err(error),
-            };
-            match outcome {
+            // No `?` anywhere in here. Every way the attempt can fail has to reach the match below
+            // or it escapes the retry it was written for -- which is how the send arm was missed.
+            match self.attempt_quote_page(url, query).await {
                 Ok(page) => return Ok(FetchedPage { page, retries }),
                 Err(error) if error.is_transient() => {
                     retries += 1;
@@ -4538,7 +4555,9 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"quotes":{"AAPL":[{"t":"2026-08-20T13:30:00Z","#)
-            .expect(QUOTES_PAGE_ATTEMPTS)
+            // Four, spelled out. Taking it from `QUOTES_PAGE_ATTEMPTS` would let the constant drop
+            // to one and this test would still pass while proving no retry happened at all.
+            .expect(4)
             .create_async()
             .await;
 

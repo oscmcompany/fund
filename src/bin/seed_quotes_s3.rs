@@ -157,7 +157,14 @@ async fn main() {
                 summary.symbols_failed,
                 summary.quotes_folded
             );
-            0
+            // Non-zero on an incomplete pass, because the partition it wrote reads as complete to
+            // everything downstream and the exit code is the only signal automation sees.
+            if summary.symbols_failed > 0 || !summary.sessions_failed.is_empty() {
+                eprintln!("Incomplete: re-run the affected sessions to fill the missing symbols");
+                1
+            } else {
+                0
+            }
         }
         Err(error) => {
             error!(%error, "Seeding the quote archive failed");
@@ -175,9 +182,8 @@ async fn run(
     parameters: &Parameters,
 ) -> Result<Option<archive::QuoteArchiveSummary>, Box<dyn std::error::Error>> {
     let credentials = AlpacaCredentials::from_env()?;
-    // Pinned to SIP rather than read from `ALPACA_DATA_FEED`. IEX carries a few percent of volume
-    // and its best bid and offer is not the national one, so a feed chosen by an environment
-    // variable would put two incomparable spread series under one key.
+    // SIP is pinned, not read from `ALPACA_DATA_FEED`: IEX's best bid and offer is not the national
+    // one, so an environment variable could put two incomparable series under one key.
     let market_data = MarketDataClient::new(credentials.clone(), DataFeed::Sip);
     let days = TradingClient::from_env(credentials)
         .fetch_calendar(parameters.start.date(), parameters.end.date())
