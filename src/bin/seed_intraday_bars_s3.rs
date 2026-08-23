@@ -18,10 +18,13 @@ const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [
                      SYMBOLS is a comma-separated list, and naming it requires naming CADENCE too.\n\
                      Supplying it fetches only those names and requests every session in the\n\
                      window rather than only the absent ones.\n\
-                     SYMBOLS may instead be one of two reserved lowercase words, matched\n\
+                     SYMBOLS may instead be one of three reserved lowercase words, matched\n\
                      exactly so an uppercase name of the same spelling is still a ticker:\n\
                        scan    report which names each partition lacks, and write nothing\n\
-                       repair  scan, then fetch the names the scan reported";
+                       repair  scan, then fetch the names the scan reported\n\
+                       all     every name the daily archive holds, for every session in the\n\
+                               window it can describe -- a session the daily archive is missing\n\
+                               is left alone, because nothing can say what a complete one holds";
 
 /// What the archive is filled with unless told otherwise.
 ///
@@ -90,6 +93,7 @@ impl Parameters {
             None => Mode::Seed(IntradayScope::MissingSessions),
             Some("scan") => Mode::Scan,
             Some("repair") => Mode::Repair,
+            Some("all") => Mode::Seed(IntradayScope::WholeMarket),
             Some(raw) => Mode::Seed(IntradayScope::Symbols(parse_symbols(raw)?)),
         };
 
@@ -217,7 +221,8 @@ async fn run(
 
     let massive = massive.expect("every mode that fetches builds a client above");
     let symbols = match &scope {
-        IntradayScope::MissingSessions => "the screened universe".to_string(),
+        IntradayScope::MissingSessions => "every name, absent sessions only".to_string(),
+        IntradayScope::WholeMarket => "every name, every session".to_string(),
         IntradayScope::Symbols(symbols) => symbols
             .iter()
             .map(Ticker::as_str)
@@ -448,6 +453,36 @@ mod tests {
         };
         let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
         assert_eq!(named, vec!["SCAN"]);
+    }
+
+    /// `all` is what widens the archive past what any screen would have admitted, and `ALL` is a
+    /// plausible ticker, so the same exact-match rule has to hold for it as for `scan`.
+    #[test]
+    fn test_all_widens_the_archive_and_its_uppercase_is_a_ticker() {
+        let parameters = Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            " all ",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parameters.mode,
+            Mode::Seed(IntradayScope::WholeMarket)
+        ));
+
+        let parameters = Parameters::parse(&arguments(&[
+            "2026-08-01",
+            "2026-08-20",
+            "five_minute",
+            "ALL",
+        ]))
+        .unwrap();
+        let Mode::Seed(IntradayScope::Symbols(symbols)) = parameters.mode else {
+            panic!("an uppercase name must not widen the archive");
+        };
+        let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
+        assert_eq!(named, vec!["ALL"]);
     }
 
     #[test]
