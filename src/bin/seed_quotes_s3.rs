@@ -10,29 +10,36 @@ use tracing::{error, info};
 use fund::common::alpaca::{AlpacaCredentials, DataFeed, MarketDataClient, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::types::{LiquidityFloor, QuoteSummary, SessionDate, Ticker};
-use fund::data::archive;
+use fund::data::archive::{self, QuoteScope};
 use fund::data::calendar::TradingCalendar;
 use fund::data::quotes;
 
-const USAGE: &str = "Usage: seed_quotes_s3 START_DATE END_DATE [STRIDE [SYMBOLS]]\n\
+const USAGE: &str = "Usage: seed_quotes_s3 START_DATE END_DATE [STRIDE [SYMBOLS [MODE]]]\n\
                      Dates are Eastern calendar dates, inclusive: YYYY-MM-DD.\n\
                      STRIDE samples every Nth trading session from START_DATE (default 1).\n\
                      A stride that is a multiple of 5 samples one weekday forever; 21 does not.\n\
                      SYMBOLS is a comma-separated list, and naming it requires naming STRIDE too.\n\
-                     Naming symbols measures rather than archives: it prints what those names read\n\
-                     and writes nothing, because a partition holding only them would read as a\n\
-                     complete session to the next pass.";
+                     MODE applies only with SYMBOLS, and is one of two reserved lowercase words:\n\
+                       measure  print what those names read and write nothing (the default)\n\
+                       repair   fold them into the sessions that already have a partition\n\
+                     A repair never creates a partition: one holding only the named symbols would\n\
+                     read as a complete session to every later pass.";
 
 /// Sessions between samples unless told otherwise, which is every session.
 const DEFAULT_STRIDE: usize = 1;
 
-/// What the run does, which the `SYMBOLS` argument selects.
+/// What the run does, which the `SYMBOLS` and `MODE` arguments select.
+///
+/// `Measure` is the default for a named symbol list rather than `Repair`, because the safe reading
+/// of "I named some symbols" is "show me these", and writing is the irreversible half.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// Fold the screened universe for every sampled session and write both cadences.
     Archive,
     /// Fold only these names and print what they read, touching no partition.
     Measure(BTreeSet<Ticker>),
+    /// Fold only these names into the sampled sessions that already have a partition.
+    Repair(BTreeSet<Ticker>),
 }
 
 struct Parameters {
@@ -44,15 +51,20 @@ struct Parameters {
 
 impl Parameters {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (start, end, stride, symbols) = match arguments {
+        // `named` pairs the symbol list with its mode, because a mode without symbols is not a
+        // state the arguments can express and should not be a branch anyone has to read.
+        let (start, end, stride, named) = match arguments {
             [start, end] => (start, end, None, None),
             [start, end, stride] => (start, end, Some(stride), None),
             // Positional after the stride, so measuring named symbols means stating the stride
             // rather than having it inferred from an argument that could be either.
-            [start, end, stride, symbols] => (start, end, Some(stride), Some(symbols)),
+            [start, end, stride, symbols] => (start, end, Some(stride), Some((symbols, None))),
+            [start, end, stride, symbols, mode] => {
+                (start, end, Some(stride), Some((symbols, Some(mode))))
+            }
             _ => {
                 return Err(format!(
-                    "Expected two dates, an optional stride and an optional symbol list\n{USAGE}"
+                    "Expected two dates, an optional stride, symbol list and mode\n{USAGE}"
                 ))
             }
         };
@@ -74,9 +86,21 @@ impl Parameters {
                 })?,
         };
 
-        let mode = match symbols.map(|raw| raw.trim()) {
+        let mode = match named {
             None => Mode::Archive,
-            Some(raw) => Mode::Measure(parse_symbols(raw)?),
+            Some((symbols, mode)) => {
+                let symbols = parse_symbols(symbols)?;
+                // Trimmed before matching, so a padded mode word is not read as an unknown one.
+                match mode.map(|raw| raw.trim()) {
+                    None | Some("measure") => Mode::Measure(symbols),
+                    Some("repair") => Mode::Repair(symbols),
+                    Some(other) => {
+                        return Err(format!(
+                            "MODE must be measure or repair, got {other:?}\n{USAGE}"
+                        ))
+                    }
+                }
+            }
         };
 
         Ok(Self {
@@ -160,7 +184,9 @@ async fn main() {
             // Non-zero on an incomplete pass, because the partition it wrote reads as complete to
             // everything downstream and the exit code is the only signal automation sees.
             if summary.symbols_failed > 0 || !summary.sessions_failed.is_empty() {
-                eprintln!("Incomplete: re-run the affected sessions to fill the missing symbols");
+                eprintln!(
+                    "Incomplete: re-run the affected sessions with the missing symbols and `repair`"
+                );
                 1
             } else {
                 0
@@ -205,28 +231,29 @@ async fn run(
         "Sampled the sessions to fold"
     );
 
-    match &parameters.mode {
+    let scope = match &parameters.mode {
         Mode::Measure(symbols) => {
             measure(&market_data, &calendar, &sampled, symbols).await;
-            Ok(None)
+            return Ok(None);
         }
-        Mode::Archive => {
-            let bucket = std::env::var("AWS_S3_BUCKET_NAME")
-                .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
-            let s3_client = fund::common::aws::s3_client().await;
-            Ok(Some(
-                archive::archive_quote_sessions(
-                    &s3_client,
-                    &market_data,
-                    &calendar,
-                    &bucket,
-                    &sampled,
-                    LiquidityFloor::CURRENT,
-                )
-                .await?,
-            ))
-        }
-    }
+        Mode::Archive => QuoteScope::ScreenedUniverse(LiquidityFloor::CURRENT),
+        Mode::Repair(symbols) => QuoteScope::Symbols(symbols.clone()),
+    };
+
+    let bucket = std::env::var("AWS_S3_BUCKET_NAME")
+        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
+    let s3_client = fund::common::aws::s3_client().await;
+    Ok(Some(
+        archive::archive_quote_sessions(
+            &s3_client,
+            &market_data,
+            &calendar,
+            &bucket,
+            &sampled,
+            &scope,
+        )
+        .await?,
+    ))
 }
 
 /// Folds the named symbols and prints their session figures, writing nothing.
@@ -344,6 +371,63 @@ mod tests {
         };
         assert_eq!(symbols.len(), 2, "lowercase is normalized, not rejected");
         assert!(symbols.contains(&Ticker::new("CBOE").unwrap()));
+    }
+
+    /// Writing is the irreversible half, so it must be asked for by name. A run that meant to
+    /// measure and silently repaired instead would rewrite partitions across a whole window.
+    #[test]
+    fn test_repairing_must_be_asked_for_explicitly() {
+        let measured = Parameters::parse(&arguments(&["2026-08-03", "2026-08-21", "21", "AAPL"]))
+            .expect("symbols without a mode parse");
+        assert!(
+            matches!(measured.mode, Mode::Measure(_)),
+            "the safe default"
+        );
+
+        let explicit = Parameters::parse(&arguments(&[
+            "2026-08-03",
+            "2026-08-21",
+            "21",
+            "AAPL",
+            " repair ",
+        ]))
+        .expect("a trimmed mode word parses");
+        assert!(matches!(explicit.mode, Mode::Repair(_)));
+
+        assert!(
+            Parameters::parse(&arguments(&[
+                "2026-08-03",
+                "2026-08-21",
+                "21",
+                "AAPL",
+                "Repair"
+            ]))
+            .is_err(),
+            "the words are lowercase, so an uppercase one is a typo rather than a mode"
+        );
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-03",
+            "2026-08-21",
+            "21",
+            "AAPL",
+            "write"
+        ]))
+        .is_err());
+    }
+
+    /// A mode names what to do with a symbol list, so the two travel together and "a mode with no
+    /// symbols" is not a state the arguments can express. What is left to refuse is a sixth one.
+    #[test]
+    fn test_arguments_past_the_mode_are_refused() {
+        assert!(Parameters::parse(&arguments(&[
+            "2026-08-03",
+            "2026-08-21",
+            "21",
+            "AAPL",
+            "repair",
+            "extra"
+        ]))
+        .is_err());
     }
 
     #[test]
