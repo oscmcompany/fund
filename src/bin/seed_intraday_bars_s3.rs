@@ -162,7 +162,13 @@ async fn main() {
                 summary.bars_written,
                 summary.symbols_failed
             );
-            0
+            // `sessions_without_data` is not a fault here: this pass requests holidays deliberately
+            // and they answer empty, unlike the quote pass, which samples the published calendar.
+            if summary.sessions_failed.is_empty() && summary.symbols_failed == 0 {
+                0
+            } else {
+                1
+            }
         }
         Err(error) => {
             error!(%error, "Seeding the intraday bar archive failed");
