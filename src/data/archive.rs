@@ -1268,10 +1268,30 @@ pub struct QuoteArchiveSummary {
     pub quotes_folded: usize,
 }
 
-/// Folds the quoted book for every session in `sessions` the archive has no summary for.
+/// What a quote pass is for, which decides both the names it folds and the sessions it touches.
+///
+/// The two variants exist because a partition's presence cannot answer whether a *symbol* is in it:
+/// one written while a name's fetch failed, or before that name cleared the screen, reads exactly
+/// like a complete one. So the seeding pass and the repairing pass want opposite session sets.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuoteScope {
+    /// Every name the daily archive screens in, for the sessions that have no summary yet.
+    ScreenedUniverse(LiquidityFloor),
+    /// An explicit set of names, folded only into sessions that *already* have a partition.
+    ///
+    /// Two things this repairs, and the second is the one that recurs: a name whose fetch failed,
+    /// and a name a widened screen now admits. Task 4 replaces the price floor with a spread bound
+    /// and task 6 makes the floor a declared rank — both add names to sessions already seeded, and
+    /// without this each of them would mean refetching whole sessions.
+    Symbols(BTreeSet<Ticker>),
+}
+
+/// Folds the quoted book across `sessions`, per `scope`.
 ///
 /// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
-/// bounded to one session's hours, so there is nothing to gain by holding a chunk of them.
+/// bounded to one session's hours, so there is nothing to gain by holding a chunk of them. That is
+/// also why the never-create rule lands here at session selection rather than at the write, where
+/// [`writable_sessions`] has to enforce it for bars — a session-major pass knows before it fetches.
 ///
 /// Regular hours only, taken from the calendar so an early close is 3.5 hours rather than 6.5. The
 /// overnight book is an order of magnitude wider and would swamp any session mean it entered.
@@ -1281,7 +1301,7 @@ pub async fn archive_quote_sessions(
     calendar: &TradingCalendar,
     bucket: &str,
     sessions: &[SessionDate],
-    floor: LiquidityFloor,
+    scope: &QuoteScope,
 ) -> Result<QuoteArchiveSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
         return Ok(QuoteArchiveSummary::default());
@@ -1294,20 +1314,29 @@ pub async fn archive_quote_sessions(
         *last,
     )
     .await?;
-    let requested: Vec<SessionDate> = sessions
-        .iter()
-        .copied()
-        .filter(|session| !present.contains(session))
-        .collect();
+    let requested = quote_sessions_for(scope, sessions, &present);
 
     info!(
         window_start = %first,
         window_end = %last,
         offered = sessions.len(),
-        present = present.len(),
+        already_summarized = present.len(),
         requested = requested.len(),
+        repairing = matches!(scope, QuoteScope::Symbols(_)),
         "Planned a quote pass"
     );
+    if let QuoteScope::Symbols(symbols) = scope {
+        let unsummarized = sessions.len() - requested.len();
+        if unsummarized > 0 {
+            // Named rather than counted silently: a repair that quietly skips most of its window
+            // looks identical to one that had nothing to do.
+            warn!(
+                unsummarized,
+                symbols = symbols.len(),
+                "Some offered sessions have no quote partition to repair; seed them first"
+            );
+        }
+    }
 
     let mut summary = QuoteArchiveSummary {
         sessions_requested: requested.len(),
@@ -1320,7 +1349,7 @@ pub async fn archive_quote_sessions(
             calendar,
             bucket,
             session,
-            floor,
+            scope,
             &mut summary,
         )
         .await?;
@@ -1347,7 +1376,28 @@ pub async fn archive_quote_sessions(
     Ok(summary)
 }
 
-/// One session: screen the universe, fold every name's book, write both cadences.
+/// The sessions a pass touches, which the scope decides — and the two want opposite sets.
+///
+/// Seeding takes the sessions with no summary. A repair takes exactly those that have one: it
+/// fetches only the names it was given, so a partition it created would hold those and nothing
+/// else, and read as complete to every later pass. Split out from the S3 call so the rule that
+/// prevents that is testable without a bucket.
+fn quote_sessions_for(
+    scope: &QuoteScope,
+    sessions: &[SessionDate],
+    present: &BTreeSet<SessionDate>,
+) -> Vec<SessionDate> {
+    sessions
+        .iter()
+        .copied()
+        .filter(|session| match scope {
+            QuoteScope::ScreenedUniverse(_) => !present.contains(session),
+            QuoteScope::Symbols(_) => present.contains(session),
+        })
+        .collect()
+}
+
+/// One session: derive the universe from the scope, fold every name's book, write both cadences.
 #[allow(clippy::too_many_arguments)]
 async fn archive_quote_session(
     s3_client: &S3Client,
@@ -1355,7 +1405,7 @@ async fn archive_quote_session(
     calendar: &TradingCalendar,
     bucket: &str,
     session: SessionDate,
-    floor: LiquidityFloor,
+    scope: &QuoteScope,
     summary: &mut QuoteArchiveSummary,
 ) -> Result<(), ArchiveError> {
     let Some((open, close)) = quotes::trading_hours(calendar, session) else {
@@ -1365,15 +1415,23 @@ async fn archive_quote_session(
         return Ok(());
     };
 
-    let daily_key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
-    let Some(daily) = read_partition(s3_client, bucket, &daily_key).await? else {
-        // Left unwritten so a later pass retries, rather than summarized against a universe that
-        // never included whatever traded only on the session the daily archive is missing.
-        warn!(%session, "No daily partition to screen against; leaving the session unsummarized");
-        summary.sessions_without_data += 1;
-        return Ok(());
+    let universe = match scope {
+        QuoteScope::ScreenedUniverse(floor) => {
+            let key =
+                date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
+            let Some(daily) = read_partition(s3_client, bucket, &key).await? else {
+                // Left unwritten so a later pass retries, rather than summarized against a universe
+                // that never included whatever traded only on the session the daily archive lacks.
+                warn!(%session, "No daily partition to screen against; leaving the session unsummarized");
+                summary.sessions_without_data += 1;
+                return Ok(());
+            };
+            screen_partition(daily, *floor)?
+        }
+        // Taken as given rather than intersected with the daily partition: a name that did not
+        // trade answers with no quotes and produces no summary, which is the same outcome.
+        QuoteScope::Symbols(symbols) => symbols.clone(),
     };
-    let universe = screen_partition(daily, floor)?;
     if universe.is_empty() {
         summary.sessions_without_data += 1;
         return Ok(());
@@ -1836,6 +1894,33 @@ mod tests {
             );
             assert_eq!(date_from_partitioned_key(&quotes), Some(date));
         }
+    }
+
+    /// The two scopes want opposite session sets, and getting it backwards is the defect #1102 was
+    /// written for: a repair fetches only the names it was given, so a partition it created would
+    /// hold those and nothing else, and read as a complete session to every later pass.
+    #[test]
+    fn test_a_repair_writes_only_where_a_partition_already_exists() {
+        let sessions = [
+            session(2026, 8, 17),
+            session(2026, 8, 18),
+            session(2026, 8, 19),
+        ];
+        let present: BTreeSet<SessionDate> = [session(2026, 8, 18)].into_iter().collect();
+
+        let seeding = QuoteScope::ScreenedUniverse(LiquidityFloor::CURRENT);
+        let repairing = QuoteScope::Symbols(tickers(&["AAPL"]));
+
+        assert_eq!(
+            quote_sessions_for(&seeding, &sessions, &present),
+            vec![session(2026, 8, 17), session(2026, 8, 19)],
+            "seeding takes the sessions with nothing in them"
+        );
+        assert_eq!(
+            quote_sessions_for(&repairing, &sessions, &present),
+            vec![session(2026, 8, 18)],
+            "repairing takes exactly the sessions that already have one"
+        );
     }
 
     /// Two cadences of one session must not collide, which is the whole reason the segment exists.
