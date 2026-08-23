@@ -171,7 +171,8 @@ pub struct ArchiveSummary {
     pub sessions_without_data: usize,
     /// Sessions whose fetch or write failed, carried rather than fatal.
     ///
-    /// A caller that treats a non-empty list as success will report a pass that wrote nothing.
+    /// Treat a non-empty list as an incomplete pass: `Ok` means the pass ran to the end, not that
+    /// every requested session was written.
     pub sessions_failed: Vec<SessionDate>,
     /// Bars written across every partition this pass touched.
     pub bars_written: usize,
@@ -434,7 +435,12 @@ async fn archive_chunk(
                 warn!(key, attempts, %session, "Partition contended; the next pass will retry it");
                 summary.sessions_failed.push(session);
             }
-            Err(error) => return Err(error),
+            // Carried like contention above, so one session's fault costs that session rather than
+            // every session after it. The pass is only complete if `sessions_failed` is empty.
+            Err(error) => {
+                warn!(%error, %session, "Partition write failed; this session was not archived");
+                summary.sessions_failed.push(session);
+            }
         }
     }
     Ok(())
@@ -821,9 +827,10 @@ async fn write_partitions(
                 summary.sessions_failed.push(session);
             }
             // Carried for the same reason contention is: one session's write says nothing about the
-            // next one's, and a systemic fault has already failed the chunk's universe read.
+            // next one's. A fault that breaks writes but not reads is carried too and costs the rest
+            // of the pass, which `sessions_failed` reports rather than hides.
             Ok((session, _, Err(error))) => {
-                warn!(%error, %session, "Partition write failed; the next pass will retry it");
+                warn!(%error, %session, "Partition write failed; this session was not archived");
                 summary.sessions_failed.push(session);
             }
             Err(error) => {
@@ -1262,7 +1269,10 @@ pub struct QuoteArchiveSummary {
     pub sessions_written: usize,
     /// Sessions that could not be summarized: a holiday, or one the daily archive cannot describe.
     pub sessions_without_data: usize,
-    /// Sessions whose write lost a race, carried rather than fatal.
+    /// Sessions whose write failed, carried rather than fatal.
+    ///
+    /// Treat a non-empty list as an incomplete pass: `Ok` means the pass ran to the end, not that
+    /// every requested session was summarized.
     pub sessions_failed: Vec<SessionDate>,
     /// Summary rows written across both cadences.
     pub summaries_written: usize,
@@ -1567,13 +1577,15 @@ async fn write_quote_partitions(
         .await
         {
             Ok(()) => written += rows.len(),
+            // Both arms leave the session unsummarized at this cadence. A scope that skips sessions
+            // already present will not return to it, so re-running is the operator's to decide.
             Err(ArchiveError::Contended { key, attempts }) => {
-                warn!(key, attempts, %session, "Quote partition contended; the next pass will retry it");
+                warn!(key, attempts, %session, "Quote partition contended; this session was not summarized");
                 summary.sessions_failed.push(session);
                 return Ok(());
             }
             Err(error) => {
-                warn!(%error, %session, "Quote partition write failed; the next pass will retry it");
+                warn!(%error, %session, "Quote partition write failed; this session was not summarized");
                 summary.sessions_failed.push(session);
                 return Ok(());
             }
