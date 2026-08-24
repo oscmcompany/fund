@@ -572,7 +572,9 @@ impl std::fmt::Display for Scope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.names {
             NameSelection::WholeMarket => write!(formatter, "every name")?,
-            NameSelection::Screened(_) => write!(formatter, "the screened universe")?,
+            // The floor, not just the word: two passes run at different floors are different passes
+            // and a log field that cannot tell them apart is the reason this exists.
+            NameSelection::Screened(floor) => write!(formatter, "the screened universe ({floor})")?,
             NameSelection::Named(symbols) => {
                 let shown: Vec<&str> = symbols
                     .iter()
@@ -2115,7 +2117,7 @@ mod tests {
                 SessionSelection::Every
             )
             .to_string(),
-            "the screened universe, every session"
+            "the screened universe ($10 close on $50000000 traded), every session"
         );
         assert_eq!(
             scope(
@@ -2149,9 +2151,15 @@ mod tests {
         ];
         let present: BTreeSet<SessionDate> = [session(2026, 8, 18)].into_iter().collect();
 
+        // The literals, not `sessions`: an expectation read off the fixture under test moves with
+        // it, so a fourth session added here would keep passing without meaning to.
         assert_eq!(
             sessions_for(SessionSelection::Every, &sessions, &present),
-            sessions.to_vec()
+            vec![
+                session(2026, 8, 17),
+                session(2026, 8, 18),
+                session(2026, 8, 19)
+            ]
         );
     }
 
