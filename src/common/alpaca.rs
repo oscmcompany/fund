@@ -2529,14 +2529,14 @@ impl MarketDataClient {
     /// Ticks arrive in ascending time order, which every time-weighted fold downstream depends on,
     /// and unusable books are refused here so `accept` only ever sees a quote worth weighing.
     ///
-    /// `asof` is the day whose mapping resolves `ticker`, and must be the session being fetched:
+    /// `as_of` is the day whose mapping resolves `ticker`, and must be the session being fetched:
     /// the default is today, which would read a historical window through today's symbol table.
     pub async fn fetch_quotes<F>(
         &self,
         ticker: &Ticker,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-        asof: NaiveDate,
+        as_of: NaiveDate,
         mut accept: F,
     ) -> Result<QuoteFetch, ClientError>
     where
@@ -2545,7 +2545,7 @@ impl MarketDataClient {
         let url = format!("{}/v2/stocks/quotes", self.base_url);
         let start_text = start.to_rfc3339();
         let end_text = end.to_rfc3339();
-        let asof_text = asof.to_string();
+        let as_of_text = as_of.to_string();
         let page_size = QUOTES_PAGE_SIZE.to_string();
         let feed = self.feed.as_str();
 
@@ -2564,7 +2564,7 @@ impl MarketDataClient {
                 ("sort", "asc"),
                 // Stated for the same reason: the default is today, and a ticker reassigned since
                 // the session would resolve to the company holding it now.
-                ("asof", asof_text.as_str()),
+                ("asof", as_of_text.as_str()),
             ];
             if let Some(token) = page_token.as_deref() {
                 query.push(("page_token", token));
