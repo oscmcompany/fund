@@ -2562,8 +2562,7 @@ impl MarketDataClient {
                 // Stated rather than inherited. The fold weighs each quote by the time until the
                 // next one, so a descending page would silently weigh every tick at zero.
                 ("sort", "asc"),
-                // Stated for the same reason: the default is today, and a ticker reassigned since
-                // the session would resolve to the company holding it now.
+                // The default is today, so a reassigned ticker resolves to its current owner.
                 ("asof", as_of_text.as_str()),
             ];
             if let Some(token) = page_token.as_deref() {
