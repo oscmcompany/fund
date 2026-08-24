@@ -80,7 +80,15 @@ axum = "0.8"
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"
+# `test-util` supplies the scripted HTTP client that lets `data::archive` be tested at all: the
+# module is almost entirely S3 round trips and every other test in it is a pure-function test.
+# This crate rather than `aws-smithy-runtime`, whose re-export is the `http` 0.x variant.
+aws-smithy-http-client = { version = "1.2", features = ["test-util"] }
+aws-smithy-types = "1.6"
 http = "1"
+# A real decoder rather than undoing `%3D` by hand: RFC 3986 allows either hex case, so a scripted
+# request that stops matching would make the test pass while injecting nothing.
+percent-encoding = "2.3"
 mockito = "1.7"
 serial_test = "4.0"
 tower = { version = "0.5", features = ["util"] }

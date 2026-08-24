@@ -1876,12 +1876,121 @@ async fn put_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use aws_smithy_types::body::SdkBody;
     use chrono::NaiveDate;
+    use percent_encoding::percent_decode_str;
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(
             NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid"),
         )
+    }
+
+    /// An S3 client answering from `respond` instead of the network, given the method and the key.
+    ///
+    /// Dispatched on the request rather than replayed in order, because `write_partitions` runs
+    /// [`INTRADAY_WRITE_CONCURRENCY`] writes at once and an ordered script would race them.
+    fn scripted_s3_client(
+        respond: impl Fn(&http::Method, &str) -> http::Response<SdkBody> + Send + Sync + 'static,
+    ) -> S3Client {
+        let http_client = infallible_client_fn(move |request| {
+            let method = request.method().clone();
+            // Decoded rather than matched against: S3 percent-encodes the `=` in every hive
+            // segment, so a key built by `date_partitioned_key` never matches the wire form.
+            let key = percent_decode_str(request.uri().path()).decode_utf8_lossy();
+            respond(&method, &key)
+        });
+        S3Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test-key",
+                    "test-secret",
+                    None,
+                    None,
+                    "test",
+                ))
+                .http_client(http_client)
+                .build(),
+        )
+    }
+
+    /// Absent, so `write_merged` takes its `Precondition::Absent` path and writes without a merge.
+    fn no_such_key() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(404)
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchKey</Code><Message>absent</Message></Error>",
+            ))
+            .expect("a canned response must build")
+    }
+
+    fn one_bar(ticker_symbol: &str, at: SessionDate) -> EquityBar {
+        EquityBar::new(
+            Ticker::new(ticker_symbol).expect("a test ticker must parse"),
+            BarInterval::FiveMinute,
+            at.midnight(),
+            100.0,
+            101.0,
+            99.0,
+            100.5,
+            1_000,
+            None,
+            None,
+        )
+        .expect("a coherent candle must construct")
+    }
+
+    /// One session's write failing must cost that session and no other.
+    ///
+    /// The regression test #1106 could not have: before it, any non-contention error returned from
+    /// `write_partitions`, so a single transient fault discarded every session after it — which is
+    /// what ended a five-hour whole-market pass four fifths of the way through.
+    #[tokio::test]
+    async fn test_a_failed_partition_write_costs_only_its_own_session() {
+        let doomed = session(2026, 9, 3);
+        let doomed_key =
+            date_partitioned_key(&bar_archive_prefix(BarInterval::FiveMinute), doomed.date());
+        let client = scripted_s3_client(move |method, key| {
+            if method == http::Method::PUT && key.ends_with(&doomed_key) {
+                http::Response::builder()
+                    .status(500)
+                    .body(SdkBody::from("<Error><Code>InternalError</Code></Error>"))
+                    .expect("a canned response must build")
+            } else if method == http::Method::PUT {
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .expect("a canned response must build")
+            } else {
+                no_such_key()
+            }
+        });
+
+        // More partitions than [`INTRADAY_WRITE_CONCURRENCY`], so work is still queued when the
+        // failure lands — a defect that stopped scheduling the rest would leave the count short.
+        let partitions: Vec<(SessionDate, Vec<EquityBar>)> = (1..=20)
+            .map(|day| session(2026, 9, day))
+            .map(|at| (at, vec![one_bar("AAPL", at)]))
+            .collect();
+
+        let mut summary = ArchiveSummary::default();
+        let outcome = write_partitions(
+            &client,
+            "test-bucket",
+            BarInterval::FiveMinute,
+            partitions,
+            &mut summary,
+        )
+        .await;
+
+        assert!(outcome.is_ok(), "one bad session must not end the pass");
+        assert_eq!(summary.sessions_written, 19);
+        // The literal, not `doomed`: an expectation carried from the fixture moves with it, so
+        // relocating the scripted failure would keep this passing without meaning to.
+        assert_eq!(summary.sessions_failed, vec![session(2026, 9, 3)]);
     }
 
     /// The stored layout, pinned to literals. Everything already written lives at these keys, and a
