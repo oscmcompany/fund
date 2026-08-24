@@ -2528,11 +2528,15 @@ impl MarketDataClient {
     ///
     /// Ticks arrive in ascending time order, which every time-weighted fold downstream depends on,
     /// and unusable books are refused here so `accept` only ever sees a quote worth weighing.
+    ///
+    /// `asof` is the day whose mapping resolves `ticker`, and must be the session being fetched:
+    /// the default is today, which would read a historical window through today's symbol table.
     pub async fn fetch_quotes<F>(
         &self,
         ticker: &Ticker,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        asof: NaiveDate,
         mut accept: F,
     ) -> Result<QuoteFetch, ClientError>
     where
@@ -2541,6 +2545,7 @@ impl MarketDataClient {
         let url = format!("{}/v2/stocks/quotes", self.base_url);
         let start_text = start.to_rfc3339();
         let end_text = end.to_rfc3339();
+        let asof_text = asof.to_string();
         let page_size = QUOTES_PAGE_SIZE.to_string();
         let feed = self.feed.as_str();
 
@@ -2557,6 +2562,9 @@ impl MarketDataClient {
                 // Stated rather than inherited. The fold weighs each quote by the time until the
                 // next one, so a descending page would silently weigh every tick at zero.
                 ("sort", "asc"),
+                // Stated for the same reason: the default is today, and a ticker reassigned since
+                // the session would resolve to the company holding it now.
+                ("asof", asof_text.as_str()),
             ];
             if let Some(token) = page_token.as_deref() {
                 query.push(("page_token", token));
@@ -4429,7 +4437,9 @@ mod tests {
         let (start, end) = quote_window();
         let mut ticks = Vec::new();
         let fetch = client(base_url)
-            .fetch_quotes(&ticker("AAPL"), start, end, |tick| ticks.push(tick))
+            .fetch_quotes(&ticker("AAPL"), start, end, date(2026, 8, 20), |tick| {
+                ticks.push(tick)
+            })
             .await;
         (ticks, fetch)
     }
@@ -4481,6 +4491,36 @@ mod tests {
         assert_eq!(ticks[0].bid_size(), 1);
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    /// The default resolves a ticker through today's symbol table, so a name reassigned since the
+    /// session would answer with the company holding it now rather than the one that traded.
+    #[tokio::test]
+    async fn test_quotes_are_resolved_as_of_the_session_rather_than_today() {
+        let mut server = mockito::Server::new_async().await;
+        let page = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "asof".into(),
+                "2026-08-20".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"quotes":{"AAPL":[
+                    {"t":"2026-08-20T13:30:00Z","bp":100.00,"ap":100.05,"bs":1,"as":2}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let (ticks, fetch) = collect_quotes(server.url()).await;
+
+        assert_eq!(fetch.expect("the page must parse").received, 1);
+        assert_eq!(ticks.len(), 1);
+        // The mock only answers a request carrying the session's own date, so reaching this line
+        // is the assertion; `assert_async` names the failure when it does not.
+        page.assert_async().await;
     }
 
     /// A crossed consolidated book is ordinary around the open — 20 of AAPL's first 30,126 quotes

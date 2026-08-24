@@ -341,7 +341,7 @@ pub async fn fold_session(
         )));
     };
     let fetch = market_data
-        .fetch_quotes(ticker, open, close, |tick| fold.push(tick))
+        .fetch_quotes(ticker, open, close, session.date(), |tick| fold.push(tick))
         .await?;
     Ok((fold.finish(), fetch))
 }
