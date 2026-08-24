@@ -86,6 +86,9 @@ aws-credential-types = "1.2.14"
 aws-smithy-http-client = { version = "1.2", features = ["test-util"] }
 aws-smithy-types = "1.6"
 http = "1"
+# A real decoder rather than undoing `%3D` by hand: RFC 3986 allows either hex case, so a scripted
+# request that stops matching would make the test pass while injecting nothing.
+percent-encoding = "2.3"
 mockito = "1.7"
 serial_test = "4.0"
 tower = { version = "0.5", features = ["util"] }

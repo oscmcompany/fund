@@ -2873,6 +2873,7 @@ dependencies = [
  "http 1.5.0",
  "mockito",
  "ndarray 0.16.1",
+ "percent-encoding",
  "polars",
  "rand 0.10.2",
  "reqwest 0.13.4",

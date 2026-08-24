@@ -1879,6 +1879,7 @@ mod tests {
     use aws_smithy_http_client::test_util::infallible_client_fn;
     use aws_smithy_types::body::SdkBody;
     use chrono::NaiveDate;
+    use percent_encoding::percent_decode_str;
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(
@@ -1895,9 +1896,9 @@ mod tests {
     ) -> S3Client {
         let http_client = infallible_client_fn(move |request| {
             let method = request.method().clone();
-            // Undone rather than matched against: S3 percent-encodes the `=` in every hive
+            // Decoded rather than matched against: S3 percent-encodes the `=` in every hive
             // segment, so a key built by `date_partitioned_key` never matches the wire form.
-            let key = request.uri().path().replace("%3D", "=");
+            let key = percent_decode_str(request.uri().path()).decode_utf8_lossy();
             respond(&method, &key)
         });
         S3Client::from_conf(
@@ -1949,7 +1950,7 @@ mod tests {
     /// what ended a five-hour whole-market pass four fifths of the way through.
     #[tokio::test]
     async fn test_a_failed_partition_write_costs_only_its_own_session() {
-        let doomed = session(2026, 8, 19);
+        let doomed = session(2026, 9, 3);
         let doomed_key =
             date_partitioned_key(&bar_archive_prefix(BarInterval::FiveMinute), doomed.date());
         let client = scripted_s3_client(move |method, key| {
@@ -1968,15 +1969,12 @@ mod tests {
             }
         });
 
-        let partitions: Vec<(SessionDate, Vec<EquityBar>)> = [
-            session(2026, 8, 18),
-            doomed,
-            session(2026, 8, 20),
-            session(2026, 8, 21),
-        ]
-        .into_iter()
-        .map(|at| (at, vec![one_bar("AAPL", at)]))
-        .collect();
+        // More partitions than [`INTRADAY_WRITE_CONCURRENCY`], so work is still queued when the
+        // failure lands — a defect that stopped scheduling the rest would leave the count short.
+        let partitions: Vec<(SessionDate, Vec<EquityBar>)> = (1..=20)
+            .map(|day| session(2026, 9, day))
+            .map(|at| (at, vec![one_bar("AAPL", at)]))
+            .collect();
 
         let mut summary = ArchiveSummary::default();
         let outcome = write_partitions(
@@ -1989,8 +1987,10 @@ mod tests {
         .await;
 
         assert!(outcome.is_ok(), "one bad session must not end the pass");
-        assert_eq!(summary.sessions_written, 3);
-        assert_eq!(summary.sessions_failed, vec![doomed]);
+        assert_eq!(summary.sessions_written, 19);
+        // The literal, not `doomed`: an expectation carried from the fixture moves with it, so
+        // relocating the scripted failure would keep this passing without meaning to.
+        assert_eq!(summary.sessions_failed, vec![session(2026, 9, 3)]);
     }
 
     /// The stored layout, pinned to literals. Everything already written lives at these keys, and a
