@@ -485,35 +485,148 @@ fn is_transient(error: &crate::common::massive::MassiveError) -> bool {
     }
 }
 
-/// The sessions an intraday pass must request: those the archive does not already hold.
+/// Which names a pass folds, and with it whether that pass may create a partition.
 ///
-/// No correction window, unlike [`sessions_to_request`]. An intraday bar is not restated after the
-/// close the way a daily one is, and re-fetching a month to learn that costs the whole universe in
-/// requests rather than one grouped call.
-fn intraday_sessions_to_request(
-    expected: &[SessionDate],
+/// Creation is not an axis of its own: only [`NameSelection::Named`] cannot create one, because a
+/// partition holding a named handful reads as complete to every later pass. The other two derive
+/// their universe from the daily partition for the session, so what they write is whole.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NameSelection {
+    /// Every name the daily partition holds, unscreened.
+    ///
+    /// The only way a name outside the screen reaches the archive at all: the screen decides what
+    /// gets fetched, so a spread it excluded cannot be read back off what was written.
+    WholeMarket,
+    /// The names in the daily partition that clear a liquidity floor.
+    Screened(LiquidityFloor),
+    /// An explicit set, taken as given rather than intersected with the daily partition.
+    ///
+    /// The partition merge keys on `(ticker, bar_interval, timestamp)`, so folding into a session
+    /// that already holds other names adds these and leaves those untouched.
+    Named(BTreeSet<Ticker>),
+}
+
+/// Which of the offered sessions a pass touches, judged on whether a partition is already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSelection {
+    /// Only the sessions with no partition, which is what seeding wants.
+    ///
+    /// No correction window, unlike [`sessions_to_request`] on the daily path: an intraday bar is
+    /// not restated after the close the way a daily one is, and re-fetching a month to learn that
+    /// costs the whole universe in requests rather than one grouped call.
+    Absent,
+    /// Only the sessions that already have one, which is what repairing wants.
+    ///
+    /// Presence cannot answer whether a *symbol* is there: a partition written while one name's
+    /// fetch failed reads exactly like a complete one, so this is the set a repair works over.
+    Present,
+    /// Every offered session, which is the only way a partition already written gets widened.
+    Every,
+}
+
+/// What a pass is for: which names, across which sessions.
+///
+/// Private fields because the two axes are not free of each other — [`Scope::new`] is the one place
+/// the pair is judged, and a value in scope is proof the pair was allowed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scope {
+    names: NameSelection,
+    sessions: SessionSelection,
+}
+
+/// Why a pair of axes is not a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeError {
+    /// A named set anywhere but [`SessionSelection::Present`].
+    #[error("a named symbol set may only touch sessions that already have a partition")]
+    NamedSetWouldCreate,
+}
+
+impl Scope {
+    /// Refuses a named set outside [`SessionSelection::Present`].
+    ///
+    /// A named pass fetches only the names it was given, so a session it answered where no
+    /// partition existed would hold that handful and read as complete to every later pass.
+    pub fn new(names: NameSelection, sessions: SessionSelection) -> Result<Self, ScopeError> {
+        if matches!(names, NameSelection::Named(_)) && sessions != SessionSelection::Present {
+            return Err(ScopeError::NamedSetWouldCreate);
+        }
+        Ok(Self { names, sessions })
+    }
+
+    /// Whether this pass may write a partition where none exists.
+    ///
+    /// Derived rather than stored, which is what stops it disagreeing with [`Scope::new`].
+    fn may_create(&self) -> bool {
+        !matches!(self.names, NameSelection::Named(_))
+    }
+}
+
+/// Names printed before a scope elides the rest.
+///
+/// A scan-driven repair names thousands of symbols, and printing the whole list produced a
+/// multi-kilobyte log line that buried the fields beside it.
+const SCOPE_NAMES_SHOWN: usize = 12;
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.names {
+            NameSelection::WholeMarket => write!(formatter, "every name")?,
+            NameSelection::Screened(_) => write!(formatter, "the screened universe")?,
+            NameSelection::Named(symbols) => {
+                let shown: Vec<&str> = symbols
+                    .iter()
+                    .take(SCOPE_NAMES_SHOWN)
+                    .map(Ticker::as_str)
+                    .collect();
+                write!(formatter, "{}", shown.join(","))?;
+                let elided = symbols.len().saturating_sub(shown.len());
+                if elided > 0 {
+                    write!(formatter, " and {elided} more")?;
+                }
+            }
+        }
+        let sessions = match self.sessions {
+            SessionSelection::Absent => "absent sessions only",
+            SessionSelection::Present => "sessions already present",
+            SessionSelection::Every => "every session",
+        };
+        write!(formatter, ", {sessions}")
+    }
+}
+
+/// The sessions a pass touches, which [`SessionSelection`] decides.
+///
+/// Split out from the S3 listing so the rule is testable without a bucket. Seeding and repairing
+/// want opposite sets, and getting that backwards is the defect #1102 was written for.
+fn sessions_for(
+    selection: SessionSelection,
+    offered: &[SessionDate],
     present: &BTreeSet<SessionDate>,
 ) -> Vec<SessionDate> {
-    expected
+    offered
         .iter()
         .copied()
-        .filter(|session| !present.contains(session))
+        .filter(|session| match selection {
+            SessionSelection::Absent => !present.contains(session),
+            SessionSelection::Present => present.contains(session),
+            SessionSelection::Every => true,
+        })
         .collect()
 }
 
-/// The sessions a pass requests, which the scope decides.
+/// The names one daily partition contributes to a pass's universe.
 ///
-/// A symbol repair asks for the whole window. The set difference above answers "is there a
-/// partition here", and a partition missing one name answers yes — so filtering by it would request
-/// nothing at all and report success.
-fn intraday_sessions_for(
-    scope: &IntradayScope,
-    expected: &[SessionDate],
-    present: &BTreeSet<SessionDate>,
-) -> Vec<SessionDate> {
-    match scope {
-        IntradayScope::MissingSessions => intraday_sessions_to_request(expected, present),
-        IntradayScope::Symbols(_) | IntradayScope::WholeMarket => expected.to_vec(),
+/// A named set comes back as given rather than intersected: a name that did not trade answers with
+/// no data and produces nothing, which is the same outcome as excluding it here.
+fn names_from_partition(
+    names: &NameSelection,
+    daily: DataFrame,
+) -> Result<BTreeSet<Ticker>, ArchiveError> {
+    match names {
+        NameSelection::WholeMarket => partition_tickers(&daily),
+        NameSelection::Screened(floor) => screen_partition(daily, *floor),
+        NameSelection::Named(symbols) => Ok(symbols.clone()),
     }
 }
 
@@ -523,28 +636,6 @@ fn intraday_sessions_for(
 /// roughly twelve a second with no throttling — so this bounds our own concurrency rather than
 /// respecting theirs, and keeps a failure to a handful of symbols rather than the whole chunk.
 const INTRADAY_CONCURRENCY: usize = 8;
-
-/// What an intraday pass is for, and it decides which sessions get requested.
-///
-/// Session presence cannot answer whether a *symbol* is present: a partition written while one
-/// name's fetch failed is indistinguishable from a complete one. So the variants that repair a
-/// symbol have to ignore the set difference that filling a missing session relies on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntradayScope {
-    /// Every name the daily archive holds, for the sessions the archive has no partition for.
-    MissingSessions,
-    /// An explicit set of names, across every session in the window regardless of what is present.
-    ///
-    /// The partition merge keys on `(ticker, bar_interval, timestamp)`, so re-requesting a session
-    /// that already holds other names adds these and leaves those untouched.
-    Symbols(BTreeSet<Ticker>),
-    /// Every name the daily archive holds, across every session in the window.
-    ///
-    /// What [`IntradayScope::MissingSessions`] cannot express: a partition that exists but is
-    /// narrower than the daily archive it was built beside. Unlike a symbol repair this may create
-    /// a partition, because the one it creates is the whole market rather than a named handful.
-    WholeMarket,
-}
 
 /// Fetches and writes intraday partitions across `[window_start, window_end]`, per `scope`.
 ///
@@ -557,16 +648,17 @@ pub async fn archive_intraday_sessions(
     interval: BarInterval,
     window_start: SessionDate,
     window_end: SessionDate,
-    scope: &IntradayScope,
+    scope: &Scope,
 ) -> Result<ArchiveSummary, ArchiveError> {
     let expected = expected_sessions(window_start, window_end);
     let present = present_sessions(s3_client, bucket, interval, window_start, window_end).await?;
-    let requested = intraday_sessions_for(scope, &expected, &present);
+    let requested = sessions_for(scope.sessions, &expected, &present);
 
     info!(
         %window_start,
         %window_end,
         interval = %interval,
+        %scope,
         expected = expected.len(),
         present = present.len(),
         requested = requested.len(),
@@ -613,8 +705,8 @@ pub async fn archive_intraday_sessions(
 
 /// One chunk: derive the universe, fan out over it, then write a partition per session.
 ///
-/// `present` is the sessions the archive already holds a partition for, which a symbol repair needs
-/// in order *not* to write one — see [`writable_sessions`].
+/// `present` is the sessions the archive already holds a partition for, which a named repair needs
+/// in order *not* to write one — see [`writable_session`].
 #[allow(clippy::too_many_arguments)]
 async fn archive_intraday_chunk(
     s3_client: &S3Client,
@@ -622,7 +714,7 @@ async fn archive_intraday_chunk(
     bucket: &str,
     interval: BarInterval,
     chunk: &[SessionDate],
-    scope: &IntradayScope,
+    scope: &Scope,
     present: &BTreeSet<SessionDate>,
     summary: &mut ArchiveSummary,
 ) -> Result<(), ArchiveError> {
@@ -738,7 +830,7 @@ async fn archive_intraday_chunk(
     let mut writable = Vec::new();
     let mut skipped = Vec::new();
     for (session, bars_for_session) in by_session {
-        if writable_sessions(session, scope, &universe.described, present) {
+        if writable_session(session, scope, &universe.described, present) {
             writable.push((session, bars_for_session));
         } else {
             skipped.push(session);
@@ -759,23 +851,15 @@ async fn archive_intraday_chunk(
 /// Whether this pass may write the partition for `session`.
 ///
 /// An undescribed session is refused whatever the scope, because nothing can say what a complete
-/// partition for it would hold. A symbol repair additionally refuses to *create* one: it fetches
-/// only the named symbols, so an absent session needs a whole-market scope instead.
-fn writable_sessions(
+/// partition for it would hold. A named set is refused an absent one too, which the chunk fetch can
+/// still reach: it spans its chunk's whole range, so bars arrive for sessions never requested.
+fn writable_session(
     session: SessionDate,
-    scope: &IntradayScope,
+    scope: &Scope,
     described: &BTreeSet<SessionDate>,
     present: &BTreeSet<SessionDate>,
 ) -> bool {
-    if !described.contains(&session) {
-        return false;
-    }
-    match scope {
-        // Both fetch every name the daily partition holds, so a partition either creates whole or
-        // is merged into whole; neither can leave one that only looks complete.
-        IntradayScope::MissingSessions | IntradayScope::WholeMarket => true,
-        IntradayScope::Symbols(_) => present.contains(&session),
-    }
+    described.contains(&session) && (scope.may_create() || present.contains(&session))
 }
 
 /// Partitions written at once.
@@ -854,7 +938,7 @@ async fn universe_over(
     s3_client: &S3Client,
     bucket: &str,
     sessions: &[SessionDate],
-    scope: &IntradayScope,
+    scope: &Scope,
 ) -> Result<Universe, ArchiveError> {
     let daily = bar_archive_prefix(BarInterval::OneDay);
     let mut universe = Universe::default();
@@ -867,15 +951,9 @@ async fn universe_over(
             continue;
         };
         universe.described.insert(*session);
-        // An explicit set reads the partition above only for `described`; it has already answered
-        // which names it wants.
-        if matches!(scope, IntradayScope::Symbols(_)) {
-            continue;
-        }
-        universe.symbols.extend(partition_tickers(&frame)?);
-    }
-    if let IntradayScope::Symbols(symbols) = scope {
-        universe.symbols = symbols.clone();
+        universe
+            .symbols
+            .extend(names_from_partition(&scope.names, frame)?);
     }
     Ok(universe)
 }
@@ -918,7 +996,7 @@ const SCAN_CONCURRENCY: usize = 16;
 
 /// Which names each intraday partition lacks against the daily universe for its own session.
 ///
-/// The difference [`intraday_sessions_to_request`] cannot express: a partition written while one
+/// The difference [`SessionSelection::Absent`] cannot express: a partition written while one
 /// symbol's fetch failed is present, non-empty, and short a name. `floor` is a parameter because
 /// this reads and never writes, so scanning wider than the archive was ingested at yields a
 /// backfill list rather than a fault.
@@ -1042,7 +1120,7 @@ fn partition_tickers(frame: &DataFrame) -> Result<BTreeSet<Ticker>, ArchiveError
 pub enum SessionCoverage {
     /// The daily archive has no partition for this session, so completeness is unanswerable.
     Undescribed,
-    /// No intraday partition at all — what [`intraday_sessions_to_request`] already finds.
+    /// No intraday partition at all — what [`SessionSelection::Absent`] already finds.
     Absent,
     /// Every screened name is present.
     Complete,
@@ -1079,11 +1157,10 @@ impl SymbolScan {
         &self.failed
     }
 
-    /// Every name missing from at least one partition, which is what [`IntradayScope::Symbols`]
-    /// takes.
+    /// Every name missing from at least one partition, which is what [`NameSelection::Named`] takes.
     ///
-    /// A union rather than a per-session list because the repair requests its symbols across the
-    /// whole window anyway — a name missing from one session costs nothing extra to ask for on the
+    /// A union rather than a per-session list because the repair requests its symbols across every
+    /// session it touches anyway — a name missing from one costs nothing extra to ask for on the
     /// others, and the merge leaves what is already there untouched.
     pub fn missing_symbols(&self) -> BTreeSet<Ticker> {
         self.coverage
@@ -1282,34 +1359,12 @@ pub struct QuoteArchiveSummary {
     pub quotes_folded: usize,
 }
 
-/// What a quote pass is for, which decides both the names it folds and the sessions it touches.
-///
-/// The two variants exist because a partition's presence cannot answer whether a *symbol* is in it:
-/// one written while a name's fetch failed, or before that name cleared the screen, reads exactly
-/// like a complete one. So the seeding pass and the repairing pass want opposite session sets.
-#[derive(Debug, Clone, PartialEq)]
-pub enum QuoteScope {
-    /// Every name the daily archive screens in, for the sessions that have no summary yet.
-    ScreenedUniverse(LiquidityFloor),
-    /// Every name the daily archive holds, across every session in the window.
-    ///
-    /// The screen decides what is fetched, so a spread it excluded cannot be read back off the
-    /// archive — this is how a name outside it gets measured at all. May write over an existing
-    /// session, unlike [`QuoteScope::Symbols`], because what it writes is the whole market.
-    WholeMarket,
-    /// An explicit set of names, folded only into sessions that *already* have a partition.
-    ///
-    /// Repairs both a name whose fetch failed and a name a widened screen now admits, without
-    /// refetching the sessions those names are missing from.
-    Symbols(BTreeSet<Ticker>),
-}
-
 /// Folds the quoted book across `sessions`, per `scope`.
 ///
 /// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
 /// bounded to one session's hours, so there is nothing to gain by holding a chunk of them. That is
-/// also why the never-create rule lands here at session selection rather than at the write, where
-/// [`writable_sessions`] has to enforce it for bars — a session-major pass knows before it fetches.
+/// also why the never-create rule costs nothing here: a session-major pass never fetches outside the
+/// sessions it selected, while a bar chunk spans a range and needs [`writable_session`] at the write.
 ///
 /// Regular hours only, taken from the calendar so an early close is 3.5 hours rather than 6.5. The
 /// overnight book is an order of magnitude wider and would swamp any session mean it entered.
@@ -1319,7 +1374,7 @@ pub async fn archive_quote_sessions(
     calendar: &TradingCalendar,
     bucket: &str,
     sessions: &[SessionDate],
-    scope: &QuoteScope,
+    scope: &Scope,
 ) -> Result<QuoteArchiveSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
         return Ok(QuoteArchiveSummary::default());
@@ -1332,18 +1387,18 @@ pub async fn archive_quote_sessions(
         *last,
     )
     .await?;
-    let requested = quote_sessions_for(scope, sessions, &present);
+    let requested = sessions_for(scope.sessions, sessions, &present);
 
     info!(
         window_start = %first,
         window_end = %last,
+        %scope,
         offered = sessions.len(),
         already_summarized = present.len(),
         requested = requested.len(),
-        repairing = matches!(scope, QuoteScope::Symbols(_)),
         "Planned a quote pass"
     );
-    if let QuoteScope::Symbols(symbols) = scope {
+    if let NameSelection::Named(symbols) = &scope.names {
         let unsummarized: Vec<SessionDate> = sessions
             .iter()
             .copied()
@@ -1398,30 +1453,6 @@ pub async fn archive_quote_sessions(
     Ok(summary)
 }
 
-/// The sessions a pass touches, which the scope decides — and the two want opposite sets.
-///
-/// Seeding takes the sessions with no summary. A repair takes exactly those that have one: it
-/// fetches only the names it was given, so a partition it created would hold those and nothing
-/// else, and read as complete to every later pass. Split out from the S3 call so the rule that
-/// prevents that is testable without a bucket.
-fn quote_sessions_for(
-    scope: &QuoteScope,
-    sessions: &[SessionDate],
-    present: &BTreeSet<SessionDate>,
-) -> Vec<SessionDate> {
-    sessions
-        .iter()
-        .copied()
-        .filter(|session| match scope {
-            QuoteScope::ScreenedUniverse(_) => !present.contains(session),
-            QuoteScope::Symbols(_) => present.contains(session),
-            // Neither filter: widening a session already summarized is the whole point, and a
-            // session with nothing in it is answered whole rather than skipped.
-            QuoteScope::WholeMarket => true,
-        })
-        .collect()
-}
-
 /// One session: derive the universe from the scope, fold every name's book, write both cadences.
 #[allow(clippy::too_many_arguments)]
 async fn archive_quote_session(
@@ -1430,7 +1461,7 @@ async fn archive_quote_session(
     calendar: &TradingCalendar,
     bucket: &str,
     session: SessionDate,
-    scope: &QuoteScope,
+    scope: &Scope,
     summary: &mut QuoteArchiveSummary,
 ) -> Result<(), ArchiveError> {
     let Some((open, close)) = quotes::trading_hours(calendar, session) else {
@@ -1440,11 +1471,11 @@ async fn archive_quote_session(
         return Ok(());
     };
 
-    let universe = match scope {
-        // Taken as given rather than intersected with the daily partition: a name that did not
-        // trade answers with no quotes and produces no summary, which is the same outcome.
-        QuoteScope::Symbols(symbols) => symbols.clone(),
-        QuoteScope::ScreenedUniverse(_) | QuoteScope::WholeMarket => {
+    let universe = match &scope.names {
+        // The partition is not read at all: it would only say which names are there, and this scope
+        // has already answered that.
+        NameSelection::Named(symbols) => symbols.clone(),
+        NameSelection::WholeMarket | NameSelection::Screened(_) => {
             let key =
                 date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
             let Some(daily) = read_partition(s3_client, bucket, &key).await? else {
@@ -1454,10 +1485,7 @@ async fn archive_quote_session(
                 summary.sessions_without_data += 1;
                 return Ok(());
             };
-            match scope {
-                QuoteScope::ScreenedUniverse(floor) => screen_partition(daily, *floor)?,
-                _ => partition_tickers(&daily)?,
-            }
+            names_from_partition(&scope.names, daily)?
         }
     };
     if universe.is_empty() {
@@ -2039,11 +2067,81 @@ mod tests {
         }
     }
 
-    /// A whole-market pass exists to widen partitions that already exist, so unlike the other two
-    /// it filters on nothing. Skipping the present ones would make it a no-op against a seeded
-    /// archive, which is exactly the state it is run against.
+    /// The rule the product exists to enforce, and the reason "may it create" is not a third axis.
+    /// A named pass fetches only its own names, so a session it answered where no partition existed
+    /// would hold that handful and read as complete to every later pass.
     #[test]
-    fn test_a_whole_market_quote_pass_takes_every_session_offered() {
+    fn test_a_named_set_may_only_touch_sessions_that_already_exist() {
+        for refused in [SessionSelection::Absent, SessionSelection::Every] {
+            assert_eq!(
+                Scope::new(NameSelection::Named(tickers(&["AAPL"])), refused),
+                Err(ScopeError::NamedSetWouldCreate),
+                "{refused:?} would let a named set answer a session nothing has written"
+            );
+        }
+        assert!(Scope::new(
+            NameSelection::Named(tickers(&["AAPL"])),
+            SessionSelection::Present
+        )
+        .is_ok());
+
+        // The other two derive their universe from the daily partition, so every pairing is a pass.
+        for names in [
+            NameSelection::WholeMarket,
+            NameSelection::Screened(LiquidityFloor::CURRENT),
+        ] {
+            for sessions in [
+                SessionSelection::Absent,
+                SessionSelection::Present,
+                SessionSelection::Every,
+            ] {
+                assert!(Scope::new(names.clone(), sessions).is_ok(), "{names:?}");
+            }
+        }
+    }
+
+    /// Both binaries log the scope through this rather than each phrasing it, and the elision is
+    /// the part that can be wrong: a scan-driven repair names thousands, and the whole list once
+    /// produced a multi-kilobyte line that buried the fields beside it.
+    #[test]
+    fn test_a_scope_says_which_names_across_which_sessions() {
+        assert_eq!(
+            scope(NameSelection::WholeMarket, SessionSelection::Absent).to_string(),
+            "every name, absent sessions only"
+        );
+        assert_eq!(
+            scope(
+                NameSelection::Screened(LiquidityFloor::CURRENT),
+                SessionSelection::Every
+            )
+            .to_string(),
+            "the screened universe, every session"
+        );
+        assert_eq!(
+            scope(
+                NameSelection::Named(tickers(&["CBOE", "AAPL"])),
+                SessionSelection::Present
+            )
+            .to_string(),
+            "AAPL,CBOE, sessions already present"
+        );
+
+        // Thirteen names, so exactly one is elided. The literal, not the bound: an expectation read
+        // off the constant it is checking moves with it and can never fail.
+        let many = tickers(&[
+            "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM",
+        ]);
+        assert_eq!(
+            scope(NameSelection::Named(many), SessionSelection::Present).to_string(),
+            "AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK,AL and 1 more, sessions already present"
+        );
+    }
+
+    /// A whole-market pass exists to widen partitions that already exist, so unlike the other two
+    /// selections it filters on nothing. Skipping the present ones would make it a no-op against a
+    /// seeded archive, which is exactly the state it is run against.
+    #[test]
+    fn test_every_session_selection_filters_on_nothing() {
         let sessions = [
             session(2026, 8, 17),
             session(2026, 8, 18),
@@ -2052,44 +2150,18 @@ mod tests {
         let present: BTreeSet<SessionDate> = [session(2026, 8, 18)].into_iter().collect();
 
         assert_eq!(
-            quote_sessions_for(&QuoteScope::WholeMarket, &sessions, &present),
+            sessions_for(SessionSelection::Every, &sessions, &present),
             sessions.to_vec()
         );
     }
 
-    /// The same asymmetry on the bar side: a named repair may not create a partition because it
-    /// would hold only those names, while a whole-market pass may because its partition is whole.
+    /// Both passes now read this off one function, where each carried its own answer and the bar
+    /// side's was a third one — request everything, refuse at the write — which fetched sessions it
+    /// was never allowed to keep. The sets are opposite because a partition holding some of its
+    /// names is indistinguishable from a complete one, so the difference that repairs a *session*
+    /// sees nothing to do; that is what left CBOE absent from 202 partitions that all existed.
     #[test]
-    fn test_a_whole_market_bar_pass_may_create_a_partition_where_a_repair_may_not() {
-        let described: BTreeSet<SessionDate> = [session(2026, 8, 19)].into_iter().collect();
-        let absent = BTreeSet::new();
-
-        assert!(writable_sessions(
-            session(2026, 8, 19),
-            &IntradayScope::WholeMarket,
-            &described,
-            &absent
-        ));
-        assert!(!writable_sessions(
-            session(2026, 8, 19),
-            &IntradayScope::Symbols(tickers(&["AAPL"])),
-            &described,
-            &absent
-        ));
-        // Undescribed refuses both: nothing can say what a complete partition would hold.
-        assert!(!writable_sessions(
-            session(2026, 8, 20),
-            &IntradayScope::WholeMarket,
-            &described,
-            &absent
-        ));
-    }
-
-    /// The two scopes want opposite session sets, and getting it backwards is the defect #1102 was
-    /// written for: a repair fetches only the names it was given, so a partition it created would
-    /// hold those and nothing else, and read as a complete session to every later pass.
-    #[test]
-    fn test_a_repair_writes_only_where_a_partition_already_exists() {
+    fn test_seeding_and_repairing_take_opposite_session_sets() {
         let sessions = [
             session(2026, 8, 17),
             session(2026, 8, 18),
@@ -2097,19 +2169,48 @@ mod tests {
         ];
         let present: BTreeSet<SessionDate> = [session(2026, 8, 18)].into_iter().collect();
 
-        let seeding = QuoteScope::ScreenedUniverse(LiquidityFloor::CURRENT);
-        let repairing = QuoteScope::Symbols(tickers(&["AAPL"]));
-
         assert_eq!(
-            quote_sessions_for(&seeding, &sessions, &present),
+            sessions_for(SessionSelection::Absent, &sessions, &present),
             vec![session(2026, 8, 17), session(2026, 8, 19)],
             "seeding takes the sessions with nothing in them"
         );
         assert_eq!(
-            quote_sessions_for(&repairing, &sessions, &present),
+            sessions_for(SessionSelection::Present, &sessions, &present),
             vec![session(2026, 8, 18)],
             "repairing takes exactly the sessions that already have one"
         );
+    }
+
+    /// The same asymmetry at the bar write, which is where it still has to be enforced: a chunk is
+    /// fetched over its whole range, so bars arrive for sessions the selection never requested.
+    #[test]
+    fn test_a_whole_market_bar_pass_may_create_a_partition_where_a_repair_may_not() {
+        let described: BTreeSet<SessionDate> = [session(2026, 8, 19)].into_iter().collect();
+        let absent = BTreeSet::new();
+        let whole_market = scope(NameSelection::WholeMarket, SessionSelection::Every);
+
+        assert!(writable_session(
+            session(2026, 8, 19),
+            &whole_market,
+            &described,
+            &absent
+        ));
+        assert!(!writable_session(
+            session(2026, 8, 19),
+            &scope(
+                NameSelection::Named(tickers(&["AAPL"])),
+                SessionSelection::Present
+            ),
+            &described,
+            &absent
+        ));
+        // Undescribed refuses both: nothing can say what a complete partition would hold.
+        assert!(!writable_session(
+            session(2026, 8, 20),
+            &whole_market,
+            &described,
+            &absent
+        ));
     }
 
     /// Two cadences of one session must not collide, which is the whole reason the segment exists.
@@ -2150,7 +2251,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let requested = intraday_sessions_to_request(&expected, &present);
+        let requested = sessions_for(SessionSelection::Absent, &expected, &present);
         assert_eq!(
             requested,
             vec![
@@ -2165,41 +2266,6 @@ mod tests {
         let daily = sessions_to_request(&expected, &present);
         assert_eq!(daily.len(), 5, "{daily:?}");
         assert!(daily.contains(&session(2026, 6, 5)), "{daily:?}");
-    }
-
-    /// A partition holding some of its names is indistinguishable from a complete one, so the set
-    /// difference that repairs a *session* cannot repair a *symbol* — it would request nothing and
-    /// report success. This is the failure that left CBOE absent from 202 partitions that all
-    /// existed.
-    #[test]
-    fn test_a_symbol_repair_requests_the_whole_window() {
-        let expected = expected_sessions(session(2026, 6, 1), session(2026, 6, 5));
-        // Every session is already held, which is exactly the state a symbol repair runs against.
-        let present: BTreeSet<SessionDate> = expected.iter().copied().collect();
-
-        let missing = intraday_sessions_for(&IntradayScope::MissingSessions, &expected, &present);
-        assert!(
-            missing.is_empty(),
-            "a session scan sees nothing to do: {missing:?}"
-        );
-
-        let symbols = IntradayScope::Symbols(
-            [Ticker::new("CBOE").expect("CBOE is a usable ticker")]
-                .into_iter()
-                .collect(),
-        );
-        let repaired = intraday_sessions_for(&symbols, &expected, &present);
-        assert_eq!(
-            repaired,
-            vec![
-                session(2026, 6, 1),
-                session(2026, 6, 2),
-                session(2026, 6, 3),
-                session(2026, 6, 4),
-                session(2026, 6, 5),
-            ],
-            "a symbol repair ignores what is present and asks for all five"
-        );
     }
 
     /// 2026-06-01 is a Monday, so the week runs Mon-Fri 1..=5 and the weekend is 6-7.
@@ -2428,16 +2494,19 @@ mod tests {
         let session = session(2026, 8, 21);
         let described = BTreeSet::from([session]);
         let absent = BTreeSet::new();
-        let repair = IntradayScope::Symbols(tickers(&["CBOE", "NVDA"]));
+        let repair = scope(
+            NameSelection::Named(tickers(&["CBOE", "NVDA"])),
+            SessionSelection::Present,
+        );
 
         assert!(
-            !writable_sessions(session, &repair, &described, &absent),
+            !writable_session(session, &repair, &described, &absent),
             "a repair must leave an absent session absent, so the session scan still fetches it"
         );
         assert!(
-            writable_sessions(
+            writable_session(
                 session,
-                &IntradayScope::MissingSessions,
+                &scope(NameSelection::WholeMarket, SessionSelection::Absent),
                 &described,
                 &absent
             ),
@@ -2451,9 +2520,12 @@ mod tests {
         let session = session(2026, 8, 20);
         let described = BTreeSet::from([session]);
         let present = BTreeSet::from([session]);
-        let repair = IntradayScope::Symbols(tickers(&["CBOE"]));
+        let repair = scope(
+            NameSelection::Named(tickers(&["CBOE"])),
+            SessionSelection::Present,
+        );
 
-        assert!(writable_sessions(session, &repair, &described, &present));
+        assert!(writable_session(session, &repair, &described, &present));
     }
 
     /// An undescribed session is refused whatever the scope, because nothing can say what a
@@ -2464,15 +2536,18 @@ mod tests {
         let described = BTreeSet::new();
         let present = BTreeSet::from([session]);
 
-        assert!(!writable_sessions(
+        assert!(!writable_session(
             session,
-            &IntradayScope::MissingSessions,
+            &scope(NameSelection::WholeMarket, SessionSelection::Absent),
             &described,
             &present
         ));
-        assert!(!writable_sessions(
+        assert!(!writable_session(
             session,
-            &IntradayScope::Symbols(tickers(&["CBOE"])),
+            &scope(
+                NameSelection::Named(tickers(&["CBOE"])),
+                SessionSelection::Present
+            ),
             &described,
             &present
         ));
@@ -2490,6 +2565,10 @@ mod tests {
             .iter()
             .map(|name| Ticker::new(name).expect("a valid test ticker"))
             .collect()
+    }
+
+    fn scope(names: NameSelection, sessions: SessionSelection) -> Scope {
+        Scope::new(names, sessions).expect("a valid test scope")
     }
 
     /// The whole point of the task: a partition that exists and is short two names reads as

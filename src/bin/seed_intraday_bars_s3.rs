@@ -10,14 +10,14 @@ use tracing::{error, info};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::{BarInterval, LiquidityFloor, SessionDate, Ticker};
-use fund::data::archive::{self, IntradayScope};
+use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
 
 const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [SYMBOLS]]\n\
                      Dates are Eastern calendar dates, inclusive: YYYY-MM-DD.\n\
                      CADENCE is five_minute (default) or one_minute.\n\
                      SYMBOLS is a comma-separated list, and naming it requires naming CADENCE too.\n\
-                     Supplying it fetches only those names and requests every session in the\n\
-                     window rather than only the absent ones.\n\
+                     Supplying it fetches only those names, into the sessions that already have a\n\
+                     partition rather than the absent ones a plain run fills.\n\
                      SYMBOLS may instead be one of three reserved lowercase words, matched\n\
                      exactly so an uppercase name of the same spelling is still a ticker:\n\
                        scan    report which names each partition lacks, and write nothing\n\
@@ -36,10 +36,10 @@ const DEFAULT_CADENCE: BarInterval = BarInterval::FiveMinute;
 ///
 /// `Scan` writes nothing, so it is the safe way to size a repair before one rewrites a partition
 /// per session across the window.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Mode {
-    /// Fetch, per the scope: the absent sessions, or an explicit set of names across all of them.
-    Seed(IntradayScope),
+    /// Fetch, per the scope: the absent sessions, or an explicit set into the ones already written.
+    Seed(Scope),
     /// Report per-session coverage and stop.
     Scan,
     /// Report per-session coverage, then fetch whatever names it reported missing.
@@ -90,11 +90,14 @@ impl Parameters {
         // Trimmed and matched before the symbol parser. Both words are valid ticker shapes, so
         // order separates them -- and untrimmed, " scan " would parse as a symbol and fetch nothing.
         let mode = match symbols.map(|raw| raw.trim()) {
-            None => Mode::Seed(IntradayScope::MissingSessions),
+            None => Mode::Seed(scope(NameSelection::WholeMarket, SessionSelection::Absent)?),
             Some("scan") => Mode::Scan,
             Some("repair") => Mode::Repair,
-            Some("all") => Mode::Seed(IntradayScope::WholeMarket),
-            Some(raw) => Mode::Seed(IntradayScope::Symbols(parse_symbols(raw)?)),
+            Some("all") => Mode::Seed(scope(NameSelection::WholeMarket, SessionSelection::Every)?),
+            Some(raw) => Mode::Seed(scope(
+                NameSelection::Named(parse_symbols(raw)?),
+                SessionSelection::Present,
+            )?),
         };
 
         Ok(Self {
@@ -104,6 +107,11 @@ impl Parameters {
             mode,
         })
     }
+}
+
+/// Builds a scope, reporting a combination the archive refuses as an argument error.
+fn scope(names: NameSelection, sessions: SessionSelection) -> Result<Scope, String> {
+    Scope::new(names, sessions).map_err(|error| format!("{error}\n{USAGE}"))
 }
 
 /// Parses the comma-separated symbol list into validated tickers.
@@ -184,8 +192,8 @@ async fn main() {
 /// Repairs the intraday archive over the requested window.
 ///
 /// Without `SYMBOLS` only the sessions the bucket is missing are fetched, so re-running over a
-/// repaired range costs one listing and nothing else. With it every session in the window is
-/// requested, because a partition missing one name is indistinguishable from a complete one.
+/// repaired range costs one listing and nothing else. With it the opposite set is: a partition
+/// missing one name is indistinguishable from a complete one, so those are the ones to fold into.
 async fn run(
     parameters: &Parameters,
 ) -> Result<Option<archive::ArchiveSummary>, Box<dyn std::error::Error>> {
@@ -221,26 +229,17 @@ async fn run(
                 println!("Nothing to repair.");
                 return Ok(None);
             }
-            IntradayScope::Symbols(missing)
+            Scope::new(NameSelection::Named(missing), SessionSelection::Present)?
         }
     };
 
     let massive = massive.expect("every mode that fetches builds a client above");
-    let symbols = match &scope {
-        IntradayScope::MissingSessions => "every name, absent sessions only".to_string(),
-        IntradayScope::WholeMarket => "every name, every session".to_string(),
-        IntradayScope::Symbols(symbols) => symbols
-            .iter()
-            .map(Ticker::as_str)
-            .collect::<Vec<_>>()
-            .join(","),
-    };
     info!(
         bucket,
         start = %parameters.start,
         end = %parameters.end,
         interval = %parameters.interval,
-        symbols,
+        %scope,
         "Seeding the intraday bar archive from Massive"
     );
 
@@ -331,6 +330,16 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    /// The scope a symbol list must parse to, which is the only one a named set is allowed.
+    fn named(names: &[&str]) -> Scope {
+        let symbols = names
+            .iter()
+            .map(|name| Ticker::new(name).expect("a valid test ticker"))
+            .collect();
+        scope(NameSelection::Named(symbols), SessionSelection::Present)
+            .expect("a named set repairing present sessions is a valid scope")
+    }
+
     #[test]
     fn test_the_cadence_defaults_to_five_minutes() {
         let parameters = Parameters::parse(&arguments(&["2026-08-01", "2026-08-20"])).unwrap();
@@ -380,18 +389,16 @@ mod tests {
 
     #[test]
     fn test_omitting_symbols_scans_for_missing_sessions() {
+        let seeding = Mode::Seed(
+            scope(NameSelection::WholeMarket, SessionSelection::Absent).expect("a valid scope"),
+        );
+
         let parameters = Parameters::parse(&arguments(&["2026-08-01", "2026-08-20"])).unwrap();
-        assert!(matches!(
-            parameters.mode,
-            Mode::Seed(IntradayScope::MissingSessions)
-        ));
+        assert_eq!(parameters.mode, seeding);
 
         let parameters =
             Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "five_minute"])).unwrap();
-        assert!(matches!(
-            parameters.mode,
-            Mode::Seed(IntradayScope::MissingSessions)
-        ));
+        assert_eq!(parameters.mode, seeding);
     }
 
     /// Both words are valid ticker shapes, so only the order of the match separates them from a
@@ -454,11 +461,11 @@ mod tests {
         ]))
         .unwrap();
 
-        let Mode::Seed(IntradayScope::Symbols(symbols)) = parameters.mode else {
-            panic!("an uppercase name must parse as a symbol list");
-        };
-        let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
-        assert_eq!(named, vec!["SCAN"]);
+        assert_eq!(
+            parameters.mode,
+            Mode::Seed(named(&["SCAN"])),
+            "an uppercase name must parse as a symbol list"
+        );
     }
 
     /// `all` is what widens the archive past what any screen would have admitted, and `ALL` is a
@@ -472,10 +479,12 @@ mod tests {
             " all ",
         ]))
         .unwrap();
-        assert!(matches!(
+        assert_eq!(
             parameters.mode,
-            Mode::Seed(IntradayScope::WholeMarket)
-        ));
+            Mode::Seed(
+                scope(NameSelection::WholeMarket, SessionSelection::Every).expect("a valid scope")
+            )
+        );
 
         let parameters = Parameters::parse(&arguments(&[
             "2026-08-01",
@@ -484,11 +493,11 @@ mod tests {
             "ALL",
         ]))
         .unwrap();
-        let Mode::Seed(IntradayScope::Symbols(symbols)) = parameters.mode else {
-            panic!("an uppercase name must not widen the archive");
-        };
-        let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
-        assert_eq!(named, vec!["ALL"]);
+        assert_eq!(
+            parameters.mode,
+            Mode::Seed(named(&["ALL"])),
+            "an uppercase name must not widen the archive"
+        );
     }
 
     #[test]
@@ -501,11 +510,11 @@ mod tests {
         ]))
         .unwrap();
 
-        let Mode::Seed(IntradayScope::Symbols(symbols)) = parameters.mode else {
-            panic!("a symbol list must produce a symbol scope");
-        };
-        let named: Vec<&str> = symbols.iter().map(Ticker::as_str).collect();
-        assert_eq!(named, vec!["CBOE", "CME", "ICE"]);
+        assert_eq!(
+            parameters.mode,
+            Mode::Seed(named(&["CBOE", "CME", "ICE"])),
+            "a symbol list must be trimmed component by component"
+        );
     }
 
     /// Refused rather than skipped. A typo silently narrowing the universe looks exactly like a name
