@@ -172,8 +172,8 @@ async fn main() {
                 summary.output().rows_written(),
                 summary.symbols_failed()
             );
-            // One rule, in the archive: this pass requests holidays deliberately and they answer
-            // empty, which `SessionSource::Weekdays` is what says.
+            // One rule, in the archive. The supplied calendar excludes holidays before the pass
+            // requests anything, so a session reported without data is a real gap.
             if summary.is_complete() {
                 0
             } else {
@@ -277,7 +277,7 @@ async fn trading_calendar(
     let days = TradingClient::from_env(credentials)
         .fetch_calendar(start.date(), end.date())
         .await?;
-    Ok(TradingCalendar::from_days(days))
+    Ok(TradingCalendar::covering(days, start, end))
 }
 
 /// Missing names printed per session before the line is truncated.

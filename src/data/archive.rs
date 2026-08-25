@@ -119,6 +119,16 @@ pub enum ArchiveError {
     },
     #[error("gave up on {key} after {attempts} concurrent writes by another pass")]
     Contended { key: String, attempts: usize },
+    /// The trading calendar does not span the window, so which dates trade is unanswerable.
+    ///
+    /// Fatal rather than carried, unlike a failed session: a calendar short of the window drops real
+    /// sessions from the request and the pass would report a complete run over a window it never
+    /// covered — the one failure the summary itself cannot show.
+    #[error("the trading calendar does not cover {start} to {end}")]
+    Calendar {
+        start: SessionDate,
+        end: SessionDate,
+    },
     /// The upstream feed failed, before any bucket was touched.
     ///
     /// The vendor is carried because two of them supply this archive, and an operator reading the
@@ -351,32 +361,25 @@ fn expected_sessions(start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
 
 /// The sessions a pass should be able to answer for, filtered by `calendar` when it has one.
 ///
-/// `calendar` must span the window: `is_trading_day` answers `false` outside its published horizon,
-/// so one fetched for a narrower range would quietly discard real sessions. That case is warned
-/// about rather than trusted, because a pass that requests nothing otherwise reports success.
+/// Refused rather than narrowed when the calendar does not span the window: `is_trading_day` answers
+/// `false` outside its published horizon, so a short calendar would drop real sessions, shrink
+/// `sessions_requested`, and leave the pass reporting a complete run over a window it never covered.
 fn sessions_in_window(
     start: SessionDate,
     end: SessionDate,
     calendar: Option<&TradingCalendar>,
-) -> Vec<SessionDate> {
+) -> Result<Vec<SessionDate>, ArchiveError> {
     let weekdays = expected_sessions(start, end);
     let Some(calendar) = calendar else {
-        return weekdays;
+        return Ok(weekdays);
     };
-    let trading: Vec<SessionDate> = weekdays
-        .iter()
-        .copied()
-        .filter(|session| calendar.is_trading_day(*session))
-        .collect();
-    if trading.is_empty() && !weekdays.is_empty() {
-        warn!(
-            %start,
-            %end,
-            weekdays = weekdays.len(),
-            "The calendar reports no trading day in this window; it may not span it"
-        );
+    if !calendar.covers(start, end) {
+        return Err(ArchiveError::Calendar { start, end });
     }
-    trading
+    Ok(weekdays
+        .into_iter()
+        .filter(|session| calendar.is_trading_day(*session))
+        .collect())
 }
 
 /// The sessions to request: those with no partition, plus the correction window.
@@ -474,7 +477,7 @@ pub async fn archive_missing_sessions(
     window_end: SessionDate,
     calendar: Option<&TradingCalendar>,
 ) -> Result<PassSummary, ArchiveError> {
-    let expected = sessions_in_window(window_start, window_end, calendar);
+    let expected = sessions_in_window(window_start, window_end, calendar)?;
     let present = present_sessions(
         s3_client,
         bucket,
@@ -833,7 +836,7 @@ pub async fn archive_intraday_sessions(
     scope: &Scope,
     calendar: Option<&TradingCalendar>,
 ) -> Result<PassSummary, ArchiveError> {
-    let expected = sessions_in_window(window_start, window_end, calendar);
+    let expected = sessions_in_window(window_start, window_end, calendar)?;
     let present = present_sessions(s3_client, bucket, interval, window_start, window_end).await?;
     let requested = sessions_for(scope.sessions, &expected, &present);
 
@@ -2273,7 +2276,11 @@ mod tests {
             sessions_without_data: 1,
             ..Default::default()
         };
-        let calendar = calendar_of(&[session(2026, 8, 17)]);
+        let calendar = calendar_of(
+            &[session(2026, 8, 17)],
+            session(2026, 8, 17),
+            session(2026, 8, 21),
+        );
 
         assert!(
             counts().into_bar_summary(None).is_complete(),
@@ -2296,7 +2303,7 @@ mod tests {
         let (start, end) = (session(2026, 7, 1), session(2026, 7, 6));
 
         assert_eq!(
-            sessions_in_window(start, end, None),
+            sessions_in_window(start, end, None).unwrap(),
             vec![
                 session(2026, 7, 1),
                 session(2026, 7, 2),
@@ -2306,13 +2313,17 @@ mod tests {
             "the weekday sweep keeps the holiday and drops only the weekend"
         );
 
-        let calendar = calendar_of(&[
-            session(2026, 7, 1),
-            session(2026, 7, 2),
-            session(2026, 7, 6),
-        ]);
+        let calendar = calendar_of(
+            &[
+                session(2026, 7, 1),
+                session(2026, 7, 2),
+                session(2026, 7, 6),
+            ],
+            start,
+            end,
+        );
         assert_eq!(
-            sessions_in_window(start, end, Some(&calendar)),
+            sessions_in_window(start, end, Some(&calendar)).unwrap(),
             vec![
                 session(2026, 7, 1),
                 session(2026, 7, 2),
@@ -2320,6 +2331,49 @@ mod tests {
             ],
             "the calendar drops 07-03, which would answer empty forever"
         );
+    }
+
+    /// The hole the first version of this only half-covered: it warned when the filter left nothing
+    /// at all, which misses the truncation that matters. A calendar short at either end drops real
+    /// sessions, shrinks `sessions_requested`, and leaves `is_complete()` reporting a clean run over
+    /// a window it never saw — the one failure the summary itself cannot show.
+    #[test]
+    fn test_a_calendar_that_does_not_span_the_window_is_refused() {
+        let (start, end) = (session(2026, 7, 1), session(2026, 7, 31));
+        let trading = [session(2026, 7, 1), session(2026, 7, 2)];
+
+        for (covered_start, covered_end, why) in [
+            (session(2026, 7, 6), end, "short at the start"),
+            (start, session(2026, 7, 20), "short at the end"),
+        ] {
+            let calendar = calendar_of(&trading, covered_start, covered_end);
+            assert!(
+                matches!(
+                    sessions_in_window(start, end, Some(&calendar)).unwrap_err(),
+                    ArchiveError::Calendar { start: refused_start, end: refused_end }
+                        if refused_start == start && refused_end == end
+                ),
+                "a calendar {why} must be refused, not silently narrow the request"
+            );
+        }
+
+        let spanning = calendar_of(&trading, start, end);
+        assert!(sessions_in_window(start, end, Some(&spanning)).is_ok());
+    }
+
+    /// A calendar built without recording its range cannot prove it covers anything, so it is
+    /// refused rather than trusted — the same conservatism `is_trading_day` already applies outside
+    /// its horizon, where it answers `false` rather than guessing.
+    #[test]
+    fn test_a_calendar_of_unknown_range_covers_nothing() {
+        let (start, end) = (session(2026, 7, 1), session(2026, 7, 2));
+        let unknown = TradingCalendar::from_days(vec![]);
+
+        assert!(!unknown.covers(start, end));
+        assert!(matches!(
+            sessions_in_window(start, end, Some(&unknown)).unwrap_err(),
+            ArchiveError::Calendar { .. }
+        ));
     }
 
     /// Every count has to survive the accumulator becoming a summary. Both finishers copy field by
@@ -2883,9 +2937,13 @@ mod tests {
         Scope::new(names, sessions).expect("a valid test scope")
     }
 
-    /// A calendar publishing exactly these sessions, at the usual bell.
-    fn calendar_of(sessions: &[SessionDate]) -> TradingCalendar {
-        TradingCalendar::from_days(
+    /// A calendar publishing exactly these sessions, at the usual bell, over `[start, end]`.
+    fn calendar_of(
+        sessions: &[SessionDate],
+        start: SessionDate,
+        end: SessionDate,
+    ) -> TradingCalendar {
+        TradingCalendar::covering(
             sessions
                 .iter()
                 .map(|at| {
@@ -2897,6 +2955,8 @@ mod tests {
                     .expect("a session with duration")
                 })
                 .collect(),
+            start,
+            end,
         )
     }
 

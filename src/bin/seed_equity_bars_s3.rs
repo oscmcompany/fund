@@ -5,8 +5,10 @@
 //! cannot cover: a bucket with nothing in it, and an outage older than the training lookback.
 //!
 //! Usage: `seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD]`
-//! With no arguments the window is the last [`DEFAULT_ARCHIVE_LOOKBACK_DAYS`] days ending today
-//! (US/Eastern), which is the answer to "just make the archive right".
+//! With no arguments the window is the last [`DEFAULT_ARCHIVE_LOOKBACK_DAYS`] days ending on the
+//! session before today (US/Eastern), which is the answer to "just make the archive right" — today's
+//! daily bar is stamped at the close and does not exist before it. Needs Alpaca credentials for the
+//! trading calendar, so holidays are never requested.
 //!
 //! Needs Massive and AWS credentials and no database, so it runs from either VM or a laptop. The
 //! work itself is [`fund::data::archive::archive_missing_sessions`] — the same call the trainer
@@ -57,17 +59,28 @@ fn parse_date(value: &str) -> Result<SessionDate, String> {
         .map_err(|error| format!("Invalid date '{value}': expected YYYY-MM-DD ({error})"))
 }
 
+/// The most recent session whose daily bar can already exist.
+///
+/// A daily bar is stamped at the close, so the current session has none until 16:00 Eastern.
+/// Defaulting to today made a pre-close run request a session with no data, which the calendar-filtered
+/// pass reports as a fault rather than as a holiday. An explicitly named date is left alone: an
+/// operator who asks for today is asking for a session with no data, and being told so is correct.
+fn last_final_session(today: SessionDate) -> SessionDate {
+    today.plus_calendar_days(-1)
+}
+
 /// Parses the optional positional date arguments.
 ///
 /// `today` is a parameter rather than read from the clock here, because a function that reads the
 /// wall clock cannot be tested across the hours where the Eastern date and the UTC date disagree.
 fn parse_arguments(arguments: &[String], today: SessionDate) -> Result<ArchiveRange, String> {
+    let latest = last_final_session(today);
     match arguments {
         [] => ArchiveRange::new(
-            today.plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS),
-            today,
+            latest.plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS),
+            latest,
         ),
-        [start] => ArchiveRange::new(parse_date(start)?, today),
+        [start] => ArchiveRange::new(parse_date(start)?, latest),
         [start, end] => ArchiveRange::new(parse_date(start)?, parse_date(end)?),
         _ => Err(format!("Too many arguments\n{USAGE}")),
     }
@@ -103,9 +116,9 @@ async fn main() {
                 "Equity bar archive seeded"
             );
             // A run that stepped over a session leaves exactly the hole this tool exists to close,
-            // and the exit code is the operator's only signal that the range needs re-running. A
-            // session with no data is not counted: holidays land there and always will, which is
-            // what `SessionSource::Weekdays` says and why this reads the archive's rule.
+            // and the exit code is the operator's only signal that the range needs re-running. The
+            // calendar excludes holidays before anything is requested, so a session reported without
+            // data is one the vendor is missing rather than one the market was shut for.
             if summary.is_complete() {
                 0
             } else {
@@ -172,7 +185,7 @@ async fn trading_calendar(
     let days = TradingClient::from_env(credentials)
         .fetch_calendar(start.date(), end.date())
         .await?;
-    Ok(TradingCalendar::from_days(days))
+    Ok(TradingCalendar::covering(days, start, end))
 }
 
 #[cfg(test)]
@@ -185,23 +198,39 @@ mod tests {
         )
     }
 
+    /// The default stops the day before, because today's daily bar is stamped at the close and does
+    /// not exist before it. Ending on today made a pre-close run request a session with no data,
+    /// which the calendar-filtered pass reports as a fault rather than as a holiday.
     #[test]
-    fn test_no_arguments_covers_the_default_lookback_ending_today() {
-        let today = session(2026, 8, 6);
-        let range = parse_arguments(&[], today).unwrap();
-        assert_eq!(range.end, today);
+    fn test_no_arguments_end_on_the_session_before_today() {
+        let range = parse_arguments(&[], session(2026, 8, 6)).unwrap();
+
+        assert_eq!(range.end, session(2026, 8, 5));
         assert_eq!(
             range.start,
-            today.plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS)
+            session(2026, 8, 5).plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS)
         );
     }
 
     #[test]
-    fn test_one_argument_runs_from_that_date_to_today() {
-        let today = session(2026, 8, 6);
-        let range = parse_arguments(&["2026-01-02".to_string()], today).unwrap();
+    fn test_one_argument_runs_from_that_date_to_the_last_final_session() {
+        let range = parse_arguments(&["2026-01-02".to_string()], session(2026, 8, 6)).unwrap();
+
         assert_eq!(range.start, session(2026, 1, 2));
-        assert_eq!(range.end, today);
+        assert_eq!(range.end, session(2026, 8, 5));
+    }
+
+    /// An explicit date is left alone. An operator naming today is asking for a session with no
+    /// data, and the run reporting that is the exit code telling the truth rather than a defect.
+    #[test]
+    fn test_an_explicit_end_date_is_taken_as_given() {
+        let range = parse_arguments(
+            &["2026-08-01".to_string(), "2026-08-06".to_string()],
+            session(2026, 8, 6),
+        )
+        .unwrap();
+
+        assert_eq!(range.end, session(2026, 8, 6));
     }
 
     #[test]

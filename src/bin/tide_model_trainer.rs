@@ -132,7 +132,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .fetch_calendar(window_start.date(), session.date())
             .await
         {
-            Ok(days) => Some(TradingCalendar::from_days(days)),
+            Ok(days) => Some(TradingCalendar::covering(days, window_start, session)),
             Err(error) => {
                 warn!(%error, "Trading calendar unavailable; the repair will request holidays too");
                 None
