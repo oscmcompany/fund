@@ -10,7 +10,7 @@ use tracing::{error, info};
 use fund::common::alpaca::{AlpacaCredentials, DataFeed, MarketDataClient, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::types::{LiquidityFloor, QuoteSummary, SessionDate, Ticker};
-use fund::data::archive::{self, QuoteScope};
+use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
 use fund::data::calendar::TradingCalendar;
 use fund::data::quotes;
 
@@ -261,9 +261,15 @@ async fn run(
             measure(&market_data, &calendar, &sampled, symbols).await;
             return Ok(None);
         }
-        Mode::Archive => QuoteScope::ScreenedUniverse(LiquidityFloor::CURRENT),
-        Mode::WholeMarket => QuoteScope::WholeMarket,
-        Mode::Repair(symbols) => QuoteScope::Symbols(symbols.clone()),
+        Mode::Archive => Scope::new(
+            NameSelection::Screened(LiquidityFloor::CURRENT),
+            SessionSelection::Absent,
+        )?,
+        Mode::WholeMarket => Scope::new(NameSelection::WholeMarket, SessionSelection::Every)?,
+        Mode::Repair(symbols) => Scope::new(
+            NameSelection::Named(symbols.clone()),
+            SessionSelection::Present,
+        )?,
     };
 
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")

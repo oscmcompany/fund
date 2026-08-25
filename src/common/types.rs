@@ -58,6 +58,18 @@ impl LiquidityFloor {
     }
 }
 
+impl std::fmt::Display for LiquidityFloor {
+    /// Both bounds unscaled, because a floor that renders ambiguously is worse than one that reads
+    /// awkwardly: abbreviating the notional to millions would print any floor under $1M as `$0M`.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "${} close on ${} traded",
+            self.minimum_close_price, self.minimum_dollar_volume
+        )
+    }
+}
+
 /// Serializes a [`Decimal`] as a JSON number rather than a quoted string.
 ///
 /// `Decimal`'s own `Serialize` writes a string, which a reader has to cast before it can do
@@ -1612,6 +1624,21 @@ mod tests {
         assert_eq!(
             LiquidityFloor::CURRENT.minimum_dollar_volume(),
             50_000_000.0
+        );
+    }
+
+    /// Both bounds have to appear, because this renders into log fields whose only job is telling
+    /// two passes apart — one that named the screen without its floor could not.
+    #[test]
+    fn test_a_floor_renders_both_of_its_bounds() {
+        assert_eq!(
+            LiquidityFloor::CURRENT.to_string(),
+            "$10 close on $50000000 traded"
+        );
+        assert_eq!(
+            LiquidityFloor::new(2.5, 750_000.0).unwrap().to_string(),
+            "$2.5 close on $750000 traded",
+            "a floor under a million must not render as zero"
         );
     }
 
