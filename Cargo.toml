@@ -4,8 +4,8 @@ version = "0.0.1"
 edition = "2021"
 resolver = "2"
 
-# No features, and four binaries auto-discovered from `src/bin/`: `fund`, `tide_model_trainer`,
-# `seed_equity_bars`, `seed_equity_details`.
+# No features, and every binary auto-discovered from `src/bin/`: the service `fund`, the `dashboard`,
+# `tide_model_trainer`, `backfill_account_snapshots`, the `seed` seeder and the `laboratory_*` studies.
 #
 # There is deliberately no `train` feature -- it existed so an inference-only build could skip the
 # training modules, but burn's `autodiff` is always compiled in anyway (it costs the NdArray
@@ -18,6 +18,10 @@ resolver = "2"
 [dependencies]
 # Shared / base (always compiled)
 chrono = { version = "0.4.44", features = ["serde"] }
+# The `seed` binary's subcommands. Derive rather than the builder, because the argument surface is
+# what the six binaries it replaced kept getting wrong: each hand-wrote a `USAGE` constant that the
+# parser beneath it was free to drift from, and every new option arrived as another positional slot.
+clap = { version = "4.6.6", features = ["derive"] }
 polars = { version = "0.51.0", features = [
   "lazy",
   "parquet",
