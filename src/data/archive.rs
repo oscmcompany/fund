@@ -119,6 +119,16 @@ pub enum ArchiveError {
     },
     #[error("gave up on {key} after {attempts} concurrent writes by another pass")]
     Contended { key: String, attempts: usize },
+    /// The trading calendar does not span the window, so which dates trade is unanswerable.
+    ///
+    /// Fatal rather than carried, unlike a failed session: a calendar short of the window drops real
+    /// sessions from the request and the pass would report a complete run over a window it never
+    /// covered — the one failure the summary itself cannot show.
+    #[error("the trading calendar does not cover {start} to {end}")]
+    Calendar {
+        start: SessionDate,
+        end: SessionDate,
+    },
     /// The upstream feed failed, before any bucket was touched.
     ///
     /// The vendor is carried because two of them supply this archive, and an operator reading the
@@ -155,39 +165,188 @@ enum WriteOutcome {
     Failed(String),
 }
 
+/// What a pass produced, whose units differ where it matters.
+///
+/// `quotes_folded` counts ticks fetched and discarded, which is what decides whether a backfill is
+/// affordable: a session yields roughly 79 summaries per name and hundreds of thousands of quotes to
+/// produce them. Per variant rather than beside the shared counts, so a bar pass cannot report one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassOutput {
+    /// Bars written across every partition the pass touched.
+    Bars { bars_written: usize },
+    /// Summary rows written across both cadences, and the ticks folded to produce them.
+    Quotes {
+        summaries_written: usize,
+        quotes_folded: usize,
+    },
+}
+
+impl PassOutput {
+    /// Rows this pass wrote to the archive, whichever kind it writes.
+    ///
+    /// For a caller that wants the one number rather than the variant — the trainer logs it, and a
+    /// bar pass and a quote pass both mean "rows that landed in a partition" by it.
+    pub fn rows_written(&self) -> usize {
+        match self {
+            PassOutput::Bars { bars_written } => *bars_written,
+            PassOutput::Quotes {
+                summaries_written, ..
+            } => *summaries_written,
+        }
+    }
+}
+
+/// How the sessions a pass requested were chosen, which decides whether an empty answer is a fault.
+///
+/// Not a label for which pass ran: [`expected_sessions`] excludes weekends but not holidays, because
+/// knowing them needs the calendar it deliberately does without. A holiday requested that way
+/// answers empty forever and is not a defect; one requested from a calendar-filtered list is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSource {
+    /// Every weekday in the window, holidays included.
+    Weekdays,
+    /// Already filtered against the exchange calendar, so no holiday survives to answer empty.
+    TradingCalendar,
+}
+
+impl SessionSource {
+    /// Read off the calendar a pass actually held, so nothing can claim a filtering it never did.
+    fn of(calendar: Option<&TradingCalendar>) -> Self {
+        match calendar {
+            Some(_) => SessionSource::TradingCalendar,
+            None => SessionSource::Weekdays,
+        }
+    }
+}
+
 /// What one archiving pass accomplished.
 ///
-/// `sessions_without_data` is reported rather than swallowed because it is how a caller tells a
-/// healthy run from a broken one. A steady handful is the holidays this deliberately re-requests; a
-/// sudden window of them is Massive answering empty, which looks identical in the archive and
-/// nothing else would surface.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ArchiveSummary {
+/// Fields are private and read through accessors: every one is a result, except the session source,
+/// which is the policy that interprets them — a caller able to set that could call a broken pass
+/// clean, and the counts carry a partition invariant nothing outside should be able to break.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PassSummary {
+    sessions_requested: usize,
+    sessions_written: usize,
+    sessions_without_data: usize,
+    sessions_failed: Vec<SessionDate>,
+    symbols_failed: usize,
+    output: PassOutput,
+    sessions: SessionSource,
+}
+
+impl PassSummary {
     /// Sessions that were absent (or inside the correction window) and therefore requested.
-    pub sessions_requested: usize,
-    /// Sessions that came back with bars and were written.
-    pub sessions_written: usize,
-    /// Sessions that were requested and returned no bars — holidays, and anything Massive lacks.
-    pub sessions_without_data: usize,
+    pub fn sessions_requested(&self) -> usize {
+        self.sessions_requested
+    }
+
+    /// Sessions that came back with data and were written.
+    pub fn sessions_written(&self) -> usize {
+        self.sessions_written
+    }
+
+    /// Sessions that were requested and returned nothing.
+    ///
+    /// Reported rather than swallowed because it is how a caller tells a healthy run from a broken
+    /// one. Whether it is a fault depends on how the session list was built, which is what
+    /// [`PassSummary::is_complete`] settles.
+    pub fn sessions_without_data(&self) -> usize {
+        self.sessions_without_data
+    }
+
     /// Sessions whose fetch or write failed, carried rather than fatal.
     ///
-    /// Treat a non-empty list as an incomplete pass: `Ok` means the pass ran to the end, not that
-    /// every requested session was written.
-    pub sessions_failed: Vec<SessionDate>,
-    /// Bars written across every partition this pass touched.
-    pub bars_written: usize,
-    /// Symbols an intraday pass could not fetch after every attempt.
+    /// A non-empty list is an incomplete pass: `Ok` means the pass ran to the end, not that every
+    /// requested session was written.
+    pub fn sessions_failed(&self) -> &[SessionDate] {
+        &self.sessions_failed
+    }
+
+    /// Symbols the pass could not fetch after every attempt.
     ///
     /// Reported because nothing downstream can detect one: a session-level gap scan sees the
     /// partition and moves on, so a symbol missing from it stays missing until someone re-runs the
     /// window. Always zero on the daily path, which fetches the market in one call.
-    pub symbols_failed: usize,
+    pub fn symbols_failed(&self) -> usize {
+        self.symbols_failed
+    }
+
+    /// What landed in the archive, in the units of the pass that wrote it.
+    pub fn output(&self) -> &PassOutput {
+        &self.output
+    }
+
+    /// Whether every session this pass requested is now in the archive.
+    ///
+    /// The one rule every binary's exit code derives from. Deciding it per binary was wrong twice —
+    /// bars exiting 0 on failure, quotes counting holidays as failure — and it is silent when wrong,
+    /// because a partition an incomplete pass wrote reads as complete to everything downstream.
+    pub fn is_complete(&self) -> bool {
+        self.sessions_failed.is_empty()
+            && self.symbols_failed == 0
+            && match self.sessions {
+                // A pass given no calendar still requested holidays, and a holiday is
+                // indistinguishable from a session the vendor lacks, so this cannot be called a fault.
+                SessionSource::Weekdays => true,
+                SessionSource::TradingCalendar => self.sessions_without_data == 0,
+            }
+    }
+}
+
+/// What a pass accumulates while it runs, before it is finished into a [`PassSummary`].
+///
+/// Separate so the published type can carry [`PassOutput`] as an enum without any code matching on a
+/// variant it might not have: the variant is built once, by the finisher, where it is not in doubt.
+#[derive(Debug, Default)]
+struct PassProgress {
+    sessions_requested: usize,
+    sessions_written: usize,
+    sessions_without_data: usize,
+    sessions_failed: Vec<SessionDate>,
+    symbols_failed: usize,
+    /// Bars on a bar pass, summary rows on a quote pass — one quantity, named at the finish.
+    rows_written: usize,
+}
+
+impl PassProgress {
+    fn into_bar_summary(self, calendar: Option<&TradingCalendar>) -> PassSummary {
+        PassSummary {
+            sessions_requested: self.sessions_requested,
+            sessions_written: self.sessions_written,
+            sessions_without_data: self.sessions_without_data,
+            sessions_failed: self.sessions_failed,
+            symbols_failed: self.symbols_failed,
+            output: PassOutput::Bars {
+                bars_written: self.rows_written,
+            },
+            sessions: SessionSource::of(calendar),
+        }
+    }
+
+    /// `quotes_folded` arrives by return rather than through this accumulator, so no bar pass ever
+    /// holds a counter it cannot fill.
+    fn into_quote_summary(self, quotes_folded: usize) -> PassSummary {
+        PassSummary {
+            sessions_requested: self.sessions_requested,
+            sessions_written: self.sessions_written,
+            sessions_without_data: self.sessions_without_data,
+            sessions_failed: self.sessions_failed,
+            symbols_failed: self.symbols_failed,
+            output: PassOutput::Quotes {
+                summaries_written: self.rows_written,
+                quotes_folded,
+            },
+            sessions: SessionSource::TradingCalendar,
+        }
+    }
 }
 
 /// Every weekday in `[start, end]` that the archive should be able to answer for.
 ///
 /// Weekends are excluded because they are never sessions anywhere; holidays are not, because
-/// knowing them requires the calendar this deliberately does without.
+/// knowing them requires a calendar this deliberately does without — see [`sessions_in_window`],
+/// which applies one when the caller has it.
 fn expected_sessions(start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
     let mut expected = Vec::new();
     let mut date = start;
@@ -198,6 +357,29 @@ fn expected_sessions(start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
         date = date.plus_calendar_days(1);
     }
     expected
+}
+
+/// The sessions a pass should be able to answer for, filtered by `calendar` when it has one.
+///
+/// Refused rather than narrowed when the calendar does not span the window: `is_trading_day` answers
+/// `false` outside its published horizon, so a short calendar would drop real sessions, shrink
+/// `sessions_requested`, and leave the pass reporting a complete run over a window it never covered.
+fn sessions_in_window(
+    start: SessionDate,
+    end: SessionDate,
+    calendar: Option<&TradingCalendar>,
+) -> Result<Vec<SessionDate>, ArchiveError> {
+    let weekdays = expected_sessions(start, end);
+    let Some(calendar) = calendar else {
+        return Ok(weekdays);
+    };
+    if !calendar.covers(start, end) {
+        return Err(ArchiveError::Calendar { start, end });
+    }
+    Ok(weekdays
+        .into_iter()
+        .filter(|session| calendar.is_trading_day(*session))
+        .collect())
 }
 
 /// The sessions to request: those with no partition, plus the correction window.
@@ -277,7 +459,7 @@ async fn present_partitions(
 /// are one case where a fixed lookback repairs only the first. Expected means "worth requesting"
 /// rather than "the market traded", since the trainer holds no broker credentials to consult a
 /// calendar with: a holiday is requested, answered with nothing, and requested again, at a cost of
-/// roughly ten empty requests a year that [`ArchiveSummary`] reports rather than hides.
+/// roughly ten empty requests a year that [`PassSummary`] reports rather than hides.
 ///
 /// Idempotent: a second pass over an unchanged window requests only the correction window and
 /// writes the same rows back. Safe to interrupt, because partitions are written as each chunk
@@ -293,8 +475,9 @@ pub async fn archive_missing_sessions(
     bucket: &str,
     window_start: SessionDate,
     window_end: SessionDate,
-) -> Result<ArchiveSummary, ArchiveError> {
-    let expected = expected_sessions(window_start, window_end);
+    calendar: Option<&TradingCalendar>,
+) -> Result<PassSummary, ArchiveError> {
+    let expected = sessions_in_window(window_start, window_end, calendar)?;
     let present = present_sessions(
         s3_client,
         bucket,
@@ -314,7 +497,7 @@ pub async fn archive_missing_sessions(
         "Scanned the bar archive for gaps"
     );
 
-    let mut summary = ArchiveSummary {
+    let mut progress = PassProgress {
         sessions_requested: requested.len(),
         ..Default::default()
     };
@@ -324,28 +507,28 @@ pub async fn archive_missing_sessions(
     // weekdays held every bar for all of them in memory before the first write. The same reasoning
     // and the same size as `seed_equity_bars_postgres`, whose chunking predates this.
     for chunk in requested.chunks(CHUNK_SESSIONS) {
-        archive_chunk(s3_client, massive, bucket, chunk, &mut summary).await?;
+        archive_chunk(s3_client, massive, bucket, chunk, &mut progress).await?;
     }
 
-    if !summary.sessions_failed.is_empty() {
+    if !progress.sessions_failed.is_empty() {
         // Logged rather than fatal: a failed session costs one partition, and the next pass finds
         // it missing again and retries it. That is the whole point of scanning rather than counting
         // back from today.
         warn!(
-            sessions_failed = ?summary.sessions_failed,
+            sessions_failed = ?progress.sessions_failed,
             "Some sessions could not be fetched; the next pass will retry them"
         );
     }
 
     info!(
-        sessions_requested = summary.sessions_requested,
-        sessions_written = summary.sessions_written,
-        sessions_without_data = summary.sessions_without_data,
-        sessions_failed = summary.sessions_failed.len(),
-        bars_written = summary.bars_written,
+        sessions_requested = progress.sessions_requested,
+        sessions_written = progress.sessions_written,
+        sessions_without_data = progress.sessions_without_data,
+        sessions_failed = progress.sessions_failed.len(),
+        bars_written = progress.rows_written,
         "Bar archive updated"
     );
-    Ok(summary)
+    Ok(progress.into_bar_summary(calendar))
 }
 
 /// Requested sessions that neither answered with bars nor failed outright.
@@ -353,7 +536,7 @@ pub async fn archive_missing_sessions(
 /// Counted over the requested sessions rather than by subtracting the number of answers. Responses
 /// are grouped by each bar's own timestamp, so a response can carry a session nobody asked for, and
 /// subtracting counts would let that extra one stand in for a session that genuinely came back
-/// empty — concealing exactly the signal [`ArchiveSummary::sessions_without_data`] exists to carry.
+/// empty — concealing exactly the signal [`PassSummary::sessions_without_data`] exists to carry.
 /// Taken together with the written and failed counts, this partitions the requested set.
 fn count_sessions_without_data(
     requested: &[SessionDate],
@@ -388,11 +571,11 @@ async fn archive_chunk(
     massive: &MassiveClient,
     bucket: &str,
     chunk: &[SessionDate],
-    summary: &mut ArchiveSummary,
+    progress: &mut PassProgress,
 ) -> Result<(), ArchiveError> {
     let fetched = bars::fetch_daily_bars(massive, chunk).await;
     let failed: BTreeSet<SessionDate> = fetched.dates_failed.iter().copied().collect();
-    summary.sessions_failed.extend(fetched.dates_failed);
+    progress.sessions_failed.extend(fetched.dates_failed);
 
     // One partition per session date, keyed by the bar's own timestamp rather than by the date that
     // was requested, so a response that answers for a neighbouring session cannot land under the
@@ -407,7 +590,7 @@ async fn archive_chunk(
     }
 
     let answered: BTreeSet<SessionDate> = by_date.keys().copied().collect();
-    summary.sessions_without_data += count_sessions_without_data(chunk, &answered, &failed);
+    progress.sessions_without_data += count_sessions_without_data(chunk, &answered, &failed);
 
     for (session, bars_for_session) in by_date {
         let fetched_frame = bars::bars_to_dataframe(&bars_for_session)?;
@@ -425,21 +608,21 @@ async fn archive_chunk(
             Ok(()) => {
                 // The rows this pass contributed, not the partition's height. Counting the merged
                 // total reported the archive's size as though every pass had just written it.
-                summary.sessions_written += 1;
-                summary.bars_written += fetched_rows;
+                progress.sessions_written += 1;
+                progress.rows_written += fetched_rows;
             }
             Err(ArchiveError::Contended { key, attempts }) => {
                 // Another pass kept winning the partition. Recorded as failed rather than retried
                 // forever: the next scan finds this session and repairs it, and the writer that did
                 // win wrote the same Massive response this one was holding.
                 warn!(key, attempts, %session, "Partition contended; the next pass will retry it");
-                summary.sessions_failed.push(session);
+                progress.sessions_failed.push(session);
             }
             // Carried like contention above, so one session's fault costs that session rather than
             // every session after it. The pass is only complete if `sessions_failed` is empty.
             Err(error) => {
                 warn!(%error, %session, "Partition write failed; this session was not archived");
-                summary.sessions_failed.push(session);
+                progress.sessions_failed.push(session);
             }
         }
     }
@@ -651,8 +834,9 @@ pub async fn archive_intraday_sessions(
     window_start: SessionDate,
     window_end: SessionDate,
     scope: &Scope,
-) -> Result<ArchiveSummary, ArchiveError> {
-    let expected = expected_sessions(window_start, window_end);
+    calendar: Option<&TradingCalendar>,
+) -> Result<PassSummary, ArchiveError> {
+    let expected = sessions_in_window(window_start, window_end, calendar)?;
     let present = present_sessions(s3_client, bucket, interval, window_start, window_end).await?;
     let requested = sessions_for(scope.sessions, &expected, &present);
 
@@ -667,7 +851,7 @@ pub async fn archive_intraday_sessions(
         "Planned an intraday pass"
     );
 
-    let mut summary = ArchiveSummary {
+    let mut progress = PassProgress {
         sessions_requested: requested.len(),
         ..Default::default()
     };
@@ -680,29 +864,29 @@ pub async fn archive_intraday_sessions(
             chunk,
             scope,
             &present,
-            &mut summary,
+            &mut progress,
         )
         .await?;
     }
 
-    if summary.symbols_failed > 0 {
+    if progress.symbols_failed > 0 {
         // Warned separately from the summary below, because this is the only outcome here that
         // needs a person: nothing re-requests a session that was written without one of its names.
         warn!(
-            symbols_failed = summary.symbols_failed,
+            symbols_failed = progress.symbols_failed,
             "Some symbols are absent from the partitions this pass wrote; re-run the window to repair them"
         );
     }
     info!(
-        sessions_requested = summary.sessions_requested,
-        sessions_written = summary.sessions_written,
-        sessions_without_data = summary.sessions_without_data,
-        sessions_failed = summary.sessions_failed.len(),
-        symbols_failed = summary.symbols_failed,
-        bars_written = summary.bars_written,
+        sessions_requested = progress.sessions_requested,
+        sessions_written = progress.sessions_written,
+        sessions_without_data = progress.sessions_without_data,
+        sessions_failed = progress.sessions_failed.len(),
+        symbols_failed = progress.symbols_failed,
+        bars_written = progress.rows_written,
         "Intraday archive updated"
     );
-    Ok(summary)
+    Ok(progress.into_bar_summary(calendar))
 }
 
 /// One chunk: derive the universe, fan out over it, then write a partition per session.
@@ -718,7 +902,7 @@ async fn archive_intraday_chunk(
     chunk: &[SessionDate],
     scope: &Scope,
     present: &BTreeSet<SessionDate>,
-    summary: &mut ArchiveSummary,
+    progress: &mut PassProgress,
 ) -> Result<(), ArchiveError> {
     let (Some(first), Some(last)) = (chunk.first(), chunk.last()) else {
         return Ok(());
@@ -736,7 +920,7 @@ async fn archive_intraday_chunk(
     }
     if universe.symbols.is_empty() {
         // Nothing to fetch, so nothing in the chunk gets written.
-        summary.sessions_without_data += chunk.len();
+        progress.sessions_without_data += chunk.len();
         return Ok(());
     }
     info!(
@@ -814,10 +998,10 @@ async fn archive_intraday_chunk(
     }
 
     let answered: BTreeSet<SessionDate> = by_session.keys().copied().collect();
-    summary.sessions_without_data +=
+    progress.sessions_without_data +=
         count_intraday_sessions_without_data(chunk, &universe.described, &answered);
     if symbols_failed > 0 {
-        summary.symbols_failed += symbols_failed;
+        progress.symbols_failed += symbols_failed;
         // Loud, because the partitions below are about to be written *without* these names and
         // nothing downstream can tell that from a complete one.
         warn!(
@@ -847,7 +1031,7 @@ async fn archive_intraday_chunk(
         );
     }
 
-    write_partitions(s3_client, bucket, interval, writable, summary).await
+    write_partitions(s3_client, bucket, interval, writable, progress).await
 }
 
 /// Whether this pass may write the partition for `session`.
@@ -881,7 +1065,7 @@ async fn write_partitions(
     bucket: &str,
     interval: BarInterval,
     partitions: Vec<(SessionDate, Vec<EquityBar>)>,
-    summary: &mut ArchiveSummary,
+    progress: &mut PassProgress,
 ) -> Result<(), ArchiveError> {
     let mut queued = partitions.into_iter();
     let mut writes = tokio::task::JoinSet::new();
@@ -905,19 +1089,19 @@ async fn write_partitions(
         };
         match finished {
             Ok((_, rows, Ok(()))) => {
-                summary.sessions_written += 1;
-                summary.bars_written += rows;
+                progress.sessions_written += 1;
+                progress.rows_written += rows;
             }
             Ok((session, _, Err(ArchiveError::Contended { key, attempts }))) => {
                 warn!(key, attempts, %session, "Partition contended; the next pass will retry it");
-                summary.sessions_failed.push(session);
+                progress.sessions_failed.push(session);
             }
             // Carried for the same reason contention is: one session's write says nothing about the
             // next one's. A fault that breaks writes but not reads is carried too and costs the rest
             // of the pass, which `sessions_failed` reports rather than hides.
             Ok((session, _, Err(error))) => {
                 warn!(%error, %session, "Partition write failed; this session was not archived");
-                summary.sessions_failed.push(session);
+                progress.sessions_failed.push(session);
             }
             Err(error) => {
                 return Err(ArchiveError::Write {
@@ -1334,33 +1518,6 @@ const QUOTE_CONCURRENCY: usize = 8;
 /// one of its names from a complete one.
 const QUOTE_SYMBOL_ATTEMPTS: usize = 3;
 
-/// What one quote-archiving pass accomplished.
-///
-/// Its own type rather than [`ArchiveSummary`], because the units differ where it matters:
-/// `quotes_folded` counts ticks that were fetched and discarded, and it is the number that decides
-/// whether a backfill is affordable. A session yields roughly 79 summaries per name and hundreds of
-/// thousands of quotes to produce them.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct QuoteArchiveSummary {
-    /// Sessions with no summary yet, and therefore requested.
-    pub sessions_requested: usize,
-    /// Sessions whose summaries were written.
-    pub sessions_written: usize,
-    /// Sessions that could not be summarized: a holiday, or one the daily archive cannot describe.
-    pub sessions_without_data: usize,
-    /// Sessions whose write failed, carried rather than fatal.
-    ///
-    /// Treat a non-empty list as an incomplete pass: `Ok` means the pass ran to the end, not that
-    /// every requested session was summarized.
-    pub sessions_failed: Vec<SessionDate>,
-    /// Summary rows written across both cadences.
-    pub summaries_written: usize,
-    /// Symbols whose quotes could not be fetched after every attempt.
-    pub symbols_failed: usize,
-    /// Quotes folded and discarded, which is what the pass actually cost.
-    pub quotes_folded: usize,
-}
-
 /// Folds the quoted book across `sessions`, per `scope`.
 ///
 /// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
@@ -1370,6 +1527,9 @@ pub struct QuoteArchiveSummary {
 ///
 /// Regular hours only, taken from the calendar so an early close is 3.5 hours rather than 6.5. The
 /// overnight book is an order of magnitude wider and would swamp any session mean it entered.
+///
+/// `sessions` must already be calendar-filtered, which the returned summary assumes when it reports
+/// a session that answered with nothing as a fault rather than as a holiday.
 pub async fn archive_quote_sessions(
     s3_client: &S3Client,
     market_data: &MarketDataClient,
@@ -1377,9 +1537,9 @@ pub async fn archive_quote_sessions(
     bucket: &str,
     sessions: &[SessionDate],
     scope: &Scope,
-) -> Result<QuoteArchiveSummary, ArchiveError> {
+) -> Result<PassSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
-        return Ok(QuoteArchiveSummary::default());
+        return Ok(PassProgress::default().into_quote_summary(0));
     };
     let present = present_partitions(
         s3_client,
@@ -1417,45 +1577,51 @@ pub async fn archive_quote_sessions(
         }
     }
 
-    let mut summary = QuoteArchiveSummary {
+    let mut progress = PassProgress {
         sessions_requested: requested.len(),
         ..Default::default()
     };
+    // Summed here rather than accumulated through `progress`, which is what lets the published
+    // summary carry it per variant without a bar pass holding a counter it can never fill.
+    let mut quotes_folded = 0usize;
     for session in requested {
-        archive_quote_session(
+        quotes_folded += archive_quote_session(
             s3_client,
             market_data,
             calendar,
             bucket,
             session,
             scope,
-            &mut summary,
+            &mut progress,
         )
         .await?;
     }
 
-    if summary.symbols_failed > 0 {
+    if progress.symbols_failed > 0 {
         // Warned separately, because this is the outcome nothing re-requests: the partition exists,
         // so the next pass reads the session as present and never looks inside it.
         warn!(
-            symbols_failed = summary.symbols_failed,
+            symbols_failed = progress.symbols_failed,
             "Some symbols are absent from the summaries this pass wrote; re-run those sessions to repair them"
         );
     }
     info!(
-        sessions_requested = summary.sessions_requested,
-        sessions_written = summary.sessions_written,
-        sessions_without_data = summary.sessions_without_data,
-        sessions_failed = summary.sessions_failed.len(),
-        summaries_written = summary.summaries_written,
-        symbols_failed = summary.symbols_failed,
-        quotes_folded = summary.quotes_folded,
+        sessions_requested = progress.sessions_requested,
+        sessions_written = progress.sessions_written,
+        sessions_without_data = progress.sessions_without_data,
+        sessions_failed = progress.sessions_failed.len(),
+        summaries_written = progress.rows_written,
+        symbols_failed = progress.symbols_failed,
+        quotes_folded,
         "Quote archive updated"
     );
-    Ok(summary)
+    Ok(progress.into_quote_summary(quotes_folded))
 }
 
 /// One session: derive the universe from the scope, fold every name's book, write both cadences.
+///
+/// Returns the quotes folded to produce them, which is the pass's real cost and the only figure that
+/// travels by return rather than through `progress`.
 #[allow(clippy::too_many_arguments)]
 async fn archive_quote_session(
     s3_client: &S3Client,
@@ -1464,13 +1630,13 @@ async fn archive_quote_session(
     bucket: &str,
     session: SessionDate,
     scope: &Scope,
-    summary: &mut QuoteArchiveSummary,
-) -> Result<(), ArchiveError> {
+    progress: &mut PassProgress,
+) -> Result<usize, ArchiveError> {
     let Some((open, close)) = quotes::trading_hours(calendar, session) else {
         // A date the calendar does not publish. Counted rather than fatal, so one unusable session
         // does not cost the rest of the window.
-        summary.sessions_without_data += 1;
-        return Ok(());
+        progress.sessions_without_data += 1;
+        return Ok(0);
     };
 
     let universe = match &scope.names {
@@ -1484,38 +1650,43 @@ async fn archive_quote_session(
                 // Left unwritten so a later pass retries, rather than summarized against a universe
                 // that never included whatever traded only on the session the daily archive lacks.
                 warn!(%session, "No daily partition to read a universe from; leaving the session unsummarized");
-                summary.sessions_without_data += 1;
-                return Ok(());
+                progress.sessions_without_data += 1;
+                return Ok(0);
             };
             names_from_partition(&scope.names, daily)?
         }
     };
     if universe.is_empty() {
-        summary.sessions_without_data += 1;
-        return Ok(());
+        progress.sessions_without_data += 1;
+        return Ok(0);
     }
 
     info!(%session, %open, %close, universe = universe.len(), "Folding a session's quoted book");
-    let folded = fold_universe(market_data, session, open, close, &universe, summary).await;
+    let (folded, quotes_folded) =
+        fold_universe(market_data, session, open, close, &universe, progress).await;
     if folded.is_empty() {
-        summary.sessions_without_data += 1;
-        return Ok(());
+        // The quotes still cost what they cost, so the count is returned even though nothing of
+        // this session reaches the archive.
+        progress.sessions_without_data += 1;
+        return Ok(quotes_folded);
     }
-    write_quote_partitions(s3_client, bucket, session, folded, summary).await
+    write_quote_partitions(s3_client, bucket, session, folded, progress).await?;
+    Ok(quotes_folded)
 }
 
-/// Fans out over the universe, folding each name's session and keeping only the summaries.
+/// Fans out over the universe, folding each name's session and keeping the summaries and the cost.
 async fn fold_universe(
     market_data: &MarketDataClient,
     session: SessionDate,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     universe: &BTreeSet<Ticker>,
-    summary: &mut QuoteArchiveSummary,
-) -> Vec<QuoteSummary> {
+    progress: &mut PassProgress,
+) -> (Vec<QuoteSummary>, usize) {
     let mut pending: Vec<Ticker> = universe.iter().cloned().collect();
     let mut tasks = tokio::task::JoinSet::new();
     let mut folded: Vec<QuoteSummary> = Vec::new();
+    let mut quotes_folded = 0usize;
 
     loop {
         while tasks.len() < QUOTE_CONCURRENCY {
@@ -1546,22 +1717,22 @@ async fn fold_universe(
         };
         match finished {
             Ok(Ok((summaries, fetch))) => {
-                summary.quotes_folded += fetch.received;
+                quotes_folded += fetch.received;
                 folded.extend(summaries);
             }
             // One symbol's failure costs that symbol, not the session — the other names are already
             // fetched, and discarding them would mean paying for them twice.
             Ok(Err((ticker, error))) => {
-                summary.symbols_failed += 1;
+                progress.symbols_failed += 1;
                 warn!(%ticker, %session, %error, "A symbol's quote fetch failed; continuing the session");
             }
             Err(error) => {
-                summary.symbols_failed += 1;
+                progress.symbols_failed += 1;
                 warn!(%error, %session, "A quote fold task did not complete");
             }
         }
     }
-    folded
+    (folded, quotes_folded)
 }
 
 /// Writes a session's summaries, one partition per cadence, five-minute first.
@@ -1574,7 +1745,7 @@ async fn write_quote_partitions(
     bucket: &str,
     session: SessionDate,
     folded: Vec<QuoteSummary>,
-    summary: &mut QuoteArchiveSummary,
+    progress: &mut PassProgress,
 ) -> Result<(), ArchiveError> {
     let mut intraday: Vec<QuoteSummary> = Vec::new();
     let mut daily: Vec<QuoteSummary> = Vec::new();
@@ -1611,19 +1782,19 @@ async fn write_quote_partitions(
             // already present will not return to it, so re-running is the operator's to decide.
             Err(ArchiveError::Contended { key, attempts }) => {
                 warn!(key, attempts, %session, "Quote partition contended; this session was not summarized");
-                summary.sessions_failed.push(session);
+                progress.sessions_failed.push(session);
                 return Ok(());
             }
             Err(error) => {
                 warn!(%error, %session, "Quote partition write failed; this session was not summarized");
-                summary.sessions_failed.push(session);
+                progress.sessions_failed.push(session);
                 return Ok(());
             }
         }
     }
 
-    summary.sessions_written += 1;
-    summary.summaries_written += written;
+    progress.sessions_written += 1;
+    progress.rows_written += written;
     Ok(())
 }
 
@@ -2006,21 +2177,21 @@ mod tests {
             .map(|at| (at, vec![one_bar("AAPL", at)]))
             .collect();
 
-        let mut summary = ArchiveSummary::default();
+        let mut progress = PassProgress::default();
         let outcome = write_partitions(
             &client,
             "test-bucket",
             BarInterval::FiveMinute,
             partitions,
-            &mut summary,
+            &mut progress,
         )
         .await;
 
         assert!(outcome.is_ok(), "one bad session must not end the pass");
-        assert_eq!(summary.sessions_written, 19);
+        assert_eq!(progress.sessions_written, 19);
         // The literal, not `doomed`: an expectation carried from the fixture moves with it, so
         // relocating the scripted failure would keep this passing without meaning to.
-        assert_eq!(summary.sessions_failed, vec![session(2026, 9, 3)]);
+        assert_eq!(progress.sessions_failed, vec![session(2026, 9, 3)]);
     }
 
     /// The stored layout, pinned to literals. Everything already written lives at these keys, and a
@@ -2067,6 +2238,193 @@ mod tests {
             );
             assert_eq!(date_from_partitioned_key(&quotes), Some(date));
         }
+    }
+
+    /// Each fault fails the pass on its own, and a clean pass passes. This is the rule all three
+    /// binaries' exit codes now derive from, and deciding it per binary was wrong twice.
+    #[test]
+    fn test_each_fault_alone_makes_a_pass_incomplete() {
+        let clean = PassProgress::default().into_bar_summary(None);
+        assert!(clean.is_complete());
+
+        let failed_session = PassProgress {
+            sessions_failed: vec![session(2026, 8, 19)],
+            ..Default::default()
+        }
+        .into_bar_summary(None);
+        assert!(!failed_session.is_complete(), "a failed session is a fault");
+
+        let failed_symbol = PassProgress {
+            symbols_failed: 1,
+            ..Default::default()
+        }
+        .into_bar_summary(None);
+        assert!(
+            !failed_symbol.is_complete(),
+            "a symbol missing from a written partition is a fault nothing downstream can see"
+        );
+    }
+
+    /// The bit that has been wrong twice, in both directions: bars exited 0 on failure and quotes
+    /// counted holidays as failure. The rule follows the calendar the pass actually held, so it
+    /// cannot claim a filtering it never did.
+    #[test]
+    fn test_an_empty_session_is_a_fault_only_when_a_calendar_filtered_the_window() {
+        let counts = || PassProgress {
+            sessions_requested: 5,
+            sessions_written: 4,
+            sessions_without_data: 1,
+            ..Default::default()
+        };
+        let calendar = calendar_of(
+            &[session(2026, 8, 17)],
+            session(2026, 8, 17),
+            session(2026, 8, 21),
+        );
+
+        assert!(
+            counts().into_bar_summary(None).is_complete(),
+            "with no calendar the list still holds holidays, which answer empty forever"
+        );
+        assert!(
+            !counts().into_bar_summary(Some(&calendar)).is_complete(),
+            "a calendar-filtered window has no holiday left to explain an empty answer"
+        );
+        assert!(
+            !counts().into_quote_summary(0).is_complete(),
+            "the quote pass is always calendar-filtered"
+        );
+    }
+
+    /// Holidays are what the weekday sweep cannot exclude on its own, and requesting them is what
+    /// made `sessions_without_data` ambiguous. 2026-07-03 is the observed Independence Day.
+    #[test]
+    fn test_a_calendar_drops_the_holidays_a_weekday_sweep_keeps() {
+        let (start, end) = (session(2026, 7, 1), session(2026, 7, 6));
+
+        assert_eq!(
+            sessions_in_window(start, end, None).unwrap(),
+            vec![
+                session(2026, 7, 1),
+                session(2026, 7, 2),
+                session(2026, 7, 3),
+                session(2026, 7, 6),
+            ],
+            "the weekday sweep keeps the holiday and drops only the weekend"
+        );
+
+        let calendar = calendar_of(
+            &[
+                session(2026, 7, 1),
+                session(2026, 7, 2),
+                session(2026, 7, 6),
+            ],
+            start,
+            end,
+        );
+        assert_eq!(
+            sessions_in_window(start, end, Some(&calendar)).unwrap(),
+            vec![
+                session(2026, 7, 1),
+                session(2026, 7, 2),
+                session(2026, 7, 6)
+            ],
+            "the calendar drops 07-03, which would answer empty forever"
+        );
+    }
+
+    /// The hole the first version of this only half-covered: it warned when the filter left nothing
+    /// at all, which misses the truncation that matters. A calendar short at either end drops real
+    /// sessions, shrinks `sessions_requested`, and leaves `is_complete()` reporting a clean run over
+    /// a window it never saw — the one failure the summary itself cannot show.
+    #[test]
+    fn test_a_calendar_that_does_not_span_the_window_is_refused() {
+        let (start, end) = (session(2026, 7, 1), session(2026, 7, 31));
+        let trading = [session(2026, 7, 1), session(2026, 7, 2)];
+
+        for (covered_start, covered_end, why) in [
+            (session(2026, 7, 6), end, "short at the start"),
+            (start, session(2026, 7, 20), "short at the end"),
+        ] {
+            let calendar = calendar_of(&trading, covered_start, covered_end);
+            assert!(
+                matches!(
+                    sessions_in_window(start, end, Some(&calendar)).unwrap_err(),
+                    ArchiveError::Calendar { start: refused_start, end: refused_end }
+                        if refused_start == start && refused_end == end
+                ),
+                "a calendar {why} must be refused, not silently narrow the request"
+            );
+        }
+
+        let spanning = calendar_of(&trading, start, end);
+        assert!(sessions_in_window(start, end, Some(&spanning)).is_ok());
+    }
+
+    /// A calendar built without recording its range cannot prove it covers anything, so it is
+    /// refused rather than trusted — the same conservatism `is_trading_day` already applies outside
+    /// its horizon, where it answers `false` rather than guessing.
+    #[test]
+    fn test_a_calendar_of_unknown_range_covers_nothing() {
+        let (start, end) = (session(2026, 7, 1), session(2026, 7, 2));
+        let unknown = TradingCalendar::from_days(vec![]);
+
+        assert!(!unknown.covers(start, end));
+        assert!(matches!(
+            sessions_in_window(start, end, Some(&unknown)).unwrap_err(),
+            ArchiveError::Calendar { .. }
+        ));
+    }
+
+    /// Every count has to survive the accumulator becoming a summary. Both finishers copy field by
+    /// field, so a transposed pair would be silent — the counts would still be plausible, just
+    /// attached to the wrong name.
+    #[test]
+    fn test_the_finish_carries_every_count_through() {
+        let progress = || PassProgress {
+            sessions_requested: 11,
+            sessions_written: 7,
+            sessions_without_data: 3,
+            sessions_failed: vec![session(2026, 8, 19)],
+            symbols_failed: 5,
+            rows_written: 2_048,
+        };
+
+        for summary in [
+            progress().into_bar_summary(None),
+            progress().into_quote_summary(0),
+        ] {
+            assert_eq!(summary.sessions_requested(), 11);
+            assert_eq!(summary.sessions_written(), 7);
+            assert_eq!(summary.sessions_without_data(), 3);
+            assert_eq!(summary.sessions_failed(), [session(2026, 8, 19)]);
+            assert_eq!(summary.symbols_failed(), 5);
+            assert_eq!(summary.output().rows_written(), 2_048);
+        }
+    }
+
+    /// The one figure that travels by return rather than through the accumulator, which is what
+    /// lets a bar pass hold no counter it could never fill.
+    #[test]
+    fn test_a_quote_pass_carries_what_it_cost() {
+        let summary = PassProgress {
+            rows_written: 158,
+            ..Default::default()
+        }
+        .into_quote_summary(412_000);
+
+        assert_eq!(
+            summary.output,
+            PassOutput::Quotes {
+                summaries_written: 158,
+                quotes_folded: 412_000
+            }
+        );
+        assert_eq!(
+            summary.output.rows_written(),
+            158,
+            "the shared accessor reads the rows, not the ticks folded to get them"
+        );
     }
 
     /// The rule the product exists to enforce, and the reason "may it create" is not a third axis.
@@ -2577,6 +2935,29 @@ mod tests {
 
     fn scope(names: NameSelection, sessions: SessionSelection) -> Scope {
         Scope::new(names, sessions).expect("a valid test scope")
+    }
+
+    /// A calendar publishing exactly these sessions, at the usual bell, over `[start, end]`.
+    fn calendar_of(
+        sessions: &[SessionDate],
+        start: SessionDate,
+        end: SessionDate,
+    ) -> TradingCalendar {
+        TradingCalendar::covering(
+            sessions
+                .iter()
+                .map(|at| {
+                    crate::common::alpaca::CalendarDay::new(
+                        at.date(),
+                        chrono::NaiveTime::from_hms_opt(9, 30, 0).expect("a valid open"),
+                        chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("a valid close"),
+                    )
+                    .expect("a session with duration")
+                })
+                .collect(),
+            start,
+            end,
+        )
     }
 
     /// The whole point of the task: a partition that exists and is short two names reads as

@@ -7,10 +7,12 @@ use std::collections::BTreeSet;
 use chrono::NaiveDate;
 use tracing::{error, info};
 
+use fund::common::alpaca::{AlpacaCredentials, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::{BarInterval, LiquidityFloor, SessionDate, Ticker};
 use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
+use fund::data::calendar::TradingCalendar;
 
 const USAGE: &str = "Usage: seed_intraday_bars_s3 START_DATE END_DATE [CADENCE [SYMBOLS]]\n\
                      Dates are Eastern calendar dates, inclusive: YYYY-MM-DD.\n\
@@ -163,16 +165,16 @@ async fn main() {
         Ok(Some(summary)) => {
             println!(
                 "requested {} sessions, wrote {}, {} without data, {} failed, {} bars, {} symbols missing",
-                summary.sessions_requested,
-                summary.sessions_written,
-                summary.sessions_without_data,
-                summary.sessions_failed.len(),
-                summary.bars_written,
-                summary.symbols_failed
+                summary.sessions_requested(),
+                summary.sessions_written(),
+                summary.sessions_without_data(),
+                summary.sessions_failed().len(),
+                summary.output().rows_written(),
+                summary.symbols_failed()
             );
-            // `sessions_without_data` is not a fault here: this pass requests holidays deliberately
-            // and they answer empty, unlike the quote pass, which samples the published calendar.
-            if summary.sessions_failed.is_empty() && summary.symbols_failed == 0 {
+            // One rule, in the archive. The supplied calendar excludes holidays before the pass
+            // requests anything, so a session reported without data is a real gap.
+            if summary.is_complete() {
                 0
             } else {
                 1
@@ -196,16 +198,19 @@ async fn main() {
 /// missing one name is indistinguishable from a complete one, so those are the ones to fold into.
 async fn run(
     parameters: &Parameters,
-) -> Result<Option<archive::ArchiveSummary>, Box<dyn std::error::Error>> {
+) -> Result<Option<archive::PassSummary>, Box<dyn std::error::Error>> {
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
     let s3_client = fund::common::aws::s3_client().await;
 
     // Built before the scan, which in repair mode is thousands of reads: an unset credential should
-    // fail in the first second rather than after it. A scan writes nothing and never needs one.
-    let massive = match parameters.mode {
-        Mode::Scan => None,
-        Mode::Seed(_) | Mode::Repair => Some(MassiveClient::from_env()?),
+    // fail in the first second rather than after it. A scan writes nothing and never needs either.
+    let (massive, calendar) = match parameters.mode {
+        Mode::Scan => (None, None),
+        Mode::Seed(_) | Mode::Repair => (
+            Some(MassiveClient::from_env()?),
+            Some(trading_calendar(parameters.start, parameters.end).await?),
+        ),
     };
 
     let scope = match &parameters.mode {
@@ -234,12 +239,14 @@ async fn run(
     };
 
     let massive = massive.expect("every mode that fetches builds a client above");
+    let calendar = calendar.expect("every mode that fetches builds a calendar above");
     info!(
         bucket,
         start = %parameters.start,
         end = %parameters.end,
         interval = %parameters.interval,
         %scope,
+        sessions = calendar.len(),
         "Seeding the intraday bar archive from Massive"
     );
 
@@ -252,9 +259,25 @@ async fn run(
             parameters.start,
             parameters.end,
             &scope,
+            Some(&calendar),
         )
         .await?,
     ))
+}
+
+/// Fetches the published sessions over the window, so holidays are never requested.
+///
+/// One request covering the whole range: `/v2/calendar` is unpaginated and answers 1990 through 2029
+/// in a single call, so even a five-year backfill costs one round trip.
+async fn trading_calendar(
+    start: SessionDate,
+    end: SessionDate,
+) -> Result<TradingCalendar, Box<dyn std::error::Error>> {
+    let credentials = AlpacaCredentials::from_env()?;
+    let days = TradingClient::from_env(credentials)
+        .fetch_calendar(start.date(), end.date())
+        .await?;
+    Ok(TradingCalendar::covering(days, start, end))
 }
 
 /// Missing names printed per session before the line is truncated.

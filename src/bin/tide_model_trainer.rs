@@ -8,20 +8,21 @@
 //! Frames are built through [`fund::data::bars::bars_to_dataframe`], shared with the application:
 //! if the two diverged, the model would train on columns the inference path does not produce.
 //!
-//! Nothing here touches a database or Alpaca — Massive answers by date, so there is no symbol list
-//! to build and no broker to ask for one. That is also why [`fund::data::archive`] decides which
-//! sessions to request from weekends rather than from the published trading calendar.
+//! Nothing here touches a database, and Alpaca is optional — Massive answers bars by date, so there
+//! is no symbol list to build. The trading calendar and the boundary table do need a broker key, and
+//! both warn and carry on without one: a repair that also requests holidays beats no repair.
 
 use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
-use fund::common::alpaca::{AlpacaCredentials, MarketDataClient};
+use fund::common::alpaca::{AlpacaCredentials, MarketDataClient, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::SessionDate;
 use fund::data::archive;
+use fund::data::calendar::TradingCalendar;
 use fund::data::details;
 use fund::laboratory::dataset;
 use fund::laboratory::journal as laboratory;
@@ -123,6 +124,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // year; a night with no new partition trains on 364 days instead of 365, which is a far better
     // outcome than publishing no model because Massive was briefly unreachable.
     let window_start = session.plus_calendar_days(-lookback_days);
+    // Fetched here rather than required, unlike the seed binaries. Without it the pass requests
+    // holidays and reports them as sessions without data; with a broker key absent entirely that is
+    // still a better trade than skipping the repair, which is the same call the boundary stage makes.
+    let calendar = match AlpacaCredentials::from_env() {
+        Ok(credentials) => match TradingClient::from_env(credentials)
+            .fetch_calendar(window_start.date(), session.date())
+            .await
+        {
+            Ok(days) => Some(TradingCalendar::covering(days, window_start, session)),
+            Err(error) => {
+                warn!(%error, "Trading calendar unavailable; the repair will request holidays too");
+                None
+            }
+        },
+        Err(error) => {
+            warn!(%error, "No Alpaca credentials; the repair will request holidays too");
+            None
+        }
+    };
     match MassiveClient::from_env() {
         Ok(massive) => {
             match archive::archive_missing_sessions(
@@ -131,14 +151,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &bucket,
                 window_start,
                 session,
+                calendar.as_ref(),
             )
             .await
             {
                 Ok(summary) => info!(
-                    sessions_written = summary.sessions_written,
-                    sessions_without_data = summary.sessions_without_data,
-                    sessions_failed = summary.sessions_failed.len(),
-                    bars_written = summary.bars_written,
+                    sessions_written = summary.sessions_written(),
+                    sessions_without_data = summary.sessions_without_data(),
+                    sessions_failed = summary.sessions_failed().len(),
+                    bars_written = summary.output().rows_written(),
                     "Archive repaired"
                 ),
                 Err(error) => {

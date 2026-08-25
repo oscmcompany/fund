@@ -189,32 +189,35 @@ async fn main() {
         // `None` when nothing was archived, which is what a measurement run always reports.
         Ok(None) => 0,
         Ok(Some(summary)) => {
+            let (summaries_written, quotes_folded) = match summary.output() {
+                archive::PassOutput::Quotes {
+                    summaries_written,
+                    quotes_folded,
+                } => (*summaries_written, *quotes_folded),
+                // Unreachable through `archive_quote_sessions`, and printed rather than panicked so
+                // a mislabelled summary costs two zeroes in a line rather than the run.
+                archive::PassOutput::Bars { .. } => (0, 0),
+            };
             println!(
                 "requested {} sessions, wrote {}, {} without data, {} failed, {} summaries, {} symbols missing, {} quotes folded",
-                summary.sessions_requested,
-                summary.sessions_written,
-                summary.sessions_without_data,
-                summary.sessions_failed.len(),
-                summary.summaries_written,
-                summary.symbols_failed,
-                summary.quotes_folded
+                summary.sessions_requested(),
+                summary.sessions_written(),
+                summary.sessions_without_data(),
+                summary.sessions_failed().len(),
+                summaries_written,
+                summary.symbols_failed(),
+                quotes_folded
             );
             // Non-zero on an incomplete pass, because the partition it wrote reads as complete to
-            // everything downstream and the exit code is the only signal automation sees.
-            //
-            // `sessions_without_data` counts here where it would not on the bar path: the sample
-            // is drawn from the published calendar, so a session that answers with nothing is a
-            // missing daily partition or an empty fold, never a holiday.
-            if summary.symbols_failed > 0
-                || !summary.sessions_failed.is_empty()
-                || summary.sessions_without_data > 0
-            {
+            // everything downstream and the exit code is the only signal automation sees. What
+            // counts as incomplete is the archive's rule now, not this binary's.
+            if summary.is_complete() {
+                0
+            } else {
                 eprintln!(
                     "Incomplete: re-run the affected sessions with the missing symbols and `repair`"
                 );
                 1
-            } else {
-                0
             }
         }
         Err(error) => {
@@ -231,7 +234,7 @@ async fn main() {
 /// Folds the sampled sessions, or measures the named symbols across them.
 async fn run(
     parameters: &Parameters,
-) -> Result<Option<archive::QuoteArchiveSummary>, Box<dyn std::error::Error>> {
+) -> Result<Option<archive::PassSummary>, Box<dyn std::error::Error>> {
     let credentials = AlpacaCredentials::from_env()?;
     // SIP is pinned, not read from `ALPACA_DATA_FEED`: IEX's best bid and offer is not the national
     // one, so an environment variable could put two incomparable series under one key.

@@ -50,6 +50,7 @@ pub fn eastern_datetime(instant: DateTime<Utc>) -> chrono::NaiveDateTime {
 #[derive(Debug, Clone, Default)]
 pub struct TradingCalendar {
     days: BTreeMap<SessionDate, CalendarDay>,
+    covered: Option<(SessionDate, SessionDate)>,
 }
 
 impl TradingCalendar {
@@ -58,13 +59,43 @@ impl TradingCalendar {
     /// This is the boundary where a date Alpaca sent over the wire becomes a [`SessionDate`].
     /// [`CalendarDay`] stays on `NaiveDate` because it is what the transport parsed; everything
     /// above this line deals in sessions.
+    ///
+    /// The result answers `false` to [`TradingCalendar::covers`] for every range: what it was
+    /// fetched for cannot be recovered from what came back. Use [`TradingCalendar::covering`] where
+    /// a caller needs to prove the horizon spans a window.
     pub fn from_days(days: Vec<CalendarDay>) -> Self {
         Self {
-            days: days
-                .into_iter()
-                .map(|day| (SessionDate::from_date(day.session_date()), day))
-                .collect(),
+            days: Self::index(days),
+            covered: None,
         }
+    }
+
+    /// Builds a calendar from days published over `[start, end]`, recording that range.
+    ///
+    /// The range is carried rather than inferred, because the contents cannot answer it: a window
+    /// opening on a weekend or a holiday has no published day at its own start, so comparing the
+    /// first session against `start` would reject a perfectly good calendar.
+    pub fn covering(days: Vec<CalendarDay>, start: SessionDate, end: SessionDate) -> Self {
+        Self {
+            days: Self::index(days),
+            covered: Some((start, end)),
+        }
+    }
+
+    fn index(days: Vec<CalendarDay>) -> BTreeMap<SessionDate, CalendarDay> {
+        days.into_iter()
+            .map(|day| (SessionDate::from_date(day.session_date()), day))
+            .collect()
+    }
+
+    /// Whether this calendar was published over the whole of `[start, end]`.
+    ///
+    /// `false` when the covered range is unknown, for the same reason
+    /// [`TradingCalendar::is_trading_day`] answers `false` outside its horizon: not knowing what you
+    /// cover is not proof of covering it, and the caller cannot tell the two apart.
+    pub fn covers(&self, start: SessionDate, end: SessionDate) -> bool {
+        self.covered
+            .is_some_and(|(first, last)| first <= start && end <= last)
     }
 
     /// Whether the market trades on `date`.
