@@ -16,10 +16,12 @@
 use chrono::{NaiveDate, Utc};
 use tracing::{error, info};
 
+use fund::common::alpaca::{AlpacaCredentials, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::SessionDate;
 use fund::data::archive;
+use fund::data::calendar::TradingCalendar;
 
 const USAGE: &str = "Usage: seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD]";
 
@@ -93,17 +95,18 @@ async fn main() {
     let code = match run(&range).await {
         Ok(summary) => {
             info!(
-                sessions_requested = summary.sessions_requested,
-                sessions_written = summary.sessions_written,
-                sessions_without_data = summary.sessions_without_data,
-                sessions_failed = summary.sessions_failed.len(),
-                bars_written = summary.bars_written,
+                sessions_requested = summary.sessions_requested(),
+                sessions_written = summary.sessions_written(),
+                sessions_without_data = summary.sessions_without_data(),
+                sessions_failed = summary.sessions_failed().len(),
+                bars_written = summary.output().rows_written(),
                 "Equity bar archive seeded"
             );
             // A run that stepped over a session leaves exactly the hole this tool exists to close,
             // and the exit code is the operator's only signal that the range needs re-running. A
-            // session with no data is not counted: holidays land there and always will.
-            if summary.sessions_failed.is_empty() {
+            // session with no data is not counted: holidays land there and always will, which is
+            // what `SessionSource::Weekdays` says and why this reads the archive's rule.
+            if summary.is_complete() {
                 0
             } else {
                 1
@@ -124,27 +127,52 @@ async fn main() {
 
 /// Repairs the archive over `range` and returns what the pass accomplished.
 ///
-/// Reads `AWS_S3_BUCKET_NAME` and the Massive credentials from the environment, and writes bar
-/// partitions under `data/equity/bars/interval=one_day/`. No database is touched. Only the sessions the bucket is
-/// missing are fetched, so the cost of a run is the size of the gap rather than the size of the
-/// range, and re-running over a repaired range is close to free.
-async fn run(range: &ArchiveRange) -> Result<archive::ArchiveSummary, Box<dyn std::error::Error>> {
+/// Reads `AWS_S3_BUCKET_NAME`, the Massive credentials and the Alpaca credentials from the
+/// environment, and writes bar partitions under `data/equity/bars/interval=one_day/`. No database is
+/// touched. Only the sessions the bucket is missing are fetched, so the cost of a run is the size of
+/// the gap rather than the size of the range, and re-running over a repaired range is close to free.
+///
+/// Alpaca answers only for the trading calendar: without it the pass would request holidays, which
+/// answer empty forever and cannot be told apart from a session Massive is missing.
+async fn run(range: &ArchiveRange) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
     let massive = MassiveClient::from_env()?;
     let s3_client = fund::common::aws::s3_client().await;
+    let calendar = trading_calendar(range.start, range.end).await?;
 
     info!(
         bucket,
         start = %range.start,
         end = %range.end,
+        sessions = calendar.len(),
         "Seeding the equity bar archive from Massive"
     );
 
-    Ok(
-        archive::archive_missing_sessions(&s3_client, &massive, &bucket, range.start, range.end)
-            .await?,
+    Ok(archive::archive_missing_sessions(
+        &s3_client,
+        &massive,
+        &bucket,
+        range.start,
+        range.end,
+        Some(&calendar),
     )
+    .await?)
+}
+
+/// Fetches the published sessions over the window, so holidays are never requested.
+///
+/// One request covering the whole range: `/v2/calendar` is unpaginated and answers 1990 through 2029
+/// in a single call, so even a five-year seed costs one round trip.
+async fn trading_calendar(
+    start: SessionDate,
+    end: SessionDate,
+) -> Result<TradingCalendar, Box<dyn std::error::Error>> {
+    let credentials = AlpacaCredentials::from_env()?;
+    let days = TradingClient::from_env(credentials)
+        .fetch_calendar(start.date(), end.date())
+        .await?;
+    Ok(TradingCalendar::from_days(days))
 }
 
 #[cfg(test)]
