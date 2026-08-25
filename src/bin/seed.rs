@@ -1,8 +1,6 @@
 //! Seeds and repairs every archive the fund reads from, one subcommand per target.
 //!
-//! Replaces six `seed_*` binaries that each parsed their own arguments, set up their own tracing and
-//! decided their own exit code. No subcommand writes to both PostgreSQL and S3: the application
-//! never reads the archive, and the trainer has no database.
+//! No subcommand writes to both PostgreSQL and S3: the application never reads the archive.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -332,7 +330,7 @@ fn read_symbols(path: &Path) -> Result<BTreeSet<Ticker>, String> {
         symbols.insert(ticker(line).map_err(|error| format!("{}: {error}", path.display()))?);
     }
     if symbols.is_empty() {
-        return Err(format!("{} names no tickers", path.display()));
+        return Err(format!("{} contains no tickers", path.display()));
     }
     Ok(symbols)
 }
@@ -765,64 +763,106 @@ async fn seed_archive_details() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Fills, widens, scans or repairs the intraday archive over the requested window.
 ///
-/// A scan writes nothing and needs neither Massive nor a calendar, so [`fold_intraday`] is what
-/// builds them and a scan never reaches it: a credential should never be demanded of a run that has
-/// no use for it, and should fail in the first second of one that does.
+/// One function per shape of run, because they disagree about what they need: a scan builds no vendor
+/// client at all, and a repair has to build its clients before the scan that derives its symbol set.
 async fn seed_intraday_bars(action: &IntradayAction) -> Result<Outcome, SeedError> {
-    // Resolved before any credential is read, so an unusable symbol file is refused in the first
-    // millisecond rather than after a listing.
-    let (arguments, named) = match action {
-        IntradayAction::Fill(arguments)
-        | IntradayAction::Widen(arguments)
-        | IntradayAction::Scan(arguments) => (arguments, None),
-        IntradayAction::Repair(repair) => (&repair.intraday, repair.symbols.names()?),
-    };
-    let window = arguments.window.window()?;
-    let interval = arguments.cadence.interval();
+    match action {
+        IntradayAction::Fill(arguments) => {
+            fold_intraday(arguments, whole_market(SessionSelection::Absent)?).await
+        }
+        IntradayAction::Widen(arguments) => {
+            fold_intraday(arguments, whole_market(SessionSelection::Every)?).await
+        }
+        IntradayAction::Scan(arguments) => scan_intraday_coverage(arguments).await,
+        IntradayAction::Repair(repair) => repair_intraday(repair).await,
+    }
+}
 
+/// The whole market over the given sessions, which only a pass that may create a partition may ask.
+fn whole_market(sessions: SessionSelection) -> Result<Scope, SeedError> {
+    Scope::new(NameSelection::WholeMarket, sessions)
+        .map_err(|error| SeedError::Usage(error.to_string()))
+}
+
+/// Reports which names each partition is short of the screen, writing nothing.
+///
+/// Builds no vendor client: this reads the archive against itself, so a credential it will never use
+/// must not be demanded of it.
+async fn scan_intraday_coverage(arguments: &IntradayArguments) -> Result<Outcome, SeedError> {
+    let window = arguments.window.window()?;
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
 
-    let scope = match action {
-        IntradayAction::Fill(_) => Scope::new(NameSelection::WholeMarket, SessionSelection::Absent),
-        IntradayAction::Widen(_) => Scope::new(NameSelection::WholeMarket, SessionSelection::Every),
-        IntradayAction::Scan(_) => {
-            report(&scan_intraday(&s3_client, &bucket, interval, &window).await?);
-            return Ok(Outcome::Complete);
-        }
-        IntradayAction::Repair(_) => match named {
-            Some(named) => Scope::new(NameSelection::Named(named), SessionSelection::Present),
-            // No symbol set given, so the scan supplies one. Reported either way: a repair driven by
-            // a scan repairs only what the readable sessions named.
-            None => {
-                let scan = scan_intraday(&s3_client, &bucket, interval, &window).await?;
-                report(&scan);
-                let missing = scan.missing_symbols();
-                if missing.is_empty() {
-                    println!("Nothing to repair.");
-                    return Ok(Outcome::Complete);
-                }
-                Scope::new(NameSelection::Named(missing), SessionSelection::Present)
-            }
-        },
-    }
-    .map_err(|error| SeedError::Usage(error.to_string()))?;
-
-    Ok(Outcome::Pass(
-        fold_intraday(&s3_client, &bucket, interval, &window, &scope).await?,
-    ))
+    let scan = scan_intraday(&s3_client, &bucket, arguments.cadence.interval(), &window).await?;
+    report(&scan);
+    require_whole_window(scan.failed())?;
+    Ok(Outcome::Complete)
 }
 
-/// Fetches the scope into the archive, which is the half of a run that needs a vendor.
-async fn fold_intraday(
+/// Fetches the whole market into the archive over the window.
+async fn fold_intraday(arguments: &IntradayArguments, scope: Scope) -> Result<Outcome, SeedError> {
+    let window = arguments.window.window()?;
+    let interval = arguments.cadence.interval();
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let massive = MassiveClient::from_env().map_err(box_error)?;
+    let calendar = trading_calendar(&window).await?;
+
+    fold(
+        &s3_client, &massive, &calendar, &bucket, interval, &window, &scope,
+    )
+    .await
+}
+
+/// Fetches named symbols into the sessions that already have a partition.
+///
+/// Given no symbol set the scan supplies one, which is why the clients are built before it rather
+/// than after: that scan is thousands of reads, and an unset credential must fail in the first second
+/// rather than at the end of them.
+async fn repair_intraday(repair: &IntradayRepairArguments) -> Result<Outcome, SeedError> {
+    let arguments = &repair.intraday;
+    // Resolved first of all, so an unusable symbol file is refused before a single request.
+    let given = repair.symbols.names()?;
+    let window = arguments.window.window()?;
+    let interval = arguments.cadence.interval();
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let massive = MassiveClient::from_env().map_err(box_error)?;
+    let calendar = trading_calendar(&window).await?;
+
+    let named = match given {
+        Some(named) => named,
+        None => {
+            let scan = scan_intraday(&s3_client, &bucket, interval, &window).await?;
+            report(&scan);
+            require_whole_window(scan.failed())?;
+            let missing = scan.missing_symbols();
+            if missing.is_empty() {
+                println!("Nothing to repair.");
+                return Ok(Outcome::Complete);
+            }
+            missing
+        }
+    };
+
+    let scope = Scope::new(NameSelection::Named(named), SessionSelection::Present)
+        .map_err(|error| SeedError::Usage(error.to_string()))?;
+    fold(
+        &s3_client, &massive, &calendar, &bucket, interval, &window, &scope,
+    )
+    .await
+}
+
+/// The half every fetching action shares, once its scope and its clients are settled.
+async fn fold(
     s3_client: &aws_sdk_s3::Client,
+    massive: &MassiveClient,
+    calendar: &TradingCalendar,
     bucket: &str,
     interval: BarInterval,
     window: &Window,
     scope: &Scope,
-) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
-    let massive = MassiveClient::from_env()?;
-    let calendar = trading_calendar(window).await?;
+) -> Result<Outcome, SeedError> {
     info!(
         bucket,
         start = %window.start,
@@ -833,17 +873,39 @@ async fn fold_intraday(
         "Seeding the intraday bar archive from Massive"
     );
 
-    Ok(archive::archive_intraday_sessions(
-        s3_client,
-        &massive,
-        bucket,
-        interval,
-        window.start,
-        window.end,
-        scope,
-        Some(&calendar),
-    )
-    .await?)
+    Ok(Outcome::Pass(
+        archive::archive_intraday_sessions(
+            s3_client,
+            massive,
+            bucket,
+            interval,
+            window.start,
+            window.end,
+            scope,
+            Some(calendar),
+        )
+        .await
+        .map_err(box_error)?,
+    ))
+}
+
+/// Refuses a scan that could not read every session it was asked about.
+///
+/// The names it found come only from the sessions it could read, so both the report and any repair
+/// driven by it are narrower than the window — and that is the one failure neither the scan line nor
+/// a pass summary can show. Fatal rather than carried, on the same terms as a calendar that does not
+/// cover its window.
+fn require_whole_window(unreadable: &BTreeSet<SessionDate>) -> Result<(), SeedError> {
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    Err(SeedError::Failed(
+        format!(
+            "could not read {} of the window's sessions, so this scan covers less than it was given",
+            unreadable.len()
+        )
+        .into(),
+    ))
 }
 
 async fn scan_intraday(
@@ -1106,6 +1168,11 @@ fn bucket_name() -> Result<String, Box<dyn std::error::Error>> {
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)".into())
 }
 
+/// Boxes a concrete error, which `?` cannot reach [`SeedError`] through in one conversion.
+fn box_error<E: std::error::Error + 'static>(error: E) -> SeedError {
+    SeedError::Failed(Box::new(error))
+}
+
 /// Fetches the published sessions over the window, so holidays are never requested.
 ///
 /// One request covering the whole range: `/v2/calendar` is unpaginated and answers 1990 through 2029
@@ -1198,10 +1265,8 @@ mod tests {
             .expect("a valid window");
 
         assert_eq!(window.end, session("2026-08-05"));
-        assert_eq!(
-            window.start,
-            session("2026-08-05").plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS)
-        );
+        // The literal rather than the constant: two years back from the end.
+        assert_eq!(window.start, session("2024-08-05"));
     }
 
     /// Named ends are taken as given. An operator naming today is asking for a session with no data,
@@ -1224,10 +1289,7 @@ mod tests {
             .expect("a valid window");
 
         assert_eq!(window.end, session("2026-03-31"));
-        assert_eq!(
-            window.start,
-            session("2026-03-31").plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS)
-        );
+        assert_eq!(window.start, session("2024-03-31"));
     }
 
     #[test]
@@ -1524,6 +1586,41 @@ mod tests {
         assert_eq!(Outcome::Chunked(fetch_skipped).exit_code(), 1);
     }
 
+    /// Fill only creates a partition; widen rewrites one that is already there. Confusing the two
+    /// turns a gap fill into a rewrite of every session in the window, which nothing downstream
+    /// reports and no re-run undoes.
+    #[test]
+    fn test_filling_and_widening_choose_different_sessions() {
+        assert_eq!(
+            whole_market(SessionSelection::Absent)
+                .expect("the whole market may create a partition")
+                .to_string(),
+            "every name, absent sessions only"
+        );
+        assert_eq!(
+            whole_market(SessionSelection::Every)
+                .expect("the whole market may rewrite a partition")
+                .to_string(),
+            "every name, every session"
+        );
+    }
+
+    /// A scan that could not read a session found its names only in the ones it could, so both the
+    /// report and any repair driven by it are narrower than the window. `report` already printed a
+    /// warning about it; the exit code, which is what automation reads, ignored it.
+    #[test]
+    fn test_a_scan_that_could_not_read_a_session_is_refused() {
+        require_whole_window(&BTreeSet::new()).expect("a scan that read its whole window");
+
+        let unreadable = BTreeSet::from([session("2026-08-18")]);
+        let error = require_whole_window(&unreadable).expect_err("an unreadable session");
+        assert!(
+            matches!(error, SeedError::Failed(_)),
+            "a run that started and could not finish, not a usage error"
+        );
+        assert!(error.to_string().contains("could not read 1"), "{error}");
+    }
+
     /// A run with nothing to step over reports through its own output, so there is no line to print
     /// and nothing to exit non-zero over.
     #[test]
@@ -1565,7 +1662,7 @@ mod tests {
 
         for chunk in &chunks {
             let span = (chunk.end.date() - chunk.start.date()).num_days() + 1;
-            assert!(span <= CHUNK_DAYS, "chunk of {span} days exceeds the bound");
+            assert!(span <= 30, "chunk of {span} days exceeds the bound");
         }
     }
 
