@@ -857,7 +857,8 @@ in {
 
   # Seeding, by data type and target. Bars come from Massive either way -- the grouped endpoint
   # answers by date rather than by symbol list -- but the two targets serve different readers and
-  # have different requirements, which is why they are separate scripts rather than one with a flag.
+  # have different requirements, which is why they are separate scripts and separate subcommands of
+  # the `seed` binary rather than one invocation with a flag.
   #
   #   *-postgres  what the application trades from. Needs a database, no AWS.
   #   *-s3        what the trainer trains from. Needs AWS and Massive, no database.
@@ -878,10 +879,15 @@ in {
       exit 1
     fi
 
+    END_FLAG=""
+    if [ -n "''${SEED_END_DATE:-}" ]; then
+      END_FLAG="--end $SEED_END_DATE"
+    fi
+
     echo "Seeding equity bars into PostgreSQL from $SEED_START_DATE to ''${SEED_END_DATE:-today}"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed_equity_bars_postgres -- \
-      "$SEED_START_DATE" ''${SEED_END_DATE:-}
+    secretspec run -- cargo run --release --bin seed -- \
+      equity-bars daily postgres --start "$SEED_START_DATE" $END_FLAG
   '';
 
   scripts.seed-equity-details-postgres.exec = ''
@@ -889,7 +895,7 @@ in {
 
     echo "Seeding equity details into PostgreSQL from the embedded CSV"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed_equity_details_postgres
+    secretspec run -- cargo run --release --bin seed -- equity-details postgres
   '';
 
   # Repairs account_snapshots from Alpaca's portfolio history. Not a seed: it fills only the
@@ -930,22 +936,22 @@ in {
   scripts.seed-equity-bars-s3.exec = ''
     set -euo pipefail
 
-    # Rejected rather than defaulted. The arguments are positional, so an unset start with a set end
-    # would send exactly one word and the binary would read it as the *start* date -- repairing a
-    # window running from the intended end to today, while the echo below reported the window the
-    # operator meant. Silently repairing the wrong range is worse than refusing to start.
-    if [ -z "''${SEED_START_DATE:-}" ] && [ -n "''${SEED_END_DATE:-}" ]; then
-      echo "SEED_END_DATE is set but SEED_START_DATE is not."
-      echo "  These are positional, so an end date alone would be read as the start date and the"
-      echo "  archive repaired over the wrong window. Set both, or set neither to repair the last"
-      echo "  two years."
-      exit 1
+    # Either date alone is a window now: an end with no start repairs the two years before it. The
+    # guard that used to sit here refused exactly that, because a lone positional would have been
+    # read as the *start* date and the archive repaired over the wrong window.
+    START_FLAG=""
+    if [ -n "''${SEED_START_DATE:-}" ]; then
+      START_FLAG="--start $SEED_START_DATE"
+    fi
+    END_FLAG=""
+    if [ -n "''${SEED_END_DATE:-}" ]; then
+      END_FLAG="--end $SEED_END_DATE"
     fi
 
-    echo "Seeding the S3 equity bar archive from ''${SEED_START_DATE:-two years ago} to ''${SEED_END_DATE:-today}"
+    echo "Seeding the S3 equity bar archive from ''${SEED_START_DATE:-two years back} to ''${SEED_END_DATE:-the last closed session}"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed_equity_bars_s3 -- \
-      ''${SEED_START_DATE:-} ''${SEED_END_DATE:-}
+    secretspec run -- cargo run --release --bin seed -- \
+      equity-bars daily s3 $START_FLAG $END_FLAG
   '';
 
   scripts.seed-equity-details-s3.exec = ''
@@ -953,7 +959,7 @@ in {
 
     echo "Archiving equity details to S3 from the embedded CSV"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed_equity_details_s3
+    secretspec run -- cargo run --release --bin seed -- equity-details s3
   '';
 
   tasks = {

@@ -85,7 +85,7 @@ const CORRECTION_WINDOW_SESSIONS: usize = 2;
 /// A grouped response is the whole market — on the order of ten thousand rows per session — so a
 /// cold seed of five hundred weekdays fetched in one call would hold several million bars before
 /// the first write and lose all of them to one failure. Thirty is a couple of hundred thousand
-/// rows, a bounded amount of work to repeat, and the same figure `seed_equity_bars_postgres` picked
+/// rows, a bounded amount of work to repeat, and the same figure `seed equity-bars daily postgres` picked
 /// for the same reason.
 const CHUNK_SESSIONS: usize = 30;
 
@@ -291,6 +291,34 @@ impl PassSummary {
                 SessionSource::Weekdays => true,
                 SessionSource::TradingCalendar => self.sessions_without_data == 0,
             }
+    }
+}
+
+impl std::fmt::Display for PassSummary {
+    /// The operator's one line, so no two callers can render the same counts differently.
+    ///
+    /// The tail comes off [`PassOutput`], which is why a quote pass reports the ticks it folded and a
+    /// bar pass does not have to print a zero it could never fill.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "requested {} sessions, wrote {}, {} without data, {} failed, {} symbols missing",
+            self.sessions_requested,
+            self.sessions_written,
+            self.sessions_without_data,
+            self.sessions_failed.len(),
+            self.symbols_failed
+        )?;
+        match &self.output {
+            PassOutput::Bars { bars_written } => write!(formatter, ", {bars_written} bars"),
+            PassOutput::Quotes {
+                summaries_written,
+                quotes_folded,
+            } => write!(
+                formatter,
+                ", {summaries_written} summaries, {quotes_folded} quotes folded"
+            ),
+        }
     }
 }
 
@@ -505,7 +533,7 @@ pub async fn archive_missing_sessions(
     // Fetched and written a chunk at a time rather than all at once. A grouped response is the whole
     // market -- on the order of ten thousand rows per session -- so a cold seed of five hundred
     // weekdays held every bar for all of them in memory before the first write. The same reasoning
-    // and the same size as `seed_equity_bars_postgres`, whose chunking predates this.
+    // and the same size as `seed equity-bars daily postgres`, whose chunking predates this.
     for chunk in requested.chunks(CHUNK_SESSIONS) {
         archive_chunk(s3_client, massive, bucket, chunk, &mut progress).await?;
     }
@@ -2401,6 +2429,31 @@ mod tests {
             assert_eq!(summary.symbols_failed(), 5);
             assert_eq!(summary.output().rows_written(), 2_048);
         }
+    }
+
+    /// The tail is what the two passes disagree about, so the rendered line has to differ exactly
+    /// there and nowhere else. A bar pass printing a folded-quote count it can never fill was the
+    /// hole the per-variant output exists to close, and rendering is the last place it could reopen.
+    #[test]
+    fn test_the_rendered_line_names_what_the_pass_actually_wrote() {
+        let progress = || PassProgress {
+            sessions_requested: 11,
+            sessions_written: 7,
+            sessions_without_data: 3,
+            sessions_failed: vec![session(2026, 8, 19)],
+            symbols_failed: 5,
+            rows_written: 2_048,
+        };
+        let shared = "requested 11 sessions, wrote 7, 3 without data, 1 failed, 5 symbols missing";
+
+        assert_eq!(
+            progress().into_bar_summary(None).to_string(),
+            format!("{shared}, 2048 bars")
+        );
+        assert_eq!(
+            progress().into_quote_summary(412_000).to_string(),
+            format!("{shared}, 2048 summaries, 412000 quotes folded")
+        );
     }
 
     /// The one figure that travels by return rather than through the accumulator, which is what
