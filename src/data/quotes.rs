@@ -2,12 +2,15 @@
 //!
 //! Quotes come from Alpaca rather than Massive; see [`crate::common::alpaca`] for that split.
 
+use std::collections::{BTreeSet, HashMap};
+
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use polars::prelude::*;
 use tracing::warn;
 
 use crate::common::alpaca::{ClientError, MarketDataClient, QuoteFetch, QuoteTick};
+use crate::common::flatfiles::QuoteSink;
 use crate::common::types::{BarInterval, BasisPoints, QuoteSummary, SessionDate, Ticker};
 use crate::data::calendar::TradingCalendar;
 
@@ -643,5 +646,210 @@ mod tests {
         let expected: Vec<&str> = QUOTE_FRAME_COLUMNS.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, expected);
         assert_eq!(frame.height(), 3);
+    }
+
+    fn universe(names: &[&str]) -> BTreeSet<Ticker> {
+        names.iter().map(|raw| named(raw)).collect()
+    }
+
+    fn named(raw: &str) -> Ticker {
+        Ticker::new(raw).expect("a valid ticker")
+    }
+
+    fn quote(minute: u32, bid: f64, ask: f64) -> QuoteTick {
+        QuoteTick::new(at(minute, 0), bid, ask, 100, 200).expect("a usable book")
+    }
+
+    /// The ordinary shape of a ticker-major file: each name contiguous, each folded on its own.
+    #[test]
+    fn test_each_contiguous_name_folds_separately() {
+        let mut fold = MarketFold::new(
+            session(),
+            at(30, 0),
+            at(40, 0),
+            universe(&["AAPL", "CBOE", "BCPC"]),
+        );
+        fold.push(named("AAPL"), quote(30, 99.95, 100.05));
+        fold.push(named("AAPL"), quote(36, 99.99, 100.01));
+        fold.push(named("CBOE"), quote(30, 199.80, 200.20));
+        let (summaries, merged) = fold.finish();
+
+        assert!(merged.is_empty(), "nothing was split");
+        let names: BTreeSet<_> = summaries
+            .iter()
+            .map(|summary| summary.ticker().as_str().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["AAPL".to_string(), "CBOE".to_string()])
+        );
+    }
+
+    /// A flat file is whole-market whatever the scope asked for, so a name outside the universe
+    /// must cost nothing — neither a summary nor a fold held open for it.
+    #[test]
+    fn test_a_name_outside_the_universe_is_not_folded() {
+        let mut fold = MarketFold::new(session(), at(30, 0), at(40, 0), universe(&["AAPL"]));
+        fold.push(named("AAPL"), quote(30, 99.95, 100.05));
+        fold.push(named("CBOE"), quote(30, 199.80, 200.20));
+        fold.push(named("ZZZ"), quote(30, 9.95, 10.05));
+        assert_eq!(fold.folded(), 1, "only the name asked for");
+
+        let (summaries, _) = fold.finish();
+        let names: BTreeSet<_> = summaries
+            .iter()
+            .map(|summary| summary.ticker().as_str().to_string())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["AAPL".to_string()]));
+    }
+
+    /// BCPC and TPC arrive in two runs on every session measured. The second run resumes the first
+    /// one's fold rather than starting a second session for the name — folded separately, each run's
+    /// last quote would prevail to the close and the two would together claim 840 seconds of a
+    /// 600-second session.
+    #[test]
+    fn test_a_split_name_resumes_its_own_fold_rather_than_opening_a_second() {
+        let mut fold = MarketFold::new(
+            session(),
+            at(30, 0),
+            at(40, 0),
+            universe(&["AAPL", "CBOE", "BCPC"]),
+        );
+        fold.push(named("BCPC"), quote(30, 99.95, 100.05));
+        fold.push(named("CBOE"), quote(30, 199.80, 200.20));
+        fold.push(named("BCPC"), quote(36, 99.99, 100.01));
+        let (summaries, merged) = fold.finish();
+
+        assert_eq!(
+            merged.iter().map(Ticker::as_str).collect::<Vec<_>>(),
+            vec!["BCPC"],
+            "the split name is reported rather than silently handled"
+        );
+
+        let session_bar = summaries
+            .iter()
+            .find(|summary| {
+                summary.ticker().as_str() == "BCPC" && summary.bar_interval() == BarInterval::OneDay
+            })
+            .expect("BCPC has one session bar rather than two");
+        assert_eq!(
+            summaries
+                .iter()
+                .filter(|summary| summary.ticker().as_str() == "BCPC"
+                    && summary.bar_interval() == BarInterval::OneDay)
+                .count(),
+            1
+        );
+        assert_eq!(session_bar.quote_count(), 2, "both runs counted");
+        // Ten minutes of session, covered end to end between the two runs.
+        assert_close(session_bar.covered_seconds(), 600.0);
+    }
+}
+
+/// Folds a whole session out of one ticker-major flat file, resuming a name that comes back.
+///
+/// Every name's fold is held until the file ends. Releasing at the ticker switch would be cheaper —
+/// thirteen megabytes against seven gigabytes — but two names a session arrive in two runs, and a
+/// released fold cannot take the second one: its observations are gone, and folding the runs
+/// separately extends each one's last quote to the close, so their weights overlap and sum past the
+/// session itself.
+pub struct MarketFold {
+    session: SessionDate,
+    open: DateTime<Utc>,
+    close: DateTime<Utc>,
+    /// The run in progress, kept out of the map so the common row costs no lookup.
+    current: Option<(Ticker, SessionFold)>,
+    parked: HashMap<Ticker, SessionFold>,
+    resumed: BTreeSet<Ticker>,
+    /// The names worth folding. A flat file is whole-market whatever the scope asked for, so the
+    /// scope is applied here rather than by the transport.
+    universe: BTreeSet<Ticker>,
+    /// Ticks belonging to the universe, which is what the pass reports as its cost.
+    folded: usize,
+}
+
+impl MarketFold {
+    /// Opens a fold over one session's regular hours.
+    pub fn new(
+        session: SessionDate,
+        open: DateTime<Utc>,
+        close: DateTime<Utc>,
+        universe: BTreeSet<Ticker>,
+    ) -> Self {
+        Self {
+            session,
+            open,
+            close,
+            current: None,
+            parked: HashMap::new(),
+            resumed: BTreeSet::new(),
+            universe,
+            folded: 0,
+        }
+    }
+
+    /// Ticks folded, which is this pass's cost and the only trace a discarded row leaves.
+    pub fn folded(&self) -> usize {
+        self.folded
+    }
+
+    /// Accepts the next row of the file, which carries its own ticker.
+    pub fn push(&mut self, ticker: Ticker, tick: QuoteTick) {
+        if !self.universe.contains(&ticker) {
+            return;
+        }
+        self.folded += 1;
+        let same = matches!(&self.current, Some((open, _)) if *open == ticker);
+        if !same {
+            self.rotate(ticker);
+        }
+        if let Some((_, fold)) = self.current.as_mut() {
+            fold.push(tick);
+        }
+    }
+
+    /// Parks the run in progress and takes up `ticker`, resuming its fold if it already has one.
+    fn rotate(&mut self, ticker: Ticker) {
+        if let Some((held, fold)) = self.current.take() {
+            self.parked.insert(held, fold);
+        }
+        let fold = match self.parked.remove(&ticker) {
+            Some(fold) => {
+                self.resumed.insert(ticker.clone());
+                Some(fold)
+            }
+            None => SessionFold::new(ticker.clone(), self.session, self.open, self.close),
+        };
+        self.current = fold.map(|fold| (ticker, fold));
+    }
+
+    /// Closes every fold, returning the summaries and the names that came back for a second run.
+    pub fn finish(mut self) -> (Vec<QuoteSummary>, BTreeSet<Ticker>) {
+        if let Some((held, fold)) = self.current.take() {
+            self.parked.insert(held, fold);
+        }
+        if !self.resumed.is_empty() {
+            warn!(
+                session = %self.session,
+                names = %self
+                    .resumed
+                    .iter()
+                    .map(|ticker| ticker.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "Resumed names whose rows arrived in more than one run"
+            );
+        }
+        let summaries = std::mem::take(&mut self.parked)
+            .into_values()
+            .flat_map(SessionFold::finish)
+            .collect();
+        (summaries, self.resumed)
+    }
+}
+
+impl QuoteSink for MarketFold {
+    fn push(&mut self, ticker: Ticker, tick: QuoteTick) {
+        MarketFold::push(self, ticker, tick)
     }
 }

@@ -209,6 +209,10 @@ struct ProbeArguments {
     /// The session to read, as an Eastern calendar date: YYYY-MM-DD.
     #[arg(long, value_parser = session_date)]
     date: SessionDate,
+    /// Fold only these names and print their session summaries, rather than counting the file.
+    /// This is how a flat-file fold is checked against the same session through Alpaca.
+    #[command(flatten)]
+    symbols: SymbolArguments,
 }
 
 #[derive(Debug, Args)]
@@ -1007,12 +1011,16 @@ fn report(scan: &archive::SymbolScan) {
 /// be reachable only after one has been demanded.
 async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
     match action {
-        QuoteAction::Probe(arguments) => probe_flat_file(arguments.date).await,
+        QuoteAction::Probe(arguments) => match arguments.symbols.names()? {
+            None => probe_flat_file(arguments.date).await,
+            Some(named) => fold_named_from_flat_file(arguments.date, named).await,
+        },
         QuoteAction::Archive(arguments) => {
             fold_sampled(
                 arguments,
                 NameSelection::Screened(LiquidityFloor::CURRENT),
                 SessionSelection::Absent,
+                QuoteProvider::WholeSession,
             )
             .await
         }
@@ -1021,6 +1029,7 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
                 arguments,
                 NameSelection::WholeMarket,
                 SessionSelection::Every,
+                QuoteProvider::WholeSession,
             )
             .await
         }
@@ -1033,6 +1042,7 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
                 &symbols.quotes,
                 NameSelection::Named(named),
                 SessionSelection::Present,
+                QuoteProvider::PerName,
             )
             .await
         }
@@ -1044,6 +1054,7 @@ async fn fold_sampled(
     arguments: &QuoteArguments,
     names: NameSelection,
     sessions: SessionSelection,
+    provider: QuoteProvider,
 ) -> Result<Outcome, SeedError> {
     let scope = Scope::new(names, sessions).map_err(|error| SeedError::Usage(error.to_string()))?;
     let window = arguments.window.window()?;
@@ -1051,8 +1062,19 @@ async fn fold_sampled(
     let sampled = sample(&calendar, &window, arguments.stride);
     report_sample(&window, arguments.stride, &calendar, &sampled);
 
+    // Bound before the source so it outlives the borrow, and built only where it is used: a
+    // repair must not demand flat-file credentials to reach two names through Alpaca.
+    let flat_files;
+    let source = match provider {
+        QuoteProvider::WholeSession => {
+            flat_files = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+            archive::QuoteSource::WholeSession(&flat_files)
+        }
+        QuoteProvider::PerName => archive::QuoteSource::PerName(&market_data),
+    };
+
     Ok(Outcome::Pass(
-        fold_quotes(&market_data, &calendar, &sampled, &scope).await?,
+        fold_quotes(&source, &calendar, &sampled, &scope).await?,
     ))
 }
 
@@ -1094,8 +1116,8 @@ fn report_sample(
 async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
     let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
     let started = tokio::time::Instant::now();
-    let summary = client
-        .fold_quotes(date.date(), |_ticker, _tick| {})
+    let (summary, _) = client
+        .fold_quotes(date.date(), flatfiles::ForEach(|_ticker, _tick| {}))
         .await
         .map_err(box_error)?;
     let elapsed = started.elapsed().as_secs_f64();
@@ -1146,6 +1168,74 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
     Ok(Outcome::Complete)
 }
 
+/// Folds named symbols out of a session's flat file and prints what they read, writing nothing.
+///
+/// The counterpart of `equity-quotes measure`, which asks Alpaca the same question. Running both on
+/// one session is how the two providers are checked against each other, and it costs one file rather
+/// than the whole universe held in memory.
+async fn fold_named_from_flat_file(
+    date: SessionDate,
+    named: BTreeSet<Ticker>,
+) -> Result<Outcome, SeedError> {
+    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    let credentials = AlpacaCredentials::from_env().map_err(box_error)?;
+    let days = TradingClient::from_env(credentials)
+        .fetch_calendar(date.date(), date.date())
+        .await
+        .map_err(box_error)?;
+    let calendar = TradingCalendar::from_days(days);
+    let Some((open, close)) = quotes::trading_hours(&calendar, date) else {
+        return Err(SeedError::Usage(format!(
+            "{date} is not a published session"
+        )));
+    };
+
+    let started = tokio::time::Instant::now();
+    let fold = quotes::MarketFold::new(date, open, close, named);
+    let (file, fold) = client
+        .fold_quotes(date.date(), fold)
+        .await
+        .map_err(box_error)?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let folded = fold.folded();
+    let (summaries, resumed) = fold.finish();
+
+    println!("{}", flatfiles::quote_key(date.date()));
+    println!(
+        "  {} rows scanned in {elapsed:.0}s, {folded} folded for the names asked for",
+        file.rows_read
+    );
+    if !resumed.is_empty() {
+        println!(
+            "  resumed across runs: {}",
+            resumed
+                .iter()
+                .map(Ticker::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut session_rows: Vec<_> = summaries
+        .iter()
+        .filter(|summary| summary.bar_interval() == BarInterval::OneDay)
+        .collect();
+    session_rows.sort_by_key(|summary| summary.ticker().as_str().to_string());
+    for summary in session_rows {
+        println!(
+            "  {:<6} mean {:>8.3}bp  median {:>8.3}bp  p90 {:>9.3}bp  bid {:>10.1}  ask {:>10.1}  quotes {:>9}  covered {:>8.1}s",
+            summary.ticker().as_str(),
+            summary.quoted_spread_basis_points_mean().value(),
+            summary.quoted_spread_basis_points_median().value(),
+            summary.quoted_spread_basis_points_ninetieth_percentile().value(),
+            summary.bid_size_mean(),
+            summary.ask_size_mean(),
+            summary.quote_count(),
+            summary.covered_seconds(),
+        );
+    }
+    Ok(Outcome::Complete)
+}
+
 /// Guards the division, because an empty file is a real answer rather than a panic.
 fn percentage(part: usize, whole: usize) -> f64 {
     if whole == 0 {
@@ -1175,9 +1265,20 @@ async fn quote_sources(
     Ok((market_data, TradingCalendar::from_days(days)))
 }
 
+/// Which provider a fold reads from.
+///
+/// A backfill takes whole sessions off Massive's flat files, because five years one name at a time
+/// is a hundred days of API calls. A repair takes named symbols from Alpaca, because it already
+/// knows which names it wants and a whole file to reach two of them is seven gigabytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteProvider {
+    WholeSession,
+    PerName,
+}
+
 /// Folds the sampled sessions into the archive, which is the half a measurement skips.
 async fn fold_quotes(
-    market_data: &MarketDataClient,
+    source: &archive::QuoteSource<'_>,
     calendar: &TradingCalendar,
     sampled: &[SessionDate],
     scope: &Scope,
@@ -1185,7 +1286,7 @@ async fn fold_quotes(
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
     Ok(
-        archive::archive_quote_sessions(&s3_client, market_data, calendar, &bucket, sampled, scope)
+        archive::archive_quote_sessions(&s3_client, source, calendar, &bucket, sampled, scope)
             .await?,
     )
 }
@@ -1671,10 +1772,10 @@ mod tests {
         }
     }
 
-    /// A probe reads one vendor file rather than the archive, so it takes a date and nothing else:
-    /// no window to sample over, no stride, no symbol set.
+    /// A probe reads one vendor file rather than the archive, so it takes a date and at most a set
+    /// of names to fold out of it — never a window or a stride, which only a sampled pass has.
     #[test]
-    fn test_a_probe_takes_one_date_and_nothing_else() {
+    fn test_a_probe_takes_one_date_and_optionally_names() {
         let QuoteAction::Probe(arguments) =
             quotes(&["equity-quotes", "probe", "--date", "2026-03-09"])
         else {
@@ -1682,11 +1783,29 @@ mod tests {
         };
         assert_eq!(arguments.date, session("2026-03-09"));
 
-        for extra in [
-            vec!["--stride", "21"],
-            vec!["--symbols", "AAPL"],
-            vec!["--start", "2026-03-09"],
-        ] {
+        // Named, it folds those names and prints their summaries against the same session read
+        // through Alpaca; unnamed, it counts the file.
+        let QuoteAction::Probe(arguments) = quotes(&[
+            "equity-quotes",
+            "probe",
+            "--date",
+            "2026-03-09",
+            "--symbols",
+            "AAPL,MSFT",
+        ]) else {
+            panic!("expected the probe action");
+        };
+        assert_eq!(
+            arguments
+                .symbols
+                .names()
+                .expect("a valid symbol list")
+                .expect("names were given")
+                .len(),
+            2
+        );
+
+        for extra in [vec!["--stride", "21"], vec!["--start", "2026-03-09"]] {
             let mut arguments = vec!["equity-quotes", "probe", "--date", "2026-03-09"];
             arguments.extend_from_slice(&extra);
             assert!(

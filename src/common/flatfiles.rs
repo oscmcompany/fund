@@ -152,6 +152,26 @@ impl FlatFileCredentials {
     }
 }
 
+/// Somewhere for a file's ticks to go.
+///
+/// A trait rather than a closure because the caller needs its accumulator back, and a closure's
+/// captures cannot be reached once it has been moved onto the blocking thread.
+pub trait QuoteSink {
+    fn push(&mut self, ticker: Ticker, tick: QuoteTick);
+}
+
+/// Adapts a plain closure, for a caller that keeps nothing — counting a file, or a test.
+pub struct ForEach<F>(pub F);
+
+impl<F> QuoteSink for ForEach<F>
+where
+    F: FnMut(Ticker, QuoteTick),
+{
+    fn push(&mut self, ticker: Ticker, tick: QuoteTick) {
+        (self.0)(ticker, tick)
+    }
+}
+
 /// The S3 key holding one day of consolidated quotes.
 ///
 /// The `us_stocks_sip` prefix is Massive's own and corroborates the SIP sourcing behind their NBBO
@@ -333,21 +353,18 @@ impl FlatFileClient {
     /// Nothing is collected and nothing touches disk: the object arrives as concurrent byte ranges
     /// which are decompressed, parsed and folded in order as they land. The parse runs on a blocking
     /// thread because decompression and CSV parsing are the CPU cost of the download, not a wait.
-    pub async fn fold_quotes<F>(
+    pub async fn fold_quotes<S: QuoteSink + Send + 'static>(
         &self,
         date: NaiveDate,
-        fold: F,
-    ) -> Result<QuoteFileFold, FlatFileError>
-    where
-        F: FnMut(Ticker, QuoteTick) + Send + 'static,
-    {
+        fold: S,
+    ) -> Result<(QuoteFileFold, S), FlatFileError> {
         let key = quote_key(date);
         info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of quotes");
 
         let compressed_bytes = self.object_length(&key).await?;
         let reader = self.ranged_reader(&key, compressed_bytes);
         let scoped = key.clone();
-        let mut summary =
+        let (mut summary, fold) =
             tokio::task::spawn_blocking(move || fold_gzipped_quotes(reader, &scoped, fold))
                 .await
                 .map_err(|error| FlatFileError::Read {
@@ -368,7 +385,7 @@ impl FlatFileClient {
             compressed_bytes,
             "Folded a flat file of quotes"
         );
-        Ok(summary)
+        Ok((summary, fold))
     }
 
     /// The object's size, which the range requests need before any of them can be addressed.
@@ -618,14 +635,14 @@ fn nanoseconds_to_instant(nanoseconds: i64) -> Option<DateTime<Utc>> {
 /// Decompresses, parses and folds, on whichever thread the caller put this on.
 ///
 /// Separate from the request so it can be tested against a file that never went over a network.
-fn fold_gzipped_quotes<R, F>(
+fn fold_gzipped_quotes<R, S>(
     reader: R,
     key: &str,
-    mut fold: F,
-) -> Result<QuoteFileFold, FlatFileError>
+    mut fold: S,
+) -> Result<(QuoteFileFold, S), FlatFileError>
 where
     R: std::io::Read,
-    F: FnMut(Ticker, QuoteTick),
+    S: QuoteSink,
 {
     let mut records = csv::Reader::from_reader(GzDecoder::new(reader));
     let header = records.headers().map_err(|error| read_error(key, error))?;
@@ -669,7 +686,7 @@ where
             previous_ticker = Some(ticker.clone());
         }
         summary.ticks_folded += 1;
-        fold(ticker, tick);
+        fold.push(ticker, tick);
     }
 
     // Asserted here because this is what read the file. An error means the fold must be discarded:
@@ -686,7 +703,7 @@ where
             "Skipped rows no spread can be read off"
         );
     }
-    Ok(summary)
+    Ok((summary, fold))
 }
 
 fn read_error(key: &str, error: csv::Error) -> FlatFileError {
@@ -743,15 +760,15 @@ mod tests {
         let summary = fold_gzipped_quotes(
             std::io::Cursor::new(gzipped(body)),
             "test.csv.gz",
-            move |ticker, tick| {
+            ForEach(move |ticker: Ticker, tick: QuoteTick| {
                 collector.borrow_mut().push((
                     ticker.as_str().to_string(),
                     tick.timestamp().timestamp_nanos_opt().unwrap_or_default(),
                 ));
-            },
+            }),
         );
         let observed = seen.borrow().clone();
-        (summary, observed)
+        (summary.map(|(summary, _)| summary), observed)
     }
 
     #[test]
@@ -977,15 +994,16 @@ mod tests {
         let summary = client
             .fold_quotes(
                 NaiveDate::from_ymd_opt(2026, 3, 9).expect("a real date"),
-                move |ticker, _tick| {
+                ForEach(move |ticker: Ticker, _tick: QuoteTick| {
                     collector
                         .lock()
                         .expect("no fold thread panics holding this")
                         .push(ticker.as_str().to_string());
-                },
+                }),
             )
             .await
-            .expect("a usable file");
+            .expect("a usable file")
+            .0;
 
         assert_eq!(summary.ticks_folded, 2);
         assert_eq!(summary.tickers, 2);
