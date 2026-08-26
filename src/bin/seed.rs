@@ -1109,11 +1109,13 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
         percentage(summary.unusable, summary.rows_read),
         summary.tickers
     );
-    println!(
-        "  {} ticker runs, so the file is {}",
-        summary.ticker_runs,
-        summary.layout()
-    );
+    match summary.layout() {
+        Some(layout) => println!(
+            "  {} ticker runs, so the file is {layout}",
+            summary.ticker_runs
+        ),
+        None => println!("  no usable rows, so the layout is unmeasured"),
+    }
     println!(
         "  {:.2} GiB compressed, read in {elapsed:.0}s at {:.1} MiB/s and {:.0} rows/s",
         summary.compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -1122,9 +1124,10 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
     );
     // The number that decides whether a fold can hold every name at once. Regular hours only, and
     // the observations are what a time-weighted quantile cannot be computed without.
+    const OBSERVATION_BYTES: f64 = 16.0;
     println!(
         "  holding every fold at once would keep {:.1} GiB of observations",
-        summary.ticks_folded as f64 * 16.0 / (1024.0 * 1024.0 * 1024.0)
+        summary.ticks_folded as f64 * OBSERVATION_BYTES / (1024.0 * 1024.0 * 1024.0)
     );
     Ok(Outcome::Complete)
 }

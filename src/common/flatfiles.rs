@@ -1,9 +1,8 @@
 //! Massive's flat files: one gzipped CSV per day, streamed and handed to a fold row by row.
 //!
-//! A separate endpoint and separate credentials from [`crate::common::massive`]'s REST API, and not
-//! AWS despite speaking S3. Nothing reaches local disk; nothing holds the file.
+//! Separate endpoint and credentials from [`crate::common::massive`]; nothing holds the file.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -171,29 +170,40 @@ pub enum RowLayout {
     TimeMajor,
 }
 
-impl std::fmt::Display for RowLayout {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
+impl RowLayout {
+    /// The name to print, separate from [`std::fmt::Display`] so a caller holding an
+    /// `Option<RowLayout>` can render the absent case without one.
+    pub fn as_str(&self) -> &'static str {
+        match self {
             RowLayout::TickerMajor => "ticker-major",
             RowLayout::TimeMajor => "time-major",
-        })
+        }
+    }
+}
+
+impl std::fmt::Display for RowLayout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
 impl QuoteFileFold {
-    /// Which way the file is grouped.
+    /// Which way the file is grouped, or `None` when it folded nothing to judge.
     ///
     /// Ticker-major puts each name in one contiguous run, so runs equal names; time-major
     /// interleaves, so nearly every row starts one. On a real day those are twelve thousand against
     /// four hundred million, so what separates them is which end the count sits nearer — there is no
     /// threshold for anyone to choose, and nothing real lands in between.
-    pub fn layout(&self) -> RowLayout {
+    pub fn layout(&self) -> Option<RowLayout> {
+        if self.ticks_folded == 0 {
+            return None;
+        }
         let above_tickers = self.ticker_runs.saturating_sub(self.tickers);
         let below_rows = self.rows_read.saturating_sub(self.ticker_runs);
         if above_tickers < below_rows {
-            RowLayout::TickerMajor
+            Some(RowLayout::TickerMajor)
         } else {
-            RowLayout::TimeMajor
+            Some(RowLayout::TimeMajor)
         }
     }
 
@@ -308,7 +318,9 @@ impl FlatFileClient {
             ticks_folded = summary.ticks_folded,
             unusable = summary.unusable,
             tickers = summary.tickers,
-            layout = %summary.layout(),
+            layout = summary
+                .layout()
+                .map_or("unmeasured", |layout| layout.as_str()),
             compressed_bytes,
             "Folded a flat file of quotes"
         );
@@ -367,12 +379,17 @@ impl QuoteColumns {
     }
 }
 
-/// Massive stamps a SIP quote in nanoseconds since the epoch.
+/// Massive stamps a SIP quote in nanoseconds since the epoch, and `None` rejects any other unit.
 ///
-/// Nanoseconds rather than millis, which is the same distinction that cost AAPL 211 seconds of a
-/// session on the Alpaca path when an interval was truncated to whole milliseconds.
+/// A stamp in seconds, millis or micros converts without complaint and lands in January 1970, where
+/// it would count as usable and weigh a whole session at one interval.
 fn nanoseconds_to_instant(nanoseconds: i64) -> Option<DateTime<Utc>> {
-    Utc.timestamp_nanos(nanoseconds).into()
+    // Below any real quote file, and far above a recent date stamped in seconds, millis or micros.
+    const YEAR_2000_NANOSECONDS: i64 = 946_684_800_000_000_000;
+    if nanoseconds < YEAR_2000_NANOSECONDS {
+        return None;
+    }
+    Some(Utc.timestamp_nanos(nanoseconds))
 }
 
 /// Decompresses, parses and folds, on whichever thread the caller put this on.
@@ -392,7 +409,7 @@ where
     let columns = QuoteColumns::resolve(header, key)?;
 
     let mut summary = QuoteFileFold::default();
-    let mut latest: BTreeMap<Ticker, DateTime<Utc>> = BTreeMap::new();
+    let mut latest: HashMap<Ticker, DateTime<Utc>> = HashMap::new();
     let mut previous_ticker: Option<Ticker> = None;
     let mut row = csv::StringRecord::new();
     while records
@@ -404,10 +421,19 @@ where
             summary.unusable += 1;
             continue;
         };
-        match latest.insert(ticker.clone(), tick.timestamp()) {
-            Some(previous) if tick.timestamp() < previous => summary.backwards += 1,
-            Some(_) => {}
-            None => summary.tickers += 1,
+        // An owned key is needed only the first time a name appears, and a day is hundreds of
+        // millions of rows.
+        match latest.get_mut(&ticker) {
+            Some(previous) => {
+                if tick.timestamp() < *previous {
+                    summary.backwards += 1;
+                }
+                *previous = tick.timestamp();
+            }
+            None => {
+                latest.insert(ticker.clone(), tick.timestamp());
+                summary.tickers += 1;
+            }
         }
         if previous_ticker.as_ref() != Some(&ticker) {
             summary.ticker_runs += 1;
@@ -417,9 +443,8 @@ where
         fold(ticker, tick);
     }
 
-    // Asserted here rather than by the caller, because this is what read the file and so this is
-    // what can answer for it. A caller that gets an error must discard whatever the fold accumulated:
-    // the rows were handed over before the order was known, which is the nature of a single pass.
+    // Asserted here because this is what read the file. An error means the fold must be discarded:
+    // the rows were handed over before the order was known.
     summary.require_ascending(key)?;
 
     if summary.unusable > 0 {
@@ -453,6 +478,13 @@ mod tests {
 
     const HEADER: &str =
         "ticker,ask_exchange,ask_price,ask_size,bid_exchange,bid_price,bid_size,sip_timestamp";
+
+    /// A stamp `offset` nanoseconds into 2026-03-09T14:30:00Z, the session the fixtures pretend to
+    /// be. A stamp near the epoch is a unit mistake rather than a quote, so these sit where real
+    /// ones would.
+    fn stamp(offset: i64) -> i64 {
+        1_773_066_600_000_000_000 + offset
+    }
 
     /// A row in the column order the header above declares, which is deliberately not the order the
     /// fold reads them in — that is the whole point of resolving against the header.
@@ -508,9 +540,9 @@ mod tests {
     fn test_every_row_is_folded_with_its_own_ticker() {
         let body = format!(
             "{HEADER}\n{}{}{}",
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_000),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_001),
-            row("AAPL", "100.02", "300", "99.98", "150", 1_000_000_002),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
+            row("AAPL", "100.02", "300", "99.98", "150", stamp(2)),
         );
         let (summary, seen) = fold(&body);
         let summary = summary.expect("a usable file");
@@ -522,9 +554,9 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("AAPL".to_string(), 1_000_000_000),
-                ("CBOE".to_string(), 1_000_000_001),
-                ("AAPL".to_string(), 1_000_000_002),
+                ("AAPL".to_string(), stamp(0)),
+                ("CBOE".to_string(), stamp(1)),
+                ("AAPL".to_string(), stamp(2)),
             ]
         );
     }
@@ -534,11 +566,11 @@ mod tests {
     #[test]
     fn test_the_columns_are_read_off_the_header_rather_than_by_position() {
         let reordered = "sip_timestamp,bid_size,bid_price,ask_size,ask_price,ticker";
-        let body = format!("{reordered}\n1000000000,100,99.95,200,100.05,AAPL\n");
+        let body = format!("{reordered}\n1773066600000000000,100,99.95,200,100.05,AAPL\n");
         let (summary, seen) = fold(&body);
 
         assert_eq!(summary.expect("a usable file").ticks_folded, 1);
-        assert_eq!(seen, vec![("AAPL".to_string(), 1_000_000_000)]);
+        assert_eq!(seen, vec![("AAPL".to_string(), stamp(0))]);
     }
 
     /// A renamed column would otherwise fold whatever sat in that position, so it fails on the
@@ -560,10 +592,10 @@ mod tests {
     fn test_a_book_no_spread_reads_off_is_counted_and_skipped() {
         let body = format!(
             "{HEADER}\n{}{}{}{}",
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_000),
-            row("AAPL", "99.90", "200", "100.10", "100", 1_000_000_001),
-            row("AAPL", "0", "200", "0", "100", 1_000_000_002),
-            row("AAPL", "100.05", "200", "not-a-price", "100", 1_000_000_003),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+            row("AAPL", "99.90", "200", "100.10", "100", stamp(1)),
+            row("AAPL", "0", "200", "0", "100", stamp(2)),
+            row("AAPL", "100.05", "200", "not-a-price", "100", stamp(3)),
         );
         let (summary, seen) = fold(&body);
         let summary = summary.expect("a usable file");
@@ -579,16 +611,7 @@ mod tests {
     #[test]
     fn test_a_descending_file_is_refused_rather_than_folded_to_zero() {
         let descending: String = (0..10)
-            .map(|index| {
-                row(
-                    "AAPL",
-                    "100.05",
-                    "200",
-                    "99.95",
-                    "100",
-                    1_000_000_000 - index,
-                )
-            })
+            .map(|index| row("AAPL", "100.05", "200", "99.95", "100", stamp(-index)))
             .collect();
         let error = fold(&format!("{HEADER}\n{descending}"))
             .0
@@ -609,25 +632,11 @@ mod tests {
         let mut body = String::from(HEADER);
         body.push('\n');
         for index in 0..20 {
-            body.push_str(&row(
-                "AAPL",
-                "100.05",
-                "200",
-                "99.95",
-                "100",
-                1_000_000_000 + index,
-            ));
+            body.push_str(&row("AAPL", "100.05", "200", "99.95", "100", stamp(index)));
         }
         // Three quotes the SIP reordered, which is ordinary rather than a wrongly sorted file.
         for index in [5, 9, 14] {
-            body.push_str(&row(
-                "AAPL",
-                "100.05",
-                "200",
-                "99.95",
-                "100",
-                1_000_000_000 + index,
-            ));
+            body.push_str(&row("AAPL", "100.05", "200", "99.95", "100", stamp(index)));
         }
         let summary = fold(&body).0.expect("an ascending file with ties");
         assert_eq!(summary.ticks_folded, 23);
@@ -641,10 +650,10 @@ mod tests {
     fn test_ordering_is_judged_within_a_ticker_not_across_the_file() {
         let body = format!(
             "{HEADER}\n{}{}{}{}",
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_100),
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_200),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_001),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_002),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(100)),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(200)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(2)),
         );
         let summary = fold(&body).0.expect("each ticker ascends");
         assert_eq!(summary.ticks_folded, 4);
@@ -694,8 +703,8 @@ mod tests {
     async fn test_a_day_is_streamed_from_the_endpoint_and_folded() {
         let body = format!(
             "{HEADER}\n{}{}",
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_000),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_001),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
         );
         let (client, requested) = client_serving(gzipped(&body));
         let folded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -735,25 +744,67 @@ mod tests {
     fn test_the_layout_is_read_off_where_the_ticker_changes() {
         let ticker_major = format!(
             "{HEADER}\n{}{}{}{}",
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_100),
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_200),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_001),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_002),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(100)),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(200)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(2)),
         );
         let summary = fold(&ticker_major).0.expect("each ticker ascends");
         assert_eq!(summary.ticker_runs, 2, "one run per name");
-        assert_eq!(summary.layout(), RowLayout::TickerMajor);
+        assert_eq!(summary.layout(), Some(RowLayout::TickerMajor));
 
         let time_major = format!(
             "{HEADER}\n{}{}{}{}",
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_000),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_001),
-            row("AAPL", "100.05", "200", "99.95", "100", 1_000_000_002),
-            row("CBOE", "200.20", "50", "199.80", "40", 1_000_000_003),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(2)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(3)),
         );
         let summary = fold(&time_major).0.expect("interleaved and ascending");
         assert_eq!(summary.ticker_runs, 4, "every row starts a run");
-        assert_eq!(summary.layout(), RowLayout::TimeMajor);
+        assert_eq!(summary.layout(), Some(RowLayout::TimeMajor));
+    }
+
+    /// The layout decides whether the backfill holds one name's ticks or every name's, so a file
+    /// that folded nothing must report no layout rather than the expensive one by arithmetic.
+    #[test]
+    fn test_a_file_that_folded_nothing_reports_no_layout() {
+        let header_only = fold(&format!("{HEADER}\n")).0.expect("an empty file");
+        assert_eq!(header_only.rows_read, 0);
+        assert_eq!(header_only.ticks_folded, 0);
+        assert_eq!(header_only.layout(), None);
+
+        // Rows that parse but carry no readable book: the guard is on what was folded, not on what
+        // was read.
+        let all_unusable = format!(
+            "{HEADER}\n{}{}",
+            row("AAPL", "0", "200", "0", "100", stamp(0)),
+            row("CBOE", "0", "50", "0", "40", stamp(1)),
+        );
+        let summary = fold(&all_unusable).0.expect("a file of unusable rows");
+        assert_eq!(summary.rows_read, 2);
+        assert_eq!(summary.ticks_folded, 0);
+        assert_eq!(summary.unusable, 2);
+        assert_eq!(summary.layout(), None);
+    }
+
+    /// The column names are a guess and so are the units. A stamp in the wrong one converts without
+    /// complaint and lands in 1970, where it would fold as a usable tick and weigh a whole session.
+    #[test]
+    fn test_a_stamp_in_the_wrong_unit_is_unusable_rather_than_a_1970_tick() {
+        let milliseconds = stamp(0) / 1_000_000;
+        let body = format!(
+            "{HEADER}\n{}{}",
+            row("AAPL", "100.05", "200", "99.95", "100", milliseconds),
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+        );
+        let (summary, seen) = fold(&body);
+        let summary = summary.expect("one usable row");
+
+        assert_eq!(summary.rows_read, 2);
+        assert_eq!(summary.ticks_folded, 1);
+        assert_eq!(summary.unusable, 1, "the millisecond stamp");
+        assert_eq!(seen, vec![("AAPL".to_string(), 1_773_066_600_000_000_000)]);
     }
 
     #[test]
