@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
+use crate::common::flatfiles::{FlatFileClient, FlatFileError};
 use crate::common::massive::MassiveClient;
 use crate::common::types::{
     BarInterval, EquityBar, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
@@ -1546,7 +1547,28 @@ const QUOTE_CONCURRENCY: usize = 8;
 /// one of its names from a complete one.
 const QUOTE_SYMBOL_ATTEMPTS: usize = 3;
 
-/// Folds the quoted book across `sessions`, per `scope`.
+/// Where a quote pass gets its ticks.
+///
+/// Two providers with opposite shapes: Alpaca answers one name at a time and is what a repair wants,
+/// while a Massive flat file is whole-market by construction and is the only affordable way to reach
+/// five years. The scope decides the universe either way; only the fetching differs.
+pub enum QuoteSource<'a> {
+    /// One request per name, retried per name.
+    PerName(&'a MarketDataClient),
+    /// One file per session, folded whole.
+    WholeSession(&'a FlatFileClient),
+}
+
+impl std::fmt::Display for QuoteSource<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            QuoteSource::PerName(_) => "per-name",
+            QuoteSource::WholeSession(_) => "whole-session",
+        })
+    }
+}
+
+/// Folds the quoted book across `sessions`, per `scope`, taking its ticks from `source`.
 ///
 /// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
 /// bounded to one session's hours, so there is nothing to gain by holding a chunk of them. That is
@@ -1560,7 +1582,7 @@ const QUOTE_SYMBOL_ATTEMPTS: usize = 3;
 /// a session that answered with nothing as a fault rather than as a holiday.
 pub async fn archive_quote_sessions(
     s3_client: &S3Client,
-    market_data: &MarketDataClient,
+    source: &QuoteSource<'_>,
     calendar: &TradingCalendar,
     bucket: &str,
     sessions: &[SessionDate],
@@ -1615,7 +1637,7 @@ pub async fn archive_quote_sessions(
     for session in requested {
         quotes_folded += archive_quote_session(
             s3_client,
-            market_data,
+            source,
             calendar,
             bucket,
             session,
@@ -1653,7 +1675,7 @@ pub async fn archive_quote_sessions(
 #[allow(clippy::too_many_arguments)]
 async fn archive_quote_session(
     s3_client: &S3Client,
-    market_data: &MarketDataClient,
+    source: &QuoteSource<'_>,
     calendar: &TradingCalendar,
     bucket: &str,
     session: SessionDate,
@@ -1689,9 +1711,24 @@ async fn archive_quote_session(
         return Ok(0);
     }
 
-    info!(%session, %open, %close, universe = universe.len(), "Folding a session's quoted book");
-    let (folded, quotes_folded) =
-        fold_universe(market_data, session, open, close, &universe, progress).await;
+    info!(%session, %open, %close, %source, universe = universe.len(), "Folding a session's quoted book");
+    let (folded, quotes_folded) = match source {
+        QuoteSource::PerName(market_data) => {
+            fold_universe(market_data, session, open, close, &universe, progress).await
+        }
+        QuoteSource::WholeSession(flat_files) => {
+            match fold_whole_session(flat_files, session, open, close, universe, progress).await {
+                Ok(folded) => folded,
+                Err(error) => {
+                    // The file is the session: nothing partial survives it, so this is the session
+                    // failing rather than a name within it.
+                    warn!(%session, %error, "A session's flat file could not be folded");
+                    progress.sessions_failed.push(session);
+                    return Ok(0);
+                }
+            }
+        }
+    };
     if folded.is_empty() {
         // The quotes still cost what they cost, so the count is returned even though nothing of
         // this session reaches the archive.
@@ -1761,6 +1798,36 @@ async fn fold_universe(
         }
     }
     (folded, quotes_folded)
+}
+
+/// Folds a whole session out of one flat file, keeping only the names the scope asked for.
+///
+/// Every fold is held until the file ends rather than released at the ticker switch. Two names a
+/// session arrive in two runs, and a released fold cannot take the second: folding the runs apart
+/// extends each one's last quote to the close, so their weights overlap and sum past the session.
+async fn fold_whole_session(
+    flat_files: &FlatFileClient,
+    session: SessionDate,
+    open: DateTime<Utc>,
+    close: DateTime<Utc>,
+    universe: BTreeSet<Ticker>,
+    progress: &mut PassProgress,
+) -> Result<(Vec<QuoteSummary>, usize), FlatFileError> {
+    let requested = universe.len();
+    let fold = quotes::MarketFold::new(session, open, close, universe);
+    let (_, fold) = flat_files.fold_quotes(session.date(), fold).await?;
+
+    let quotes_folded = fold.folded();
+    let folded = fold.finish();
+    // Counted against what the file carried rather than against what produced a summary: a name that
+    // was there and stayed quiet through regular hours is not a failure, and the per-name path counts
+    // only a failed fetch. Counting it would make almost every session of a whole-market pass exit
+    // non-zero and invite a re-run that cannot change the result.
+    progress.symbols_failed += requested.saturating_sub(folded.seen);
+    if !folded.resumed.is_empty() {
+        info!(%session, resumed = folded.resumed.len(), "Names whose rows arrived in more than one run");
+    }
+    Ok((folded.summaries, quotes_folded))
 }
 
 /// Writes a session's summaries, one partition per cadence, five-minute first.
