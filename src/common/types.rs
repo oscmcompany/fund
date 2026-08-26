@@ -1078,6 +1078,9 @@ pub struct QuoteSummary {
     quoted_spread_basis_points_mean: BasisPoints,
     quoted_spread_basis_points_median: BasisPoints,
     quoted_spread_basis_points_ninetieth_percentile: BasisPoints,
+    /// Time-weighted top-of-book size, in the unit the session's feed used: **round lots before
+    /// 2025-11-03, shares on or after**. A series crossing that date steps by about a hundred and
+    /// the step is the unit rather than the liquidity, so convert on read, keyed on the session.
     bid_size_mean: f64,
     ask_size_mean: f64,
     quote_count: i64,

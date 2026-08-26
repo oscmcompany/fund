@@ -36,6 +36,7 @@ pub const QUOTE_FRAME_COLUMNS: [(&str, DataType); 11] = [
         "quoted_spread_basis_points_ninetieth_percentile",
         DataType::Float64,
     ),
+    // Round lots before 2025-11-03 and shares on or after; see `QuoteSummary::bid_size_mean`.
     ("bid_size_mean", DataType::Float64),
     ("ask_size_mean", DataType::Float64),
     ("quote_count", DataType::Int64),
@@ -52,6 +53,9 @@ struct SpreadAccumulator {
     covered_seconds: f64,
     spread_weighted: f64,
     spread_basis_points_weighted: f64,
+    /// Time-weighted top-of-book size **in whatever unit the session's feed used**: round lots
+    /// before 2025-11-03 and shares on or after, per the SEC MDI rules. Not normalised here, because
+    /// the divisor is a per-ticker `round_lot` and today's value is not the one a 2021 session had.
     bid_size_weighted: f64,
     ask_size_weighted: f64,
     quote_count: i64,
