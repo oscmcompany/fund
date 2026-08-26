@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, DataFeed, MarketDataClient, TradingClient};
 use fund::common::database::connect_pool;
+use fund::common::flatfiles;
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::{BarInterval, LiquidityFloor, QuoteSummary, SessionDate, Ticker};
@@ -195,6 +196,19 @@ enum QuoteAction {
     Measure(QuoteSymbolArguments),
     /// Fold named symbols into the sampled sessions that already have a partition.
     Repair(QuoteSymbolArguments),
+    /// Read one day of Massive's flat files and report what is in it, writing nothing.
+    ///
+    /// What the backfill needs measured before it is written: the row order, which decides whether
+    /// a fold holds one name's ticks or every name's, and the throughput, which the published
+    /// download estimate leaves out because it counts bandwidth only.
+    Probe(ProbeArguments),
+}
+
+#[derive(Debug, Args)]
+struct ProbeArguments {
+    /// The session to read, as an Eastern calendar date: YYYY-MM-DD.
+    #[arg(long, value_parser = session_date)]
+    date: SessionDate,
 }
 
 #[derive(Debug, Args)]
@@ -986,52 +1000,151 @@ fn report(scan: &archive::SymbolScan) {
 
 // --- Quotes ---------------------------------------------------------------------------------
 
-/// Folds the sampled sessions, or measures the named symbols across them.
+/// Folds the sampled sessions, measures named symbols across them, or probes a vendor file.
+///
+/// One function per action, as on the intraday path and for the same reason: a probe reads a
+/// different vendor over a different transport and needs no Alpaca credential at all, so it must not
+/// be reachable only after one has been demanded.
 async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
-    // Resolved before any credential is read, so a missing symbol set is refused in the first
-    // millisecond rather than after a calendar fetch. Empty exactly when the action names none,
-    // because `required_names` refuses an empty set for the two that do.
-    let (arguments, named) = match action {
-        QuoteAction::Archive(arguments) | QuoteAction::Widen(arguments) => {
-            (arguments, BTreeSet::new())
+    match action {
+        QuoteAction::Probe(arguments) => probe_flat_file(arguments.date).await,
+        QuoteAction::Archive(arguments) => {
+            fold_sampled(
+                arguments,
+                NameSelection::Screened(LiquidityFloor::CURRENT),
+                SessionSelection::Absent,
+            )
+            .await
         }
-        QuoteAction::Measure(symbols) | QuoteAction::Repair(symbols) => {
-            (&symbols.quotes, symbols.symbols.required_names()?)
+        QuoteAction::Widen(arguments) => {
+            fold_sampled(
+                arguments,
+                NameSelection::WholeMarket,
+                SessionSelection::Every,
+            )
+            .await
         }
-    };
-    let window = arguments.window.window()?;
-
-    let (market_data, calendar) = quote_sources(&window).await?;
-    let sampled = sample(&calendar, &window, arguments.stride);
-
-    info!(
-        start = %window.start,
-        end = %window.end,
-        stride = arguments.stride,
-        published = calendar.len(),
-        sampled = sampled.len(),
-        "Sampled the sessions to fold"
-    );
-
-    let scope = match action {
-        QuoteAction::Archive(_) => Scope::new(
-            NameSelection::Screened(LiquidityFloor::CURRENT),
-            SessionSelection::Absent,
-        ),
-        QuoteAction::Widen(_) => Scope::new(NameSelection::WholeMarket, SessionSelection::Every),
-        QuoteAction::Measure(_) => {
-            measure(&market_data, &calendar, &sampled, &named).await;
-            return Ok(Outcome::Complete);
-        }
-        QuoteAction::Repair(_) => {
-            Scope::new(NameSelection::Named(named), SessionSelection::Present)
+        QuoteAction::Measure(symbols) => measure_sampled(symbols).await,
+        QuoteAction::Repair(symbols) => {
+            // Resolved before any credential is read, so a missing symbol set is refused in the
+            // first millisecond rather than after a calendar fetch.
+            let named = symbols.symbols.required_names()?;
+            fold_sampled(
+                &symbols.quotes,
+                NameSelection::Named(named),
+                SessionSelection::Present,
+            )
+            .await
         }
     }
-    .map_err(|error| SeedError::Usage(error.to_string()))?;
+}
+
+/// Folds the sampled sessions into the archive under the scope the action names.
+async fn fold_sampled(
+    arguments: &QuoteArguments,
+    names: NameSelection,
+    sessions: SessionSelection,
+) -> Result<Outcome, SeedError> {
+    let scope = Scope::new(names, sessions).map_err(|error| SeedError::Usage(error.to_string()))?;
+    let window = arguments.window.window()?;
+    let (market_data, calendar) = quote_sources(&window).await?;
+    let sampled = sample(&calendar, &window, arguments.stride);
+    report_sample(&window, arguments.stride, &calendar, &sampled);
 
     Ok(Outcome::Pass(
         fold_quotes(&market_data, &calendar, &sampled, &scope).await?,
     ))
+}
+
+/// Folds named symbols across the sampled sessions and prints what they read, writing nothing.
+async fn measure_sampled(symbols: &QuoteSymbolArguments) -> Result<Outcome, SeedError> {
+    let named = symbols.symbols.required_names()?;
+    let arguments = &symbols.quotes;
+    let window = arguments.window.window()?;
+    let (market_data, calendar) = quote_sources(&window).await?;
+    let sampled = sample(&calendar, &window, arguments.stride);
+    report_sample(&window, arguments.stride, &calendar, &sampled);
+
+    measure(&market_data, &calendar, &sampled, &named).await;
+    Ok(Outcome::Complete)
+}
+
+fn report_sample(
+    window: &Window,
+    stride: usize,
+    calendar: &TradingCalendar,
+    sampled: &[SessionDate],
+) {
+    info!(
+        start = %window.start,
+        end = %window.end,
+        stride,
+        published = calendar.len(),
+        sampled = sampled.len(),
+        "Sampled the sessions to fold"
+    );
+}
+
+/// Reads one day of Massive's flat files and reports what is in it, folding nothing.
+///
+/// Four things cannot be known before the subscription exists and all four decide how the backfill
+/// is written: the row order, the file's size, the throughput of decompressing and parsing it, and
+/// how much of it is a book no spread reads off. Counting rather than folding, so the measurement
+/// costs one download and almost no memory.
+async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
+    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    let started = tokio::time::Instant::now();
+    let summary = client
+        .fold_quotes(date.date(), |_ticker, _tick| {})
+        .await
+        .map_err(box_error)?;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    println!("{}", flatfiles::quote_key(date.date()));
+    println!(
+        "  {} rows, {} usable, {} unusable ({:.2}%), {} tickers",
+        summary.rows_read,
+        summary.ticks_folded,
+        summary.unusable,
+        percentage(summary.unusable, summary.rows_read),
+        summary.tickers
+    );
+    match summary.layout() {
+        Some(layout) => println!(
+            "  {} ticker runs, so the file is {layout}",
+            summary.ticker_runs
+        ),
+        None => println!("  no usable rows, so the layout is unmeasured"),
+    }
+    println!(
+        "  {:.2} GiB compressed, read in {elapsed:.0}s at {:.1} MiB/s and {:.0} rows/s",
+        summary.compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        rate(summary.compressed_bytes as f64 / (1024.0 * 1024.0), elapsed),
+        rate(summary.rows_read as f64, elapsed)
+    );
+    // The number that decides whether a fold can hold every name at once. Regular hours only, and
+    // the observations are what a time-weighted quantile cannot be computed without.
+    const OBSERVATION_BYTES: f64 = 16.0;
+    println!(
+        "  holding every fold at once would keep {:.1} GiB of observations",
+        summary.ticks_folded as f64 * OBSERVATION_BYTES / (1024.0 * 1024.0 * 1024.0)
+    );
+    Ok(Outcome::Complete)
+}
+
+/// Guards the division, because an empty file is a real answer rather than a panic.
+fn percentage(part: usize, whole: usize) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 * 100.0 / whole as f64
+}
+
+fn rate(quantity: f64, seconds: f64) -> f64 {
+    if seconds <= 0.0 {
+        return 0.0;
+    }
+    quantity / seconds
 }
 
 /// The Alpaca client and the calendar every quote action needs, measuring or writing.
@@ -1542,6 +1655,35 @@ mod tests {
                 "{value} must not parse"
             );
         }
+    }
+
+    /// A probe reads one vendor file rather than the archive, so it takes a date and nothing else:
+    /// no window to sample over, no stride, no symbol set.
+    #[test]
+    fn test_a_probe_takes_one_date_and_nothing_else() {
+        let QuoteAction::Probe(arguments) =
+            quotes(&["equity-quotes", "probe", "--date", "2026-03-09"])
+        else {
+            panic!("expected the probe action");
+        };
+        assert_eq!(arguments.date, session("2026-03-09"));
+
+        for extra in [
+            vec!["--stride", "21"],
+            vec!["--symbols", "AAPL"],
+            vec!["--start", "2026-03-09"],
+        ] {
+            let mut arguments = vec!["equity-quotes", "probe", "--date", "2026-03-09"];
+            arguments.extend_from_slice(&extra);
+            assert!(
+                parse(&arguments).is_err(),
+                "{extra:?} is not a probe argument"
+            );
+        }
+        assert!(
+            parse(&["equity-quotes", "probe"]).is_err(),
+            "the date is required"
+        );
     }
 
     /// Writing is the irreversible half and measuring reads a handful of numbers, so neither can
