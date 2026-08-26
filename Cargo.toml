@@ -50,7 +50,7 @@ tokio = { version = "1.51.1", features = ["full"] }
 # `CancellationToken`, for the shutdown signal shared between the listener and the recovery scan.
 # `io-util` brings `SyncIoBridge`, which is what lets a flat file's async `ByteStream` be read by the
 # synchronous gzip decoder and CSV reader on a blocking thread, where that CPU work belongs anyway.
-tokio-util = { version = "0.7", features = ["io", "io-util"] }
+tokio-util = "0.7"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.23", features = [
   "env-filter",

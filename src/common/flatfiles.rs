@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use flate2::read::GzDecoder;
-use tokio_util::io::SyncIoBridge;
 use tracing::{info, warn};
 
 use crate::common::alpaca::QuoteTick;
@@ -19,6 +18,35 @@ const FLAT_FILE_BUCKET: &str = "flatfiles";
 /// The region the signer needs. Massive is not AWS, so nothing resolves this from an instance or a
 /// profile — it is a constant the signature requires rather than a place anything is stored.
 const FLAT_FILE_REGION: &str = "us-east-1";
+
+/// How much of the object one range request asks for.
+///
+/// Small enough that a failure costs little and the reorder buffer stays bounded, large enough that
+/// per-request overhead does not dominate.
+const CHUNK_BYTES: i64 = 2 * 1024 * 1024;
+
+/// How many ranges are outstanding at once, which is what buys the throughput.
+///
+/// Measured against one session: 1 connection reads 1.15 MB/s, 64 read 14.1, 128 read 26.8 — the
+/// throttle is per connection, so concurrency is the only lever. Massive resets connections when
+/// pushed, which [`RANGE_ATTEMPTS`] absorbs rather than this number avoiding.
+const RANGES_IN_FLIGHT: usize = 128;
+
+/// How many times one range is asked for before the file gives up.
+const RANGE_ATTEMPTS: usize = 5;
+
+/// The first wait after a failed range, doubling per attempt.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Chunks allowed to sit finished ahead of the parser, bounding what the reorder costs in memory.
+const READY_CHUNKS: usize = 8;
+
+/// How long a range may read nothing before it is abandoned.
+///
+/// The default is five seconds, which a request waiting its turn behind [`RANGES_IN_FLIGHT`] others
+/// exceeds routinely — that default is what killed the first whole-file read, mid-download and with
+/// no explanation. Long enough that only a genuinely dead connection trips it.
+const STALL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The columns [`QuoteColumns`] resolves out of a quote file's header.
 ///
@@ -251,6 +279,11 @@ impl FlatFileClient {
             .region(aws_sdk_s3::config::Region::new(FLAT_FILE_REGION))
             .endpoint_url(credentials.endpoint_url)
             .force_path_style(true)
+            .stalled_stream_protection(
+                aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+                    .grace_period(STALL_GRACE_PERIOD)
+                    .build(),
+            )
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 credentials.access_key_id,
                 credentials.secret_access_key,
@@ -273,9 +306,9 @@ impl FlatFileClient {
 
     /// Streams one day of quotes, handing every usable tick to `fold`.
     ///
-    /// Nothing is collected and nothing touches disk: `GetObject` gives a byte stream, which is
-    /// decompressed, parsed and folded as it arrives. The whole pipeline runs on a blocking thread
-    /// because decompression and CSV parsing are the CPU cost of the download, not a wait.
+    /// Nothing is collected and nothing touches disk: the object arrives as concurrent byte ranges
+    /// which are decompressed, parsed and folded in order as they land. The parse runs on a blocking
+    /// thread because decompression and CSV parsing are the CPU cost of the download, not a wait.
     pub async fn fold_quotes<F>(
         &self,
         date: NaiveDate,
@@ -287,29 +320,16 @@ impl FlatFileClient {
         let key = quote_key(date);
         info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of quotes");
 
-        let object = self
-            .s3_client
-            .get_object()
-            .bucket(FLAT_FILE_BUCKET)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|error| FlatFileError::Fetch {
-                key: key.clone(),
-                source: Box::new(error),
-            })?;
-
-        let compressed_bytes = object.content_length().unwrap_or_default();
-        let reader = object.body.into_async_read();
+        let compressed_bytes = self.object_length(&key).await?;
+        let reader = self.ranged_reader(&key, compressed_bytes);
         let scoped = key.clone();
-        let mut summary = tokio::task::spawn_blocking(move || {
-            fold_gzipped_quotes(SyncIoBridge::new(reader), &scoped, fold)
-        })
-        .await
-        .map_err(|error| FlatFileError::Read {
-            key: key.clone(),
-            source: std::io::Error::other(error),
-        })??;
+        let mut summary =
+            tokio::task::spawn_blocking(move || fold_gzipped_quotes(reader, &scoped, fold))
+                .await
+                .map_err(|error| FlatFileError::Read {
+                    key: key.clone(),
+                    source: std::io::Error::other(error),
+                })??;
 
         summary.compressed_bytes = compressed_bytes;
         info!(
@@ -325,6 +345,185 @@ impl FlatFileClient {
             "Folded a flat file of quotes"
         );
         Ok(summary)
+    }
+
+    /// The object's size, which the range requests need before any of them can be addressed.
+    async fn object_length(&self, key: &str) -> Result<i64, FlatFileError> {
+        let head = self
+            .s3_client
+            .head_object()
+            .bucket(FLAT_FILE_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| FlatFileError::Fetch {
+                key: key.to_string(),
+                source: Box::new(error),
+            })?;
+        match head.content_length() {
+            Some(length) if length > 0 => Ok(length),
+            _ => Err(FlatFileError::Empty { field: "object" }),
+        }
+    }
+
+    /// A reader over the whole object, fetched as concurrent ranges and delivered in order.
+    ///
+    /// One connection is both too slow and too fragile for a file this size: Massive throttles per
+    /// connection, and a stream held open for the length of a whole file does not reliably survive.
+    fn ranged_reader(&self, key: &str, length: i64) -> ChunkReader {
+        let (sender, receiver) = tokio::sync::mpsc::channel(READY_CHUNKS);
+        let client = self.s3_client.clone();
+        let key = key.to_string();
+        tokio::spawn(async move { fetch_ranges(client, key, length, sender).await });
+        ChunkReader::new(receiver)
+    }
+}
+
+/// Fetches every range of `key` with [`RANGES_IN_FLIGHT`] outstanding, sending them in file order.
+///
+/// Order is what makes this usable: gzip decodes only forwards, so a chunk that arrives early waits
+/// for its predecessors. Awaiting the oldest request while newer ones are still running is what
+/// keeps the pipe full without buffering the file.
+async fn fetch_ranges(
+    client: S3Client,
+    key: String,
+    length: i64,
+    sender: tokio::sync::mpsc::Sender<Result<Vec<u8>, FlatFileError>>,
+) {
+    let mut in_flight: std::collections::VecDeque<
+        tokio::task::JoinHandle<Result<Vec<u8>, FlatFileError>>,
+    > = std::collections::VecDeque::with_capacity(RANGES_IN_FLIGHT);
+    let mut next_offset = 0i64;
+
+    loop {
+        while in_flight.len() < RANGES_IN_FLIGHT && next_offset < length {
+            let (range, after) = chunk_range(next_offset, length);
+            let (client, key) = (client.clone(), key.clone());
+            in_flight.push_back(tokio::spawn(async move {
+                fetch_one_range(client, key, range).await
+            }));
+            next_offset = after;
+        }
+
+        let Some(oldest) = in_flight.pop_front() else {
+            return;
+        };
+        let chunk = match oldest.await {
+            Ok(chunk) => chunk,
+            Err(error) => Err(FlatFileError::Read {
+                key: key.clone(),
+                source: std::io::Error::other(error),
+            }),
+        };
+        // A closed receiver means the parse stopped early, which is its answer rather than an error.
+        if sender.send(chunk).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Every layer of an error, because the outermost one is routinely the least informative.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(inner) = source {
+        rendered.push_str(&format!(" <- {inner}"));
+        source = inner.source();
+    }
+    rendered
+}
+
+/// The `Range` header covering the chunk at `offset`, and the offset the next one starts at.
+///
+/// Inclusive on both ends, which is what the header means and where the off-by-one lives: the last
+/// chunk of a file stops at `length - 1` rather than a chunk boundary.
+fn chunk_range(offset: i64, length: i64) -> (String, i64) {
+    let last = (offset + CHUNK_BYTES - 1).min(length - 1);
+    (format!("bytes={offset}-{last}"), last + 1)
+}
+
+/// Fetches one range, retrying it on its own.
+///
+/// The point of addressing bytes by offset: a reset range is simply asked for again, where a reset
+/// whole-file stream had nothing to resume from. Massive resets connections under load, so this is
+/// the ordinary case rather than the exceptional one.
+async fn fetch_one_range(
+    client: S3Client,
+    key: String,
+    range: String,
+) -> Result<Vec<u8>, FlatFileError> {
+    let mut attempt = 1;
+    loop {
+        match try_fetch_one_range(&client, &key, &range).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if attempt < RANGE_ATTEMPTS => {
+                warn!(key, range, attempt, chain = %error_chain(&error), "Retrying a range");
+                tokio::time::sleep(RETRY_BACKOFF * 2u32.pow(attempt as u32 - 1)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn try_fetch_one_range(
+    client: &S3Client,
+    key: &str,
+    range: &str,
+) -> Result<Vec<u8>, FlatFileError> {
+    let object = client
+        .get_object()
+        .bucket(FLAT_FILE_BUCKET)
+        .key(key)
+        .range(range)
+        .send()
+        .await
+        .map_err(|error| FlatFileError::Fetch {
+            key: format!("{key} {range}"),
+            source: Box::new(error),
+        })?;
+    let body = object
+        .body
+        .collect()
+        .await
+        .map_err(|error| FlatFileError::Fetch {
+            key: format!("{key} {range}"),
+            source: Box::new(error),
+        })?;
+    Ok(body.to_vec())
+}
+
+/// Presents the ordered chunks as something the gzip decoder can read.
+///
+/// Blocking by construction: it is handed to `spawn_blocking` alongside the decoder and the parser,
+/// so waiting for the next chunk is the same wait the old single stream did.
+struct ChunkReader {
+    receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, FlatFileError>>,
+    current: std::io::Cursor<Vec<u8>>,
+}
+
+impl ChunkReader {
+    fn new(receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, FlatFileError>>) -> Self {
+        Self {
+            receiver,
+            current: std::io::Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let read = std::io::Read::read(&mut self.current, buffer)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            match self.receiver.blocking_recv() {
+                None => return Ok(0),
+                Some(Ok(chunk)) => self.current = std::io::Cursor::new(chunk),
+                Some(Err(error)) => return Err(std::io::Error::other(error)),
+            }
+        }
     }
 }
 
@@ -660,7 +859,15 @@ mod tests {
         assert_eq!(summary.tickers, 2);
     }
 
-    /// Serves `body` for any `GET`, and refuses anything else so a change of verb is visible.
+    /// `bytes=first-last`, or `None` for anything else.
+    fn parse_range(header: &str) -> Option<(usize, usize)> {
+        let (first, last) = header.strip_prefix("bytes=")?.split_once('-')?;
+        Some((first.parse().ok()?, last.parse().ok()?))
+    }
+
+    /// An object store, near enough: `HEAD` reports the length and `GET` serves only what its
+    /// `Range` asks for. A `GET` without one is refused, so a regression to whole-object reads —
+    /// which is what could not survive a file this size — fails rather than quietly passing.
     fn client_serving(
         body: Vec<u8>,
     ) -> (
@@ -670,15 +877,40 @@ mod tests {
         let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = std::sync::Arc::clone(&requested);
         let http_client = infallible_client_fn(move |request| {
+            let range = request
+                .headers()
+                .get("range")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
             recorder
                 .lock()
                 .expect("no test thread panics holding this")
-                .push(request.uri().path().to_string());
-            match *request.method() {
-                http::Method::GET => http::Response::builder()
+                .push(format!(
+                    "{} {}{}",
+                    request.method(),
+                    request.uri().path(),
+                    {
+                        if range.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {range}")
+                        }
+                    }
+                ));
+            match (request.method().clone(), parse_range(&range)) {
+                (http::Method::HEAD, _) => http::Response::builder()
                     .status(200)
-                    .body(SdkBody::from(body.clone()))
+                    .header("content-length", body.len().to_string())
+                    .body(SdkBody::empty())
                     .expect("a valid response"),
+                (http::Method::GET, Some((first, last))) => {
+                    let slice = body[first..=last.min(body.len() - 1)].to_vec();
+                    http::Response::builder()
+                        .status(206)
+                        .body(SdkBody::from(slice))
+                        .expect("a valid response")
+                }
                 _ => http::Response::builder()
                     .status(405)
                     .body(SdkBody::empty())
@@ -706,7 +938,9 @@ mod tests {
             row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
             row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
         );
-        let (client, requested) = client_serving(gzipped(&body));
+        let compressed = gzipped(&body);
+        let body_length = compressed.len();
+        let (client, requested) = client_serving(compressed);
         let folded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let collector = std::sync::Arc::clone(&folded);
 
@@ -731,11 +965,74 @@ mod tests {
         );
 
         // Path-style, because the endpoint is not AWS: a virtual-host bucket would resolve
-        // `flatfiles.files.massive.com`, which does not exist.
+        // `flatfiles.files.massive.com`, which does not exist. The length is asked for first, then
+        // the bytes are asked for by range rather than as a whole object.
+        let path = "/flatfiles/us_stocks_sip/quotes_v1/2026/03/2026-03-09.csv.gz";
+        let seen = requested.lock().expect("the request was recorded").clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], format!("HEAD {path}"));
+        assert_eq!(seen[1], format!("GET {path} bytes=0-{}", body_length - 1));
+    }
+
+    /// Both ends inclusive, and the last chunk of a file stops where the file does rather than on a
+    /// chunk boundary — which is where an off-by-one would drop or duplicate bytes.
+    #[test]
+    fn test_ranges_are_contiguous_and_stop_at_the_final_byte() {
+        let length = CHUNK_BYTES * 2 + 5;
+        let mut offset = 0;
+        let mut headers = Vec::new();
+        while offset < length {
+            let (header, after) = chunk_range(offset, length);
+            headers.push(header);
+            offset = after;
+        }
+
         assert_eq!(
-            *requested.lock().expect("the request was recorded"),
-            vec!["/flatfiles/us_stocks_sip/quotes_v1/2026/03/2026-03-09.csv.gz".to_string()]
+            headers,
+            vec![
+                "bytes=0-2097151".to_string(),
+                "bytes=2097152-4194303".to_string(),
+                "bytes=4194304-4194308".to_string(),
+            ]
         );
+        assert_eq!(offset, length, "the walk ends exactly at the length");
+    }
+
+    /// The chunks arrive as separate reads and have to read back as one stream, because gzip decodes
+    /// only forwards and a boundary landing mid-token would corrupt the parse rather than fail it.
+    #[test]
+    fn test_ordered_chunks_read_back_as_one_stream() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        for chunk in ["ticker,sip", "_timestamp\nAAPL", ",1773066600000000000\n"] {
+            sender
+                .blocking_send(Ok(chunk.as_bytes().to_vec()))
+                .expect("the receiver is alive");
+        }
+        drop(sender);
+
+        let mut read = String::new();
+        std::io::Read::read_to_string(&mut ChunkReader::new(receiver), &mut read)
+            .expect("the chunks concatenate");
+        assert_eq!(read, "ticker,sip_timestamp\nAAPL,1773066600000000000\n");
+    }
+
+    /// A failed range must reach the parser as an error rather than as a short read, which would
+    /// look like a truncated file and produce a summary of whatever arrived before it.
+    #[test]
+    fn test_a_failed_range_surfaces_rather_than_truncating() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        sender
+            .blocking_send(Ok(b"ticker,sip_timestamp\n".to_vec()))
+            .expect("the receiver is alive");
+        sender
+            .blocking_send(Err(FlatFileError::Empty { field: "object" }))
+            .expect("the receiver is alive");
+        drop(sender);
+
+        let mut read = String::new();
+        let error = std::io::Read::read_to_string(&mut ChunkReader::new(receiver), &mut read)
+            .expect_err("the failed range");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 
     /// The measurement the probe exists to take, because it decides whether the backfill holds one
