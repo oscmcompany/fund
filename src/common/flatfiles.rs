@@ -171,8 +171,10 @@ pub fn quote_key(date: NaiveDate) -> String {
 /// `unusable` counts rows whose book no spread can be read off — a crossed or zero-priced quote,
 /// which is ordinary around the open rather than a defect. Reported because it is the only trace a
 /// discarded row leaves, and a file that is suddenly half unusable is a vendor change.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct QuoteFileFold {
+    /// Names whose rows are not contiguous, which is what a fold releasing at the switch must know.
+    pub split_tickers: SplitTickers,
     pub rows_read: usize,
     pub ticks_folded: usize,
     pub unusable: usize,
@@ -183,6 +185,28 @@ pub struct QuoteFileFold {
     /// returns 403 — and is what turns a download estimate from arithmetic into a measurement.
     pub compressed_bytes: i64,
     backwards: usize,
+}
+
+/// Names that start a second run after their first has ended, which a ticker-major file should have
+/// none of and every measured session has two of.
+///
+/// Kept separately from the counts because a fold that releases at the ticker switch is correct only
+/// for names absent from this set — for the rest it would write two partial summaries.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SplitTickers(std::collections::BTreeSet<Ticker>);
+
+impl SplitTickers {
+    pub fn names(&self) -> impl Iterator<Item = &Ticker> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// How a file's rows are grouped, which is what decides how many folds must be held at once.
@@ -622,20 +646,26 @@ where
         };
         // An owned key is needed only the first time a name appears, and a day is hundreds of
         // millions of rows.
-        match latest.get_mut(&ticker) {
+        let seen_before = match latest.get_mut(&ticker) {
             Some(previous) => {
                 if tick.timestamp() < *previous {
                     summary.backwards += 1;
                 }
                 *previous = tick.timestamp();
+                true
             }
             None => {
                 latest.insert(ticker.clone(), tick.timestamp());
                 summary.tickers += 1;
+                false
             }
-        }
+        };
         if previous_ticker.as_ref() != Some(&ticker) {
             summary.ticker_runs += 1;
+            // Already seen, and yet starting a run: its rows are split across the file.
+            if seen_before {
+                summary.split_tickers.0.insert(ticker.clone());
+            }
             previous_ticker = Some(ticker.clone());
         }
         summary.ticks_folded += 1;
@@ -1060,6 +1090,41 @@ mod tests {
         let summary = fold(&time_major).0.expect("interleaved and ascending");
         assert_eq!(summary.ticker_runs, 4, "every row starts a run");
         assert_eq!(summary.layout(), Some(RowLayout::TimeMajor));
+    }
+
+    /// A ticker-major file still puts two real names in two runs each — BCPC and TPC, on every
+    /// session measured. A fold that releases at the switch is wrong for exactly those, so the names
+    /// are reported rather than the count alone: two out of thirteen thousand is invisible in a
+    /// total and actionable as a list.
+    #[test]
+    fn test_a_name_returning_after_its_run_is_named_not_just_counted() {
+        let body = format!(
+            "{HEADER}\n{}{}{}",
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
+            row("AAPL", "100.02", "300", "99.98", "150", stamp(2)),
+        );
+        let summary = fold(&body).0.expect("a usable file");
+
+        assert_eq!(summary.tickers, 2);
+        assert_eq!(summary.ticker_runs, 3, "AAPL opens two of them");
+        assert_eq!(summary.split_tickers.len(), 1);
+        assert_eq!(
+            summary
+                .split_tickers
+                .names()
+                .map(|ticker| ticker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AAPL"]
+        );
+
+        let contiguous = format!(
+            "{HEADER}\n{}{}",
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+            row("CBOE", "200.20", "50", "199.80", "40", stamp(1)),
+        );
+        let summary = fold(&contiguous).0.expect("a usable file");
+        assert!(summary.split_tickers.is_empty());
     }
 
     /// The layout decides whether the backfill holds one name's ticks or every name's, so a file

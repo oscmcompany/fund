@@ -1116,6 +1116,20 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
         ),
         None => println!("  no usable rows, so the layout is unmeasured"),
     }
+    if summary.split_tickers.is_empty() {
+        println!("  every name's rows are contiguous");
+    } else {
+        println!(
+            "  {} names are split across the file: {}",
+            summary.split_tickers.len(),
+            summary
+                .split_tickers
+                .names()
+                .map(|ticker| ticker.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  {:.2} GiB compressed, read in {elapsed:.0}s at {:.1} MiB/s and {:.0} rows/s",
         summary.compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
