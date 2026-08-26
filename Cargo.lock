@@ -2966,6 +2966,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "csv",
  "flate2",
  "http 1.5.0",
  "mockito",
