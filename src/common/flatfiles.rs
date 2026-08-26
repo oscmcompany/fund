@@ -38,7 +38,10 @@ const RANGE_ATTEMPTS: usize = 5;
 /// The first wait after a failed range, doubling per attempt.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Chunks allowed to sit finished ahead of the parser, bounding what the reorder costs in memory.
+/// Chunks allowed to sit finished in the channel ahead of the parser.
+///
+/// This is not the whole reorder cost: a completed request keeps its own chunk until the ones before
+/// it have been sent, so the peak is `(RANGES_IN_FLIGHT + READY_CHUNKS) * CHUNK_BYTES`, 272 MiB.
 const READY_CHUNKS: usize = 8;
 
 /// How long a range may read nothing before it is abandoned.
@@ -91,6 +94,14 @@ pub enum FlatFileError {
         key: String,
         backwards: usize,
         forwards: usize,
+    },
+    /// A range answered with a different number of bytes than it asked for.
+    #[error("{key} {range} returned {received} bytes rather than {expected}")]
+    ShortRange {
+        key: String,
+        range: String,
+        expected: usize,
+        received: usize,
     },
 }
 
@@ -439,9 +450,10 @@ async fn fetch_ranges(
     loop {
         while in_flight.len() < RANGES_IN_FLIGHT && next_offset < length {
             let (range, after) = chunk_range(next_offset, length);
+            let expected = (after - next_offset) as usize;
             let (client, key) = (client.clone(), key.clone());
             in_flight.push_back(tokio::spawn(async move {
-                fetch_one_range(client, key, range).await
+                fetch_one_range(client, key, range, expected).await
             }));
             next_offset = after;
         }
@@ -457,7 +469,12 @@ async fn fetch_ranges(
             }),
         };
         // A closed receiver means the parse stopped early, which is its answer rather than an error.
+        // Dropping a handle does not cancel its request, so the rest are stopped rather than left
+        // downloading megabytes nothing will read.
         if sender.send(chunk).await.is_err() {
+            for pending in in_flight {
+                pending.abort();
+            }
             return;
         }
     }
@@ -492,10 +509,11 @@ async fn fetch_one_range(
     client: S3Client,
     key: String,
     range: String,
+    expected: usize,
 ) -> Result<Vec<u8>, FlatFileError> {
     let mut attempt = 1;
     loop {
-        match try_fetch_one_range(&client, &key, &range).await {
+        match try_fetch_one_range(&client, &key, &range, expected).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) if attempt < RANGE_ATTEMPTS => {
                 warn!(key, range, attempt, chain = %error_chain(&error), "Retrying a range");
@@ -511,6 +529,7 @@ async fn try_fetch_one_range(
     client: &S3Client,
     key: &str,
     range: &str,
+    expected: usize,
 ) -> Result<Vec<u8>, FlatFileError> {
     let object = client
         .get_object()
@@ -531,7 +550,18 @@ async fn try_fetch_one_range(
             key: format!("{key} {range}"),
             source: Box::new(error),
         })?;
-    Ok(body.to_vec())
+    let bytes = body.to_vec();
+    // A short body puts a hole in the gzip stream, and an endpoint that ignores Range altogether
+    // answers with the whole object, which decodes to its first member and reads as a clean success.
+    if bytes.len() != expected {
+        return Err(FlatFileError::ShortRange {
+            key: key.to_string(),
+            range: range.to_string(),
+            expected,
+            received: bytes.len(),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Presents the ordered chunks as something the gzip decoder can read.
@@ -912,6 +942,58 @@ mod tests {
         Some((first.parse().ok()?, last.parse().ok()?))
     }
 
+    /// Serves `missing` bytes fewer than each range asked for, which is what a truncating endpoint
+    /// looks like from the client's side.
+    fn client_serving_short(
+        body: Vec<u8>,
+        missing: usize,
+    ) -> (
+        FlatFileClient,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http_client = infallible_client_fn(move |request| {
+            match (
+                request.method().clone(),
+                parse_range(
+                    request
+                        .headers()
+                        .get("range")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default(),
+                ),
+            ) {
+                (http::Method::HEAD, _) => http::Response::builder()
+                    .status(200)
+                    .header("content-length", body.len().to_string())
+                    .body(SdkBody::empty())
+                    .expect("a valid response"),
+                (http::Method::GET, Some((first, last))) => {
+                    let last = last.min(body.len() - 1).saturating_sub(missing);
+                    let slice = body[first..=last.max(first)].to_vec();
+                    http::Response::builder()
+                        .status(206)
+                        .body(SdkBody::from(slice))
+                        .expect("a valid response")
+                }
+                _ => http::Response::builder()
+                    .status(405)
+                    .body(SdkBody::empty())
+                    .expect("a valid response"),
+            }
+        });
+        let credentials = FlatFileCredentials::new(
+            "https://files.massive.com".to_string(),
+            "key".to_string(),
+            "secret".to_string(),
+        )
+        .expect("usable credentials");
+        let configuration = FlatFileClient::configuration(credentials)
+            .http_client(http_client)
+            .build();
+        (FlatFileClient::from_configuration(configuration), requested)
+    }
+
     /// An object store, near enough: `HEAD` reports the length and `GET` serves only what its
     /// `Range` asks for. A `GET` without one is refused, so a regression to whole-object reads —
     /// which is what could not survive a file this size — fails rather than quietly passing.
@@ -1020,6 +1102,39 @@ mod tests {
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert_eq!(seen[0], format!("HEAD {path}"));
         assert_eq!(seen[1], format!("GET {path} bytes=0-{}", body_length - 1));
+    }
+
+    /// A short body puts a hole in the gzip stream, and an endpoint that ignores Range altogether
+    /// answers with the whole object — which decodes to its first member and reads as a clean
+    /// success. Both are refused by comparing what came back against what was asked for.
+    #[tokio::test]
+    async fn test_a_range_answered_with_the_wrong_number_of_bytes_is_refused() {
+        let body = format!(
+            "{HEADER}\n{}",
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+        );
+        let compressed = gzipped(&body);
+        // Reports the real length but serves one byte fewer than every range asks for.
+        let (client, _) = client_serving_short(compressed.clone(), 1);
+        let error = client
+            .fold_quotes(
+                NaiveDate::from_ymd_opt(2026, 3, 9).expect("a real date"),
+                ForEach(|_ticker: Ticker, _tick: QuoteTick| {}),
+            )
+            .await
+            .map(|(summary, _)| summary)
+            .expect_err("a truncated range");
+        // Wrapped by the reader boundary on its way out, so the refusal is read off the message
+        // rather than the variant — what matters is that the byte count is named and the file fails.
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!(
+                "returned {} bytes rather than {}",
+                compressed.len() - 1,
+                compressed.len()
+            )),
+            "{rendered}"
+        );
     }
 
     /// Both ends inclusive, and the last chunk of a file stops where the file does rather than on a

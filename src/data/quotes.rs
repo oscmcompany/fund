@@ -676,10 +676,11 @@ mod tests {
         fold.push(named("AAPL"), quote(30, 99.95, 100.05));
         fold.push(named("AAPL"), quote(36, 99.99, 100.01));
         fold.push(named("CBOE"), quote(30, 199.80, 200.20));
-        let (summaries, merged) = fold.finish();
+        let folded = fold.finish();
 
-        assert!(merged.is_empty(), "nothing was split");
-        let names: BTreeSet<_> = summaries
+        assert!(folded.resumed.is_empty(), "nothing was split");
+        let names: BTreeSet<_> = folded
+            .summaries
             .iter()
             .map(|summary| summary.ticker().as_str().to_string())
             .collect();
@@ -699,12 +700,45 @@ mod tests {
         fold.push(named("ZZZ"), quote(30, 9.95, 10.05));
         assert_eq!(fold.folded(), 1, "only the name asked for");
 
-        let (summaries, _) = fold.finish();
-        let names: BTreeSet<_> = summaries
+        let folded = fold.finish();
+        let names: BTreeSet<_> = folded
+            .summaries
             .iter()
             .map(|summary| summary.ticker().as_str().to_string())
             .collect();
         assert_eq!(names, BTreeSet::from(["AAPL".to_string()]));
+    }
+
+    /// `seen` is what separates a name the file never carried from one that was there and simply
+    /// never quoted inside regular hours. Only the first is a failed symbol, and counting the second
+    /// would make almost every session of a whole-market pass exit non-zero.
+    #[test]
+    fn test_a_name_that_quoted_only_outside_regular_hours_still_counts_as_seen() {
+        let mut fold = MarketFold::new(
+            session(),
+            at(30, 0),
+            at(40, 0),
+            universe(&["AAPL", "CBOE", "ZZZ"]),
+        );
+        fold.push(named("AAPL"), quote(30, 99.95, 100.05));
+        // In the universe and in the file, but its only quote lands after the close. A quote posted
+        // *before* the open would not do: standing and unrevised, it is the book at the open and is
+        // weighed as such.
+        fold.push(named("CBOE"), quote(50, 199.80, 200.20));
+
+        let folded = fold.finish();
+        assert_eq!(folded.seen, 2, "AAPL and CBOE were both in the file");
+        assert_eq!(
+            folded
+                .summaries
+                .iter()
+                .map(|summary| summary.ticker().as_str().to_string())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["AAPL".to_string()]),
+            "CBOE quoted nothing the session could weigh"
+        );
+        // ZZZ never appeared at all: three asked for, two carried, one genuinely missing.
+        assert_eq!(3usize.saturating_sub(folded.seen), 1);
     }
 
     /// BCPC and TPC arrive in two runs on every session measured. The second run resumes the first
@@ -722,22 +756,28 @@ mod tests {
         fold.push(named("BCPC"), quote(30, 99.95, 100.05));
         fold.push(named("CBOE"), quote(30, 199.80, 200.20));
         fold.push(named("BCPC"), quote(36, 99.99, 100.01));
-        let (summaries, merged) = fold.finish();
+        let folded = fold.finish();
 
         assert_eq!(
-            merged.iter().map(Ticker::as_str).collect::<Vec<_>>(),
+            folded
+                .resumed
+                .iter()
+                .map(Ticker::as_str)
+                .collect::<Vec<_>>(),
             vec!["BCPC"],
             "the split name is reported rather than silently handled"
         );
 
-        let session_bar = summaries
+        let session_bar = folded
+            .summaries
             .iter()
             .find(|summary| {
                 summary.ticker().as_str() == "BCPC" && summary.bar_interval() == BarInterval::OneDay
             })
             .expect("BCPC has one session bar rather than two");
         assert_eq!(
-            summaries
+            folded
+                .summaries
                 .iter()
                 .filter(|summary| summary.ticker().as_str() == "BCPC"
                     && summary.bar_interval() == BarInterval::OneDay)
@@ -827,8 +867,8 @@ impl MarketFold {
         self.current = fold.map(|fold| (ticker, fold));
     }
 
-    /// Closes every fold, returning the summaries and the names that came back for a second run.
-    pub fn finish(mut self) -> (Vec<QuoteSummary>, BTreeSet<Ticker>) {
+    /// Closes every fold and reports what the session yielded.
+    pub fn finish(mut self) -> SessionFolded {
         if let Some((held, fold)) = self.current.take() {
             self.parked.insert(held, fold);
         }
@@ -844,12 +884,25 @@ impl MarketFold {
                 "Resumed names whose rows arrived in more than one run"
             );
         }
-        let summaries = std::mem::take(&mut self.parked)
-            .into_values()
-            .flat_map(SessionFold::finish)
-            .collect();
-        (summaries, self.resumed)
+        let parked = std::mem::take(&mut self.parked);
+        let seen = parked.len();
+        let summaries = parked.into_values().flat_map(SessionFold::finish).collect();
+        SessionFolded {
+            summaries,
+            resumed: self.resumed,
+            seen,
+        }
     }
+}
+
+/// What one session's file yielded.
+pub struct SessionFolded {
+    pub summaries: Vec<QuoteSummary>,
+    /// Names that came back for a second run.
+    pub resumed: BTreeSet<Ticker>,
+    /// Names the file carried at all, which is what separates a name absent from the file from one
+    /// that was there and simply never quoted inside regular hours. Only the first is a failure.
+    pub seen: usize,
 }
 
 impl QuoteSink for MarketFold {

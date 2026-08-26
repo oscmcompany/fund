@@ -1197,25 +1197,27 @@ async fn fold_named_from_flat_file(
         .await
         .map_err(box_error)?;
     let elapsed = started.elapsed().as_secs_f64();
-    let folded = fold.folded();
-    let (summaries, resumed) = fold.finish();
+    let folded_ticks = fold.folded();
+    let folded = fold.finish();
 
     println!("{}", flatfiles::quote_key(date.date()));
     println!(
-        "  {} rows scanned in {elapsed:.0}s, {folded} folded for the names asked for",
+        "  {} rows scanned in {elapsed:.0}s, {folded_ticks} folded for the names asked for",
         file.rows_read
     );
-    if !resumed.is_empty() {
+    if !folded.resumed.is_empty() {
         println!(
             "  resumed across runs: {}",
-            resumed
+            folded
+                .resumed
                 .iter()
                 .map(Ticker::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     }
-    let mut session_rows: Vec<_> = summaries
+    let mut session_rows: Vec<_> = folded
+        .summaries
         .iter()
         .filter(|summary| summary.bar_interval() == BarInterval::OneDay)
         .collect();

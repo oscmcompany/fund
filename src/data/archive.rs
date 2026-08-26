@@ -1547,17 +1547,6 @@ const QUOTE_CONCURRENCY: usize = 8;
 /// one of its names from a complete one.
 const QUOTE_SYMBOL_ATTEMPTS: usize = 3;
 
-/// Folds the quoted book across `sessions`, per `scope`.
-///
-/// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
-/// bounded to one session's hours, so there is nothing to gain by holding a chunk of them. That is
-/// also why the never-create rule costs nothing here: a session-major pass never fetches outside the
-/// sessions it selected, while a bar chunk spans a range and needs [`writable_session`] at the write.
-///
-/// Regular hours only, taken from the calendar so an early close is 3.5 hours rather than 6.5. The
-/// overnight book is an order of magnitude wider and would swamp any session mean it entered.
-///
-/// `sessions` must already be calendar-filtered, which the returned summary assumes when it reports
 /// Where a quote pass gets its ticks.
 ///
 /// Two providers with opposite shapes: Alpaca answers one name at a time and is what a repair wants,
@@ -1579,6 +1568,17 @@ impl std::fmt::Display for QuoteSource<'_> {
     }
 }
 
+/// Folds the quoted book across `sessions`, per `scope`, taking its ticks from `source`.
+///
+/// Session-major rather than ticker-major, unlike the intraday bar pass: a quote request is already
+/// bounded to one session's hours, so there is nothing to gain by holding a chunk of them. That is
+/// also why the never-create rule costs nothing here: a session-major pass never fetches outside the
+/// sessions it selected, while a bar chunk spans a range and needs [`writable_session`] at the write.
+///
+/// Regular hours only, taken from the calendar so an early close is 3.5 hours rather than 6.5. The
+/// overnight book is an order of magnitude wider and would swamp any session mean it entered.
+///
+/// `sessions` must already be calendar-filtered, which the returned summary assumes when it reports
 /// a session that answered with nothing as a fault rather than as a holiday.
 pub async fn archive_quote_sessions(
     s3_client: &S3Client,
@@ -1818,14 +1818,16 @@ async fn fold_whole_session(
     let (_, fold) = flat_files.fold_quotes(session.date(), fold).await?;
 
     let quotes_folded = fold.folded();
-    let (summaries, resumed) = fold.finish();
-    let summarized: BTreeSet<&Ticker> = summaries.iter().map(QuoteSummary::ticker).collect();
-    // A name the file never carried, which the per-name path would have recorded as a failed fetch.
-    progress.symbols_failed += requested.saturating_sub(summarized.len());
-    if !resumed.is_empty() {
-        info!(%session, resumed = resumed.len(), "Names whose rows arrived in more than one run");
+    let folded = fold.finish();
+    // Counted against what the file carried rather than against what produced a summary: a name that
+    // was there and stayed quiet through regular hours is not a failure, and the per-name path counts
+    // only a failed fetch. Counting it would make almost every session of a whole-market pass exit
+    // non-zero and invite a re-run that cannot change the result.
+    progress.symbols_failed += requested.saturating_sub(folded.seen);
+    if !folded.resumed.is_empty() {
+        info!(%session, resumed = folded.resumed.len(), "Names whose rows arrived in more than one run");
     }
-    Ok((summaries, quotes_folded))
+    Ok((folded.summaries, quotes_folded))
 }
 
 /// Writes a session's summaries, one partition per cadence, five-minute first.
