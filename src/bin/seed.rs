@@ -187,7 +187,8 @@ struct IntradayRepairArguments {
 
 #[derive(Debug, Subcommand)]
 enum QuoteAction {
-    /// Fold the screened universe into the sampled sessions that have no partition yet.
+    /// Fold every name the daily archive holds into the sampled sessions that have no partition
+    /// yet.
     Archive(QuoteArguments),
     /// Fold every name the daily archive holds into every sampled session, widening ones already
     /// summarized.
@@ -202,6 +203,25 @@ enum QuoteAction {
     /// a fold holds one name's ticks or every name's, and the throughput, which the published
     /// download estimate leaves out because it counts bandwidth only.
     Probe(ProbeArguments),
+}
+
+impl QuoteAction {
+    /// The scope an action that derives its universe from the archive folds under, and `None` for
+    /// the actions that name their own symbols or write nothing.
+    ///
+    /// Both universe actions fold the whole market and differ only in their session set. Returned
+    /// as one value so a test asserts the scope the pass will actually use rather than a
+    /// reconstruction of it beside it.
+    fn universe_scope(&self) -> Option<Result<Scope, SeedError>> {
+        let sessions = match self {
+            QuoteAction::Archive(_) => SessionSelection::Absent,
+            QuoteAction::Widen(_) => SessionSelection::Every,
+            QuoteAction::Measure(_) | QuoteAction::Repair(_) | QuoteAction::Probe(_) => {
+                return None;
+            }
+        };
+        Some(whole_market(sessions))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1015,48 +1035,34 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
             None => probe_flat_file(arguments.date).await,
             Some(named) => fold_named_from_flat_file(arguments.date, named).await,
         },
-        QuoteAction::Archive(arguments) => {
-            fold_sampled(
-                arguments,
-                NameSelection::Screened(LiquidityFloor::CURRENT),
-                SessionSelection::Absent,
-                QuoteProvider::WholeSession,
-            )
-            .await
-        }
-        QuoteAction::Widen(arguments) => {
-            fold_sampled(
-                arguments,
-                NameSelection::WholeMarket,
-                SessionSelection::Every,
-                QuoteProvider::WholeSession,
-            )
-            .await
+        // One arm, so the universe is written once and the two actions cannot disagree about it.
+        QuoteAction::Archive(arguments) | QuoteAction::Widen(arguments) => {
+            let scope = action
+                .universe_scope()
+                .expect("a universe action has a scope")?;
+            fold_sampled(arguments, scope, QuoteProvider::WholeSession).await
         }
         QuoteAction::Measure(symbols) => measure_sampled(symbols).await,
         QuoteAction::Repair(symbols) => {
             // Resolved before any credential is read, so a missing symbol set is refused in the
             // first millisecond rather than after a calendar fetch.
             let named = symbols.symbols.required_names()?;
-            fold_sampled(
-                &symbols.quotes,
-                NameSelection::Named(named),
-                SessionSelection::Present,
-                QuoteProvider::PerName,
-            )
-            .await
+            let scope = Scope::new(NameSelection::Named(named), SessionSelection::Present)
+                .map_err(|error| SeedError::Usage(error.to_string()))?;
+            fold_sampled(&symbols.quotes, scope, QuoteProvider::PerName).await
         }
     }
 }
 
 /// Folds the sampled sessions into the archive under the scope the action names.
+///
+/// Takes a built `Scope` rather than its two halves, so a caller cannot pair a universe with a
+/// session set here that the constructor would have refused.
 async fn fold_sampled(
     arguments: &QuoteArguments,
-    names: NameSelection,
-    sessions: SessionSelection,
+    scope: Scope,
     provider: QuoteProvider,
 ) -> Result<Outcome, SeedError> {
-    let scope = Scope::new(names, sessions).map_err(|error| SeedError::Usage(error.to_string()))?;
     let window = arguments.window.window()?;
     let (market_data, calendar) = quote_sources(&window).await?;
     let sampled = sample(&calendar, &window, arguments.stride);
@@ -1880,6 +1886,54 @@ mod tests {
                 .to_string(),
             "every name, every session"
         );
+    }
+
+    /// `archive` folded the screened universe, so a five-year pass wrote roughly 1,200 names a
+    /// session where the daily archive held 10,067. Nothing downstream reports it: the partition
+    /// exists, so the next pass reads the session as present and never looks inside, and widening
+    /// afterwards means re-reading vendor files a lapsed subscription no longer serves.
+    #[test]
+    fn test_both_universe_quote_actions_fold_the_whole_market() {
+        let window = ["--start", "2021-08-26", "--end", "2026-08-25"];
+        let parsed = |verb: &str| {
+            let arguments = parse(&[["equity-quotes", verb].as_slice(), &window].concat())
+                .expect("a quote window");
+            match arguments.command {
+                Command::EquityQuotes { action } => action,
+                other => panic!("expected a quote action, got {other:?}"),
+            }
+        };
+
+        let rendered = |verb: &str| {
+            parsed(verb)
+                .universe_scope()
+                .expect("a universe action has a scope")
+                .expect("the whole market may write a partition")
+                .to_string()
+        };
+
+        // Literals, not `whole_market(..).to_string()`: an expectation built from the call under
+        // test moves with it and can never fail.
+        assert_eq!(rendered("archive"), "every name, absent sessions only");
+        assert_eq!(rendered("widen"), "every name, every session");
+
+        // The actions that name their own symbols must not answer here at all, or the arm above
+        // would fold a universe over a repair.
+        let repair = parse(&[
+            "equity-quotes",
+            "repair",
+            "--symbols",
+            "AAPL",
+            "--start",
+            "2021-08-26",
+            "--end",
+            "2026-08-25",
+        ])
+        .expect("a repair");
+        match repair.command {
+            Command::EquityQuotes { action } => assert!(action.universe_scope().is_none()),
+            other => panic!("expected a quote action, got {other:?}"),
+        }
     }
 
     /// A scan that could not read a session found its names only in the ones it could, so both the
