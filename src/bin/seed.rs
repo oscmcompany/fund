@@ -1037,9 +1037,12 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
         },
         // One arm, so the universe is written once and the two actions cannot disagree about it.
         QuoteAction::Archive(arguments) | QuoteAction::Widen(arguments) => {
+            // Unreachable: this arm names the two actions that answer. Returned rather than
+            // panicked so that adding a variant here without adding it to `universe_scope`
+            // degrades to a usage error instead of killing the process mid-pass.
             let scope = action
                 .universe_scope()
-                .expect("a universe action has a scope")?;
+                .ok_or_else(|| SeedError::Usage(format!("{action:?} folds no universe")))??;
             fold_sampled(arguments, scope, QuoteProvider::WholeSession).await
         }
         QuoteAction::Measure(symbols) => measure_sampled(symbols).await,
