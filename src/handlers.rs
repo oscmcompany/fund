@@ -11,7 +11,9 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
+use crate::common::alpaca::{
+    AlpacaCredentials, ClientError, DataFeed, MarketDataClient, TradingClient,
+};
 use crate::common::events::{self, Command, EventError};
 use crate::common::journal::{
     BarsIngested, CommandFinished, CommandOutcome, DatabaseExported, Journal, JournalError,
@@ -133,7 +135,9 @@ impl ServiceState {
         Ok(Self {
             pool,
             trading: TradingClient::from_env(credentials.clone()),
-            market_data: MarketDataClient::from_env(credentials),
+            // SIP is pinned, not read from the environment: IEX's best bid and offer is not the
+            // national one, so a variable could put two incomparable series under one key.
+            market_data: MarketDataClient::new(credentials, DataFeed::Sip),
             massive,
             s3_client: crate::common::aws::s3_client().await,
             bucket,

@@ -17,7 +17,7 @@ use burn::tensor::backend::Backend;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
-use fund::common::alpaca::{AlpacaCredentials, MarketDataClient, TradingClient};
+use fund::common::alpaca::{AlpacaCredentials, DataFeed, MarketDataClient, TradingClient};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::SessionDate;
@@ -196,7 +196,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // one whose boundary table is a night stale.
     match AlpacaCredentials::from_env() {
         Ok(credentials) => {
-            let market_data = MarketDataClient::from_env(credentials);
+            let market_data = MarketDataClient::new(credentials, DataFeed::Sip);
             match archive::archive_boundaries(
                 &s3_client,
                 &market_data,
