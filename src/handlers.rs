@@ -11,7 +11,9 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
+use crate::common::alpaca::{
+    AlpacaCredentials, ClientError, DataFeed, MarketDataClient, TradingClient,
+};
 use crate::common::events::{self, Command, EventError};
 use crate::common::journal::{
     BarsIngested, CommandFinished, CommandOutcome, DatabaseExported, Journal, JournalError,
@@ -133,7 +135,10 @@ impl ServiceState {
         Ok(Self {
             pool,
             trading: TradingClient::from_env(credentials.clone()),
-            market_data: MarketDataClient::from_env(credentials),
+            // SIP, pinned rather than configurable: IEX carries a few percent of consolidated
+            // volume and its top of book is not the national one, so a feed set by environment
+            // would change every price the strategy sees without failing anything.
+            market_data: MarketDataClient::new(credentials, DataFeed::Sip),
             massive,
             s3_client: crate::common::aws::s3_client().await,
             bucket,

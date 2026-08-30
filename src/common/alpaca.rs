@@ -2362,26 +2362,6 @@ impl MarketDataClient {
         }
     }
 
-    /// Reads the data feed from `ALPACA_DATA_FEED`, defaulting to [`DataFeed::Iex`].
-    ///
-    /// Defaulting to `iex` keeps an unconfigured deployment working rather than failing on an
-    /// entitlement error. An unrecognized value warns and falls back rather than failing startup,
-    /// for the same reason -- but it warns, because silently serving a different feed than the
-    /// operator asked for changes every price the strategy sees.
-    pub fn from_env(credentials: AlpacaCredentials) -> Self {
-        let feed = match std::env::var("ALPACA_DATA_FEED") {
-            Ok(raw) => DataFeed::parse(&raw).unwrap_or_else(|| {
-                warn!(
-                    requested = %raw,
-                    "Unrecognized ALPACA_DATA_FEED, falling back to iex"
-                );
-                DataFeed::Iex
-            }),
-            Err(_) => DataFeed::Iex,
-        };
-        Self::new(credentials, feed)
-    }
-
     fn get(&self, url: &str) -> reqwest::RequestBuilder {
         self.http_client
             .get(url)
@@ -3880,6 +3860,31 @@ mod tests {
 
     fn client(base_url: String) -> MarketDataClient {
         MarketDataClient::with_base_url(credentials(), base_url, DataFeed::Iex)
+    }
+
+    /// The feed reaches the query string rather than being decoration on the client.
+    ///
+    /// Asserted against the literal `feed=sip`, because the application pins SIP and IEX's top of
+    /// book is not the national one — a client that quietly requested the wrong tape would return
+    /// prices that parse perfectly and describe a different market.
+    #[tokio::test]
+    async fn test_a_sip_client_requests_the_sip_feed() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=sip")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FULL_SNAPSHOT)
+            .create_async()
+            .await;
+
+        let client = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Sip);
+        client
+            .fetch_snapshots(&[Ticker::new("AAPL").unwrap()])
+            .await
+            .expect("the snapshot request should succeed");
+
+        mock.assert_async().await;
     }
 
     const FULL_SNAPSHOT: &str = r#"{
