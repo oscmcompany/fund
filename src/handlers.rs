@@ -135,9 +135,8 @@ impl ServiceState {
         Ok(Self {
             pool,
             trading: TradingClient::from_env(credentials.clone()),
-            // SIP, pinned rather than configurable: IEX carries a few percent of consolidated
-            // volume and its top of book is not the national one, so a feed set by environment
-            // would change every price the strategy sees without failing anything.
+            // SIP is pinned, not read from the environment: IEX's best bid and offer is not the
+            // national one, so a variable could put two incomparable series under one key.
             market_data: MarketDataClient::new(credentials, DataFeed::Sip),
             massive,
             s3_client: crate::common::aws::s3_client().await,

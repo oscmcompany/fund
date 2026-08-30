@@ -3862,11 +3862,10 @@ mod tests {
         MarketDataClient::with_base_url(credentials(), base_url, DataFeed::Iex)
     }
 
-    /// The feed reaches the query string rather than being decoration on the client.
+    /// The feed reaches the query string rather than decorating the client.
     ///
-    /// Asserted against the literal `feed=sip`, because the application pins SIP and IEX's top of
-    /// book is not the national one — a client that quietly requested the wrong tape would return
-    /// prices that parse perfectly and describe a different market.
+    /// Asserted against the literal `feed=sip`: a client requesting the wrong tape returns prices
+    /// that parse perfectly and describe a different market.
     #[tokio::test]
     async fn test_a_sip_client_requests_the_sip_feed() {
         let mut server = mockito::Server::new_async().await;
