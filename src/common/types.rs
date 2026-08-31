@@ -1289,24 +1289,78 @@ impl QuoteSummary {
 /// recover how much of the tape it declined to count. Both counts and dollar volumes, because the
 /// two disagree wildly — 246 auction prints were 0.03% of one session's trades and 14.1% of its
 /// money.
+/// Every field is private and every count moves with its dollars, which is the point: a rule
+/// recorded in two statements can be half-recorded, and these columns are the audit trail.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TradeExclusions {
     /// Refused by the provider's own `updates_volume`, chiefly the official open and close.
-    pub volume_ineligible_trades: i64,
-    pub volume_ineligible_dollar_volume: f64,
+    volume_ineligible_trades: i64,
+    volume_ineligible_dollar_volume: f64,
     /// Marked corrected or busted by the provider.
-    pub corrected_trades: i64,
-    pub corrected_dollar_volume: f64,
+    corrected_trades: i64,
+    corrected_dollar_volume: f64,
     /// Priced away from the market — an average or derivatively priced print. Counted rather than
     /// applied: no aggregate here differences against a quote yet, and this is what it would cost.
-    pub non_market_price_trades: i64,
-    pub non_market_price_dollar_volume: f64,
+    non_market_price_trades: i64,
+    non_market_price_dollar_volume: f64,
     /// Carried a condition the baked table does not name, so its eligibility was assumed rather than
     /// read. Never disqualifying; a rising count is how a provider's new code becomes visible.
-    pub unresolved_condition_trades: i64,
+    unresolved_condition_trades: i64,
 }
 
 impl TradeExclusions {
+    /// Records a print the provider's volume rule refused.
+    pub fn record_volume_ineligible(&mut self, notional: f64) {
+        self.volume_ineligible_trades += 1;
+        self.volume_ineligible_dollar_volume += notional;
+    }
+
+    /// Records a print the provider marked corrected or busted.
+    pub fn record_correction(&mut self, notional: f64) {
+        self.corrected_trades += 1;
+        self.corrected_dollar_volume += notional;
+    }
+
+    /// Records a print whose price is not a market price, which still counts as volume.
+    pub fn record_non_market_price(&mut self, notional: f64) {
+        self.non_market_price_trades += 1;
+        self.non_market_price_dollar_volume += notional;
+    }
+
+    /// Records a print carrying a condition this table does not name. No dollars: the print is
+    /// folded like any other, and this counts only that its eligibility was assumed.
+    pub fn record_unresolved_condition(&mut self) {
+        self.unresolved_condition_trades += 1;
+    }
+
+    pub fn volume_ineligible_trades(&self) -> i64 {
+        self.volume_ineligible_trades
+    }
+
+    pub fn volume_ineligible_dollar_volume(&self) -> f64 {
+        self.volume_ineligible_dollar_volume
+    }
+
+    pub fn corrected_trades(&self) -> i64 {
+        self.corrected_trades
+    }
+
+    pub fn corrected_dollar_volume(&self) -> f64 {
+        self.corrected_dollar_volume
+    }
+
+    pub fn non_market_price_trades(&self) -> i64 {
+        self.non_market_price_trades
+    }
+
+    pub fn non_market_price_dollar_volume(&self) -> f64 {
+        self.non_market_price_dollar_volume
+    }
+
+    pub fn unresolved_condition_trades(&self) -> i64 {
+        self.unresolved_condition_trades
+    }
+
     /// Takes everything `other` recorded, so a coarser bar is the merge of its finer ones.
     ///
     /// Destructured rather than field-by-field: a field added later stops compiling here instead of
@@ -1328,6 +1382,55 @@ impl TradeExclusions {
         self.non_market_price_trades += non_market_price_trades;
         self.non_market_price_dollar_volume += non_market_price_dollar_volume;
         self.unresolved_condition_trades += unresolved_condition_trades;
+    }
+}
+
+#[cfg(test)]
+mod trade_exclusion_tests {
+    use super::TradeExclusions;
+
+    /// Every recorded exclusion moves its count and its dollars together.
+    ///
+    /// The reason the fields are private. Recording a rule used to be two statements at each of
+    /// three call sites, so a fourth rule added later could increment a count and forget its
+    /// dollars — and these columns are the archive's audit trail, so the audit would be the thing
+    /// that was wrong. Pinned to literals rather than to a sum of the inputs.
+    #[test]
+    fn test_a_recorded_exclusion_moves_its_count_and_its_dollars_together() {
+        let mut exclusions = TradeExclusions::default();
+        exclusions.record_volume_ineligible(100_000.0);
+        exclusions.record_volume_ineligible(50_000.0);
+        exclusions.record_correction(7_500.0);
+        exclusions.record_non_market_price(250.0);
+        exclusions.record_unresolved_condition();
+
+        assert_eq!(exclusions.volume_ineligible_trades(), 2);
+        assert_eq!(exclusions.volume_ineligible_dollar_volume(), 150_000.0);
+        assert_eq!(exclusions.corrected_trades(), 1);
+        assert_eq!(exclusions.corrected_dollar_volume(), 7_500.0);
+        assert_eq!(exclusions.non_market_price_trades(), 1);
+        assert_eq!(exclusions.non_market_price_dollar_volume(), 250.0);
+        // No dollars: the print is folded like any other, and this counts only that its
+        // eligibility was assumed rather than read.
+        assert_eq!(exclusions.unresolved_condition_trades(), 1);
+    }
+
+    /// A coarser bar is the merge of its finer ones, on every field at once.
+    #[test]
+    fn test_absorb_carries_every_rule_upward() {
+        let mut minute = TradeExclusions::default();
+        minute.record_correction(1_000.0);
+        minute.record_unresolved_condition();
+
+        let mut session = TradeExclusions::default();
+        session.record_volume_ineligible(9_000.0);
+        session.absorb(minute);
+
+        assert_eq!(session.corrected_trades(), 1);
+        assert_eq!(session.corrected_dollar_volume(), 1_000.0);
+        assert_eq!(session.volume_ineligible_trades(), 1);
+        assert_eq!(session.volume_ineligible_dollar_volume(), 9_000.0);
+        assert_eq!(session.unresolved_condition_trades(), 1);
     }
 }
 

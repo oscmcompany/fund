@@ -205,24 +205,21 @@ impl SessionFold {
 
         let bucket = &mut self.buckets[index];
         if tick.corrected() {
-            bucket.exclusions.corrected_trades += 1;
-            bucket.exclusions.corrected_dollar_volume += tick.notional();
+            bucket.exclusions.record_correction(tick.notional());
             return;
         }
         match volume_eligibility(tick.conditions()) {
             Eligibility::Ineligible => {
-                bucket.exclusions.volume_ineligible_trades += 1;
-                bucket.exclusions.volume_ineligible_dollar_volume += tick.notional();
+                bucket.exclusions.record_volume_ineligible(tick.notional());
                 return;
             }
             // Counted and still folded: an unknown code is likelier to be a namespace this table
             // does not cover than a volume rule the provider forgot to publish.
-            Eligibility::Ambiguous => bucket.exclusions.unresolved_condition_trades += 1,
+            Eligibility::Ambiguous => bucket.exclusions.record_unresolved_condition(),
             Eligibility::Eligible => {}
         }
         if !carries_a_market_price(tick.conditions()) {
-            bucket.exclusions.non_market_price_trades += 1;
-            bucket.exclusions.non_market_price_dollar_volume += tick.notional();
+            bucket.exclusions.record_non_market_price(tick.notional());
         }
         bucket.add(&tick, direction);
     }
@@ -534,49 +531,49 @@ pub fn summaries_to_dataframe(summaries: &[TradeSummary]) -> Result<DataFrame, P
             "volume_ineligible_trades",
             summaries
                 .iter()
-                .map(|row| row.exclusions().volume_ineligible_trades)
+                .map(|row| row.exclusions().volume_ineligible_trades())
                 .collect(),
         ),
         column(
             "volume_ineligible_dollar_volume",
             summaries
                 .iter()
-                .map(|row| row.exclusions().volume_ineligible_dollar_volume)
+                .map(|row| row.exclusions().volume_ineligible_dollar_volume())
                 .collect(),
         ),
         counted(
             "corrected_trades",
             summaries
                 .iter()
-                .map(|row| row.exclusions().corrected_trades)
+                .map(|row| row.exclusions().corrected_trades())
                 .collect(),
         ),
         column(
             "corrected_dollar_volume",
             summaries
                 .iter()
-                .map(|row| row.exclusions().corrected_dollar_volume)
+                .map(|row| row.exclusions().corrected_dollar_volume())
                 .collect(),
         ),
         counted(
             "non_market_price_trades",
             summaries
                 .iter()
-                .map(|row| row.exclusions().non_market_price_trades)
+                .map(|row| row.exclusions().non_market_price_trades())
                 .collect(),
         ),
         column(
             "non_market_price_dollar_volume",
             summaries
                 .iter()
-                .map(|row| row.exclusions().non_market_price_dollar_volume)
+                .map(|row| row.exclusions().non_market_price_dollar_volume())
                 .collect(),
         ),
         counted(
             "unresolved_condition_trades",
             summaries
                 .iter()
-                .map(|row| row.exclusions().unresolved_condition_trades)
+                .map(|row| row.exclusions().unresolved_condition_trades())
                 .collect(),
         ),
     ])
@@ -689,9 +686,9 @@ mod tests {
         let daily = rows(&summaries, BarInterval::OneDay);
         assert_eq!(daily[0].volume(), 100.0, "the auction is not in volume");
         assert_eq!(daily[0].trade_count(), 1);
-        assert_eq!(daily[0].exclusions().volume_ineligible_trades, 1);
+        assert_eq!(daily[0].exclusions().volume_ineligible_trades(), 1);
         assert_eq!(
-            daily[0].exclusions().volume_ineligible_dollar_volume,
+            daily[0].exclusions().volume_ineligible_dollar_volume(),
             100_000_000.0
         );
     }
@@ -705,9 +702,9 @@ mod tests {
         ]);
         let daily = rows(&summaries, BarInterval::OneDay);
         assert_eq!(daily[0].volume(), 100.0);
-        assert_eq!(daily[0].exclusions().corrected_trades, 1);
-        assert_eq!(daily[0].exclusions().corrected_dollar_volume, 500_000.0);
-        assert_eq!(daily[0].exclusions().volume_ineligible_trades, 0);
+        assert_eq!(daily[0].exclusions().corrected_trades(), 1);
+        assert_eq!(daily[0].exclusions().corrected_dollar_volume(), 500_000.0);
+        assert_eq!(daily[0].exclusions().volume_ineligible_trades(), 0);
     }
 
     /// An average-price print counts as volume and is flagged as not a market price.
@@ -719,12 +716,12 @@ mod tests {
         let summaries = fold_of(vec![marked(30, 100.0, 500.0, vec![2], false)]);
         let daily = rows(&summaries, BarInterval::OneDay);
         assert_eq!(daily[0].volume(), 500.0, "still real volume");
-        assert_eq!(daily[0].exclusions().non_market_price_trades, 1);
+        assert_eq!(daily[0].exclusions().non_market_price_trades(), 1);
         assert_eq!(
-            daily[0].exclusions().non_market_price_dollar_volume,
+            daily[0].exclusions().non_market_price_dollar_volume(),
             50_000.0
         );
-        assert_eq!(daily[0].exclusions().volume_ineligible_trades, 0);
+        assert_eq!(daily[0].exclusions().volume_ineligible_trades(), 0);
     }
 
     /// An unknown code is folded and counted, never treated as ordinary in silence.
@@ -733,7 +730,7 @@ mod tests {
         let summaries = fold_of(vec![marked(30, 100.0, 200.0, vec![41], false)]);
         let daily = rows(&summaries, BarInterval::OneDay);
         assert_eq!(daily[0].volume(), 200.0, "41 is not a sale condition");
-        assert_eq!(daily[0].exclusions().unresolved_condition_trades, 1);
+        assert_eq!(daily[0].exclusions().unresolved_condition_trades(), 1);
     }
 
     /// The tick rule signs on price direction, and a flat print inherits the last one.
@@ -842,9 +839,9 @@ mod tests {
             None,
             "no eligible share traded, so there is no price it traded at"
         );
-        assert_eq!(daily[0].exclusions().volume_ineligible_trades, 1);
+        assert_eq!(daily[0].exclusions().volume_ineligible_trades(), 1);
         assert_eq!(
-            daily[0].exclusions().volume_ineligible_dollar_volume,
+            daily[0].exclusions().volume_ineligible_dollar_volume(),
             100_000.0
         );
         assert_eq!(rows(&summaries, BarInterval::OneMinute).len(), 1);
