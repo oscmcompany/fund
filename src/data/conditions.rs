@@ -43,25 +43,6 @@ pub enum Eligibility {
     Ambiguous,
 }
 
-/// The rule a trade was excluded under, which the archive carries per bar.
-///
-/// Split by *whose* rule it is. The provider publishes no spread-eligibility flag, so
-/// [`Exclusion::HouseSpreadRule`] is our judgment and is labelled as ours — a reader who disagrees
-/// with it should be able to see they are disagreeing with us rather than with the SIP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Exclusion {
-    /// The provider's own `updates_volume` said no.
-    ProviderVolumeRule,
-    /// The provider corrected or busted the print.
-    ProviderCorrection,
-    /// Priced away from the market at the moment it printed, so no spread can be read off it.
-    HouseSpreadRule,
-    /// No size, so it can weigh nothing and would divide by zero.
-    HouseZeroSize,
-    /// A code this table does not carry. Counted rather than dropped, and never disqualifying.
-    UnresolvedCode,
-}
-
 /// Conditions whose price is not a market price at the instant they printed.
 ///
 /// Ours, not the provider's — both are volume-eligible and belong in VWAP. An average-price trade
