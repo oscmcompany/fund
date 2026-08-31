@@ -15,6 +15,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Entered rather than merely resolved: `cargo fmt` below reads the manifest from the working
+# directory, so a run from anywhere but the repository root would format nothing and say so quietly.
+cd "${ROOT}"
 OUTPUT="${ROOT}/src/data/conditions_table.rs"
 
 CHECK_ONLY=false
@@ -35,10 +38,21 @@ done
 RESPONSE="$(mktemp)"
 trap 'rm -f "${RESPONSE}"' EXIT
 
+if [[ "${MASSIVE_BASE_URL}" != https://* ]]; then
+  echo "Error: MASSIVE_BASE_URL is not https, so the credential would cross the wire in clear" >&2
+  exit 1
+fi
+
 echo "Fetching sale conditions from ${MASSIVE_BASE_URL}"
-curl -sS --fail-with-body \
-  "${MASSIVE_BASE_URL}/v3/reference/conditions?asset_class=stocks&limit=1000&apiKey=${MASSIVE_API_KEY}" \
-  -o "${RESPONSE}"
+# The key travels as a bearer header fed over stdin, so it reaches neither the query string nor
+# `argv`. The header half matches `massive.rs:311` and the reason recorded there — reqwest prints the
+# full URL when a decode fails, so a key in the URL reaches every log line reporting one. The stdin
+# half is this script's own: an argument would sit in `ps` output for as long as the request runs,
+# and a config file would put the credential on disk.
+curl -sS --fail-with-body --config - -o "${RESPONSE}" <<CURL_CONFIGURATION
+url = "${MASSIVE_BASE_URL}/v3/reference/conditions?asset_class=stocks&limit=1000"
+header = "Authorization: Bearer ${MASSIVE_API_KEY}"
+CURL_CONFIGURATION
 
 TARGET="${OUTPUT}"
 if [[ "${CHECK_ONLY}" == true ]]; then
@@ -48,6 +62,7 @@ fi
 
 python3 - "${RESPONSE}" "${TARGET}" <<'PYTHON'
 import json
+import re
 import sys
 from datetime import date
 
@@ -81,11 +96,14 @@ def character(row, tape):
 lines = [
     "//! The provider's sale-condition table, generated — see `tools/fetch-trade-conditions`.",
     "//!",
-    f"//! Fetched {date.today().isoformat()}. Edit the script, never this file.",
+    "//! Edit the script, never this file. [`FETCHED_ON`] carries the date it was read.",
     "",
     "use crate::data::conditions::SaleCondition;",
     "",
     "/// The date the provider's reference endpoint was last read into this file.",
+    "///",
+    "/// The only line in this file that changes with the clock, which is what lets `--check` compare",
+    "/// two generations by ignoring exactly one line.",
     f'pub const FETCHED_ON: &str = "{date.today().isoformat()}";',
     "",
     "/// Every stock sale condition the provider publishes, ordered by identifier.",
@@ -106,23 +124,39 @@ for row in conditions:
 lines.append("];")
 lines.append("")
 
+rendered = "\n".join(lines)
+
+# `--check` compares two generations by ignoring the one dated line, so a second one would make an
+# unchanged table read as drift a day later. That is exactly the bug this guard exists to prevent,
+# and it is asserted here rather than trusted because the failure only appears the next morning.
+dated = [
+    line
+    for line in rendered.splitlines()
+    if re.search(r"\d{4}-\d{2}-\d{2}", line) and not line.startswith("pub const FETCHED_ON")
+]
+if dated:
+    sys.exit(
+        "Error: the generated file carries a date outside FETCHED_ON, which would make --check "
+        f"report drift every day: {dated}"
+    )
+
 with open(output, "w") as handle:
-    handle.write("\n".join(lines))
+    handle.write(rendered)
 
 print(f"Wrote {len(conditions)} sale conditions to {output}")
 PYTHON
 
 if [[ "${CHECK_ONLY}" == true ]]; then
-  # Compared ignoring the stamp, which moves every day the script runs and says nothing about
-  # whether the provider changed anything.
-  if diff <(grep -v '^pub const FETCHED_ON' "${OUTPUT}") \
-          <(grep -v '^pub const FETCHED_ON' "${TARGET}") >/dev/null; then
+  # Ignoring FETCHED_ON, which moves with the clock and says nothing about the provider. It is the
+  # only dated line by construction — the generator refuses to emit a second one — so this compares
+  # the table itself rather than the day it was read.
+  undated() { grep -v '^pub const FETCHED_ON' "$1"; }
+  if diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null; then
     echo "Up to date: the committed table matches the provider"
     exit 0
   fi
   echo "DRIFT: the provider's table no longer matches the committed one" >&2
-  diff <(grep -v '^pub const FETCHED_ON' "${OUTPUT}") \
-       <(grep -v '^pub const FETCHED_ON' "${TARGET}") >&2 || true
+  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
   echo >&2
   echo "Re-run without --check, review the diff, and commit it." >&2
   exit 1

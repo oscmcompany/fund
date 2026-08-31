@@ -1,7 +1,6 @@
 //! Which trades count, and under whose rule.
 //!
-//! Two providers spell a condition differently — Massive by identifier, Alpaca by SIP character —
-//! so both resolve through [`conditions_table`](crate::data::conditions_table) before any policy.
+//! Massive spells a condition by identifier and Alpaca by SIP character; both resolve here first.
 
 use crate::common::types::Tape;
 use crate::data::conditions_table::SALE_CONDITIONS;
@@ -272,23 +271,54 @@ mod tests {
     }
 
     /// The house rule is read off characters too, so its codes must name nothing else.
+    ///
+    /// Spelled out rather than iterated over `NOT_A_MARKET_PRICE`: a loop driven by the constant
+    /// under test passes vacuously if the constant is emptied, which is the one edit that would
+    /// silently retire the rule.
     #[test]
     fn test_the_house_rule_codes_are_collision_free_on_every_tape() {
-        for identifier in NOT_A_MARKET_PRICE {
+        for (identifier, name, expected) in [
+            (
+                2,
+                "Average Price Trade",
+                vec![
+                    (Tape::ConsolidatedTapeAssociation, b'B'),
+                    (Tape::UnlistedTradingPrivileges, b'W'),
+                    (Tape::TradeDataDissemination, b'W'),
+                ],
+            ),
+            (
+                10,
+                "Derivatively Priced",
+                vec![
+                    (Tape::ConsolidatedTapeAssociation, b'4'),
+                    (Tape::UnlistedTradingPrivileges, b'4'),
+                ],
+            ),
+        ] {
+            assert!(
+                NOT_A_MARKET_PRICE.contains(&identifier),
+                "{identifier} must still be excluded from the effective spread"
+            );
             let condition = by_identifier(identifier).expect("a published condition");
-            for tape in Tape::ALL {
-                let Some(character) = condition.character_on(tape) else {
-                    continue;
-                };
+            assert_eq!(condition.name, name);
+            for (tape, character) in expected {
+                assert_eq!(
+                    condition.character_on(tape),
+                    Some(character),
+                    "{tape} spells {name} {:?}",
+                    character as char
+                );
                 assert_eq!(
                     by_character(character, tape).len(),
                     1,
-                    "{tape} {:?} must name only {}",
-                    character as char,
-                    condition.name
+                    "{tape} {:?} must name only {name}",
+                    character as char
                 );
             }
         }
+        assert_eq!(NOT_A_MARKET_PRICE.len(), 2, "exactly the two above");
+
         assert!(!carries_a_market_price_from_characters(
             b"B",
             Tape::ConsolidatedTapeAssociation
@@ -332,13 +362,13 @@ mod tests {
             "the provider published 40 sale conditions when this was written"
         );
         assert_eq!(FETCHED_ON.len(), 10, "an ISO date");
-        let mut identifiers: Vec<u32> = SALE_CONDITIONS.iter().map(|row| row.identifier).collect();
-        let count = identifiers.len();
-        identifiers.dedup();
-        assert_eq!(
-            identifiers.len(),
-            count,
-            "identifiers are unique and sorted"
+        // Strictly increasing, which is uniqueness and ordering in one pass. `dedup` would not do:
+        // it drops only adjacent repeats, so an unsorted table with duplicates apart reads clean.
+        assert!(
+            SALE_CONDITIONS
+                .windows(2)
+                .all(|pair| pair[0].identifier < pair[1].identifier),
+            "identifiers must ascend without repeating, which `by_identifier` assumes"
         );
     }
 }

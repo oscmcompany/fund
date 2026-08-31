@@ -1,10 +1,13 @@
 //! The provider's sale-condition table, generated — see `tools/fetch-trade-conditions`.
 //!
-//! Fetched 2026-08-31. Edit the script, never this file.
+//! Edit the script, never this file. [`FETCHED_ON`] carries the date it was read.
 
 use crate::data::conditions::SaleCondition;
 
 /// The date the provider's reference endpoint was last read into this file.
+///
+/// The only line in this file that changes with the clock, which is what lets `--check` compare
+/// two generations by ignoring exactly one line.
 pub const FETCHED_ON: &str = "2026-08-31";
 
 /// Every stock sale condition the provider publishes, ordered by identifier.
