@@ -719,6 +719,51 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for BarInterval {
     }
 }
 
+/// Which SIP disseminated a print, which is what decides how its conditions are spelled.
+///
+/// The same condition carries a different character on each tape — an average price trade is `B` on
+/// CTA and `W` on UTP — so a character cannot be read without knowing which one published it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tape {
+    /// Tapes A and B: NYSE and NYSE-listed issues.
+    ConsolidatedTapeAssociation,
+    /// Tape C: Nasdaq-listed issues.
+    UnlistedTradingPrivileges,
+    /// FINRA's off-exchange feed, which carries the TRF prints.
+    TradeDataDissemination,
+}
+
+impl Tape {
+    /// Every variant, for exhaustive iteration in tests and validation.
+    pub const ALL: [Tape; 3] = [
+        Tape::ConsolidatedTapeAssociation,
+        Tape::UnlistedTradingPrivileges,
+        Tape::TradeDataDissemination,
+    ];
+
+    /// The tape a provider's numeric marker names, or `None` for a value no SIP publishes.
+    ///
+    /// `1` and `2` are both CTA — tape A is NYSE-listed and tape B is regional, and they share a
+    /// condition vocabulary, so the distinction does not survive into this type.
+    pub fn from_marker(marker: u8) -> Option<Self> {
+        match marker {
+            1 | 2 => Some(Tape::ConsolidatedTapeAssociation),
+            3 => Some(Tape::UnlistedTradingPrivileges),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Tape {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Tape::ConsolidatedTapeAssociation => "CTA",
+            Tape::UnlistedTradingPrivileges => "UTP",
+            Tape::TradeDataDissemination => "FINRA_TDDS",
+        })
+    }
+}
+
 /// The grid a session is folded onto, which is the two [`BarInterval`] values that name a bucket.
 ///
 /// Distinct from [`BarInterval`] so a fold cannot be opened at [`BarInterval::OneDay`], whose bucket
