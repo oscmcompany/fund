@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Regenerates src/data/conditions_table.rs from the provider's sale-condition reference.
+#
+# The table decides which trades enter volume, VWAP and the effective spread, so it is baked into
+# the binary rather than fetched at fold time: a five-year backfill and tonight's nightly must apply
+# the same rules, and a table that moves under a running pass would make two partitions written a day
+# apart incomparable. Re-run this when the provider publishes new codes, and commit the diff.
+#
+#   secretspec run -- tools/fetch-trade-conditions
+#   secretspec run -- tools/fetch-trade-conditions --check
+#
+# `--check` rewrites nothing and exits non-zero when the provider has moved, which is the drift
+# detection a baked table would otherwise lack. Deliberately not a test: it needs the network and a
+# credential, and a suite that fails when the vendor is down stops meaning anything.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUTPUT="${ROOT}/src/data/conditions_table.rs"
+
+CHECK_ONLY=false
+if [[ "${1:-}" == "--check" ]]; then
+  CHECK_ONLY=true
+elif [[ -n "${1:-}" ]]; then
+  echo "Usage: $(basename "$0") [--check]" >&2
+  exit 1
+fi
+
+for variable in MASSIVE_BASE_URL MASSIVE_API_KEY; do
+  if [[ -z "${!variable:-}" ]]; then
+    echo "Error: ${variable} is not set; run under 'secretspec run --'" >&2
+    exit 1
+  fi
+done
+
+RESPONSE="$(mktemp)"
+trap 'rm -f "${RESPONSE}"' EXIT
+
+echo "Fetching sale conditions from ${MASSIVE_BASE_URL}"
+curl -sS --fail-with-body \
+  "${MASSIVE_BASE_URL}/v3/reference/conditions?asset_class=stocks&limit=1000&apiKey=${MASSIVE_API_KEY}" \
+  -o "${RESPONSE}"
+
+TARGET="${OUTPUT}"
+if [[ "${CHECK_ONLY}" == true ]]; then
+  TARGET="$(mktemp)"
+  trap 'rm -f "${RESPONSE}" "${TARGET}"' EXIT
+fi
+
+python3 - "${RESPONSE}" "${TARGET}" <<'PYTHON'
+import json
+import sys
+from datetime import date
+
+response, output = sys.argv[1], sys.argv[2]
+with open(response) as handle:
+    payload = json.load(handle)
+
+conditions = sorted(
+    (row for row in payload.get("results", []) if row.get("type") == "sale_condition"),
+    key=lambda row: row["id"],
+)
+if not conditions:
+    sys.exit("Error: the response carried no sale conditions")
+
+for row in conditions:
+    rules = row.get("update_rules", {}).get("consolidated", {})
+    for rule in ("updates_volume", "updates_high_low", "updates_open_close"):
+        if rule not in rules:
+            sys.exit(f"Error: condition {row['id']} is missing {rule}")
+
+
+def character(row, tape):
+    value = row.get("sip_mapping", {}).get(tape)
+    if value is None:
+        return "None"
+    if len(value) != 1:
+        sys.exit(f"Error: condition {row['id']} maps to {value!r} on {tape}, which is not one byte")
+    return f"Some(b'{value}')" if value != "'" else "Some(b'\\'')"
+
+
+lines = [
+    "//! The provider's sale-condition table, generated — see `tools/fetch-trade-conditions`.",
+    "//!",
+    f"//! Fetched {date.today().isoformat()}. Edit the script, never this file.",
+    "",
+    "use crate::data::conditions::SaleCondition;",
+    "",
+    "/// The date the provider's reference endpoint was last read into this file.",
+    f'pub const FETCHED_ON: &str = "{date.today().isoformat()}";',
+    "",
+    "/// Every stock sale condition the provider publishes, ordered by identifier.",
+    f"pub const SALE_CONDITIONS: [SaleCondition; {len(conditions)}] = [",
+]
+for row in conditions:
+    rules = row["update_rules"]["consolidated"]
+    lines.append("    SaleCondition {")
+    lines.append(f"        identifier: {row['id']},")
+    lines.append(f"        name: {json.dumps(row['name'])},")
+    lines.append(f"        updates_volume: {str(rules['updates_volume']).lower()},")
+    lines.append(f"        updates_high_low: {str(rules['updates_high_low']).lower()},")
+    lines.append(f"        updates_open_close: {str(rules['updates_open_close']).lower()},")
+    lines.append(f"        consolidated_tape_association: {character(row, 'CTA')},")
+    lines.append(f"        unlisted_trading_privileges: {character(row, 'UTP')},")
+    lines.append(f"        trade_data_dissemination: {character(row, 'FINRA_TDDS')},")
+    lines.append("    },")
+lines.append("];")
+lines.append("")
+
+with open(output, "w") as handle:
+    handle.write("\n".join(lines))
+
+print(f"Wrote {len(conditions)} sale conditions to {output}")
+PYTHON
+
+if [[ "${CHECK_ONLY}" == true ]]; then
+  # Compared ignoring the stamp, which moves every day the script runs and says nothing about
+  # whether the provider changed anything.
+  if diff <(grep -v '^pub const FETCHED_ON' "${OUTPUT}") \
+          <(grep -v '^pub const FETCHED_ON' "${TARGET}") >/dev/null; then
+    echo "Up to date: the committed table matches the provider"
+    exit 0
+  fi
+  echo "DRIFT: the provider's table no longer matches the committed one" >&2
+  diff <(grep -v '^pub const FETCHED_ON' "${OUTPUT}") \
+       <(grep -v '^pub const FETCHED_ON' "${TARGET}") >&2 || true
+  echo >&2
+  echo "Re-run without --check, review the diff, and commit it." >&2
+  exit 1
+fi
+
+echo "Formatting"
+cargo fmt -- "${OUTPUT}" 2>/dev/null || cargo fmt
+echo "Done. Review the diff and commit it."
