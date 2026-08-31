@@ -1283,6 +1283,181 @@ impl QuoteSummary {
     }
 }
 
+/// What a bar dropped, and under whose rule.
+///
+/// Carried beside every aggregate because the fold is lossy: once a bar is written, no reader can
+/// recover how much of the tape it declined to count. Both counts and dollar volumes, because the
+/// two disagree wildly — 246 auction prints were 0.03% of one session's trades and 14.1% of its
+/// money.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TradeExclusions {
+    /// Refused by the provider's own `updates_volume`, chiefly the official open and close.
+    pub volume_ineligible_trades: i64,
+    pub volume_ineligible_dollar_volume: f64,
+    /// Marked corrected or busted by the provider.
+    pub corrected_trades: i64,
+    pub corrected_dollar_volume: f64,
+    /// Priced away from the market — an average or derivatively priced print. Counted rather than
+    /// applied: no aggregate here differences against a quote yet, and this is what it would cost.
+    pub non_market_price_trades: i64,
+    pub non_market_price_dollar_volume: f64,
+    /// Carried a condition the baked table does not name, so its eligibility was assumed rather than
+    /// read. Never disqualifying; a rising count is how a provider's new code becomes visible.
+    pub unresolved_condition_trades: i64,
+}
+
+impl TradeExclusions {
+    /// Takes everything `other` recorded, so a coarser bar is the merge of its finer ones.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.volume_ineligible_trades += other.volume_ineligible_trades;
+        self.volume_ineligible_dollar_volume += other.volume_ineligible_dollar_volume;
+        self.corrected_trades += other.corrected_trades;
+        self.corrected_dollar_volume += other.corrected_dollar_volume;
+        self.non_market_price_trades += other.non_market_price_trades;
+        self.non_market_price_dollar_volume += other.non_market_price_dollar_volume;
+        self.unresolved_condition_trades += other.unresolved_condition_trades;
+    }
+}
+
+/// One bar's worth of printed trades, counting only what the eligibility policy admits.
+///
+/// `volume` and `dollar_volume` are the eligible tape, not the whole of it; [`TradeSummary::
+/// exclusions`] says what was left out. A reader that wants the raw total must add them back
+/// deliberately rather than by default.
+#[derive(Debug, Clone)]
+pub struct TradeSummary {
+    ticker: Ticker,
+    bar_interval: BarInterval,
+    /// UTC timestamp of the period this summary opens, matching the bar it describes.
+    timestamp: DateTime<Utc>,
+    trade_count: i64,
+    /// Shares, fractional: 16.5% of a session's prints are not whole shares.
+    volume: f64,
+    dollar_volume: f64,
+    volume_weighted_average_price: f64,
+    median_trade_size: f64,
+    ninetieth_percentile_trade_size: f64,
+    /// Buys minus sells in shares, signed by the tick rule — a trade above the previous price is a
+    /// buy, below is a sell, equal inherits the last non-zero direction.
+    signed_volume: f64,
+    exclusions: TradeExclusions,
+}
+
+impl TradeSummary {
+    /// Constructs a `TradeSummary`, rejecting a bar that cannot have come from real prints.
+    ///
+    /// A bar nothing eligible traded in has no summary rather than a zero-volume one, so `volume`
+    /// must be positive. The exclusions may still be non-zero on such a bar, which is why a bar of
+    /// nothing but auction prints is absent here and visible in the daily row that absorbs it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ticker: Ticker,
+        bar_interval: BarInterval,
+        timestamp: DateTime<Utc>,
+        trade_count: i64,
+        volume: f64,
+        dollar_volume: f64,
+        median_trade_size: f64,
+        ninetieth_percentile_trade_size: f64,
+        signed_volume: f64,
+        exclusions: TradeExclusions,
+    ) -> Result<Self, InconsistentRecordError> {
+        for (name, value) in [("volume", volume), ("dollar volume", dollar_volume)] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(reject(format!("{name} {value} is not a positive number")));
+            }
+        }
+        for (name, value) in [
+            ("median trade size", median_trade_size),
+            (
+                "ninetieth percentile trade size",
+                ninetieth_percentile_trade_size,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(reject(format!(
+                    "{name} {value} is not a non-negative number"
+                )));
+            }
+        }
+        if median_trade_size > ninetieth_percentile_trade_size {
+            return Err(reject(format!(
+                "median trade size {median_trade_size} exceeds the ninetieth percentile {ninetieth_percentile_trade_size}"
+            )));
+        }
+        if trade_count <= 0 {
+            return Err(reject(format!(
+                "trade count {trade_count} is not a positive number"
+            )));
+        }
+        // Signed volume is buys minus sells drawn from the same shares, so it cannot exceed them.
+        // A violation means the tick rule and the volume accumulator saw different trades.
+        if !signed_volume.is_finite() || signed_volume.abs() > volume {
+            return Err(reject(format!(
+                "signed volume {signed_volume} exceeds the {volume} shares it is drawn from"
+            )));
+        }
+        Ok(Self {
+            ticker,
+            bar_interval,
+            timestamp,
+            trade_count,
+            volume,
+            dollar_volume,
+            // Divided here rather than passed in, so the identity cannot be violated by a caller.
+            volume_weighted_average_price: dollar_volume / volume,
+            median_trade_size,
+            ninetieth_percentile_trade_size,
+            signed_volume,
+            exclusions,
+        })
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn bar_interval(&self) -> BarInterval {
+        self.bar_interval
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn trade_count(&self) -> i64 {
+        self.trade_count
+    }
+
+    pub fn volume(&self) -> f64 {
+        self.volume
+    }
+
+    pub fn dollar_volume(&self) -> f64 {
+        self.dollar_volume
+    }
+
+    pub fn volume_weighted_average_price(&self) -> f64 {
+        self.volume_weighted_average_price
+    }
+
+    pub fn median_trade_size(&self) -> f64 {
+        self.median_trade_size
+    }
+
+    pub fn ninetieth_percentile_trade_size(&self) -> f64 {
+        self.ninetieth_percentile_trade_size
+    }
+
+    pub fn signed_volume(&self) -> f64 {
+        self.signed_volume
+    }
+
+    pub fn exclusions(&self) -> TradeExclusions {
+        self.exclusions
+    }
+}
+
 /// The most recent trade in a symbol, as one snapshot reported it.
 ///
 /// The timestamp is not optional because the last trade is what the pass prices on whenever the

@@ -15,6 +15,7 @@ pub mod export;
 pub mod purge;
 pub mod quotes;
 pub mod splits;
+pub mod trades;
 pub mod truncate;
 pub mod universe;
 

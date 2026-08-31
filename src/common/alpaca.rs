@@ -2099,6 +2099,74 @@ impl QuoteTick {
     }
 }
 
+/// One printed trade, carrying the marks that decide whether it counts.
+///
+/// `size` is `f64` and not the `i32` a quote's size is: 16.5% of a session's prints are fractional
+/// shares, some as small as 0.0008. `conditions` travels with the tick because eligibility is
+/// decided at fold time and cannot be recovered from the aggregate afterwards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradeTick {
+    timestamp: DateTime<Utc>,
+    price: f64,
+    size: f64,
+    conditions: Vec<u32>,
+    corrected: bool,
+}
+
+impl TradeTick {
+    /// Constructs a `TradeTick`, refusing a print that can carry no weight.
+    ///
+    /// `None` rather than an error, matching [`QuoteTick::new`]: these are refused in bulk and
+    /// counted. A zero size is refused here rather than downstream because it would divide.
+    pub fn new(
+        timestamp: DateTime<Utc>,
+        price: f64,
+        size: f64,
+        conditions: Vec<u32>,
+        corrected: bool,
+    ) -> Option<Self> {
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+        if !size.is_finite() || size <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            timestamp,
+            price,
+            size,
+            conditions,
+            corrected,
+        })
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn price(&self) -> f64 {
+        self.price
+    }
+
+    pub fn size(&self) -> f64 {
+        self.size
+    }
+
+    pub fn conditions(&self) -> &[u32] {
+        &self.conditions
+    }
+
+    /// Whether the provider marked the print corrected or busted.
+    pub fn corrected(&self) -> bool {
+        self.corrected
+    }
+
+    /// What the print was worth, which is the weight every trade aggregate is taken against.
+    pub fn notional(&self) -> f64 {
+        self.price * self.size
+    }
+}
+
 /// Attempts per quote page before the fetch gives up on the whole symbol.
 ///
 /// Four, because the page is the unit that fails: one session of AAPL is 118 pages and a single
