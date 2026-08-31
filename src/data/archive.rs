@@ -17,7 +17,7 @@ use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::flatfiles::{FlatFileClient, FlatFileError};
 use crate::common::massive::MassiveClient;
 use crate::common::types::{
-    BarInterval, EquityBar, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
+    BarInterval, EquityBar, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
 };
 use crate::data::calendar::TradingCalendar;
 use crate::data::{bars, boundaries, quotes, splits};
@@ -1587,6 +1587,7 @@ pub async fn archive_quote_sessions(
     bucket: &str,
     sessions: &[SessionDate],
     scope: &Scope,
+    cadence: IntradayCadence,
 ) -> Result<PassSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
         return Ok(PassProgress::default().into_quote_summary(0));
@@ -1642,6 +1643,7 @@ pub async fn archive_quote_sessions(
             bucket,
             session,
             scope,
+            cadence,
             &mut progress,
         )
         .await?;
@@ -1680,6 +1682,7 @@ async fn archive_quote_session(
     bucket: &str,
     session: SessionDate,
     scope: &Scope,
+    cadence: IntradayCadence,
     progress: &mut PassProgress,
 ) -> Result<usize, ArchiveError> {
     let Some((open, close)) = quotes::trading_hours(calendar, session) else {
@@ -1711,13 +1714,26 @@ async fn archive_quote_session(
         return Ok(0);
     }
 
-    info!(%session, %open, %close, %source, universe = universe.len(), "Folding a session's quoted book");
+    info!(%session, %open, %close, %source, %cadence, universe = universe.len(), "Folding a session's quoted book");
     let (folded, quotes_folded) = match source {
         QuoteSource::PerName(market_data) => {
-            fold_universe(market_data, session, open, close, &universe, progress).await
+            fold_universe(
+                market_data,
+                session,
+                cadence,
+                open,
+                close,
+                &universe,
+                progress,
+            )
+            .await
         }
         QuoteSource::WholeSession(flat_files) => {
-            match fold_whole_session(flat_files, session, open, close, universe, progress).await {
+            match fold_whole_session(
+                flat_files, session, cadence, open, close, universe, progress,
+            )
+            .await
+            {
                 Ok(folded) => folded,
                 Err(error) => {
                     // The file is the session: nothing partial survives it, so this is the session
@@ -1740,9 +1756,11 @@ async fn archive_quote_session(
 }
 
 /// Fans out over the universe, folding each name's session and keeping the summaries and the cost.
+#[allow(clippy::too_many_arguments)]
 async fn fold_universe(
     market_data: &MarketDataClient,
     session: SessionDate,
+    cadence: IntradayCadence,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     universe: &BTreeSet<Ticker>,
@@ -1760,7 +1778,9 @@ async fn fold_universe(
             tasks.spawn(async move {
                 let mut last_error = None;
                 for attempt in 0..QUOTE_SYMBOL_ATTEMPTS {
-                    match quotes::fold_session(&client, &ticker, session, open, close).await {
+                    match quotes::fold_session(&client, &ticker, session, cadence, open, close)
+                        .await
+                    {
                         Ok(folded) => return Ok(folded),
                         Err(error) => {
                             if !error.is_transient() {
@@ -1805,16 +1825,18 @@ async fn fold_universe(
 /// Every fold is held until the file ends rather than released at the ticker switch. Two names a
 /// session arrive in two runs, and a released fold cannot take the second: folding the runs apart
 /// extends each one's last quote to the close, so their weights overlap and sum past the session.
+#[allow(clippy::too_many_arguments)]
 async fn fold_whole_session(
     flat_files: &FlatFileClient,
     session: SessionDate,
+    cadence: IntradayCadence,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     universe: BTreeSet<Ticker>,
     progress: &mut PassProgress,
 ) -> Result<(Vec<QuoteSummary>, usize), FlatFileError> {
     let requested = universe.len();
-    let fold = quotes::MarketFold::new(session, open, close, universe);
+    let fold = quotes::MarketFold::new(session, cadence, open, close, universe);
     let (_, fold) = flat_files.fold_quotes(session.date(), fold).await?;
 
     let quotes_folded = fold.folded();
@@ -1830,11 +1852,11 @@ async fn fold_whole_session(
     Ok((folded.summaries, quotes_folded))
 }
 
-/// Writes a session's summaries, one partition per cadence, five-minute first.
+/// Writes a session's summaries, one partition per cadence, daily last.
 ///
 /// The order is the recovery rule, not a preference. Presence is read off the daily prefix, so a
-/// pass that dies between the two writes leaves the session looking absent and the next pass redoes
-/// both — where the reverse order would mark it done with its intraday half missing.
+/// pass that dies partway leaves the session looking absent and the next pass redoes every cadence —
+/// where writing the daily first would mark it done with its intraday half missing.
 async fn write_quote_partitions(
     s3_client: &S3Client,
     bucket: &str,
@@ -1842,24 +1864,21 @@ async fn write_quote_partitions(
     folded: Vec<QuoteSummary>,
     progress: &mut PassProgress,
 ) -> Result<(), ArchiveError> {
-    let mut intraday: Vec<QuoteSummary> = Vec::new();
+    let mut one_minute: Vec<QuoteSummary> = Vec::new();
+    let mut five_minute: Vec<QuoteSummary> = Vec::new();
     let mut daily: Vec<QuoteSummary> = Vec::new();
-    let mut unexpected = 0usize;
     for row in folded {
         match row.bar_interval() {
-            BarInterval::FiveMinute => intraday.push(row),
+            BarInterval::OneMinute => one_minute.push(row),
+            BarInterval::FiveMinute => five_minute.push(row),
             BarInterval::OneDay => daily.push(row),
-            // The fold emits exactly the two cadences above; a third is this module's own bug.
-            BarInterval::OneMinute => unexpected += 1,
         }
-    }
-    if unexpected > 0 {
-        warn!(unexpected, %session, "Discarded quote summaries at a cadence the archive has no prefix for");
     }
 
     let mut written = 0usize;
     for (interval, rows) in [
-        (BarInterval::FiveMinute, intraday),
+        (BarInterval::OneMinute, one_minute),
+        (BarInterval::FiveMinute, five_minute),
         (BarInterval::OneDay, daily),
     ] {
         if rows.is_empty() {

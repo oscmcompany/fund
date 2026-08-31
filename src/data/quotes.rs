@@ -11,11 +11,10 @@ use tracing::warn;
 
 use crate::common::alpaca::{ClientError, MarketDataClient, QuoteFetch, QuoteTick};
 use crate::common::flatfiles::QuoteSink;
-use crate::common::types::{BarInterval, BasisPoints, QuoteSummary, SessionDate, Ticker};
+use crate::common::types::{
+    BarInterval, BasisPoints, IntradayCadence, QuoteSummary, SessionDate, Ticker,
+};
 use crate::data::calendar::TradingCalendar;
-
-/// Seconds in one intraday bucket, matching the five-minute bar grid the archive is built on.
-const BUCKET_SECONDS: i64 = 300;
 
 /// The upper quantile every summary reports beside its median.
 const UPPER_QUANTILE: f64 = 0.9;
@@ -152,13 +151,14 @@ fn quantile(observations: &[(f64, f64)], weight: f64, quantile: f64) -> Option<f
     observations.last().map(|(spread, _)| *spread)
 }
 
-/// Accumulates one name's session into a five-minute grid and the session that grid sums to.
+/// Accumulates one name's session into an intraday grid and the session that grid sums to.
 ///
 /// Fed tick by tick and never holding them: the ticks a session's fetch delivers run to most of a
 /// million, and what survives is one summary per bucket.
 pub struct SessionFold {
     ticker: Ticker,
     session: SessionDate,
+    cadence: IntradayCadence,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     buckets: Vec<SpreadAccumulator>,
@@ -175,6 +175,7 @@ impl SessionFold {
     pub fn new(
         ticker: Ticker,
         session: SessionDate,
+        cadence: IntradayCadence,
         open: DateTime<Utc>,
         close: DateTime<Utc>,
     ) -> Option<Self> {
@@ -184,11 +185,12 @@ impl SessionFold {
         }
         // Rounded up, so a session whose close does not land on the grid keeps its short last
         // bucket rather than dropping the minutes past the final boundary.
-        let bucket_milliseconds = BUCKET_SECONDS * 1_000;
+        let bucket_milliseconds = cadence.seconds() * 1_000;
         let buckets = ((span + bucket_milliseconds - 1) / bucket_milliseconds) as usize;
         Some(Self {
             ticker,
             session,
+            cadence,
             open,
             close,
             buckets: (0..buckets).map(|_| SpreadAccumulator::default()).collect(),
@@ -215,7 +217,7 @@ impl SessionFold {
         self.previous = Some(tick);
     }
 
-    /// Closes the fold, returning the five-minute summaries followed by the session's.
+    /// Closes the fold, returning the intraday summaries followed by the session's.
     ///
     /// The session summary is the merge of the buckets rather than a separate accumulation, so the
     /// two cadences describe the same weight by construction.
@@ -236,8 +238,9 @@ impl SessionFold {
         let mut session = SpreadAccumulator::default();
         let mut summaries = Vec::with_capacity(self.buckets.len() + 1);
         for (index, mut bucket) in std::mem::take(&mut self.buckets).into_iter().enumerate() {
-            let opens_at = self.open + Duration::seconds(BUCKET_SECONDS * index as i64);
-            if let Some(summary) = bucket.summarize(&self.ticker, BarInterval::FiveMinute, opens_at)
+            let opens_at = self.open + Duration::seconds(self.cadence.seconds() * index as i64);
+            if let Some(summary) =
+                bucket.summarize(&self.ticker, self.cadence.bar_interval(), opens_at)
             {
                 summaries.push(summary);
             }
@@ -271,8 +274,9 @@ impl SessionFold {
             let Some(index) = self.bucket_index(cursor) else {
                 return;
             };
-            let boundary =
-                (self.open + Duration::seconds(BUCKET_SECONDS * (index as i64 + 1))).min(until);
+            let boundary = (self.open
+                + Duration::seconds(self.cadence.seconds() * (index as i64 + 1)))
+            .min(until);
             // Nanoseconds, not milliseconds: truncating loses a quarter of one per quote, which
             // cost AAPL 211 seconds of a 23,400-second session. One bucket cannot overflow it.
             let seconds = (boundary - cursor)
@@ -290,7 +294,7 @@ impl SessionFold {
         if instant < self.open || instant >= self.close {
             return None;
         }
-        let offset = (instant - self.open).num_milliseconds() / (BUCKET_SECONDS * 1_000);
+        let offset = (instant - self.open).num_milliseconds() / (self.cadence.seconds() * 1_000);
         let index = usize::try_from(offset).ok()?;
         (index < self.buckets.len()).then_some(index)
     }
@@ -339,10 +343,11 @@ pub async fn fold_session(
     market_data: &MarketDataClient,
     ticker: &Ticker,
     session: SessionDate,
+    cadence: IntradayCadence,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
 ) -> Result<(Vec<QuoteSummary>, QuoteFetch), ClientError> {
-    let Some(mut fold) = SessionFold::new(ticker.clone(), session, open, close) else {
+    let Some(mut fold) = SessionFold::new(ticker.clone(), session, cadence, open, close) else {
         return Err(ClientError::Parse(format!(
             "{session} spans no time between {open} and {close}"
         )));
@@ -441,8 +446,14 @@ mod tests {
     /// Two quotes over two buckets: a ten-basis-point book standing from 13:30 to 13:36, then a
     /// two-basis-point book standing to the 13:40 close.
     fn folded() -> Vec<QuoteSummary> {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0))
-            .expect("a positive session");
+        let mut fold = SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(30, 0),
+            at(40, 0),
+        )
+        .expect("a positive session");
         fold.push(tick(30, 99.95, 100.05, 100, 200));
         fold.push(tick(36, 99.99, 100.01, 300, 400));
         fold.finish()
@@ -487,6 +498,69 @@ mod tests {
         );
     }
 
+    /// The same ticks on the sixty-second grid, which is what the one-minute pass will fold.
+    fn folded_at_one_minute() -> Vec<QuoteSummary> {
+        let mut fold = SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::OneMinute,
+            at(30, 0),
+            at(40, 0),
+        )
+        .expect("a positive session");
+        fold.push(tick(30, 99.95, 100.05, 100, 200));
+        fold.push(tick(36, 99.99, 100.01, 300, 400));
+        fold.finish()
+    }
+
+    /// The cadence reaches the grid and the stored interval, rather than decorating the fold.
+    ///
+    /// Pinned to the literal 11 — ten one-minute buckets and the session — because a cadence that
+    /// were silently ignored would still produce a coherent frame, just the wrong one.
+    #[test]
+    fn test_a_one_minute_fold_buckets_by_the_minute_and_says_so() {
+        let summaries = folded_at_one_minute();
+        assert_eq!(
+            summaries.len(),
+            11,
+            "ten minutes of buckets and the session"
+        );
+
+        let buckets = &summaries[..summaries.len() - 1];
+        assert!(
+            buckets
+                .iter()
+                .all(|bucket| bucket.bar_interval() == BarInterval::OneMinute),
+            "every intraday row carries the cadence it was folded at"
+        );
+        assert!(
+            buckets
+                .iter()
+                .all(|bucket| bucket.covered_seconds() == 60.0),
+            "a sixty-second grid over a gapless session covers sixty seconds a bucket"
+        );
+    }
+
+    /// The premise of the cross-cadence check: two grids over the same ticks describe one session.
+    ///
+    /// Asserted against 600.0 and 6.8 rather than against the five-minute fold alone, so a bug that
+    /// moved both cadences the same way still fails.
+    #[test]
+    fn test_the_two_intraday_cadences_agree_on_the_session_they_describe() {
+        let one_minute = folded_at_one_minute().pop().expect("a session summary");
+        let five_minute = folded().pop().expect("a session summary");
+
+        assert_eq!(one_minute.bar_interval(), BarInterval::OneDay);
+        assert_eq!(one_minute.covered_seconds(), 600.0);
+        assert_eq!(one_minute.covered_seconds(), five_minute.covered_seconds());
+        assert_eq!(one_minute.quote_count(), five_minute.quote_count());
+        assert_close(one_minute.quoted_spread_basis_points_mean().value(), 6.8);
+        assert_close(
+            one_minute.quoted_spread_basis_points_mean().value(),
+            five_minute.quoted_spread_basis_points_mean().value(),
+        );
+    }
+
     /// Weighting by count instead would read 6.0 here. It reads 6.0 on AAPL's open too, against a
     /// time-weighted 3.44 — the count is a message rate, not a market.
     #[test]
@@ -526,8 +600,14 @@ mod tests {
     /// however long the final book stood — four minutes of the ten here.
     #[test]
     fn test_the_last_quote_prevails_to_the_close() {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0))
-            .expect("a positive session");
+        let mut fold = SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(30, 0),
+            at(40, 0),
+        )
+        .expect("a positive session");
         fold.push(tick(30, 99.95, 100.05, 100, 200));
         let session_summary = fold.finish().pop().expect("a session summary");
         assert_eq!(session_summary.covered_seconds(), 600.0);
@@ -538,8 +618,14 @@ mod tests {
     /// time from the bucket it landed in.
     #[test]
     fn test_a_tick_older_than_the_one_before_it_is_dropped() {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0))
-            .expect("a positive session");
+        let mut fold = SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(30, 0),
+            at(40, 0),
+        )
+        .expect("a positive session");
         fold.push(tick(30, 99.95, 100.05, 100, 200));
         fold.push(tick(36, 99.99, 100.01, 300, 400));
         fold.push(tick(33, 99.00, 101.00, 100, 100));
@@ -558,8 +644,14 @@ mod tests {
     /// zero spread into a cost model rather than an absence.
     #[test]
     fn test_a_bucket_no_quote_stood_across_produces_no_row() {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(45, 0))
-            .expect("a positive session");
+        let mut fold = SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(30, 0),
+            at(45, 0),
+        )
+        .expect("a positive session");
         fold.push(tick(40, 99.95, 100.05, 100, 200));
         let summaries = fold.finish();
 
@@ -573,8 +665,14 @@ mod tests {
     /// session is weighed — otherwise a pre-open book would stretch the denominator.
     #[test]
     fn test_weight_outside_the_session_bounds_is_not_counted() {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0))
-            .expect("a positive session");
+        let mut fold = SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(30, 0),
+            at(40, 0),
+        )
+        .expect("a positive session");
         fold.push(QuoteTick::new(at(20, 0), 99.95, 100.05, 100, 200).expect("a usable book"));
         let session_summary = fold.finish().pop().expect("a session summary");
         assert_eq!(session_summary.covered_seconds(), 600.0);
@@ -594,6 +692,7 @@ mod tests {
         let mut fold = SessionFold::new(
             ticker(),
             session(),
+            IntradayCadence::FiveMinute,
             opens,
             opens + Duration::milliseconds(1),
         )
@@ -623,8 +722,22 @@ mod tests {
 
     #[test]
     fn test_a_session_with_no_span_is_refused() {
-        assert!(SessionFold::new(ticker(), session(), at(40, 0), at(40, 0)).is_none());
-        assert!(SessionFold::new(ticker(), session(), at(40, 0), at(30, 0)).is_none());
+        assert!(SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(40, 0),
+            at(40, 0)
+        )
+        .is_none());
+        assert!(SessionFold::new(
+            ticker(),
+            session(),
+            IntradayCadence::FiveMinute,
+            at(40, 0),
+            at(30, 0)
+        )
+        .is_none());
     }
 
     /// Pinned to the stamp the daily bar archive actually carries, which 2025-11-28 shows is 16:00
@@ -669,6 +782,7 @@ mod tests {
     fn test_each_contiguous_name_folds_separately() {
         let mut fold = MarketFold::new(
             session(),
+            IntradayCadence::FiveMinute,
             at(30, 0),
             at(40, 0),
             universe(&["AAPL", "CBOE", "BCPC"]),
@@ -694,7 +808,13 @@ mod tests {
     /// must cost nothing — neither a summary nor a fold held open for it.
     #[test]
     fn test_a_name_outside_the_universe_is_not_folded() {
-        let mut fold = MarketFold::new(session(), at(30, 0), at(40, 0), universe(&["AAPL"]));
+        let mut fold = MarketFold::new(
+            session(),
+            IntradayCadence::FiveMinute,
+            at(30, 0),
+            at(40, 0),
+            universe(&["AAPL"]),
+        );
         fold.push(named("AAPL"), quote(30, 99.95, 100.05));
         fold.push(named("CBOE"), quote(30, 199.80, 200.20));
         fold.push(named("ZZZ"), quote(30, 9.95, 10.05));
@@ -716,6 +836,7 @@ mod tests {
     fn test_a_name_that_quoted_only_outside_regular_hours_still_counts_as_seen() {
         let mut fold = MarketFold::new(
             session(),
+            IntradayCadence::FiveMinute,
             at(30, 0),
             at(40, 0),
             universe(&["AAPL", "CBOE", "ZZZ"]),
@@ -749,6 +870,7 @@ mod tests {
     fn test_a_split_name_resumes_its_own_fold_rather_than_opening_a_second() {
         let mut fold = MarketFold::new(
             session(),
+            IntradayCadence::FiveMinute,
             at(30, 0),
             at(40, 0),
             universe(&["AAPL", "CBOE", "BCPC"]),
@@ -799,6 +921,7 @@ mod tests {
 /// session itself.
 pub struct MarketFold {
     session: SessionDate,
+    cadence: IntradayCadence,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     /// The run in progress, kept out of the map so the common row costs no lookup.
@@ -816,12 +939,14 @@ impl MarketFold {
     /// Opens a fold over one session's regular hours.
     pub fn new(
         session: SessionDate,
+        cadence: IntradayCadence,
         open: DateTime<Utc>,
         close: DateTime<Utc>,
         universe: BTreeSet<Ticker>,
     ) -> Self {
         Self {
             session,
+            cadence,
             open,
             close,
             current: None,
@@ -862,7 +987,13 @@ impl MarketFold {
                 self.resumed.insert(ticker.clone());
                 Some(fold)
             }
-            None => SessionFold::new(ticker.clone(), self.session, self.open, self.close),
+            None => SessionFold::new(
+                ticker.clone(),
+                self.session,
+                self.cadence,
+                self.open,
+                self.close,
+            ),
         };
         self.current = fold.map(|fold| (ticker, fold));
     }

@@ -14,7 +14,9 @@ use fund::common::database::connect_pool;
 use fund::common::flatfiles;
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
-use fund::common::types::{BarInterval, LiquidityFloor, QuoteSummary, SessionDate, Ticker};
+use fund::common::types::{
+    BarInterval, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
+};
 use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
 use fund::data::calendar::TradingCalendar;
 use fund::data::{bars, details, quotes};
@@ -1200,7 +1202,7 @@ async fn fold_named_from_flat_file(
     };
 
     let started = tokio::time::Instant::now();
-    let fold = quotes::MarketFold::new(date, open, close, named);
+    let fold = quotes::MarketFold::new(date, QUOTE_CADENCE, open, close, named);
     let (file, fold) = client
         .fold_quotes(date.date(), fold)
         .await
@@ -1276,6 +1278,13 @@ async fn quote_sources(
     Ok((market_data, TradingCalendar::from_days(days)))
 }
 
+/// The cadence every quote action folds at.
+///
+/// One-minute is plumbed the whole way through [`IntradayCadence`] but deliberately unreachable from
+/// the command line: a one-minute pass re-derives the session row, and the check that compares it
+/// against the stored one rather than overwriting it does not exist yet.
+const QUOTE_CADENCE: IntradayCadence = IntradayCadence::FiveMinute;
+
 /// Which provider a fold reads from.
 ///
 /// A backfill takes whole sessions off Massive's flat files, because five years one name at a time
@@ -1296,10 +1305,16 @@ async fn fold_quotes(
 ) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
-    Ok(
-        archive::archive_quote_sessions(&s3_client, source, calendar, &bucket, sampled, scope)
-            .await?,
+    Ok(archive::archive_quote_sessions(
+        &s3_client,
+        source,
+        calendar,
+        &bucket,
+        sampled,
+        scope,
+        QUOTE_CADENCE,
     )
+    .await?)
 }
 
 /// Every `stride`-th published session in the window, anchored at the oldest.
@@ -1343,7 +1358,9 @@ async fn measure(
             continue;
         };
         for ticker in symbols {
-            match quotes::fold_session(market_data, ticker, *session, open, close).await {
+            match quotes::fold_session(market_data, ticker, *session, QUOTE_CADENCE, open, close)
+                .await
+            {
                 Ok((summaries, fetch)) => {
                     print_session_row(ticker, *session, &summaries, fetch.received)
                 }

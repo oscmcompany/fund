@@ -719,6 +719,52 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for BarInterval {
     }
 }
 
+/// The grid a session is folded onto, which is the two [`BarInterval`] values that name a bucket.
+///
+/// Distinct from [`BarInterval`] so a fold cannot be opened at [`BarInterval::OneDay`], whose bucket
+/// is the session itself: the daily row is the merge of the intraday ones, never a grid of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntradayCadence {
+    OneMinute,
+    FiveMinute,
+}
+
+impl IntradayCadence {
+    /// Every variant, for exhaustive iteration in tests and validation.
+    pub const ALL: [IntradayCadence; 2] = [IntradayCadence::OneMinute, IntradayCadence::FiveMinute];
+
+    /// Seconds in one bucket.
+    pub fn seconds(self) -> i64 {
+        match self {
+            IntradayCadence::OneMinute => 60,
+            IntradayCadence::FiveMinute => 300,
+        }
+    }
+
+    /// The interval the rows folded at this cadence are stored under.
+    pub fn bar_interval(self) -> BarInterval {
+        match self {
+            IntradayCadence::OneMinute => BarInterval::OneMinute,
+            IntradayCadence::FiveMinute => BarInterval::FiveMinute,
+        }
+    }
+
+    /// The cadence an interval names, or `None` for [`BarInterval::OneDay`].
+    pub fn from_bar_interval(interval: BarInterval) -> Option<Self> {
+        match interval {
+            BarInterval::OneMinute => Some(IntradayCadence::OneMinute),
+            BarInterval::FiveMinute => Some(IntradayCadence::FiveMinute),
+            BarInterval::OneDay => None,
+        }
+    }
+}
+
+impl std::fmt::Display for IntradayCadence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.bar_interval().as_str())
+    }
+}
+
 /// Why an open pair was closed.
 ///
 /// These four are the `close_reason` CHECK constraint in `schema.sql`, spelled as an enum so a
@@ -1935,6 +1981,23 @@ mod tests {
         assert!(BarInterval::parse("OneDay").is_none());
         assert!(BarInterval::parse("1day").is_none());
         assert!(BarInterval::parse("1_day").is_none());
+    }
+
+    /// Every cadence names a bucket, and every bucket-naming interval has a cadence.
+    ///
+    /// The `OneDay` arm is the point: a fold opened on the session would divide it into a grid of
+    /// one, and the daily row is the merge of the intraday rows rather than a bucket of its own.
+    #[test]
+    fn test_intraday_cadence_covers_the_bucket_naming_intervals_and_no_others() {
+        for cadence in IntradayCadence::ALL {
+            assert_eq!(
+                IntradayCadence::from_bar_interval(cadence.bar_interval()),
+                Some(cadence)
+            );
+        }
+        assert!(IntradayCadence::from_bar_interval(BarInterval::OneDay).is_none());
+        assert_eq!(IntradayCadence::OneMinute.seconds(), 60);
+        assert_eq!(IntradayCadence::FiveMinute.seconds(), 300);
     }
 
     #[test]
