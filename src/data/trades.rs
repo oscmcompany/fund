@@ -81,8 +81,10 @@ impl TradeAccumulator {
         self.exclusions.absorb(other.exclusions);
     }
 
-    /// Reduces the bar to a summary, or `None` when nothing eligible traded in it.
+    /// Reduces the bar to a summary, or `None` when the tape held nothing here at all.
     ///
+    /// A bar that admitted no eligible print but excluded one is still a row: that is the case the
+    /// exclusion columns exist for, and an auction-only bar would otherwise leave no trace anywhere.
     /// Sorts in place, so the sizes are left ordered for whoever absorbs them.
     fn summarize(
         &mut self,
@@ -90,7 +92,8 @@ impl TradeAccumulator {
         bar_interval: BarInterval,
         timestamp: DateTime<Utc>,
     ) -> Option<TradeSummary> {
-        if self.trade_count == 0 || self.volume <= 0.0 {
+        let excluded_something = self.exclusions != TradeExclusions::default();
+        if self.trade_count == 0 && !excluded_something {
             return None;
         }
         self.sizes.sort_unstable_by(f64::total_cmp);
@@ -102,8 +105,9 @@ impl TradeAccumulator {
             self.trade_count,
             self.volume,
             self.dollar_volume,
-            quantile(&self.sizes, 0.5)?,
-            quantile(&self.sizes, UPPER_QUANTILE)?,
+            // Zero on an exclusion-only bar, where no eligible print has a size to report.
+            quantile(&self.sizes, 0.5).unwrap_or(0.0),
+            quantile(&self.sizes, UPPER_QUANTILE).unwrap_or(0.0),
             self.signed_volume,
             self.exclusions,
         );
@@ -143,6 +147,8 @@ pub struct SessionFold {
     previous_price: Option<f64>,
     /// The direction an unchanged price inherits, per the tick rule's zero-tick convention.
     previous_direction: f64,
+    /// The last stamp accepted, which is what an inverted print is judged against.
+    previous_timestamp: Option<DateTime<Utc>>,
     out_of_order: usize,
 }
 
@@ -168,6 +174,7 @@ impl SessionFold {
             buckets: (0..buckets).map(|_| TradeAccumulator::default()).collect(),
             previous_price: None,
             previous_direction: 1.0,
+            previous_timestamp: None,
             out_of_order: 0,
         })
     }
@@ -175,8 +182,20 @@ impl SessionFold {
     /// Accepts the next print, applying the eligibility policy before it can weigh anything.
     ///
     /// Exclusions are recorded against the bucket the print fell in, so a bar says what it dropped
-    /// even when it admits nothing — a session whose only prints were the auction is visible.
+    /// even when it admits nothing — a bar whose only prints were the auction is still a row.
     pub fn push(&mut self, tick: TradeTick) {
+        // A print older than the one before it is dropped rather than signed. The file is only
+        // *mostly* ascending — `require_ascending` tolerates a minority of SIP reorderings — and an
+        // inverted print would still set `previous_price`, making the tick rule read a sequence the
+        // tape never printed. Only the sign is affected, which is why it needs counting to be seen.
+        if let Some(previous) = self.previous_timestamp {
+            if tick.timestamp() < previous {
+                self.out_of_order += 1;
+                return;
+            }
+        }
+        self.previous_timestamp = Some(tick.timestamp());
+
         let Some(index) = self.bucket_index(tick.timestamp()) else {
             return;
         };
@@ -340,14 +359,21 @@ pub struct MarketFold {
 }
 
 impl MarketFold {
-    /// Opens a fold over one session's regular hours.
+    /// Opens a fold over one session's regular hours, or `None` if that span is not positive.
+    ///
+    /// Refused here rather than left to the per-name folds. Each of those would return `None`
+    /// separately, `push` would count every print as folded, and `finish` would return no rows and
+    /// no warning — a session that reports its whole cost and produces nothing, silently.
     pub fn new(
         session: SessionDate,
         open: DateTime<Utc>,
         close: DateTime<Utc>,
         universe: BTreeSet<Ticker>,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if (close - open).num_milliseconds() <= 0 {
+            return None;
+        }
+        Some(Self {
             session,
             open,
             close,
@@ -356,7 +382,7 @@ impl MarketFold {
             resumed: BTreeSet::new(),
             universe,
             folded: 0,
-        }
+        })
     }
 
     /// Prints folded, which is this pass's cost.
@@ -416,6 +442,7 @@ impl MarketFold {
         let summaries = parked.into_values().flat_map(SessionFold::finish).collect();
         SessionFolded {
             summaries,
+            folded: self.folded,
             resumed: self.resumed,
             seen,
         }
@@ -425,6 +452,8 @@ impl MarketFold {
 /// What one session's trade file yielded.
 pub struct SessionFolded {
     pub summaries: Vec<TradeSummary>,
+    /// Prints belonging to the universe, which is what the pass reports as its cost.
+    pub folded: usize,
     pub resumed: BTreeSet<Ticker>,
     pub seen: usize,
 }
@@ -474,12 +503,14 @@ pub fn summaries_to_dataframe(summaries: &[TradeSummary]) -> Result<DataFrame, P
             "dollar_volume",
             summaries.iter().map(TradeSummary::dollar_volume).collect(),
         ),
-        column(
-            "volume_weighted_average_price",
+        // Null rather than zero on an exclusion-only bar: no eligible share traded, so there is no
+        // price it traded at, and a zero would average into a reader's own aggregate as if real.
+        Column::new(
+            "volume_weighted_average_price".into(),
             summaries
                 .iter()
                 .map(TradeSummary::volume_weighted_average_price)
-                .collect(),
+                .collect::<Vec<Option<f64>>>(),
         ),
         column(
             "median_trade_size",
@@ -643,7 +674,7 @@ mod tests {
         let summaries = fold_of(vec![trade(30, 100.0, 100.0), trade(31, 200.0, 300.0)]);
         let daily = rows(&summaries, BarInterval::OneDay);
         // 100*100 + 200*300 = 70,000 over 400 shares. A size-blind mean would read 150.
-        assert_eq!(daily[0].volume_weighted_average_price(), 175.0);
+        assert_eq!(daily[0].volume_weighted_average_price(), Some(175.0));
     }
 
     /// The auction prints are counted and excluded, and the bar says so.
@@ -751,6 +782,29 @@ mod tests {
     /// The frame is pinned to its declared column set and order.
     #[test]
     fn test_the_frame_column_set_and_order_is_fixed() {
+        // Written out rather than read off `TRADE_FRAME_COLUMNS`, which is half of what this
+        // protects: an edit that moved the constant and the builder together would otherwise change
+        // the archive's wire schema against a green test.
+        let expected: [(&str, DataType); 17] = [
+            ("ticker", DataType::String),
+            ("bar_interval", DataType::String),
+            ("timestamp", DataType::Int64),
+            ("trade_count", DataType::Int64),
+            ("volume", DataType::Float64),
+            ("dollar_volume", DataType::Float64),
+            ("volume_weighted_average_price", DataType::Float64),
+            ("median_trade_size", DataType::Float64),
+            ("ninetieth_percentile_trade_size", DataType::Float64),
+            ("signed_volume", DataType::Float64),
+            ("volume_ineligible_trades", DataType::Int64),
+            ("volume_ineligible_dollar_volume", DataType::Float64),
+            ("corrected_trades", DataType::Int64),
+            ("corrected_dollar_volume", DataType::Float64),
+            ("non_market_price_trades", DataType::Int64),
+            ("non_market_price_dollar_volume", DataType::Float64),
+            ("unresolved_condition_trades", DataType::Int64),
+        ];
+
         let summaries = fold_of(vec![trade(30, 100.0, 100.0)]);
         let frame = summaries_to_dataframe(&summaries).expect("a frame");
         let observed: Vec<(String, DataType)> = frame
@@ -758,11 +812,168 @@ mod tests {
             .iter()
             .map(|column| (column.name().to_string(), column.dtype().clone()))
             .collect();
-        let expected: Vec<(String, DataType)> = TRADE_FRAME_COLUMNS
+
+        let literal: Vec<(String, DataType)> = expected
             .iter()
             .map(|(name, dtype)| (name.to_string(), dtype.clone()))
             .collect();
-        assert_eq!(observed, expected);
+        assert_eq!(observed, literal, "the builder matches the literal schema");
+        // And the declared constant matches it too, so the two cannot drift apart in step.
+        let declared: Vec<(String, DataType)> = TRADE_FRAME_COLUMNS
+            .iter()
+            .map(|(name, dtype)| (name.to_string(), dtype.clone()))
+            .collect();
+        assert_eq!(declared, literal, "the constant matches the literal schema");
+    }
+
+    /// An exclusion-only bar is a row, because that is the case the columns exist for.
+    ///
+    /// A name whose whole session was the closing auction would otherwise vanish from the archive
+    /// entirely, taking with it the only record that 14% of a session's dollar volume was dropped.
+    #[test]
+    fn test_a_bar_with_only_excluded_prints_is_still_a_row() {
+        let summaries = fold_of(vec![marked(30, 100.0, 1_000.0, vec![16], false)]);
+        let daily = rows(&summaries, BarInterval::OneDay);
+        assert_eq!(daily.len(), 1, "the session is recorded, not dropped");
+        assert_eq!(daily[0].trade_count(), 0);
+        assert_eq!(daily[0].volume(), 0.0);
+        assert_eq!(
+            daily[0].volume_weighted_average_price(),
+            None,
+            "no eligible share traded, so there is no price it traded at"
+        );
+        assert_eq!(daily[0].exclusions().volume_ineligible_trades, 1);
+        assert_eq!(
+            daily[0].exclusions().volume_ineligible_dollar_volume,
+            100_000.0
+        );
+        assert_eq!(rows(&summaries, BarInterval::OneMinute).len(), 1);
+    }
+
+    /// A print older than the one before it is dropped rather than signed against a later price.
+    ///
+    /// The flat file is only mostly ascending — `require_ascending` tolerates a minority of SIP
+    /// reorderings — so an inversion reaches this fold and must not corrupt the tick rule.
+    #[test]
+    fn test_a_print_older_than_the_one_before_it_is_dropped() {
+        let summaries = fold_of(vec![
+            trade(30, 100.0, 100.0),
+            trade(32, 105.0, 100.0),
+            // Older than its predecessor: dropped, and must not become the reference price.
+            trade(31, 90.0, 100.0),
+            trade(33, 106.0, 100.0),
+        ]);
+        let daily = rows(&summaries, BarInterval::OneDay);
+        assert_eq!(
+            daily[0].trade_count(),
+            3,
+            "the inverted print is not folded"
+        );
+        assert_eq!(daily[0].volume(), 300.0);
+        // 106 is an uptick against 105, not against the dropped 90. All three are buys.
+        assert_eq!(daily[0].signed_volume(), 300.0);
+    }
+
+    /// The short trailing bar an early close leaves is emitted rather than dropped.
+    ///
+    /// Seven minutes, so the last five-minute bar holds only two: the branch every other test in
+    /// this module misses, because a ten-minute window divides evenly.
+    #[test]
+    fn test_a_window_that_does_not_divide_evenly_keeps_its_short_last_bar() {
+        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(37, 0))
+            .expect("a positive session");
+        fold.push(trade(30, 100.0, 100.0));
+        fold.push(trade(36, 100.0, 200.0));
+        let summaries = fold.finish();
+
+        let fives = rows(&summaries, BarInterval::FiveMinute);
+        assert_eq!(fives.len(), 2, "13:30-13:35 and the short 13:35-13:37");
+        assert_eq!(fives[0].volume(), 100.0);
+        assert_eq!(fives[1].volume(), 200.0, "the tail is not lost");
+        assert_eq!(rows(&summaries, BarInterval::OneDay)[0].volume(), 300.0);
+    }
+
+    /// The daily row is stamped at 16:00 Eastern, crossing the timezone boundary properly.
+    ///
+    /// Pinned to 20:00 UTC because 2026-08-20 is daylight saving; the winter stamp is 21:00, and a
+    /// fold that used a fixed offset would put the row an hour from the bar it must join.
+    #[test]
+    fn test_the_session_row_is_stamped_where_the_daily_bar_is() {
+        let summaries = fold_of(vec![trade(30, 100.0, 100.0)]);
+        let daily = rows(&summaries, BarInterval::OneDay);
+        assert_eq!(
+            daily[0].timestamp().to_rfc3339(),
+            "2026-08-20T20:00:00+00:00"
+        );
+
+        let winter =
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 1, 15).expect("a real date"));
+        assert_eq!(
+            daily_stamp(winter).to_rfc3339(),
+            "2026-01-15T21:00:00+00:00",
+            "outside daylight saving the same 16:00 Eastern is an hour later in UTC"
+        );
+    }
+
+    /// A name whose rows arrive in two runs resumes its own fold rather than opening a second.
+    ///
+    /// The case the whole `MarketFold` shape exists for: two names a session arrive split, and
+    /// folding the runs apart would report the name twice with half its tape each.
+    #[test]
+    fn test_a_split_name_resumes_its_own_fold() {
+        let universe: BTreeSet<Ticker> = ["AAPL", "CBOE"]
+            .iter()
+            .map(|name| Ticker::new(name).expect("a valid ticker"))
+            .collect();
+        let mut fold =
+            MarketFold::new(session(), at(30, 0), at(40, 0), universe).expect("a positive session");
+        let named = |name: &str| Ticker::new(name).expect("a valid ticker");
+
+        fold.push(named("AAPL"), trade(30, 100.0, 100.0));
+        fold.push(named("CBOE"), trade(31, 200.0, 50.0));
+        // AAPL comes back after CBOE's run, which is the split this holds folds open for.
+        fold.push(named("AAPL"), trade(32, 101.0, 300.0));
+        // Outside the universe, so never folded at all.
+        fold.push(named("AAPL"), trade(33, 101.0, 1.0));
+
+        let folded = fold.finish();
+        assert!(folded.resumed.contains(&named("AAPL")), "AAPL was resumed");
+        assert_eq!(folded.seen, 2, "two names carried rows");
+
+        let apple: Vec<&TradeSummary> = folded
+            .summaries
+            .iter()
+            .filter(|row| {
+                row.ticker().as_str() == "AAPL" && row.bar_interval() == BarInterval::OneDay
+            })
+            .collect();
+        assert_eq!(apple.len(), 1, "one daily row, not one per run");
+        assert_eq!(apple[0].volume(), 401.0, "both runs in a single fold");
+    }
+
+    /// A name outside the universe is not folded, however many rows the file carries for it.
+    #[test]
+    fn test_a_name_outside_the_universe_is_not_folded() {
+        let universe: BTreeSet<Ticker> = std::iter::once(ticker()).collect();
+        let mut fold =
+            MarketFold::new(session(), at(30, 0), at(40, 0), universe).expect("a positive session");
+        fold.push(
+            Ticker::new("CBOE").expect("a valid ticker"),
+            trade(30, 200.0, 50.0),
+        );
+        let folded = fold.finish();
+        assert_eq!(folded.folded, 0, "nothing in the universe was pushed");
+        assert!(folded.summaries.is_empty());
+    }
+
+    /// A market fold refuses a span its per-name folds would each refuse separately.
+    ///
+    /// Without this it would report every print as folded and return no rows, with nothing logged.
+    #[test]
+    fn test_a_market_fold_refuses_a_session_with_no_span() {
+        let universe: BTreeSet<Ticker> = std::iter::once(ticker()).collect();
+        assert!(MarketFold::new(session(), at(40, 0), at(40, 0), universe.clone()).is_none());
+        assert!(MarketFold::new(session(), at(40, 0), at(30, 0), universe).is_none());
     }
 
     /// A session with no span is refused rather than folded into zero buckets.

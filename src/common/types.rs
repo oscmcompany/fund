@@ -1308,14 +1308,26 @@ pub struct TradeExclusions {
 
 impl TradeExclusions {
     /// Takes everything `other` recorded, so a coarser bar is the merge of its finer ones.
+    ///
+    /// Destructured rather than field-by-field: a field added later stops compiling here instead of
+    /// being silently omitted, which would make a daily row understate what its minutes reported.
     pub(crate) fn absorb(&mut self, other: Self) {
-        self.volume_ineligible_trades += other.volume_ineligible_trades;
-        self.volume_ineligible_dollar_volume += other.volume_ineligible_dollar_volume;
-        self.corrected_trades += other.corrected_trades;
-        self.corrected_dollar_volume += other.corrected_dollar_volume;
-        self.non_market_price_trades += other.non_market_price_trades;
-        self.non_market_price_dollar_volume += other.non_market_price_dollar_volume;
-        self.unresolved_condition_trades += other.unresolved_condition_trades;
+        let Self {
+            volume_ineligible_trades,
+            volume_ineligible_dollar_volume,
+            corrected_trades,
+            corrected_dollar_volume,
+            non_market_price_trades,
+            non_market_price_dollar_volume,
+            unresolved_condition_trades,
+        } = other;
+        self.volume_ineligible_trades += volume_ineligible_trades;
+        self.volume_ineligible_dollar_volume += volume_ineligible_dollar_volume;
+        self.corrected_trades += corrected_trades;
+        self.corrected_dollar_volume += corrected_dollar_volume;
+        self.non_market_price_trades += non_market_price_trades;
+        self.non_market_price_dollar_volume += non_market_price_dollar_volume;
+        self.unresolved_condition_trades += unresolved_condition_trades;
     }
 }
 
@@ -1334,7 +1346,8 @@ pub struct TradeSummary {
     /// Shares, fractional: 16.5% of a session's prints are not whole shares.
     volume: f64,
     dollar_volume: f64,
-    volume_weighted_average_price: f64,
+    /// `None` when no eligible share traded, which an exclusion-only bar is.
+    volume_weighted_average_price: Option<f64>,
     median_trade_size: f64,
     ninetieth_percentile_trade_size: f64,
     /// Buys minus sells in shares, signed by the tick rule — a trade above the previous price is a
@@ -1362,9 +1375,21 @@ impl TradeSummary {
         signed_volume: f64,
         exclusions: TradeExclusions,
     ) -> Result<Self, InconsistentRecordError> {
+        // A bar that admitted nothing is still a row when it *excluded* something: an auction-only
+        // bar is exactly where the exclusion matters, and dropping it would lose the only record
+        // that the tape had anything in it at all. Zeroes are permitted on that condition alone, so
+        // a fold that produced nothing for no reason is still refused.
+        let excluded_something = exclusions != TradeExclusions::default();
         for (name, value) in [("volume", volume), ("dollar volume", dollar_volume)] {
-            if !value.is_finite() || value <= 0.0 {
-                return Err(reject(format!("{name} {value} is not a positive number")));
+            if !value.is_finite() || value < 0.0 {
+                return Err(reject(format!(
+                    "{name} {value} is not a non-negative number"
+                )));
+            }
+            if value == 0.0 && !excluded_something {
+                return Err(reject(format!(
+                    "{name} is zero on a bar that excluded nothing, so it describes no trades"
+                )));
             }
         }
         for (name, value) in [
@@ -1385,10 +1410,13 @@ impl TradeSummary {
                 "median trade size {median_trade_size} exceeds the ninetieth percentile {ninetieth_percentile_trade_size}"
             )));
         }
-        if trade_count <= 0 {
-            return Err(reject(format!(
-                "trade count {trade_count} is not a positive number"
-            )));
+        if trade_count < 0 {
+            return Err(reject(format!("trade count {trade_count} is negative")));
+        }
+        if trade_count == 0 && !excluded_something {
+            return Err(reject(
+                "a bar with no trades and no exclusions describes nothing".to_string(),
+            ));
         }
         // Signed volume is buys minus sells drawn from the same shares, so it cannot exceed them.
         // A violation means the tick rule and the volume accumulator saw different trades.
@@ -1405,7 +1433,9 @@ impl TradeSummary {
             volume,
             dollar_volume,
             // Divided here rather than passed in, so the identity cannot be violated by a caller.
-            volume_weighted_average_price: dollar_volume / volume,
+            // `None` on an exclusion-only bar: no eligible share traded, so there is no price it
+            // traded at, and a zero would read as one.
+            volume_weighted_average_price: (volume > 0.0).then(|| dollar_volume / volume),
             median_trade_size,
             ninetieth_percentile_trade_size,
             signed_volume,
@@ -1437,7 +1467,7 @@ impl TradeSummary {
         self.dollar_volume
     }
 
-    pub fn volume_weighted_average_price(&self) -> f64 {
+    pub fn volume_weighted_average_price(&self) -> Option<f64> {
         self.volume_weighted_average_price
     }
 

@@ -88,10 +88,10 @@ pub enum FlatFileError {
         column: &'static str,
         header: String,
     },
-    /// More quotes stepped backwards in time than stepped forwards, which is what a file sorted the
-    /// wrong way looks like. See [`QuoteFileFold::require_ascending`].
+    /// More rows stepped backwards in time than stepped forwards, which is what a file sorted the
+    /// wrong way looks like. See [`FlatFileFold::require_ascending`].
     #[error(
-        "{key} is not in ascending time within a ticker: {backwards} quotes stepped back against \
+        "{key} is not in ascending time within a ticker: {backwards} rows stepped back against \
          {forwards} forwards, so the fold would weigh almost every one at zero"
     )]
     Descending {
@@ -238,14 +238,14 @@ pub fn trade_key(date: NaiveDate) -> String {
 /// which is ordinary around the open rather than a defect. Reported because it is the only trace a
 /// discarded row leaves, and a file that is suddenly half unusable is a vendor change.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct QuoteFileFold {
+pub struct FlatFileFold {
     /// Names whose rows are not contiguous, which is what a fold releasing at the switch must know.
     pub split_tickers: SplitTickers,
     pub rows_read: usize,
     pub ticks_folded: usize,
     pub unusable: usize,
     pub tickers: usize,
-    /// Rows whose ticker differs from the row before, which is what [`QuoteFileFold::layout`] reads.
+    /// Rows whose ticker differs from the row before, which is what [`FlatFileFold::layout`] reads.
     pub ticker_runs: usize,
     /// The object's own size, which cannot be obtained before paying — an unauthenticated `HEAD`
     /// returns 403 — and is what turns a download estimate from arithmetic into a measurement.
@@ -305,7 +305,7 @@ impl std::fmt::Display for RowLayout {
     }
 }
 
-impl QuoteFileFold {
+impl FlatFileFold {
     /// Which way the file is grouped, or `None` when it folded nothing to judge.
     ///
     /// Ticker-major puts each name in one contiguous run, so runs equal names; time-major
@@ -325,9 +325,9 @@ impl QuoteFileFold {
         }
     }
 
-    /// Refuses a file whose quotes descend in time within a ticker.
+    /// Refuses a file whose rows descend in time within a ticker.
     ///
-    /// The fold weighs each quote by the interval to the next, so a descending run weighs every one
+    /// The quote fold weighs each tick by the interval to the next, so a descending run weighs every one
     /// at zero and still produces a summary — a silent wrong answer rather than a failure. Massive
     /// does not document the row order and it cannot be inspected before paying, so it is asserted.
     ///
@@ -403,7 +403,7 @@ impl FlatFileClient {
         &self,
         date: NaiveDate,
         fold: S,
-    ) -> Result<(QuoteFileFold, S), FlatFileError> {
+    ) -> Result<(FlatFileFold, S), FlatFileError> {
         let key = quote_key(date);
         info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of quotes");
 
@@ -442,7 +442,7 @@ impl FlatFileClient {
         &self,
         date: NaiveDate,
         fold: S,
-    ) -> Result<(QuoteFileFold, S), FlatFileError> {
+    ) -> Result<(FlatFileFold, S), FlatFileError> {
         let key = trade_key(date);
         info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of trades");
 
@@ -672,6 +672,24 @@ impl std::io::Read for ChunkReader {
     }
 }
 
+/// Where `column` sits in `header`, or the error naming what the file called its columns instead.
+///
+/// Shared by both resolvers so a renamed column fails identically whichever dataset met it first.
+fn column_index(
+    header: &csv::StringRecord,
+    key: &str,
+    column: &'static str,
+) -> Result<usize, FlatFileError> {
+    header
+        .iter()
+        .position(|found| found.trim() == column)
+        .ok_or_else(|| FlatFileError::Column {
+            key: key.to_string(),
+            column,
+            header: header.iter().collect::<Vec<_>>().join(","),
+        })
+}
+
 /// Where each field the fold needs sits in this particular file.
 ///
 /// Resolved from the header rather than fixed, so a column inserted or reordered upstream costs
@@ -687,16 +705,7 @@ struct QuoteColumns {
 
 impl QuoteColumns {
     fn resolve(header: &csv::StringRecord, key: &str) -> Result<Self, FlatFileError> {
-        let index = |column: &'static str| {
-            header
-                .iter()
-                .position(|found| found.trim() == column)
-                .ok_or_else(|| FlatFileError::Column {
-                    key: key.to_string(),
-                    column,
-                    header: header.iter().collect::<Vec<_>>().join(","),
-                })
-        };
+        let index = |column: &'static str| column_index(header, key, column);
         Ok(Self {
             ticker: index(TICKER_COLUMN)?,
             timestamp: index(TIMESTAMP_COLUMN)?,
@@ -738,16 +747,7 @@ struct TradeColumns {
 
 impl TradeColumns {
     fn resolve(header: &csv::StringRecord, key: &str) -> Result<Self, FlatFileError> {
-        let index = |column: &'static str| {
-            header
-                .iter()
-                .position(|found| found.trim() == column)
-                .ok_or_else(|| FlatFileError::Column {
-                    key: key.to_string(),
-                    column,
-                    header: header.iter().collect::<Vec<_>>().join(","),
-                })
-        };
+        let index = |column: &'static str| column_index(header, key, column);
         Ok(Self {
             ticker: index(TICKER_COLUMN)?,
             // `sip_timestamp`, never `participant_timestamp`: the quote file is stamped in SIP time
@@ -770,7 +770,13 @@ impl TradeColumns {
             field(self.price)?.parse::<f64>().ok()?,
             field(self.size)?.parse::<f64>().ok()?,
             parse_conditions(field(self.conditions)?),
-            field(self.correction)?.parse::<u32>().ok()? != 0,
+            // A blank cell is "no correction", not an unreadable row. The provider has never
+            // emitted one in the data measured, and a row rejected for it would disappear into the
+            // `unusable` count with nothing naming the cause.
+            match field(self.correction)? {
+                "" => false,
+                marker => marker.parse::<u32>().ok()? != 0,
+            },
         )?;
         Some((ticker, tick))
     }
@@ -813,7 +819,7 @@ struct TickerRuns {
 
 impl TickerRuns {
     /// Records that `ticker` appeared stamped `timestamp`, updating `summary` in place.
-    fn observe(&mut self, ticker: &Ticker, timestamp: DateTime<Utc>, summary: &mut QuoteFileFold) {
+    fn observe(&mut self, ticker: &Ticker, timestamp: DateTime<Utc>, summary: &mut FlatFileFold) {
         // An owned key is needed only the first time a name appears, and a day is hundreds of
         // millions of rows.
         let seen_before = match self.latest.get_mut(ticker) {
@@ -848,7 +854,7 @@ fn fold_gzipped_quotes<R, S>(
     reader: R,
     key: &str,
     mut fold: S,
-) -> Result<(QuoteFileFold, S), FlatFileError>
+) -> Result<(FlatFileFold, S), FlatFileError>
 where
     R: std::io::Read,
     S: QuoteSink,
@@ -857,7 +863,7 @@ where
     let header = records.headers().map_err(|error| read_error(key, error))?;
     let columns = QuoteColumns::resolve(header, key)?;
 
-    let mut summary = QuoteFileFold::default();
+    let mut summary = FlatFileFold::default();
     let mut runs = TickerRuns::default();
     let mut row = csv::StringRecord::new();
     while records
@@ -896,7 +902,7 @@ fn fold_gzipped_trades<R, S>(
     reader: R,
     key: &str,
     mut fold: S,
-) -> Result<(QuoteFileFold, S), FlatFileError>
+) -> Result<(FlatFileFold, S), FlatFileError>
 where
     R: std::io::Read,
     S: TradeSink,
@@ -905,7 +911,7 @@ where
     let header = records.headers().map_err(|error| read_error(key, error))?;
     let columns = TradeColumns::resolve(header, key)?;
 
-    let mut summary = QuoteFileFold::default();
+    let mut summary = FlatFileFold::default();
     let mut runs = TickerRuns::default();
     let mut row = csv::StringRecord::new();
     while records
@@ -985,7 +991,7 @@ mod tests {
     }
 
     /// Folds a body and returns what the fold saw alongside the summary.
-    fn fold(body: &str) -> (Result<QuoteFileFold, FlatFileError>, Vec<(String, i64)>) {
+    fn fold(body: &str) -> (Result<FlatFileFold, FlatFileError>, Vec<(String, i64)>) {
         let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let collector = std::rc::Rc::clone(&seen);
         let summary = fold_gzipped_quotes(
@@ -1039,7 +1045,7 @@ mod tests {
     fn fold_trades_body(
         body: &str,
     ) -> (
-        Result<QuoteFileFold, FlatFileError>,
+        Result<FlatFileFold, FlatFileError>,
         Vec<(String, TradeTick)>,
     ) {
         let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
