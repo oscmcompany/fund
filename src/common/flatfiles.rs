@@ -1959,6 +1959,185 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// A tee against a scripted archive, recording every request it makes.
+    ///
+    /// `head_lengths` is answered in order, one per `HEAD`: `store` heads twice, once to decide
+    /// whether the object is already there and once to read back what it wrote, and the two answers
+    /// are what distinguish skipping an upload from botching one. `None` is a 404.
+    fn tee_against(
+        head_lengths: Vec<Option<i64>>,
+        complete_status: u16,
+        staging_directory: PathBuf,
+    ) -> (RawTee, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&requested);
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(head_lengths.into_iter()));
+        let http_client = infallible_client_fn(move |request| {
+            let method = request.method().clone();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let label = match (&method, query.as_str()) {
+                (&http::Method::HEAD, _) => "HEAD",
+                (&http::Method::POST, q) if q.contains("uploads") => "CREATE",
+                (&http::Method::PUT, _) => "PART",
+                (&http::Method::POST, _) => "COMPLETE",
+                (&http::Method::DELETE, _) => "ABORT",
+                _ => "OTHER",
+            };
+            recorder
+                .lock()
+                .expect("no test thread panics holding this")
+                .push(label.to_string());
+
+            match label {
+                "HEAD" => match heads
+                    .lock()
+                    .expect("no test thread panics holding this")
+                    .next()
+                    .flatten()
+                {
+                    Some(length) => http::Response::builder()
+                        .status(200)
+                        .header("content-length", length.to_string())
+                        .body(SdkBody::empty())
+                        .expect("a valid response"),
+                    None => http::Response::builder()
+                        .status(404)
+                        .body(SdkBody::empty())
+                        .expect("a valid response"),
+                },
+                "CREATE" => http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<InitiateMultipartUploadResult><UploadId>an-upload</UploadId></InitiateMultipartUploadResult>"#,
+                    ))
+                    .expect("a valid response"),
+                "PART" => http::Response::builder()
+                    .status(200)
+                    .header("etag", "\"a-part\"")
+                    .body(SdkBody::empty())
+                    .expect("a valid response"),
+                "COMPLETE" => http::Response::builder()
+                    .status(complete_status)
+                    .body(SdkBody::from(
+                        r#"<CompleteMultipartUploadResult><ETag>"whole"</ETag></CompleteMultipartUploadResult>"#,
+                    ))
+                    .expect("a valid response"),
+                _ => http::Response::builder()
+                    .status(204)
+                    .body(SdkBody::empty())
+                    .expect("a valid response"),
+            }
+        });
+        let tee = RawTee::new(
+            S3Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+                    .http_client(http_client)
+                    .build(),
+            ),
+            "oscm-fund-archive".to_string(),
+            staging_directory,
+        );
+        (tee, requested)
+    }
+
+    /// A staged file of `bytes` length, in its own directory so tests cannot see each other's.
+    fn staged_object(name: &str, bytes: usize) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("fund-tee-{name}"));
+        std::fs::create_dir_all(&directory).expect("a staging directory");
+        let path = directory.join("data.csv.gz");
+        std::fs::write(&path, vec![7u8; bytes]).expect("a staged object");
+        (directory, path)
+    }
+
+    /// Length is the whole verification, so a staged file that is not the size the vendor reported
+    /// must never reach the bucket. Uploading it would put an object under a key that promises the
+    /// vendor's bytes and holds a truncated download, which no later reader could detect.
+    #[tokio::test]
+    async fn test_a_staged_object_of_the_wrong_length_is_never_uploaded() {
+        let (directory, path) = staged_object("wrong-length", 4096);
+        let (tee, requested) = tee_against(vec![], 200, directory.clone());
+
+        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 8192).await;
+
+        assert!(
+            matches!(outcome, Err(FlatFileError::TeeLength { staged, expected, .. })
+                if staged == 4096 && expected == 8192),
+            "{outcome:?}"
+        );
+        assert!(
+            requested
+                .lock()
+                .expect("no test thread panics holding this")
+                .is_empty(),
+            "nothing may be sent for an object that failed its length check"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The backfill re-runs sessions routinely, and a 9 GB upload per re-run is the difference
+    /// between a resumable pass and one nobody dares repeat.
+    #[tokio::test]
+    async fn test_an_object_already_archived_at_the_right_length_is_not_uploaded_again() {
+        let (directory, path) = staged_object("already-there", 4096);
+        let (tee, requested) = tee_against(vec![Some(4096)], 200, directory.clone());
+
+        tee.store("data/raw/whatever.csv.gz", &path, 4096)
+            .await
+            .expect("an object already present is not an error");
+
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this");
+        assert_eq!(*sent, vec!["HEAD".to_string()], "{sent:?}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The completion response is not the proof — an upload can report success and land short, which
+    /// is the one failure that would otherwise reach the archive silently and stay there.
+    #[tokio::test]
+    async fn test_an_upload_that_lands_short_is_refused_on_read_back() {
+        let (directory, path) = staged_object("short-read-back", 4096);
+        // Absent to begin with, then present at the wrong length once the upload claims success.
+        let (tee, requested) = tee_against(vec![None, Some(17)], 200, directory.clone());
+
+        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 4096).await;
+
+        assert!(
+            matches!(outcome, Err(FlatFileError::TeeLength { staged, expected, .. })
+                if staged == 17 && expected == 4096),
+            "{outcome:?}"
+        );
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this");
+        assert!(sent.contains(&"COMPLETE".to_string()), "{sent:?}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A completion that fails leaves every part open and billing exactly as a failed part upload
+    /// would. This was a real hole: the abort used to hang off the `send_parts` error arm only, so
+    /// the completion path reached the same outcome by a door with no abort behind it.
+    #[tokio::test]
+    async fn test_a_failed_completion_still_aborts_the_upload() {
+        let (directory, path) = staged_object("failed-completion", 4096);
+        let (tee, requested) = tee_against(vec![None], 500, directory.clone());
+
+        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 4096).await;
+
+        assert!(outcome.is_err(), "a failed completion must fail the store");
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this");
+        assert!(
+            sent.contains(&"ABORT".to_string()),
+            "the parts were left open and billing: {sent:?}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     /// A staged object that could not be uploaded must survive the failure. Deleting it would throw
     /// away the local copy of the expensive half and make the retry a fresh download of the whole
     /// vendor object — the exact cost this tee exists to stop paying, spent on its own error path.
