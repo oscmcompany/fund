@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Runs `seed` on a bare backfill box, where there is no devenv shell to inherit an environment from.
+#
+# devenv's runtimeEnv normally supplies FUND_PROFILE, the two bucket names and the log directory, but
+# a provisioned EC2 box has none of it and `seed` reads its configuration from the environment alone.
+# This assembles the same environment from Secrets Manager and execs `seed` with its arguments.
+#
+#   run-backfill equity-trades archive --start 2021-08-26 --end 2026-08-28 --tee-raw
+#
+# The instance role this runs under is `backfill-box-role-policy.json` beside this file:
+#   aws iam put-role-policy --role-name fund-quote-backfill \
+#     --policy-name archive-and-secrets \
+#     --policy-document file://tools/backfill-box-role-policy.json
+set -euo pipefail
+
+REGION="${AWS_REGION:-us-east-1}"
+PROFILE="${FUND_PROFILE:-}"
+
+# The shape `create-bucket` accepts, and for its reason: the records bucket is derived from this
+# string, so an argument like `archive` would resolve records to the shared archive bucket.
+if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
+  echo "Error: FUND_PROFILE must be production or development/<name>; got \"$PROFILE\"." >&2
+  echo "  It names both the secretspec profile and this instance's records bucket." >&2
+  exit 1
+fi
+
+# Assigned rather than defaulted. This role can reach both buckets, so honouring a caller's
+# AWS_S3_RECORDS_BUCKET_NAME would let one instance's records be written into the shared archive.
+SLUG="${PROFILE//[\/.]/-}"
+export AWS_S3_RECORDS_BUCKET_NAME="oscm-fund-${SLUG}"
+# devenv.nix holds the same literal as `archiveBucket` and is the source of truth; nix values are
+# not readable from bash, which is why it appears twice.
+export AWS_S3_ARCHIVE_BUCKET_NAME="oscm-fund-archive"
+
+# Read individually rather than through secretspec, which is not installed on a provisioned box. The
+# two lists mirror secretspec.toml, so this reproduces its contract instead of a stricter one.
+REQUIRED_KEYS="MASSIVE_BASE_URL MASSIVE_API_KEY ALPACA_API_KEY_ID ALPACA_API_SECRET"
+OPTIONAL_KEYS="MASSIVE_S3_ENDPOINT MASSIVE_S3_ACCESS_KEY_ID MASSIVE_S3_SECRET_ACCESS_KEY ALPACA_IS_PAPER"
+
+STDERR_FILE="$(mktemp)"
+trap 'rm -f "$STDERR_FILE"' EXIT
+
+read_secret() {
+  local key="$1" requirement="$2" value
+  # stderr to a file rather than 2>&1, which would fold a warning on a successful call into the value.
+  if value="$(aws secretsmanager get-secret-value --region "$REGION" \
+    --secret-id "secretspec/fund/$PROFILE/$key" --query SecretString --output text 2>"$STDERR_FILE")"; then
+    export "$key"="$value"
+    return 0
+  fi
+  # Absence alone is tolerated: a denial or a network failure must not read as an unset optional key,
+  # which is how a missing grant would become a silent misconfiguration rather than a startup error.
+  if [[ "$requirement" == optional ]] && grep -q ResourceNotFoundException "$STDERR_FILE"; then
+    return 0
+  fi
+  echo "Error: could not read secretspec/fund/$PROFILE/$key" >&2
+  cat "$STDERR_FILE" >&2
+  exit 1
+}
+
+for key in $REQUIRED_KEYS; do read_secret "$key" required; done
+for key in $OPTIONAL_KEYS; do read_secret "$key" optional; done
+
+export FUND_PROFILE="$PROFILE"
+export AWS_REGION="$REGION"
+# No database on a backfill box, so the `query!` macros must resolve against the checked-in cache.
+export SQLX_OFFLINE=true
+export RUST_LOG="${RUST_LOG:-info}"
+
+# An SSM session leaves HOME unset, and `set -u` turns that into a crash rather than a message.
+ROOT="${FUND_ROOT:-${HOME:+$HOME/fund}}"
+if [[ -z "$ROOT" ]]; then
+  echo "Error: set FUND_ROOT to the checkout; HOME is unset, so it cannot be derived." >&2
+  exit 1
+fi
+
+cd "$ROOT"
+rm -f "$STDERR_FILE"
+exec ./target/release/seed "$@"

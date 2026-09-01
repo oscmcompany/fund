@@ -9,6 +9,23 @@ if [[ -z "$PROFILE" ]]; then
   exit 1
 fi
 
+# This script makes one records bucket per profile and nothing else. The name is derived from the
+# argument, so a non-profile still produces a plausible bucket: `archive` would reach
+# `oscm-fund-archive` and enable versioning on a corpus that repairs partitions in place, and bare
+# `development` -- secretspec's credential-less fallback, which `provision-common-vm` refuses as a
+# deployment target -- would make a bucket no VM is provisioned against. Versioning cannot be
+# turned back off once enabled, only suspended, so the shape is validated instead.
+if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
+  echo "Error: \"$PROFILE\" is not a profile." >&2
+  echo "" >&2
+  echo "  Profiles are: production or development/<name>." >&2
+  echo "" >&2
+  echo "  This creates the per-instance records bucket that holds exports/, models/ and" >&2
+  echo "  database/. The shared archive holding data/** is not a profile and is not made" >&2
+  echo "  here -- it is a single hand-configured fixture, deliberately without versioning." >&2
+  exit 1
+fi
+
 SLUG="${PROFILE//[\/.]/-}"
 BUCKET="oscm-fund-${SLUG}"
 

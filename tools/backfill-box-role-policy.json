@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ArchiveObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListBucket",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": [
+        "arn:aws:s3:::oscm-fund-development-john-forstmeier",
+        "arn:aws:s3:::oscm-fund-development-john-forstmeier/*",
+        "arn:aws:s3:::oscm-fund-archive",
+        "arn:aws:s3:::oscm-fund-archive/*"
+      ]
+    },
+    {
+      "Sid": "ReadOwnSecretspecKeys",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:982604770479:secret:secretspec/fund/development/john.forstmeier/*"
+    }
+  ]
+}
