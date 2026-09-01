@@ -19,9 +19,14 @@
 -- exported as well, from the same Massive endpoint by a second path, and two
 -- writers of one fact is one too many.
 --
+-- The two prefixes live in two buckets, which is why there are two variables
+-- below. data/ is shared and the same for every instance; exports/ is this
+-- instance's own record and differs per profile.
+--
 -- Requirements:
 --   - AWS credentials configured in the environment (e.g. ~/.aws/credentials)
---   - AWS_S3_BUCKET_NAME set (start-duckdb passes the bucket argument)
+--   - AWS_S3_ARCHIVE_BUCKET_NAME set (start-duckdb passes the bucket argument)
+--   - AWS_S3_BUCKET_NAME set (start-duckdb takes it from the profile)
 
 INSTALL aws;
 LOAD aws;
@@ -29,7 +34,10 @@ INSTALL httpfs;
 LOAD httpfs;
 CALL load_aws_credentials();
 
-SET VARIABLE bucket = getenv('AWS_S3_BUCKET_NAME');
+-- Named for what they hold rather than which is default, so a view reading the wrong prefix from
+-- the wrong bucket is visible at the read_parquet call instead of in an empty result.
+SET VARIABLE archive_bucket = getenv('AWS_S3_ARCHIVE_BUCKET_NAME');
+SET VARIABLE records_bucket = getenv('AWS_S3_BUCKET_NAME');
 
 .bail off
 
@@ -46,7 +54,7 @@ DROP VIEW IF EXISTS training_bars;
 CREATE OR REPLACE VIEW training_bars AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/data/equity/bars/interval=one_day/**/*.parquet',
+    's3://' || getvariable('archive_bucket') || '/data/equity/bars/interval=one_day/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -55,7 +63,7 @@ DROP VIEW IF EXISTS training_details;
 CREATE OR REPLACE VIEW training_details AS
 SELECT *
 FROM read_csv(
-    's3://' || getvariable('bucket') || '/data/equity/details/details.csv',
+    's3://' || getvariable('archive_bucket') || '/data/equity/details/details.csv',
     auto_detect = true
 );
 
@@ -83,7 +91,7 @@ SELECT
     split_to,
     to_timestamp(first_seen / 1000.0) AS first_seen
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/data/equity/corporate_actions/splits.parquet'
+    's3://' || getvariable('archive_bucket') || '/data/equity/corporate_actions/splits.parquet'
 );
 
 -- The dates a symbol's series may not be read across. `related_ticker` is where a rename continues
@@ -100,7 +108,7 @@ SELECT
     related_ticker,
     to_timestamp(first_seen / 1000.0) AS first_seen
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/data/equity/corporate_actions/boundaries.parquet'
+    's3://' || getvariable('archive_bucket') || '/data/equity/corporate_actions/boundaries.parquet'
 );
 
 -- ---------------------------------------------------------------------------
@@ -116,7 +124,7 @@ DROP VIEW IF EXISTS equity_predictions;
 CREATE OR REPLACE VIEW equity_predictions AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/predictions/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/equity/predictions/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -125,7 +133,7 @@ DROP VIEW IF EXISTS equity_pairs;
 CREATE OR REPLACE VIEW equity_pairs AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/pairs/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/equity/pairs/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -134,7 +142,7 @@ DROP VIEW IF EXISTS account_snapshots;
 CREATE OR REPLACE VIEW account_snapshots AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/account/snapshots/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/account/snapshots/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -143,7 +151,7 @@ DROP VIEW IF EXISTS account_activities;
 CREATE OR REPLACE VIEW account_activities AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/account/activities/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/account/activities/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -155,7 +163,7 @@ DROP VIEW IF EXISTS events;
 CREATE OR REPLACE VIEW events AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/events/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/events/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -220,7 +228,7 @@ SELECT
     month,
     day
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/journal/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/journal/**/*.parquet',
     hive_partitioning = true
 );
 

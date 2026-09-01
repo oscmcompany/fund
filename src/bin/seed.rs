@@ -82,6 +82,12 @@ enum Command {
         #[command(subcommand)]
         action: QuoteAction,
     },
+    /// The printed tape from Massive's flat files, into the S3 archive. Every session is written at
+    /// all three cadences, so there is no interval to choose.
+    EquityTrades {
+        #[command(subcommand)]
+        action: TradeAction,
+    },
 }
 
 impl Command {
@@ -97,6 +103,7 @@ impl Command {
             },
             Command::EquityDetails { .. } => "seed-equity-details",
             Command::EquityQuotes { .. } => "seed-equity-quotes",
+            Command::EquityTrades { .. } => "seed-equity-trades",
         }
     }
 }
@@ -223,6 +230,36 @@ impl QuoteAction {
             }
         };
         Some(whole_market(sessions))
+    }
+}
+
+/// What a trade pass does with the sessions it is given.
+///
+/// Two actions where quotes have five: there is no per-name repair, because a trade file *is* the
+/// session and a name missing from it is missing from the tape rather than from a retryable fetch.
+#[derive(Debug, Subcommand)]
+enum TradeAction {
+    /// Fold every name the daily archive holds into the sampled sessions that have no partition yet.
+    Archive(QuoteArguments),
+    /// Fold every name the daily archive holds into every sampled session, widening ones already
+    /// summarized.
+    Widen(QuoteArguments),
+}
+
+impl TradeAction {
+    /// The scope this action folds under. Both fold the whole market and differ only in sessions.
+    fn universe_scope(&self) -> Result<Scope, SeedError> {
+        whole_market(match self {
+            TradeAction::Archive(_) => SessionSelection::Absent,
+            TradeAction::Widen(_) => SessionSelection::Every,
+        })
+    }
+
+    /// The window and stride this action runs over.
+    fn arguments(&self) -> &QuoteArguments {
+        match self {
+            TradeAction::Archive(arguments) | TradeAction::Widen(arguments) => arguments,
+        }
     }
 }
 
@@ -639,6 +676,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
             Ok(Outcome::Complete)
         }
         Command::EquityQuotes { action } => seed_quotes(action).await,
+        Command::EquityTrades { action } => seed_trades(action).await,
     }
 }
 
@@ -1089,6 +1127,41 @@ async fn fold_sampled(
     ))
 }
 
+/// Folds the sampled sessions' printed tape into the archive under the scope the action names.
+///
+/// The calendar comes from Alpaca and the tape from Massive, which is the same split the quote
+/// pass uses: only the exchange publishes its own hours, and only the flat files hold every print.
+async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
+    let arguments = action.arguments();
+    let scope = action.universe_scope()?;
+    let window = arguments.window.window()?;
+
+    let credentials = AlpacaCredentials::from_env().map_err(box_error)?;
+    let days = TradingClient::from_env(credentials)
+        .fetch_calendar(window.start.date(), window.end.date())
+        .await
+        .map_err(box_error)?;
+    let calendar = TradingCalendar::from_days(days);
+    let sampled = sample(&calendar, &window, arguments.stride);
+    report_sample(&window, arguments.stride, &calendar, &sampled);
+
+    let flat_files = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    Ok(Outcome::Pass(
+        archive::archive_trade_sessions(
+            &s3_client,
+            &flat_files,
+            &calendar,
+            &bucket,
+            &sampled,
+            &scope,
+        )
+        .await
+        .map_err(box_error)?,
+    ))
+}
+
 /// Folds named symbols across the sampled sessions and prints what they read, writing nothing.
 async fn measure_sampled(symbols: &QuoteSymbolArguments) -> Result<Outcome, SeedError> {
     let named = symbols.symbols.required_names()?;
@@ -1420,8 +1493,8 @@ fn print_session_row(
 
 /// The bucket every S3 subcommand writes into.
 fn bucket_name() -> Result<String, Box<dyn std::error::Error>> {
-    std::env::var("AWS_S3_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)".into())
+    std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
+        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)".into())
 }
 
 /// Boxes a concrete error, which `?` cannot reach [`SeedError`] through in one conversion.
@@ -1954,6 +2027,33 @@ mod tests {
             Command::EquityQuotes { action } => assert!(action.universe_scope().is_none()),
             other => panic!("expected a quote action, got {other:?}"),
         }
+    }
+
+    /// The trade pass folds the whole market, asserted before it runs for four days.
+    ///
+    /// The quote backfill folded the *screened* universe for fifteen hours and 254 sessions before a
+    /// count caught it, because nothing pinned the scope the pass would actually use. This is that
+    /// assertion for trades, and it is worth more here: the trade pass is the last Advanced-only
+    /// item, so a wrong universe cannot be re-read after the subscription lapses.
+    #[test]
+    fn test_both_universe_trade_actions_fold_the_whole_market() {
+        let window = ["--start", "2021-08-26", "--end", "2026-08-25"];
+        let rendered = |verb: &str| {
+            let arguments = parse(&[["equity-trades", verb].as_slice(), &window].concat())
+                .expect("a trade window");
+            match arguments.command {
+                Command::EquityTrades { action } => action
+                    .universe_scope()
+                    .expect("the whole market may write a partition")
+                    .to_string(),
+                other => panic!("expected a trade action, got {other:?}"),
+            }
+        };
+
+        // Literals, not `whole_market(..).to_string()`: an expectation built from the call under
+        // test moves with it and can never fail.
+        assert_eq!(rendered("archive"), "every name, absent sessions only");
+        assert_eq!(rendered("widen"), "every name, every session");
     }
 
     /// A scan that could not read a session found its names only in the ones it could, so both the

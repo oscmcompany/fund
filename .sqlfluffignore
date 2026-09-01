@@ -2,4 +2,5 @@
 target/
 .venv/
 models/tide/.devenv/
+.scratchpad/
 tools/duckdb_initialization.sql
