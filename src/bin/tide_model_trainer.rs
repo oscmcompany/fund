@@ -76,8 +76,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // below belongs to the one instance that trained it.
     let archive_bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
         .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
-    let bucket = std::env::var("AWS_S3_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (this instance's records)")?;
+    let records_bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME").map_err(|_| {
+        "AWS_S3_RECORDS_BUCKET_NAME must be set (this instance's own, not the shared archive)"
+    })?;
     let artifact_prefix =
         std::env::var("AWS_S3_MODEL_ARTIFACT_PATH").unwrap_or_else(|_| "models/tide/".to_string());
     let lookback_days = read_positive_env("FUND_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)?;
@@ -106,7 +107,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!(
-        bucket,
+        records_bucket,
         artifact_prefix,
         lookback_days,
         %session,
@@ -353,7 +354,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let model_key = format!("{artifact_prefix}{timestamp}/output/model.tar.gz");
     upload_artifact(
         &s3_client,
-        &bucket,
+        &records_bucket,
         &model_key,
         package_dir_to_tar_gz(staging.path())?,
         "application/gzip",
@@ -365,7 +366,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let prior_continuous_ranked_probability_scores =
         fetch_prior_continuous_ranked_probability_scores(
             &s3_client,
-            &bucket,
+            &records_bucket,
             &artifact_prefix,
             &current_folder,
             DRIFT_PRIOR_RUN_COUNT,
@@ -431,7 +432,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for attempt in 1..=METADATA_UPLOAD_ATTEMPTS {
         match upload_artifact(
             &s3_client,
-            &bucket,
+            &records_bucket,
             &metadata_key,
             metadata_body.clone(),
             "application/json",
@@ -459,7 +460,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("failed to publish run metadata for {current_folder}").into());
     }
 
-    println!("Training complete: artifact s3://{bucket}/{model_key}");
+    println!("Training complete: artifact s3://{records_bucket}/{model_key}");
     println!(
         "Metrics: CRPS={:.6} directional_accuracy={:.4} quantile_coverage={:.4}",
         metrics.continuous_ranked_probability_score,

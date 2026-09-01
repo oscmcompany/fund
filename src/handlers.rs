@@ -92,7 +92,7 @@ pub struct ServiceState {
     /// Massive, for daily bars. See [`crate::common::massive`] for why the two are split.
     massive: MassiveClient,
     s3_client: aws_sdk_s3::Client,
-    bucket: String,
+    records_bucket: String,
     artifact_prefix: String,
     model_version: String,
     calendar_cache: CalendarCache,
@@ -125,8 +125,8 @@ impl ServiceState {
         let massive = MassiveClient::from_env()
             .map_err(|error| HandlerError::Configuration(error.to_string()))?;
 
-        let bucket = std::env::var("AWS_S3_BUCKET_NAME").map_err(|_| {
-            HandlerError::Configuration("AWS_S3_BUCKET_NAME is not set".to_string())
+        let records_bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME").map_err(|_| {
+            HandlerError::Configuration("AWS_S3_RECORDS_BUCKET_NAME is not set".to_string())
         })?;
         let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
             .unwrap_or_else(|_| "models/tide/".to_string());
@@ -140,7 +140,7 @@ impl ServiceState {
             market_data: MarketDataClient::new(credentials, DataFeed::Sip),
             massive,
             s3_client: crate::common::aws::s3_client().await,
-            bucket,
+            records_bucket,
             artifact_prefix,
             model_version,
             calendar_cache: CalendarCache::new(),
@@ -380,14 +380,14 @@ async fn handle_predictions(
     // liquidation consults no spread model.
     let splits = state
         .split_table_cache
-        .get(&state.s3_client, &state.bucket, now)
+        .get(&state.s3_client, &state.records_bucket, now)
         .await?;
     let unadjustable = SplitTable::default();
     // Absent boundaries do not block the way absent splits do: the guard they provide is worth far
     // less than the trading refusing to run without it would cost.
     let boundaries = state
         .boundary_table_cache
-        .get(&state.s3_client, &state.bucket, now)
+        .get(&state.s3_client, &state.records_bucket, now)
         .await?;
     let unbounded = BoundaryTable::default();
     let close_history = state
@@ -412,15 +412,19 @@ async fn handle_predictions(
 
     let artifact_key = artifact::resolve_artifact_key(
         &state.s3_client,
-        &state.bucket,
+        &state.records_bucket,
         &state.artifact_prefix,
         &state.model_version,
         None,
     )
     .await?;
-    let model_state =
-        artifact::download_and_load_model(&state.s3_client, &state.bucket, &artifact_key, None)
-            .await?;
+    let model_state = artifact::download_and_load_model(
+        &state.s3_client,
+        &state.records_bucket,
+        &artifact_key,
+        None,
+    )
+    .await?;
 
     let artifact_staleness_sessions =
         artifact_staleness_sessions(model_state.run_id(), &calendar, today);
@@ -491,13 +495,13 @@ async fn run_inference(
     // model would read a two-for-one as a genuine fifty percent fall.
     let splits = state
         .split_table_cache
-        .get(&state.s3_client, &state.bucket, now)
+        .get(&state.s3_client, &state.records_bucket, now)
         .await
         .map_err(|error| at("load_splits")(error.to_string()))?
         .ok_or_else(|| at("load_splits")("no splits table in the archive".to_string()))?;
     let boundaries = state
         .boundary_table_cache
-        .get(&state.s3_client, &state.bucket, now)
+        .get(&state.s3_client, &state.records_bucket, now)
         .await
         .map_err(|error| at("load_boundaries")(error.to_string()))?;
     let unbounded = BoundaryTable::default();
@@ -569,14 +573,14 @@ async fn handle_portfolio_evaluation(
     // liquidation consults no spread model.
     let splits = state
         .split_table_cache
-        .get(&state.s3_client, &state.bucket, now)
+        .get(&state.s3_client, &state.records_bucket, now)
         .await?;
     let unadjustable = SplitTable::default();
     // Absent boundaries do not block the way absent splits do: the guard they provide is worth far
     // less than the trading refusing to run without it would cost.
     let boundaries = state
         .boundary_table_cache
-        .get(&state.s3_client, &state.bucket, now)
+        .get(&state.s3_client, &state.records_bucket, now)
         .await?;
     let unbounded = BoundaryTable::default();
     let close_history = state
@@ -774,8 +778,13 @@ async fn handle_database_export(
 ) -> Result<Value, HandlerError> {
     let today = SessionDate::at(Utc::now());
 
-    let sessions =
-        export::export_journals(&state.journal, &state.s3_client, &state.bucket, today).await;
+    let sessions = export::export_journals(
+        &state.journal,
+        &state.s3_client,
+        &state.records_bucket,
+        today,
+    )
+    .await;
     // After the export, so the seal has released. This record lands in the session the export ran
     // in and ships on the next run, which is what lets the journal describe its own export.
     state
@@ -815,7 +824,7 @@ async fn handle_database_export(
     let logs = export::export_logs(
         &crate::common::log::log_directory(),
         &state.s3_client,
-        &state.bucket,
+        &state.records_bucket,
         today,
     )
     .await;
@@ -835,7 +844,8 @@ async fn handle_database_export(
         )
         .await;
 
-    let export = export::export_database(&state.pool, &state.s3_client, &state.bucket, today).await;
+    let export =
+        export::export_database(&state.pool, &state.s3_client, &state.records_bucket, today).await;
 
     // Skipped rather than attempted, because the purge deletes rows on the strength of S3 holding
     // them. `purge_skipped` on the record below is what separates this from a purge of zero rows.

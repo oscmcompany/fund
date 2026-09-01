@@ -16,7 +16,7 @@
   # per-profile bucket, so a stray key is a bug rather than a judgement call.
   archiveBucket = "oscm-fund-archive";
   runtimeEnv = ''
-    export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
+    export AWS_S3_RECORDS_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
     export AWS_S3_ARCHIVE_BUCKET_NAME="${archiveBucket}"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
     export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
@@ -287,7 +287,7 @@ in {
     pg_dump -Fc -h localhost -p 5432 fund > /tmp/fund-latest.dump
     gzip -f /tmp/fund-latest.dump
     echo "Uploading backup to S3..."
-    aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY"
+    aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_RECORDS_BUCKET_NAME/$BACKUP_KEY"
     rm -f /tmp/fund-latest.dump.gz
     echo "Database backup complete"
   '';
@@ -309,7 +309,7 @@ in {
     ${runtimeEnv}
     unset AWS_ENDPOINT_URL
     echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
-    echo "  Records: $AWS_S3_BUCKET_NAME"
+    echo "  Records: $AWS_S3_RECORDS_BUCKET_NAME"
     echo "  Archive: $AWS_S3_ARCHIVE_BUCKET_NAME (shared, holds data/**)"
     echo ""
     buckets=$(aws s3 ls)
@@ -718,7 +718,7 @@ in {
     fi
 
     export AWS_S3_ARCHIVE_BUCKET_NAME="$1"
-    echo "Opening DuckDB lab (archive: $AWS_S3_ARCHIVE_BUCKET_NAME, records: $AWS_S3_BUCKET_NAME)"
+    echo "Opening DuckDB lab (archive: $AWS_S3_ARCHIVE_BUCKET_NAME, records: $AWS_S3_RECORDS_BUCKET_NAME)"
 
     exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
   '';
@@ -1044,7 +1044,7 @@ in {
       export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
       export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
       echo "Rehearsing the tide training pipeline ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
-      echo "  Publishing to s3://$AWS_S3_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
+      echo "  Publishing to s3://$AWS_S3_RECORDS_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
       secretspec run -- cargo run --release --bin tide_model_trainer
     '';
 
@@ -1072,7 +1072,7 @@ in {
       export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
       echo "Rehearsing against PRODUCTION ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
       echo "  Reading and repairing s3://$AWS_S3_ARCHIVE_BUCKET_NAME/data/equity/bars/interval=one_day/"
-      echo "  Publishing to s3://$AWS_S3_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
+      echo "  Publishing to s3://$AWS_S3_RECORDS_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
       secretspec run -- cargo run --release --bin tide_model_trainer
     '';
 
@@ -1327,7 +1327,7 @@ in {
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""
-      echo "  Records: $AWS_S3_BUCKET_NAME"
+      echo "  Records: $AWS_S3_RECORDS_BUCKET_NAME"
       echo "  Archive: $AWS_S3_ARCHIVE_BUCKET_NAME (shared, holds data/**)"
       echo ""
       echo "  Profiles:"
