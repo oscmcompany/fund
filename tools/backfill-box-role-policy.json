@@ -23,7 +23,7 @@
       "Action": [
         "secretsmanager:GetSecretValue"
       ],
-      "Resource": "arn:aws:secretsmanager:us-east-1:982604770479:secret:secretspec/fund/*"
+      "Resource": "arn:aws:secretsmanager:us-east-1:982604770479:secret:secretspec/fund/development/john.forstmeier/*"
     }
   ]
 }
