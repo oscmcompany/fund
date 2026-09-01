@@ -26,7 +26,7 @@
 -- Requirements:
 --   - AWS credentials configured in the environment (e.g. ~/.aws/credentials)
 --   - AWS_S3_ARCHIVE_BUCKET_NAME set (start-duckdb passes the bucket argument)
---   - AWS_S3_BUCKET_NAME set (start-duckdb takes it from the profile)
+--   - AWS_S3_RECORDS_BUCKET_NAME set (start-duckdb takes it from the profile)
 
 INSTALL aws;
 LOAD aws;
@@ -37,7 +37,7 @@ CALL load_aws_credentials();
 -- Named for what they hold rather than which is default, so a view reading the wrong prefix from
 -- the wrong bucket is visible at the read_parquet call instead of in an empty result.
 SET VARIABLE archive_bucket = getenv('AWS_S3_ARCHIVE_BUCKET_NAME');
-SET VARIABLE records_bucket = getenv('AWS_S3_BUCKET_NAME');
+SET VARIABLE records_bucket = getenv('AWS_S3_RECORDS_BUCKET_NAME');
 
 .bail off
 

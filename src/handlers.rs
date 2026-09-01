@@ -125,8 +125,8 @@ impl ServiceState {
         let massive = MassiveClient::from_env()
             .map_err(|error| HandlerError::Configuration(error.to_string()))?;
 
-        let bucket = std::env::var("AWS_S3_BUCKET_NAME").map_err(|_| {
-            HandlerError::Configuration("AWS_S3_BUCKET_NAME is not set".to_string())
+        let bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME").map_err(|_| {
+            HandlerError::Configuration("AWS_S3_RECORDS_BUCKET_NAME is not set".to_string())
         })?;
         let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
             .unwrap_or_else(|_| "models/tide/".to_string());

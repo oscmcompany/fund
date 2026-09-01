@@ -76,8 +76,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // below belongs to the one instance that trained it.
     let archive_bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
         .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
-    let bucket = std::env::var("AWS_S3_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (this instance's records)")?;
+    let bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME")
+        .map_err(|_| "AWS_S3_RECORDS_BUCKET_NAME must be set (derived from FUND_PROFILE)")?;
     let artifact_prefix =
         std::env::var("AWS_S3_MODEL_ARTIFACT_PATH").unwrap_or_else(|_| "models/tide/".to_string());
     let lookback_days = read_positive_env("FUND_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)?;
