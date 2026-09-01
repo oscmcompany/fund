@@ -7,8 +7,17 @@
   # artifacts live in the same per-profile bucket under models/tide/: the Rust
   # tide trainer (tide_model_trainer) writes there and the inference service
   # reads there, so training and serving agree in both dev and production.
+  #
+  # Two buckets, split by whether the bytes are a provider-derived fact or a
+  # record of what one instance did. The archive holds data/** and is shared:
+  # production writes it, every instance reads it, and it is not per-profile
+  # because the corpus is expensive and irreproducible once a subscription
+  # lapses. Everything else -- exports, models, database backups -- stays in the
+  # per-profile bucket, so a stray key is a bug rather than a judgement call.
+  archiveBucket = "oscm-fund-archive";
   runtimeEnv = ''
     export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
+    export AWS_S3_ARCHIVE_BUCKET_NAME="${archiveBucket}"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
     export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
     if [[ ! -w "''${FUND_LOG_DIRECTORY:-/var/log/fund}" ]]; then
@@ -300,7 +309,8 @@ in {
     ${runtimeEnv}
     unset AWS_ENDPOINT_URL
     echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
-    echo "  Bucket: $AWS_S3_BUCKET_NAME"
+    echo "  Records: $AWS_S3_BUCKET_NAME"
+    echo "  Archive: $AWS_S3_ARCHIVE_BUCKET_NAME (shared, holds data/**)"
     echo ""
     buckets=$(aws s3 ls)
     printf '%s\n' "$buckets" | grep fund || echo "No fund buckets found"
@@ -696,16 +706,17 @@ in {
     set -euo pipefail
 
     if [ -z "''${1:-}" ]; then
-      echo "Usage: start-duckdb <bucket-name>" >&2
+      echo "Usage: start-duckdb <archive-bucket-name>" >&2
       echo "" >&2
-      echo "Examples:" >&2
-      echo "  start-duckdb oscm-fund-production" >&2
-      echo "  start-duckdb oscm-fund-development-john-forstmeier" >&2
+      echo "Every view reads data/**, so this names the shared archive." >&2
+      echo "" >&2
+      echo "Example:" >&2
+      echo "  start-duckdb ${archiveBucket}" >&2
       exit 1
     fi
 
-    export AWS_S3_BUCKET_NAME="$1"
-    echo "Opening DuckDB lab (bucket: $AWS_S3_BUCKET_NAME)"
+    export AWS_S3_ARCHIVE_BUCKET_NAME="$1"
+    echo "Opening DuckDB lab (archive: $AWS_S3_ARCHIVE_BUCKET_NAME)"
 
     exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
   '';
@@ -1058,7 +1069,7 @@ in {
       export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
       export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
       echo "Rehearsing against PRODUCTION ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
-      echo "  Reading and repairing s3://$AWS_S3_BUCKET_NAME/data/equity/bars/interval=one_day/"
+      echo "  Reading and repairing s3://$AWS_S3_ARCHIVE_BUCKET_NAME/data/equity/bars/interval=one_day/"
       echo "  Publishing to s3://$AWS_S3_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
       secretspec run -- cargo run --release --bin tide_model_trainer
     '';
@@ -1115,8 +1126,8 @@ in {
       exec = ''
         set -euo pipefail
 
-        if [ -z "''${AWS_S3_BUCKET_NAME:-}" ]; then
-          echo "AWS_S3_BUCKET_NAME is not set."
+        if [ -z "''${AWS_S3_ARCHIVE_BUCKET_NAME:-}" ]; then
+          echo "AWS_S3_ARCHIVE_BUCKET_NAME is not set."
           echo "  This half of the seed writes what the trainer trains from and needs AWS and"
           echo "  Massive credentials. If you only wanted the database, run"
           echo "  'devenv tasks run data:seed:postgres' instead."
@@ -1314,7 +1325,8 @@ in {
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""
-      echo "  Bucket: $AWS_S3_BUCKET_NAME"
+      echo "  Records: $AWS_S3_BUCKET_NAME"
+      echo "  Archive: $AWS_S3_ARCHIVE_BUCKET_NAME (shared, holds data/**)"
       echo ""
       echo "  Profiles:"
       echo "    devenv --profile application up      Start application processes"

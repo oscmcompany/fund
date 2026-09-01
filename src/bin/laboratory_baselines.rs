@@ -116,13 +116,13 @@ async fn main() {
 
 /// Reads the window, lays out the panel, and scores every baseline against it.
 ///
-/// Reads `AWS_S3_BUCKET_NAME` and writes to the laboratory journal. Nothing is fetched and nothing
+/// Reads `AWS_S3_ARCHIVE_BUCKET_NAME` and writes to the laboratory journal. Nothing is fetched and nothing
 /// is published: this measures what the archive already holds.
 async fn run(
     parameters: &Parameters,
 ) -> Result<Vec<laboratory::ForecastScored>, Box<dyn std::error::Error>> {
-    let bucket = std::env::var("AWS_S3_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
+    let bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
+        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
     let s3_client = fund::common::aws::s3_client().await;
 
     // One instant for the run, resolved once to its Eastern session, as the trainer does: the window

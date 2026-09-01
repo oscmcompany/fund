@@ -21,7 +21,7 @@
 --
 -- Requirements:
 --   - AWS credentials configured in the environment (e.g. ~/.aws/credentials)
---   - AWS_S3_BUCKET_NAME set (start-duckdb passes the bucket argument)
+--   - AWS_S3_ARCHIVE_BUCKET_NAME set (start-duckdb passes the bucket argument)
 
 INSTALL aws;
 LOAD aws;
@@ -29,7 +29,8 @@ INSTALL httpfs;
 LOAD httpfs;
 CALL load_aws_credentials();
 
-SET VARIABLE bucket = getenv('AWS_S3_BUCKET_NAME');
+-- The shared archive, not this instance's records: every view below reads data/**.
+SET VARIABLE bucket = getenv('AWS_S3_ARCHIVE_BUCKET_NAME');
 
 .bail off
 

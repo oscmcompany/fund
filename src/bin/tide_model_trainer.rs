@@ -72,8 +72,14 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Two buckets, because this binary does two things. It repairs and reads `data/**`, which every
+    // instance shares, and it publishes a model artifact, which belongs to the instance that trained
+    // it. One variable for both would either put one trainer's artifacts in the shared archive or
+    // give each instance its own copy of a corpus that is expensive and irreproducible.
+    let archive_bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
+        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
+        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (this instance's records)")?;
     let artifact_prefix =
         std::env::var("AWS_S3_MODEL_ARTIFACT_PATH").unwrap_or_else(|_| "models/tide/".to_string());
     let lookback_days = read_positive_env("FUND_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)?;
@@ -148,7 +154,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             match archive::archive_missing_sessions(
                 &s3_client,
                 &massive,
-                &bucket,
+                &archive_bucket,
                 window_start,
                 session,
                 calendar.as_ref(),
@@ -169,7 +175,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // Refreshed whole rather than topped up, and stepped over on failure like the bars
             // above. Stage two reads it, and refuses to train if it is absent entirely.
-            match archive::archive_splits(&s3_client, &massive, &bucket, now).await {
+            match archive::archive_splits(&s3_client, &massive, &archive_bucket, now).await {
                 Ok(splits) => info!(splits, "Splits table refreshed"),
                 Err(error) => warn!(%error, "Splits refresh failed; the archive keeps its copy"),
             }
@@ -181,7 +187,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // reaching S3 with it needs no Massive credential. Gating it on one meant a bad key left
     // DuckDB's `training_details` view resolving a stale copy for a reason that had nothing to do
     // with it.
-    if let Err(error) = archive::archive_details(&s3_client, &bucket, details::embedded_csv()).await
+    if let Err(error) =
+        archive::archive_details(&s3_client, &archive_bucket, details::embedded_csv()).await
     {
         warn!(%error, "Ticker metadata upload failed; the archive keeps the previous copy");
     }
@@ -200,7 +207,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             match archive::archive_boundaries(
                 &s3_client,
                 &market_data,
-                &bucket,
+                &archive_bucket,
                 window_start,
                 session,
                 now,
@@ -223,7 +230,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let prepared = dataset::build(
         &s3_client,
-        &bucket,
+        &archive_bucket,
         lookback_days,
         session,
         training_fraction,

@@ -1493,8 +1493,8 @@ fn print_session_row(
 
 /// The bucket every S3 subcommand writes into.
 fn bucket_name() -> Result<String, Box<dyn std::error::Error>> {
-    std::env::var("AWS_S3_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)".into())
+    std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
+        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)".into())
 }
 
 /// Boxes a concrete error, which `?` cannot reach [`SeedError`] through in one conversion.
