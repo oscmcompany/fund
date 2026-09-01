@@ -282,7 +282,20 @@ struct QuoteArguments {
     /// weekday forever; 21 does not.
     #[arg(long, default_value_t = DEFAULT_STRIDE, value_parser = stride)]
     stride: usize,
+    /// Keep the vendor's own bytes under `data/raw/`, as Deep Archive, as this pass reads them.
+    /// Every cadence the archive stores is a lossy read of them, so this is what makes a later
+    /// cadence a compute cost rather than another subscription month.
+    #[arg(long)]
+    tee_raw: bool,
+    /// Where a raw object waits between the download finishing and the upload starting. Needs room
+    /// for one object: the largest session measured is 9.0 GB of quotes.
+    #[arg(long, default_value = DEFAULT_STAGING_DIRECTORY)]
+    staging_directory: std::path::PathBuf,
 }
+
+/// Where `--tee-raw` stages by default. Deliberately not `/tmp`, which is a tmpfs on the backfill
+/// box and would put a 9 GB object in memory.
+const DEFAULT_STAGING_DIRECTORY: &str = "/var/tmp/fund-flat-files";
 
 #[derive(Debug, Args)]
 struct QuoteSymbolArguments {
@@ -1116,7 +1129,7 @@ async fn fold_sampled(
     let flat_files;
     let source = match provider {
         QuoteProvider::WholeSession => {
-            flat_files = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+            flat_files = flat_file_client(arguments).await?;
             archive::QuoteSource::WholeSession(&flat_files)
         }
         QuoteProvider::PerName => archive::QuoteSource::PerName(&market_data),
@@ -1125,6 +1138,26 @@ async fn fold_sampled(
     Ok(Outcome::Pass(
         fold_quotes(&source, &calendar, &sampled, &scope).await?,
     ))
+}
+
+/// The flat-file client, teeing the vendor's bytes into the archive when the pass keeps them.
+///
+/// The tee writes the shared archive rather than this instance's records: the raw objects are a
+/// provider-derived fact, and a second copy per developer is the thing the bucket split exists to
+/// prevent.
+async fn flat_file_client(
+    arguments: &QuoteArguments,
+) -> Result<flatfiles::FlatFileClient, SeedError> {
+    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    if !arguments.tee_raw {
+        return Ok(client);
+    }
+    let s3_client = fund::common::aws::s3_client().await;
+    Ok(client.teeing_raw_to(flatfiles::RawTee::new(
+        s3_client,
+        bucket_name()?,
+        arguments.staging_directory.clone(),
+    )))
 }
 
 /// Folds the sampled sessions' printed tape into the archive under the scope the action names.
@@ -1145,7 +1178,7 @@ async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
     let sampled = sample(&calendar, &window, arguments.stride);
     report_sample(&window, arguments.stride, &calendar, &sampled);
 
-    let flat_files = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    let flat_files = flat_file_client(arguments).await?;
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
     Ok(Outcome::Pass(

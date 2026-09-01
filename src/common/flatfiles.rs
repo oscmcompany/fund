@@ -3,9 +3,10 @@
 //! Separate endpoint and credentials from [`crate::common::massive`]; nothing holds the file.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use aws_sdk_s3::Client as S3Client;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use flate2::read::GzDecoder;
 use tracing::{info, warn};
 
@@ -37,6 +38,13 @@ const RANGE_ATTEMPTS: usize = 5;
 
 /// The first wait after a failed range, doubling per attempt.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What one part of the raw tee's multipart upload carries.
+///
+/// Chosen once the bytes are local, which is the whole reason the tee stages to disk: the 2 MiB
+/// ranges the download arrives in are below S3's 5 MiB part floor and never have to meet it. At this
+/// size the largest session measured, 9.0 GB of quotes, is 135 parts against a 10,000 limit.
+const TEE_PART_BYTES: usize = 64 * 1024 * 1024;
 
 /// Chunks allowed to sit finished in the channel ahead of the parser.
 ///
@@ -106,6 +114,19 @@ pub enum FlatFileError {
         range: String,
         expected: usize,
         received: usize,
+    },
+    /// The raw tee could not store the vendor's bytes.
+    #[error("could not archive the raw object for {key}: {source}")]
+    Tee {
+        key: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The bytes that landed are not the bytes the source reports, so the capture is not the object.
+    #[error("the raw object for {key} is {staged} bytes rather than {expected}")]
+    TeeLength {
+        key: String,
+        staged: u64,
+        expected: i64,
     },
 }
 
@@ -348,8 +369,294 @@ impl FlatFileFold {
 }
 
 /// Reads one day of flat files from Massive's object store.
+/// Keeps the vendor's own bytes, so a re-fold never has to be a re-purchase.
+///
+/// The corpus is irreproducible once the subscription lapses, and every cadence the archive stores is
+/// a lossy read of it — so the raw object is the only thing that makes a later cadence a compute cost
+/// rather than a subscription one.
+#[derive(Debug, Clone)]
+pub struct RawTee {
+    s3_client: S3Client,
+    bucket: String,
+    staging_directory: PathBuf,
+}
+
+impl RawTee {
+    /// `s3_client` is ours, not Massive's: the two endpoints share no credentials and no server-side
+    /// copy reaches between them, so the bytes transit this machine either way.
+    pub fn new(s3_client: S3Client, bucket: String, staging_directory: PathBuf) -> Self {
+        Self {
+            s3_client,
+            bucket,
+            staging_directory,
+        }
+    }
+
+    /// Where a staged object waits between the download finishing and the upload starting.
+    ///
+    /// Carries the process id because the name is otherwise a function of the object alone: two
+    /// tee-enabled passes folding one session on one host would then stage to the same path and
+    /// truncate each other's bytes, and the length check would call the survivor corrupt.
+    fn staging_path(&self, key: &str) -> PathBuf {
+        self.staging_directory
+            .join(format!("{}.{}", key.replace('/', "_"), std::process::id()))
+    }
+
+    /// Uploads `staged` under `key` as Deep Archive, unless an object of the right length is there.
+    ///
+    /// Verified on length rather than ETag: a multipart ETag is a function of the part size, so ours
+    /// never matches the vendor's and would fail every comparison it was asked to make.
+    async fn store(&self, key: &str, staged: &Path, expected: i64) -> Result<(), FlatFileError> {
+        let written = std::fs::metadata(staged)
+            .map_err(|source| FlatFileError::Tee {
+                key: key.to_string(),
+                source: Box::new(source),
+            })?
+            .len();
+        if written != expected as u64 {
+            return Err(FlatFileError::TeeLength {
+                key: key.to_string(),
+                staged: written,
+                expected,
+            });
+        }
+
+        if self.already_stored(key, expected).await? {
+            info!(
+                key,
+                bytes = expected,
+                "Raw object already archived; skipping the upload"
+            );
+            return Ok(());
+        }
+
+        self.upload_multipart(key, staged, expected).await?;
+
+        // Read back rather than trusting the completion response: an upload that reported success and
+        // landed short is the failure this tee exists to make impossible.
+        let stored = self.stored_length(key).await?;
+        if stored != Some(expected) {
+            return Err(FlatFileError::TeeLength {
+                key: key.to_string(),
+                staged: stored.unwrap_or_default() as u64,
+                expected,
+            });
+        }
+        info!(
+            bucket = self.bucket,
+            key,
+            bytes = expected,
+            "Archived the vendor's raw object"
+        );
+        Ok(())
+    }
+
+    /// Whether `key` is already present at the length the source reports.
+    async fn already_stored(&self, key: &str, expected: i64) -> Result<bool, FlatFileError> {
+        Ok(self.stored_length(key).await? == Some(expected))
+    }
+
+    /// The stored object's length, or `None` where there is no object.
+    ///
+    /// A `HEAD` answers for a Deep Archive object without restoring it — the class governs the body,
+    /// not the metadata — which is what makes the idempotence check free.
+    async fn stored_length(&self, key: &str) -> Result<Option<i64>, FlatFileError> {
+        match self
+            .s3_client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) => Ok(head.content_length()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|inner| inner.is_not_found()) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(FlatFileError::Tee {
+                key: key.to_string(),
+                source: Box::new(error),
+            }),
+        }
+    }
+
+    /// Sends the staged file as one multipart upload, aborting it rather than leaving parts behind.
+    async fn upload_multipart(
+        &self,
+        key: &str,
+        staged: &Path,
+        expected: i64,
+    ) -> Result<(), FlatFileError> {
+        let tee_error = |source: Box<dyn std::error::Error + Send + Sync>| FlatFileError::Tee {
+            key: key.to_string(),
+            source,
+        };
+
+        let created = self
+            .s3_client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .storage_class(aws_sdk_s3::types::StorageClass::DeepArchive)
+            .send()
+            .await
+            .map_err(|error| tee_error(Box::new(error)))?;
+        let Some(upload_id) = created.upload_id() else {
+            return Err(FlatFileError::Empty { field: "upload_id" });
+        };
+
+        // Every failure path aborts, completion included: a `complete` that fails leaves the parts
+        // just as open as a `send_parts` that fails, and they bill until the bucket's seven-day rule
+        // sweeps them. Written as one fallible block rather than a match, so a future step added
+        // between the two cannot quietly acquire an exit that skips the abort.
+        let outcome = async {
+            let parts = self.send_parts(key, staged, upload_id, expected).await?;
+            self.s3_client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|error| tee_error(Box::new(error)))?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = outcome {
+            if let Err(abort) = self
+                .s3_client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+            {
+                warn!(key, error = %abort, "Could not abort the failed multipart upload");
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Reads the staged file a part at a time, so a 9 GB object never sits in memory whole.
+    async fn send_parts(
+        &self,
+        key: &str,
+        staged: &Path,
+        upload_id: &str,
+        expected: i64,
+    ) -> Result<Vec<aws_sdk_s3::types::CompletedPart>, FlatFileError> {
+        let mut file = std::fs::File::open(staged).map_err(|source| FlatFileError::Tee {
+            key: key.to_string(),
+            source: Box::new(source),
+        })?;
+        let mut parts = Vec::new();
+        let mut buffer = vec![0u8; TEE_PART_BYTES];
+        let mut sent = 0i64;
+        let mut number = 1i32;
+
+        loop {
+            // Filling 64 MiB is a real disk read and would hold a runtime worker for the whole of
+            // it. The file and the buffer travel to the blocking pool and back rather than the file
+            // being reopened per part, so the read position stays the loop's own.
+            let filled;
+            (file, buffer, filled) = tokio::task::spawn_blocking(move || {
+                let filled = read_fully(&mut file, &mut buffer);
+                (file, buffer, filled)
+            })
+            .await
+            .map_err(|source| FlatFileError::Tee {
+                key: key.to_string(),
+                source: Box::new(source),
+            })?;
+            let filled = filled.map_err(|source| FlatFileError::Tee {
+                key: key.to_string(),
+                source: Box::new(source),
+            })?;
+            if filled == 0 {
+                break;
+            }
+            let uploaded = self
+                .s3_client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(number)
+                .body(aws_sdk_s3::primitives::ByteStream::from(
+                    buffer[..filled].to_vec(),
+                ))
+                .send()
+                .await
+                .map_err(|error| FlatFileError::Tee {
+                    key: key.to_string(),
+                    source: Box::new(error),
+                })?;
+            parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .part_number(number)
+                    .set_e_tag(uploaded.e_tag().map(str::to_string))
+                    .build(),
+            );
+            sent += filled as i64;
+            number += 1;
+        }
+
+        if sent != expected {
+            return Err(FlatFileError::TeeLength {
+                key: key.to_string(),
+                staged: sent as u64,
+                expected,
+            });
+        }
+        Ok(parts)
+    }
+}
+
+/// Fills `buffer` as far as the file allows, since one `read` may stop short of a part boundary.
+///
+/// A short part that is not the last one fails the whole upload, so this cannot be a bare `read`.
+fn read_fully(file: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
+}
+
+/// The key one day of a dataset's raw bytes is stored under.
+///
+/// `schema=v1` is a hive dimension carrying Massive's *schema* version rather than their filename:
+/// the column layout and the quote size-unit change are both properties of `quotes_v1`, so a re-fold
+/// years from now knows which parser the bytes want.
+pub fn raw_key(dataset: &str, date: NaiveDate) -> String {
+    format!(
+        "data/raw/massive/equity/{}/schema=v1/year={}/month={:02}/day={:02}/data.csv.gz",
+        dataset,
+        date.year(),
+        date.month(),
+        date.day()
+    )
+}
+
 pub struct FlatFileClient {
     s3_client: S3Client,
+    tee: Option<RawTee>,
 }
 
 impl FlatFileClient {
@@ -386,12 +693,21 @@ impl FlatFileClient {
     fn from_configuration(configuration: aws_sdk_s3::Config) -> Self {
         Self {
             s3_client: S3Client::from_conf(configuration),
+            tee: None,
         }
     }
 
     /// Constructs from the environment.
     pub fn from_env() -> Result<Self, FlatFileError> {
         Ok(Self::new(FlatFileCredentials::from_env()?))
+    }
+
+    /// Keeps the vendor's own bytes, teeing every object this client reads into Deep Archive.
+    ///
+    /// Off unless asked for, because a pass that only measures should not be writing 9 GB an object.
+    pub fn teeing_raw_to(mut self, tee: RawTee) -> Self {
+        self.tee = Some(tee);
+        self
     }
 
     /// Streams one day of quotes, handing every usable tick to `fold`.
@@ -407,16 +723,12 @@ impl FlatFileClient {
         let key = quote_key(date);
         info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of quotes");
 
-        let compressed_bytes = self.object_length(&key).await?;
-        let reader = self.ranged_reader(&key, compressed_bytes);
         let scoped = key.clone();
-        let (mut summary, fold) =
-            tokio::task::spawn_blocking(move || fold_gzipped_quotes(reader, &scoped, fold))
-                .await
-                .map_err(|error| FlatFileError::Read {
-                    key: key.clone(),
-                    source: std::io::Error::other(error),
-                })??;
+        let ((mut summary, fold), compressed_bytes) = self
+            .fold_object(key.clone(), "quotes", date, move |reader| {
+                fold_gzipped_quotes(reader, &scoped, fold)
+            })
+            .await?;
 
         summary.compressed_bytes = compressed_bytes;
         info!(
@@ -446,16 +758,12 @@ impl FlatFileClient {
         let key = trade_key(date);
         info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of trades");
 
-        let compressed_bytes = self.object_length(&key).await?;
-        let reader = self.ranged_reader(&key, compressed_bytes);
         let scoped = key.clone();
-        let (mut summary, fold) =
-            tokio::task::spawn_blocking(move || fold_gzipped_trades(reader, &scoped, fold))
-                .await
-                .map_err(|error| FlatFileError::Read {
-                    key: key.clone(),
-                    source: std::io::Error::other(error),
-                })??;
+        let ((mut summary, fold), compressed_bytes) = self
+            .fold_object(key.clone(), "trades", date, move |reader| {
+                fold_gzipped_trades(reader, &scoped, fold)
+            })
+            .await?;
 
         summary.compressed_bytes = compressed_bytes;
         info!(
@@ -496,12 +804,77 @@ impl FlatFileClient {
     ///
     /// One connection is both too slow and too fragile for a file this size: Massive throttles per
     /// connection, and a stream held open for the length of a whole file does not reliably survive.
-    fn ranged_reader(&self, key: &str, length: i64) -> ChunkReader {
+    fn ranged_reader(
+        &self,
+        key: &str,
+        length: i64,
+        staging: Option<PathBuf>,
+    ) -> (ChunkReader, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = tokio::sync::mpsc::channel(READY_CHUNKS);
         let client = self.s3_client.clone();
         let key = key.to_string();
-        tokio::spawn(async move { fetch_ranges(client, key, length, sender).await });
-        ChunkReader::new(receiver)
+        let producer =
+            tokio::spawn(async move { fetch_ranges(client, key, length, sender, staging).await });
+        (ChunkReader::new(receiver), producer)
+    }
+
+    /// Reads the whole object, folds it, and archives the vendor's bytes whichever way the fold went.
+    ///
+    /// The tee is not the caller's to forget: the download is the expensive half and a fold bug must
+    /// never cost it, so the raw object is stored here rather than in an error arm someone has to
+    /// remember to write.
+    async fn fold_object<T>(
+        &self,
+        key: String,
+        dataset: &str,
+        date: NaiveDate,
+        parse: impl FnOnce(ChunkReader) -> Result<T, FlatFileError> + Send + 'static,
+    ) -> Result<(T, i64), FlatFileError>
+    where
+        T: Send + 'static,
+    {
+        let compressed_bytes = self.object_length(&key).await?;
+        let staged = self.tee.as_ref().map(|tee| tee.staging_path(&key));
+        let (reader, producer) = self.ranged_reader(&key, compressed_bytes, staged.clone());
+
+        let folded = tokio::task::spawn_blocking(move || parse(reader))
+            .await
+            .map_err(|error| FlatFileError::Read {
+                key: key.clone(),
+                source: std::io::Error::other(error),
+            });
+
+        // Awaited before anything is decided, so the staged file is final rather than still growing.
+        if let Err(error) = producer.await {
+            warn!(key, %error, "The range producer did not finish cleanly");
+        }
+
+        if let (Some(tee), Some(staged)) = (self.tee.as_ref(), staged.as_ref()) {
+            // Removed only once the bytes are known to be in the archive. Deleting them on a failed
+            // upload would destroy the one local copy of the expensive half and force the whole
+            // object to be downloaded again — the exact cost this tee exists to stop paying.
+            match tee
+                .store(&raw_key(dataset, date), staged, compressed_bytes)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(error) = std::fs::remove_file(staged) {
+                        warn!(path = %staged.display(), %error, "Could not remove the staged file");
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        key,
+                        path = %staged.display(),
+                        %error,
+                        "Could not archive the vendor's raw object; the staged bytes are kept for recovery"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok((folded??, compressed_bytes))
     }
 }
 
@@ -515,11 +888,25 @@ async fn fetch_ranges(
     key: String,
     length: i64,
     sender: tokio::sync::mpsc::Sender<Result<Vec<u8>, FlatFileError>>,
+    staging: Option<PathBuf>,
 ) {
+    let mut staged = match staging.as_ref() {
+        None => None,
+        Some(path) => match stage_file(path).await {
+            Ok(file) => Some(file),
+            Err(error) => {
+                warn!(key, %error, "Could not open the staging file; this object will not be archived");
+                None
+            }
+        },
+    };
     let mut in_flight: std::collections::VecDeque<
         tokio::task::JoinHandle<Result<Vec<u8>, FlatFileError>>,
     > = std::collections::VecDeque::with_capacity(RANGES_IN_FLIGHT);
     let mut next_offset = 0i64;
+    // Set once the parse has stopped reading. The download keeps going: the raw capture is the half
+    // that cannot be repeated without paying for the month again, and a fold bug must not cost it.
+    let mut listening = true;
 
     loop {
         while in_flight.len() < RANGES_IN_FLIGHT && next_offset < length {
@@ -533,6 +920,13 @@ async fn fetch_ranges(
         }
 
         let Some(oldest) = in_flight.pop_front() else {
+            // `tokio::fs::File` buffers, and dropping one with writes outstanding loses them. The
+            // length check downstream would call that a short capture rather than a missing flush.
+            if let Some(file) = staged.as_mut() {
+                if let Err(error) = tokio::io::AsyncWriteExt::flush(file).await {
+                    warn!(key, %error, "Could not flush the staged object");
+                }
+            }
             return;
         };
         let chunk = match oldest.await {
@@ -542,16 +936,43 @@ async fn fetch_ranges(
                 source: std::io::Error::other(error),
             }),
         };
-        // A closed receiver means the parse stopped early, which is its answer rather than an error.
-        // Dropping a handle does not cancel its request, so the rest are stopped rather than left
-        // downloading megabytes nothing will read.
-        if sender.send(chunk).await.is_err() {
-            for pending in in_flight {
-                pending.abort();
+        if let (Some(file), Ok(bytes)) = (staged.as_mut(), chunk.as_ref()) {
+            if let Err(error) = tokio::io::AsyncWriteExt::write_all(file, bytes).await {
+                warn!(key, %error, "Could not stage a chunk; this object will not be archived");
+                staged = None;
             }
-            return;
+        }
+
+        // A closed receiver means the parse stopped early, which is its answer rather than an error.
+        // With nothing to stage there is nothing left to do; with a staging file the download runs to
+        // the end regardless, because the bytes are what the subscription bought.
+        if listening && sender.send(chunk).await.is_err() {
+            listening = false;
+            if staged.is_none() {
+                // Dropping a handle does not cancel its request, so the rest are stopped rather than
+                // left downloading megabytes nothing will read.
+                for pending in in_flight {
+                    pending.abort();
+                }
+                return;
+            }
+            warn!(
+                key,
+                "The parse stopped early; finishing the download for the raw archive"
+            );
         }
     }
+}
+
+/// Opens the staging file, creating its directory, and truncates any partial file left behind.
+///
+/// Async because the chunks are written from the range producer, which is on the runtime: a 2 MiB
+/// write is usually page cache, but it is a real write whenever the cache is under pressure.
+async fn stage_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+    if let Some(directory) = path.parent() {
+        tokio::fs::create_dir_all(directory).await?;
+    }
+    tokio::fs::File::create(path).await
 }
 
 /// Every layer of an error, because the outermost one is routinely the least informative.
@@ -1499,6 +1920,362 @@ mod tests {
             ]
         );
         assert_eq!(offset, length, "the walk ends exactly at the length");
+    }
+
+    /// The reason the tee runs before anything parses: a fold that dies mid-file must not cost the
+    /// download, because the bytes are the half that cannot be had again without buying the month
+    /// back. The receiver is dropped before a single chunk is taken, which is the worst case — the
+    /// parser died on the header — and every byte must still reach the staging file.
+    #[tokio::test]
+    async fn test_a_dead_parse_does_not_cost_the_raw_capture() {
+        let body: Vec<u8> = (0..(CHUNK_BYTES * 2 + 1234))
+            .map(|value| (value % 251) as u8)
+            .collect();
+        let (client, _requested) = client_serving(body.clone());
+
+        let directory = std::env::temp_dir().join("fund-tee-decoupling-test");
+        std::fs::create_dir_all(&directory).expect("a staging directory");
+        let staged = directory.join("data.csv.gz");
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(READY_CHUNKS);
+        drop(receiver);
+        fetch_ranges(
+            client.s3_client.clone(),
+            "us_stocks_sip/trades_v1/2021/09/2021-09-01.csv.gz".to_string(),
+            body.len() as i64,
+            sender,
+            Some(staged.clone()),
+        )
+        .await;
+
+        let captured = std::fs::read(&staged).expect("the staged object");
+        assert_eq!(
+            captured.len(),
+            body.len(),
+            "the download must run to the end even though nothing was reading it"
+        );
+        assert_eq!(captured, body, "and the bytes must be the vendor's own");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A tee against a scripted archive, recording every request it makes.
+    ///
+    /// `head_lengths` is answered in order, one per `HEAD`: `store` heads twice, once to decide
+    /// whether the object is already there and once to read back what it wrote, and the two answers
+    /// are what distinguish skipping an upload from botching one. `None` is a 404.
+    fn tee_against(
+        head_lengths: Vec<Option<i64>>,
+        complete_status: u16,
+        staging_directory: PathBuf,
+    ) -> (RawTee, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&requested);
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(head_lengths.into_iter()));
+        let http_client = infallible_client_fn(move |request| {
+            let method = request.method().clone();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let label = match (&method, query.as_str()) {
+                (&http::Method::HEAD, _) => "HEAD",
+                (&http::Method::POST, q) if q.contains("uploads") => "CREATE",
+                (&http::Method::PUT, _) => "PART",
+                (&http::Method::POST, _) => "COMPLETE",
+                (&http::Method::DELETE, _) => "ABORT",
+                _ => "OTHER",
+            };
+            recorder
+                .lock()
+                .expect("no test thread panics holding this")
+                .push(label.to_string());
+
+            match label {
+                "HEAD" => match heads
+                    .lock()
+                    .expect("no test thread panics holding this")
+                    .next()
+                    .flatten()
+                {
+                    Some(length) => http::Response::builder()
+                        .status(200)
+                        .header("content-length", length.to_string())
+                        .body(SdkBody::empty())
+                        .expect("a valid response"),
+                    None => http::Response::builder()
+                        .status(404)
+                        .body(SdkBody::empty())
+                        .expect("a valid response"),
+                },
+                "CREATE" => http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<InitiateMultipartUploadResult><UploadId>an-upload</UploadId></InitiateMultipartUploadResult>"#,
+                    ))
+                    .expect("a valid response"),
+                "PART" => http::Response::builder()
+                    .status(200)
+                    .header("etag", "\"a-part\"")
+                    .body(SdkBody::empty())
+                    .expect("a valid response"),
+                "COMPLETE" => http::Response::builder()
+                    .status(complete_status)
+                    .body(SdkBody::from(
+                        r#"<CompleteMultipartUploadResult><ETag>"whole"</ETag></CompleteMultipartUploadResult>"#,
+                    ))
+                    .expect("a valid response"),
+                _ => http::Response::builder()
+                    .status(204)
+                    .body(SdkBody::empty())
+                    .expect("a valid response"),
+            }
+        });
+        let tee = RawTee::new(
+            S3Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+                    .http_client(http_client)
+                    .build(),
+            ),
+            "oscm-fund-archive".to_string(),
+            staging_directory,
+        );
+        (tee, requested)
+    }
+
+    /// A staged file of `bytes` length, in its own directory so tests cannot see each other's.
+    fn staged_object(name: &str, bytes: usize) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("fund-tee-{name}"));
+        std::fs::create_dir_all(&directory).expect("a staging directory");
+        let path = directory.join("data.csv.gz");
+        std::fs::write(&path, vec![7u8; bytes]).expect("a staged object");
+        (directory, path)
+    }
+
+    /// Length is the whole verification, so a staged file that is not the size the vendor reported
+    /// must never reach the bucket. Uploading it would put an object under a key that promises the
+    /// vendor's bytes and holds a truncated download, which no later reader could detect.
+    #[tokio::test]
+    async fn test_a_staged_object_of_the_wrong_length_is_never_uploaded() {
+        let (directory, path) = staged_object("wrong-length", 4096);
+        let (tee, requested) = tee_against(vec![], 200, directory.clone());
+
+        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 8192).await;
+
+        assert!(
+            matches!(outcome, Err(FlatFileError::TeeLength { staged, expected, .. })
+                if staged == 4096 && expected == 8192),
+            "{outcome:?}"
+        );
+        assert!(
+            requested
+                .lock()
+                .expect("no test thread panics holding this")
+                .is_empty(),
+            "nothing may be sent for an object that failed its length check"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The backfill re-runs sessions routinely, and a 9 GB upload per re-run is the difference
+    /// between a resumable pass and one nobody dares repeat.
+    #[tokio::test]
+    async fn test_an_object_already_archived_at_the_right_length_is_not_uploaded_again() {
+        let (directory, path) = staged_object("already-there", 4096);
+        let (tee, requested) = tee_against(vec![Some(4096)], 200, directory.clone());
+
+        tee.store("data/raw/whatever.csv.gz", &path, 4096)
+            .await
+            .expect("an object already present is not an error");
+
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this");
+        assert_eq!(*sent, vec!["HEAD".to_string()], "{sent:?}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The completion response is not the proof — an upload can report success and land short, which
+    /// is the one failure that would otherwise reach the archive silently and stay there.
+    #[tokio::test]
+    async fn test_an_upload_that_lands_short_is_refused_on_read_back() {
+        let (directory, path) = staged_object("short-read-back", 4096);
+        // Absent to begin with, then present at the wrong length once the upload claims success.
+        let (tee, requested) = tee_against(vec![None, Some(17)], 200, directory.clone());
+
+        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 4096).await;
+
+        assert!(
+            matches!(outcome, Err(FlatFileError::TeeLength { staged, expected, .. })
+                if staged == 17 && expected == 4096),
+            "{outcome:?}"
+        );
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this");
+        assert!(sent.contains(&"COMPLETE".to_string()), "{sent:?}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A completion that fails leaves every part open and billing exactly as a failed part upload
+    /// would. This was a real hole: the abort used to hang off the `send_parts` error arm only, so
+    /// the completion path reached the same outcome by a door with no abort behind it.
+    #[tokio::test]
+    async fn test_a_failed_completion_still_aborts_the_upload() {
+        let (directory, path) = staged_object("failed-completion", 4096);
+        let (tee, requested) = tee_against(vec![None], 500, directory.clone());
+
+        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 4096).await;
+
+        assert!(outcome.is_err(), "a failed completion must fail the store");
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this");
+        assert!(
+            sent.contains(&"ABORT".to_string()),
+            "the parts were left open and billing: {sent:?}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A staged object that could not be uploaded must survive the failure. Deleting it would throw
+    /// away the local copy of the expensive half and make the retry a fresh download of the whole
+    /// vendor object — the exact cost this tee exists to stop paying, spent on its own error path.
+    #[tokio::test]
+    async fn test_a_failed_upload_keeps_the_staged_bytes() {
+        let body: Vec<u8> = (0..4096u32).map(|value| (value % 251) as u8).collect();
+        let (mut client, _requested) = client_serving(body.clone());
+
+        let directory = std::env::temp_dir().join("fund-tee-retention-test");
+        std::fs::create_dir_all(&directory).expect("a staging directory");
+        // A destination that refuses everything, so `store` fails after the download succeeded.
+        client = client.teeing_raw_to(RawTee::new(
+            S3Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+                    .http_client(infallible_client_fn(|_| {
+                        http::Response::builder()
+                            .status(500)
+                            .body(SdkBody::from("no"))
+                            .expect("a valid response")
+                    }))
+                    .build(),
+            ),
+            "oscm-fund-archive".to_string(),
+            directory.clone(),
+        ));
+
+        let date = NaiveDate::from_ymd_opt(2021, 9, 1).expect("a real date");
+        let outcome = client
+            .fold_object(trade_key(date), "trades", date, |mut reader| {
+                let mut sink = Vec::new();
+                std::io::copy(&mut reader, &mut sink).expect("the staged stream");
+                Ok(sink.len())
+            })
+            .await;
+        assert!(
+            outcome.is_err(),
+            "an unusable destination must fail the pass"
+        );
+
+        let staged: Vec<_> = std::fs::read_dir(&directory)
+            .expect("the staging directory")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            staged.len(),
+            1,
+            "the staged object must outlive the failed upload"
+        );
+        assert_eq!(
+            std::fs::metadata(staged[0].path())
+                .expect("the staged file")
+                .len(),
+            body.len() as u64,
+            "and it must be the whole object, not a truncated one"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The raw key is what a re-fold years from now has to find the bytes by, and every segment of
+    /// it carries meaning: the lifecycle rule matches on `data/raw/`, and `schema=v1` says which
+    /// parser the bytes want. Pinned to a literal, because deriving it from the builder under test
+    /// would move with any change rather than catching one.
+    #[test]
+    fn test_the_raw_key_carries_the_prefix_the_lifecycle_rule_matches() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        assert_eq!(
+            raw_key("quotes", date),
+            "data/raw/massive/equity/quotes/schema=v1/year=2026/month=08/day=28/data.csv.gz"
+        );
+        assert_eq!(
+            raw_key("trades", NaiveDate::from_ymd_opt(2021, 1, 4).unwrap()),
+            "data/raw/massive/equity/trades/schema=v1/year=2021/month=01/day=04/data.csv.gz"
+        );
+    }
+
+    /// One `read` may stop short of the buffer, and a multipart part that is short without being the
+    /// last one fails the whole upload — so the fill has to loop rather than trust a single read.
+    #[test]
+    fn test_a_part_is_filled_across_short_reads() {
+        let directory = std::env::temp_dir().join("fund-tee-part-test");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("staged.bin");
+        let bytes: Vec<u8> = (0..5000u32).map(|value| (value % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut buffer = vec![0u8; 4096];
+        assert_eq!(read_fully(&mut file, &mut buffer).unwrap(), 4096);
+        assert_eq!(buffer[..], bytes[..4096]);
+        // The tail is shorter than the buffer, which is the only legitimate short part.
+        assert_eq!(read_fully(&mut file, &mut buffer).unwrap(), 904);
+        assert_eq!(buffer[..904], bytes[4096..]);
+        assert_eq!(read_fully(&mut file, &mut buffer).unwrap(), 0);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A staging path has to be one file per object: the vendor's key contains slashes, and joining
+    /// it unflattened would write into directories that do not exist and collide across datasets.
+    #[test]
+    fn test_a_staging_path_is_one_flat_file_per_object() {
+        let tee = RawTee::new(
+            S3Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+            "oscm-fund-archive".to_string(),
+            PathBuf::from("/var/tmp/fund-flat-files"),
+        );
+        let path = tee.staging_path("us_stocks_sip/quotes_v1/2026/08/2026-08-28.csv.gz");
+        let rendered = path.to_str().expect("a printable path");
+        assert!(
+            rendered.starts_with(
+                "/var/tmp/fund-flat-files/us_stocks_sip_quotes_v1_2026_08_2026-08-28.csv.gz."
+            ),
+            "the vendor's key must flatten into one filename: {rendered}"
+        );
+        // The suffix is the process, which is what stops two passes over one session on one host
+        // from truncating each other. Read back rather than restated, since a literal cannot name a
+        // process id — but the assertion above pins everything that is not the process.
+        assert_eq!(
+            rendered
+                .rsplit('.')
+                .next()
+                .and_then(|tail| tail.parse().ok()),
+            Some(std::process::id()),
+            "{rendered}"
+        );
+        assert_eq!(
+            path.parent(),
+            Some(Path::new("/var/tmp/fund-flat-files")),
+            "one directory, so a run cannot scatter staged objects"
+        );
     }
 
     /// The chunks arrive as separate reads and have to read back as one stream, because gzip decodes
