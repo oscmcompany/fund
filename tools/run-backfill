@@ -14,6 +14,11 @@
 # bucket. That is the whole reason this file exists rather than a remembered `export` line -- the
 # variables were renamed in #1123 and the archive one added in #1122, and a copy living only on a
 # box's filesystem needed hand-editing for both, unreviewed.
+#
+# The instance role this runs under is `backfill-box-role-policy.json` beside this file:
+#   aws iam put-role-policy --role-name fund-quote-backfill \
+#     --policy-name archive-and-secrets \
+#     --policy-document file://tools/backfill-box-role-policy.json
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
