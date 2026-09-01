@@ -54,9 +54,10 @@ start-trainer
 devenv tasks run data:seed:s3
 
 # Launch DuckDB for a local query interface against S3 with all data lake views
-# pre-loaded. Once in the DuckDB shell, run .help for commands and SHOW TABLES
-# to list loaded views.
-start-duckdb oscm-fund-production
+# pre-loaded. The argument names the shared archive the data/** views read; the
+# exports/** views read this profile's own bucket. Once in the DuckDB shell, run
+# .help for commands and SHOW TABLES to list loaded views.
+start-duckdb oscm-fund-archive
 ```
 
 > For development VMs, run the equivalent `development` scripts.

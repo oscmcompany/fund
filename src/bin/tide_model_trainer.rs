@@ -72,10 +72,8 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Two buckets, because this binary does two things. It repairs and reads `data/**`, which every
-    // instance shares, and it publishes a model artifact, which belongs to the instance that trained
-    // it. One variable for both would either put one trainer's artifacts in the shared archive or
-    // give each instance its own copy of a corpus that is expensive and irreproducible.
+    // Two buckets: `data/**` is the shared corpus this reads and repairs, and the model artifact
+    // below belongs to the one instance that trained it.
     let archive_bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
         .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")

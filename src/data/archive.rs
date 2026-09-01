@@ -181,6 +181,11 @@ pub enum PassOutput {
         summaries_written: usize,
         quotes_folded: usize,
     },
+    /// Summary rows written across all three cadences, and the prints folded to produce them.
+    Trades {
+        summaries_written: usize,
+        trades_folded: usize,
+    },
 }
 
 impl PassOutput {
@@ -192,6 +197,9 @@ impl PassOutput {
         match self {
             PassOutput::Bars { bars_written } => *bars_written,
             PassOutput::Quotes {
+                summaries_written, ..
+            }
+            | PassOutput::Trades {
                 summaries_written, ..
             } => *summaries_written,
         }
@@ -320,6 +328,13 @@ impl std::fmt::Display for PassSummary {
                 formatter,
                 ", {summaries_written} summaries, {quotes_folded} quotes folded"
             ),
+            PassOutput::Trades {
+                summaries_written,
+                trades_folded,
+            } => write!(
+                formatter,
+                ", {summaries_written} summaries, {trades_folded} trades folded"
+            ),
         }
     }
 }
@@ -366,6 +381,22 @@ impl PassProgress {
             output: PassOutput::Quotes {
                 summaries_written: self.rows_written,
                 quotes_folded,
+            },
+            sessions: SessionSource::TradingCalendar,
+        }
+    }
+
+    /// The trade counterpart, separate so neither pass can render the other's units.
+    fn into_trade_summary(self, trades_folded: usize) -> PassSummary {
+        PassSummary {
+            sessions_requested: self.sessions_requested,
+            sessions_written: self.sessions_written,
+            sessions_without_data: self.sessions_without_data,
+            sessions_failed: self.sessions_failed,
+            symbols_failed: self.symbols_failed,
+            output: PassOutput::Trades {
+                summaries_written: self.rows_written,
+                trades_folded,
             },
             sessions: SessionSource::TradingCalendar,
         }
@@ -1921,13 +1952,12 @@ async fn write_quote_partitions(
     Ok(())
 }
 
-/// Folds the printed tape across `sessions`, per `scope`, out of Massive's flat files.
+/// Folds the printed tape across `sessions`, per `scope`, out of Massive's flat files, which must
+/// already be calendar-filtered on the same terms as the quote pass.
 ///
-/// Session-major and flat-file only. There is no per-name variant because there is no repair path
-/// yet: a trade file is the session, so a name missing from it is missing from the tape rather than
-/// from a fetch that can be retried.
-///
-/// `sessions` must already be calendar-filtered, on the same terms as the quote pass.
+/// Session-major and flat-file only. There is no per-name variant because there is no repair path:
+/// a trade file is the session, so a name missing from it is missing from the tape rather than from
+/// a fetch that can be retried.
 pub async fn archive_trade_sessions(
     s3_client: &S3Client,
     flat_files: &FlatFileClient,
@@ -1937,7 +1967,7 @@ pub async fn archive_trade_sessions(
     scope: &Scope,
 ) -> Result<PassSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
-        return Ok(PassProgress::default().into_quote_summary(0));
+        return Ok(PassProgress::default().into_trade_summary(0));
     };
     // Presence is read off the daily prefix, which is the last one written, so a pass that died
     // partway reads as absent and is redone rather than left with its intraday half missing.
@@ -1980,9 +2010,11 @@ pub async fn archive_trade_sessions(
     }
 
     if progress.symbols_failed > 0 {
+        // Deliberately not the quote pass's "re-run to repair": re-running skips the session, whose
+        // daily partition is now written, and the flat file would answer the same way if it did not.
         warn!(
             symbols_failed = progress.symbols_failed,
-            "Some symbols are absent from the summaries this pass wrote; re-run those sessions to repair them"
+            "Some symbols in the universe never printed in these sessions' trade files; only a widen pass revisits them"
         );
     }
     info!(
@@ -1995,7 +2027,7 @@ pub async fn archive_trade_sessions(
         trades_folded,
         "Trade archive updated"
     );
-    Ok(progress.into_quote_summary(trades_folded))
+    Ok(progress.into_trade_summary(trades_folded))
 }
 
 /// One session: derive the universe from the scope, fold the tape, write all three cadences.
@@ -2783,6 +2815,10 @@ mod tests {
             progress().into_quote_summary(412_000).to_string(),
             format!("{shared}, 2048 summaries, 412000 quotes folded")
         );
+        assert_eq!(
+            progress().into_trade_summary(871_159).to_string(),
+            format!("{shared}, 2048 summaries, 871159 trades folded")
+        );
     }
 
     /// The one figure that travels by return rather than through the accumulator, which is what
@@ -2807,6 +2843,26 @@ mod tests {
             158,
             "the shared accessor reads the rows, not the ticks folded to get them"
         );
+    }
+
+    /// Same shape on the trade path, which shares the `rows_written` arm with quotes: a variant
+    /// folded into that arm by mistake would report the prints it folded as rows it wrote.
+    #[test]
+    fn test_a_trade_pass_carries_what_it_cost() {
+        let summary = PassProgress {
+            rows_written: 158,
+            ..Default::default()
+        }
+        .into_trade_summary(871_159);
+
+        assert_eq!(
+            summary.output,
+            PassOutput::Trades {
+                summaries_written: 158,
+                trades_folded: 871_159
+            }
+        );
+        assert_eq!(summary.output.rows_written(), 158);
     }
 
     /// The rule the product exists to enforce, and the reason "may it create" is not a third axis.

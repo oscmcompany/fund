@@ -704,11 +704,13 @@ in {
 
   scripts.start-duckdb.exec = ''
     set -euo pipefail
+    ${runtimeEnv}
 
     if [ -z "''${1:-}" ]; then
       echo "Usage: start-duckdb <archive-bucket-name>" >&2
       echo "" >&2
-      echo "Every view reads data/**, so this names the shared archive." >&2
+      echo "Names the shared archive the data/** views read. The exports/** views" >&2
+      echo "read this profile's own records bucket, which comes from FUND_PROFILE." >&2
       echo "" >&2
       echo "Example:" >&2
       echo "  start-duckdb ${archiveBucket}" >&2
@@ -716,7 +718,7 @@ in {
     fi
 
     export AWS_S3_ARCHIVE_BUCKET_NAME="$1"
-    echo "Opening DuckDB lab (archive: $AWS_S3_ARCHIVE_BUCKET_NAME)"
+    echo "Opening DuckDB lab (archive: $AWS_S3_ARCHIVE_BUCKET_NAME, records: $AWS_S3_BUCKET_NAME)"
 
     exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
   '';
