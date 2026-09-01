@@ -26,9 +26,10 @@ Autonomous model optimization via iterative architecture search. See
 
 ## Training Infrastructure
 
-Training runs **locally** via `cargo run --release --bin tide_model_trainer`. S3 data
-and model artifacts are accessed via AWS SDK using the `AWS_S3_RECORDS_BUCKET_NAME`
-environment variable.
+Training runs **locally** via `cargo run --release --bin tide_model_trainer`. It reads two
+buckets over the AWS SDK, and they are not interchangeable: training data comes from the
+shared archive named by `AWS_S3_ARCHIVE_BUCKET_NAME`, and the model artifact it publishes
+goes to this instance's own bucket, `AWS_S3_RECORDS_BUCKET_NAME`.
 
 ### Local Training
 
@@ -149,7 +150,9 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 
 - **Training crash**: Log as CRASH, fix the bug, commit fix, retry.
 - **Compilation errors**: Fix the Rust code, ensure `cargo build --release --features train` passes.
-- **Missing data**: Check `AWS_S3_RECORDS_BUCKET_NAME` and S3 connectivity via `secretspec run -- aws s3 ls`.
+- **Missing data**: Check `AWS_S3_ARCHIVE_BUCKET_NAME`, which is where training data is read from,
+  and S3 connectivity via `secretspec run -- aws s3 ls`. `AWS_S3_RECORDS_BUCKET_NAME` is the
+  publish target and a missing artifact points there instead.
 
 ## Files Modified During Loop
 
