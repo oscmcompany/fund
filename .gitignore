@@ -18,6 +18,10 @@ data/*
 **/*.safetensor
 **/*.json
 !.sqlx/*.json
+# Hand-applied AWS documents live here so a fixture can be rebuilt by reading rather than by
+# remembering. A glob rather than one filename, because the failure this fixes is a file being
+# silently ignored -- which is what a narrower rule would do to the next one.
+!tools/*.json
 .claude/tasks/
 .claude/settings.local.json*
 .scratchpad/

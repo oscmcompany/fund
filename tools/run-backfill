@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Runs `seed` on a bare backfill box, where there is no devenv shell to inherit an environment from.
+#
+# devenv's runtimeEnv is what normally supplies FUND_PROFILE, the two bucket names and the log
+# directory, and it reaches every script and task in the repository. A provisioned EC2 box has none
+# of it: secretspec is not installed, the shell is whatever SSM hands the command, and `seed` reads
+# its configuration from the environment alone. This assembles the same environment from Secrets
+# Manager and execs `seed` with whatever arguments it was given.
+#
+#   run-backfill equity-trades archive --start 2021-08-26 --end 2026-08-28 --tee-raw
+#
+# Both bucket variables are required and neither has a default inside `seed`: every read fails
+# closed, so an environment missing one is a startup error rather than a silent write to the wrong
+# bucket. That is the whole reason this file exists rather than a remembered `export` line -- the
+# variables were renamed in #1123 and the archive one added in #1122, and a copy living only on a
+# box's filesystem needed hand-editing for both, unreviewed.
+set -euo pipefail
+
+REGION="${AWS_REGION:-us-east-1}"
+PROFILE="${FUND_PROFILE:-}"
+if [[ -z "$PROFILE" ]]; then
+  echo "Error: FUND_PROFILE must be set (e.g. development/john.forstmeier)." >&2
+  echo "  It names both the secretspec profile and this instance's records bucket." >&2
+  exit 1
+fi
+
+# The same derivation devenv.nix uses, so a box and a shell resolve one profile to one bucket.
+SLUG="${PROFILE//[\/.]/-}"
+export AWS_S3_RECORDS_BUCKET_NAME="${AWS_S3_RECORDS_BUCKET_NAME:-oscm-fund-${SLUG}}"
+# Shared, so it is not derived from the profile. devenv.nix holds the same literal as `archiveBucket`
+# and is the source of truth; nix values are not readable from bash, which is why it appears twice.
+export AWS_S3_ARCHIVE_BUCKET_NAME="${AWS_S3_ARCHIVE_BUCKET_NAME:-oscm-fund-archive}"
+
+# Read individually rather than through secretspec, which is not installed on a provisioned box. The
+# instance role grants GetSecretValue on secretspec/fund/* and nothing wider.
+for key in ALPACA_API_KEY_ID ALPACA_API_SECRET ALPACA_IS_PAPER \
+           MASSIVE_BASE_URL MASSIVE_API_KEY \
+           MASSIVE_S3_ENDPOINT MASSIVE_S3_ACCESS_KEY_ID MASSIVE_S3_SECRET_ACCESS_KEY; do
+  if ! value="$(aws secretsmanager get-secret-value --region "$REGION" \
+    --secret-id "secretspec/fund/$PROFILE/$key" --query SecretString --output text 2>&1)"; then
+    echo "Error: could not read secretspec/fund/$PROFILE/$key: $value" >&2
+    exit 1
+  fi
+  export "$key"="$value"
+done
+
+export FUND_PROFILE="$PROFILE"
+export AWS_REGION="$REGION"
+# No database on a backfill box, so the `query!` macros must resolve against the checked-in cache.
+export SQLX_OFFLINE=true
+export RUST_LOG="${RUST_LOG:-info}"
+
+cd "${FUND_ROOT:-$HOME/fund}"
+exec ./target/release/seed "$@"
