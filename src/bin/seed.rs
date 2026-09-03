@@ -63,7 +63,7 @@ struct Arguments {
     command: Command,
 }
 
-/// The nouns, named for the prefixes they write: `data/equity/{bars,details,quotes}`.
+/// The nouns, named for the prefixes they write: `data/derived/equity/{bars,details,quotes}`.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Bars from Massive, at whichever cadence the route beneath answers for.
@@ -131,7 +131,7 @@ enum BarRoute {
 enum DailyTarget {
     /// Into `equity_bars`, which the application trades from. Needs a database and Massive.
     Postgres(DatabaseBarsArguments),
-    /// Into `data/equity/bars/interval=one_day/`, which the trainer trains from. Needs AWS, Massive
+    /// Into `data/derived/equity/bars/interval=one_day/`, which the trainer trains from. Needs AWS, Massive
     /// and Alpaca.
     S3(ArchiveBarsArguments),
 }
@@ -140,7 +140,7 @@ enum DailyTarget {
 enum DetailsTarget {
     /// Into `equity_details`, which the pair screen's per-sector cap reads.
     Postgres,
-    /// Into `data/equity/details/details.csv`, which DuckDB's `training_details` view resolves to.
+    /// Into `data/derived/equity/details/details.csv`, which DuckDB's `training_details` view resolves to.
     S3,
 }
 

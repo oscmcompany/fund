@@ -11,7 +11,7 @@ pub async fn s3_client() -> aws_sdk_s3::Client {
 }
 
 /// Build the Hive-partitioned S3 key for one day of parquet data, e.g.
-/// `data/equity/bars/interval=one_day/year=2026/month=06/day=10/data.parquet`. The single
+/// `data/derived/equity/bars/interval=one_day/year=2026/month=06/day=10/data.parquet`. The single
 /// source of truth for the date-partition layout: the data manager's daily
 /// writers and exports, the historical backfill, and the tide trainer's
 /// reader all derive their keys here so they can never diverge.
@@ -55,8 +55,8 @@ mod tests {
     fn test_date_partitioned_key_zero_pads_month_and_day() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 3).unwrap();
         assert_eq!(
-            date_partitioned_key("data/equity/bars", date),
-            "data/equity/bars/year=2026/month=06/day=03/data.parquet"
+            date_partitioned_key("data/derived/equity/bars", date),
+            "data/derived/equity/bars/year=2026/month=06/day=03/data.parquet"
         );
     }
 
@@ -76,7 +76,7 @@ mod tests {
     fn test_date_round_trips_through_a_partitioned_key() {
         for (year, month, day) in [(2026, 6, 3), (2025, 12, 31), (2024, 2, 29), (2026, 1, 1)] {
             let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
-            let key = date_partitioned_key("data/equity/bars", date);
+            let key = date_partitioned_key("data/derived/equity/bars", date);
             assert_eq!(date_from_partitioned_key(&key), Some(date), "key: {key}");
         }
     }
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn test_date_recovered_regardless_of_prefix() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 3).unwrap();
-        for prefix in ["data/equity/bars", "exports/equity/orders", "a", ""] {
+        for prefix in ["data/derived/equity/bars", "exports/equity/orders", "a", ""] {
             let key = date_partitioned_key(prefix, date);
             assert_eq!(
                 date_from_partitioned_key(&key),
@@ -100,13 +100,13 @@ mod tests {
     fn test_malformed_keys_are_skipped_rather_than_parsed() {
         for key in [
             "",
-            "data/equity/bars/details.csv",
-            "data/equity/bars/year=2026/month=06/day=03/manifest.json",
-            "data/equity/bars/year=2026/month=06/data.parquet",
-            "data/equity/bars/year=2026/month=6x/day=03/data.parquet",
-            "data/equity/bars/year=2026/month=13/day=03/data.parquet",
-            "data/equity/bars/year=2026/month=02/day=30/data.parquet",
-            "data/equity/bars/2026/06/03/data.parquet",
+            "data/derived/equity/bars/details.csv",
+            "data/derived/equity/bars/year=2026/month=06/day=03/manifest.json",
+            "data/derived/equity/bars/year=2026/month=06/data.parquet",
+            "data/derived/equity/bars/year=2026/month=6x/day=03/data.parquet",
+            "data/derived/equity/bars/year=2026/month=13/day=03/data.parquet",
+            "data/derived/equity/bars/year=2026/month=02/day=30/data.parquet",
+            "data/derived/equity/bars/2026/06/03/data.parquet",
         ] {
             assert_eq!(date_from_partitioned_key(key), None, "key: {key}");
         }
