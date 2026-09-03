@@ -1,6 +1,6 @@
 //! The S3 bar archive: the trainer's data, repaired to a window rather than topped up by a night.
 //!
-//! One partition per session and cadence under `data/equity/bars/interval=/year=/month=/day=/`.
+//! One partition per session and cadence under `data/derived/equity/bars/interval=/year=/month=/day=/`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -29,7 +29,7 @@ use crate::data::{bars, boundaries, quotes, splits, trades};
 /// Deliberately not under `exports/`, which is where the application's nightly database export
 /// lands. The two datasets live in one bucket and describe overlapping facts, and giving them one
 /// prefix would make whichever job ran second the one that mattered.
-pub const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
+pub const BAR_ARCHIVE_PREFIX: &str = "data/derived/equity/bars";
 
 /// The archive prefix for one bar cadence.
 ///
@@ -46,7 +46,7 @@ pub fn bar_archive_prefix(interval: BarInterval) -> String {
 /// Written for external readers — DuckDB's `training_details` view resolves here. Training does not
 /// read it: the trainer parses the CSV compiled into its own binary, so this copy can be absent
 /// without a model run noticing.
-pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
+pub const DETAILS_ARCHIVE_KEY: &str = "data/derived/equity/details/details.csv";
 
 /// S3 key for the stock splits the bars are adjusted against.
 ///
@@ -59,13 +59,13 @@ pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 ///
 /// Under `corporate_actions/` rather than a directory of its own, because spinoffs and symbol
 /// changes are the same kind of fact read the same way and belong beside it as sibling files.
-pub const SPLITS_ARCHIVE_KEY: &str = "data/equity/corporate_actions/splits.parquet";
+pub const SPLITS_ARCHIVE_KEY: &str = "data/derived/equity/corporate_actions/splits.parquet";
 
 /// Object holding every date a symbol's price series may not be read across.
 ///
 /// Beside the splits table rather than merged into it, because the two are read for opposite
 /// purposes: a split says how to restate a price across a date, a boundary says not to.
-pub const BOUNDARIES_ARCHIVE_KEY: &str = "data/equity/corporate_actions/boundaries.parquet";
+pub const BOUNDARIES_ARCHIVE_KEY: &str = "data/derived/equity/corporate_actions/boundaries.parquet";
 
 /// Trailing sessions re-fetched even when a partition already exists.
 ///
@@ -1557,7 +1557,7 @@ fn merge_or_replace(
 /// Keyed by what the rows describe, not by who supplied them: the five-year backfill folded these
 /// from Massive's flat files and a repair folds the same names from Alpaca, so one session's
 /// partition routinely holds both. Splitting by vendor would put one session under two keys.
-pub const QUOTE_ARCHIVE_PREFIX: &str = "data/equity/quotes";
+pub const QUOTE_ARCHIVE_PREFIX: &str = "data/derived/equity/quotes";
 
 /// The archive prefix for one summary cadence, hive-partitioned like the bars.
 pub fn quote_archive_prefix(interval: BarInterval) -> String {
@@ -1565,7 +1565,7 @@ pub fn quote_archive_prefix(interval: BarInterval) -> String {
 }
 
 /// Root of the trade-summary archive, beside the quotes it will eventually be differenced against.
-pub const TRADE_ARCHIVE_PREFIX: &str = "data/equity/trades";
+pub const TRADE_ARCHIVE_PREFIX: &str = "data/derived/equity/trades";
 
 /// The archive prefix for one trade cadence, hive-partitioned like the quotes.
 pub fn trade_archive_prefix(interval: BarInterval) -> String {
@@ -2511,15 +2511,15 @@ mod tests {
 
         assert_eq!(
             key(BarInterval::OneMinute),
-            "data/equity/trades/interval=one_minute/year=2026/month=08/day=21/data.parquet"
+            "data/derived/equity/trades/interval=one_minute/year=2026/month=08/day=21/data.parquet"
         );
         assert_eq!(
             key(BarInterval::FiveMinute),
-            "data/equity/trades/interval=five_minute/year=2026/month=08/day=21/data.parquet"
+            "data/derived/equity/trades/interval=five_minute/year=2026/month=08/day=21/data.parquet"
         );
         assert_eq!(
             key(BarInterval::OneDay),
-            "data/equity/trades/interval=one_day/year=2026/month=08/day=21/data.parquet"
+            "data/derived/equity/trades/interval=one_day/year=2026/month=08/day=21/data.parquet"
         );
 
         // Disjoint from the quote archive at every cadence, so one session's two datasets cannot
@@ -2592,15 +2592,15 @@ mod tests {
 
         assert_eq!(
             date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), date),
-            "data/equity/bars/interval=one_day/year=2026/month=08/day=19/data.parquet"
+            "data/derived/equity/bars/interval=one_day/year=2026/month=08/day=19/data.parquet"
         );
         assert_eq!(
             date_partitioned_key(&bar_archive_prefix(BarInterval::OneMinute), date),
-            "data/equity/bars/interval=one_minute/year=2026/month=08/day=19/data.parquet"
+            "data/derived/equity/bars/interval=one_minute/year=2026/month=08/day=19/data.parquet"
         );
         assert_eq!(
             date_partitioned_key(&bar_archive_prefix(BarInterval::FiveMinute), date),
-            "data/equity/bars/interval=five_minute/year=2026/month=08/day=19/data.parquet"
+            "data/derived/equity/bars/interval=five_minute/year=2026/month=08/day=19/data.parquet"
         );
     }
 
@@ -2613,11 +2613,11 @@ mod tests {
 
         assert_eq!(
             date_partitioned_key(&quote_archive_prefix(BarInterval::OneDay), date),
-            "data/equity/quotes/interval=one_day/year=2026/month=08/day=19/data.parquet"
+            "data/derived/equity/quotes/interval=one_day/year=2026/month=08/day=19/data.parquet"
         );
         assert_eq!(
             date_partitioned_key(&quote_archive_prefix(BarInterval::FiveMinute), date),
-            "data/equity/quotes/interval=five_minute/year=2026/month=08/day=19/data.parquet"
+            "data/derived/equity/quotes/interval=five_minute/year=2026/month=08/day=19/data.parquet"
         );
         for interval in BarInterval::ALL {
             let quotes = date_partitioned_key(&quote_archive_prefix(interval), date);

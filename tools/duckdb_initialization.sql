@@ -54,7 +54,7 @@ DROP VIEW IF EXISTS training_bars;
 CREATE OR REPLACE VIEW training_bars AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('archive_bucket') || '/data/equity/bars/interval=one_day/**/*.parquet',
+    's3://' || getvariable('archive_bucket') || '/data/derived/equity/bars/interval=one_day/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -63,7 +63,7 @@ DROP VIEW IF EXISTS training_details;
 CREATE OR REPLACE VIEW training_details AS
 SELECT *
 FROM read_csv(
-    's3://' || getvariable('archive_bucket') || '/data/equity/details/details.csv',
+    's3://' || getvariable('archive_bucket') || '/data/derived/equity/details/details.csv',
     auto_detect = true
 );
 
@@ -91,7 +91,7 @@ SELECT
     split_to,
     to_timestamp(first_seen / 1000.0) AS first_seen
 FROM read_parquet(
-    's3://' || getvariable('archive_bucket') || '/data/equity/corporate_actions/splits.parquet'
+    's3://' || getvariable('archive_bucket') || '/data/derived/equity/corporate_actions/splits.parquet'
 );
 
 -- The dates a symbol's series may not be read across. `related_ticker` is where a rename continues
@@ -108,7 +108,7 @@ SELECT
     related_ticker,
     to_timestamp(first_seen / 1000.0) AS first_seen
 FROM read_parquet(
-    's3://' || getvariable('archive_bucket') || '/data/equity/corporate_actions/boundaries.parquet'
+    's3://' || getvariable('archive_bucket') || '/data/derived/equity/corporate_actions/boundaries.parquet'
 );
 
 -- ---------------------------------------------------------------------------
