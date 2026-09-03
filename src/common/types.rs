@@ -621,9 +621,9 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
 
 /// The sampling interval of an OHLCV bar.
 ///
-/// Part of the `equity_bars` primary key. Nothing writes [`BarInterval::OneMinute`] today; the
-/// CHECK constraint permits it, so "daily only" is a property of the current writers rather than of
-/// the table.
+/// Part of the `equity_bars` primary key. Every variant now has a writer:
+/// [`BarInterval::OneMinute`] gained one with the flat-file bar route, which had been the outstanding
+/// case this paragraph used to record.
 ///
 /// [`BarInterval::as_str`] must match the `bar_interval` CHECK constraint exactly. It is the
 /// snake_case of the variant name, which lets `rename_all` derive the same string for serde so what
