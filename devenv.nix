@@ -1071,7 +1071,7 @@ in {
       export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
       export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
       echo "Rehearsing against PRODUCTION ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
-      echo "  Reading and repairing s3://$AWS_S3_ARCHIVE_BUCKET_NAME/data/equity/bars/interval=one_day/"
+      echo "  Reading and repairing s3://$AWS_S3_ARCHIVE_BUCKET_NAME/data/derived/equity/bars/interval=one_day/"
       echo "  Publishing to s3://$AWS_S3_RECORDS_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
       secretspec run -- cargo run --release --bin tide_model_trainer
     '';
