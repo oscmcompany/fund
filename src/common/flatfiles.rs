@@ -258,9 +258,8 @@ where
 /// partition. Quotes and trades cannot do this — their sinks aggregate ticks into summaries.
 impl BarSink for Vec<EquityBar> {
     fn push(&mut self, bar: EquityBar) {
-        // Spelled as an inherent call. `self.push(bar)` also resolves here -- an inherent method
-        // wins over a trait one -- but it reads as unbounded recursion, and the rule that saves it
-        // is not one a reader should have to recall to believe this line terminates.
+        // Explicit because `self.push(bar)` reads as unbounded recursion, even though the
+        // inherent method wins over the trait one.
         Vec::push(self, bar)
     }
 }
@@ -277,7 +276,7 @@ pub enum RawDataset {
     Trades,
     /// Massive's own name for one-minute OHLCV bars, kept over `bars` so provenance reads off the
     /// key: `minute_aggs_v1` is a vendor dataset, where `interval=one_minute` is our cadence.
-    MinuteAggs,
+    MinuteAggregates,
 }
 
 impl RawDataset {
@@ -286,7 +285,7 @@ impl RawDataset {
         match self {
             RawDataset::Quotes => "quotes",
             RawDataset::Trades => "trades",
-            RawDataset::MinuteAggs => "minute_aggs",
+            RawDataset::MinuteAggregates => "minute_aggs",
         }
     }
 
@@ -295,7 +294,7 @@ impl RawDataset {
         match self {
             RawDataset::Quotes => "quotes_v1",
             RawDataset::Trades => "trades_v1",
-            RawDataset::MinuteAggs => "minute_aggs_v1",
+            RawDataset::MinuteAggregates => "minute_aggs_v1",
         }
     }
 
@@ -334,7 +333,7 @@ pub fn trade_key(date: NaiveDate) -> String {
 
 /// The S3 key holding one day of one-minute bars.
 pub fn bar_key(date: NaiveDate) -> String {
-    RawDataset::MinuteAggs.key(date)
+    RawDataset::MinuteAggregates.key(date)
 }
 
 /// What one file cost and what it yielded.
@@ -880,9 +879,12 @@ impl FlatFileClient {
 
         let scoped = key.clone();
         let ((mut summary, fold), compressed_bytes) = self
-            .fold_object(key.clone(), RawDataset::MinuteAggs, date, move |reader| {
-                fold_gzipped_bars(reader, &scoped, fold)
-            })
+            .fold_object(
+                key.clone(),
+                RawDataset::MinuteAggregates,
+                date,
+                move |reader| fold_gzipped_bars(reader, &scoped, fold),
+            )
             .await?;
 
         summary.compressed_bytes = compressed_bytes;
@@ -1325,10 +1327,9 @@ impl TradeColumns {
 
 /// Where each field of a one-minute bar row sits.
 ///
-/// Resolved by *name*, which is not incidental here: the vendor orders the columns
-/// `volume,open,close,high,low` -- close before high and low. A positional read would swap close
-/// with high, and the result would still be a coherent-looking candle that passes every downstream
-/// check. Name resolution is what makes that unrepresentable rather than merely unlikely.
+/// Resolved by *name* because the vendor orders the columns `volume,open,close,high,low`, with
+/// close before high and low. A positional read would swap the two and still produce a coherent
+/// candle that passes every downstream check.
 struct BarColumns {
     ticker: usize,
     volume: usize,
@@ -2560,7 +2561,7 @@ mod tests {
             "data/raw/massive/equity/trades/schema=v1/year=2021/month=01/day=04/data.csv.gz"
         );
         assert_eq!(
-            raw_key(RawDataset::MinuteAggs, date),
+            raw_key(RawDataset::MinuteAggregates, date),
             "data/raw/massive/equity/minute_aggs/schema=v1/year=2026/month=08/day=28/data.csv.gz"
         );
     }

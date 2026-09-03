@@ -2176,12 +2176,17 @@ async fn archive_bar_flat_file_session(
         return Ok(());
     }
 
-    let written = bars.len();
-    let frame = bars::bars_to_dataframe(&bars)?;
-    write_partition(s3_client, bucket, BarInterval::OneMinute, session, frame).await?;
-    progress.sessions_written += 1;
-    progress.rows_written += written;
-    Ok(())
+    // Through `write_partitions` rather than `write_partition`, for one session at a time. The
+    // plural form is where contention and write faults are carried instead of ending the pass --
+    // the #1106 behaviour, and a third hand-written copy of those arms could drift from it.
+    write_partitions(
+        s3_client,
+        bucket,
+        BarInterval::OneMinute,
+        vec![(session, bars)],
+        progress,
+    )
+    .await
 }
 
 /// Writes a session's trade summaries, one partition per cadence, daily last.
