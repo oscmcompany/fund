@@ -142,7 +142,11 @@ enum BarRoute {
 enum BarFlatFileAction {
     /// Write the sampled sessions that have no one-minute partition yet.
     Archive(QuoteArguments),
-    /// Write every sampled session, replacing ones already written.
+    /// Re-fold every sampled session and merge the result into what is already there.
+    ///
+    /// Merge, not replace: the write path unions the fold with the stored partition, so this adds
+    /// rows and collapses duplicate keys but cannot remove one an earlier pass wrote. Correcting a
+    /// partition downward means deleting it and running `archive` over the gap.
     Widen(QuoteArguments),
 }
 
