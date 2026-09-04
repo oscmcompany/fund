@@ -1262,7 +1262,7 @@ impl QuoteColumns {
     /// Reads one row, or `None` if it is not a book a spread can be read off.
     fn tick(&self, row: &csv::StringRecord) -> Option<(Ticker, QuoteTick)> {
         let field = |index: usize| row.get(index).map(str::trim);
-        let ticker = Ticker::new(field(self.ticker)?)?;
+        let ticker = flat_file_ticker(field(self.ticker)?)?;
         let timestamp = nanoseconds_to_instant(field(self.timestamp)?.parse::<i64>().ok()?)?;
         let tick = QuoteTick::new(
             timestamp,
@@ -1306,7 +1306,7 @@ impl TradeColumns {
     /// Reads one row, or `None` if it is not a print that can carry weight.
     fn tick(&self, row: &csv::StringRecord) -> Option<(Ticker, TradeTick)> {
         let field = |index: usize| row.get(index).map(str::trim);
-        let ticker = Ticker::new(field(self.ticker)?)?;
+        let ticker = flat_file_ticker(field(self.ticker)?)?;
         let timestamp = nanoseconds_to_instant(field(self.timestamp)?.parse::<i64>().ok()?)?;
         let tick = TradeTick::new(
             timestamp,
@@ -1363,7 +1363,7 @@ impl BarColumns {
     /// cannot drift from the one every other producer goes through.
     fn bar(&self, row: &csv::StringRecord) -> Option<EquityBar> {
         let field = |index: usize| row.get(index).map(str::trim);
-        let ticker = Ticker::new(field(self.ticker)?)?;
+        let ticker = flat_file_ticker(field(self.ticker)?)?;
         let timestamp = nanoseconds_to_instant(field(self.window_start)?.parse::<i64>().ok()?)?;
         let price = |index: usize| field(index)?.parse::<f64>().ok();
 
@@ -1405,6 +1405,20 @@ fn parse_conditions(field: &str) -> Vec<u32> {
         .split(',')
         .filter_map(|code| code.trim().parse::<u32>().ok())
         .collect()
+}
+
+/// Reads a flat-file symbol, rejecting the ones where Massive's case carries meaning.
+///
+/// Massive spells a preferred share with a lowercase `p` -- `ABRpD`, `BCpC`, `TpC` -- so case is
+/// semantic in this source alone. [`Ticker::new`] uppercases, which turns `BCpC` into `BCPC` and
+/// merges Balchem's preferred into Balchem's common at the same timestamp. Rejected rather than
+/// preserved: no other dataset in the archive holds preferreds, and admitting ~310 of them a
+/// session under mangled names would widen the universe by a side effect of parsing.
+fn flat_file_ticker(raw: &str) -> Option<Ticker> {
+    if raw.chars().any(|character| character.is_ascii_lowercase()) {
+        return None;
+    }
+    Ticker::new(raw)
 }
 
 /// Massive stamps a SIP quote in nanoseconds since the epoch, and `None` rejects any other unit.
@@ -1595,13 +1609,15 @@ where
     summary.require_ascending(key)?;
 
     if summary.unusable > 0 {
-        // A candle whose prices do not cohere, or a stamp in the wrong unit. Rare, and a file
-        // suddenly half unusable is a vendor change nobody announced.
+        // `bar` rejects on the symbol, the stamp, the volume, an unparseable price and an incoherent
+        // candle, so this counter is five causes and the message names none of them. Measured, it is
+        // one: classifying four whole sessions found 0.7-0.9% of rows rejected and every one a
+        // symbol, mostly preferred shares. A candle or a stamp appearing here would be new.
         warn!(
             key,
             unusable = summary.unusable,
             rows_read = summary.rows_read,
-            "Skipped bars that are not coherent candles"
+            "Skipped rows that did not yield a bar"
         );
     }
     Ok((summary, fold))
@@ -1824,6 +1840,49 @@ mod tests {
         assert_eq!(summary.unusable, 1);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].ticker().as_str(), "A");
+    }
+
+    /// A preferred share is skipped on its symbol, which is what `unusable` actually counts.
+    ///
+    /// Measured over four sessions spanning the corpus: ~380-450 rows a session carry a lowercase
+    /// `p`, and none of the skipped rows was a malformed candle. `TRTNpE` would also fail the
+    /// five-character base, and `VST.WS.A` fails the suffix rule, but neither is the rule that has
+    /// to hold -- `ABRpD` passes both and is still not a security this archive stores.
+    #[test]
+    fn test_a_preferred_share_symbol_is_skipped_rather_than_written() {
+        let common = "TRTN,100,156.500000,158.000000,158.000000,156.090000,1787319000000000000,127";
+        // Five characters uppercased, so length alone would have admitted it.
+        let preferred = "ABRpD,100,25.500000,25.600000,25.700000,25.400000,1787319000000000000,4";
+        let warrant_series =
+            "VST.WS.A,100,1.500000,1.600000,1.700000,1.400000,1787319000000000000,2";
+        let body = format!("{BAR_HEADER}\n{common}\n{preferred}\n{warrant_series}\n");
+        let (summary, seen) = fold_bars_body(&body);
+        let summary = summary.expect("a readable file");
+        assert_eq!(summary.rows_read, 3);
+        assert_eq!(summary.unusable, 2);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].ticker().as_str(), "TRTN");
+    }
+
+    /// A preferred share must not merge into the common stock it uppercases onto.
+    ///
+    /// This is the one that cost a whole pass. `BCpC` is a preferred and `BCPC` is Balchem; folding
+    /// case put both under `BCPC` at the same minute, so a session held two rows for one key and a
+    /// five-minute close came out 157 points from the REST archive's. Three names collide this way
+    /// -- `BCpC`, `TpC` and `CpK` -- and every other lowercase name lands under a ticker that
+    /// belongs to nothing at all, which is quieter and no more correct.
+    #[test]
+    fn test_a_preferred_share_does_not_merge_into_the_common_it_uppercases_onto() {
+        let common = "BCPC,1136,178.120000,178.120000,178.120000,178.120000,1787319000000000000,81";
+        let preferred = "BCpC,806,23.680000,23.680000,23.680000,23.680000,1787319000000000000,1";
+        let body = format!("{BAR_HEADER}\n{common}\n{preferred}\n");
+        let (summary, seen) = fold_bars_body(&body);
+        let summary = summary.expect("a readable file");
+        assert_eq!(summary.rows_read, 2);
+        assert_eq!(summary.unusable, 1);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].ticker().as_str(), "BCPC");
+        assert_eq!(seen[0].close_price(), 178.12);
     }
 
     /// The trade fold reads the SIP clock, the fractional size, and the condition set.

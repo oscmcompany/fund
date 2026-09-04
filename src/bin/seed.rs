@@ -142,7 +142,12 @@ enum BarRoute {
 enum BarFlatFileAction {
     /// Write the sampled sessions that have no one-minute partition yet.
     Archive(QuoteArguments),
-    /// Write every sampled session, replacing ones already written.
+    /// Re-fold every sampled session and merge the result into what is already there.
+    ///
+    /// Merge, not replace. A row the re-fold produces wins its key, so a corrected value does land;
+    /// a row the re-fold no longer produces is not matched, and survives. Shrinking a partition --
+    /// dropping a name that should never have been stored -- therefore means deleting it and running
+    /// `archive` over the gap, since no merge can remove what it does not overwrite.
     Widen(QuoteArguments),
 }
 
