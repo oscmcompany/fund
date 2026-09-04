@@ -11,7 +11,7 @@ use flate2::read::GzDecoder;
 use tracing::{info, warn};
 
 use crate::common::alpaca::{QuoteTick, TradeTick};
-use crate::common::types::Ticker;
+use crate::common::types::{BarInterval, EquityBar, Ticker};
 
 /// The bucket every dataset lives under, which Massive support named on 2026-08-24.
 const FLAT_FILE_BUCKET: &str = "flatfiles";
@@ -74,6 +74,13 @@ const PRICE_COLUMN: &str = "price";
 const SIZE_COLUMN: &str = "size";
 const CONDITIONS_COLUMN: &str = "conditions";
 const CORRECTION_COLUMN: &str = "correction";
+const VOLUME_COLUMN: &str = "volume";
+const OPEN_COLUMN: &str = "open";
+const CLOSE_COLUMN: &str = "close";
+const HIGH_COLUMN: &str = "high";
+const LOW_COLUMN: &str = "low";
+const WINDOW_START_COLUMN: &str = "window_start";
+const TRANSACTIONS_COLUMN: &str = "transactions";
 
 /// Why a flat-file read failed.
 #[derive(Debug, thiserror::Error)]
@@ -225,32 +232,108 @@ where
     }
 }
 
-/// The S3 key holding one day of consolidated quotes.
+/// Somewhere for a file's bars to go, on the same reasoning as [`QuoteSink`].
 ///
-/// The `us_stocks_sip` prefix is Massive's own and corroborates the SIP sourcing behind their NBBO
-/// answer — a file under it is the consolidated book rather than one venue's.
+/// Takes a whole [`EquityBar`] rather than a tick, because a bar row *is* an output row: there is
+/// nothing to fold, only to validate and place.
+pub trait BarSink {
+    fn push(&mut self, bar: EquityBar);
+}
+
+/// The bar half of [`ForEach`], distinct for the same reason as [`ForEachTrade`].
+pub struct ForEachBar<F>(pub F);
+
+impl<F> BarSink for ForEachBar<F>
+where
+    F: FnMut(EquityBar),
+{
+    fn push(&mut self, bar: EquityBar) {
+        (self.0)(bar)
+    }
+}
+
+/// Collecting the session whole, which is what the archive pass wants.
+///
+/// No adapter needed: a bar row is already an output row, so the vector the fold returns *is* the
+/// partition. Quotes and trades cannot do this — their sinks aggregate ticks into summaries.
+impl BarSink for Vec<EquityBar> {
+    fn push(&mut self, bar: EquityBar) {
+        // Explicit because `self.push(bar)` reads as unbounded recursion, even though the
+        // inherent method wins over the trait one.
+        Vec::push(self, bar)
+    }
+}
+
+/// One of Massive's flat-file datasets, which is also which parser its rows want.
+///
+/// An enum rather than the string this used to be, because the value names two things that must
+/// agree — the vendor path a fold reads and the archive prefix its bytes are teed to — and a pair of
+/// strings passed separately can disagree. Both derive from the variant here, so a fold cannot read
+/// trades and file them under quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawDataset {
+    Quotes,
+    Trades,
+    /// Massive's own name for one-minute OHLCV bars, kept over `bars` so provenance reads off the
+    /// key: `minute_aggs_v1` is a vendor dataset, where `interval=one_minute` is our cadence.
+    MinuteAggregates,
+}
+
+impl RawDataset {
+    /// The segment naming this dataset under `data/raw/massive/equity/`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RawDataset::Quotes => "quotes",
+            RawDataset::Trades => "trades",
+            RawDataset::MinuteAggregates => "minute_aggs",
+        }
+    }
+
+    /// Massive's own dataset directory, which carries their schema version in its name.
+    fn vendor_segment(self) -> &'static str {
+        match self {
+            RawDataset::Quotes => "quotes_v1",
+            RawDataset::Trades => "trades_v1",
+            RawDataset::MinuteAggregates => "minute_aggs_v1",
+        }
+    }
+
+    /// The S3 key holding one day of this dataset.
+    ///
+    /// The `us_stocks_sip` prefix is Massive's own and corroborates the SIP sourcing behind their
+    /// NBBO answer — a file under it is the consolidated book rather than one venue's. One layout
+    /// across all three datasets is what lets a pass read any of them without a second convention.
+    pub fn key(self, date: NaiveDate) -> String {
+        use chrono::Datelike;
+        format!(
+            "us_stocks_sip/{}/{}/{:02}/{}.csv.gz",
+            self.vendor_segment(),
+            date.year(),
+            date.month(),
+            date.format("%Y-%m-%d")
+        )
+    }
+}
+
+impl std::fmt::Display for RawDataset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The S3 key holding one day of consolidated quotes.
 pub fn quote_key(date: NaiveDate) -> String {
-    use chrono::Datelike;
-    format!(
-        "us_stocks_sip/quotes_v1/{}/{:02}/{}.csv.gz",
-        date.year(),
-        date.month(),
-        date.format("%Y-%m-%d")
-    )
+    RawDataset::Quotes.key(date)
 }
 
 /// The S3 key holding one day of consolidated trades.
-///
-/// The same layout as [`quote_key`] under a sibling dataset, which is what lets one pass read both
-/// halves of a session without a second convention.
 pub fn trade_key(date: NaiveDate) -> String {
-    use chrono::Datelike;
-    format!(
-        "us_stocks_sip/trades_v1/{}/{:02}/{}.csv.gz",
-        date.year(),
-        date.month(),
-        date.format("%Y-%m-%d")
-    )
+    RawDataset::Trades.key(date)
+}
+
+/// The S3 key holding one day of one-minute bars.
+pub fn bar_key(date: NaiveDate) -> String {
+    RawDataset::MinuteAggregates.key(date)
 }
 
 /// What one file cost and what it yielded.
@@ -644,10 +727,10 @@ fn read_fully(file: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<us
 /// `schema=v1` is a hive dimension carrying Massive's *schema* version rather than their filename:
 /// the column layout and the quote size-unit change are both properties of `quotes_v1`, so a re-fold
 /// years from now knows which parser the bytes want.
-pub fn raw_key(dataset: &str, date: NaiveDate) -> String {
+pub fn raw_key(dataset: RawDataset, date: NaiveDate) -> String {
     format!(
         "data/raw/massive/equity/{}/schema=v1/year={}/month={:02}/day={:02}/data.csv.gz",
-        dataset,
+        dataset.as_str(),
         date.year(),
         date.month(),
         date.day()
@@ -725,7 +808,7 @@ impl FlatFileClient {
 
         let scoped = key.clone();
         let ((mut summary, fold), compressed_bytes) = self
-            .fold_object(key.clone(), "quotes", date, move |reader| {
+            .fold_object(key.clone(), RawDataset::Quotes, date, move |reader| {
                 fold_gzipped_quotes(reader, &scoped, fold)
             })
             .await?;
@@ -760,7 +843,7 @@ impl FlatFileClient {
 
         let scoped = key.clone();
         let ((mut summary, fold), compressed_bytes) = self
-            .fold_object(key.clone(), "trades", date, move |reader| {
+            .fold_object(key.clone(), RawDataset::Trades, date, move |reader| {
                 fold_gzipped_trades(reader, &scoped, fold)
             })
             .await?;
@@ -777,6 +860,45 @@ impl FlatFileClient {
                 .map_or("unmeasured", |layout| layout.as_str()),
             compressed_bytes,
             "Folded a flat file of trades"
+        );
+        Ok((summary, fold))
+    }
+
+    /// Streams one day of one-minute bars, handing every coherent candle to `fold`.
+    ///
+    /// The same transport as [`FlatFileClient::fold_quotes`] over a third dataset — the ranges, the
+    /// blocking parse, the ordering guarantee and the raw tee are all shared. What differs is that a
+    /// bar row is already an output row, so nothing is aggregated on the way through.
+    pub async fn fold_bars<S: BarSink + Send + 'static>(
+        &self,
+        date: NaiveDate,
+        fold: S,
+    ) -> Result<(FlatFileFold, S), FlatFileError> {
+        let key = bar_key(date);
+        info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of bars");
+
+        let scoped = key.clone();
+        let ((mut summary, fold), compressed_bytes) = self
+            .fold_object(
+                key.clone(),
+                RawDataset::MinuteAggregates,
+                date,
+                move |reader| fold_gzipped_bars(reader, &scoped, fold),
+            )
+            .await?;
+
+        summary.compressed_bytes = compressed_bytes;
+        info!(
+            key,
+            rows_read = summary.rows_read,
+            bars_folded = summary.ticks_folded,
+            unusable = summary.unusable,
+            tickers = summary.tickers,
+            layout = summary
+                .layout()
+                .map_or("unmeasured", |layout| layout.as_str()),
+            compressed_bytes,
+            "Folded a flat file of bars"
         );
         Ok((summary, fold))
     }
@@ -826,7 +948,7 @@ impl FlatFileClient {
     async fn fold_object<T>(
         &self,
         key: String,
-        dataset: &str,
+        dataset: RawDataset,
         date: NaiveDate,
         parse: impl FnOnce(ChunkReader) -> Result<T, FlatFileError> + Send + 'static,
     ) -> Result<(T, i64), FlatFileError>
@@ -1203,6 +1325,77 @@ impl TradeColumns {
     }
 }
 
+/// Where each field of a one-minute bar row sits.
+///
+/// Resolved by *name* because the vendor orders the columns `volume,open,close,high,low`, with
+/// close before high and low. A positional read would swap the two and still produce a coherent
+/// candle that passes every downstream check.
+struct BarColumns {
+    ticker: usize,
+    volume: usize,
+    open: usize,
+    close: usize,
+    high: usize,
+    low: usize,
+    window_start: usize,
+    transactions: usize,
+}
+
+impl BarColumns {
+    fn resolve(header: &csv::StringRecord, key: &str) -> Result<Self, FlatFileError> {
+        let index = |column: &'static str| column_index(header, key, column);
+        Ok(Self {
+            ticker: index(TICKER_COLUMN)?,
+            volume: index(VOLUME_COLUMN)?,
+            open: index(OPEN_COLUMN)?,
+            close: index(CLOSE_COLUMN)?,
+            high: index(HIGH_COLUMN)?,
+            low: index(LOW_COLUMN)?,
+            window_start: index(WINDOW_START_COLUMN)?,
+            transactions: index(TRANSACTIONS_COLUMN)?,
+        })
+    }
+
+    /// Reads one row, or `None` if it is not a candle worth storing.
+    ///
+    /// The coherence rules -- finite, positive, low <= open/close <= high -- are not checked here.
+    /// `EquityBar::new` owns them, so a bar that exists is a bar that validated, and this path
+    /// cannot drift from the one every other producer goes through.
+    fn bar(&self, row: &csv::StringRecord) -> Option<EquityBar> {
+        let field = |index: usize| row.get(index).map(str::trim);
+        let ticker = Ticker::new(field(self.ticker)?)?;
+        let timestamp = nanoseconds_to_instant(field(self.window_start)?.parse::<i64>().ok()?)?;
+        let price = |index: usize| field(index)?.parse::<f64>().ok();
+
+        // Fractional, as the trade tape is: 109807.346392 shares is an ordinary row. Rounded on the
+        // same terms as the REST route (`massive.rs`), so the two agree on whole shares.
+        let volume = field(self.volume)?.parse::<f64>().ok()?;
+        if !volume.is_finite() || volume < 0.0 {
+            return None;
+        }
+        let rounded = volume.round();
+        if rounded > i64::MAX as f64 {
+            return None;
+        }
+
+        EquityBar::new(
+            ticker,
+            BarInterval::OneMinute,
+            timestamp,
+            price(self.open)?,
+            price(self.high)?,
+            price(self.low)?,
+            price(self.close)?,
+            rounded as i64,
+            // The flat file carries no `vw`, where the REST aggregates route does. Absent rather
+            // than zero: a zero would read as a real volume-weighted price of nothing.
+            None,
+            field(self.transactions)?.parse::<i64>().ok(),
+        )
+        .ok()
+    }
+}
+
 /// Splits the comma-separated condition set, dropping codes that are not numbers.
 ///
 /// Parsed to integers rather than matched as text, because the field holds a *set*: `"14,12,37,41"`
@@ -1364,6 +1557,56 @@ where
     Ok((summary, fold))
 }
 
+/// Parses one gzipped bar file, handing every coherent candle to `fold`.
+///
+/// The same shape as [`fold_gzipped_trades`] over a sibling dataset. `ticks_folded` counts bars
+/// here, which keeps one summary type across all three datasets rather than a third vocabulary for
+/// the same question: how many rows survived.
+fn fold_gzipped_bars<R, S>(
+    reader: R,
+    key: &str,
+    mut fold: S,
+) -> Result<(FlatFileFold, S), FlatFileError>
+where
+    R: std::io::Read,
+    S: BarSink,
+{
+    let mut records = csv::Reader::from_reader(GzDecoder::new(reader));
+    let header = records.headers().map_err(|error| read_error(key, error))?;
+    let columns = BarColumns::resolve(header, key)?;
+
+    let mut summary = FlatFileFold::default();
+    let mut runs = TickerRuns::default();
+    let mut row = csv::StringRecord::new();
+    while records
+        .read_record(&mut row)
+        .map_err(|error| read_error(key, error))?
+    {
+        summary.rows_read += 1;
+        let Some(bar) = columns.bar(&row) else {
+            summary.unusable += 1;
+            continue;
+        };
+        runs.observe(bar.ticker(), bar.timestamp(), &mut summary);
+        summary.ticks_folded += 1;
+        fold.push(bar);
+    }
+
+    summary.require_ascending(key)?;
+
+    if summary.unusable > 0 {
+        // A candle whose prices do not cohere, or a stamp in the wrong unit. Rare, and a file
+        // suddenly half unusable is a vendor change nobody announced.
+        warn!(
+            key,
+            unusable = summary.unusable,
+            rows_read = summary.rows_read,
+            "Skipped bars that are not coherent candles"
+        );
+    }
+    Ok((summary, fold))
+}
+
 fn read_error(key: &str, error: csv::Error) -> FlatFileError {
     FlatFileError::Read {
         key: key.to_string(),
@@ -1482,6 +1725,105 @@ mod tests {
         );
         let observed = seen.borrow().clone();
         (summary.map(|(summary, _)| summary), observed)
+    }
+
+    /// The header exactly as the vendor writes it, verified against a live file on 2026-08-21.
+    ///
+    /// `open,close,high,low` -- close sits before high and low. Kept verbatim so a test cannot
+    /// quietly "fix" the order into OHLC and stop covering the trap the real file sets.
+    const BAR_HEADER: &str = "ticker,volume,open,close,high,low,window_start,transactions";
+
+    fn fold_bars_body(body: &str) -> (Result<FlatFileFold, FlatFileError>, Vec<EquityBar>) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let collector = std::rc::Rc::clone(&seen);
+        let summary = fold_gzipped_bars(
+            std::io::Cursor::new(gzipped(body)),
+            "minute_aggs.csv.gz",
+            ForEachBar(move |bar: EquityBar| collector.borrow_mut().push(bar)),
+        );
+        let observed = seen.borrow().clone();
+        (summary.map(|(summary, _)| summary), observed)
+    }
+
+    /// A bar row is read by column *name*, so the vendor's `open,close,high,low` cannot invert it.
+    ///
+    /// The fixture is the real first row of 2026-08-21. Its close (158.00) equals its high and its
+    /// low (156.09) is neither, so a positional read that took the third numeric column as high
+    /// would still produce a candle `EquityBar::new` accepts -- which is exactly why the assertion
+    /// pins every price rather than checking the row merely parsed.
+    #[test]
+    fn test_a_bar_row_is_read_by_column_name_not_position() {
+        let body = format!("{BAR_HEADER}\nA,109807.346392,156.500000,158.000000,158.000000,156.090000,1787319000000000000,127\n");
+        let (summary, seen) = fold_bars_body(&body);
+        let summary = summary.expect("a usable file");
+        assert_eq!(summary.rows_read, 1);
+        assert_eq!(summary.unusable, 0);
+
+        let bar = seen.first().expect("one bar");
+        assert_eq!(bar.ticker().as_str(), "A");
+        assert_eq!(bar.open_price(), 156.50);
+        assert_eq!(bar.high_price(), 158.00);
+        assert_eq!(bar.low_price(), 156.09);
+        assert_eq!(bar.close_price(), 158.00);
+        assert_eq!(bar.bar_interval(), BarInterval::OneMinute);
+    }
+
+    /// Fractional volume rounds to whole shares, on the same terms as the REST route.
+    #[test]
+    fn test_a_fractional_volume_rounds_to_whole_shares() {
+        let body = format!("{BAR_HEADER}\nA,109807.346392,156.500000,158.000000,158.000000,156.090000,1787319000000000000,127\n");
+        let (_, seen) = fold_bars_body(&body);
+        assert_eq!(seen.first().expect("one bar").volume(), 109_807);
+    }
+
+    /// The flat file carries no `vw`, and its absence is `None` rather than a zero or an error.
+    ///
+    /// A zero would read as a real volume-weighted price of nothing, and anything comparing the
+    /// one-minute archive against the REST-built five-minute one would see a price of 0.00.
+    #[test]
+    fn test_a_flat_file_bar_carries_no_volume_weighted_price() {
+        let body = format!("{BAR_HEADER}\nA,100,156.500000,158.000000,158.000000,156.090000,1787319000000000000,127\n");
+        let (_, seen) = fold_bars_body(&body);
+        assert_eq!(
+            seen.first()
+                .expect("one bar")
+                .volume_weighted_average_price(),
+            None
+        );
+    }
+
+    /// A `window_start` in milliseconds is refused rather than placed in 1970.
+    ///
+    /// The same guard the trade fold relies on. A millisecond stamp converts without complaint and
+    /// lands fifty years early, where it would count as usable and sit in the wrong partition.
+    #[test]
+    fn test_a_bar_stamped_in_the_wrong_unit_is_unusable() {
+        let body = format!(
+            "{BAR_HEADER}\nA,100,156.500000,158.000000,158.000000,156.090000,1787319000000,127\n"
+        );
+        let (summary, seen) = fold_bars_body(&body);
+        let summary = summary.expect("a readable file");
+        assert_eq!(summary.rows_read, 1);
+        assert_eq!(summary.unusable, 1);
+        assert!(seen.is_empty());
+    }
+
+    /// A candle whose prices do not cohere is counted, not written.
+    ///
+    /// `EquityBar::new` owns the rule; this pins that the fold routes its rejection to `unusable`
+    /// rather than failing the whole file, which one bad row in five million should not do.
+    #[test]
+    fn test_an_incoherent_candle_is_counted_rather_than_failing_the_file() {
+        let good = "A,100,156.500000,158.000000,158.000000,156.090000,1787319000000000000,127";
+        // A low above its own high.
+        let bad = "B,100,156.500000,158.000000,150.000000,199.000000,1787319000000000000,12";
+        let body = format!("{BAR_HEADER}\n{good}\n{bad}\n");
+        let (summary, seen) = fold_bars_body(&body);
+        let summary = summary.expect("a readable file");
+        assert_eq!(summary.rows_read, 2);
+        assert_eq!(summary.unusable, 1);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].ticker().as_str(), "A");
     }
 
     /// The trade fold reads the SIP clock, the fractional size, and the condition set.
@@ -2169,7 +2511,7 @@ mod tests {
 
         let date = NaiveDate::from_ymd_opt(2021, 9, 1).expect("a real date");
         let outcome = client
-            .fold_object(trade_key(date), "trades", date, |mut reader| {
+            .fold_object(trade_key(date), RawDataset::Trades, date, |mut reader| {
                 let mut sink = Vec::new();
                 std::io::copy(&mut reader, &mut sink).expect("the staged stream");
                 Ok(sink.len())
@@ -2208,12 +2550,19 @@ mod tests {
     fn test_the_raw_key_carries_the_prefix_the_lifecycle_rule_matches() {
         let date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
         assert_eq!(
-            raw_key("quotes", date),
+            raw_key(RawDataset::Quotes, date),
             "data/raw/massive/equity/quotes/schema=v1/year=2026/month=08/day=28/data.csv.gz"
         );
         assert_eq!(
-            raw_key("trades", NaiveDate::from_ymd_opt(2021, 1, 4).unwrap()),
+            raw_key(
+                RawDataset::Trades,
+                NaiveDate::from_ymd_opt(2021, 1, 4).unwrap()
+            ),
             "data/raw/massive/equity/trades/schema=v1/year=2021/month=01/day=04/data.csv.gz"
+        );
+        assert_eq!(
+            raw_key(RawDataset::MinuteAggregates, date),
+            "data/raw/massive/equity/minute_aggs/schema=v1/year=2026/month=08/day=28/data.csv.gz"
         );
     }
 

@@ -2096,6 +2096,99 @@ async fn archive_trade_session(
     Ok(trades_folded)
 }
 
+/// Writes one-minute bar partitions across `sessions`, per `scope`.
+///
+/// The flat-file counterpart to [`archive_intraday_sessions`], and simpler in one way that matters:
+/// a bar row is already an output row, so there is no universe to derive and no fold to seed. The
+/// file is the whole market, which is the reason to read it rather than 12,000 per-symbol requests.
+pub async fn archive_bar_flat_file_sessions(
+    s3_client: &S3Client,
+    flat_files: &FlatFileClient,
+    bucket: &str,
+    sessions: &[SessionDate],
+    scope: &Scope,
+    calendar: Option<&TradingCalendar>,
+) -> Result<PassSummary, ArchiveError> {
+    let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
+        return Ok(PassProgress::default().into_bar_summary(calendar));
+    };
+    // One cadence, so presence is read off the prefix this pass writes. The trade and quote passes
+    // read theirs off the daily prefix only because they write several and need the last one.
+    let present = present_partitions(
+        s3_client,
+        bucket,
+        &bar_archive_prefix(BarInterval::OneMinute),
+        *first,
+        *last,
+    )
+    .await?;
+    let requested = sessions_for(scope.sessions, sessions, &present);
+
+    info!(
+        window_start = %first,
+        window_end = %last,
+        %scope,
+        offered = sessions.len(),
+        already_written = present.len(),
+        requested = requested.len(),
+        "Planned a one-minute bar pass"
+    );
+
+    let mut progress = PassProgress {
+        sessions_requested: requested.len(),
+        ..Default::default()
+    };
+    for session in requested {
+        archive_bar_flat_file_session(s3_client, flat_files, bucket, session, &mut progress)
+            .await?;
+    }
+
+    info!(
+        sessions_requested = progress.sessions_requested,
+        sessions_written = progress.sessions_written,
+        sessions_without_data = progress.sessions_without_data,
+        sessions_failed = progress.sessions_failed.len(),
+        bars_written = progress.rows_written,
+        "One-minute bar archive updated"
+    );
+    Ok(progress.into_bar_summary(calendar))
+}
+
+/// One session: fold the file into bars and write the single partition they form.
+async fn archive_bar_flat_file_session(
+    s3_client: &S3Client,
+    flat_files: &FlatFileClient,
+    bucket: &str,
+    session: SessionDate,
+    progress: &mut PassProgress,
+) -> Result<(), ArchiveError> {
+    let bars: Vec<EquityBar> = match flat_files.fold_bars(session.date(), Vec::new()).await {
+        Ok((_, bars)) => bars,
+        Err(error) => {
+            // The file is the session: nothing partial survives it, exactly as for trades.
+            warn!(%session, %error, "A session's bar file could not be folded");
+            progress.sessions_failed.push(session);
+            return Ok(());
+        }
+    };
+    if bars.is_empty() {
+        progress.sessions_without_data += 1;
+        return Ok(());
+    }
+
+    // Through `write_partitions` rather than `write_partition`, for one session at a time. The
+    // plural form is where contention and write faults are carried instead of ending the pass --
+    // the #1106 behaviour, and a third hand-written copy of those arms could drift from it.
+    write_partitions(
+        s3_client,
+        bucket,
+        BarInterval::OneMinute,
+        vec![(session, bars)],
+        progress,
+    )
+    .await
+}
+
 /// Writes a session's trade summaries, one partition per cadence, daily last.
 ///
 /// The order is the recovery rule, matching the quote pass: presence is read off the daily prefix,

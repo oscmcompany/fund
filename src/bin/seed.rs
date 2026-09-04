@@ -100,6 +100,7 @@ impl Command {
             Command::EquityBars { route } => match route {
                 BarRoute::Daily { .. } => "seed-equity-bars-daily",
                 BarRoute::Intraday { .. } => "seed-equity-bars-intraday",
+                BarRoute::FlatFile { .. } => "seed-equity-bars-flat-file",
             },
             Command::EquityDetails { .. } => "seed-equity-details",
             Command::EquityQuotes { .. } => "seed-equity-quotes",
@@ -125,6 +126,43 @@ enum BarRoute {
         #[command(subcommand)]
         action: IntradayAction,
     },
+    /// Whole-market one-minute bars off Massive's flat files, into the S3 archive.
+    ///
+    /// A third route rather than a cadence flag on `intraday`, for the reason the two above already
+    /// differ: this one reads a whole session from one object instead of 12,000 per-symbol
+    /// requests, carries no `vw`, and stamps its rows in nanoseconds.
+    FlatFile {
+        #[command(subcommand)]
+        action: BarFlatFileAction,
+    },
+}
+
+/// What a flat-file bar pass does about a session that already has a partition.
+#[derive(Debug, Subcommand)]
+enum BarFlatFileAction {
+    /// Write the sampled sessions that have no one-minute partition yet.
+    Archive(QuoteArguments),
+    /// Write every sampled session, replacing ones already written.
+    Widen(QuoteArguments),
+}
+
+impl BarFlatFileAction {
+    /// The scope this action writes under. Both are whole-market and differ only in sessions.
+    fn scope(&self) -> Result<Scope, SeedError> {
+        whole_market(match self {
+            BarFlatFileAction::Archive(_) => SessionSelection::Absent,
+            BarFlatFileAction::Widen(_) => SessionSelection::Every,
+        })
+    }
+
+    /// The window and stride this action runs over.
+    fn arguments(&self) -> &QuoteArguments {
+        match self {
+            BarFlatFileAction::Archive(arguments) | BarFlatFileAction::Widen(arguments) => {
+                arguments
+            }
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -680,6 +718,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
                 )),
             },
             BarRoute::Intraday { action } => seed_intraday_bars(action).await,
+            BarRoute::FlatFile { action } => seed_flat_file_bars(action).await,
         },
         Command::EquityDetails { target } => {
             match target {
@@ -1189,6 +1228,42 @@ async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
             &bucket,
             &sampled,
             &scope,
+        )
+        .await
+        .map_err(box_error)?,
+    ))
+}
+
+/// Writes whole-market one-minute bars from Massive's flat files.
+///
+/// The trade pass's shape over a different dataset. Sessions come from the trading calendar rather
+/// than from the archive, because a bar file needs no universe to fold against -- the file is the
+/// whole market, which is the reason to read it at all.
+async fn seed_flat_file_bars(action: &BarFlatFileAction) -> Result<Outcome, SeedError> {
+    let arguments = action.arguments();
+    let scope = action.scope()?;
+    let window = arguments.window.window()?;
+
+    let credentials = AlpacaCredentials::from_env().map_err(box_error)?;
+    let days = TradingClient::from_env(credentials)
+        .fetch_calendar(window.start.date(), window.end.date())
+        .await
+        .map_err(box_error)?;
+    let calendar = TradingCalendar::from_days(days);
+    let sampled = sample(&calendar, &window, arguments.stride);
+    report_sample(&window, arguments.stride, &calendar, &sampled);
+
+    let flat_files = flat_file_client(arguments).await?;
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    Ok(Outcome::Pass(
+        archive::archive_bar_flat_file_sessions(
+            &s3_client,
+            &flat_files,
+            &bucket,
+            &sampled,
+            &scope,
+            Some(&calendar),
         )
         .await
         .map_err(box_error)?,
