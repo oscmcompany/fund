@@ -1609,9 +1609,10 @@ where
     summary.require_ascending(key)?;
 
     if summary.unusable > 0 {
-        // In practice this is entirely the symbol: preferred shares, which Massive spells with a
-        // lowercase `p`, are ~0.1% of a session's rows and no part of any archive. Named as the row
-        // it is, not the candle it is not -- measured over four sessions, none was a bad candle.
+        // `bar` rejects on the symbol, the stamp, the volume, an unparseable price and an incoherent
+        // candle, so this counter is five causes and the message names none of them. Measured, it is
+        // one: classifying four whole sessions found 0.7-0.9% of rows rejected and every one a
+        // symbol, mostly preferred shares. A candle or a stamp appearing here would be new.
         warn!(
             key,
             unusable = summary.unusable,
