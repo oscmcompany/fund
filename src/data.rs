@@ -4,6 +4,7 @@
 
 pub mod adjust;
 pub mod archive;
+pub mod attribution;
 pub mod bars;
 pub mod boundaries;
 pub mod cache;

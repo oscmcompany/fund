@@ -19,7 +19,7 @@ use fund::common::types::{
 };
 use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
 use fund::data::calendar::TradingCalendar;
-use fund::data::{bars, details, quotes};
+use fund::data::{attribution, bars, details, quotes};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
 ///
@@ -88,6 +88,33 @@ enum Command {
         #[command(subcommand)]
         action: TradeAction,
     },
+    /// Which vendor and subscription built each archived partition.
+    ArchiveProvenance {
+        #[command(subcommand)]
+        action: ProvenanceAction,
+    },
+}
+
+/// What to do about provenance the archive does not yet record.
+#[derive(Debug, Subcommand)]
+enum ProvenanceAction {
+    /// Write sidecars for partitions that have none, reading the attribution from pass logs.
+    ///
+    /// The logs are one configuration source. A partition already carrying a sidecar is left
+    /// alone: a record written at the time of the write beats one reconstructed afterwards.
+    Backfill(ProvenanceArguments),
+    /// Report partitions carrying no sidecar, writing nothing.
+    Sweep,
+}
+
+#[derive(Debug, Args)]
+struct ProvenanceArguments {
+    /// Directory of pass logs to attribute from, searched recursively for `*.log`.
+    #[arg(long)]
+    from_logs: std::path::PathBuf,
+    /// Count what would be written without writing it.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 impl Command {
@@ -105,6 +132,7 @@ impl Command {
             Command::EquityDetails { .. } => "seed-equity-details",
             Command::EquityQuotes { .. } => "seed-equity-quotes",
             Command::EquityTrades { .. } => "seed-equity-trades",
+            Command::ArchiveProvenance { .. } => "seed-archive-provenance",
         }
     }
 }
@@ -734,6 +762,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         }
         Command::EquityQuotes { action } => seed_quotes(action).await,
         Command::EquityTrades { action } => seed_trades(action).await,
+        Command::ArchiveProvenance { action } => seed_provenance(action).await,
     }
 }
 
@@ -1208,6 +1237,63 @@ async fn flat_file_client(
 ///
 /// The calendar comes from Alpaca and the tape from Massive, which is the same split the quote
 /// pass uses: only the exchange publishes its own hours, and only the flat files hold every print.
+/// Records, or reports, which route built each archived partition.
+///
+/// Reads the archive rather than the calendar: this is about objects that exist, so a session the
+/// archive never held is not a gap here.
+async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    let outcome = match action {
+        ProvenanceAction::Backfill(arguments) => {
+            let attribution =
+                attribution::routes_from_logs(&arguments.from_logs).map_err(box_error)?;
+            info!(
+                logs = %arguments.from_logs.display(),
+                attributed = attribution.len(),
+                dry_run = arguments.dry_run,
+                "Read an attribution from pass logs"
+            );
+            archive::stamp_partition_provenance(
+                &s3_client,
+                &bucket,
+                &attribution,
+                arguments.dry_run,
+            )
+            .await
+            .map_err(box_error)?
+        }
+        ProvenanceAction::Sweep => archive::sweep_partition_provenance(&s3_client, &bucket)
+            .await
+            .map_err(box_error)?,
+    };
+
+    // The population, not just the difference: a run that wrote nothing because everything was
+    // already stamped reads identically to one that found no partitions at all.
+    info!(
+        partitions_seen = outcome.partitions_seen,
+        sidecars_present = outcome.sidecars_present,
+        sidecars_written = outcome.sidecars_written,
+        unattributed = outcome.unattributed.len(),
+        "Provenance pass finished"
+    );
+    for key in outcome.unattributed.iter().take(20) {
+        warn!(
+            key,
+            "Partition carries no provenance and none could be attributed"
+        );
+    }
+    println!(
+        "{} partitions, {} already recorded, {} written, {} unattributed",
+        outcome.partitions_seen,
+        outcome.sidecars_present,
+        outcome.sidecars_written,
+        outcome.unattributed.len()
+    );
+    Ok(Outcome::Complete)
+}
+
 async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
     let arguments = action.arguments();
     let scope = action.universe_scope()?;
