@@ -27,6 +27,8 @@ pub enum AttributionError {
         path: String,
         source: std::io::Error,
     },
+    #[error("could not parse {path}: {message}")]
+    Parse { path: String, message: String },
 }
 
 /// One log line, of the two shapes that name a route.
@@ -120,6 +122,43 @@ fn vendor_key_parts(key: &str) -> Option<(String, Option<BarInterval>, NaiveDate
     let file = key.rsplit('/').next()?;
     let date = file.split('.').next()?.parse().ok()?;
     Some((dataset.to_string(), interval, date))
+}
+
+/// A route declared for a whole prefix rather than observed on a session.
+///
+/// The other half of an attribution. Logs can only speak for passes that logged; a dataset whose
+/// route is uniform by construction — Massive's REST bar cadences, every raw flat file — is
+/// described rather than discovered, and saying so is not a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Declaration {
+    pub dataset: String,
+    /// One cadence, or every cadence of the dataset when absent.
+    #[serde(default)]
+    pub interval: Option<BarInterval>,
+    #[serde(flatten)]
+    pub provenance: Provenance,
+}
+
+#[derive(Deserialize)]
+struct DeclarationFile {
+    declarations: Vec<Declaration>,
+}
+
+/// Reads declared routes from a JSON file.
+///
+/// Refused rather than skipped on a parse failure, unlike a log line: a configuration that does not
+/// parse is a mistake being made now, where a malformed log line is a run that already happened.
+pub fn routes_from_configuration(path: &Path) -> Result<Vec<Declaration>, AttributionError> {
+    let text = std::fs::read_to_string(path).map_err(|source| AttributionError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let parsed: DeclarationFile =
+        serde_json::from_str(&text).map_err(|source| AttributionError::Parse {
+            path: path.display().to_string(),
+            message: source.to_string(),
+        })?;
+    Ok(parsed.declarations)
 }
 
 /// Every `*.log` beneath `directory`, including subdirectories.
@@ -226,6 +265,62 @@ mod tests {
         let found = routes_from_logs(directory.path()).expect("the logs parse");
         assert_eq!(found.len(), 1, "only the one well-formed line counts");
         assert!(found.contains_key(&("equity_quotes".to_string(), None, session(2026, 8, 25))));
+    }
+
+    #[test]
+    fn a_declaration_names_a_route_for_a_whole_prefix() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("declared.json");
+        std::fs::write(
+            &path,
+            r#"{"declarations":[
+                {"dataset":"equity_bars","interval":"five_minute",
+                 "provider":"massive","subscription":"stocks_starter","transport":"rest"},
+                {"dataset":"raw_equity_trades",
+                 "provider":"massive","subscription":"stocks_advanced","transport":"flat_file"}
+            ]}"#,
+        )
+        .expect("the fixture writes");
+
+        let declared = routes_from_configuration(&path).expect("the configuration parses");
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].dataset, "equity_bars");
+        assert_eq!(declared[0].interval, Some(BarInterval::FiveMinute));
+        assert_eq!(
+            declared[0].provenance,
+            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest)
+        );
+        // A raw dataset has no cadence, and an absent field must read as "every one".
+        assert_eq!(declared[1].interval, None);
+    }
+
+    /// A configuration that does not parse is a mistake being made now, unlike a malformed log line.
+    #[test]
+    fn a_broken_configuration_is_refused_rather_than_skipped() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("declared.json");
+        std::fs::write(&path, r#"{"declarations":[{"dataset":"equity_bars"}]}"#)
+            .expect("the fixture writes");
+        assert!(routes_from_configuration(&path).is_err());
+    }
+
+    /// The file shipped in the repository must be the shape the reader expects.
+    #[test]
+    fn the_checked_in_declaration_parses() {
+        let declared = routes_from_configuration(Path::new("data/archive_provenance.json"))
+            .expect("the shipped configuration parses");
+        assert!(
+            declared
+                .iter()
+                .any(|entry| entry.dataset == "raw_equity_trades"),
+            "the raw tee must be declared; nothing else can attribute it"
+        );
+        assert!(
+            declared
+                .iter()
+                .any(|entry| entry.interval == Some(BarInterval::OneDay)),
+            "daily bars have no log to attribute them"
+        );
     }
 
     #[test]

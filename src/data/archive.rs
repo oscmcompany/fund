@@ -8,7 +8,7 @@ use std::io::Cursor;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::*;
 use tracing::{info, warn};
 
@@ -23,7 +23,7 @@ use crate::common::types::{
     BarInterval, EquityBar, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
     TradeSummary,
 };
-use crate::data::attribution::Attribution;
+use crate::data::attribution::{Attribution, Declaration};
 use crate::data::calendar::TradingCalendar;
 use crate::data::{bars, boundaries, quotes, splits, trades};
 
@@ -528,33 +528,72 @@ pub struct ProvenanceOutcome {
     pub unattributed: Vec<String>,
 }
 
-/// Every archive prefix one dataset name covers.
+/// One prefix a provenance pass covers, and what its objects are called.
 ///
 /// Named rather than derived from a listing, so a dataset that stops being written still reports
-/// its partitions instead of silently leaving the sweep.
-fn dataset_prefixes(dataset: &str) -> Vec<(BarInterval, String)> {
-    let cadences = |build: fn(BarInterval) -> String| -> Vec<(BarInterval, String)> {
-        BarInterval::ALL
-            .iter()
-            .map(|at| (*at, build(*at)))
-            .collect()
-    };
-    match dataset {
-        "equity_bars" => cadences(bar_archive_prefix),
-        "equity_quotes" => cadences(quote_archive_prefix),
-        "equity_trades" => cadences(trade_archive_prefix),
-        _ => Vec::new(),
-    }
+/// its objects instead of silently leaving the sweep.
+struct StampablePrefix {
+    dataset: String,
+    /// `None` for a prefix that has no cadence, which is every raw dataset.
+    interval: Option<BarInterval>,
+    prefix: String,
+    /// Derived partitions are parquet; the raw tee keeps the vendor's own gzip.
+    object: &'static str,
 }
 
-/// The datasets a provenance pass covers.
-pub const PROVENANCE_DATASETS: [&str; 3] = ["equity_bars", "equity_quotes", "equity_trades"];
+/// Every prefix a provenance pass covers: the derived cadences, and the raw tee beside them.
+fn stampable_prefixes() -> Vec<StampablePrefix> {
+    let mut found = Vec::new();
+    for (dataset, build) in [
+        (
+            "equity_bars",
+            bar_archive_prefix as fn(BarInterval) -> String,
+        ),
+        ("equity_quotes", quote_archive_prefix),
+        ("equity_trades", trade_archive_prefix),
+    ] {
+        for interval in BarInterval::ALL {
+            found.push(StampablePrefix {
+                dataset: dataset.to_string(),
+                interval: Some(interval),
+                prefix: build(interval),
+                object: "data.parquet",
+            });
+        }
+    }
+    for raw in [
+        RawDataset::Quotes,
+        RawDataset::Trades,
+        RawDataset::MinuteAggregates,
+    ] {
+        found.push(StampablePrefix {
+            dataset: format!("raw_equity_{}", raw.as_str()),
+            interval: None,
+            prefix: format!("data/raw/massive/equity/{}", raw.as_str()),
+            object: "data.csv.gz",
+        });
+    }
+    found
+}
+
+/// The session a partition or raw key belongs to, whatever its object is called.
+fn session_from_key(key: &str, object: &str) -> Option<NaiveDate> {
+    let mut segments = key.rsplit('/');
+    if segments.next()? != object {
+        return None;
+    }
+    let day: u32 = segments.next()?.strip_prefix("day=")?.parse().ok()?;
+    let month: u32 = segments.next()?.strip_prefix("month=")?.parse().ok()?;
+    let year: i32 = segments.next()?.strip_prefix("year=")?.parse().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
 
 /// Every partition key under `prefix`, with whether it already carries a sidecar.
 async fn partitions_and_sidecars(
     s3_client: &S3Client,
     bucket: &str,
     prefix: &str,
+    object: &str,
 ) -> Result<(Vec<String>, BTreeSet<String>), ArchiveError> {
     let mut partitions = Vec::new();
     let mut sidecars = BTreeSet::new();
@@ -571,9 +610,9 @@ async fn partitions_and_sidecars(
             prefix: prefix.to_string(),
             message: error.to_string(),
         })?;
-        for object in page.contents() {
-            let Some(key) = object.key() else { continue };
-            if key.ends_with("/data.parquet") {
+        for listed in page.contents() {
+            let Some(key) = listed.key() else { continue };
+            if key.ends_with(&format!("/{object}")) {
                 partitions.push(key.to_string());
             } else if key.ends_with("/provenance.json") {
                 sidecars.insert(key.to_string());
@@ -591,53 +630,64 @@ pub async fn stamp_partition_provenance(
     s3_client: &S3Client,
     bucket: &str,
     attribution: &Attribution,
+    declarations: &[Declaration],
     dry_run: bool,
 ) -> Result<ProvenanceOutcome, ArchiveError> {
     let mut outcome = ProvenanceOutcome::default();
-    for dataset in PROVENANCE_DATASETS {
-        for (interval, prefix) in dataset_prefixes(dataset) {
-            let (partitions, sidecars) =
-                partitions_and_sidecars(s3_client, bucket, &prefix).await?;
-            for key in partitions {
-                outcome.partitions_seen += 1;
-                let sidecar = PartitionProvenance::sidecar_key(&key);
-                if sidecars.contains(&sidecar) {
-                    outcome.sidecars_present += 1;
-                    continue;
-                }
-                let Some(date) = date_from_partitioned_key(&key) else {
-                    outcome.unattributed.push(key);
-                    continue;
-                };
-                // Cadence-specific first, then the whole-dataset claim. A source that named one
-                // cadence must never speak for the others written on the same session.
-                let routes = attribution
-                    .get(&(dataset.to_string(), Some(interval), date))
-                    .or_else(|| attribution.get(&(dataset.to_string(), None, date)));
-                let Some(routes) = routes else {
-                    outcome.unattributed.push(key);
-                    continue;
-                };
-                let record = PartitionProvenance {
-                    dataset: dataset.to_string(),
-                    session: date.to_string(),
-                    routes: routes.clone(),
-                    written_at: Utc::now(),
-                };
-                if !dry_run {
-                    let body =
-                        serde_json::to_vec(&record).map_err(|error| ArchiveError::Write {
-                            bucket: bucket.to_string(),
-                            key: sidecar.clone(),
-                            message: error.to_string(),
-                        })?;
-                    put_bytes(s3_client, bucket, &sidecar, body, "application/json").await?;
-                }
-                outcome.sidecars_written += 1;
+    for target in stampable_prefixes() {
+        let (objects, sidecars) =
+            partitions_and_sidecars(s3_client, bucket, &target.prefix, target.object).await?;
+        for key in objects {
+            outcome.partitions_seen += 1;
+            let sidecar = PartitionProvenance::sidecar_key(&key);
+            if sidecars.contains(&sidecar) {
+                outcome.sidecars_present += 1;
+                continue;
             }
+            let Some(date) = session_from_key(&key, target.object) else {
+                outcome.unattributed.push(key);
+                continue;
+            };
+            // Observed beats declared, and cadence-specific beats dataset-wide. A source that named
+            // one cadence must never speak for the others written on the same session.
+            let routes = attribution
+                .get(&(target.dataset.clone(), target.interval, date))
+                .or_else(|| attribution.get(&(target.dataset.clone(), None, date)))
+                .cloned()
+                .or_else(|| declared(declarations, &target).map(|route| vec![route]));
+            let Some(routes) = routes else {
+                outcome.unattributed.push(key);
+                continue;
+            };
+            let record = PartitionProvenance {
+                dataset: target.dataset.clone(),
+                session: date.to_string(),
+                routes,
+                written_at: Utc::now(),
+            };
+            if !dry_run {
+                let body = serde_json::to_vec(&record).map_err(|error| ArchiveError::Write {
+                    bucket: bucket.to_string(),
+                    key: sidecar.clone(),
+                    message: error.to_string(),
+                })?;
+                put_bytes(s3_client, bucket, &sidecar, body, "application/json").await?;
+            }
+            outcome.sidecars_written += 1;
         }
     }
     Ok(outcome)
+}
+
+/// The declared route for a prefix, preferring one that names its cadence.
+fn declared(declarations: &[Declaration], target: &StampablePrefix) -> Option<Provenance> {
+    let matching = |wanted: Option<BarInterval>| {
+        declarations
+            .iter()
+            .find(|entry| entry.dataset == target.dataset && entry.interval == wanted)
+            .map(|entry| entry.provenance)
+    };
+    matching(target.interval).or_else(|| matching(None))
 }
 
 /// Reports partitions carrying no provenance sidecar, which is the check the best-effort write
@@ -647,17 +697,15 @@ pub async fn sweep_partition_provenance(
     bucket: &str,
 ) -> Result<ProvenanceOutcome, ArchiveError> {
     let mut outcome = ProvenanceOutcome::default();
-    for dataset in PROVENANCE_DATASETS {
-        for (_, prefix) in dataset_prefixes(dataset) {
-            let (partitions, sidecars) =
-                partitions_and_sidecars(s3_client, bucket, &prefix).await?;
-            for key in partitions {
-                outcome.partitions_seen += 1;
-                if sidecars.contains(&PartitionProvenance::sidecar_key(&key)) {
-                    outcome.sidecars_present += 1;
-                } else {
-                    outcome.unattributed.push(key);
-                }
+    for target in stampable_prefixes() {
+        let (objects, sidecars) =
+            partitions_and_sidecars(s3_client, bucket, &target.prefix, target.object).await?;
+        for key in objects {
+            outcome.partitions_seen += 1;
+            if sidecars.contains(&PartitionProvenance::sidecar_key(&key)) {
+                outcome.sidecars_present += 1;
+            } else {
+                outcome.unattributed.push(key);
             }
         }
     }

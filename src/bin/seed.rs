@@ -108,10 +108,19 @@ enum ProvenanceAction {
 }
 
 #[derive(Debug, Args)]
+#[group(required = true, multiple = true)]
 struct ProvenanceArguments {
     /// Directory of pass logs to attribute from, searched recursively for `*.log`.
+    ///
+    /// What a pass observed. Only speaks for sessions a pass actually logged.
     #[arg(long)]
-    from_logs: std::path::PathBuf,
+    from_logs: Option<std::path::PathBuf>,
+    /// JSON file declaring routes for whole prefixes.
+    ///
+    /// What is true by construction: Massive's REST bar cadences, and every raw flat file. Logs win
+    /// where both answer, because observed beats declared.
+    #[arg(long)]
+    from_configuration: Option<std::path::PathBuf>,
     /// Count what would be written without writing it.
     #[arg(long)]
     dry_run: bool,
@@ -1247,18 +1256,25 @@ async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError
 
     let outcome = match action {
         ProvenanceAction::Backfill(arguments) => {
-            let attribution =
-                attribution::routes_from_logs(&arguments.from_logs).map_err(box_error)?;
+            let attribution = match &arguments.from_logs {
+                Some(logs) => attribution::routes_from_logs(logs).map_err(box_error)?,
+                None => Default::default(),
+            };
+            let declarations = match &arguments.from_configuration {
+                Some(path) => attribution::routes_from_configuration(path).map_err(box_error)?,
+                None => Vec::new(),
+            };
             info!(
-                logs = %arguments.from_logs.display(),
-                attributed = attribution.len(),
+                observed = attribution.len(),
+                declared = declarations.len(),
                 dry_run = arguments.dry_run,
-                "Read an attribution from pass logs"
+                "Read an attribution"
             );
             archive::stamp_partition_provenance(
                 &s3_client,
                 &bucket,
                 &attribution,
+                &declarations,
                 arguments.dry_run,
             )
             .await
