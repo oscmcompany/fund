@@ -527,6 +527,10 @@ impl RawTee {
                 bytes = expected,
                 "Raw object already archived; skipping the upload"
             );
+            // Stamped anyway. The sidecar is best-effort, so an earlier run may have uploaded the
+            // object and failed to record it; returning here would make that permanent, because
+            // nothing re-uploads an object already at the right length.
+            self.record_provenance(key, dataset, date).await;
             return Ok(());
         }
 
@@ -561,7 +565,7 @@ impl RawTee {
         let sidecar = PartitionProvenance::sidecar_key(key);
         let record = PartitionProvenance::new(
             &format!("raw_equity_{}", dataset.as_str()),
-            &date.to_string(),
+            Some(&date.to_string()),
             dataset.provenance(),
         );
         let body = match serde_json::to_vec(&record) {
@@ -2438,20 +2442,29 @@ mod tests {
         let http_client = infallible_client_fn(move |request| {
             let method = request.method().clone();
             let query = request.uri().query().unwrap_or_default().to_string();
+            // The sidecar is the one unqueried PUT: every multipart part carries `partNumber`. Its
+            // path is recorded so a test can assert the key literally rather than that "a PUT
+            // happened".
             let label = match (&method, query.as_str()) {
-                (&http::Method::HEAD, _) => "HEAD",
-                (&http::Method::POST, q) if q.contains("uploads") => "CREATE",
-                (&http::Method::PUT, _) => "PART",
-                (&http::Method::POST, _) => "COMPLETE",
-                (&http::Method::DELETE, _) => "ABORT",
-                _ => "OTHER",
+                (&http::Method::HEAD, _) => "HEAD".to_string(),
+                (&http::Method::POST, q) if q.contains("uploads") => "CREATE".to_string(),
+                (&http::Method::PUT, q) if q.contains("partNumber") => "PART".to_string(),
+                // Decoded, because S3 percent-encodes the `=` in every hive segment and a key
+                // built by `raw_key` never matches the wire form.
+                (&http::Method::PUT, _) => format!(
+                    "SIDECAR {}",
+                    percent_encoding::percent_decode_str(request.uri().path()).decode_utf8_lossy()
+                ),
+                (&http::Method::POST, _) => "COMPLETE".to_string(),
+                (&http::Method::DELETE, _) => "ABORT".to_string(),
+                _ => "OTHER".to_string(),
             };
             recorder
                 .lock()
                 .expect("no test thread panics holding this")
-                .push(label.to_string());
+                .push(label.clone());
 
-            match label {
+            match label.as_str() {
                 "HEAD" => match heads
                     .lock()
                     .expect("no test thread panics holding this")
@@ -2568,7 +2581,46 @@ mod tests {
         let sent = requested
             .lock()
             .expect("no test thread panics holding this");
-        assert_eq!(*sent, vec!["HEAD".to_string()], "{sent:?}");
+        // The upload is still skipped; the sidecar is not. An object archived before provenance
+        // existed, or one whose best-effort sidecar failed, is never re-uploaded -- so returning
+        // before the stamp would leave it unattributed permanently.
+        assert_eq!(
+            *sent,
+            vec![
+                "HEAD".to_string(),
+                "SIDECAR /data/raw/whatever.csv.gz.provenance.json".to_string()
+            ],
+            "{sent:?}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A raw upload must leave a record naming the subscription that served the bytes.
+    #[tokio::test]
+    async fn test_a_raw_object_records_the_subscription_that_served_it() {
+        let (directory, path) = staged_object("stamped", 4096);
+        let (tee, requested) = tee_against(vec![None, Some(4096)], 200, directory.clone());
+
+        tee.store(
+            &raw_key(RawDataset::Trades, a_date()),
+            &path,
+            4096,
+            RawDataset::Trades,
+            a_date(),
+        )
+        .await
+        .expect("the upload succeeds");
+
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this")
+            .clone();
+        // Pinned to the literal rather than built from `raw_key`, so relocating the prefix has to be
+        // a deliberate change to this expectation.
+        assert!(
+            sent.contains(&"SIDECAR /data/raw/massive/equity/trades/schema=v1/year=2026/month=08/day=31/data.csv.gz.provenance.json".to_string()),
+            "{sent:?}"
+        );
         std::fs::remove_dir_all(&directory).ok();
     }
 

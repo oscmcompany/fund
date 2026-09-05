@@ -104,30 +104,28 @@ impl Provenance {
     }
 }
 
-/// What a partition's sidecar records: every route that has contributed to it, and when.
+/// What an object's sidecar records: every route that has contributed to it, and when.
 ///
-/// **A set rather than a single route, because a partition is not sourced once.** The quote archive
-/// is the worked example: the whole-market walk folded 1,254 sessions from Massive flat files, and
-/// a repair pass then wrote 1,107 names into *every one of those same sessions* from Alpaca. A
-/// single-valued record would name whichever route wrote last and silently disown the other.
-///
-/// `written_at` is deliberately *content* rather than metadata. A server-side copy rewrites an
-/// object's `LastModified` — the 2026-09-03 prefix rewrite did exactly that to the whole archive —
-/// so the only durable answer to "when was this session built" is one written inside the object.
+/// A set rather than one route, because an object is not sourced once: 1,249 of 1,254 quote sessions
+/// were built by both a flat-file walk and an Alpaca repair, and a single-valued record would name
+/// whichever wrote last and disown the other. `written_at` is content rather than metadata because a
+/// server-side copy rewrites `LastModified`, as the 2026-09-03 prefix rewrite did to the archive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionProvenance {
     pub dataset: String,
-    pub session: String,
+    /// Absent for a whole-table object, which the splits and boundaries tables both are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     pub routes: Vec<Provenance>,
     pub written_at: DateTime<Utc>,
 }
 
 impl PartitionProvenance {
     /// The record for one partition, stamped now, naming the single route that just wrote.
-    pub fn new(dataset: &str, session: &str, provenance: Provenance) -> Self {
+    pub fn new(dataset: &str, session: Option<&str>, provenance: Provenance) -> Self {
         PartitionProvenance {
             dataset: dataset.to_string(),
-            session: session.to_string(),
+            session: session.map(str::to_string),
             routes: vec![provenance],
             written_at: Utc::now(),
         }
@@ -152,15 +150,12 @@ impl PartitionProvenance {
             .any(|route| route.requires_massive_advanced())
     }
 
-    /// The sidecar's key, beside the partition it describes.
+    /// The sidecar's key: the object's own key, with a suffix.
     ///
-    /// Takes the partition key rather than rebuilding one, so the two can never disagree about
-    /// which session they belong to.
-    pub fn sidecar_key(partition_key: &str) -> String {
-        match partition_key.rsplit_once('/') {
-            Some((directory, _)) => format!("{directory}/provenance.json"),
-            None => "provenance.json".to_string(),
-        }
+    /// Suffixed rather than named `provenance.json` beside the object, because the splits and
+    /// boundaries tables share one directory and would otherwise overwrite each other's record.
+    pub fn sidecar_key(object_key: &str) -> String {
+        format!("{object_key}.provenance.json")
     }
 }
 
@@ -200,20 +195,28 @@ mod tests {
     }
 
     #[test]
-    fn the_sidecar_sits_beside_its_partition() {
+    fn the_sidecar_sits_beside_its_object() {
         assert_eq!(
             PartitionProvenance::sidecar_key(
                 "data/derived/equity/trades/interval=one_day/year=2023/month=06/day=14/data.parquet"
             ),
-            "data/derived/equity/trades/interval=one_day/year=2023/month=06/day=14/provenance.json"
+            "data/derived/equity/trades/interval=one_day/year=2023/month=06/day=14/data.parquet.provenance.json"
         );
     }
 
+    /// Two whole-table objects share a directory, so a per-directory sidecar would collide.
     #[test]
-    fn a_bare_key_still_yields_a_sidecar() {
+    fn two_objects_in_one_directory_get_their_own_records() {
+        let splits = PartitionProvenance::sidecar_key(
+            "data/derived/equity/corporate_actions/splits.parquet",
+        );
+        let boundaries = PartitionProvenance::sidecar_key(
+            "data/derived/equity/corporate_actions/boundaries.parquet",
+        );
+        assert_ne!(splits, boundaries);
         assert_eq!(
-            PartitionProvenance::sidecar_key("data.parquet"),
-            "provenance.json"
+            splits,
+            "data/derived/equity/corporate_actions/splits.parquet.provenance.json"
         );
     }
 
@@ -221,7 +224,7 @@ mod tests {
     fn the_serialized_shape_names_both_provider_and_subscription() {
         let record = PartitionProvenance {
             dataset: "equity_trades".to_string(),
-            session: "2023-06-14".to_string(),
+            session: Some("2023-06-14".to_string()),
             routes: vec![Provenance::massive(
                 MassivePlan::StocksAdvanced,
                 MassiveTransport::FlatFile,
@@ -243,7 +246,7 @@ mod tests {
     fn an_alpaca_route_carries_no_transport() {
         let record = PartitionProvenance::new(
             "equity_quotes",
-            "2026-08-25",
+            Some("2026-08-25"),
             Provenance::alpaca(AlpacaPlan::AlgoTraderPlus),
         );
 
@@ -261,7 +264,7 @@ mod tests {
         let bulk = Provenance::massive(MassivePlan::StocksAdvanced, MassiveTransport::FlatFile);
         let repair = Provenance::alpaca(AlpacaPlan::AlgoTraderPlus);
 
-        let record = PartitionProvenance::new("equity_quotes", "2025-11-14", bulk)
+        let record = PartitionProvenance::new("equity_quotes", Some("2025-11-14"), bulk)
             .contributed(repair)
             // The same route twice must not grow the set; a re-run is not a new source.
             .contributed(repair);
@@ -277,7 +280,7 @@ mod tests {
     fn a_partition_alpaca_alone_built_survives_the_lapse() {
         let record = PartitionProvenance::new(
             "equity_quotes",
-            "2026-08-25",
+            Some("2026-08-25"),
             Provenance::alpaca(AlpacaPlan::AlgoTraderPlus),
         );
         assert!(!record.requires_massive_advanced());
@@ -287,7 +290,7 @@ mod tests {
     fn a_record_round_trips() {
         let record = PartitionProvenance::new(
             "equity_bars",
-            "2026-08-28",
+            Some("2026-08-28"),
             Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
         );
         let encoded = serde_json::to_string(&record).expect("the record serializes");

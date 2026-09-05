@@ -1,7 +1,7 @@
-//! Recovers which route built each archived session, from the passes' own logs.
+//! Recovers which route built each archived object, from pass logs and from declared configuration.
 //!
-//! The logs are a configuration source, not a special case: they happen to be the only place the
-//! quote archive's two routes were ever recorded.
+//! Logs are one source among two, not a special case; they are simply the only record of the quote
+//! archive's two routes.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -126,9 +126,8 @@ fn vendor_key_parts(key: &str) -> Option<(String, Option<BarInterval>, NaiveDate
 
 /// A route declared for a whole prefix rather than observed on a session.
 ///
-/// The other half of an attribution. Logs can only speak for passes that logged; a dataset whose
-/// route is uniform by construction — Massive's REST bar cadences, every raw flat file — is
-/// described rather than discovered, and saying so is not a guess.
+/// The other half of an attribution: a dataset whose route is uniform by construction is described
+/// rather than discovered, which logs cannot do for a pass that never logged.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Declaration {
     pub dataset: String,
@@ -168,7 +167,13 @@ fn log_files(directory: &Path) -> Result<Vec<std::path::PathBuf>, AttributionErr
         path: directory.display().to_string(),
         source,
     })?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Propagated rather than skipped: a directory that cannot be walked yields a partial
+        // attribution, and a partial attribution silently under-stamps the archive.
+        let entry = entry.map_err(|source| AttributionError::Read {
+            path: directory.display().to_string(),
+            source,
+        })?;
         let path = entry.path();
         if path.is_dir() {
             found.extend(log_files(&path)?);

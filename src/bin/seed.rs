@@ -121,9 +121,12 @@ struct ProvenanceArguments {
     /// where both answer, because observed beats declared.
     #[arg(long)]
     from_configuration: Option<std::path::PathBuf>,
-    /// Count what would be written without writing it.
+    /// Write the sidecars. Without it the pass reports what it would write and writes nothing.
+    ///
+    /// Opt-in rather than opt-out: the archive holds tens of thousands of objects, and a flag that
+    /// has to be remembered in order to *avoid* writing them is the wrong default.
     #[arg(long)]
-    dry_run: bool,
+    apply: bool,
 }
 
 impl Command {
@@ -1267,7 +1270,7 @@ async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError
             info!(
                 observed = attribution.len(),
                 declared = declarations.len(),
-                dry_run = arguments.dry_run,
+                apply = arguments.apply,
                 "Read an attribution"
             );
             archive::stamp_partition_provenance(
@@ -1275,7 +1278,7 @@ async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError
                 &bucket,
                 &attribution,
                 &declarations,
-                arguments.dry_run,
+                arguments.apply,
             )
             .await
             .map_err(box_error)?
@@ -1286,27 +1289,49 @@ async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError
     };
 
     // The population, not just the difference: a run that wrote nothing because everything was
-    // already stamped reads identically to one that found no partitions at all.
+    // already stamped reads identically to one that found no objects at all.
     info!(
-        partitions_seen = outcome.partitions_seen,
+        objects_seen = outcome.objects_seen,
         sidecars_present = outcome.sidecars_present,
+        sidecars_planned = outcome.sidecars_planned,
         sidecars_written = outcome.sidecars_written,
+        sidecars_missing = outcome.sidecars_missing.len(),
         unattributed = outcome.unattributed.len(),
+        write_failures = outcome.write_failures.len(),
         "Provenance pass finished"
     );
     for key in outcome.unattributed.iter().take(20) {
         warn!(
             key,
-            "Partition carries no provenance and none could be attributed"
+            "Object carries no provenance and none could be attributed"
         );
     }
-    println!(
-        "{} partitions, {} already recorded, {} written, {} unattributed",
-        outcome.partitions_seen,
-        outcome.sidecars_present,
-        outcome.sidecars_written,
-        outcome.unattributed.len()
-    );
+    for key in outcome.sidecars_missing.iter().take(20) {
+        warn!(key, "Object carries no provenance record");
+    }
+    match action {
+        ProvenanceAction::Backfill(arguments) if arguments.apply => println!(
+            "{} objects, {} already recorded, {} written, {} failed, {} unattributed",
+            outcome.objects_seen,
+            outcome.sidecars_present,
+            outcome.sidecars_written,
+            outcome.write_failures.len(),
+            outcome.unattributed.len()
+        ),
+        // Says "would write". A reporting run that printed "written" is the output an operator would
+        // act on, and it would be false.
+        ProvenanceAction::Backfill(_) => println!(
+            "{} objects, {} already recorded, {} would be written, {} unattributed -- pass --apply to write",
+            outcome.objects_seen,
+            outcome.sidecars_present,
+            outcome.sidecars_planned,
+            outcome.unattributed.len()
+        ),
+        ProvenanceAction::Sweep => println!(
+            "{} objects, {} recorded, {} missing a provenance record",
+            outcome.objects_seen, outcome.sidecars_present, outcome.sidecars_missing.len()
+        ),
+    }
     Ok(Outcome::Complete)
 }
 
@@ -1964,6 +1989,43 @@ mod tests {
             .expect("a named set");
         assert_eq!(names.len(), 3);
         assert!(names.contains(&Ticker::new("SCAN").expect("a valid ticker")));
+    }
+
+    /// Writing must be asked for. The pass touches every object in the archive, so a flag that has
+    /// to be remembered in order to *avoid* writing is the wrong way round.
+    #[test]
+    fn test_provenance_backfill_does_not_write_without_apply() {
+        let parsed = parse(&["archive-provenance", "backfill", "--from-logs", "/tmp/logs"])
+            .expect("valid arguments");
+        let Command::ArchiveProvenance {
+            action: ProvenanceAction::Backfill(arguments),
+        } = parsed.command
+        else {
+            panic!("expected a provenance backfill");
+        };
+        assert!(!arguments.apply, "the default must not write");
+
+        let parsed = parse(&[
+            "archive-provenance",
+            "backfill",
+            "--from-logs",
+            "/tmp/logs",
+            "--apply",
+        ])
+        .expect("valid arguments");
+        let Command::ArchiveProvenance {
+            action: ProvenanceAction::Backfill(arguments),
+        } = parsed.command
+        else {
+            panic!("expected a provenance backfill");
+        };
+        assert!(arguments.apply);
+    }
+
+    /// A backfill with neither source would silently stamp nothing.
+    #[test]
+    fn test_provenance_backfill_needs_a_source() {
+        assert!(parse(&["archive-provenance", "backfill"]).is_err());
     }
 
     #[test]
