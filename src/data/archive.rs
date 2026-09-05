@@ -8,18 +8,22 @@ use std::io::Cursor;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::*;
 use tracing::{info, warn};
 
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
-use crate::common::flatfiles::{FlatFileClient, FlatFileError};
+use crate::common::flatfiles::{FlatFileClient, FlatFileError, RawDataset};
 use crate::common::massive::MassiveClient;
+use crate::common::provenance::{
+    AlpacaPlan, MassivePlan, MassiveTransport, PartitionProvenance, Provenance,
+};
 use crate::common::types::{
     BarInterval, EquityBar, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
     TradeSummary,
 };
+use crate::data::attribution::{Attribution, Declaration};
 use crate::data::calendar::TradingCalendar;
 use crate::data::{bars, boundaries, quotes, splits, trades};
 
@@ -514,6 +518,288 @@ async fn present_partitions(
     Ok(present)
 }
 
+/// What a provenance pass did, counted so a run can be believed rather than assumed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ProvenanceOutcome {
+    pub objects_seen: usize,
+    pub sidecars_present: usize,
+    /// What a stamp would write. Counted apart from `sidecars_written` so a reporting run cannot
+    /// claim writes it did not make.
+    pub sidecars_planned: usize,
+    pub sidecars_written: usize,
+    /// Objects no source could attribute. Reported rather than guessed at.
+    pub unattributed: Vec<String>,
+    /// Objects carrying no sidecar, which is what a sweep finds. Distinct from `unattributed`,
+    /// because a sweep consults no attribution and so cannot say anything failed to attribute.
+    pub sidecars_missing: Vec<String>,
+    /// Sidecars a stamp meant to write and could not. One fault costs one object, not the pass.
+    pub write_failures: Vec<String>,
+}
+
+/// A dataset the archive writes, named once so a prefix and a provenance record cannot disagree.
+///
+/// An enum rather than the `&str` this began as: the same name reaches `write_merged`, the stamp and
+/// the sweep, and nothing linked those lists. A dataset added at one and forgotten at the others was
+/// skipped in silence; now it does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedDataset {
+    Bars,
+    Quotes,
+    Trades,
+    Splits,
+    Boundaries,
+}
+
+impl DerivedDataset {
+    /// Every dataset, so a pass cannot iterate a subset by accident.
+    pub const ALL: [DerivedDataset; 5] = [
+        DerivedDataset::Bars,
+        DerivedDataset::Quotes,
+        DerivedDataset::Trades,
+        DerivedDataset::Splits,
+        DerivedDataset::Boundaries,
+    ];
+
+    /// The name a provenance record carries, and the name a declaration matches on.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DerivedDataset::Bars => "equity_bars",
+            DerivedDataset::Quotes => "equity_quotes",
+            DerivedDataset::Trades => "equity_trades",
+            DerivedDataset::Splits => "equity_corporate_action_splits",
+            DerivedDataset::Boundaries => "equity_corporate_action_boundaries",
+        }
+    }
+}
+
+/// One prefix a provenance pass covers, and what its objects are called.
+///
+/// Named rather than derived from a listing, so a dataset that stops being written still reports its
+/// objects instead of silently leaving the sweep.
+struct StampablePrefix {
+    dataset: String,
+    /// `None` for a prefix that has no cadence: every raw dataset, and both corporate-action tables.
+    interval: Option<BarInterval>,
+    prefix: String,
+    /// Derived partitions are parquet, the raw tee keeps the vendor's gzip, and the corporate-action
+    /// tables are a single object rather than a partition.
+    object: &'static str,
+}
+
+/// Every prefix a provenance pass covers: the derived cadences, the whole-table objects, and the raw
+/// tee beside them.
+fn stampable_prefixes() -> Vec<StampablePrefix> {
+    let mut found = Vec::new();
+    for dataset in DerivedDataset::ALL {
+        match dataset {
+            DerivedDataset::Bars | DerivedDataset::Quotes | DerivedDataset::Trades => {
+                let build: fn(BarInterval) -> String = match dataset {
+                    DerivedDataset::Bars => bar_archive_prefix,
+                    DerivedDataset::Quotes => quote_archive_prefix,
+                    _ => trade_archive_prefix,
+                };
+                for interval in BarInterval::ALL {
+                    found.push(StampablePrefix {
+                        dataset: dataset.as_str().to_string(),
+                        interval: Some(interval),
+                        prefix: build(interval),
+                        object: "data.parquet",
+                    });
+                }
+            }
+            // One object, not a partition tree, so the prefix is its parent and the object its name.
+            DerivedDataset::Splits => found.push(whole_table(dataset, SPLITS_ARCHIVE_KEY)),
+            DerivedDataset::Boundaries => found.push(whole_table(dataset, BOUNDARIES_ARCHIVE_KEY)),
+        }
+    }
+    for raw in [
+        RawDataset::Quotes,
+        RawDataset::Trades,
+        RawDataset::MinuteAggregates,
+    ] {
+        found.push(StampablePrefix {
+            dataset: format!("raw_equity_{}", raw.as_str()),
+            interval: None,
+            prefix: format!("data/raw/massive/equity/{}", raw.as_str()),
+            object: "data.csv.gz",
+        });
+    }
+    found
+}
+
+/// A whole-table object described as a prefix and a filename, so the sweep can list it like any other.
+fn whole_table(dataset: DerivedDataset, key: &'static str) -> StampablePrefix {
+    let (prefix, object) = key
+        .rsplit_once('/')
+        .expect("an archive key has a parent prefix");
+    StampablePrefix {
+        dataset: dataset.as_str().to_string(),
+        interval: None,
+        prefix: prefix.to_string(),
+        object,
+    }
+}
+
+/// The session a partition or raw key belongs to, whatever its object is called.
+fn session_from_key(key: &str, object: &str) -> Option<NaiveDate> {
+    let mut segments = key.rsplit('/');
+    if segments.next()? != object {
+        return None;
+    }
+    let day: u32 = segments.next()?.strip_prefix("day=")?.parse().ok()?;
+    let month: u32 = segments.next()?.strip_prefix("month=")?.parse().ok()?;
+    let year: i32 = segments.next()?.strip_prefix("year=")?.parse().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+/// Every partition key under `prefix`, with whether it already carries a sidecar.
+async fn partitions_and_sidecars(
+    s3_client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    object: &str,
+) -> Result<(Vec<String>, BTreeSet<String>), ArchiveError> {
+    let mut partitions = Vec::new();
+    let mut sidecars = BTreeSet::new();
+    let mut pages = s3_client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(format!("{prefix}/"))
+        .into_paginator()
+        .send();
+
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(|error| ArchiveError::List {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            message: error.to_string(),
+        })?;
+        for listed in page.contents() {
+            let Some(key) = listed.key() else { continue };
+            if key.ends_with(&format!("/{object}")) {
+                partitions.push(key.to_string());
+            } else if key.ends_with(".provenance.json") {
+                sidecars.insert(key.to_string());
+            }
+        }
+    }
+    Ok((partitions, sidecars))
+}
+
+/// Writes provenance sidecars for partitions that have none, from an attribution built elsewhere.
+///
+/// Only ever adds: a partition that already carries a sidecar is left alone, because the record
+/// written at the time of the write is better evidence than one reconstructed afterwards.
+pub async fn stamp_partition_provenance(
+    s3_client: &S3Client,
+    bucket: &str,
+    attribution: &Attribution,
+    declarations: &[Declaration],
+    apply: bool,
+) -> Result<ProvenanceOutcome, ArchiveError> {
+    let mut outcome = ProvenanceOutcome::default();
+    for target in stampable_prefixes() {
+        let (objects, sidecars) =
+            partitions_and_sidecars(s3_client, bucket, &target.prefix, target.object).await?;
+        for key in objects {
+            outcome.objects_seen += 1;
+            let sidecar = PartitionProvenance::sidecar_key(&key);
+            if sidecars.contains(&sidecar) {
+                outcome.sidecars_present += 1;
+                continue;
+            }
+            let session = session_from_key(&key, target.object);
+            // Observed beats declared, and cadence-specific beats dataset-wide. A source that named
+            // one cadence must never speak for the others written on the same session.
+            let routes = session
+                .and_then(|date| {
+                    attribution
+                        .get(&(target.dataset.clone(), target.interval, date))
+                        .or_else(|| attribution.get(&(target.dataset.clone(), None, date)))
+                })
+                .cloned()
+                .or_else(|| declared(declarations, &target).map(|route| vec![route]));
+            let Some(routes) = routes else {
+                outcome.unattributed.push(key);
+                continue;
+            };
+            outcome.sidecars_planned += 1;
+            if !apply {
+                continue;
+            }
+            let record = PartitionProvenance {
+                dataset: target.dataset.clone(),
+                session: session.map(|at| at.to_string()),
+                routes,
+                written_at: Utc::now(),
+            };
+            let body = match serde_json::to_vec(&record) {
+                Ok(body) => body,
+                Err(error) => {
+                    warn!(key = sidecar, %error, "Provenance did not serialize");
+                    outcome.write_failures.push(sidecar);
+                    continue;
+                }
+            };
+            // One fault costs one object rather than the pass, matching `write_partitions`. A run
+            // that dies on a transient S3 error would otherwise discard everything it had done.
+            match put_object_with_precondition(
+                s3_client,
+                bucket,
+                &sidecar,
+                body,
+                "application/json",
+                &Precondition::Absent,
+            )
+            .await
+            {
+                WriteOutcome::Written => outcome.sidecars_written += 1,
+                WriteOutcome::Contended => outcome.sidecars_present += 1,
+                WriteOutcome::Failed(message) => {
+                    warn!(key = sidecar, message, "Provenance sidecar was not written");
+                    outcome.write_failures.push(sidecar);
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// The declared route for a prefix, preferring one that names its cadence.
+fn declared(declarations: &[Declaration], target: &StampablePrefix) -> Option<Provenance> {
+    let matching = |wanted: Option<BarInterval>| {
+        declarations
+            .iter()
+            .find(|entry| entry.dataset == target.dataset && entry.interval == wanted)
+            .map(|entry| entry.provenance)
+    };
+    matching(target.interval).or_else(|| matching(None))
+}
+
+/// Reports partitions carrying no provenance sidecar, which is the check the best-effort write
+/// trades against.
+pub async fn sweep_partition_provenance(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<ProvenanceOutcome, ArchiveError> {
+    let mut outcome = ProvenanceOutcome::default();
+    for target in stampable_prefixes() {
+        let (objects, sidecars) =
+            partitions_and_sidecars(s3_client, bucket, &target.prefix, target.object).await?;
+        for key in objects {
+            outcome.objects_seen += 1;
+            if sidecars.contains(&PartitionProvenance::sidecar_key(&key)) {
+                outcome.sidecars_present += 1;
+            } else {
+                // Missing, not unattributable: a sweep reads no attribution and so cannot say
+                // whether anything could have named this object's route.
+                outcome.sidecars_missing.push(key);
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 /// Fetches and writes every session in `[window_start, window_end]` the archive is missing.
 ///
 /// **A set difference, not a lookback**, so a missed night, a week of downtime, and an empty bucket
@@ -663,6 +949,7 @@ async fn archive_chunk(
             BarInterval::OneDay,
             session,
             fetched_frame,
+            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
         )
         .await
         {
@@ -1092,7 +1379,17 @@ async fn archive_intraday_chunk(
         );
     }
 
-    write_partitions(s3_client, bucket, interval, writable, progress).await
+    // Massive's per-ticker aggregate route, which the Starter tier answers within its rolling
+    // five-year window.
+    write_partitions(
+        s3_client,
+        bucket,
+        interval,
+        writable,
+        progress,
+        Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+    )
+    .await
 }
 
 /// Whether this pass may write the partition for `session`.
@@ -1127,6 +1424,7 @@ async fn write_partitions(
     interval: BarInterval,
     partitions: Vec<(SessionDate, Vec<EquityBar>)>,
     progress: &mut PassProgress,
+    provenance: Provenance,
 ) -> Result<(), ArchiveError> {
     let mut queued = partitions.into_iter();
     let mut writes = tokio::task::JoinSet::new();
@@ -1141,7 +1439,8 @@ async fn write_partitions(
             let bucket = bucket.to_string();
             let rows = frame.height();
             writes.spawn(async move {
-                let written = write_partition(&client, &bucket, interval, session, frame).await;
+                let written =
+                    write_partition(&client, &bucket, interval, session, frame, provenance).await;
                 (session, rows, written)
             });
         }
@@ -1463,11 +1762,18 @@ async fn write_partition(
     interval: BarInterval,
     session: SessionDate,
     fetched: DataFrame,
+    provenance: Provenance,
 ) -> Result<(), ArchiveError> {
     let key = date_partitioned_key(&bar_archive_prefix(interval), session.date());
-    write_merged(s3_client, bucket, key, fetched, |existing, fetched, key| {
-        merge_or_replace(existing, fetched, key)
-    })
+    write_merged(
+        s3_client,
+        bucket,
+        key,
+        fetched,
+        |existing, fetched, key| merge_or_replace(existing, fetched, key),
+        DerivedDataset::Bars,
+        provenance,
+    )
     .await
 }
 
@@ -1481,6 +1787,8 @@ async fn write_merged<F>(
     key: String,
     fetched: DataFrame,
     merge: F,
+    dataset: DerivedDataset,
+    provenance: Provenance,
 ) -> Result<(), ArchiveError>
 where
     F: Fn(DataFrame, DataFrame, &str) -> Result<DataFrame, ArchiveError>,
@@ -1502,7 +1810,10 @@ where
         ParquetWriter::new(&mut buffer).finish(&mut frame)?;
 
         match put_partition(s3_client, bucket, &key, buffer, &precondition).await {
-            WriteOutcome::Written => return Ok(()),
+            WriteOutcome::Written => {
+                write_sidecar(s3_client, bucket, &key, dataset, provenance).await;
+                return Ok(());
+            }
             // Someone else wrote between this read and this write. Go round again so the merge is
             // redone against what they left, rather than resending a buffer built from stale rows.
             WriteOutcome::Contended => {
@@ -1597,6 +1908,19 @@ pub enum QuoteSource<'a> {
     PerName(&'a MarketDataClient),
     /// One file per session, folded whole.
     WholeSession(&'a FlatFileClient),
+}
+
+impl QuoteSource<'_> {
+    /// Where this route's ticks come from.
+    ///
+    /// Derived from the variant rather than passed alongside it, so a session folded from Alpaca
+    /// cannot be filed as having come from a flat file.
+    pub const fn provenance(&self) -> Provenance {
+        match self {
+            QuoteSource::PerName(_) => Provenance::alpaca(AlpacaPlan::AlgoTraderPlus),
+            QuoteSource::WholeSession(_) => RawDataset::Quotes.provenance(),
+        }
+    }
 }
 
 impl std::fmt::Display for QuoteSource<'_> {
@@ -1791,7 +2115,15 @@ async fn archive_quote_session(
         progress.sessions_without_data += 1;
         return Ok(quotes_folded);
     }
-    write_quote_partitions(s3_client, bucket, session, folded, progress).await?;
+    write_quote_partitions(
+        s3_client,
+        bucket,
+        session,
+        folded,
+        progress,
+        source.provenance(),
+    )
+    .await?;
     Ok(quotes_folded)
 }
 
@@ -1903,6 +2235,7 @@ async fn write_quote_partitions(
     session: SessionDate,
     folded: Vec<QuoteSummary>,
     progress: &mut PassProgress,
+    provenance: Provenance,
 ) -> Result<(), ArchiveError> {
     let mut one_minute: Vec<QuoteSummary> = Vec::new();
     let mut five_minute: Vec<QuoteSummary> = Vec::new();
@@ -1926,9 +2259,15 @@ async fn write_quote_partitions(
         }
         let frame = quotes::summaries_to_dataframe(&rows)?;
         let key = date_partitioned_key(&quote_archive_prefix(interval), session.date());
-        match write_merged(s3_client, bucket, key, frame, |existing, fetched, key| {
-            merge_or_replace(existing, fetched, key)
-        })
+        match write_merged(
+            s3_client,
+            bucket,
+            key,
+            frame,
+            |existing, fetched, key| merge_or_replace(existing, fetched, key),
+            DerivedDataset::Quotes,
+            provenance,
+        )
         .await
         {
             Ok(()) => written += rows.len(),
@@ -2185,6 +2524,7 @@ async fn archive_bar_flat_file_session(
         BarInterval::OneMinute,
         vec![(session, bars)],
         progress,
+        RawDataset::MinuteAggregates.provenance(),
     )
     .await
 }
@@ -2222,9 +2562,16 @@ async fn write_trade_partitions(
         }
         let frame = trades::summaries_to_dataframe(&rows)?;
         let key = date_partitioned_key(&trade_archive_prefix(interval), session.date());
-        match write_merged(s3_client, bucket, key, frame, |existing, fetched, key| {
-            merge_or_replace(existing, fetched, key)
-        })
+        match write_merged(
+            s3_client,
+            bucket,
+            key,
+            frame,
+            |existing, fetched, key| merge_or_replace(existing, fetched, key),
+            DerivedDataset::Trades,
+            // Trades have one route and no repair path: a trade file *is* the session.
+            RawDataset::Trades.provenance(),
+        )
         .await
         {
             Ok(()) => written += rows.len(),
@@ -2296,6 +2643,8 @@ pub async fn archive_splits(
                 Ok(fetched)
             }
         },
+        DerivedDataset::Splits,
+        Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
     )
     .await?;
 
@@ -2345,6 +2694,8 @@ pub async fn archive_boundaries(
                 ))
             })
         },
+        DerivedDataset::Boundaries,
+        Provenance::alpaca(AlpacaPlan::AlgoTraderPlus),
     )
     .await?;
 
@@ -2438,6 +2789,114 @@ async fn read_partition_with_etag(
 
 /// Writes a partition only if the object at `key` still matches `precondition`.
 ///
+/// Reads a partition's provenance and the ETag it carried, or `None` where there is no record.
+///
+/// Absent and unparseable are both `None` deliberately, because refusing to write over a corrupt
+/// object would make it permanent. **A failed request is neither**, and is propagated: treating a
+/// throttle as "no record" is what lets a single-route write replace a multi-route one.
+async fn read_sidecar(
+    s3_client: &S3Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<(PartitionProvenance, String)>, ArchiveError> {
+    let response = match s3_client.get_object().bucket(bucket).key(key).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return match error.into_service_error() {
+                GetObjectError::NoSuchKey(_) => Ok(None),
+                other => Err(ArchiveError::Read {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    message: other.to_string(),
+                }),
+            }
+        }
+    };
+    let etag = response.e_tag().unwrap_or_default().to_string();
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|error| ArchiveError::Read {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            message: error.to_string(),
+        })?
+        .into_bytes();
+    Ok(serde_json::from_slice(&bytes)
+        .ok()
+        .map(|record| (record, etag)))
+}
+
+/// Records where an object's bytes came from, beside the object itself.
+///
+/// Best-effort and warned rather than propagated: a 200-byte sidecar must never fail a fold that has
+/// already landed, and the sweep finds whatever this misses. The write is conditional, so a repair
+/// racing a bulk walk retries against what the other wrote instead of discarding it.
+async fn write_sidecar(
+    s3_client: &S3Client,
+    bucket: &str,
+    object_key: &str,
+    dataset: DerivedDataset,
+    provenance: Provenance,
+) {
+    let key = PartitionProvenance::sidecar_key(object_key);
+    let session = session_from_key(object_key, "data.parquet").map(|at| at.to_string());
+
+    for attempt in 1..=CONTENDED_WRITE_ATTEMPTS {
+        let existing = match read_sidecar(s3_client, bucket, &key).await {
+            Ok(existing) => existing,
+            // Never overwrite a record that could not be read. The whole point of the set is that a
+            // later route adds itself; guessing "absent" here is how it would lose one.
+            Err(error) => {
+                warn!(key, %error, "Provenance could not be read; leaving the record alone");
+                return;
+            }
+        };
+        let (record, precondition) = match existing {
+            Some((record, etag)) => (record.contributed(provenance), Precondition::Match(etag)),
+            None => (
+                PartitionProvenance::new(dataset.as_str(), session.as_deref(), provenance),
+                Precondition::Absent,
+            ),
+        };
+        let body = match serde_json::to_vec(&record) {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(key, %error, "Provenance did not serialize");
+                return;
+            }
+        };
+        match put_object_with_precondition(
+            s3_client,
+            bucket,
+            &key,
+            body,
+            "application/json",
+            &precondition,
+        )
+        .await
+        {
+            WriteOutcome::Written => return,
+            WriteOutcome::Contended => {
+                warn!(
+                    key,
+                    attempt, "Provenance changed under a write; merging again"
+                )
+            }
+            WriteOutcome::Failed(message) => {
+                warn!(key, message, "Provenance sidecar was not written");
+                return;
+            }
+        }
+    }
+    warn!(
+        key,
+        attempts = CONTENDED_WRITE_ATTEMPTS,
+        "Provenance sidecar lost every race; the sweep will report it"
+    );
+}
+
 /// S3 answers a failed precondition with `412 Precondition Failed`, and `If-None-Match: *` against
 /// an object that has appeared since the read with `409 Conflict`. Both mean the same thing here —
 /// another pass got there first — so both become [`WriteOutcome::Contended`] rather than an error.
@@ -2448,12 +2907,35 @@ async fn put_partition(
     body: Vec<u8>,
     precondition: &Precondition,
 ) -> WriteOutcome {
+    put_object_with_precondition(
+        s3_client,
+        bucket,
+        key,
+        body,
+        "application/vnd.apache.parquet",
+        precondition,
+    )
+    .await
+}
+
+/// The conditional write itself, over any content type.
+///
+/// Shared with the provenance sidecar, whose contention window is the same one partitions have: two
+/// routes touching a session at once must merge rather than overwrite.
+async fn put_object_with_precondition(
+    s3_client: &S3Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    content_type: &str,
+    precondition: &Precondition,
+) -> WriteOutcome {
     let request = s3_client
         .put_object()
         .bucket(bucket)
         .key(key)
         .body(ByteStream::from(body))
-        .content_type("application/vnd.apache.parquet");
+        .content_type(content_type);
 
     let request = match precondition {
         Precondition::Match(etag) => request.if_match(etag),
@@ -2524,6 +3006,8 @@ async fn put_bytes(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use aws_smithy_http_client::test_util::infallible_client_fn;
     use aws_smithy_types::body::SdkBody;
@@ -2626,6 +3110,147 @@ mod tests {
         }
     }
 
+    /// A written partition must leave a provenance sidecar beside it, naming the route.
+    ///
+    /// The sidecar is the only durable answer to "where did this session come from": the prefix
+    /// rewrite of 2026-09-03 reset `LastModified` across the whole archive, so object metadata
+    /// cannot date or attribute a partition, and the summary itself carries no vendor.
+    #[tokio::test]
+    async fn test_a_written_partition_records_where_its_bytes_came_from() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let client = scripted_s3_client(move |method, key| {
+            if method == http::Method::PUT {
+                recorder
+                    .lock()
+                    .expect("the recorder must not be poisoned")
+                    .push(key.to_string());
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .expect("a canned response must build")
+            } else {
+                no_such_key()
+            }
+        });
+
+        let at = session(2026, 9, 3);
+        let mut progress = PassProgress::default();
+        write_partitions(
+            &client,
+            "test-bucket",
+            BarInterval::FiveMinute,
+            vec![(at, vec![one_bar("AAPL", at)])],
+            &mut progress,
+            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+        )
+        .await
+        .expect("the partition must be written");
+
+        let written = seen
+            .lock()
+            .expect("the recorder must not be poisoned")
+            .clone();
+        // Pinned to the literal rather than derived from the constant under test.
+        assert!(
+            written.iter().any(|key| key.ends_with(
+                "data/derived/equity/bars/interval=five_minute/year=2026/month=09/day=03/data.parquet.provenance.json"
+            )),
+            "a sidecar must sit beside the partition; wrote {written:?}"
+        );
+    }
+
+    /// A failed read must never become an overwrite.
+    ///
+    /// `read_sidecar` once mapped every error to "absent", so a throttle or a 503 made the next write
+    /// build a fresh single-route record over a multi-route one -- the exact loss the set exists to
+    /// prevent. The record is only ever replaced by one that read the old one first.
+    #[tokio::test]
+    async fn test_a_sidecar_that_cannot_be_read_is_not_overwritten() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let client = scripted_s3_client(move |method, key| {
+            if method == http::Method::PUT {
+                recorder
+                    .lock()
+                    .expect("the recorder must not be poisoned")
+                    .push(key.to_string());
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .expect("a canned response must build")
+            } else {
+                // Throttled, not absent. A 503 is the vendor saying "ask again", not "there is
+                // nothing here".
+                http::Response::builder()
+                    .status(503)
+                    .body(SdkBody::from("<Error><Code>SlowDown</Code></Error>"))
+                    .expect("a canned response must build")
+            }
+        });
+
+        write_sidecar(
+            &client,
+            "test-bucket",
+            SPLITS_ARCHIVE_KEY,
+            DerivedDataset::Splits,
+            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+        )
+        .await;
+
+        let written = seen
+            .lock()
+            .expect("the recorder must not be poisoned")
+            .clone();
+        assert!(
+            written.is_empty(),
+            "a sidecar that could not be read must be left alone; wrote {written:?}"
+        );
+    }
+
+    /// A whole-table object must carry provenance too, and must not be reported as sessionless.
+    ///
+    /// The splits and boundaries tables are one object rather than a partition tree, so a stamp that
+    /// insisted on a date-partitioned key wrote nothing for them and warned on every single write.
+    #[tokio::test]
+    async fn test_a_whole_table_object_records_its_route() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let client = scripted_s3_client(move |method, key| {
+            if method == http::Method::PUT {
+                recorder
+                    .lock()
+                    .expect("the recorder must not be poisoned")
+                    .push(key.to_string());
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .expect("a canned response must build")
+            } else {
+                no_such_key()
+            }
+        });
+
+        write_sidecar(
+            &client,
+            "test-bucket",
+            SPLITS_ARCHIVE_KEY,
+            DerivedDataset::Splits,
+            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+        )
+        .await;
+
+        let written = seen
+            .lock()
+            .expect("the recorder must not be poisoned")
+            .clone();
+        assert!(
+            written.iter().any(|key| key
+                .ends_with("data/derived/equity/corporate_actions/splits.parquet.provenance.json")),
+            "a whole-table object needs a sidecar; wrote {written:?}"
+        );
+    }
+
     /// One session's write failing must cost that session and no other.
     ///
     /// The regression test #1106 could not have: before it, any non-contention error returned from
@@ -2666,6 +3291,7 @@ mod tests {
             BarInterval::FiveMinute,
             partitions,
             &mut progress,
+            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
         )
         .await;
 

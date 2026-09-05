@@ -19,7 +19,7 @@ use fund::common::types::{
 };
 use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
 use fund::data::calendar::TradingCalendar;
-use fund::data::{bars, details, quotes};
+use fund::data::{attribution, bars, details, quotes};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
 ///
@@ -88,6 +88,45 @@ enum Command {
         #[command(subcommand)]
         action: TradeAction,
     },
+    /// Which vendor and subscription built each archived partition.
+    ArchiveProvenance {
+        #[command(subcommand)]
+        action: ProvenanceAction,
+    },
+}
+
+/// What to do about provenance the archive does not yet record.
+#[derive(Debug, Subcommand)]
+enum ProvenanceAction {
+    /// Write sidecars for partitions that have none, reading the attribution from pass logs.
+    ///
+    /// The logs are one configuration source. A partition already carrying a sidecar is left
+    /// alone: a record written at the time of the write beats one reconstructed afterwards.
+    Backfill(ProvenanceArguments),
+    /// Report partitions carrying no sidecar, writing nothing.
+    Sweep,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = true)]
+struct ProvenanceArguments {
+    /// Directory of pass logs to attribute from, searched recursively for `*.log`.
+    ///
+    /// What a pass observed. Only speaks for sessions a pass actually logged.
+    #[arg(long)]
+    from_logs: Option<std::path::PathBuf>,
+    /// JSON file declaring routes for whole prefixes.
+    ///
+    /// What is true by construction: Massive's REST bar cadences, and every raw flat file. Logs win
+    /// where both answer, because observed beats declared.
+    #[arg(long)]
+    from_configuration: Option<std::path::PathBuf>,
+    /// Write the sidecars. Without it the pass reports what it would write and writes nothing.
+    ///
+    /// Opt-in rather than opt-out: the archive holds tens of thousands of objects, and a flag that
+    /// has to be remembered in order to *avoid* writing them is the wrong default.
+    #[arg(long)]
+    apply: bool,
 }
 
 impl Command {
@@ -105,6 +144,7 @@ impl Command {
             Command::EquityDetails { .. } => "seed-equity-details",
             Command::EquityQuotes { .. } => "seed-equity-quotes",
             Command::EquityTrades { .. } => "seed-equity-trades",
+            Command::ArchiveProvenance { .. } => "seed-archive-provenance",
         }
     }
 }
@@ -734,6 +774,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         }
         Command::EquityQuotes { action } => seed_quotes(action).await,
         Command::EquityTrades { action } => seed_trades(action).await,
+        Command::ArchiveProvenance { action } => seed_provenance(action).await,
     }
 }
 
@@ -1208,6 +1249,92 @@ async fn flat_file_client(
 ///
 /// The calendar comes from Alpaca and the tape from Massive, which is the same split the quote
 /// pass uses: only the exchange publishes its own hours, and only the flat files hold every print.
+/// Records, or reports, which route built each archived partition.
+///
+/// Reads the archive rather than the calendar: this is about objects that exist, so a session the
+/// archive never held is not a gap here.
+async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    let outcome = match action {
+        ProvenanceAction::Backfill(arguments) => {
+            let attribution = match &arguments.from_logs {
+                Some(logs) => attribution::routes_from_logs(logs).map_err(box_error)?,
+                None => Default::default(),
+            };
+            let declarations = match &arguments.from_configuration {
+                Some(path) => attribution::routes_from_configuration(path).map_err(box_error)?,
+                None => Vec::new(),
+            };
+            info!(
+                observed = attribution.len(),
+                declared = declarations.len(),
+                apply = arguments.apply,
+                "Read an attribution"
+            );
+            archive::stamp_partition_provenance(
+                &s3_client,
+                &bucket,
+                &attribution,
+                &declarations,
+                arguments.apply,
+            )
+            .await
+            .map_err(box_error)?
+        }
+        ProvenanceAction::Sweep => archive::sweep_partition_provenance(&s3_client, &bucket)
+            .await
+            .map_err(box_error)?,
+    };
+
+    // The population, not just the difference: a run that wrote nothing because everything was
+    // already stamped reads identically to one that found no objects at all.
+    info!(
+        objects_seen = outcome.objects_seen,
+        sidecars_present = outcome.sidecars_present,
+        sidecars_planned = outcome.sidecars_planned,
+        sidecars_written = outcome.sidecars_written,
+        sidecars_missing = outcome.sidecars_missing.len(),
+        unattributed = outcome.unattributed.len(),
+        write_failures = outcome.write_failures.len(),
+        "Provenance pass finished"
+    );
+    for key in outcome.unattributed.iter().take(20) {
+        warn!(
+            key,
+            "Object carries no provenance and none could be attributed"
+        );
+    }
+    for key in outcome.sidecars_missing.iter().take(20) {
+        warn!(key, "Object carries no provenance record");
+    }
+    match action {
+        ProvenanceAction::Backfill(arguments) if arguments.apply => println!(
+            "{} objects, {} already recorded, {} written, {} failed, {} unattributed",
+            outcome.objects_seen,
+            outcome.sidecars_present,
+            outcome.sidecars_written,
+            outcome.write_failures.len(),
+            outcome.unattributed.len()
+        ),
+        // Says "would write". A reporting run that printed "written" is the output an operator would
+        // act on, and it would be false.
+        ProvenanceAction::Backfill(_) => println!(
+            "{} objects, {} already recorded, {} would be written, {} unattributed -- pass --apply to write",
+            outcome.objects_seen,
+            outcome.sidecars_present,
+            outcome.sidecars_planned,
+            outcome.unattributed.len()
+        ),
+        ProvenanceAction::Sweep => println!(
+            "{} objects, {} recorded, {} missing a provenance record",
+            outcome.objects_seen, outcome.sidecars_present, outcome.sidecars_missing.len()
+        ),
+    }
+    Ok(Outcome::Complete)
+}
+
 async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
     let arguments = action.arguments();
     let scope = action.universe_scope()?;
@@ -1862,6 +1989,43 @@ mod tests {
             .expect("a named set");
         assert_eq!(names.len(), 3);
         assert!(names.contains(&Ticker::new("SCAN").expect("a valid ticker")));
+    }
+
+    /// Writing must be asked for. The pass touches every object in the archive, so a flag that has
+    /// to be remembered in order to *avoid* writing is the wrong way round.
+    #[test]
+    fn test_provenance_backfill_does_not_write_without_apply() {
+        let parsed = parse(&["archive-provenance", "backfill", "--from-logs", "/tmp/logs"])
+            .expect("valid arguments");
+        let Command::ArchiveProvenance {
+            action: ProvenanceAction::Backfill(arguments),
+        } = parsed.command
+        else {
+            panic!("expected a provenance backfill");
+        };
+        assert!(!arguments.apply, "the default must not write");
+
+        let parsed = parse(&[
+            "archive-provenance",
+            "backfill",
+            "--from-logs",
+            "/tmp/logs",
+            "--apply",
+        ])
+        .expect("valid arguments");
+        let Command::ArchiveProvenance {
+            action: ProvenanceAction::Backfill(arguments),
+        } = parsed.command
+        else {
+            panic!("expected a provenance backfill");
+        };
+        assert!(arguments.apply);
+    }
+
+    /// A backfill with neither source would silently stamp nothing.
+    #[test]
+    fn test_provenance_backfill_needs_a_source() {
+        assert!(parse(&["archive-provenance", "backfill"]).is_err());
     }
 
     #[test]

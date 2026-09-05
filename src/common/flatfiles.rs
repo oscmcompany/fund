@@ -11,6 +11,7 @@ use flate2::read::GzDecoder;
 use tracing::{info, warn};
 
 use crate::common::alpaca::{QuoteTick, TradeTick};
+use crate::common::provenance::{MassivePlan, MassiveTransport, PartitionProvenance, Provenance};
 use crate::common::types::{BarInterval, EquityBar, Ticker};
 
 /// The bucket every dataset lives under, which Massive support named on 2026-08-24.
@@ -280,6 +281,15 @@ pub enum RawDataset {
 }
 
 impl RawDataset {
+    /// Where these bytes come from, and under which subscription.
+    ///
+    /// Static here and only here: a flat file is Massive's by construction, and every one of the
+    /// three lives behind Stocks Advanced. Derived partitions carry no such constant, because the
+    /// same dataset has arrived by more than one route.
+    pub const fn provenance(self) -> Provenance {
+        Provenance::massive(MassivePlan::StocksAdvanced, MassiveTransport::FlatFile)
+    }
+
     /// The segment naming this dataset under `data/raw/massive/equity/`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -489,7 +499,14 @@ impl RawTee {
     ///
     /// Verified on length rather than ETag: a multipart ETag is a function of the part size, so ours
     /// never matches the vendor's and would fail every comparison it was asked to make.
-    async fn store(&self, key: &str, staged: &Path, expected: i64) -> Result<(), FlatFileError> {
+    async fn store(
+        &self,
+        key: &str,
+        staged: &Path,
+        expected: i64,
+        dataset: RawDataset,
+        date: NaiveDate,
+    ) -> Result<(), FlatFileError> {
         let written = std::fs::metadata(staged)
             .map_err(|source| FlatFileError::Tee {
                 key: key.to_string(),
@@ -510,6 +527,10 @@ impl RawTee {
                 bytes = expected,
                 "Raw object already archived; skipping the upload"
             );
+            // Stamped anyway. The sidecar is best-effort, so an earlier run may have uploaded the
+            // object and failed to record it; returning here would make that permanent, because
+            // nothing re-uploads an object already at the right length.
+            self.record_provenance(key, dataset, date).await;
             return Ok(());
         }
 
@@ -531,7 +552,41 @@ impl RawTee {
             bytes = expected,
             "Archived the vendor's raw object"
         );
+        self.record_provenance(key, dataset, date).await;
         Ok(())
+    }
+
+    /// Records which subscription these bytes came from, beside the object itself.
+    ///
+    /// Written in the default storage class rather than Deep Archive: a record that needs a
+    /// 12-to-48-hour restore before it can be read is not a record. Best-effort for the same reason
+    /// the tee's own abort is — a sidecar must never fail an upload that has already landed.
+    async fn record_provenance(&self, key: &str, dataset: RawDataset, date: NaiveDate) {
+        let sidecar = PartitionProvenance::sidecar_key(key);
+        let record = PartitionProvenance::new(
+            &format!("raw_equity_{}", dataset.as_str()),
+            Some(&date.to_string()),
+            dataset.provenance(),
+        );
+        let body = match serde_json::to_vec(&record) {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(key = sidecar, %error, "Raw provenance did not serialize");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&sidecar)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .content_type("application/json")
+            .send()
+            .await
+        {
+            warn!(key = sidecar, %error, "Raw provenance sidecar was not written");
+        }
     }
 
     /// Whether `key` is already present at the length the source reports.
@@ -976,7 +1031,13 @@ impl FlatFileClient {
             // upload would destroy the one local copy of the expensive half and force the whole
             // object to be downloaded again — the exact cost this tee exists to stop paying.
             match tee
-                .store(&raw_key(dataset, date), staged, compressed_bytes)
+                .store(
+                    &raw_key(dataset, date),
+                    staged,
+                    compressed_bytes,
+                    dataset,
+                    date,
+                )
                 .await
             {
                 Ok(()) => {
@@ -1633,6 +1694,11 @@ fn read_error(key: &str, error: csv::Error) -> FlatFileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed session, so a tee test never reads the clock.
+    fn a_date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 8, 31).expect("a real date")
+    }
 
     use std::io::Write;
 
@@ -2376,20 +2442,29 @@ mod tests {
         let http_client = infallible_client_fn(move |request| {
             let method = request.method().clone();
             let query = request.uri().query().unwrap_or_default().to_string();
+            // The sidecar is the one unqueried PUT: every multipart part carries `partNumber`. Its
+            // path is recorded so a test can assert the key literally rather than that "a PUT
+            // happened".
             let label = match (&method, query.as_str()) {
-                (&http::Method::HEAD, _) => "HEAD",
-                (&http::Method::POST, q) if q.contains("uploads") => "CREATE",
-                (&http::Method::PUT, _) => "PART",
-                (&http::Method::POST, _) => "COMPLETE",
-                (&http::Method::DELETE, _) => "ABORT",
-                _ => "OTHER",
+                (&http::Method::HEAD, _) => "HEAD".to_string(),
+                (&http::Method::POST, q) if q.contains("uploads") => "CREATE".to_string(),
+                (&http::Method::PUT, q) if q.contains("partNumber") => "PART".to_string(),
+                // Decoded, because S3 percent-encodes the `=` in every hive segment and a key
+                // built by `raw_key` never matches the wire form.
+                (&http::Method::PUT, _) => format!(
+                    "SIDECAR {}",
+                    percent_encoding::percent_decode_str(request.uri().path()).decode_utf8_lossy()
+                ),
+                (&http::Method::POST, _) => "COMPLETE".to_string(),
+                (&http::Method::DELETE, _) => "ABORT".to_string(),
+                _ => "OTHER".to_string(),
             };
             recorder
                 .lock()
                 .expect("no test thread panics holding this")
-                .push(label.to_string());
+                .push(label.clone());
 
-            match label {
+            match label.as_str() {
                 "HEAD" => match heads
                     .lock()
                     .expect("no test thread panics holding this")
@@ -2461,7 +2536,15 @@ mod tests {
         let (directory, path) = staged_object("wrong-length", 4096);
         let (tee, requested) = tee_against(vec![], 200, directory.clone());
 
-        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 8192).await;
+        let outcome = tee
+            .store(
+                "data/raw/whatever.csv.gz",
+                &path,
+                8192,
+                RawDataset::Trades,
+                a_date(),
+            )
+            .await;
 
         assert!(
             matches!(outcome, Err(FlatFileError::TeeLength { staged, expected, .. })
@@ -2485,14 +2568,59 @@ mod tests {
         let (directory, path) = staged_object("already-there", 4096);
         let (tee, requested) = tee_against(vec![Some(4096)], 200, directory.clone());
 
-        tee.store("data/raw/whatever.csv.gz", &path, 4096)
-            .await
-            .expect("an object already present is not an error");
+        tee.store(
+            "data/raw/whatever.csv.gz",
+            &path,
+            4096,
+            RawDataset::Trades,
+            a_date(),
+        )
+        .await
+        .expect("an object already present is not an error");
 
         let sent = requested
             .lock()
             .expect("no test thread panics holding this");
-        assert_eq!(*sent, vec!["HEAD".to_string()], "{sent:?}");
+        // The upload is still skipped; the sidecar is not. An object archived before provenance
+        // existed, or one whose best-effort sidecar failed, is never re-uploaded -- so returning
+        // before the stamp would leave it unattributed permanently.
+        assert_eq!(
+            *sent,
+            vec![
+                "HEAD".to_string(),
+                "SIDECAR /data/raw/whatever.csv.gz.provenance.json".to_string()
+            ],
+            "{sent:?}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A raw upload must leave a record naming the subscription that served the bytes.
+    #[tokio::test]
+    async fn test_a_raw_object_records_the_subscription_that_served_it() {
+        let (directory, path) = staged_object("stamped", 4096);
+        let (tee, requested) = tee_against(vec![None, Some(4096)], 200, directory.clone());
+
+        tee.store(
+            &raw_key(RawDataset::Trades, a_date()),
+            &path,
+            4096,
+            RawDataset::Trades,
+            a_date(),
+        )
+        .await
+        .expect("the upload succeeds");
+
+        let sent = requested
+            .lock()
+            .expect("no test thread panics holding this")
+            .clone();
+        // Pinned to the literal rather than built from `raw_key`, so relocating the prefix has to be
+        // a deliberate change to this expectation.
+        assert!(
+            sent.contains(&"SIDECAR /data/raw/massive/equity/trades/schema=v1/year=2026/month=08/day=31/data.csv.gz.provenance.json".to_string()),
+            "{sent:?}"
+        );
         std::fs::remove_dir_all(&directory).ok();
     }
 
@@ -2504,7 +2632,15 @@ mod tests {
         // Absent to begin with, then present at the wrong length once the upload claims success.
         let (tee, requested) = tee_against(vec![None, Some(17)], 200, directory.clone());
 
-        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 4096).await;
+        let outcome = tee
+            .store(
+                "data/raw/whatever.csv.gz",
+                &path,
+                4096,
+                RawDataset::Trades,
+                a_date(),
+            )
+            .await;
 
         assert!(
             matches!(outcome, Err(FlatFileError::TeeLength { staged, expected, .. })
@@ -2526,7 +2662,15 @@ mod tests {
         let (directory, path) = staged_object("failed-completion", 4096);
         let (tee, requested) = tee_against(vec![None], 500, directory.clone());
 
-        let outcome = tee.store("data/raw/whatever.csv.gz", &path, 4096).await;
+        let outcome = tee
+            .store(
+                "data/raw/whatever.csv.gz",
+                &path,
+                4096,
+                RawDataset::Trades,
+                a_date(),
+            )
+            .await;
 
         assert!(outcome.is_err(), "a failed completion must fail the store");
         let sent = requested

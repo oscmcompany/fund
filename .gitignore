@@ -14,10 +14,14 @@ wandb/
 **/target/
 data/*
 !data/equity_details.csv
+!data/archive_provenance.json
 **/model.tar.gz
 **/*.safetensor
 **/*.json
 !.sqlx/*.json
+# Declared archive routes. Re-included after the `**/*.json` rule as well as after `data/*`,
+# because a negation only counts if nothing later re-excludes the path.
+!data/archive_provenance.json
 # Hand-applied AWS documents live here so a fixture can be rebuilt by reading rather than by
 # remembering. A glob rather than one filename, because the failure this fixes is a file being
 # silently ignored -- which is what a narrower rule would do to the next one.

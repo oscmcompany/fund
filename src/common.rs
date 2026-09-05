@@ -9,4 +9,5 @@ pub mod flatfiles;
 pub mod journal;
 pub mod log;
 pub mod massive;
+pub mod provenance;
 pub mod types;

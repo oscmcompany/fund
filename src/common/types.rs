@@ -628,7 +628,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
 /// [`BarInterval::as_str`] must match the `bar_interval` CHECK constraint exactly. It is the
 /// snake_case of the variant name, which lets `rename_all` derive the same string for serde so what
 /// is serialized and what is stored cannot drift apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BarInterval {
     OneMinute,
