@@ -339,6 +339,21 @@ struct IntradayArguments {
     cadence: Cadence,
 }
 
+/// What a symbol scan takes: a window and any interval the archive stores.
+///
+/// Deliberately not [`IntradayArguments`], whose [`Cadence`] cannot name `one_day` by construction.
+/// Quotes and trades both store a daily partition, and those are the ones a completeness question is
+/// most often asked of, so a scan that could not reach them would be answering about two thirds of
+/// the archive while looking like it answered about all of it.
+#[derive(Debug, Args)]
+struct ScanArguments {
+    #[command(flatten)]
+    window: WindowArguments,
+    /// The interval to scan, which is the partition the names are read from.
+    #[arg(long, value_enum, default_value = "one_minute")]
+    interval: Interval,
+}
+
 #[derive(Debug, Args)]
 struct IntradayRepairArguments {
     #[command(flatten)]
@@ -366,7 +381,7 @@ enum QuoteAction {
     /// download estimate leaves out because it counts bandwidth only.
     Probe(ProbeArguments),
     /// Report which names each partition is short of the daily universe, and write nothing.
-    Scan(IntradayArguments),
+    Scan(ScanArguments),
 }
 
 impl QuoteAction {
@@ -412,7 +427,7 @@ enum TradeAction {
     /// passes at once, and this exists so the comparison costs nothing.
     Measure(TradeSymbolArguments),
     /// Report which names each partition is short of the daily universe, and write nothing.
-    Scan(IntradayArguments),
+    Scan(ScanArguments),
 }
 
 /// What a per-name trade pass takes, which is the window, the stride and the names.
@@ -1320,7 +1335,7 @@ fn require_whole_window(unreadable: &BTreeSet<SessionDate>) -> Result<(), SeedEr
 /// from the sessions it could read, so a short scan understates the gap it was run to measure.
 async fn scan_summary_coverage(
     family: archive::SessionFamily,
-    arguments: &IntradayArguments,
+    arguments: &ScanArguments,
 ) -> Result<Outcome, SeedError> {
     let window = arguments.window.window()?;
     let bucket = bucket_name()?;
@@ -1330,7 +1345,7 @@ async fn scan_summary_coverage(
         &s3_client,
         &bucket,
         family,
-        arguments.cadence.interval(),
+        arguments.interval.bar_interval(),
         &window,
     )
     .await?;
@@ -1341,8 +1356,8 @@ async fn scan_summary_coverage(
 
 /// Scans one family, against the universe that family's own fold was written to fill.
 ///
-/// The selection comes from the family itself rather than from here, so this cannot pick the wrong
-/// one; the floor is still ours to choose, because a scan writes nothing.
+/// The selection is no longer expressible here — it comes from the family inside the scan — so the
+/// floor is the only thing this chooses, and it may because a scan writes nothing.
 async fn scan_family(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1350,13 +1365,12 @@ async fn scan_family(
     interval: BarInterval,
     window: &Window,
 ) -> Result<archive::SymbolScan, Box<dyn std::error::Error>> {
-    let names = family.universe(LiquidityFloor::CURRENT);
     Ok(archive::scan_session_symbols(
         s3_client,
         bucket,
         family,
         interval,
-        &names,
+        LiquidityFloor::CURRENT,
         window.start,
         window.end,
     )

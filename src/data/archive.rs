@@ -1632,20 +1632,20 @@ const SCAN_CONCURRENCY: usize = 16;
 /// Which names each session partition lacks against the daily universe for its own session.
 ///
 /// The difference [`SessionSelection::Absent`] cannot express: a partition written while one
-/// symbol's fetch failed is present, non-empty, and short a name. `names` is a parameter because it
-/// is the one thing that differs between the families — bars are ingested against the liquidity
-/// screen and the tick folds against every name the daily partition holds — so passing the wrong one
-/// reports a universe the pass never promised to fill. It also means scanning wider than the archive
-/// was ingested at yields a backfill list rather than a fault.
+/// symbol's fetch failed is present, non-empty, and short a name. The selection comes from `family`
+/// rather than from the caller, because the two are not interchangeable and picking the wrong one is
+/// silent — only `floor` is open, and only because a scan writes nothing, so scanning wider than the
+/// archive was ingested at yields a backfill list rather than a fault.
 pub async fn scan_session_symbols(
     s3_client: &S3Client,
     bucket: &str,
     family: SessionFamily,
     interval: BarInterval,
-    names: &NameSelection,
+    floor: LiquidityFloor,
     window_start: SessionDate,
     window_end: SessionDate,
 ) -> Result<SymbolScan, ArchiveError> {
+    let names = family.universe(floor);
     let sessions = expected_sessions(window_start, window_end);
     info!(
         %window_start,
@@ -5277,10 +5277,10 @@ mod tests {
         assert_eq!(SummaryFamily::Trades.to_string(), "trades");
     }
 
-    /// The distinction the scan turns on, and the one that would quietly ruin it. Bars are ingested
-    /// behind the liquidity screen; the tick folds take every name the daily partition holds. Scan
-    /// quotes against the screen and every name below the floor reads as a gap the fold never
-    /// promised to fill — thousands of them, on every session.
+    /// The distinction the scan turns on, and the two opposite ways it goes wrong. Scan a tick fold
+    /// against the screen and every gap below the floor is **hidden**, because a narrower expectation
+    /// can only report fewer differences. Scan bars against the whole market and the mirror happens —
+    /// every below-floor name reads as a gap, because a bars partition holds only screened names.
     #[test]
     fn test_the_tick_folds_are_scanned_against_every_name_and_bars_against_the_screen() {
         let daily = || {
@@ -5306,15 +5306,17 @@ mod tests {
         assert_eq!(screened, tickers(&["CBOE"]));
         assert_eq!(whole, tickers(&["CBOE", "OBDC", "SNDL"]));
 
-        // The consequence, stated as the scan would see it: two of the three names are a gap only
-        // under the wrong selection.
+        // The consequence, in the direction it actually runs: a partition holding only CBOE is two
+        // names short, and the screen calls that complete.
         assert_eq!(
             coverage_of(&whole, &tickers(&["CBOE"])),
-            SessionCoverage::Partial(tickers(&["OBDC", "SNDL"]))
+            SessionCoverage::Partial(tickers(&["OBDC", "SNDL"])),
+            "the tick folds' universe reports the gap"
         );
         assert_eq!(
             coverage_of(&screened, &tickers(&["CBOE"])),
-            SessionCoverage::Complete
+            SessionCoverage::Complete,
+            "the screen hides it, which is why the selection is not the caller's to choose"
         );
     }
 
