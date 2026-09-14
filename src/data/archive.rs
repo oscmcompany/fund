@@ -1159,15 +1159,50 @@ fn sessions_for(
 ///
 /// A named set comes back as given rather than intersected: a name that did not trade answers with
 /// no data and produces nothing, which is the same outcome as excluding it here.
+/// The exchanges' test symbols, which the daily aggregate carries and no tick file ever does.
+///
+/// Listed by name rather than matched by pattern: `ZTS` and `ZBRA` are real securities and any
+/// prefix rule wide enough to catch `ZVZZT` catches them too. A test symbol the exchanges add later
+/// is absent from here and reads as a gap, which is the safe direction to be wrong in — a false
+/// alarm rather than a real name silently excused.
+///
+/// Sorted, because the lookup binary-searches it.
+const EXCHANGE_TEST_SYMBOLS: [&str; 28] = [
+    "CBOA", "CBOJ", "CBOL", "CBOO", "CBOT", "CBOX", "CBOY", "CBXA", "CBXJ", "CBXL", "CBXO", "CBXY",
+    "IBOT", "MTEST", "MTEST.A", "NTEST", "NTEST.H", "NTEST.I", "ZBZX", "ZEXIT", "ZIEXT", "ZJZZT",
+    "ZTEST", "ZTST", "ZVZZT", "ZWZZT", "ZXIET", "ZXZZT",
+];
+
+/// Whether this name is an exchange test symbol rather than a security.
+fn is_exchange_test_symbol(ticker: &Ticker) -> bool {
+    EXCHANGE_TEST_SYMBOLS
+        .binary_search(&ticker.as_str())
+        .is_ok()
+}
+
+/// The names a pass over `daily` should expect to find ticks for.
+///
+/// Test symbols are dropped here rather than at each call site, because this is the one place a
+/// universe is derived from a daily partition and both the folds and the scan read it. Leaving them
+/// in made every whole-market pass end `complete: false` on roughly 25 names a session that can
+/// never print — a permanent non-zero exit, which is an alert nobody can act on and everybody
+/// learns to ignore.
 fn names_from_partition(
     names: &NameSelection,
     daily: DataFrame,
 ) -> Result<BTreeSet<Ticker>, ArchiveError> {
-    match names {
-        NameSelection::WholeMarket => partition_tickers(&daily),
-        NameSelection::Screened(floor) => screen_partition(daily, *floor),
-        NameSelection::Named(symbols) => Ok(symbols.clone()),
-    }
+    let derived = match names {
+        NameSelection::WholeMarket => partition_tickers(&daily)?,
+        NameSelection::Screened(floor) => screen_partition(daily, *floor)?,
+        // Taken as given: naming a symbol is a deliberate act, so an operator who asks for a test
+        // symbol gets it rather than being silently given nothing.
+        NameSelection::Named(symbols) => return Ok(symbols.clone()),
+    };
+    let expected: BTreeSet<Ticker> = derived
+        .into_iter()
+        .filter(|ticker| !is_exchange_test_symbol(ticker))
+        .collect();
+    Ok(expected)
 }
 
 /// Symbols fetched at once.
@@ -1540,6 +1575,53 @@ fn screen_partition(
         .collect())
 }
 
+/// A family stored as one partition per session, and therefore one that can be short a name.
+///
+/// Narrower than [`DerivedDataset`] deliberately: splits and boundaries are whole-table objects with
+/// no session to be short a name on, so scanning one is not a question that can be asked rather than
+/// one that returns nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFamily {
+    Bars,
+    Quotes,
+    Trades,
+}
+
+impl SessionFamily {
+    /// The archive prefix this family stores `interval` under.
+    pub fn prefix(self, interval: BarInterval) -> String {
+        match self {
+            SessionFamily::Bars => bar_archive_prefix(interval),
+            SessionFamily::Quotes => quote_archive_prefix(interval),
+            SessionFamily::Trades => trade_archive_prefix(interval),
+        }
+    }
+
+    /// The universe a scan of this family compares against, which is the one its own fold fills.
+    ///
+    /// Carried by the family rather than chosen at the call site because the two selections are not
+    /// interchangeable: bars are ingested behind the liquidity screen and the tick folds take every
+    /// name the daily partition holds. `floor` stays a parameter because the scan writes nothing, so
+    /// scanning wider than the archive was ingested at yields a backfill list rather than a fault.
+    pub fn universe(self, floor: LiquidityFloor) -> NameSelection {
+        match self {
+            SessionFamily::Bars => NameSelection::Screened(floor),
+            SessionFamily::Quotes | SessionFamily::Trades => NameSelection::WholeMarket,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionFamily {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            SessionFamily::Bars => "bars",
+            SessionFamily::Quotes => "quotes",
+            SessionFamily::Trades => "trades",
+        };
+        formatter.write_str(name)
+    }
+}
+
 /// Sessions scanned at once.
 ///
 /// Two reads a session against S3, and the scan is read-only, so this bounds our own concurrency
@@ -1547,27 +1629,31 @@ fn screen_partition(
 /// twenty minutes of latency for no work.
 const SCAN_CONCURRENCY: usize = 16;
 
-/// Which names each intraday partition lacks against the daily universe for its own session.
+/// Which names each session partition lacks against the daily universe for its own session.
 ///
 /// The difference [`SessionSelection::Absent`] cannot express: a partition written while one
-/// symbol's fetch failed is present, non-empty, and short a name. `floor` is a parameter because
-/// this reads and never writes, so scanning wider than the archive was ingested at yields a
-/// backfill list rather than a fault.
-pub async fn scan_intraday_symbols(
+/// symbol's fetch failed is present, non-empty, and short a name. The selection comes from `family`
+/// rather than from the caller, because the two are not interchangeable and picking the wrong one is
+/// silent — only `floor` is open, and only because a scan writes nothing, so scanning wider than the
+/// archive was ingested at yields a backfill list rather than a fault.
+pub async fn scan_session_symbols(
     s3_client: &S3Client,
     bucket: &str,
+    family: SessionFamily,
     interval: BarInterval,
+    floor: LiquidityFloor,
     window_start: SessionDate,
     window_end: SessionDate,
-    floor: LiquidityFloor,
 ) -> Result<SymbolScan, ArchiveError> {
+    let names = family.universe(floor);
     let sessions = expected_sessions(window_start, window_end);
     info!(
         %window_start,
         %window_end,
+        %family,
         interval = %interval,
         sessions = sessions.len(),
-        "Scanning intraday partitions for symbol-level gaps"
+        "Scanning session partitions for symbol-level gaps"
     );
 
     let mut queued = sessions.into_iter();
@@ -1580,8 +1666,10 @@ pub async fn scan_intraday_symbols(
             let Some(session) = queued.next() else { break };
             let client = s3_client.clone();
             let bucket = bucket.to_string();
+            let names = names.clone();
             scans.spawn(async move {
-                let coverage = session_coverage(&client, &bucket, interval, session, floor).await;
+                let coverage =
+                    session_coverage(&client, &bucket, family, interval, &names, session).await;
                 (session, coverage)
             });
         }
@@ -1601,7 +1689,7 @@ pub async fn scan_intraday_symbols(
             Err(error) => {
                 return Err(ArchiveError::Read {
                     bucket: bucket.to_string(),
-                    key: bar_archive_prefix(interval),
+                    key: family.prefix(interval),
                     message: format!("a scan task did not complete: {error}"),
                 })
             }
@@ -1621,21 +1709,22 @@ pub async fn scan_intraday_symbols(
 async fn session_coverage(
     s3_client: &S3Client,
     bucket: &str,
+    family: SessionFamily,
     interval: BarInterval,
+    names: &NameSelection,
     session: SessionDate,
-    floor: LiquidityFloor,
 ) -> Result<SessionCoverage, ArchiveError> {
     let daily_key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
     let Some(daily) = read_partition(s3_client, bucket, &daily_key).await? else {
         return Ok(SessionCoverage::Undescribed);
     };
-    let expected = screen_partition(daily, floor)?;
+    let expected = names_from_partition(names, daily)?;
 
-    let intraday_key = date_partitioned_key(&bar_archive_prefix(interval), session.date());
-    let Some(intraday) = read_partition(s3_client, bucket, &intraday_key).await? else {
+    let scanned_key = date_partitioned_key(&family.prefix(interval), session.date());
+    let Some(scanned) = read_partition(s3_client, bucket, &scanned_key).await? else {
         return Ok(SessionCoverage::Absent);
     };
-    Ok(coverage_of(&expected, &partition_tickers(&intraday)?))
+    Ok(coverage_of(&expected, &partition_tickers(&scanned)?))
 }
 
 /// Classifies a session from the two ticker sets, so the comparison is testable without S3.
@@ -2516,12 +2605,21 @@ pub enum SummaryFamily {
 }
 
 impl SummaryFamily {
+    /// The same family seen as a session partition, which is where its prefix and name come from.
+    ///
+    /// Every summary family is stored per session; not every session family reconstructs from finer
+    /// rows, which is why bars have no variant here. One mapping rather than two so the prefixes
+    /// cannot drift apart.
+    fn session_family(self) -> SessionFamily {
+        match self {
+            SummaryFamily::Quotes => SessionFamily::Quotes,
+            SummaryFamily::Trades => SessionFamily::Trades,
+        }
+    }
+
     /// The archive prefix this family stores `interval` under.
     fn prefix(self, interval: BarInterval) -> String {
-        match self {
-            SummaryFamily::Quotes => quote_archive_prefix(interval),
-            SummaryFamily::Trades => trade_archive_prefix(interval),
-        }
+        self.session_family().prefix(interval)
     }
 
     /// Which columns a coarser row of this family reconstructs, and how.
@@ -2540,10 +2638,7 @@ impl SummaryFamily {
 
 impl std::fmt::Display for SummaryFamily {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            SummaryFamily::Quotes => "quotes",
-            SummaryFamily::Trades => "trades",
-        })
+        self.session_family().fmt(formatter)
     }
 }
 
@@ -5076,6 +5171,152 @@ mod tests {
         assert_eq!(
             coverage,
             SessionCoverage::Partial(tickers(&["CBOE", "NVDA"]))
+        );
+    }
+
+    /// `binary_search` is only correct on a sorted slice, and an entry appended in the wrong place
+    /// fails by silently not matching — the one way this list can be wrong without looking wrong.
+    #[test]
+    fn test_the_test_symbol_list_is_sorted_because_the_lookup_assumes_it() {
+        let mut sorted = EXCHANGE_TEST_SYMBOLS;
+        sorted.sort_unstable();
+
+        assert_eq!(EXCHANGE_TEST_SYMBOLS, sorted);
+        for symbol in EXCHANGE_TEST_SYMBOLS {
+            let ticker = Ticker::new(symbol).expect("every listed test symbol must parse");
+            assert!(is_exchange_test_symbol(&ticker), "{symbol} must be found");
+        }
+    }
+
+    /// The reason the list is spelled out instead of pattern-matched. Every one of these is a real
+    /// security whose name sits inside the shape of a test symbol, and a prefix rule wide enough to
+    /// catch `ZVZZT` or the `CBO` series would drop them from every universe in the archive.
+    #[test]
+    fn test_real_securities_shaped_like_test_symbols_survive() {
+        for real in ["ZTS", "ZBRA", "CBOE", "IBM", "NTES", "ZIM", "MTN"] {
+            let ticker = Ticker::new(real).expect("a real ticker must parse");
+            assert!(
+                !is_exchange_test_symbol(&ticker),
+                "{real} is a listed security and must never be filtered"
+            );
+        }
+    }
+
+    /// Measured over every September 2026 session: these 28 names appear in the daily aggregate and
+    /// are quoted on zero sessions and traded on zero sessions. Counting them made a whole-market
+    /// pass end `complete: false` forever, so they are not the universe a fold can be held to.
+    #[test]
+    fn test_a_derived_universe_drops_test_symbols_and_keeps_securities() {
+        let daily = df![
+            "ticker" => ["AAPL", "ZVZZT", "CBOE", "CBOX", "NTEST.H", "ZTS"],
+            "close_price" => [230.0_f64, 27.43, 101.66, 101.66, 25.03, 160.0],
+            "volume" => [50_000_000_i64, 73_771, 900_000, 15_287, 1_800, 2_000_000],
+        ]
+        .unwrap();
+
+        let universe = names_from_partition(&NameSelection::WholeMarket, daily)
+            .expect("a whole-market universe");
+
+        assert_eq!(universe, tickers(&["AAPL", "CBOE", "ZTS"]));
+    }
+
+    /// A named set is an operator's instruction, not a universe that drifted, so it is taken as
+    /// given — otherwise probing a test symbol deliberately would silently fold nothing.
+    #[test]
+    fn test_a_named_selection_is_never_filtered() {
+        let daily = df![
+            "ticker" => ["AAPL"],
+            "close_price" => [230.0_f64],
+            "volume" => [50_000_000_i64],
+        ]
+        .unwrap();
+        let named = tickers(&["ZVZZT"]);
+
+        let universe = names_from_partition(&NameSelection::Named(named.clone()), daily)
+            .expect("a named universe");
+
+        assert_eq!(universe, named);
+    }
+
+    /// The three families must not share a prefix, or a scan reports one family's gaps against
+    /// another's partitions and the answer looks plausible.
+    #[test]
+    fn test_each_session_family_scans_its_own_prefix() {
+        let interval = BarInterval::OneMinute;
+
+        assert_eq!(
+            SessionFamily::Bars.prefix(interval),
+            "data/derived/equity/bars/interval=one_minute"
+        );
+        assert_eq!(
+            SessionFamily::Quotes.prefix(interval),
+            "data/derived/equity/quotes/interval=one_minute"
+        );
+        assert_eq!(
+            SessionFamily::Trades.prefix(interval),
+            "data/derived/equity/trades/interval=one_minute"
+        );
+    }
+
+    /// The cadence check and the symbol scan must read the same bytes for the same family. They
+    /// held separate copies of this mapping until they were joined, which is two places for one
+    /// prefix to be wrong in.
+    #[test]
+    fn test_the_cadence_check_and_the_scan_agree_on_where_a_family_lives() {
+        for interval in [BarInterval::OneMinute, BarInterval::OneDay] {
+            assert_eq!(
+                SummaryFamily::Quotes.prefix(interval),
+                SessionFamily::Quotes.prefix(interval)
+            );
+            assert_eq!(
+                SummaryFamily::Trades.prefix(interval),
+                SessionFamily::Trades.prefix(interval)
+            );
+        }
+        assert_eq!(SummaryFamily::Quotes.to_string(), "quotes");
+        assert_eq!(SummaryFamily::Trades.to_string(), "trades");
+    }
+
+    /// The distinction the scan turns on, and the two opposite ways it goes wrong. Scan a tick fold
+    /// against the screen and every gap below the floor is **hidden**, because a narrower expectation
+    /// can only report fewer differences. Scan bars against the whole market and the mirror happens —
+    /// every below-floor name reads as a gap, because a bars partition holds only screened names.
+    #[test]
+    fn test_the_tick_folds_are_scanned_against_every_name_and_bars_against_the_screen() {
+        let daily = || {
+            df![
+                "ticker" => ["CBOE", "OBDC", "SNDL"],
+                "close_price" => [290.0_f64, 11.3, 1.50],
+                "volume" => [900_000_i64, 4_350_000, 40_000_000],
+            ]
+            .unwrap()
+        };
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
+
+        let screened = names_from_partition(&SessionFamily::Bars.universe(floor), daily())
+            .expect("a screened read");
+        let whole = names_from_partition(&SessionFamily::Quotes.universe(floor), daily())
+            .expect("a whole-market read");
+        assert_eq!(
+            SessionFamily::Trades.universe(floor),
+            SessionFamily::Quotes.universe(floor),
+            "both tick folds take the same universe"
+        );
+
+        assert_eq!(screened, tickers(&["CBOE"]));
+        assert_eq!(whole, tickers(&["CBOE", "OBDC", "SNDL"]));
+
+        // The consequence, in the direction it actually runs: a partition holding only CBOE is two
+        // names short, and the screen calls that complete.
+        assert_eq!(
+            coverage_of(&whole, &tickers(&["CBOE"])),
+            SessionCoverage::Partial(tickers(&["OBDC", "SNDL"])),
+            "the tick folds' universe reports the gap"
+        );
+        assert_eq!(
+            coverage_of(&screened, &tickers(&["CBOE"])),
+            SessionCoverage::Complete,
+            "the screen hides it, which is why the selection is not the caller's to choose"
         );
     }
 
