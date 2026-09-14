@@ -1159,15 +1159,50 @@ fn sessions_for(
 ///
 /// A named set comes back as given rather than intersected: a name that did not trade answers with
 /// no data and produces nothing, which is the same outcome as excluding it here.
+/// The exchanges' test symbols, which the daily aggregate carries and no tick file ever does.
+///
+/// Listed by name rather than matched by pattern: `ZTS` and `ZBRA` are real securities and any
+/// prefix rule wide enough to catch `ZVZZT` catches them too. A test symbol the exchanges add later
+/// is absent from here and reads as a gap, which is the safe direction to be wrong in — a false
+/// alarm rather than a real name silently excused.
+///
+/// Sorted, because the lookup binary-searches it.
+const EXCHANGE_TEST_SYMBOLS: [&str; 28] = [
+    "CBOA", "CBOJ", "CBOL", "CBOO", "CBOT", "CBOX", "CBOY", "CBXA", "CBXJ", "CBXL", "CBXO", "CBXY",
+    "IBOT", "MTEST", "MTEST.A", "NTEST", "NTEST.H", "NTEST.I", "ZBZX", "ZEXIT", "ZIEXT", "ZJZZT",
+    "ZTEST", "ZTST", "ZVZZT", "ZWZZT", "ZXIET", "ZXZZT",
+];
+
+/// Whether this name is an exchange test symbol rather than a security.
+fn is_exchange_test_symbol(ticker: &Ticker) -> bool {
+    EXCHANGE_TEST_SYMBOLS
+        .binary_search(&ticker.as_str())
+        .is_ok()
+}
+
+/// The names a pass over `daily` should expect to find ticks for.
+///
+/// Test symbols are dropped here rather than at each call site, because this is the one place a
+/// universe is derived from a daily partition and both the folds and the scan read it. Leaving them
+/// in made every whole-market pass end `complete: false` on roughly 25 names a session that can
+/// never print — a permanent non-zero exit, which is an alert nobody can act on and everybody
+/// learns to ignore.
 fn names_from_partition(
     names: &NameSelection,
     daily: DataFrame,
 ) -> Result<BTreeSet<Ticker>, ArchiveError> {
-    match names {
-        NameSelection::WholeMarket => partition_tickers(&daily),
-        NameSelection::Screened(floor) => screen_partition(daily, *floor),
-        NameSelection::Named(symbols) => Ok(symbols.clone()),
-    }
+    let derived = match names {
+        NameSelection::WholeMarket => partition_tickers(&daily)?,
+        NameSelection::Screened(floor) => screen_partition(daily, *floor)?,
+        // Taken as given: naming a symbol is a deliberate act, so an operator who asks for a test
+        // symbol gets it rather than being silently given nothing.
+        NameSelection::Named(symbols) => return Ok(symbols.clone()),
+    };
+    let expected: BTreeSet<Ticker> = derived
+        .into_iter()
+        .filter(|ticker| !is_exchange_test_symbol(ticker))
+        .collect();
+    Ok(expected)
 }
 
 /// Symbols fetched at once.
@@ -5137,6 +5172,70 @@ mod tests {
             coverage,
             SessionCoverage::Partial(tickers(&["CBOE", "NVDA"]))
         );
+    }
+
+    /// `binary_search` is only correct on a sorted slice, and an entry appended in the wrong place
+    /// fails by silently not matching — the one way this list can be wrong without looking wrong.
+    #[test]
+    fn test_the_test_symbol_list_is_sorted_because_the_lookup_assumes_it() {
+        let mut sorted = EXCHANGE_TEST_SYMBOLS;
+        sorted.sort_unstable();
+
+        assert_eq!(EXCHANGE_TEST_SYMBOLS, sorted);
+        for symbol in EXCHANGE_TEST_SYMBOLS {
+            let ticker = Ticker::new(symbol).expect("every listed test symbol must parse");
+            assert!(is_exchange_test_symbol(&ticker), "{symbol} must be found");
+        }
+    }
+
+    /// The reason the list is spelled out instead of pattern-matched. Every one of these is a real
+    /// security whose name sits inside the shape of a test symbol, and a prefix rule wide enough to
+    /// catch `ZVZZT` or the `CBO` series would drop them from every universe in the archive.
+    #[test]
+    fn test_real_securities_shaped_like_test_symbols_survive() {
+        for real in ["ZTS", "ZBRA", "CBOE", "IBM", "NTES", "ZIM", "MTN"] {
+            let ticker = Ticker::new(real).expect("a real ticker must parse");
+            assert!(
+                !is_exchange_test_symbol(&ticker),
+                "{real} is a listed security and must never be filtered"
+            );
+        }
+    }
+
+    /// Measured over every September 2026 session: these 28 names appear in the daily aggregate and
+    /// are quoted on zero sessions and traded on zero sessions. Counting them made a whole-market
+    /// pass end `complete: false` forever, so they are not the universe a fold can be held to.
+    #[test]
+    fn test_a_derived_universe_drops_test_symbols_and_keeps_securities() {
+        let daily = df![
+            "ticker" => ["AAPL", "ZVZZT", "CBOE", "CBOX", "NTEST.H", "ZTS"],
+            "close_price" => [230.0_f64, 27.43, 101.66, 101.66, 25.03, 160.0],
+            "volume" => [50_000_000_i64, 73_771, 900_000, 15_287, 1_800, 2_000_000],
+        ]
+        .unwrap();
+
+        let universe = names_from_partition(&NameSelection::WholeMarket, daily)
+            .expect("a whole-market universe");
+
+        assert_eq!(universe, tickers(&["AAPL", "CBOE", "ZTS"]));
+    }
+
+    /// A named set is an operator's instruction, not a universe that drifted, so it is taken as
+    /// given — otherwise probing a test symbol deliberately would silently fold nothing.
+    #[test]
+    fn test_a_named_selection_is_never_filtered() {
+        let daily = df![
+            "ticker" => ["AAPL"],
+            "close_price" => [230.0_f64],
+            "volume" => [50_000_000_i64],
+        ]
+        .unwrap();
+        let named = tickers(&["ZVZZT"]);
+
+        let universe = names_from_partition(&NameSelection::Named(named.clone()), daily)
+            .expect("a named universe");
+
+        assert_eq!(universe, named);
     }
 
     /// The three families must not share a prefix, or a scan reports one family's gaps against
