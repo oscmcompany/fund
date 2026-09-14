@@ -365,6 +365,8 @@ enum QuoteAction {
     /// a fold holds one name's ticks or every name's, and the throughput, which the published
     /// download estimate leaves out because it counts bandwidth only.
     Probe(ProbeArguments),
+    /// Report which names each partition is short of the daily universe, and write nothing.
+    Scan(IntradayArguments),
 }
 
 impl QuoteAction {
@@ -378,7 +380,10 @@ impl QuoteAction {
         let sessions = match self {
             QuoteAction::Archive(_) => SessionSelection::Absent,
             QuoteAction::Widen(_) => SessionSelection::Every,
-            QuoteAction::Measure(_) | QuoteAction::Repair(_) | QuoteAction::Probe(_) => {
+            QuoteAction::Measure(_)
+            | QuoteAction::Repair(_)
+            | QuoteAction::Probe(_)
+            | QuoteAction::Scan(_) => {
                 return None;
             }
         };
@@ -406,6 +411,8 @@ enum TradeAction {
     /// a partition built from flat files is how the quote archive ended up carrying rows from two
     /// passes at once, and this exists so the comparison costs nothing.
     Measure(TradeSymbolArguments),
+    /// Report which names each partition is short of the daily universe, and write nothing.
+    Scan(IntradayArguments),
 }
 
 /// What a per-name trade pass takes, which is the window, the stride and the names.
@@ -434,7 +441,7 @@ impl TradeAction {
         let sessions = match self {
             TradeAction::Archive(_) => SessionSelection::Absent,
             TradeAction::Widen(_) => SessionSelection::Every,
-            TradeAction::Repair(_) | TradeAction::Measure(_) => return None,
+            TradeAction::Repair(_) | TradeAction::Measure(_) | TradeAction::Scan(_) => return None,
         };
         Some(whole_market(sessions))
     }
@@ -448,6 +455,7 @@ impl TradeAction {
         match self {
             TradeAction::Archive(arguments) | TradeAction::Widen(arguments) => &arguments.window,
             TradeAction::Repair(symbols) | TradeAction::Measure(symbols) => &symbols.window,
+            TradeAction::Scan(arguments) => &arguments.window,
         }
     }
 
@@ -456,6 +464,9 @@ impl TradeAction {
         match self {
             TradeAction::Archive(arguments) | TradeAction::Widen(arguments) => arguments.stride,
             TradeAction::Repair(symbols) | TradeAction::Measure(symbols) => symbols.stride,
+            // A scan reads whatever the archive holds, so every published session is its
+            // population; striding would make a hole it skipped read as one that is not there.
+            TradeAction::Scan(_) => 1,
         }
     }
 }
@@ -1174,7 +1185,14 @@ async fn scan_intraday_coverage(arguments: &IntradayArguments) -> Result<Outcome
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
 
-    let scan = scan_intraday(&s3_client, &bucket, arguments.cadence.interval(), &window).await?;
+    let scan = scan_family(
+        &s3_client,
+        &bucket,
+        archive::SessionFamily::Bars,
+        arguments.cadence.interval(),
+        &window,
+    )
+    .await?;
     report(&scan);
     require_whole_window(scan.failed())?;
     Ok(Outcome::Complete)
@@ -1214,7 +1232,14 @@ async fn repair_intraday(repair: &IntradayRepairArguments) -> Result<Outcome, Se
     let named = match given {
         Some(named) => named,
         None => {
-            let scan = scan_intraday(&s3_client, &bucket, interval, &window).await?;
+            let scan = scan_family(
+                &s3_client,
+                &bucket,
+                archive::SessionFamily::Bars,
+                interval,
+                &window,
+            )
+            .await?;
             report(&scan);
             require_whole_window(scan.failed())?;
             let missing = scan.missing_symbols();
@@ -1289,19 +1314,51 @@ fn require_whole_window(unreadable: &BTreeSet<SessionDate>) -> Result<(), SeedEr
     ))
 }
 
-async fn scan_intraday(
+/// Scans a summary family and prints what it found, reading the archive against itself.
+///
+/// Refuses a partial window for the same reason the bars scan does: the names it found come only
+/// from the sessions it could read, so a short scan understates the gap it was run to measure.
+async fn scan_summary_coverage(
+    family: archive::SessionFamily,
+    arguments: &IntradayArguments,
+) -> Result<Outcome, SeedError> {
+    let window = arguments.window.window()?;
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    let scan = scan_family(
+        &s3_client,
+        &bucket,
+        family,
+        arguments.cadence.interval(),
+        &window,
+    )
+    .await?;
+    report(&scan);
+    require_whole_window(scan.failed())?;
+    Ok(Outcome::Complete)
+}
+
+/// Scans one family, against the universe that family's own fold was written to fill.
+///
+/// The selection comes from the family itself rather than from here, so this cannot pick the wrong
+/// one; the floor is still ours to choose, because a scan writes nothing.
+async fn scan_family(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
+    family: archive::SessionFamily,
     interval: BarInterval,
     window: &Window,
 ) -> Result<archive::SymbolScan, Box<dyn std::error::Error>> {
-    Ok(archive::scan_intraday_symbols(
+    let names = family.universe(LiquidityFloor::CURRENT);
+    Ok(archive::scan_session_symbols(
         s3_client,
         bucket,
+        family,
         interval,
+        &names,
         window.start,
         window.end,
-        LiquidityFloor::CURRENT,
     )
     .await?)
 }
@@ -1378,6 +1435,9 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
             None => probe_flat_file(arguments.date).await,
             Some(named) => fold_named_from_flat_file(arguments.date, named).await,
         },
+        QuoteAction::Scan(arguments) => {
+            scan_summary_coverage(archive::SessionFamily::Quotes, arguments).await
+        }
         // One arm, so the universe is written once and the two actions cannot disagree about it.
         QuoteAction::Archive(arguments) | QuoteAction::Widen(arguments) => {
             // Unreachable: this arm names the two actions that answer. Returned rather than
@@ -1554,8 +1614,14 @@ async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError
 }
 
 async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
-    if let TradeAction::Measure(symbols) = action {
-        return measure_trades(symbols).await;
+    match action {
+        TradeAction::Measure(symbols) => return measure_trades(symbols).await,
+        // Answered here for the same reason as a measure: it reads the archive against itself, so
+        // demanding a vendor credential it will never use would be the only way it could fail.
+        TradeAction::Scan(arguments) => {
+            return scan_summary_coverage(archive::SessionFamily::Trades, arguments).await
+        }
+        TradeAction::Archive(_) | TradeAction::Repair(_) | TradeAction::Widen(_) => {}
     }
     // Resolved before any credential is read, so a repair with no symbol set is refused in the first
     // millisecond rather than after a calendar fetch.
@@ -1585,24 +1651,23 @@ async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
     // must not demand flat-file credentials to reach two names through Alpaca.
     let flat_files;
     let market_data;
-    let source = match action {
-        TradeAction::Repair(_) => {
-            market_data = sip_market_data()?;
-            archive::TradeSource::PerName(&market_data)
-        }
-        TradeAction::Archive(arguments) | TradeAction::Widen(arguments) => {
-            flat_files = flat_file_client(arguments).await?;
-            archive::TradeSource::WholeSession(&flat_files)
-        }
-        // Returned above, before any credential is read. Named rather than swept into a catch-all so
-        // a new action cannot silently inherit the flat-file route.
-        TradeAction::Measure(_) => {
-            return Err(SeedError::Usage(
-                "a measure pass writes nothing and is answered before a source is built"
+    let source =
+        match action {
+            TradeAction::Repair(_) => {
+                market_data = sip_market_data()?;
+                archive::TradeSource::PerName(&market_data)
+            }
+            TradeAction::Archive(arguments) | TradeAction::Widen(arguments) => {
+                flat_files = flat_file_client(arguments).await?;
+                archive::TradeSource::WholeSession(&flat_files)
+            }
+            // Returned above, before any credential is read. Named rather than swept into a catch-all so
+            // a new action cannot silently inherit the flat-file route.
+            TradeAction::Measure(_) | TradeAction::Scan(_) => return Err(SeedError::Usage(
+                "a measure or scan pass writes nothing and is answered before a source is built"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
 
     // Refused before a single print is fetched: past the floor Alpaca folds an opening auction
     // print the archive correctly excludes, adding 0.3-2.2% of session volume and varying by name.
