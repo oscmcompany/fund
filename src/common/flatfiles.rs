@@ -793,9 +793,57 @@ pub fn raw_key(dataset: RawDataset, date: NaiveDate) -> String {
     )
 }
 
+/// Which copy of a flat file a client reads, and under which key.
+///
+/// The same bytes live in two places and cost differently: the vendor's endpoint is where they are
+/// bought, and the archive's raw prefix is the copy kept so a re-fold spends compute instead of a
+/// subscription month. The tee hangs off [`FlatFileOrigin::Vendor`] alone, which is what makes
+/// "teeing the archive's bytes back over the object being read" unrepresentable rather than guarded.
+pub enum FlatFileOrigin {
+    /// Massive's endpoint, optionally keeping every object it serves.
+    Vendor {
+        s3_client: S3Client,
+        tee: Option<RawTee>,
+    },
+    /// The archive's own copy, which is AWS and needs no vendor credential.
+    Archive { s3_client: S3Client, bucket: String },
+}
+
+impl FlatFileOrigin {
+    /// The bucket the object is addressed in.
+    fn bucket(&self) -> &str {
+        match self {
+            FlatFileOrigin::Vendor { .. } => FLAT_FILE_BUCKET,
+            FlatFileOrigin::Archive { bucket, .. } => bucket,
+        }
+    }
+
+    fn s3_client(&self) -> &S3Client {
+        match self {
+            FlatFileOrigin::Vendor { s3_client, .. }
+            | FlatFileOrigin::Archive { s3_client, .. } => s3_client,
+        }
+    }
+
+    fn tee(&self) -> Option<&RawTee> {
+        match self {
+            FlatFileOrigin::Vendor { tee, .. } => tee.as_ref(),
+            FlatFileOrigin::Archive { .. } => None,
+        }
+    }
+
+    /// Where one day of `dataset` sits, which differs by origin: the vendor's own layout against the
+    /// hive partitioning [`raw_key`] writes.
+    fn key(&self, dataset: RawDataset, date: NaiveDate) -> String {
+        match self {
+            FlatFileOrigin::Vendor { .. } => dataset.key(date),
+            FlatFileOrigin::Archive { .. } => raw_key(dataset, date),
+        }
+    }
+}
+
 pub struct FlatFileClient {
-    s3_client: S3Client,
-    tee: Option<RawTee>,
+    origin: FlatFileOrigin,
 }
 
 impl FlatFileClient {
@@ -805,6 +853,37 @@ impl FlatFileClient {
     /// resolve `flatfiles.files.massive.com`, which does not exist.
     pub fn new(credentials: FlatFileCredentials) -> Self {
         Self::from_configuration(Self::configuration(credentials).build())
+    }
+
+    /// Attaches a tee to an already-configured vendor client.
+    ///
+    /// Test-only, because production puts the tee in the constructor — which is exactly what stops an
+    /// archive read from carrying one. The tests that exercise the tee's failure paths need a
+    /// scripted endpoint and a tee at once, and building the endpoint is what `client_serving` does.
+    #[cfg(test)]
+    fn with_tee_for_test(self, tee: RawTee) -> Self {
+        match self.origin {
+            FlatFileOrigin::Vendor { s3_client, .. } => Self {
+                origin: FlatFileOrigin::Vendor {
+                    s3_client,
+                    tee: Some(tee),
+                },
+            },
+            FlatFileOrigin::Archive { .. } => {
+                panic!("the tee tests script a vendor endpoint, so this is a vendor client")
+            }
+        }
+    }
+
+    /// Reads the archive's own copy of the vendor's bytes instead of buying them again.
+    ///
+    /// The objects are Deep Archive, so a key this addresses must already be restored; a read of one
+    /// that is not fails at the transport with the vendor's own error shape rather than silently
+    /// returning nothing.
+    pub fn reading_the_archive(s3_client: S3Client, bucket: String) -> Self {
+        Self {
+            origin: FlatFileOrigin::Archive { s3_client, bucket },
+        }
     }
 
     /// The signed, path-style configuration, separated so a test can attach its own transport to
@@ -830,9 +909,18 @@ impl FlatFileClient {
     }
 
     fn from_configuration(configuration: aws_sdk_s3::Config) -> Self {
+        Self::from_configuration_teeing_to(configuration, None)
+    }
+
+    fn from_configuration_teeing_to(
+        configuration: aws_sdk_s3::Config,
+        tee: Option<RawTee>,
+    ) -> Self {
         Self {
-            s3_client: S3Client::from_conf(configuration),
-            tee: None,
+            origin: FlatFileOrigin::Vendor {
+                s3_client: S3Client::from_conf(configuration),
+                tee,
+            },
         }
     }
 
@@ -841,12 +929,16 @@ impl FlatFileClient {
         Ok(Self::new(FlatFileCredentials::from_env()?))
     }
 
-    /// Keeps the vendor's own bytes, teeing every object this client reads into Deep Archive.
+    /// Constructs from the environment, keeping every object it reads in Deep Archive.
     ///
-    /// Off unless asked for, because a pass that only measures should not be writing 9 GB an object.
-    pub fn teeing_raw_to(mut self, tee: RawTee) -> Self {
-        self.tee = Some(tee);
-        self
+    /// The tee is a constructor argument rather than something attached afterwards so that the one
+    /// combination that must never exist — an archive read teeing back over the object it is
+    /// reading — has no way to be spelled.
+    pub fn from_env_teeing_to(tee: RawTee) -> Result<Self, FlatFileError> {
+        Ok(Self::from_configuration_teeing_to(
+            Self::configuration(FlatFileCredentials::from_env()?).build(),
+            Some(tee),
+        ))
     }
 
     /// Streams one day of quotes, handing every usable tick to `fold`.
@@ -859,12 +951,12 @@ impl FlatFileClient {
         date: NaiveDate,
         fold: S,
     ) -> Result<(FlatFileFold, S), FlatFileError> {
-        let key = quote_key(date);
-        info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of quotes");
+        let key = self.origin.key(RawDataset::Quotes, date);
+        info!(bucket = self.origin.bucket(), key, %date, "Reading a flat file of quotes");
 
         let scoped = key.clone();
         let ((mut summary, fold), compressed_bytes) = self
-            .fold_object(key.clone(), RawDataset::Quotes, date, move |reader| {
+            .fold_object(RawDataset::Quotes, date, move |reader| {
                 fold_gzipped_quotes(reader, &scoped, fold)
             })
             .await?;
@@ -894,12 +986,12 @@ impl FlatFileClient {
         date: NaiveDate,
         fold: S,
     ) -> Result<(FlatFileFold, S), FlatFileError> {
-        let key = trade_key(date);
-        info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of trades");
+        let key = self.origin.key(RawDataset::Trades, date);
+        info!(bucket = self.origin.bucket(), key, %date, "Reading a flat file of trades");
 
         let scoped = key.clone();
         let ((mut summary, fold), compressed_bytes) = self
-            .fold_object(key.clone(), RawDataset::Trades, date, move |reader| {
+            .fold_object(RawDataset::Trades, date, move |reader| {
                 fold_gzipped_trades(reader, &scoped, fold)
             })
             .await?;
@@ -930,17 +1022,14 @@ impl FlatFileClient {
         date: NaiveDate,
         fold: S,
     ) -> Result<(FlatFileFold, S), FlatFileError> {
-        let key = bar_key(date);
-        info!(bucket = FLAT_FILE_BUCKET, key, %date, "Reading a flat file of bars");
+        let key = self.origin.key(RawDataset::MinuteAggregates, date);
+        info!(bucket = self.origin.bucket(), key, %date, "Reading a flat file of bars");
 
         let scoped = key.clone();
         let ((mut summary, fold), compressed_bytes) = self
-            .fold_object(
-                key.clone(),
-                RawDataset::MinuteAggregates,
-                date,
-                move |reader| fold_gzipped_bars(reader, &scoped, fold),
-            )
+            .fold_object(RawDataset::MinuteAggregates, date, move |reader| {
+                fold_gzipped_bars(reader, &scoped, fold)
+            })
             .await?;
 
         summary.compressed_bytes = compressed_bytes;
@@ -962,9 +1051,10 @@ impl FlatFileClient {
     /// The object's size, which the range requests need before any of them can be addressed.
     async fn object_length(&self, key: &str) -> Result<i64, FlatFileError> {
         let head = self
-            .s3_client
+            .origin
+            .s3_client()
             .head_object()
-            .bucket(FLAT_FILE_BUCKET)
+            .bucket(self.origin.bucket())
             .key(key)
             .send()
             .await
@@ -990,10 +1080,12 @@ impl FlatFileClient {
         staging: Option<PathBuf>,
     ) -> (ChunkReader, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = tokio::sync::mpsc::channel(READY_CHUNKS);
-        let client = self.s3_client.clone();
+        let client = self.origin.s3_client().clone();
+        let bucket = self.origin.bucket().to_string();
         let key = key.to_string();
-        let producer =
-            tokio::spawn(async move { fetch_ranges(client, key, length, sender, staging).await });
+        let producer = tokio::spawn(async move {
+            fetch_ranges(client, bucket, key, length, sender, staging).await
+        });
         (ChunkReader::new(receiver), producer)
     }
 
@@ -1004,7 +1096,6 @@ impl FlatFileClient {
     /// remember to write.
     async fn fold_object<T>(
         &self,
-        key: String,
         dataset: RawDataset,
         date: NaiveDate,
         parse: impl FnOnce(ChunkReader) -> Result<T, FlatFileError> + Send + 'static,
@@ -1012,8 +1103,9 @@ impl FlatFileClient {
     where
         T: Send + 'static,
     {
+        let key = self.origin.key(dataset, date);
         let compressed_bytes = self.object_length(&key).await?;
-        let staged = self.tee.as_ref().map(|tee| tee.staging_path(&key));
+        let staged = self.origin.tee().map(|tee| tee.staging_path(&key));
         let (reader, producer) = self.ranged_reader(&key, compressed_bytes, staged.clone());
 
         let folded = tokio::task::spawn_blocking(move || parse(reader))
@@ -1028,7 +1120,7 @@ impl FlatFileClient {
             warn!(key, %error, "The range producer did not finish cleanly");
         }
 
-        if let (Some(tee), Some(staged)) = (self.tee.as_ref(), staged.as_ref()) {
+        if let (Some(tee), Some(staged)) = (self.origin.tee(), staged.as_ref()) {
             // Removed only once the bytes are known to be in the archive. Deleting them on a failed
             // upload would destroy the one local copy of the expensive half and force the whole
             // object to be downloaded again — the exact cost this tee exists to stop paying.
@@ -1070,6 +1162,7 @@ impl FlatFileClient {
 /// keeps the pipe full without buffering the file.
 async fn fetch_ranges(
     client: S3Client,
+    bucket: String,
     key: String,
     length: i64,
     sender: tokio::sync::mpsc::Sender<Result<Vec<u8>, FlatFileError>>,
@@ -1097,9 +1190,9 @@ async fn fetch_ranges(
         while in_flight.len() < RANGES_IN_FLIGHT && next_offset < length {
             let (range, after) = chunk_range(next_offset, length);
             let expected = (after - next_offset) as usize;
-            let (client, key) = (client.clone(), key.clone());
+            let (client, bucket, key) = (client.clone(), bucket.clone(), key.clone());
             in_flight.push_back(tokio::spawn(async move {
-                fetch_one_range(client, key, range, expected).await
+                fetch_one_range(client, bucket, key, range, expected).await
             }));
             next_offset = after;
         }
@@ -1254,13 +1347,14 @@ fn chunk_range(offset: i64, length: i64) -> (String, i64) {
 /// exceptional one -- a measured 1.3% of ranges, none yet needing a third attempt.
 async fn fetch_one_range(
     client: S3Client,
+    bucket: String,
     key: String,
     range: String,
     expected: usize,
 ) -> Result<Vec<u8>, FlatFileError> {
     let mut attempt = 1;
     loop {
-        match try_fetch_one_range(&client, &key, &range, expected).await {
+        match try_fetch_one_range(&client, &bucket, &key, &range, expected).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) if attempt < RANGE_ATTEMPTS => {
                 // `failure` is the field that separates a throttle from a reset; `source` keeps
@@ -1283,13 +1377,14 @@ async fn fetch_one_range(
 
 async fn try_fetch_one_range(
     client: &S3Client,
+    bucket: &str,
     key: &str,
     range: &str,
     expected: usize,
 ) -> Result<Vec<u8>, FlatFileError> {
     let object = client
         .get_object()
-        .bucket(FLAT_FILE_BUCKET)
+        .bucket(bucket)
         .key(key)
         .range(range)
         .send()
@@ -2349,7 +2444,8 @@ mod tests {
         );
 
         let error = try_fetch_one_range(
-            &client.s3_client,
+            client.origin.s3_client(),
+            FLAT_FILE_BUCKET,
             "us_stocks_sip/quotes_v1/2021/08/2021-08-26.csv.gz",
             "bytes=0-2097151",
             2 * 1024 * 1024,
@@ -2471,6 +2567,27 @@ mod tests {
         FlatFileClient,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        let (http_client, requested) = recording_endpoint(body);
+        let credentials = FlatFileCredentials::new(
+            "https://files.massive.com".to_string(),
+            "key".to_string(),
+            "secret".to_string(),
+        )
+        .expect("usable credentials");
+        let configuration = FlatFileClient::configuration(credentials)
+            .http_client(http_client)
+            .build();
+        (FlatFileClient::from_configuration(configuration), requested)
+    }
+
+    /// The scripted endpoint itself, shared so both origins are exercised against one object store
+    /// rather than against two hand-written approximations of the same thing.
+    fn recording_endpoint(
+        body: Vec<u8>,
+    ) -> (
+        aws_sdk_s3::config::SharedHttpClient,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = std::sync::Arc::clone(&requested);
         let http_client = infallible_client_fn(move |request| {
@@ -2480,21 +2597,19 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
+            // The whole URI rather than its path: which bucket an object was addressed in is half
+            // of what an origin decides, and a path alone hides it whenever addressing is
+            // virtual-host rather than path-style.
             recorder
                 .lock()
                 .expect("no test thread panics holding this")
-                .push(format!(
-                    "{} {}{}",
-                    request.method(),
-                    request.uri().path(),
-                    {
-                        if range.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {range}")
-                        }
+                .push(format!("{} {}{}", request.method(), request.uri(), {
+                    if range.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {range}")
                     }
-                ));
+                }));
             match (request.method().clone(), parse_range(&range)) {
                 (http::Method::HEAD, _) => http::Response::builder()
                     .status(200)
@@ -2514,16 +2629,7 @@ mod tests {
                     .expect("a valid response"),
             }
         });
-        let credentials = FlatFileCredentials::new(
-            "https://files.massive.com".to_string(),
-            "key".to_string(),
-            "secret".to_string(),
-        )
-        .expect("usable credentials");
-        let configuration = FlatFileClient::configuration(credentials)
-            .http_client(http_client)
-            .build();
-        (FlatFileClient::from_configuration(configuration), requested)
+        (http_client, requested)
     }
 
     /// The whole path a real run takes: a signed request against Massive's endpoint, a gzip stream
@@ -2565,11 +2671,90 @@ mod tests {
         // Path-style, because the endpoint is not AWS: a virtual-host bucket would resolve
         // `flatfiles.files.massive.com`, which does not exist. The length is asked for first, then
         // the bytes are asked for by range rather than as a whole object.
-        let path = "/flatfiles/us_stocks_sip/quotes_v1/2026/03/2026-03-09.csv.gz";
+        let object =
+            "https://files.massive.com/flatfiles/us_stocks_sip/quotes_v1/2026/03/2026-03-09.csv.gz";
         let seen = requested.lock().expect("the request was recorded").clone();
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[0], format!("HEAD {path}"));
-        assert_eq!(seen[1], format!("GET {path} bytes=0-{}", body_length - 1));
+        assert_eq!(seen[0], format!("HEAD {object}"));
+        assert_eq!(
+            seen[1],
+            format!("GET {object}?x-id=GetObject bytes=0-{}", body_length - 1)
+        );
+    }
+
+    /// The same session, the same fold, the other copy of the bytes.
+    ///
+    /// Pinned as a whole URI because an origin decides two things at once and a wrong bucket with a
+    /// right key reads as a missing object rather than as a misdirected request. The literal is the
+    /// tee's own layout, which is what makes this the test that the archived bytes are reachable at
+    /// all -- until now nothing had ever read one back.
+    #[tokio::test]
+    async fn test_the_archived_copy_is_read_from_the_archive_at_the_tees_own_key() {
+        let body = format!(
+            "{HEADER}\n{}",
+            row("AAPL", "100.05", "200", "99.95", "100", stamp(0)),
+        );
+        let compressed = gzipped(&body);
+        let body_length = compressed.len();
+        let (http_client, requested) = recording_endpoint(compressed);
+        let client = FlatFileClient::reading_the_archive(
+            S3Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+                    .http_client(http_client)
+                    .build(),
+            ),
+            "oscm-fund-archive".to_string(),
+        );
+
+        let summary = client
+            .fold_quotes(
+                NaiveDate::from_ymd_opt(2026, 3, 9).expect("a real date"),
+                ForEach(|_ticker: Ticker, _tick: QuoteTick| {}),
+            )
+            .await
+            .expect("a usable file")
+            .0;
+        assert_eq!(summary.ticks_folded, 1);
+
+        // Virtual-host addressing, so the bucket is the host: this is AWS, unlike the vendor
+        // endpoint next door. `=` arrives percent-encoded, which is what a hive-partitioned key
+        // looks like on the wire and is why the literal is pinned here rather than assembled.
+        let object = "https://oscm-fund-archive.s3.us-east-1.amazonaws.com/data/raw/massive/equity/quotes/schema%3Dv1/year%3D2026/month%3D03/day%3D09/data.csv.gz";
+        let seen = requested.lock().expect("the request was recorded").clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], format!("HEAD {object}"));
+        assert_eq!(
+            seen[1],
+            format!("GET {object}?x-id=GetObject bytes=0-{}", body_length - 1)
+        );
+    }
+
+    /// An archive read has nothing to tee, and the one combination that would overwrite the object
+    /// being read is unspellable rather than guarded: the tee is a constructor argument on the
+    /// vendor path, so there is no method here to call with one.
+    #[test]
+    fn test_an_archive_origin_carries_no_tee() {
+        let archive = FlatFileOrigin::Archive {
+            s3_client: S3Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+                    .build(),
+            ),
+            bucket: "oscm-fund-archive".to_string(),
+        };
+        assert!(archive.tee().is_none());
+        assert_eq!(archive.bucket(), "oscm-fund-archive");
+
+        let date = NaiveDate::from_ymd_opt(2026, 3, 9).expect("a real date");
+        assert_eq!(
+            archive.key(RawDataset::Quotes, date),
+            "data/raw/massive/equity/quotes/schema=v1/year=2026/month=03/day=09/data.csv.gz"
+        );
     }
 
     /// A short body puts a hole in the gzip stream, and an endpoint that ignores Range altogether
@@ -2647,7 +2832,8 @@ mod tests {
         let (sender, receiver) = tokio::sync::mpsc::channel(READY_CHUNKS);
         drop(receiver);
         fetch_ranges(
-            client.s3_client.clone(),
+            client.origin.s3_client().clone(),
+            FLAT_FILE_BUCKET.to_string(),
             "us_stocks_sip/trades_v1/2021/09/2021-09-01.csv.gz".to_string(),
             body.len() as i64,
             sender,
@@ -2938,7 +3124,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a staging directory");
         // A destination that refuses everything, so `store` fails after the download succeeded.
-        client = client.teeing_raw_to(RawTee::new(
+        client = client.with_tee_for_test(RawTee::new(
             S3Client::from_conf(
                 aws_sdk_s3::Config::builder()
                     .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -2958,7 +3144,7 @@ mod tests {
 
         let date = NaiveDate::from_ymd_opt(2021, 9, 1).expect("a real date");
         let outcome = client
-            .fold_object(trade_key(date), RawDataset::Trades, date, |mut reader| {
+            .fold_object(RawDataset::Trades, date, |mut reader| {
                 let mut sink = Vec::new();
                 std::io::copy(&mut reader, &mut sink).expect("the staged stream");
                 Ok(sink.len())

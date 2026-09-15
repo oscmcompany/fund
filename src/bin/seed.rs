@@ -505,15 +505,32 @@ struct QuoteArguments {
     /// weekday forever; 21 does not.
     #[arg(long, default_value_t = DEFAULT_STRIDE, value_parser = stride)]
     stride: usize,
-    /// Keep the vendor's own bytes under `data/raw/`, as Deep Archive, as this pass reads them.
-    /// Every cadence the archive stores is a lossy read of them, so this is what makes a later
-    /// cadence a compute cost rather than another subscription month.
-    #[arg(long)]
-    tee_raw: bool,
+    /// Which copy of the flat files to read, and whether to keep it.
+    #[arg(long, value_enum, default_value_t = FlatFileSource::Vendor)]
+    source: FlatFileSource,
     /// Where a raw object waits between the download finishing and the upload starting. Needs room
     /// for one object: the largest session measured is 9.0 GB of quotes.
     #[arg(long, default_value = DEFAULT_STAGING_DIRECTORY)]
     staging_directory: std::path::PathBuf,
+}
+
+/// Which copy of a flat file a whole-session pass reads.
+///
+/// One flag rather than a source and a `--tee-raw` beside it, because only two of the four
+/// combinations mean anything: the archive's copy is already kept, so teeing it would upload the
+/// object being read back over itself. Spelling the pair as one value is what leaves that
+/// unsayable instead of guarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FlatFileSource {
+    /// Massive's endpoint, reading the bytes and discarding them.
+    Vendor,
+    /// Massive's endpoint, keeping every object under `data/raw/` as Deep Archive. Every cadence
+    /// the archive stores is a lossy read of them, so this is what makes a later cadence a compute
+    /// cost rather than another subscription month.
+    VendorKeepingRaw,
+    /// The archive's own copy, which buys nothing from the vendor. The objects are Deep Archive, so
+    /// a session must be restored before a pass can reach it.
+    Archive,
 }
 
 /// Where `--tee-raw` stages by default. Deliberately not `/tmp`, which is a tmpfs on the backfill
@@ -1517,24 +1534,30 @@ async fn fold_sampled(
     ))
 }
 
-/// The flat-file client, teeing the vendor's bytes into the archive when the pass keeps them.
+/// The flat-file client the pass's source names.
 ///
-/// The tee writes the shared archive rather than this instance's records: the raw objects are a
-/// provider-derived fact, and a second copy per developer is the thing the bucket split exists to
-/// prevent.
+/// The tee and the archive read both address the shared archive rather than this instance's
+/// records: the raw objects are a provider-derived fact, and a second copy per developer is the
+/// thing the bucket split exists to prevent.
 async fn flat_file_client(
     arguments: &QuoteArguments,
 ) -> Result<flatfiles::FlatFileClient, SeedError> {
-    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
-    if !arguments.tee_raw {
-        return Ok(client);
+    match arguments.source {
+        FlatFileSource::Vendor => flatfiles::FlatFileClient::from_env().map_err(box_error),
+        FlatFileSource::VendorKeepingRaw => {
+            let s3_client = fund::common::aws::s3_client().await;
+            flatfiles::FlatFileClient::from_env_teeing_to(flatfiles::RawTee::new(
+                s3_client,
+                bucket_name()?,
+                arguments.staging_directory.clone(),
+            ))
+            .map_err(box_error)
+        }
+        FlatFileSource::Archive => Ok(flatfiles::FlatFileClient::reading_the_archive(
+            fund::common::aws::s3_client().await,
+            bucket_name()?,
+        )),
     }
-    let s3_client = fund::common::aws::s3_client().await;
-    Ok(client.teeing_raw_to(flatfiles::RawTee::new(
-        s3_client,
-        bucket_name()?,
-        arguments.staging_directory.clone(),
-    )))
 }
 
 /// Folds the sampled sessions' printed tape into the archive under the scope the action names.
