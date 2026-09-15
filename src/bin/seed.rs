@@ -495,6 +495,8 @@ struct ProbeArguments {
     /// This is how a flat-file fold is checked against the same session through Alpaca.
     #[command(flatten)]
     symbols: SymbolArguments,
+    #[command(flatten)]
+    files: FlatFileArguments,
 }
 
 #[derive(Debug, Args)]
@@ -1483,8 +1485,8 @@ fn report(scan: &archive::SymbolScan) {
 async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
     match action {
         QuoteAction::Probe(arguments) => match arguments.symbols.names()? {
-            None => probe_flat_file(arguments.date).await,
-            Some(named) => fold_named_from_flat_file(arguments.date, named).await,
+            None => probe_flat_file(arguments.date, &arguments.files).await,
+            Some(named) => fold_named_from_flat_file(arguments.date, named, &arguments.files).await,
         },
         QuoteAction::Scan(arguments) => {
             scan_summary_coverage(archive::SessionFamily::Quotes, arguments).await
@@ -1906,8 +1908,11 @@ fn report_sample(
 /// is written: the row order, the file's size, the throughput of decompressing and parsing it, and
 /// how much of it is a book no spread reads off. Counting rather than folding, so the measurement
 /// costs one download and almost no memory.
-async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
-    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+async fn probe_flat_file(
+    date: SessionDate,
+    files: &FlatFileArguments,
+) -> Result<Outcome, SeedError> {
+    let client = flat_file_client(files).await?;
     let started = tokio::time::Instant::now();
     let (summary, _) = client
         .fold_quotes(date.date(), flatfiles::ForEach(|_ticker, _tick| {}))
@@ -1915,7 +1920,11 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
         .map_err(box_error)?;
     let elapsed = started.elapsed().as_secs_f64();
 
-    println!("{}", flatfiles::quote_key(date.date()));
+    println!(
+        "{}/{}",
+        client.bucket(),
+        client.object_key(flatfiles::RawDataset::Quotes, date.date())
+    );
     println!(
         "  {} rows, {} usable, {} unusable ({:.2}%), {} tickers",
         summary.rows_read,
@@ -1969,8 +1978,9 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
 async fn fold_named_from_flat_file(
     date: SessionDate,
     named: BTreeSet<Ticker>,
+    files: &FlatFileArguments,
 ) -> Result<Outcome, SeedError> {
-    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    let client = flat_file_client(files).await?;
     let credentials = AlpacaCredentials::from_env().map_err(box_error)?;
     let days = TradingClient::from_env(credentials)
         .fetch_calendar(date.date(), date.date())
@@ -1993,7 +2003,11 @@ async fn fold_named_from_flat_file(
     let folded_ticks = fold.folded();
     let folded = fold.finish();
 
-    println!("{}", flatfiles::quote_key(date.date()));
+    println!(
+        "{}/{}",
+        client.bucket(),
+        client.object_key(flatfiles::RawDataset::Quotes, date.date())
+    );
     println!(
         "  {} rows scanned in {elapsed:.0}s, {folded_ticks} folded for the names asked for",
         file.rows_read
@@ -2775,10 +2789,19 @@ mod tests {
                 "{action} with --source"
             );
         }
+
+        // The probe takes a date rather than a window, and it is the only route that reads an
+        // archived object without writing one -- so it is how a restore is checked at all.
+        let probe = ["equity-quotes", "probe", "--date", "2026-08-03"];
+        assert!(parse(&probe).is_ok(), "a probe must parse without a source");
+        assert!(
+            parse(&[probe.as_slice(), &["--source", "archive"]].concat()).is_ok(),
+            "a probe must reach the archive"
+        );
     }
 
-    /// A probe reads one vendor file rather than the archive, so it takes a date and at most a set
-    /// of names to fold out of it — never a window or a stride, which only a sampled pass has.
+    /// A probe reads one file rather than a sampled range, so it takes a date and at most a set of
+    /// names to fold out of it — never a window or a stride, which only a sampled pass has.
     #[test]
     fn test_a_probe_takes_one_date_and_optionally_names() {
         let QuoteAction::Probe(arguments) =

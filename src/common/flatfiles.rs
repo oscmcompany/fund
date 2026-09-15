@@ -855,6 +855,19 @@ impl FlatFileClient {
         Self::from_configuration(Self::configuration(credentials).build())
     }
 
+    /// Where this client would look for one day of `dataset`, which differs by origin.
+    ///
+    /// Exposed so a read-only probe can name the object it actually read rather than the vendor key
+    /// it would have read under the other origin.
+    pub fn object_key(&self, dataset: RawDataset, date: NaiveDate) -> String {
+        self.origin.key(dataset, date)
+    }
+
+    /// The bucket this client addresses.
+    pub fn bucket(&self) -> &str {
+        self.origin.bucket()
+    }
+
     /// Attaches a tee to an already-configured vendor client.
     ///
     /// Test-only, because production puts the tee in the constructor — which is exactly what stops an
