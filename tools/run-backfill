@@ -5,7 +5,7 @@
 # a provisioned EC2 box has none of it and `seed` reads its configuration from the environment alone.
 # This assembles the same environment from Secrets Manager and execs `seed` with its arguments.
 #
-#   run-backfill equity-trades archive --start 2021-08-26 --end 2026-08-28 --tee-raw
+#   run-backfill equity-trades archive --start 2021-08-26 --end 2026-08-28 --source vendor-keeping-raw
 #
 # The instance role this runs under is `backfill-box-role-policy.json` beside this file:
 #   aws iam put-role-policy --role-name fund-quote-backfill \
