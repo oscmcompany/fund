@@ -372,10 +372,9 @@ enum QuoteAction {
     Widen(QuoteFoldArguments),
     /// Fold every sampled session afresh, taking each partition over from whatever built it.
     ///
-    /// The only action that discards stored rows. `widen` merges, which keeps a second provider's
-    /// rows exactly where they are; this is what makes a partition that already mixes two vendors
-    /// answer for one. Its own verb rather than a flag on `widen`, because the failure mode is a
-    /// pass that silently deletes the rows it was meant to preserve.
+    /// The only action that discards stored rows, which is what makes a partition mixing two
+    /// vendors answer for one where `widen` would merge and keep both. Its own verb rather than a
+    /// flag, because the failure mode is a pass that silently deletes what it should preserve.
     Refold(QuoteFoldArguments),
     /// Fold named symbols and print what they read, touching no partition.
     Measure(QuoteSymbolArguments),
@@ -2921,7 +2920,7 @@ mod tests {
     /// exists, so the next pass reads the session as present and never looks inside, and widening
     /// afterwards means re-reading vendor files a lapsed subscription no longer serves.
     #[test]
-    fn test_both_universe_quote_actions_fold_the_whole_market() {
+    fn test_every_universe_quote_action_folds_the_whole_market() {
         let window = ["--start", "2021-08-26", "--end", "2026-08-25"];
         let parsed = |verb: &str| {
             let arguments = parse(&[["equity-quotes", verb].as_slice(), &window].concat())
@@ -2944,6 +2943,18 @@ mod tests {
         // test moves with it and can never fail.
         assert_eq!(rendered("archive"), "every name, absent sessions only");
         assert_eq!(rendered("widen"), "every name, every session");
+        assert_eq!(rendered("refold"), "every name, every session");
+
+        // The boundary a routing change would erase: exactly one verb discards stored rows, and
+        // widening that to `archive` or `widen` turns two ordinary backfills into destructive ones.
+        assert_eq!(parsed("refold").foreign_provider(), ForeignProvider::Claim);
+        for verb in ["archive", "widen"] {
+            assert_eq!(
+                parsed(verb).foreign_provider(),
+                ForeignProvider::Refuse,
+                "{verb} must refuse a foreign provider"
+            );
+        }
 
         // The actions that name their own symbols must not answer here at all, or the arm above
         // would fold a universe over a repair.

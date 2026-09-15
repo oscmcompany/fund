@@ -1879,6 +1879,9 @@ async fn write_partition(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForeignProvider {
     Refuse,
+    /// Takes the partition over. Must not run beside a repair on the same session: the parquet and
+    /// its sidecar are two conditional writes, and a repair landing between them merges into the
+    /// replacement, which the claim then records as single-source.
     Claim,
 }
 
@@ -1949,9 +1952,8 @@ where
             refuse_a_second_provider(s3_client, bucket, &key, authorship.provenance).await?;
         }
         let (mut frame, precondition) = match existing {
-            // Still conditional on the ETag, so a claim is an overwrite of the object this pass
-            // read and not of whatever happens to be there when it writes. That is what keeps a
-            // failed re-fold from leaving a hole where a wrong-but-present partition used to be.
+            // Still conditional on the ETag: a claim overwrites the object this pass read, so a
+            // failed re-fold cannot leave a hole where a wrong-but-present partition was.
             Some((_, etag)) if authorship.claims() => (fetched.clone(), Precondition::Match(etag)),
             Some((existing_frame, etag)) => (
                 merge(existing_frame, fetched.clone(), &key)?,
@@ -1965,8 +1967,21 @@ where
 
         match put_partition(s3_client, bucket, &key, buffer, &precondition).await {
             WriteOutcome::Written => {
-                write_sidecar(s3_client, bucket, &key, dataset, authorship).await;
-                return Ok(());
+                return match write_sidecar(s3_client, bucket, &key, dataset, authorship).await {
+                    Ok(()) => Ok(()),
+                    // A claim's record is the write, not a footnote to it. Rows that changed hands
+                    // under a record still naming the old provider read as a re-fold that did
+                    // nothing, and every provenance query would agree with the record.
+                    Err(message) if authorship.claims() => Err(ArchiveError::Write {
+                        bucket: bucket.to_string(),
+                        key: PartitionProvenance::sidecar_key(&key),
+                        message,
+                    }),
+                    Err(message) => {
+                        warn!(key, message, "Provenance sidecar was not written");
+                        Ok(())
+                    }
+                };
             }
             // Someone else wrote between this read and this write. Go round again so the merge is
             // redone against what they left, rather than resending a buffer built from stale rows.
@@ -3522,16 +3537,17 @@ async fn read_sidecar(
 
 /// Records where an object's bytes came from, beside the object itself.
 ///
-/// Best-effort and warned rather than propagated: a 200-byte sidecar must never fail a fold that has
-/// already landed, and the sweep finds whatever this misses. The write is conditional, so a repair
-/// racing a bulk walk retries against what the other wrote instead of discarding it.
+/// Returns why it gave up rather than swallowing it, because what a failure costs depends on the
+/// write: an ordinary fold loses a record the sweep rebuilds, and a claim loses the only statement
+/// that the partition changed hands. The write is conditional, so a repair racing a bulk walk
+/// retries against what the other wrote instead of discarding it.
 async fn write_sidecar(
     s3_client: &S3Client,
     bucket: &str,
     object_key: &str,
     dataset: DerivedDataset,
     authorship: Authorship,
-) {
+) -> Result<(), String> {
     let key = PartitionProvenance::sidecar_key(object_key);
     let session = session_from_key(object_key, "data.parquet").map(|at| at.to_string());
     let provenance = authorship.provenance;
@@ -3540,18 +3556,12 @@ async fn write_sidecar(
     for attempt in 1..=CONTENDED_WRITE_ATTEMPTS {
         let existing = match read_sidecar(s3_client, bucket, &key).await {
             Ok(existing) => existing,
-            // Never overwrite a record that could not be read. The whole point of the set is that a
-            // later route adds itself; guessing "absent" here is how it would lose one.
-            Err(error) => {
-                warn!(key, %error, "Provenance could not be read; leaving the record alone");
-                return;
-            }
+            // Never overwrite a record that could not be read: guessing "absent" loses a route.
+            Err(error) => return Err(format!("the record could not be read: {error}")),
         };
         let (record, precondition) = match existing {
-            // A claim rewrites the record rather than adding to it. The rows the other route
-            // produced are gone, so a record still naming it would describe a partition that no
-            // longer exists -- and it is the sidecar, not the parquet, that every provenance query
-            // reads.
+            // A claim rewrites the record rather than adding to it: the other route's rows are
+            // gone, and the sidecar is what every provenance query reads.
             SidecarRead::Found(_, etag) if authorship.claims() => {
                 (fresh(), Precondition::Match(etag))
             }
@@ -3562,16 +3572,12 @@ async fn write_sidecar(
             // An `Absent` precondition cannot replace an object that is really there, so retrying
             // would 409 until the attempts ran out under a warning naming the wrong cause.
             SidecarRead::Unreadable => {
-                warn!(key, "Provenance did not parse; the sweep must rewrite it");
-                return;
+                return Err("the record did not parse; the sweep must rewrite it".to_string())
             }
         };
         let body = match serde_json::to_vec(&record) {
             Ok(body) => body,
-            Err(error) => {
-                warn!(key, %error, "Provenance did not serialize");
-                return;
-            }
+            Err(error) => return Err(format!("the record did not serialize: {error}")),
         };
         match put_object_with_precondition(
             s3_client,
@@ -3583,24 +3589,17 @@ async fn write_sidecar(
         )
         .await
         {
-            WriteOutcome::Written => return,
+            WriteOutcome::Written => return Ok(()),
             WriteOutcome::Contended => {
                 warn!(
                     key,
                     attempt, "Provenance changed under a write; merging again"
                 )
             }
-            WriteOutcome::Failed(message) => {
-                warn!(key, message, "Provenance sidecar was not written");
-                return;
-            }
+            WriteOutcome::Failed(message) => return Err(message),
         }
     }
-    warn!(
-        key,
-        attempts = CONTENDED_WRITE_ATTEMPTS,
-        "Provenance sidecar lost every race; the sweep will report it"
-    );
+    Err(format!("the record lost {CONTENDED_WRITE_ATTEMPTS} races"))
 }
 
 /// S3 answers a failed precondition with `412 Precondition Failed`, and `If-None-Match: *` against
@@ -4282,6 +4281,54 @@ mod tests {
                 .len(),
             2,
             "the partition and its sidecar"
+        );
+    }
+
+    /// A claim whose record cannot be written must not report success; an ordinary write still may.
+    ///
+    /// The asymmetry is the point. An ordinary fold that loses its sidecar loses a note the sweep
+    /// rebuilds, while a claim that loses its sidecar leaves rows that changed hands under a record
+    /// still naming the provider they came from — which reads downstream as a re-fold that never ran.
+    #[tokio::test]
+    async fn test_only_a_claim_fails_when_its_provenance_record_cannot_be_written() {
+        let outcome = |authorship: Authorship| async move {
+            let client = scripted_s3_client(move |method, key| {
+                // The sidecar alone refuses, so the partition lands and only the record fails.
+                if method == http::Method::PUT && key.ends_with("provenance.json") {
+                    return http::Response::builder()
+                        .status(500)
+                        .body(SdkBody::from("<Error><Code>InternalError</Code></Error>"))
+                        .expect("a canned response must build");
+                }
+                if method == http::Method::PUT {
+                    return http::Response::builder()
+                        .status(200)
+                        .body(SdkBody::empty())
+                        .expect("a canned response must build");
+                }
+                no_such_key()
+            });
+            write_merged(
+                &client,
+                "test-bucket",
+                "data/derived/equity/quotes/interval=one_day/year=2024/month=01/day=25/data.parquet"
+                    .to_string(),
+                one_frame("NEW"),
+                |_existing, fetched, _key| Ok(fetched),
+                DerivedDataset::Quotes,
+                authorship,
+            )
+            .await
+        };
+
+        let massive = Provenance::massive(MassivePlan::StocksAdvanced, MassiveTransport::FlatFile);
+        assert!(
+            outcome(Authorship::claiming(massive)).await.is_err(),
+            "a claim must not report success over an unwritten record"
+        );
+        assert!(
+            outcome(Authorship::refusing(massive)).await.is_ok(),
+            "an ordinary fold must survive a lost sidecar"
         );
     }
 
