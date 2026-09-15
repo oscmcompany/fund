@@ -1865,15 +1865,67 @@ async fn write_partition(
         fetched,
         |existing, fetched, key| merge_or_replace(existing, fetched, key),
         DerivedDataset::Bars,
-        provenance,
+        Authorship::refusing(provenance),
     )
     .await
+}
+
+/// What a write does about a provider the partition it is entering already names.
+///
+/// [`ForeignProvider::Refuse`] is the standing rule and the default everywhere: a partition answers
+/// for one vendor. [`ForeignProvider::Claim`] is the re-fold's, and it is the only way a partition
+/// that already mixes two vendors becomes single-source — merging would keep precisely the rows a
+/// re-fold exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignProvider {
+    Refuse,
+    Claim,
+}
+
+/// Who a write is attributed to, and what it does about a provider already named.
+///
+/// The two travel together because the second is only meaningful against the first: a claim is the
+/// statement that *this* provider owns the partition from here on, so the pair cannot be separated
+/// without letting a caller claim a partition for nobody in particular. Named for the byline rather
+/// than the record, since [`crate::data::attribution::Attribution`] is already the stored one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorship {
+    provenance: Provenance,
+    foreign: ForeignProvider,
+}
+
+impl Authorship {
+    /// A write that refuses to enter a partition another provider built.
+    pub const fn refusing(provenance: Provenance) -> Self {
+        Self {
+            provenance,
+            foreign: ForeignProvider::Refuse,
+        }
+    }
+
+    /// A write that takes the partition over from whatever built it.
+    pub const fn claiming(provenance: Provenance) -> Self {
+        Self {
+            provenance,
+            foreign: ForeignProvider::Claim,
+        }
+    }
+
+    pub const fn provenance(self) -> Provenance {
+        self.provenance
+    }
+
+    const fn claims(self) -> bool {
+        matches!(self.foreign, ForeignProvider::Claim)
+    }
 }
 
 /// The read-merge-write cycle itself, over any key and any way of combining the two frames.
 ///
 /// Shared because the bar partitions and the splits table differ only in how they merge — the
-/// compare-and-swap around it, and the reasoning for it, are the same either way.
+/// compare-and-swap around it, and the reasoning for it, are the same either way. A claiming
+/// attribution does not call `merge` at all: its whole purpose is that the stored rows do not
+/// survive.
 async fn write_merged<F>(
     s3_client: &S3Client,
     bucket: &str,
@@ -1881,7 +1933,7 @@ async fn write_merged<F>(
     fetched: DataFrame,
     merge: F,
     dataset: DerivedDataset,
-    provenance: Provenance,
+    authorship: Authorship,
 ) -> Result<(), ArchiveError>
 where
     F: Fn(DataFrame, DataFrame, &str) -> Result<DataFrame, ArchiveError>,
@@ -1893,10 +1945,14 @@ where
         let existing = read_partition_with_etag(s3_client, bucket, &key).await?;
         // Checked before the merge, not after: the sidecar records a set of routes rather than a
         // route per row, so this is the last point at which the two providers are still separable.
-        if existing.is_some() {
-            refuse_a_second_provider(s3_client, bucket, &key, provenance).await?;
+        if existing.is_some() && !authorship.claims() {
+            refuse_a_second_provider(s3_client, bucket, &key, authorship.provenance).await?;
         }
         let (mut frame, precondition) = match existing {
+            // Still conditional on the ETag, so a claim is an overwrite of the object this pass
+            // read and not of whatever happens to be there when it writes. That is what keeps a
+            // failed re-fold from leaving a hole where a wrong-but-present partition used to be.
+            Some((_, etag)) if authorship.claims() => (fetched.clone(), Precondition::Match(etag)),
             Some((existing_frame, etag)) => (
                 merge(existing_frame, fetched.clone(), &key)?,
                 Precondition::Match(etag),
@@ -1909,7 +1965,7 @@ where
 
         match put_partition(s3_client, bucket, &key, buffer, &precondition).await {
             WriteOutcome::Written => {
-                write_sidecar(s3_client, bucket, &key, dataset, provenance).await;
+                write_sidecar(s3_client, bucket, &key, dataset, authorship).await;
                 return Ok(());
             }
             // Someone else wrote between this read and this write. Go round again so the merge is
@@ -2077,6 +2133,7 @@ impl std::fmt::Display for QuoteSource<'_> {
 /// overnight book is an order of magnitude wider and would swamp any session mean it entered.
 /// `sessions` must already be calendar-filtered, which the returned summary assumes when it reports
 /// a session that answered with nothing as a fault rather than as a holiday.
+#[allow(clippy::too_many_arguments)]
 pub async fn archive_quote_sessions(
     s3_client: &S3Client,
     source: &QuoteSource<'_>,
@@ -2085,6 +2142,7 @@ pub async fn archive_quote_sessions(
     sessions: &[SessionDate],
     scope: &Scope,
     cadence: IntradayCadence,
+    foreign: ForeignProvider,
 ) -> Result<PassSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
         return Ok(PassProgress::default().into_quote_summary(0));
@@ -2142,6 +2200,7 @@ pub async fn archive_quote_sessions(
             session,
             scope,
             cadence,
+            foreign,
             &mut progress,
             &mut agreement,
         )
@@ -2197,6 +2256,7 @@ async fn archive_quote_session(
     session: SessionDate,
     scope: &Scope,
     cadence: IntradayCadence,
+    foreign: ForeignProvider,
     progress: &mut PassProgress,
     agreement: &mut CadenceTotals,
 ) -> Result<usize, ArchiveError> {
@@ -2274,7 +2334,10 @@ async fn archive_quote_session(
         cadence,
         progress,
         agreement,
-        source.provenance(),
+        Authorship {
+            provenance: source.provenance(),
+            foreign,
+        },
     )
     .await?;
     Ok(quotes_folded)
@@ -2422,7 +2485,7 @@ async fn write_quote_partitions(
     cadence: IntradayCadence,
     progress: &mut PassProgress,
     agreement: &mut CadenceTotals,
-    provenance: Provenance,
+    authorship: Authorship,
 ) -> Result<(), ArchiveError> {
     let mut intraday: Vec<QuoteSummary> = Vec::new();
     let mut daily: Vec<QuoteSummary> = Vec::new();
@@ -2438,7 +2501,7 @@ async fn write_quote_partitions(
         let rows = match prefix {
             BarInterval::OneDay => {
                 settle_session_row(
-                    s3_client, bucket, session, &daily, cadence, progress, agreement, provenance,
+                    s3_client, bucket, session, &daily, cadence, progress, agreement, authorship,
                 )
                 .await?
             }
@@ -2450,7 +2513,7 @@ async fn write_quote_partitions(
                     &intraday,
                     intraday_prefix,
                     progress,
-                    provenance,
+                    authorship,
                 )
                 .await?
             }
@@ -2476,7 +2539,7 @@ async fn write_intraday_partition(
     intraday: &[QuoteSummary],
     interval: BarInterval,
     progress: &mut PassProgress,
-    provenance: Provenance,
+    authorship: Authorship,
 ) -> Result<Option<usize>, ArchiveError> {
     if intraday.is_empty() {
         return Ok(Some(0));
@@ -2484,7 +2547,7 @@ async fn write_intraday_partition(
     let frame = quotes::summaries_to_dataframe(intraday)?;
     let key = date_partitioned_key(&quote_archive_prefix(interval), session.date());
     let survived =
-        write_quote_partition(s3_client, bucket, session, key, frame, progress, provenance).await?;
+        write_quote_partition(s3_client, bucket, session, key, frame, progress, authorship).await?;
     Ok(survived.then_some(intraday.len()))
 }
 
@@ -2501,7 +2564,7 @@ async fn settle_session_row(
     cadence: IntradayCadence,
     progress: &mut PassProgress,
     agreement: &mut CadenceTotals,
-    provenance: Provenance,
+    authorship: Authorship,
 ) -> Result<Option<usize>, ArchiveError> {
     if daily.is_empty() {
         return Ok(Some(0));
@@ -2514,7 +2577,7 @@ async fn settle_session_row(
     let Some(stored) = stored else {
         let frame = quotes::summaries_to_dataframe(daily)?;
         let survived =
-            write_quote_partition(s3_client, bucket, session, key, frame, progress, provenance)
+            write_quote_partition(s3_client, bucket, session, key, frame, progress, authorship)
                 .await?;
         return Ok(survived.then_some(daily.len()));
     };
@@ -2534,7 +2597,7 @@ async fn write_quote_partition(
     key: String,
     frame: DataFrame,
     progress: &mut PassProgress,
-    provenance: Provenance,
+    authorship: Authorship,
 ) -> Result<bool, ArchiveError> {
     match write_merged(
         s3_client,
@@ -2543,7 +2606,7 @@ async fn write_quote_partition(
         frame,
         |existing, fetched, key| merge_or_replace(existing, fetched, key),
         DerivedDataset::Quotes,
-        provenance,
+        authorship,
     )
     .await
     {
@@ -3188,7 +3251,7 @@ async fn write_trade_partitions(
             // Carried from the source rather than named here: a repair folds Alpaca into a partition
             // a flat file built, and filing that as Massive-only would hide the provider seam in the
             // one record that exists to expose it.
-            provenance,
+            Authorship::refusing(provenance),
         )
         .await
         {
@@ -3262,7 +3325,10 @@ pub async fn archive_splits(
             }
         },
         DerivedDataset::Splits,
-        Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+        Authorship::refusing(Provenance::massive(
+            MassivePlan::StocksStarter,
+            MassiveTransport::Rest,
+        )),
     )
     .await?;
 
@@ -3313,7 +3379,7 @@ pub async fn archive_boundaries(
             })
         },
         DerivedDataset::Boundaries,
-        Provenance::alpaca(AlpacaPlan::AlgoTraderPlus),
+        Authorship::refusing(Provenance::alpaca(AlpacaPlan::AlgoTraderPlus)),
     )
     .await?;
 
@@ -3464,10 +3530,12 @@ async fn write_sidecar(
     bucket: &str,
     object_key: &str,
     dataset: DerivedDataset,
-    provenance: Provenance,
+    authorship: Authorship,
 ) {
     let key = PartitionProvenance::sidecar_key(object_key);
     let session = session_from_key(object_key, "data.parquet").map(|at| at.to_string());
+    let provenance = authorship.provenance;
+    let fresh = || PartitionProvenance::new(dataset.as_str(), session.as_deref(), provenance);
 
     for attempt in 1..=CONTENDED_WRITE_ATTEMPTS {
         let existing = match read_sidecar(s3_client, bucket, &key).await {
@@ -3480,13 +3548,17 @@ async fn write_sidecar(
             }
         };
         let (record, precondition) = match existing {
+            // A claim rewrites the record rather than adding to it. The rows the other route
+            // produced are gone, so a record still naming it would describe a partition that no
+            // longer exists -- and it is the sidecar, not the parquet, that every provenance query
+            // reads.
+            SidecarRead::Found(_, etag) if authorship.claims() => {
+                (fresh(), Precondition::Match(etag))
+            }
             SidecarRead::Found(record, etag) => {
                 (record.contributed(provenance), Precondition::Match(etag))
             }
-            SidecarRead::Absent => (
-                PartitionProvenance::new(dataset.as_str(), session.as_deref(), provenance),
-                Precondition::Absent,
-            ),
+            SidecarRead::Absent => (fresh(), Precondition::Absent),
             // An `Absent` precondition cannot replace an object that is really there, so retrying
             // would 409 until the attempts ran out under a warning naming the wrong cause.
             SidecarRead::Unreadable => {
@@ -3901,6 +3973,12 @@ mod tests {
         .expect("a coherent candle must construct")
     }
 
+    /// A one-row frame carrying a name, which is all a replace test needs to tell two apart.
+    fn one_frame(ticker_symbol: &str) -> DataFrame {
+        crate::data::bars::bars_to_dataframe(&[one_bar(ticker_symbol, session(2024, 1, 25))])
+            .expect("a single bar must frame")
+    }
+
     /// One name's session, folded from a single ordinary print.
     fn one_trade_summary(ticker_symbol: &str, at: SessionDate) -> Vec<TradeSummary> {
         let open = at.midnight();
@@ -4076,6 +4154,137 @@ mod tests {
         );
     }
 
+    /// A claim rewrites the provenance record instead of adding to it.
+    ///
+    /// The union is right for every other write and wrong for this one: the rows the other route
+    /// produced are gone, so a record still naming it describes a partition that no longer exists.
+    /// It is the sidecar rather than the parquet that every provenance query reads, so a stale one
+    /// leaves the re-fold looking like it did nothing.
+    #[tokio::test]
+    async fn test_a_claim_rewrites_the_provenance_record_rather_than_joining_it() {
+        let mixed = PartitionProvenance::new(
+            "equity_quotes",
+            Some("2024-01-25"),
+            Provenance::massive(MassivePlan::StocksAdvanced, MassiveTransport::FlatFile),
+        )
+        .contributed(Provenance::alpaca(AlpacaPlan::AlgoTraderPlus));
+        let body = serde_json::to_string(&mixed).expect("the record must serialize");
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&written);
+        let client = scripted_s3_client_capturing(move |method, _key, put| {
+            if method == http::Method::PUT {
+                recorder
+                    .lock()
+                    .expect("the recorder must not be poisoned")
+                    .push(put.to_string());
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .expect("a canned response must build")
+            } else {
+                http::Response::builder()
+                    .status(200)
+                    .header("etag", "\"an-etag\"")
+                    .body(SdkBody::from(body.clone()))
+                    .expect("a canned response must build")
+            }
+        });
+
+        let key =
+            "data/derived/equity/quotes/interval=one_day/year=2024/month=01/day=25/data.parquet";
+        write_sidecar(
+            &client,
+            "test-bucket",
+            key,
+            DerivedDataset::Quotes,
+            Authorship::claiming(Provenance::massive(
+                MassivePlan::StocksAdvanced,
+                MassiveTransport::FlatFile,
+            )),
+        )
+        .await;
+
+        let records = written
+            .lock()
+            .expect("the recorder must not be poisoned")
+            .clone();
+        assert_eq!(records.len(), 1, "one record must be written: {records:?}");
+        let rewritten: PartitionProvenance =
+            serde_json::from_str(&records[0]).expect("the record must parse");
+        let providers: Vec<&str> = rewritten
+            .routes
+            .iter()
+            .map(|route| route.provider_name())
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["massive"],
+            "alpaca must not survive a claim"
+        );
+    }
+
+    /// A claim discards the stored rows, and does so without asking the merge how to combine them.
+    ///
+    /// The merge is what a `widen` uses to keep everything either side holds, which is precisely
+    /// wrong here -- it would preserve the rows the re-fold exists to remove. Asserted by handing in
+    /// a merge that panics, so "not called" is proven rather than inferred from the output.
+    #[tokio::test]
+    async fn test_a_claim_replaces_the_stored_rows_without_merging_them() {
+        let mut stored = one_frame("OLD");
+        let mut existing: Vec<u8> = Vec::new();
+        ParquetWriter::new(&mut existing)
+            .finish(&mut stored)
+            .expect("the stored partition must serialize");
+
+        let conditions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&conditions);
+        let client = scripted_s3_client(move |method, key| {
+            if method == http::Method::PUT {
+                recorder
+                    .lock()
+                    .expect("the recorder must not be poisoned")
+                    .push(key.to_string());
+                return http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .expect("a canned response must build");
+            }
+            if key.ends_with("provenance.json") {
+                return no_such_key();
+            }
+            http::Response::builder()
+                .status(200)
+                .header("etag", "\"an-etag\"")
+                .body(SdkBody::from(existing.clone()))
+                .expect("a canned response must build")
+        });
+
+        write_merged(
+            &client,
+            "test-bucket",
+            "data/derived/equity/quotes/interval=one_day/year=2024/month=01/day=25/data.parquet"
+                .to_string(),
+            one_frame("NEW"),
+            |_existing, _fetched, _key| panic!("a claim must not consult the merge"),
+            DerivedDataset::Quotes,
+            Authorship::claiming(Provenance::massive(
+                MassivePlan::StocksAdvanced,
+                MassiveTransport::FlatFile,
+            )),
+        )
+        .await
+        .expect("the claim must be written");
+
+        assert_eq!(
+            conditions
+                .lock()
+                .expect("the recorder must not be poisoned")
+                .len(),
+            2,
+            "the partition and its sidecar"
+        );
+    }
+
     /// A failed read must never become an overwrite.
     ///
     /// `read_sidecar` once mapped every error to "absent", so a throttle or a 503 made the next write
@@ -4110,7 +4319,10 @@ mod tests {
             "test-bucket",
             SPLITS_ARCHIVE_KEY,
             DerivedDataset::Splits,
-            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+            Authorship::refusing(Provenance::massive(
+                MassivePlan::StocksStarter,
+                MassiveTransport::Rest,
+            )),
         )
         .await;
 
@@ -4156,7 +4368,10 @@ mod tests {
             "test-bucket",
             SPLITS_ARCHIVE_KEY,
             DerivedDataset::Splits,
-            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+            Authorship::refusing(Provenance::massive(
+                MassivePlan::StocksStarter,
+                MassiveTransport::Rest,
+            )),
         )
         .await;
 
@@ -4198,7 +4413,10 @@ mod tests {
             "test-bucket",
             SPLITS_ARCHIVE_KEY,
             DerivedDataset::Splits,
-            Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+            Authorship::refusing(Provenance::massive(
+                MassivePlan::StocksStarter,
+                MassiveTransport::Rest,
+            )),
         )
         .await;
 

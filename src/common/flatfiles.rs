@@ -592,7 +592,21 @@ impl RawTee {
 
     /// Whether `key` is already present at the length the source reports.
     async fn already_stored(&self, key: &str, expected: i64) -> Result<bool, FlatFileError> {
-        Ok(self.stored_length(key).await? == Some(expected))
+        let stored = self.stored_length(key).await?;
+        // A stored object at a different length is the vendor having reissued the file, and it is
+        // the only drift signal this path gets for free. The upload proceeds -- the fresh bytes are
+        // what the partitions about to be written come from -- but it must not proceed quietly,
+        // because it replaces the only copy of what the archive was previously built from.
+        if let Some(stored) = stored.filter(|stored| *stored != expected) {
+            warn!(
+                key,
+                stored,
+                fetched = expected,
+                difference = expected - stored,
+                "The vendor's object differs in length from the archived copy; replacing it"
+            );
+        }
+        Ok(stored == Some(expected))
     }
 
     /// The stored object's length, or `None` where there is no object.
@@ -1063,6 +1077,19 @@ impl FlatFileClient {
                 failure: FetchFailure::read(&error),
                 source: Box::new(error),
             })?;
+        // Logged rather than only measured. The vendor's own metadata is the cheapest drift signal
+        // there is -- an object last modified long after the session it holds has been reissued
+        // since, and this is the one place a pass already asks for it. `ETag` is here because a
+        // reissue at an identical length changes nothing else.
+        info!(
+            key,
+            bucket = self.origin.bucket(),
+            last_modified = head.last_modified().map(|at| at.to_string()),
+            etag = head.e_tag(),
+            storage_class = head.storage_class().map(|class| class.as_str()),
+            content_length = head.content_length(),
+            "Read a flat file's vendor metadata"
+        );
         match head.content_length() {
             Some(length) if length > 0 => Ok(length),
             _ => Err(FlatFileError::Empty { field: "object" }),
