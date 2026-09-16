@@ -495,6 +495,8 @@ struct ProbeArguments {
     /// This is how a flat-file fold is checked against the same session through Alpaca.
     #[command(flatten)]
     symbols: SymbolArguments,
+    #[command(flatten)]
+    files: FlatFileArguments,
 }
 
 #[derive(Debug, Args)]
@@ -505,25 +507,62 @@ struct QuoteArguments {
     /// weekday forever; 21 does not.
     #[arg(long, default_value_t = DEFAULT_STRIDE, value_parser = stride)]
     stride: usize,
-    /// Keep the vendor's own bytes under `data/raw/`, as Deep Archive, as this pass reads them.
-    /// Every cadence the archive stores is a lossy read of them, so this is what makes a later
-    /// cadence a compute cost rather than another subscription month.
-    #[arg(long)]
-    tee_raw: bool,
+    #[command(flatten)]
+    files: FlatFileArguments,
+}
+
+/// Where a whole-session pass reads its flat files, and where it stages them.
+///
+/// Separate from [`QuoteArguments`] so it can be left off the per-name types, which reach Alpaca one
+/// name at a time and never open a file. The same reasoning [`TradeSymbolArguments`] already
+/// records: a flag the CLI accepts and ignores reads as a setting that was applied.
+#[derive(Debug, Args)]
+struct FlatFileArguments {
+    /// Which copy of the flat files to read, and whether to keep it.
+    #[arg(long, value_enum, default_value_t = FlatFileSource::Vendor)]
+    source: FlatFileSource,
     /// Where a raw object waits between the download finishing and the upload starting. Needs room
     /// for one object: the largest session measured is 9.0 GB of quotes.
     #[arg(long, default_value = DEFAULT_STAGING_DIRECTORY)]
     staging_directory: std::path::PathBuf,
 }
 
-/// Where `--tee-raw` stages by default. Deliberately not `/tmp`, which is a tmpfs on the backfill
-/// box and would put a 9 GB object in memory.
+/// Which copy of a flat file a whole-session pass reads.
+///
+/// One flag rather than a source and a `--tee-raw` beside it, because only two of the four
+/// combinations mean anything: the archive's copy is already kept, so teeing it would upload the
+/// object being read back over itself. Spelling the pair as one value is what leaves that
+/// unsayable instead of guarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FlatFileSource {
+    /// Massive's endpoint, reading the bytes and discarding them.
+    Vendor,
+    /// Massive's endpoint, keeping every object under `data/raw/` as Deep Archive. Every cadence
+    /// the archive stores is a lossy read of them, so this is what makes a later cadence a compute
+    /// cost rather than another subscription month.
+    VendorKeepingRaw,
+    /// The archive's own copy, which buys nothing from the vendor. The objects are Deep Archive, so
+    /// a session must be restored before a pass can reach it.
+    Archive,
+}
+
+/// Where a kept raw object stages by default. Deliberately not `/tmp`, which is a tmpfs on the
+/// backfill box and would put a 9 GB object in memory.
 const DEFAULT_STAGING_DIRECTORY: &str = "/var/tmp/fund-flat-files";
 
+/// What a per-name quote pass takes, which is the window, the stride, the names and the cadence.
+///
+/// Deliberately not [`QuoteArguments`]: these routes reach Alpaca one name at a time, so `--source`
+/// and `--staging-directory` name nothing they can act on. The window and stride are repeated here
+/// rather than flattened in, which is the same trade [`TradeSymbolArguments`] makes.
 #[derive(Debug, Args)]
 struct QuoteSymbolArguments {
     #[command(flatten)]
-    quotes: QuoteArguments,
+    window: WindowArguments,
+    /// Sample every Nth published session, anchored at the start. A multiple of 5 samples one
+    /// weekday forever; 21 does not.
+    #[arg(long, default_value_t = DEFAULT_STRIDE, value_parser = stride)]
+    stride: usize,
     #[command(flatten)]
     symbols: SymbolArguments,
     /// Cadence of the partition being repaired, which is the cadence the fold is opened at.
@@ -1446,8 +1485,8 @@ fn report(scan: &archive::SymbolScan) {
 async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
     match action {
         QuoteAction::Probe(arguments) => match arguments.symbols.names()? {
-            None => probe_flat_file(arguments.date).await,
-            Some(named) => fold_named_from_flat_file(arguments.date, named).await,
+            None => probe_flat_file(arguments.date, &arguments.files).await,
+            Some(named) => fold_named_from_flat_file(arguments.date, named, &arguments.files).await,
         },
         QuoteAction::Scan(arguments) => {
             scan_summary_coverage(archive::SessionFamily::Quotes, arguments).await
@@ -1461,9 +1500,10 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
                 .universe_scope()
                 .ok_or_else(|| SeedError::Usage(format!("{action:?} folds no universe")))??;
             fold_sampled(
-                &arguments.quotes,
+                &arguments.quotes.window,
+                arguments.quotes.stride,
                 scope,
-                QuoteProvider::WholeSession,
+                QuoteProvider::WholeSession(&arguments.quotes.files),
                 arguments.cadence.intraday(),
             )
             .await
@@ -1476,7 +1516,8 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
             let scope = Scope::new(NameSelection::Named(named), SessionSelection::Present)
                 .map_err(|error| SeedError::Usage(error.to_string()))?;
             fold_sampled(
-                &symbols.quotes,
+                &symbols.window,
+                symbols.stride,
                 scope,
                 QuoteProvider::PerName,
                 symbols.cadence.intraday(),
@@ -1489,24 +1530,27 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
 /// Folds the sampled sessions into the archive under the scope the action names.
 ///
 /// Takes a built `Scope` rather than its two halves, so a caller cannot pair a universe with a
-/// session set here that the constructor would have refused.
+/// session set here that the constructor would have refused. The provider carries the flat-file
+/// arguments rather than taking them beside it, so the per-name route has no way to be handed
+/// settings it cannot act on.
 async fn fold_sampled(
-    arguments: &QuoteArguments,
+    window: &WindowArguments,
+    stride: usize,
     scope: Scope,
-    provider: QuoteProvider,
+    provider: QuoteProvider<'_>,
     cadence: IntradayCadence,
 ) -> Result<Outcome, SeedError> {
-    let window = arguments.window.window()?;
+    let window = window.window()?;
     let (market_data, calendar) = quote_sources(&window).await?;
-    let sampled = sample(&calendar, &window, arguments.stride);
-    report_sample(&window, arguments.stride, &calendar, &sampled);
+    let sampled = sample(&calendar, &window, stride);
+    report_sample(&window, stride, &calendar, &sampled);
 
     // Bound before the source so it outlives the borrow, and built only where it is used: a
     // repair must not demand flat-file credentials to reach two names through Alpaca.
     let flat_files;
     let source = match provider {
-        QuoteProvider::WholeSession => {
-            flat_files = flat_file_client(arguments).await?;
+        QuoteProvider::WholeSession(files) => {
+            flat_files = flat_file_client(files).await?;
             archive::QuoteSource::WholeSession(&flat_files)
         }
         QuoteProvider::PerName => archive::QuoteSource::PerName(&market_data),
@@ -1517,24 +1561,30 @@ async fn fold_sampled(
     ))
 }
 
-/// The flat-file client, teeing the vendor's bytes into the archive when the pass keeps them.
+/// The flat-file client the pass's source names.
 ///
-/// The tee writes the shared archive rather than this instance's records: the raw objects are a
-/// provider-derived fact, and a second copy per developer is the thing the bucket split exists to
-/// prevent.
+/// The tee and the archive read both address the shared archive rather than this instance's
+/// records: the raw objects are a provider-derived fact, and a second copy per developer is the
+/// thing the bucket split exists to prevent.
 async fn flat_file_client(
-    arguments: &QuoteArguments,
+    arguments: &FlatFileArguments,
 ) -> Result<flatfiles::FlatFileClient, SeedError> {
-    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
-    if !arguments.tee_raw {
-        return Ok(client);
+    match arguments.source {
+        FlatFileSource::Vendor => flatfiles::FlatFileClient::from_env().map_err(box_error),
+        FlatFileSource::VendorKeepingRaw => {
+            let s3_client = fund::common::aws::s3_client().await;
+            flatfiles::FlatFileClient::from_env_teeing_to(flatfiles::RawTee::new(
+                s3_client,
+                bucket_name()?,
+                arguments.staging_directory.clone(),
+            ))
+            .map_err(box_error)
+        }
+        FlatFileSource::Archive => Ok(flatfiles::FlatFileClient::reading_the_archive(
+            fund::common::aws::s3_client().await,
+            bucket_name()?,
+        )),
     }
-    let s3_client = fund::common::aws::s3_client().await;
-    Ok(client.teeing_raw_to(flatfiles::RawTee::new(
-        s3_client,
-        bucket_name()?,
-        arguments.staging_directory.clone(),
-    )))
 }
 
 /// Folds the sampled sessions' printed tape into the archive under the scope the action names.
@@ -1672,7 +1722,7 @@ async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
                 archive::TradeSource::PerName(&market_data)
             }
             TradeAction::Archive(arguments) | TradeAction::Widen(arguments) => {
-                flat_files = flat_file_client(arguments).await?;
+                flat_files = flat_file_client(&arguments.files).await?;
                 archive::TradeSource::WholeSession(&flat_files)
             }
             // Returned above, before any credential is read. Named rather than swept into a catch-all so
@@ -1800,7 +1850,7 @@ async fn seed_flat_file_bars(action: &BarFlatFileAction) -> Result<Outcome, Seed
     let sampled = sample(&calendar, &window, arguments.stride);
     report_sample(&window, arguments.stride, &calendar, &sampled);
 
-    let flat_files = flat_file_client(arguments).await?;
+    let flat_files = flat_file_client(&arguments.files).await?;
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
     Ok(Outcome::Pass(
@@ -1820,11 +1870,10 @@ async fn seed_flat_file_bars(action: &BarFlatFileAction) -> Result<Outcome, Seed
 /// Folds named symbols across the sampled sessions and prints what they read, writing nothing.
 async fn measure_sampled(symbols: &QuoteSymbolArguments) -> Result<Outcome, SeedError> {
     let named = symbols.symbols.required_names()?;
-    let arguments = &symbols.quotes;
-    let window = arguments.window.window()?;
+    let window = symbols.window.window()?;
     let (market_data, calendar) = quote_sources(&window).await?;
-    let sampled = sample(&calendar, &window, arguments.stride);
-    report_sample(&window, arguments.stride, &calendar, &sampled);
+    let sampled = sample(&calendar, &window, symbols.stride);
+    report_sample(&window, symbols.stride, &calendar, &sampled);
 
     measure(
         &market_data,
@@ -1859,8 +1908,11 @@ fn report_sample(
 /// is written: the row order, the file's size, the throughput of decompressing and parsing it, and
 /// how much of it is a book no spread reads off. Counting rather than folding, so the measurement
 /// costs one download and almost no memory.
-async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
-    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+async fn probe_flat_file(
+    date: SessionDate,
+    files: &FlatFileArguments,
+) -> Result<Outcome, SeedError> {
+    let client = flat_file_client(files).await?;
     let started = tokio::time::Instant::now();
     let (summary, _) = client
         .fold_quotes(date.date(), flatfiles::ForEach(|_ticker, _tick| {}))
@@ -1868,7 +1920,11 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
         .map_err(box_error)?;
     let elapsed = started.elapsed().as_secs_f64();
 
-    println!("{}", flatfiles::quote_key(date.date()));
+    println!(
+        "{}/{}",
+        client.bucket(),
+        client.object_key(flatfiles::RawDataset::Quotes, date.date())
+    );
     println!(
         "  {} rows, {} usable, {} unusable ({:.2}%), {} tickers",
         summary.rows_read,
@@ -1922,8 +1978,9 @@ async fn probe_flat_file(date: SessionDate) -> Result<Outcome, SeedError> {
 async fn fold_named_from_flat_file(
     date: SessionDate,
     named: BTreeSet<Ticker>,
+    files: &FlatFileArguments,
 ) -> Result<Outcome, SeedError> {
-    let client = flatfiles::FlatFileClient::from_env().map_err(box_error)?;
+    let client = flat_file_client(files).await?;
     let credentials = AlpacaCredentials::from_env().map_err(box_error)?;
     let days = TradingClient::from_env(credentials)
         .fetch_calendar(date.date(), date.date())
@@ -1946,7 +2003,11 @@ async fn fold_named_from_flat_file(
     let folded_ticks = fold.folded();
     let folded = fold.finish();
 
-    println!("{}", flatfiles::quote_key(date.date()));
+    println!(
+        "{}/{}",
+        client.bucket(),
+        client.object_key(flatfiles::RawDataset::Quotes, date.date())
+    );
     println!(
         "  {} rows scanned in {elapsed:.0}s, {folded_ticks} folded for the names asked for",
         file.rows_read
@@ -2034,9 +2095,10 @@ const QUOTE_CADENCE: IntradayCadence = IntradayCadence::FiveMinute;
 /// A backfill takes whole sessions off Massive's flat files, because five years one name at a time
 /// is a hundred days of API calls. A repair takes named symbols from Alpaca, because it already
 /// knows which names it wants and a whole file to reach two of them is seven gigabytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuoteProvider {
-    WholeSession,
+#[derive(Debug, Clone, Copy)]
+enum QuoteProvider<'a> {
+    /// Whole sessions off a flat file, which is the only variant with a file to source.
+    WholeSession(&'a FlatFileArguments),
     PerName,
 }
 
@@ -2696,8 +2758,50 @@ mod tests {
         }
     }
 
-    /// A probe reads one vendor file rather than the archive, so it takes a date and at most a set
-    /// of names to fold out of it — never a window or a stride, which only a sampled pass has.
+    /// `--source` chooses which copy of a flat file to read, so only the actions that open one may
+    /// take it.
+    ///
+    /// A per-name route reaches Alpaca a symbol at a time and never opens a file, so accepting the
+    /// flag there would report a source that changed nothing about the pass. Asserted as a refusal
+    /// rather than as an ignored value, because clap is what has to do the rejecting.
+    #[test]
+    fn test_only_the_actions_that_open_a_file_take_a_source() {
+        let window = ["--start", "2026-08-03", "--end", "2026-08-21"];
+        for (action, extra) in [
+            ("archive", &[][..]),
+            ("widen", &[][..]),
+            ("repair", &["--symbols", "AAPL"][..]),
+            ("measure", &["--symbols", "AAPL"][..]),
+        ] {
+            let mut arguments = vec!["equity-quotes", action];
+            arguments.extend_from_slice(&window);
+            arguments.extend_from_slice(extra);
+            assert!(
+                parse(&arguments).is_ok(),
+                "{action} must parse without a source"
+            );
+
+            arguments.extend_from_slice(&["--source", "archive"]);
+            let opens_a_file = matches!(action, "archive" | "widen");
+            assert_eq!(
+                parse(&arguments).is_ok(),
+                opens_a_file,
+                "{action} with --source"
+            );
+        }
+
+        // The probe takes a date rather than a window, and it is the only route that reads an
+        // archived object without writing one -- so it is how a restore is checked at all.
+        let probe = ["equity-quotes", "probe", "--date", "2026-08-03"];
+        assert!(parse(&probe).is_ok(), "a probe must parse without a source");
+        assert!(
+            parse(&[probe.as_slice(), &["--source", "archive"]].concat()).is_ok(),
+            "a probe must reach the archive"
+        );
+    }
+
+    /// A probe reads one file rather than a sampled range, so it takes a date and at most a set of
+    /// names to fold out of it — never a window or a stride, which only a sampled pass has.
     #[test]
     fn test_a_probe_takes_one_date_and_optionally_names() {
         let QuoteAction::Probe(arguments) =
