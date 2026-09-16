@@ -103,6 +103,10 @@ This is a collection of guidelines and references.
   something is there
 - State the trivial baseline before reading any metric, and quote skill against a named baseline rather
   than a raw score
+- Start a study as simply as you can provided the main effects are in, get the insights, then evolve
+  it to the fully detailed run — a full-scale simulation disguises the system
+- Volume of output is a poor substitute for an intimate feeling for the situation being simulated —
+  prefer fewer runs read carefully over many runs summarized
 - Unusually low variance across seeds is a warning rather than a quality signal — it means the metric is
   pinned by the shape of the data rather than by anything the model learned
 - Magnitude before significance: ask whether the effect could pay for itself at measured cost before asking
