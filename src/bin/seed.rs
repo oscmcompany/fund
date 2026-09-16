@@ -17,7 +17,7 @@ use fund::common::massive::MassiveClient;
 use fund::common::types::{
     BarInterval, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker, TradeSummary,
 };
-use fund::data::archive::{self, NameSelection, Scope, SessionSelection};
+use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
 use fund::data::{attribution, bars, details, quotes, trades};
@@ -370,6 +370,12 @@ enum QuoteAction {
     /// Fold every name the daily archive holds into every sampled session, widening ones already
     /// summarized.
     Widen(QuoteFoldArguments),
+    /// Fold every sampled session afresh, taking each partition over from whatever built it.
+    ///
+    /// The only action that discards stored rows, which is what makes a partition mixing two
+    /// vendors answer for one where `widen` would merge and keep both. Its own verb rather than a
+    /// flag, because the failure mode is a pass that silently deletes what it should preserve.
+    Refold(QuoteFoldArguments),
     /// Fold named symbols and print what they read, touching no partition.
     Measure(QuoteSymbolArguments),
     /// Fold named symbols into the sampled sessions that already have a partition.
@@ -394,7 +400,9 @@ impl QuoteAction {
     fn universe_scope(&self) -> Option<Result<Scope, SeedError>> {
         let sessions = match self {
             QuoteAction::Archive(_) => SessionSelection::Absent,
-            QuoteAction::Widen(_) => SessionSelection::Every,
+            // A re-fold only has work where a partition already exists, so it takes the same
+            // session set as `widen` rather than a third one.
+            QuoteAction::Widen(_) | QuoteAction::Refold(_) => SessionSelection::Every,
             QuoteAction::Measure(_)
             | QuoteAction::Repair(_)
             | QuoteAction::Probe(_)
@@ -403,6 +411,22 @@ impl QuoteAction {
             }
         };
         Some(whole_market(sessions))
+    }
+
+    /// What this action does to a partition another provider built.
+    ///
+    /// Read off the action rather than taken as an argument, so a claim is reachable only by asking
+    /// for the verb that means it. Every other action refuses, which is the archive's standing rule.
+    fn foreign_provider(&self) -> ForeignProvider {
+        match self {
+            QuoteAction::Refold(_) => ForeignProvider::Claim,
+            QuoteAction::Archive(_)
+            | QuoteAction::Widen(_)
+            | QuoteAction::Measure(_)
+            | QuoteAction::Repair(_)
+            | QuoteAction::Probe(_)
+            | QuoteAction::Scan(_) => ForeignProvider::Refuse,
+        }
     }
 }
 
@@ -1491,9 +1515,11 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
         QuoteAction::Scan(arguments) => {
             scan_summary_coverage(archive::SessionFamily::Quotes, arguments).await
         }
-        // One arm, so the universe is written once and the two actions cannot disagree about it.
-        QuoteAction::Archive(arguments) | QuoteAction::Widen(arguments) => {
-            // Unreachable: this arm names the two actions that answer. Returned rather than
+        // One arm, so the universe is written once and the three actions cannot disagree about it.
+        QuoteAction::Archive(arguments)
+        | QuoteAction::Widen(arguments)
+        | QuoteAction::Refold(arguments) => {
+            // Unreachable: this arm names the three actions that answer. Returned rather than
             // panicked so that adding a variant here without adding it to `universe_scope`
             // degrades to a usage error instead of killing the process mid-pass.
             let scope = action
@@ -1505,6 +1531,7 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
                 scope,
                 QuoteProvider::WholeSession(&arguments.quotes.files),
                 arguments.cadence.intraday(),
+                action.foreign_provider(),
             )
             .await
         }
@@ -1521,6 +1548,7 @@ async fn seed_quotes(action: &QuoteAction) -> Result<Outcome, SeedError> {
                 scope,
                 QuoteProvider::PerName,
                 symbols.cadence.intraday(),
+                action.foreign_provider(),
             )
             .await
         }
@@ -1539,6 +1567,7 @@ async fn fold_sampled(
     scope: Scope,
     provider: QuoteProvider<'_>,
     cadence: IntradayCadence,
+    foreign: ForeignProvider,
 ) -> Result<Outcome, SeedError> {
     let window = window.window()?;
     let (market_data, calendar) = quote_sources(&window).await?;
@@ -1557,7 +1586,7 @@ async fn fold_sampled(
     };
 
     Ok(Outcome::Pass(
-        fold_quotes(&source, &calendar, &sampled, &scope, cadence).await?,
+        fold_quotes(&source, &calendar, &sampled, &scope, cadence, foreign).await?,
     ))
 }
 
@@ -2109,11 +2138,12 @@ async fn fold_quotes(
     sampled: &[SessionDate],
     scope: &Scope,
     cadence: IntradayCadence,
+    foreign: ForeignProvider,
 ) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
     Ok(archive::archive_quote_sessions(
-        &s3_client, source, calendar, &bucket, sampled, scope, cadence,
+        &s3_client, source, calendar, &bucket, sampled, scope, cadence, foreign,
     )
     .await?)
 }
@@ -2913,7 +2943,7 @@ mod tests {
     /// exists, so the next pass reads the session as present and never looks inside, and widening
     /// afterwards means re-reading vendor files a lapsed subscription no longer serves.
     #[test]
-    fn test_both_universe_quote_actions_fold_the_whole_market() {
+    fn test_every_universe_quote_action_folds_the_whole_market() {
         let window = ["--start", "2021-08-26", "--end", "2026-08-25"];
         let parsed = |verb: &str| {
             let arguments = parse(&[["equity-quotes", verb].as_slice(), &window].concat())
@@ -2936,6 +2966,18 @@ mod tests {
         // test moves with it and can never fail.
         assert_eq!(rendered("archive"), "every name, absent sessions only");
         assert_eq!(rendered("widen"), "every name, every session");
+        assert_eq!(rendered("refold"), "every name, every session");
+
+        // The boundary a routing change would erase: exactly one verb discards stored rows, and
+        // widening that to `archive` or `widen` turns two ordinary backfills into destructive ones.
+        assert_eq!(parsed("refold").foreign_provider(), ForeignProvider::Claim);
+        for verb in ["archive", "widen"] {
+            assert_eq!(
+                parsed(verb).foreign_provider(),
+                ForeignProvider::Refuse,
+                "{verb} must refuse a foreign provider"
+            );
+        }
 
         // The actions that name their own symbols must not answer here at all, or the arm above
         // would fold a universe over a repair.
