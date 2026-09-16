@@ -7,10 +7,11 @@ use tracing::{error, info};
 
 use fund::common::alpaca::{AlpacaCredentials, TradingClient};
 use fund::common::log::init_tracing;
-use fund::common::types::{BarInterval, SessionDate};
+use fund::common::types::{BarInterval, BasisPoints, SessionDate};
 use fund::laboratory::convergence::{
     curves_of, sample_universe, state_at, Closes, Curve, Selection,
 };
+use fund::laboratory::cost::{CostModel, Crossings, FillStyle};
 use fund::laboratory::intraday::{self, SessionHours};
 use fund::laboratory::intraday_convergence::{self, IntradayEntry};
 use fund::laboratory::{dataset, intraday_convergence as measure};
@@ -35,14 +36,16 @@ const DEFAULT_UNIVERSE: usize = 200;
 /// Fixed, so two runs over one archive draw the same sample and differ only where the data does.
 const SAMPLE_SEED: u64 = 0x5EED;
 
-/// Roll's effective spread for a *single* name, in basis points, measured over the same archive.
+/// The spread this run prices its hurdle against, until a per-name reading is loaded beside the
+/// pairs.
 ///
-/// Cost in z-score units is not knowable without the fitted sigma, so it is reported in basis points
-/// beside the result rather than folded into it.
-const EFFECTIVE_SPREAD_BASIS_POINTS: f64 = 10.0;
+/// A placeholder rather than a measurement: archived spreads run from 0.26bp to 18bp, so one figure
+/// understates the tight names and overstates the wide ones. Cost in z-score units needs the fitted
+/// sigma, so it is reported in basis points beside the result rather than folded into it.
+const PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS: f64 = 10.0;
 
-/// Crossings a pair round trip pays: both legs in and both legs out.
-const PAIR_ROUND_TRIP_CROSSINGS: f64 = 4.0;
+/// What this study assumes about reaching the book: both legs crossed, in and out.
+const COST_MODEL: CostModel = CostModel::new(FillStyle::Aggressive, Crossings::PAIR_ROUND_TRIP);
 
 struct Parameters {
     session: SessionDate,
@@ -284,22 +287,28 @@ fn report(selection: Selection, entries: &[IntradayEntry]) {
                 final_curve.horizon
             ),
         }
-        let round_trip = pair_round_trip_basis_points(EFFECTIVE_SPREAD_BASIS_POINTS);
-        println!(
-            "  pair round trip is about {round_trip:.0} basis points \
-             ({EFFECTIVE_SPREAD_BASIS_POINTS:.0} bp single-name effective spread over \
-             {PAIR_ROUND_TRIP_CROSSINGS:.0} crossings); a sigma is worth that only if the fitted \
-             spread is wider than it"
-        );
+        match pair_round_trip(PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS) {
+            Ok(round_trip) => println!(
+                "  pair round trip is about {round_trip} \
+                 ({PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS:.0} bp single-name quoted spread over \
+                 {} crossings); a sigma is worth that only if the fitted spread is wider than it",
+                COST_MODEL.crossings().count()
+            ),
+            Err(refusal) => println!("  pair round trip is not priceable: {refusal}"),
+        }
     }
 }
 
-/// What a pair round trip costs, in basis points, given one name's effective spread.
+/// What a pair round trip costs, given one name's quoted spread in basis points.
 ///
-/// An effective spread is the full width and a crossing pays half of it, so four crossings come to
-/// twice the single-name figure.
-fn pair_round_trip_basis_points(single_name_effective_spread: f64) -> f64 {
-    single_name_effective_spread * PAIR_ROUND_TRIP_CROSSINGS / 2.0
+/// The arithmetic lives in [`CostModel`] rather than here, so this study and every later one price
+/// turnover the same way. A reading that is not a usable spread is refused rather than costed.
+fn pair_round_trip(single_name_quoted_spread: f64) -> Result<BasisPoints, String> {
+    let spread = BasisPoints::new(single_name_quoted_spread)
+        .ok_or_else(|| format!("{single_name_quoted_spread} is not a usable spread"))?;
+    COST_MODEL
+        .round_trip(spread)
+        .map_err(|refusal| refusal.to_string())
 }
 
 /// The entries a horizon's shares are computed over, which is what those shares may be priced with.
@@ -370,16 +379,24 @@ mod tests {
         );
     }
 
-    /// A pair round trip is four crossings and Roll's estimator prices one name's spread, so the
-    /// hurdle is twice the single-name figure rather than the figure itself.
+    /// A pair round trip is four crossings against one name's spread, so the hurdle is twice the
+    /// single-name figure rather than the figure itself.
     #[test]
     fn test_a_pair_round_trip_costs_four_crossings() {
+        let ten = pair_round_trip(10.0).expect("ten basis points is a usable spread");
         assert!(
-            (pair_round_trip_basis_points(10.0) - 20.0).abs() < 1e-12,
-            "ten basis points a name is twenty for the pair, got {}",
-            pair_round_trip_basis_points(10.0)
+            (ten.value() - 20.0).abs() < 1e-12,
+            "ten basis points a name is twenty for the pair, got {ten}"
         );
-        assert!((pair_round_trip_basis_points(6.0) - 12.0).abs() < 1e-12);
+        let six = pair_round_trip(6.0).expect("six basis points is a usable spread");
+        assert!((six.value() - 12.0).abs() < 1e-12);
+    }
+
+    /// The study reports a hurdle rather than crashing when handed a reading that is not a spread.
+    #[test]
+    fn test_an_unusable_spread_is_refused_rather_than_costed() {
+        assert!(pair_round_trip(f64::NAN).is_err());
+        assert!(pair_round_trip(-1.0).is_err());
     }
 
     /// One ticker makes no pairs, so a universe of one would measure nothing and report it as a

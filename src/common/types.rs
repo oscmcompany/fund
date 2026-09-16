@@ -52,7 +52,7 @@ impl std::fmt::Display for LiquidityRefusal {
 /// One value rather than two arguments, because the pair is meaningless apart and every screen
 /// compares against both. Volume is counted in dollars traded, never in shares: a share count is a
 /// liquidity measure divided by price, so it excludes expensive names that trade freely.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct LiquidityFloor {
     minimum_close_price: f64,
     minimum_dollar_volume: f64,

@@ -273,6 +273,7 @@ mod tests {
                 fingerprint: DatasetFingerprint {
                     session: session(2026, 8, 17),
                     lookback_days: 365,
+                    liquidity_floor: None,
                     rows: 10,
                     tickers: 2,
                     first_timestamp: DateTime::from_timestamp_millis(0),

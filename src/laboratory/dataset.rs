@@ -42,6 +42,12 @@ pub enum DatasetError {
 pub struct DatasetFingerprint {
     pub session: SessionDate,
     pub lookback_days: i64,
+    /// The screen the rows were filtered through, or `None` where none was applied.
+    ///
+    /// Load-bearing rather than descriptive: two runs at different floors differ only in `rows` and
+    /// `tickers`, which is also what two runs over different windows differ in. Without this field
+    /// the fingerprint cannot tell those apart, and the floor is about to become configurable.
+    pub liquidity_floor: Option<LiquidityFloor>,
     pub rows: usize,
     pub tickers: usize,
     pub first_timestamp: Option<DateTime<Utc>>,
@@ -164,10 +170,12 @@ pub async fn intraday(
         &adjustments.boundaries,
     )
     .await?;
+    // `None`: these bars are the whole archive for the window, unscreened.
     let fingerprint = fingerprint_of(
         &bars,
         session,
         lookback_days,
+        None,
         adjustments.splits_digest,
         adjustments.boundaries_digest,
     )?;
@@ -223,12 +231,14 @@ async fn read_window(
 
     let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
     let consolidated = consolidate_data(equity_bars, equity_details)?;
-    let filtered = filter_training_bars(consolidated, LiquidityFloor::CURRENT)?;
+    let floor = LiquidityFloor::CURRENT;
+    let filtered = filter_training_bars(consolidated, floor)?;
 
     let fingerprint = fingerprint_of(
         &filtered,
         session,
         lookback_days,
+        Some(floor),
         adjustments.splits_digest,
         adjustments.boundaries_digest,
     )?;
@@ -294,6 +304,7 @@ fn fingerprint_of(
     frame: &DataFrame,
     session: SessionDate,
     lookback_days: i64,
+    liquidity_floor: Option<LiquidityFloor>,
     splits_digest: u64,
     boundaries_digest: u64,
 ) -> Result<DatasetFingerprint, DatasetError> {
@@ -303,6 +314,7 @@ fn fingerprint_of(
     Ok(DatasetFingerprint {
         session,
         lookback_days,
+        liquidity_floor,
         rows: frame.height(),
         tickers: tickers
             .into_no_null_iter()
@@ -517,6 +529,38 @@ mod tests {
         );
     }
 
+    /// The defect this field exists to close: two runs at different floors read different tables,
+    /// and every other field the fingerprint carries can be identical across them.
+    ///
+    /// Not hypothetical — `build_training_dataset` screens before fingerprinting, so a configurable
+    /// floor makes this reachable. The rows are held fixed here so that the floor is the *only*
+    /// difference, which is what the un-fingerprinted case looked like from the outside.
+    #[test]
+    fn test_two_floors_over_the_same_rows_do_not_share_a_fingerprint() {
+        const DAY: i64 = 86_400_000;
+        let rows = frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]);
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap());
+        // Literals rather than `LiquidityFloor::CURRENT`, so this keeps failing if the screen moves.
+        let strict = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
+        let loose = LiquidityFloor::new(1.0, 1_000_000.0).unwrap();
+
+        let unscreened = fingerprint_of(&rows, session, 365, None, 0xAB, 0xCD).unwrap();
+        let strictly = fingerprint_of(&rows, session, 365, Some(strict), 0xAB, 0xCD).unwrap();
+        let loosely = fingerprint_of(&rows, session, 365, Some(loose), 0xAB, 0xCD).unwrap();
+
+        assert_eq!(
+            strictly.rows, loosely.rows,
+            "the fixture must isolate the floor"
+        );
+        assert_eq!(
+            strictly.tickers, loosely.tickers,
+            "the fixture must isolate the floor"
+        );
+        assert_ne!(strictly, loosely, "two floors must not share a fingerprint");
+        assert_ne!(unscreened, strictly, "a screen and no screen must differ");
+        assert_eq!(unscreened.liquidity_floor, None);
+    }
+
     #[test]
     fn test_fingerprint_counts_distinct_tickers_not_rows() {
         const DAY: i64 = 86_400_000;
@@ -524,6 +568,7 @@ mod tests {
             &frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]),
             SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()),
             365,
+            None,
             0xAB,
             0xCD,
         )
@@ -563,8 +608,10 @@ mod tests {
         let after = splits(4.0);
         assert_eq!(before.height(), after.height());
 
-        let before = fingerprint_of(&rows, session, 365, digest_of(&before).unwrap(), 0).unwrap();
-        let after = fingerprint_of(&rows, session, 365, digest_of(&after).unwrap(), 0).unwrap();
+        let before =
+            fingerprint_of(&rows, session, 365, None, digest_of(&before).unwrap(), 0).unwrap();
+        let after =
+            fingerprint_of(&rows, session, 365, None, digest_of(&after).unwrap(), 0).unwrap();
 
         assert_ne!(
             before, after,

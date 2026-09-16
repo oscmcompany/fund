@@ -1,6 +1,6 @@
 //! Pair selection: which two symbols, which way round, and how strong the signal.
 //!
-//! Quadratic in the eligible universe, so the cheap tests come first.
+//! Quadratic in the supplied universe, so the cheap tests come first.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,9 +40,6 @@ pub const STOP_LOSS_WIDENING: f64 = 1.5;
 /// A data-quality guard, not a strategy rule: a spread this far out is more often an unadjusted
 /// corporate action or a regime break than an opportunity, and neither reverts.
 pub const ENTRY_Z_SCORE_CAP: f64 = 5.0;
-
-/// Minimum model confidence for a ticker to be eligible for either leg.
-pub const CONFIDENCE_FLOOR: f64 = 0.5;
 
 /// Legs the book may hold in one sector at once.
 ///
@@ -624,16 +621,11 @@ impl OrientationRejection {
 /// concentration is bounded across the book in [`select_disjoint`] instead. No disjointness applies
 /// either — the returned list is the full reservoir and pairs may share tickers.
 pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
-    let eligible: Vec<&ScreenInput> = inputs
-        .iter()
-        .filter(|input| input.confidence >= CONFIDENCE_FLOOR)
-        .collect();
-
-    if eligible.len() < MINIMUM_ELIGIBLE_TICKERS {
+    if inputs.len() < MINIMUM_ELIGIBLE_TICKERS {
         debug!(
-            eligible = eligible.len(),
             supplied = inputs.len(),
-            "Too few tickers cleared the confidence floor to screen any pair"
+            required = MINIMUM_ELIGIBLE_TICKERS,
+            "Too few tickers were supplied to screen any pair"
         );
         return Vec::new();
     }
@@ -642,10 +634,10 @@ pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
     // Tallied rather than logged per pair: the loop is quadratic in the universe, so a line each
     // would be millions of them.
     let mut rejections: HashMap<&'static str, usize> = HashMap::new();
-    for first_index in 0..eligible.len() {
-        for second_index in (first_index + 1)..eligible.len() {
-            let first = eligible[first_index];
-            let second = eligible[second_index];
+    for first_index in 0..inputs.len() {
+        for second_index in (first_index + 1)..inputs.len() {
+            let first = &inputs[first_index];
+            let second = &inputs[second_index];
 
             // At least one leg has to be shortable or there is no orientation to take.
             if !first.is_shortable && !second.is_shortable {
@@ -704,7 +696,7 @@ pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
     let mut tally: Vec<(&str, usize)> = rejections.into_iter().collect();
     tally.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     debug!(
-        eligible = eligible.len(),
+        supplied = inputs.len(),
         candidates = candidates.len(),
         rejections = ?tally,
         "Pair screen complete"
@@ -1451,23 +1443,38 @@ mod tests {
         assert!(score_candidates(&inputs).is_empty());
     }
 
+    /// Confidence is carried and journaled but no longer screened on, so a leg that would have
+    /// failed the retired 0.5 floor now reaches the screen like any other.
+    ///
+    /// Built on the `screenable_inputs` stretch, which is the only one in this module that yields a
+    /// candidate: the retired test used 1.5, which clears `ENTRY_Z_SCORE_CAP` and returned nothing
+    /// at *any* confidence, so it never tested the floor it was named for.
     #[test]
-    fn test_a_leg_below_the_confidence_floor_is_ineligible() {
+    fn test_a_low_confidence_leg_still_reaches_the_screen() {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
-        let stretched = follower.last().unwrap() * 1.5;
+        let stretched = follower.last().unwrap() * 1.012;
         let inputs = vec![
             input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
-            ScreenInput::new(
-                ticker("BBBB"),
-                follower,
-                stretched,
-                -0.02,
-                CONFIDENCE_FLOOR - 0.01,
-                true,
-            )
-            .unwrap(),
+            // 0.01, far below the 0.5 both legs used to have to clear.
+            ScreenInput::new(ticker("BBBB"), follower, stretched, -0.02, 0.01, true).unwrap(),
         ];
-        assert!(score_candidates(&inputs).is_empty());
+
+        let candidates = score_candidates(&inputs);
+
+        // One pair from two tickers, where the retired floor would have left none.
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a dislocated pair must still be scored"
+        );
+        let tickers = [
+            candidates[0].long_ticker().as_str(),
+            candidates[0].short_ticker().as_str(),
+        ];
+        assert!(
+            tickers.contains(&"BBBB"),
+            "the 0.01 leg must be in the pair"
+        );
     }
 
     #[test]
