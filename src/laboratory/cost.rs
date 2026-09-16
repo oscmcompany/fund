@@ -20,26 +20,26 @@ pub enum FillStyle {
     Midpoint,
 }
 
-/// Touches a strategy pays on one round trip: two for each name it holds, in and out.
+/// The names one round trip touches, each of them crossed twice — in and out.
 ///
-/// A count rather than a bare number because the halving in [`CostModel::round_trip`] is only
-/// correct against a count of crossings, and a stray factor of two is invisible in the result.
+/// Counted in names rather than crossings so that a half-finished round trip cannot be expressed:
+/// a count of crossings admits odd numbers, and three crossings would price one and a half spreads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Crossings(u32);
+pub struct RoundTrip(u32);
 
-impl Crossings {
-    /// One name, in and out.
-    pub const SINGLE_NAME_ROUND_TRIP: Self = Self(2);
+impl RoundTrip {
+    /// One name, bought and sold.
+    pub const SINGLE_NAME: Self = Self(1);
 
-    /// Both legs of a pair, in and out.
-    pub const PAIR_ROUND_TRIP: Self = Self(4);
+    /// Both legs of a pair.
+    pub const PAIR: Self = Self(2);
 
     /// `None` on zero, which describes a position that is never opened rather than a free one.
-    pub fn new(count: u32) -> Option<Self> {
-        (count > 0).then_some(Self(count))
+    pub fn new(names: u32) -> Option<Self> {
+        (names > 0).then_some(Self(names))
     }
 
-    pub fn count(self) -> u32 {
+    pub fn names(self) -> u32 {
         self.0
     }
 }
@@ -57,6 +57,15 @@ pub enum CostRefusal {
         /// What the name did quote, so the refusal still says how wide the book was.
         quoted_spread: BasisPoints,
     },
+    /// The product left the range a basis-point reading can hold.
+    ///
+    /// Distinct from the above because the cause is arithmetic rather than absent data: a spread
+    /// near `f64::MAX` passes `BasisPoints::new` and still overflows here, and reporting that as an
+    /// unmeasured fill rate would send a caller looking for data that was never the problem.
+    Unrepresentable {
+        quoted_spread: BasisPoints,
+        names: u32,
+    },
 }
 
 impl std::fmt::Display for CostRefusal {
@@ -70,6 +79,14 @@ impl std::fmt::Display for CostRefusal {
                 "a {style:?} fill costs no spread but turns on a fill rate the archive does not \
                  measure; the book quoted {quoted_spread}"
             ),
+            CostRefusal::Unrepresentable {
+                quoted_spread,
+                names,
+            } => write!(
+                formatter,
+                "a quoted spread of {quoted_spread} over {names} name(s) is not representable as a \
+                 basis-point cost"
+            ),
         }
     }
 }
@@ -81,14 +98,14 @@ impl std::fmt::Display for CostRefusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostModel {
     fill_style: FillStyle,
-    crossings: Crossings,
+    round_trip: RoundTrip,
 }
 
 impl CostModel {
-    pub const fn new(fill_style: FillStyle, crossings: Crossings) -> Self {
+    pub const fn new(fill_style: FillStyle, round_trip: RoundTrip) -> Self {
         Self {
             fill_style,
-            crossings,
+            round_trip,
         }
     }
 
@@ -96,8 +113,8 @@ impl CostModel {
         self.fill_style
     }
 
-    pub const fn crossings(self) -> Crossings {
-        self.crossings
+    pub const fn round_trip(self) -> RoundTrip {
+        self.round_trip
     }
 
     /// What one round trip pays, given the name's quoted spread over the period being traded.
@@ -105,15 +122,18 @@ impl CostModel {
     /// The spread is the **quoted** width, which is what the archive folds. Substituting it for an
     /// effective spread is deliberately conservative: price improvement makes an effective spread no
     /// wider than the quoted one, so a strategy that survives this cost survives the real one.
-    pub fn round_trip(self, quoted_spread: BasisPoints) -> Result<BasisPoints, CostRefusal> {
+    pub fn cost(self, quoted_spread: BasisPoints) -> Result<BasisPoints, CostRefusal> {
         match self.fill_style {
-            // Half per crossing, because a spread is the full width and a crossing pays one side.
+            // Spread times names, because a crossing pays half a spread and each name is crossed
+            // twice; the two factors of two cancel and there is no halving left to get wrong.
             FillStyle::Aggressive => {
-                BasisPoints::new(quoted_spread.value() * f64::from(self.crossings.count()) / 2.0)
-                    .ok_or(CostRefusal::FillRateUnmeasured {
-                        style: FillStyle::Aggressive,
+                let names = self.round_trip.names();
+                BasisPoints::new(quoted_spread.value() * f64::from(names)).ok_or(
+                    CostRefusal::Unrepresentable {
                         quoted_spread,
-                    })
+                        names,
+                    },
+                )
             }
             FillStyle::Passive | FillStyle::Midpoint => Err(CostRefusal::FillRateUnmeasured {
                 style: self.fill_style,
@@ -133,23 +153,23 @@ mod tests {
 
     #[test]
     fn test_a_pair_round_trip_pays_twice_the_single_name_spread() {
-        let model = CostModel::new(FillStyle::Aggressive, Crossings::PAIR_ROUND_TRIP);
+        let model = CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR);
 
         let paid = model
-            .round_trip(basis_points(10.0))
+            .cost(basis_points(10.0))
             .expect("an aggressive fill is costable from a quoted spread");
 
-        // Pinned to the literal the old `EFFECTIVE_SPREAD_BASIS_POINTS = 10.0` produced through
+        // Pinned to the literal the retired `EFFECTIVE_SPREAD_BASIS_POINTS = 10.0` produced through
         // `pair_round_trip_basis_points`, so this fails if the arithmetic moves rather than tracking it.
         assert!((paid.value() - 20.0).abs() < 1e-12, "got {paid}");
     }
 
     #[test]
     fn test_a_single_name_round_trip_pays_the_spread_once() {
-        let model = CostModel::new(FillStyle::Aggressive, Crossings::SINGLE_NAME_ROUND_TRIP);
+        let model = CostModel::new(FillStyle::Aggressive, RoundTrip::SINGLE_NAME);
 
         let paid = model
-            .round_trip(basis_points(10.0))
+            .cost(basis_points(10.0))
             .expect("an aggressive fill is costable from a quoted spread");
 
         assert!((paid.value() - 10.0).abs() < 1e-12, "got {paid}");
@@ -157,11 +177,11 @@ mod tests {
 
     #[test]
     fn test_the_measured_spreads_price_differently_from_the_retired_literal() {
-        let model = CostModel::new(FillStyle::Aggressive, Crossings::PAIR_ROUND_TRIP);
+        let model = CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR);
 
         // SPY and CBOE as measured in the archive, against the 10.0 bp every prior study assumed.
-        let tight = model.round_trip(basis_points(0.26)).expect("costable");
-        let wide = model.round_trip(basis_points(18.04)).expect("costable");
+        let tight = model.cost(basis_points(0.26)).expect("costable");
+        let wide = model.cost(basis_points(18.04)).expect("costable");
 
         assert!((tight.value() - 0.52).abs() < 1e-12, "got {tight}");
         assert!((wide.value() - 36.08).abs() < 1e-12, "got {wide}");
@@ -172,10 +192,10 @@ mod tests {
     #[test]
     fn test_the_styles_that_pay_no_spread_refuse_rather_than_return_zero() {
         for style in [FillStyle::Passive, FillStyle::Midpoint] {
-            let model = CostModel::new(style, Crossings::PAIR_ROUND_TRIP);
+            let model = CostModel::new(style, RoundTrip::PAIR);
 
             let refusal = model
-                .round_trip(basis_points(7.5))
+                .cost(basis_points(7.5))
                 .expect_err("a fill rate the archive does not hold cannot be costed");
 
             match refusal {
@@ -187,16 +207,46 @@ mod tests {
                     // The refusal carries the number that produced it.
                     assert!((quoted_spread.value() - 7.5).abs() < 1e-12);
                 }
+                CostRefusal::Unrepresentable { .. } => {
+                    panic!("a 7.5bp spread is representable; the cause is the fill rate")
+                }
+            }
+        }
+    }
+
+    /// An overflowing product must not borrow the fill-rate refusal.
+    ///
+    /// `BasisPoints::new` admits any finite non-negative reading, so `f64::MAX` reaches the
+    /// multiplication and leaves the representable range. Reporting that as an unmeasured fill rate
+    /// would send a caller looking for data that was never the problem.
+    #[test]
+    fn test_an_overflowing_product_names_arithmetic_rather_than_a_fill_rate() {
+        let model = CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR);
+
+        let refusal = model
+            .cost(basis_points(f64::MAX))
+            .expect_err("the product leaves the representable range");
+
+        match refusal {
+            CostRefusal::Unrepresentable {
+                quoted_spread,
+                names,
+            } => {
+                assert_eq!(quoted_spread.value(), f64::MAX);
+                assert_eq!(names, 2);
+            }
+            CostRefusal::FillRateUnmeasured { .. } => {
+                panic!("an aggressive fill's cost is measured; the cause is arithmetic")
             }
         }
     }
 
     #[test]
     fn test_a_refusal_says_which_style_it_refused_and_how_wide_the_book_was() {
-        let model = CostModel::new(FillStyle::Passive, Crossings::SINGLE_NAME_ROUND_TRIP);
+        let model = CostModel::new(FillStyle::Passive, RoundTrip::SINGLE_NAME);
 
         let rendered = model
-            .round_trip(basis_points(3.25))
+            .cost(basis_points(3.25))
             .expect_err("passive is not costable")
             .to_string();
 
@@ -205,25 +255,48 @@ mod tests {
     }
 
     #[test]
-    fn test_a_crossing_count_of_zero_is_refused() {
-        assert!(Crossings::new(0).is_none());
-        assert_eq!(Crossings::new(2), Some(Crossings::SINGLE_NAME_ROUND_TRIP));
-        assert_eq!(Crossings::new(4), Some(Crossings::PAIR_ROUND_TRIP));
+    fn test_a_round_trip_over_no_names_is_refused() {
+        assert!(RoundTrip::new(0).is_none());
+        assert_eq!(RoundTrip::new(1), Some(RoundTrip::SINGLE_NAME));
+        assert_eq!(RoundTrip::new(2), Some(RoundTrip::PAIR));
+    }
+
+    /// Counting names rather than crossings is what makes a half round trip unrepresentable.
+    ///
+    /// The retired `Crossings` type admitted three, which priced one and a half spreads. Every
+    /// count here is a whole number of names and therefore an even number of crossings.
+    #[test]
+    fn test_every_admissible_round_trip_costs_a_whole_number_of_spreads() {
+        let spread = basis_points(1.0);
+
+        for names in 1..=5u32 {
+            let model = CostModel::new(
+                FillStyle::Aggressive,
+                RoundTrip::new(names).expect("a positive count of names"),
+            );
+
+            let paid = model.cost(spread).expect("costable");
+
+            assert!(
+                (paid.value() - paid.value().round()).abs() < 1e-12,
+                "{names} names priced {paid}, which is not a whole number of spreads"
+            );
+        }
     }
 
     #[test]
-    fn test_the_named_counts_are_two_and_four() {
+    fn test_the_named_round_trips_are_one_and_two_names() {
         // Literals rather than the constants, so a change to either has to be made deliberately.
-        assert_eq!(Crossings::SINGLE_NAME_ROUND_TRIP.count(), 2);
-        assert_eq!(Crossings::PAIR_ROUND_TRIP.count(), 4);
+        assert_eq!(RoundTrip::SINGLE_NAME.names(), 1);
+        assert_eq!(RoundTrip::PAIR.names(), 2);
     }
 
     #[test]
     fn test_a_zero_spread_costs_zero_rather_than_refusing() {
-        let model = CostModel::new(FillStyle::Aggressive, Crossings::PAIR_ROUND_TRIP);
+        let model = CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR);
 
         // Zero is a measurement here, not an absence: a locked book quotes no width.
-        let paid = model.round_trip(basis_points(0.0)).expect("costable");
+        let paid = model.cost(basis_points(0.0)).expect("costable");
 
         assert!((paid.value() - 0.0).abs() < 1e-12, "got {paid}");
     }

@@ -18,7 +18,10 @@ use crate::laboratory::predictor::Evaluation;
 use crate::laboratory::stability::{Association, SignAgreement};
 
 /// The shape of a laboratory record, versioned independently of the application journal.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Readers map old versions forward rather than rewriting files, so this only ever goes up. v2 added
+/// `liquidity_floor` to the `dataset_built` fingerprint, which a v1 reader will not find.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Where the laboratory writes when `FUND_LABORATORY_JOURNAL_DIRECTORY` says nothing.
 const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund/laboratory";
@@ -608,7 +611,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["schema_version"], serde_json::json!(1));
+        assert_eq!(value["schema_version"], serde_json::json!(2));
         assert_eq!(value["run_id"], serde_json::json!(run_id.to_string()));
         assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
         assert_eq!(

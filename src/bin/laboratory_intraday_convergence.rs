@@ -11,7 +11,7 @@ use fund::common::types::{BarInterval, BasisPoints, SessionDate};
 use fund::laboratory::convergence::{
     curves_of, sample_universe, state_at, Closes, Curve, Selection,
 };
-use fund::laboratory::cost::{CostModel, Crossings, FillStyle};
+use fund::laboratory::cost::{CostModel, FillStyle, RoundTrip};
 use fund::laboratory::intraday::{self, SessionHours};
 use fund::laboratory::intraday_convergence::{self, IntradayEntry};
 use fund::laboratory::{dataset, intraday_convergence as measure};
@@ -45,7 +45,7 @@ const SAMPLE_SEED: u64 = 0x5EED;
 const PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS: f64 = 10.0;
 
 /// What this study assumes about reaching the book: both legs crossed, in and out.
-const COST_MODEL: CostModel = CostModel::new(FillStyle::Aggressive, Crossings::PAIR_ROUND_TRIP);
+const COST_MODEL: CostModel = CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR);
 
 struct Parameters {
     session: SessionDate,
@@ -287,28 +287,20 @@ fn report(selection: Selection, entries: &[IntradayEntry]) {
                 final_curve.horizon
             ),
         }
-        match pair_round_trip(PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS) {
+        // `expect` on a source literal rather than on a reading: the placeholder is fixed above,
+        // so a failure here is an edit to this file and not anything the archive could produce.
+        let quoted = BasisPoints::new(PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS)
+            .expect("the placeholder spread must be a usable reading");
+        match COST_MODEL.cost(quoted) {
             Ok(round_trip) => println!(
                 "  pair round trip is about {round_trip} \
-                 ({PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS:.0} bp single-name quoted spread over \
-                 {} crossings); a sigma is worth that only if the fitted spread is wider than it",
-                COST_MODEL.crossings().count()
+                 ({quoted} single-name quoted spread over {} names); a sigma is worth that only if \
+                 the fitted spread is wider than it",
+                COST_MODEL.round_trip().names()
             ),
             Err(refusal) => println!("  pair round trip is not priceable: {refusal}"),
         }
     }
-}
-
-/// What a pair round trip costs, given one name's quoted spread in basis points.
-///
-/// The arithmetic lives in [`CostModel`] rather than here, so this study and every later one price
-/// turnover the same way. A reading that is not a usable spread is refused rather than costed.
-fn pair_round_trip(single_name_quoted_spread: f64) -> Result<BasisPoints, String> {
-    let spread = BasisPoints::new(single_name_quoted_spread)
-        .ok_or_else(|| format!("{single_name_quoted_spread} is not a usable spread"))?;
-    COST_MODEL
-        .round_trip(spread)
-        .map_err(|refusal| refusal.to_string())
 }
 
 /// The entries a horizon's shares are computed over, which is what those shares may be priced with.
@@ -379,24 +371,26 @@ mod tests {
         );
     }
 
-    /// A pair round trip is four crossings against one name's spread, so the hurdle is twice the
-    /// single-name figure rather than the figure itself.
+    /// This study prices a pair and not a single name, which is the study-level choice worth
+    /// pinning here; the arithmetic itself belongs to `laboratory::cost` and is tested there.
     #[test]
-    fn test_a_pair_round_trip_costs_four_crossings() {
-        let ten = pair_round_trip(10.0).expect("ten basis points is a usable spread");
+    fn test_this_study_prices_a_pair_rather_than_a_single_name() {
+        assert_eq!(COST_MODEL.round_trip().names(), 2);
+
+        let hurdle = COST_MODEL
+            .cost(BasisPoints::new(10.0).expect("ten basis points is a usable reading"))
+            .expect("an aggressive pair fill is costable");
+
         assert!(
-            (ten.value() - 20.0).abs() < 1e-12,
-            "ten basis points a name is twenty for the pair, got {ten}"
+            (hurdle.value() - 20.0).abs() < 1e-12,
+            "ten basis points a name is twenty for the pair, got {hurdle}"
         );
-        let six = pair_round_trip(6.0).expect("six basis points is a usable spread");
-        assert!((six.value() - 12.0).abs() < 1e-12);
     }
 
-    /// The study reports a hurdle rather than crashing when handed a reading that is not a spread.
+    /// The placeholder has to survive its own validation, or `report` panics at run time.
     #[test]
-    fn test_an_unusable_spread_is_refused_rather_than_costed() {
-        assert!(pair_round_trip(f64::NAN).is_err());
-        assert!(pair_round_trip(-1.0).is_err());
+    fn test_the_placeholder_spread_is_a_usable_reading() {
+        assert!(BasisPoints::new(PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS).is_some());
     }
 
     /// One ticker makes no pairs, so a universe of one would measure nothing and report it as a
