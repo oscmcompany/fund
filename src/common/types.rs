@@ -1720,6 +1720,202 @@ impl EquityTrade {
     }
 }
 
+/// What kind of instrument a symbol is, as the reference feed classifies it.
+///
+/// The variant that matters is [`SecurityType::CommonStock`]: a bar exists for every instrument that
+/// traded, so without this the universe admits exchange-traded funds and warrants alongside the
+/// companies a pairs book is supposed to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecurityType {
+    CommonStock,
+    ExchangeTradedFund,
+    ExchangeTradedNote,
+    Warrant,
+    Unit,
+    Preferred,
+    AmericanDepositaryReceipt,
+    Fund,
+    StructuredProduct,
+    Right,
+    Index,
+    /// A code the archive does not model, kept verbatim rather than folded into a neighbour.
+    ///
+    /// Carrying the code means a type the feed adds later reads as unmodelled instead of silently
+    /// becoming whichever variant a wildcard arm happened to name.
+    Other(String),
+}
+
+impl SecurityType {
+    /// Reads the feed's code. Every unrecognized code becomes [`SecurityType::Other`] rather than an
+    /// error, because a new instrument class is not a malformed record.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "CS" => SecurityType::CommonStock,
+            "ETF" => SecurityType::ExchangeTradedFund,
+            "ETN" => SecurityType::ExchangeTradedNote,
+            "WARRANT" => SecurityType::Warrant,
+            "UNIT" => SecurityType::Unit,
+            "PFD" => SecurityType::Preferred,
+            "ADRC" => SecurityType::AmericanDepositaryReceipt,
+            "FUND" => SecurityType::Fund,
+            "SP" => SecurityType::StructuredProduct,
+            "RIGHT" => SecurityType::Right,
+            "INDEX" => SecurityType::Index,
+            other => SecurityType::Other(other.to_string()),
+        }
+    }
+
+    /// The stored form, which round-trips through [`SecurityType::from_code`].
+    pub fn as_code(&self) -> &str {
+        match self {
+            SecurityType::CommonStock => "CS",
+            SecurityType::ExchangeTradedFund => "ETF",
+            SecurityType::ExchangeTradedNote => "ETN",
+            SecurityType::Warrant => "WARRANT",
+            SecurityType::Unit => "UNIT",
+            SecurityType::Preferred => "PFD",
+            SecurityType::AmericanDepositaryReceipt => "ADRC",
+            SecurityType::Fund => "FUND",
+            SecurityType::StructuredProduct => "SP",
+            SecurityType::Right => "RIGHT",
+            SecurityType::Index => "INDEX",
+            SecurityType::Other(code) => code,
+        }
+    }
+
+    /// Whether this is a share in a company, which is the only thing the equity universe admits.
+    ///
+    /// The one place that comparison is written, so widening the universe to another class is an
+    /// edit here rather than a screen somewhere that forgot to.
+    pub fn is_common_stock(&self) -> bool {
+        matches!(self, SecurityType::CommonStock)
+    }
+}
+
+/// What the reference feed said about one symbol as of one date.
+///
+/// Point-in-time by construction: `as_of` is the date the values were requested for, not the date
+/// they were fetched, and the feed answers differently for different dates. Reading a 2021 session
+/// against a 2026 snapshot is what made the universe survivorship-biased.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EquityReference {
+    ticker: Ticker,
+    as_of: SessionDate,
+    /// `None` where the feed classified nothing, which it does for a small tail of symbols.
+    ///
+    /// Absent rather than assumed: an unclassified symbol must not enter the universe as though it
+    /// were common stock, and the count of them is worth reporting rather than hiding.
+    security_type: Option<SecurityType>,
+    /// Four digits: the leading two are the major group a sector reads off, the whole is an industry.
+    sic_code: Option<String>,
+    sic_description: Option<String>,
+    /// Shares in issue on `as_of`, which is what makes a market capitalization point-in-time.
+    ///
+    /// `None` means the feed reported none, never zero — a company with no shares is not a thing,
+    /// so a zero here would be a missing measurement wearing a number.
+    shares_outstanding: Option<f64>,
+    /// The feed's own capitalization, carried only as a cross-check against `shares x close`.
+    reported_market_capitalization: Option<f64>,
+    primary_exchange: Option<String>,
+}
+
+impl EquityReference {
+    /// Constructs a reference row, rejecting counts that cannot describe an instrument.
+    ///
+    /// A non-positive or non-finite share count would make a derived capitalization meaningless in a
+    /// way no downstream reader could detect, so it is refused here rather than stored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ticker: Ticker,
+        as_of: SessionDate,
+        security_type: Option<SecurityType>,
+        sic_code: Option<String>,
+        sic_description: Option<String>,
+        shares_outstanding: Option<f64>,
+        reported_market_capitalization: Option<f64>,
+        primary_exchange: Option<String>,
+    ) -> Result<Self, InconsistentRecordError> {
+        for (name, value) in [
+            ("shares outstanding", shares_outstanding),
+            (
+                "reported market capitalization",
+                reported_market_capitalization,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(reject(format!(
+                        "{name} must be finite and positive, got {value}"
+                    )));
+                }
+            }
+        }
+        Ok(Self {
+            ticker,
+            as_of,
+            security_type,
+            sic_code,
+            sic_description,
+            shares_outstanding,
+            reported_market_capitalization,
+            primary_exchange,
+        })
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn as_of(&self) -> SessionDate {
+        self.as_of
+    }
+
+    pub fn security_type(&self) -> Option<&SecurityType> {
+        self.security_type.as_ref()
+    }
+
+    pub fn sic_code(&self) -> Option<&str> {
+        self.sic_code.as_deref()
+    }
+
+    pub fn sic_description(&self) -> Option<&str> {
+        self.sic_description.as_deref()
+    }
+
+    pub fn shares_outstanding(&self) -> Option<f64> {
+        self.shares_outstanding
+    }
+
+    pub fn reported_market_capitalization(&self) -> Option<f64> {
+        self.reported_market_capitalization
+    }
+
+    pub fn primary_exchange(&self) -> Option<&str> {
+        self.primary_exchange.as_deref()
+    }
+
+    /// The two-digit SIC major group, which is what a sector is read off.
+    ///
+    /// `None` rather than a truncated guess when the code is not four digits, so a malformed code
+    /// cannot become a plausible-looking sector.
+    pub fn sic_major_group(&self) -> Option<&str> {
+        self.sic_code
+            .as_deref()
+            .filter(|code| code.len() == 4 && code.chars().all(|digit| digit.is_ascii_digit()))
+            .map(|code| &code[..2])
+    }
+
+    /// Whether the universe admits this symbol, which requires the feed to have classified it.
+    ///
+    /// An unclassified symbol is refused rather than admitted: the screen's job is to say what a
+    /// thing is, and `None` is the feed declining to.
+    pub fn is_tradeable_equity(&self) -> bool {
+        self.security_type
+            .as_ref()
+            .is_some_and(SecurityType::is_common_stock)
+    }
+}
+
 /// One stock split as the corporate-actions feed reported it.
 ///
 /// The ratio reads `split_from` shares becoming `split_to` shares, so a two-for-one forward split
@@ -2775,5 +2971,147 @@ mod tests {
         assert!(medium.confidence() < tight.confidence());
         assert!(wide.confidence() < medium.confidence());
         assert!(wide.confidence() > 0.0);
+    }
+
+    fn reference(security_type: Option<SecurityType>, sic: Option<&str>) -> EquityReference {
+        EquityReference::new(
+            ticker("AAPL"),
+            session(2021, 9, 15),
+            security_type,
+            sic.map(str::to_string),
+            None,
+            Some(16_530_169_999.0),
+            Some(2_445_045_344_910.0),
+            Some("XNAS".to_string()),
+        )
+        .expect("the fixture must be constructible")
+    }
+
+    /// Every code the feed actually emitted on one session, counted from a full sweep on
+    /// 2021-09-15. Pinned to literals so a code silently changing meaning fails here.
+    #[test]
+    fn test_every_observed_security_code_round_trips() {
+        for code in [
+            "CS", "ETF", "ETN", "WARRANT", "UNIT", "PFD", "ADRC", "FUND", "SP", "RIGHT", "INDEX",
+        ] {
+            let parsed = SecurityType::from_code(code);
+            assert_eq!(parsed.as_code(), code, "{code} did not round trip");
+            assert!(
+                !matches!(parsed, SecurityType::Other(_)),
+                "{code} was observed in the feed and must be modelled"
+            );
+        }
+    }
+
+    /// A class the archive does not model keeps its code rather than becoming a neighbour.
+    #[test]
+    fn test_an_unmodelled_code_is_carried_verbatim() {
+        let parsed = SecurityType::from_code("BASKET");
+
+        assert_eq!(parsed, SecurityType::Other("BASKET".to_string()));
+        assert_eq!(parsed.as_code(), "BASKET");
+        assert!(!parsed.is_common_stock());
+    }
+
+    /// The screen the whole dataset exists to enable: a bar is written for every instrument that
+    /// traded, and only common stock may reach the universe.
+    #[test]
+    fn test_only_common_stock_is_a_tradeable_equity() {
+        assert!(reference(Some(SecurityType::CommonStock), None).is_tradeable_equity());
+
+        for excluded in [
+            SecurityType::ExchangeTradedFund,
+            SecurityType::Warrant,
+            SecurityType::Unit,
+            SecurityType::Preferred,
+            SecurityType::Fund,
+            SecurityType::Other("BASKET".to_string()),
+        ] {
+            assert!(
+                !reference(Some(excluded.clone()), None).is_tradeable_equity(),
+                "{} must not reach the universe",
+                excluded.as_code()
+            );
+        }
+    }
+
+    /// 153 symbols carried no type at all on the session measured. An unclassified symbol is
+    /// refused rather than admitted, because `None` is the feed declining to say what it is.
+    #[test]
+    fn test_an_unclassified_symbol_is_refused_rather_than_assumed() {
+        let unclassified = reference(None, None);
+
+        assert_eq!(unclassified.security_type(), None);
+        assert!(!unclassified.is_tradeable_equity());
+    }
+
+    #[test]
+    fn test_the_major_group_is_the_leading_two_digits() {
+        assert_eq!(reference(None, Some("3571")).sic_major_group(), Some("35"));
+        assert_eq!(reference(None, Some("0100")).sic_major_group(), Some("01"));
+    }
+
+    /// A malformed code yields nothing rather than a plausible-looking sector.
+    #[test]
+    fn test_a_code_that_is_not_four_digits_has_no_major_group() {
+        for malformed in ["357", "35710", "35A1", ""] {
+            assert_eq!(
+                reference(None, Some(malformed)).sic_major_group(),
+                None,
+                "{malformed} must not yield a major group"
+            );
+        }
+        assert_eq!(reference(None, None).sic_major_group(), None);
+    }
+
+    /// Zero shares is a missing measurement wearing a number, so it is refused at construction.
+    #[test]
+    fn test_a_share_count_that_cannot_describe_a_company_is_refused() {
+        let build = |shares: Option<f64>, capitalization: Option<f64>| {
+            EquityReference::new(
+                ticker("AAPL"),
+                session(2021, 9, 15),
+                Some(SecurityType::CommonStock),
+                None,
+                None,
+                shares,
+                capitalization,
+                None,
+            )
+        };
+
+        assert!(build(Some(16_530_169_999.0), Some(1.0)).is_ok());
+        // Absent is fine; present-but-impossible is not.
+        assert!(build(None, None).is_ok());
+        assert!(build(Some(0.0), None).is_err());
+        assert!(build(Some(-1.0), None).is_err());
+        assert!(build(Some(f64::NAN), None).is_err());
+        assert!(build(None, Some(0.0)).is_err());
+    }
+
+    /// The point-in-time claim, as two real readings: Apple bought back roughly 1.9 billion shares
+    /// between these dates, so a 2026 snapshot cannot stand in for a 2021 one.
+    #[test]
+    fn test_two_dates_carry_their_own_share_counts() {
+        let build = |as_of: SessionDate, shares: f64| {
+            EquityReference::new(
+                ticker("AAPL"),
+                as_of,
+                Some(SecurityType::CommonStock),
+                Some("3571".to_string()),
+                None,
+                Some(shares),
+                None,
+                None,
+            )
+            .expect("the fixture must be constructible")
+        };
+
+        let then = build(session(2021, 9, 15), 16_530_169_999.0);
+        let now = build(session(2026, 9, 16), 14_594_180_000.0);
+
+        assert_ne!(then.shares_outstanding(), now.shares_outstanding());
+        assert_eq!(then.as_of(), session(2021, 9, 15));
+        assert!(then.shares_outstanding().unwrap() > now.shares_outstanding().unwrap());
     }
 }

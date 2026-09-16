@@ -4,7 +4,9 @@ use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::common::types::{BarInterval, EquityBar, EquitySplit, SessionDate, Ticker};
+use crate::common::types::{
+    BarInterval, EquityBar, EquityReference, EquitySplit, SecurityType, SessionDate, Ticker,
+};
 
 /// Why the client could not be constructed.
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -109,6 +111,19 @@ fn splits_url(base: &str) -> String {
     )
 }
 
+/// The per-ticker reference URL for one date.
+///
+/// `date` is what makes the answer point-in-time; without it the feed resolves through today's
+/// ticker table and reports a 2026 company under a 2021 symbol.
+fn reference_url(base: &str, ticker: &Ticker, as_of: SessionDate) -> String {
+    format!(
+        "{}/v3/reference/tickers/{}?date={}",
+        base.trim_end_matches('/'),
+        ticker.as_str(),
+        as_of.date().format("%Y-%m-%d")
+    )
+}
+
 /// Whether a cursor URL points at the same origin as the configured base.
 ///
 /// `next_url` arrives in the response body and the request following it carries the API key, so
@@ -163,6 +178,28 @@ struct SplitRow {
 struct SplitsResponse {
     results: Option<Vec<SplitRow>>,
     next_url: Option<String>,
+}
+
+/// One symbol's reference record as of one date.
+///
+/// `sic_code` is a string and not a number, which is load-bearing: codes are four digits including
+/// leading zeros, and `0100` read as an integer becomes a different industry.
+#[derive(Deserialize, Debug)]
+struct ReferenceRow {
+    ticker: String,
+    #[serde(rename = "type")]
+    security_type: Option<String>,
+    sic_code: Option<String>,
+    sic_description: Option<String>,
+    share_class_shares_outstanding: Option<f64>,
+    market_cap: Option<f64>,
+    primary_exchange: Option<String>,
+}
+
+/// The per-ticker reference envelope, which carries one result rather than a page of them.
+#[derive(Deserialize)]
+struct ReferenceResponse {
+    results: Option<ReferenceRow>,
 }
 
 /// Converts an untrusted splits row into a validated [`EquitySplit`], or `None`.
@@ -508,6 +545,58 @@ impl MassiveClient {
         Err(MassiveError::Parse(format!(
             "splits pagination did not end within {SPLITS_PAGE_LIMIT} pages"
         )))
+    }
+
+    /// One symbol's reference record as the feed saw it on `as_of`.
+    ///
+    /// `Ok(None)` is the feed having no record for that symbol on that date, which is a `404` and an
+    /// answer rather than a failure — it is how a symbol that had not yet listed, or had already
+    /// delisted, reports. Only a transport or parse failure is an error.
+    pub async fn fetch_reference(
+        &self,
+        ticker: &Ticker,
+        as_of: SessionDate,
+    ) -> Result<Option<EquityReference>, MassiveError> {
+        let url = reference_url(&self.credentials.base_url, ticker, as_of);
+        let response = self.authorized(&url).send().await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(MassiveError::Api { status, body });
+        }
+
+        let payload: ReferenceResponse = response.json().await.map_err(|error| {
+            MassiveError::Parse(format!("Failed to parse reference for {ticker}: {error}"))
+        })?;
+        let Some(row) = payload.results else {
+            return Ok(None);
+        };
+
+        // The response is keyed by the symbol requested, so a mismatch means the feed answered about
+        // a different company and every field below would be attributed to the wrong one.
+        if row.ticker != ticker.as_str() {
+            return Err(MassiveError::Parse(format!(
+                "asked for {ticker} and the feed answered about {}",
+                row.ticker
+            )));
+        }
+
+        EquityReference::new(
+            ticker.clone(),
+            as_of,
+            row.security_type.as_deref().map(SecurityType::from_code),
+            row.sic_code,
+            row.sic_description,
+            row.share_class_shares_outstanding,
+            row.market_cap,
+            row.primary_exchange,
+        )
+        .map(Some)
+        .map_err(|error| MassiveError::Parse(format!("{ticker} on {as_of}: {error}")))
     }
 }
 
@@ -1071,6 +1160,137 @@ mod tests {
 
         let error = MassiveClient::for_tests(&server.url())
             .fetch_splits()
+            .await
+            .expect_err("a throttle is an error");
+
+        mock.assert_async().await;
+        assert!(
+            matches!(error, MassiveError::Api { status: 429, .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Captured verbatim from the live endpoint on 2026-09-16, not written from belief: a fixture
+    /// typed against an assumed shape only proves the parser agrees with the assumption.
+    const APPLE_REFERENCE: &str = r#"{"status":"OK","results":{"ticker":"AAPL","name":"Apple Inc.","type":"CS","sic_code":"3571","sic_description":"ELECTRONIC COMPUTERS","share_class_shares_outstanding":16530169999,"market_cap":2445045344910.0,"primary_exchange":"XNAS","active":true}}"#;
+
+    /// Also captured live. An exchange-traded fund carries a share count but no SIC and no
+    /// capitalization, which is the shape the optional columns exist for.
+    const SPY_REFERENCE: &str = r#"{"status":"OK","results":{"ticker":"SPY","name":"SPDR S&P 500 ETF TRUST","type":"ETF","sic_code":null,"sic_description":null,"share_class_shares_outstanding":899630000,"market_cap":null,"primary_exchange":"ARCX","active":true}}"#;
+
+    async fn reference_for(
+        body: &str,
+        ticker: &str,
+    ) -> Result<Option<EquityReference>, MassiveError> {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", format!("/v3/reference/tickers/{ticker}").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "date".into(),
+                "2021-09-15".into(),
+            ))
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let result = MassiveClient::for_tests(&server.url())
+            .fetch_reference(&symbol(ticker), SessionDate::from_date(date("2021-09-15")))
+            .await;
+
+        // Also proves the date reached the query string, since the mock matches on it.
+        mock.assert_async().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn test_a_reference_row_parses_every_field_the_feed_publishes() {
+        let reference = reference_for(APPLE_REFERENCE, "AAPL")
+            .await
+            .expect("a populated row is not an error")
+            .expect("the feed had a record");
+
+        assert_eq!(reference.ticker().as_str(), "AAPL");
+        assert_eq!(reference.security_type(), Some(&SecurityType::CommonStock));
+        assert_eq!(reference.sic_code(), Some("3571"));
+        assert_eq!(reference.sic_major_group(), Some("35"));
+        assert_eq!(reference.shares_outstanding(), Some(16_530_169_999.0));
+        assert_eq!(
+            reference.reported_market_capitalization(),
+            Some(2_445_045_344_910.0)
+        );
+        assert_eq!(reference.primary_exchange(), Some("XNAS"));
+        assert!(reference.is_tradeable_equity());
+    }
+
+    #[tokio::test]
+    async fn test_a_fund_parses_its_nulls_and_does_not_reach_the_universe() {
+        let reference = reference_for(SPY_REFERENCE, "SPY")
+            .await
+            .expect("null optional fields are not an error")
+            .expect("the feed had a record");
+
+        assert_eq!(
+            reference.security_type(),
+            Some(&SecurityType::ExchangeTradedFund)
+        );
+        assert_eq!(reference.sic_code(), None);
+        assert_eq!(reference.reported_market_capitalization(), None);
+        // Present even on a fund, so a null share count is genuinely absent rather than typical.
+        assert_eq!(reference.shares_outstanding(), Some(899_630_000.0));
+        assert!(!reference.is_tradeable_equity());
+    }
+
+    /// A symbol that had not listed, or had already delisted, answers 404. That is the feed saying
+    /// so rather than failing, and it must not abort a sweep over ten thousand names.
+    #[tokio::test]
+    async fn test_a_symbol_absent_on_that_date_is_an_answer_rather_than_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v3/reference/tickers/TWTR")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .with_body(r#"{"status":"NOT_FOUND","message":"Ticker not found."}"#)
+            .create_async()
+            .await;
+
+        let absent = MassiveClient::for_tests(&server.url())
+            .fetch_reference(&symbol("TWTR"), SessionDate::from_date(date("2024-06-15")))
+            .await
+            .expect("a 404 is an answer");
+
+        mock.assert_async().await;
+        assert_eq!(absent, None);
+    }
+
+    /// The response is keyed by the symbol asked about, so answering about another company would
+    /// attribute every field to the wrong one.
+    #[tokio::test]
+    async fn test_an_answer_about_a_different_symbol_is_refused() {
+        let error = reference_for(APPLE_REFERENCE, "MSFT")
+            .await
+            .expect_err("a mismatched symbol is not a usable answer");
+
+        assert!(
+            matches!(&error, MassiveError::Parse(message) if message.contains("AAPL")),
+            "{error:?}"
+        );
+    }
+
+    /// A throttle or an outage is still an error, so the 404 arm cannot swallow a failed sweep.
+    #[tokio::test]
+    async fn test_a_throttled_reference_request_is_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v3/reference/tickers/AAPL")
+            .match_query(mockito::Matcher::Any)
+            .with_status(429)
+            .with_body("slow down")
+            .create_async()
+            .await;
+
+        let error = MassiveClient::for_tests(&server.url())
+            .fetch_reference(&symbol("AAPL"), SessionDate::from_date(date("2021-09-15")))
             .await
             .expect_err("a throttle is an error");
 

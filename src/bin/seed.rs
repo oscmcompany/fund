@@ -89,6 +89,11 @@ enum Command {
         #[command(subcommand)]
         action: TradeAction,
     },
+    /// Point-in-time symbol reference from Massive: what each instrument was on a date.
+    EquityReference {
+        #[command(subcommand)]
+        action: ReferenceAction,
+    },
     /// Which vendor and subscription built each archived partition.
     ArchiveProvenance {
         #[command(subcommand)]
@@ -213,10 +218,29 @@ impl Command {
             Command::EquityDetails { .. } => "seed-equity-details",
             Command::EquityQuotes { .. } => "seed-equity-quotes",
             Command::EquityTrades { .. } => "seed-equity-trades",
+            Command::EquityReference { .. } => "seed-equity-reference",
             Command::ArchiveProvenance { .. } => "seed-archive-provenance",
             Command::ArchiveCadence { .. } => "seed-archive-cadence",
         }
     }
+}
+
+/// What to do with a reference sweep.
+///
+/// `Probe` exists because a capability with no read-only route is one nobody checks: without it the
+/// only way to see what the feed says for a date would be to write a partition and read it back.
+#[derive(Debug, Subcommand)]
+enum ReferenceAction {
+    /// Fetch every symbol that traded and write one partition per date in the window.
+    Archive(ReferenceArguments),
+    /// Fetch and report, writing nothing.
+    Probe(ReferenceArguments),
+}
+
+#[derive(Debug, clap::Args)]
+struct ReferenceArguments {
+    #[command(flatten)]
+    window: WindowArguments,
 }
 
 /// Which Massive endpoint answers, which is also which cadences it can answer for.
@@ -1067,6 +1091,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         }
         Command::EquityQuotes { action } => seed_quotes(action).await,
         Command::EquityTrades { action } => seed_trades(action).await,
+        Command::EquityReference { action } => seed_reference(action).await,
         Command::ArchiveProvenance { action } => seed_provenance(action).await,
         Command::ArchiveCadence { action } => check_cadence(action).await,
     }
@@ -1624,6 +1649,125 @@ async fn flat_file_client(
 ///
 /// Reads the archive rather than the calendar: this is about objects that exist, so a session the
 /// archive never held is not a gap here.
+/// Sweeps the reference feed over every session in the window, writing one partition per date.
+///
+/// The caller chooses the dates. A quarterly grid is the intended use — share counts move over
+/// quarters, not sessions — but the window is not forced to one, because a sampling question is the
+/// operator's and a rule here would be a second place the grid is decided.
+async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> {
+    let (arguments, writes) = match action {
+        ReferenceAction::Archive(arguments) => (arguments, true),
+        ReferenceAction::Probe(arguments) => (arguments, false),
+    };
+    let window = arguments.window.window()?;
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let massive = MassiveClient::from_env().map_err(box_error)?;
+    let calendar = trading_calendar(&window).await?;
+    let sessions = calendar.trading_days_in_range(window.start, window.end);
+
+    info!(
+        bucket,
+        start = %window.start,
+        end = %window.end,
+        sessions = sessions.len(),
+        writes,
+        "Sweeping the point-in-time reference feed"
+    );
+
+    let mut sessions_written = 0usize;
+    let mut sessions_failed = 0usize;
+    for session in &sessions {
+        let tickers = archive::session_symbols(&s3_client, &bucket, *session)
+            .await
+            .map_err(box_error)?;
+        if tickers.is_empty() {
+            // A session the bar archive does not hold is not a market holiday, it is a gap; the
+            // calendar already excluded the holidays.
+            warn!(%session, "No bar partition, so no symbols to ask the reference feed about");
+            sessions_failed += 1;
+            continue;
+        }
+
+        if !writes {
+            let sample = tickers
+                .first()
+                .expect("a non-empty list has a first symbol");
+            let found = massive
+                .fetch_reference(sample, *session)
+                .await
+                .map_err(box_error)?;
+            println!(
+                "{session}  {:>6} symbols traded  |  {} -> {}",
+                tickers.len(),
+                sample,
+                match &found {
+                    Some(reference) => format!(
+                        "type={:?} sic={} shares={}",
+                        reference.security_type().map(|kind| kind.as_code()),
+                        reference.sic_code().unwrap_or("-"),
+                        reference
+                            .shares_outstanding()
+                            .map_or_else(|| "-".to_string(), |count| format!("{count:.0}"))
+                    ),
+                    None => "the feed has no record".to_string(),
+                }
+            );
+            continue;
+        }
+
+        let sweep = archive::archive_reference(&s3_client, &massive, &bucket, *session, &tickers)
+            .await
+            .map_err(box_error)?;
+        if sweep.found == 0 {
+            sessions_failed += 1;
+        } else {
+            sessions_written += 1;
+        }
+        println!(
+            "{session}  requested {:>6}  found {:>6}  absent {:>4}  failed {:>4}  coverage {}",
+            sweep.requested,
+            sweep.found,
+            sweep.absent.len(),
+            sweep.failed.len(),
+            sweep.coverage().map_or_else(
+                || "n/a".to_string(),
+                |share| format!("{:.2}%", share * 100.0)
+            )
+        );
+    }
+
+    // Keyed on sessions rather than on symbols. A symbol the feed cannot answer for is the ordinary
+    // residual of a whole-market sweep, and treating it as failure is what made an earlier driver
+    // record no progress at all; a session that wrote nothing is a real gap.
+    if sessions_failed > 0 {
+        return Err(box_error(ReferenceSweepIncomplete {
+            written: sessions_written,
+            failed: sessions_failed,
+        }));
+    }
+    Ok(Outcome::Complete)
+}
+
+/// A sweep that left a session unwritten, named so the exit code has a reason attached.
+#[derive(Debug)]
+struct ReferenceSweepIncomplete {
+    written: usize,
+    failed: usize,
+}
+
+impl std::fmt::Display for ReferenceSweepIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "wrote {} reference partitions and left {} session(s) unwritten",
+            self.written, self.failed
+        )
+    }
+}
+
+impl std::error::Error for ReferenceSweepIncomplete {}
+
 async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
@@ -3060,6 +3204,58 @@ mod tests {
     /// A run with nothing to step over reports through its own output, so there is no line to print
     /// and nothing to exit non-zero over.
     #[test]
+    /// The read-only route exists and takes the same window as the writing one, so checking what
+    /// the feed says for a date costs nothing and writes nothing.
+    #[test]
+    fn test_a_reference_sweep_has_a_read_only_route() {
+        let probe = Arguments::try_parse_from([
+            "seed",
+            "equity-reference",
+            "probe",
+            "--start",
+            "2021-10-01",
+            "--end",
+            "2021-10-01",
+        ])
+        .expect("probe must parse");
+        let Command::EquityReference { action } = probe.command else {
+            panic!("expected a reference command");
+        };
+        assert!(matches!(action, ReferenceAction::Probe(_)));
+
+        let archive = Arguments::try_parse_from([
+            "seed",
+            "equity-reference",
+            "archive",
+            "--start",
+            "2021-10-01",
+            "--end",
+            "2021-12-31",
+        ])
+        .expect("archive must parse");
+        let Command::EquityReference { action } = archive.command else {
+            panic!("expected a reference command");
+        };
+        assert!(matches!(action, ReferenceAction::Archive(_)));
+    }
+
+    /// A sweep that left a session unwritten reports the count rather than exiting quietly.
+    ///
+    /// Keyed on sessions and not symbols: the ordinary residual of a whole-market sweep is a handful
+    /// of symbols the feed has no record for, and failing on those is what made an earlier driver
+    /// record no progress across an entire five-year run.
+    #[test]
+    fn test_an_unwritten_session_is_named_in_the_failure() {
+        let incomplete = ReferenceSweepIncomplete {
+            written: 20,
+            failed: 1,
+        };
+
+        let rendered = incomplete.to_string();
+        assert!(rendered.contains("20"), "{rendered}");
+        assert!(rendered.contains("1 session"), "{rendered}");
+    }
+
     fn test_a_run_with_nothing_to_step_over_is_silent_and_succeeds() {
         assert_eq!(Outcome::Complete.exit_code(), 0);
         assert_eq!(Outcome::Complete.report(), None);
