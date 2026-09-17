@@ -5,7 +5,8 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::common::types::{
-    BarInterval, EquityBar, EquityReference, EquitySplit, SecurityType, SessionDate, Ticker,
+    BarInterval, EquityBar, EquityReference, EquitySplit, SecurityType, SessionDate, SicCode,
+    Ticker,
 };
 
 /// Why the client could not be constructed.
@@ -589,7 +590,9 @@ impl MassiveClient {
             ticker.clone(),
             as_of,
             row.security_type.as_deref().map(SecurityType::from_code),
-            row.sic_code,
+            // A code the feed sends in a shape `SicCode` will not admit is dropped rather than
+            // failing the row: the classification is still usable without an industry.
+            row.sic_code.as_deref().and_then(SicCode::new),
             row.sic_description,
             row.share_class_shares_outstanding,
             row.market_cap,
@@ -1212,7 +1215,7 @@ mod tests {
 
         assert_eq!(reference.ticker().as_str(), "AAPL");
         assert_eq!(reference.security_type(), Some(&SecurityType::CommonStock));
-        assert_eq!(reference.sic_code(), Some("3571"));
+        assert_eq!(reference.sic_code().map(SicCode::as_str), Some("3571"));
         assert_eq!(reference.sic_major_group(), Some("35"));
         assert_eq!(reference.shares_outstanding(), Some(16_530_169_999.0));
         assert_eq!(

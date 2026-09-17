@@ -3468,9 +3468,25 @@ pub async fn archive_reference(
             Ok(None) => sweep.absent.push(ticker.as_str().to_string()),
             Err(error) => {
                 warn!(%ticker, %as_of, %error, "Reference fetch failed for a symbol");
-                sweep.failed.push(ticker.as_str().to_string());
+                sweep.failed.push(reference::ReferenceFailure {
+                    ticker: ticker.as_str().to_string(),
+                    reason: error.to_string(),
+                });
             }
         }
+    }
+
+    // A claim replaces the partition, so a sweep that could not ask every symbol would overwrite a
+    // complete stored answer with a shorter one. Refused rather than merged: a retry is cheap.
+    if !sweep.failed.is_empty() {
+        warn!(
+            %as_of,
+            requested = sweep.requested,
+            found = sweep.found,
+            failed = sweep.failed.len(),
+            "Reference sweep left symbols unanswered; keeping the stored partition"
+        );
+        return Ok(sweep);
     }
 
     // Refused before the write for the reason `archive_splits` gives: a feed answering success with
@@ -3495,8 +3511,8 @@ pub async fn archive_reference(
         bucket,
         key.clone(),
         frame,
-        // A claim rather than a merge: this pass asked about every symbol that traded, so its rows
-        // are the whole answer for the date and a stored row absent from them is stale.
+        // A claim rather than a merge, which the guard above is what licenses: every symbol was
+        // answered for, so these rows are the whole answer and a stored row absent from them is stale.
         |_existing, fetched, _key| Ok(fetched),
         DerivedDataset::Reference,
         Authorship::claiming(Provenance::massive(

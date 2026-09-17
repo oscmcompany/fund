@@ -1720,6 +1720,31 @@ impl EquityTrade {
     }
 }
 
+/// A Standard Industrial Classification code: four digits, leading zeros significant.
+///
+/// A validated value rather than a `String` because the first two digits are the major group a
+/// sector reads off, so a malformed code must be refused where it arrives — stored, it would read as
+/// a name with no sector, which is indistinguishable from the 595 that genuinely have none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SicCode(String);
+
+impl SicCode {
+    /// `None` unless the code is exactly four ASCII digits.
+    pub fn new(code: &str) -> Option<Self> {
+        (code.len() == 4 && code.chars().all(|digit| digit.is_ascii_digit()))
+            .then(|| Self(code.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The two-digit major group, which is what a sector is read off.
+    pub fn major_group(&self) -> &str {
+        &self.0[..2]
+    }
+}
+
 /// What kind of instrument a symbol is, as the reference feed classifies it.
 ///
 /// The variant that matters is [`SecurityType::CommonStock`]: a bar exists for every instrument that
@@ -1806,8 +1831,8 @@ pub struct EquityReference {
     /// Absent rather than assumed: an unclassified symbol must not enter the universe as though it
     /// were common stock, and the count of them is worth reporting rather than hiding.
     security_type: Option<SecurityType>,
-    /// Four digits: the leading two are the major group a sector reads off, the whole is an industry.
-    sic_code: Option<String>,
+    /// `None` covers both a feed that reported no code and one that reported an unusable one.
+    sic_code: Option<SicCode>,
     sic_description: Option<String>,
     /// Shares in issue on `as_of`, which is what makes a market capitalization point-in-time.
     ///
@@ -1829,7 +1854,7 @@ impl EquityReference {
         ticker: Ticker,
         as_of: SessionDate,
         security_type: Option<SecurityType>,
-        sic_code: Option<String>,
+        sic_code: Option<SicCode>,
         sic_description: Option<String>,
         shares_outstanding: Option<f64>,
         reported_market_capitalization: Option<f64>,
@@ -1874,8 +1899,8 @@ impl EquityReference {
         self.security_type.as_ref()
     }
 
-    pub fn sic_code(&self) -> Option<&str> {
-        self.sic_code.as_deref()
+    pub fn sic_code(&self) -> Option<&SicCode> {
+        self.sic_code.as_ref()
     }
 
     pub fn sic_description(&self) -> Option<&str> {
@@ -1896,13 +1921,10 @@ impl EquityReference {
 
     /// The two-digit SIC major group, which is what a sector is read off.
     ///
-    /// `None` rather than a truncated guess when the code is not four digits, so a malformed code
-    /// cannot become a plausible-looking sector.
+    /// No validation here: [`SicCode`] admits nothing that lacks a major group, so this reads one
+    /// off rather than re-checking whether there is one.
     pub fn sic_major_group(&self) -> Option<&str> {
-        self.sic_code
-            .as_deref()
-            .filter(|code| code.len() == 4 && code.chars().all(|digit| digit.is_ascii_digit()))
-            .map(|code| &code[..2])
+        self.sic_code.as_ref().map(SicCode::major_group)
     }
 
     /// Whether the universe admits this symbol, which requires the feed to have classified it.
@@ -2978,7 +3000,7 @@ mod tests {
             ticker("AAPL"),
             session(2021, 9, 15),
             security_type,
-            sic.map(str::to_string),
+            sic.and_then(SicCode::new),
             None,
             Some(16_530_169_999.0),
             Some(2_445_045_344_910.0),
@@ -3051,17 +3073,30 @@ mod tests {
         assert_eq!(reference(None, Some("0100")).sic_major_group(), Some("01"));
     }
 
-    /// A malformed code yields nothing rather than a plausible-looking sector.
+    /// A malformed code is refused where it arrives rather than stored and re-checked downstream.
     #[test]
-    fn test_a_code_that_is_not_four_digits_has_no_major_group() {
-        for malformed in ["357", "35710", "35A1", ""] {
+    fn test_a_code_that_is_not_four_digits_is_not_a_sic_code() {
+        for malformed in ["357", "35710", "35A1", "", " 357"] {
+            assert!(
+                SicCode::new(malformed).is_none(),
+                "{malformed:?} must not construct"
+            );
             assert_eq!(
                 reference(None, Some(malformed)).sic_major_group(),
                 None,
-                "{malformed} must not yield a major group"
+                "{malformed:?} must not yield a major group"
             );
         }
         assert_eq!(reference(None, None).sic_major_group(), None);
+    }
+
+    /// Leading zeros are significant, which is why the code is a string and not a number.
+    #[test]
+    fn test_a_leading_zero_survives_construction() {
+        let agriculture = SicCode::new("0100").expect("four digits");
+
+        assert_eq!(agriculture.as_str(), "0100");
+        assert_eq!(agriculture.major_group(), "01");
     }
 
     /// Zero shares is a missing measurement wearing a number, so it is refused at construction.
@@ -3098,7 +3133,7 @@ mod tests {
                 ticker("AAPL"),
                 as_of,
                 Some(SecurityType::CommonStock),
-                Some("3571".to_string()),
+                SicCode::new("3571"),
                 None,
                 Some(shares),
                 None,

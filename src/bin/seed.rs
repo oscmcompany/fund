@@ -15,7 +15,8 @@ use fund::common::flatfiles;
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::{
-    BarInterval, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker, TradeSummary,
+    BarInterval, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, SicCode, Ticker,
+    TradeSummary,
 };
 use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
@@ -1641,14 +1642,6 @@ async fn flat_file_client(
     }
 }
 
-/// Folds the sampled sessions' printed tape into the archive under the scope the action names.
-///
-/// The calendar comes from Alpaca and the tape from Massive, which is the same split the quote
-/// pass uses: only the exchange publishes its own hours, and only the flat files hold every print.
-/// Records, or reports, which route built each archived partition.
-///
-/// Reads the archive rather than the calendar: this is about objects that exist, so a session the
-/// archive never held is not a gap here.
 /// Sweeps the reference feed over every session in the window, writing one partition per date.
 ///
 /// The caller chooses the dates. A quarterly grid is the intended use — share counts move over
@@ -1705,7 +1698,7 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
                     Some(reference) => format!(
                         "type={:?} sic={} shares={}",
                         reference.security_type().map(|kind| kind.as_code()),
-                        reference.sic_code().unwrap_or("-"),
+                        reference.sic_code().map_or("-", SicCode::as_str),
                         reference
                             .shares_outstanding()
                             .map_or_else(|| "-".to_string(), |count| format!("{count:.0}"))
@@ -1719,10 +1712,12 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
         let sweep = archive::archive_reference(&s3_client, &massive, &bucket, *session, &tickers)
             .await
             .map_err(box_error)?;
-        if sweep.found == 0 {
-            sessions_failed += 1;
-        } else {
+        // Written means the partition was replaced, which the archive refuses when any symbol went
+        // unanswered. A non-zero `found` alone would call a preserved partition a fresh one.
+        if sweep.failed.is_empty() && sweep.found > 0 {
             sessions_written += 1;
+        } else {
+            sessions_failed += 1;
         }
         println!(
             "{session}  requested {:>6}  found {:>6}  absent {:>4}  failed {:>4}  coverage {}",
@@ -1737,9 +1732,8 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
         );
     }
 
-    // Keyed on sessions rather than on symbols. A symbol the feed cannot answer for is the ordinary
-    // residual of a whole-market sweep, and treating it as failure is what made an earlier driver
-    // record no progress at all; a session that wrote nothing is a real gap.
+    // Keyed on sessions, not symbols: an unanswerable symbol is the ordinary residual of a
+    // whole-market sweep, and an earlier driver recorded no progress at all by failing on one.
     if sessions_failed > 0 {
         return Err(box_error(ReferenceSweepIncomplete {
             written: sessions_written,
@@ -1768,6 +1762,10 @@ impl std::fmt::Display for ReferenceSweepIncomplete {
 
 impl std::error::Error for ReferenceSweepIncomplete {}
 
+/// Records, or reports, which route built each archived partition.
+///
+/// Reads the archive rather than the calendar: this is about objects that exist, so a session the
+/// archive never held is not a gap here.
 async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
@@ -1850,6 +1848,10 @@ async fn seed_provenance(action: &ProvenanceAction) -> Result<Outcome, SeedError
     Ok(Outcome::Complete)
 }
 
+/// Folds the sampled sessions' printed tape into the archive under the scope the action names.
+///
+/// The calendar comes from Alpaca and the tape from Massive, which is the same split the quote
+/// pass uses: only the exchange publishes its own hours, and only the flat files hold every print.
 async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
     match action {
         TradeAction::Measure(symbols) => return measure_trades(symbols).await,
@@ -3204,6 +3206,11 @@ mod tests {
     /// A run with nothing to step over reports through its own output, so there is no line to print
     /// and nothing to exit non-zero over.
     #[test]
+    fn test_a_run_with_nothing_to_step_over_is_silent_and_succeeds() {
+        assert_eq!(Outcome::Complete.exit_code(), 0);
+        assert_eq!(Outcome::Complete.report(), None);
+    }
+
     /// The read-only route exists and takes the same window as the writing one, so checking what
     /// the feed says for a date costs nothing and writes nothing.
     #[test]
@@ -3254,11 +3261,6 @@ mod tests {
         let rendered = incomplete.to_string();
         assert!(rendered.contains("20"), "{rendered}");
         assert!(rendered.contains("1 session"), "{rendered}");
-    }
-
-    fn test_a_run_with_nothing_to_step_over_is_silent_and_succeeds() {
-        assert_eq!(Outcome::Complete.exit_code(), 0);
-        assert_eq!(Outcome::Complete.report(), None);
     }
 
     #[test]

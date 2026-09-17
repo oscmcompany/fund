@@ -1,7 +1,6 @@
 //! Point-in-time symbol reference: what each instrument *was* on a date, not what it is now.
 //!
-//! One partition per `as_of` date rather than one table, because these are dated observations and
-//! the feed answers differently for each. See [`crate::data::archive::archive_reference`].
+//! One partition per `as_of`, because these are dated observations rather than a table revised once.
 
 use polars::prelude::*;
 
@@ -31,7 +30,7 @@ pub fn reference_to_dataframe(references: &[EquityReference]) -> Result<DataFram
                 .security_type()
                 .map(|kind| kind.as_code().to_string()),
         );
-        sic_codes.push(reference.sic_code().map(str::to_string));
+        sic_codes.push(reference.sic_code().map(|code| code.as_str().to_string()));
         sic_descriptions.push(reference.sic_description().map(str::to_string));
         shares.push(reference.shares_outstanding());
         capitalizations.push(reference.reported_market_capitalization());
@@ -61,8 +60,18 @@ pub struct ReferenceSweep {
     pub found: usize,
     /// Symbols the feed answered `404` for, despite each having traded that session.
     pub absent: Vec<String>,
-    /// Symbols whose request failed, with the reason the last one gave.
-    pub failed: Vec<String>,
+    /// Symbols whose request never completed, each with the reason it gave.
+    pub failed: Vec<ReferenceFailure>,
+}
+
+/// One symbol the feed was asked about and did not answer for, and why.
+///
+/// The reason travels with the symbol rather than only reaching the log, because a sweep is judged
+/// after the fact and a log that has rotated cannot say whether an outage or a bad symbol caused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceFailure {
+    pub ticker: String,
+    pub reason: String,
 }
 
 impl ReferenceSweep {
@@ -83,7 +92,7 @@ impl ReferenceSweep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{SecurityType, SessionDate, Ticker};
+    use crate::common::types::{SecurityType, SessionDate, SicCode, Ticker};
 
     fn reference(
         ticker: &str,
@@ -95,7 +104,7 @@ mod tests {
             Ticker::new(ticker).expect("a valid test symbol"),
             SessionDate::from_date("2021-09-15".parse().expect("a valid date")),
             security_type,
-            sic.map(str::to_string),
+            sic.and_then(SicCode::new),
             None,
             shares,
             None,
@@ -174,6 +183,38 @@ mod tests {
         assert_eq!(populated.schema(), empty.schema());
     }
 
+    /// The distinction the archive guard turns on: a symbol the feed answered `404` for is an
+    /// answer and does not block the write, while one whose request never completed does.
+    ///
+    /// Collapsing them would either refuse every partition — the absent residual is 7 to 18 symbols
+    /// a quarter and never zero — or let an outage silently shorten a complete stored partition.
+    #[test]
+    fn test_an_absent_symbol_is_not_a_failed_one() {
+        let only_absent = ReferenceSweep {
+            requested: 100,
+            found: 99,
+            absent: vec!["TWTR".to_string()],
+            failed: Vec::new(),
+        };
+        let one_failed = ReferenceSweep {
+            requested: 100,
+            found: 99,
+            absent: Vec::new(),
+            failed: vec![ReferenceFailure {
+                ticker: "AAPL".to_string(),
+                reason: "connection reset".to_string(),
+            }],
+        };
+
+        // Identical coverage, opposite consequences.
+        assert_eq!(only_absent.coverage(), one_failed.coverage());
+        assert!(
+            only_absent.failed.is_empty(),
+            "a 404 must not block the write"
+        );
+        assert!(!one_failed.failed.is_empty(), "an unanswered request must");
+    }
+
     #[test]
     fn test_an_empty_sweep_reports_no_coverage_rather_than_complete_coverage() {
         let nothing = ReferenceSweep::default();
@@ -189,12 +230,24 @@ mod tests {
             requested: 10,
             found: 7,
             absent: vec!["TWTR".to_string()],
-            failed: vec!["AAPL".to_string(), "MSFT".to_string()],
+            failed: vec![
+                ReferenceFailure {
+                    ticker: "AAPL".to_string(),
+                    reason: "connection reset".to_string(),
+                },
+                ReferenceFailure {
+                    ticker: "MSFT".to_string(),
+                    reason: "429 slow down".to_string(),
+                },
+            ],
         };
 
         assert_eq!(sweep.coverage(), Some(0.7));
         assert!(!sweep.is_complete());
         assert_eq!(sweep.absent.len(), 1);
         assert_eq!(sweep.failed.len(), 2);
+        // The cause travels with the symbol, so a sweep can be judged without its log.
+        assert_eq!(sweep.failed[0].ticker, "AAPL");
+        assert_eq!(sweep.failed[0].reason, "connection reset");
     }
 }
