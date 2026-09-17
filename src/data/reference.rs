@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 
 use polars::prelude::*;
 
-use crate::common::types::{EquityReference, SecurityType, SessionDate};
-use crate::data::details::UNKNOWN;
+use crate::common::types::{EquityReference, SecurityType, SessionDate, SicCode};
+use crate::data::classification;
+use crate::data::classification_table::{Industry, Sector};
+use crate::data::details::{industry_code, sector_code};
 
 /// The column carrying which `as_of` observation a row was classified by.
 ///
@@ -74,8 +76,12 @@ const CARRY_FORWARD_OBSERVATIONS: u32 = 1;
 #[derive(Clone)]
 struct Observation {
     security_type: Option<String>,
-    sector: String,
-    industry: String,
+    /// `None` where the feed reported no usable SIC code, which is 17% of common stock.
+    ///
+    /// Never a sentinel bucket: the twelve-industry definition already has an `Other` group that
+    /// shares a factor, and folding the unclassified into it would put two meanings in one value.
+    sector: Option<Sector>,
+    industry: Option<Industry>,
     /// `None` where the feed declined to report it, which is 4% of common stock from 2025-07 and
     /// under 1% before. Never defaulted: a zero share count is not a company with no equity.
     shares_outstanding: Option<f64>,
@@ -140,8 +146,8 @@ pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, 
             }
             tickers.push(ticker.clone());
             observed_at.push(stamp);
-            sectors.push(observation.sector.clone());
-            industries.push(observation.industry.clone());
+            sectors.push(sector_code(observation.sector));
+            industries.push(industry_code(observation.industry));
             shares.push(observation.shares_outstanding);
         }
     }
@@ -181,13 +187,14 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
                 shares_outstanding: shares
                     .get(index)
                     .filter(|count| count.is_finite() && *count > 0.0),
-                // Spelled rather than left null, matching the retired CSV: an unknown sector must
-                // not be assumed to diversify, so two unclassified names count as one group.
+                // Both lookups are total over four-digit codes, so `None` here carries exactly
+                // one meaning: the feed reported no usable code.
                 sector: sic_code
-                    .and_then(|code| code.get(..2))
-                    .unwrap_or(UNKNOWN)
-                    .to_string(),
-                industry: sic_code.unwrap_or(UNKNOWN).to_string(),
+                    .and_then(SicCode::new)
+                    .map(|code| classification::sector_of(&code)),
+                industry: sic_code
+                    .and_then(SicCode::new)
+                    .map(|code| classification::industry_of(&code)),
             },
         ));
     }
@@ -401,25 +408,40 @@ mod tests {
         assert_eq!(tickers, vec!["AAPL"]);
     }
 
+    /// The whole code is looked up, not sliced.
+    ///
+    /// The two-digit major group this replaced put electronic computers in `35` beside construction
+    /// machinery and prepackaged software in `73` beside advertising. Pinned to literal bucket names
+    /// rather than to the lookup, so a table that moves fails here instead of agreeing with itself.
     #[test]
-    fn test_the_sector_is_the_major_group_and_the_industry_the_whole_code() {
+    fn test_the_sector_and_industry_are_looked_up_from_the_whole_code() {
         let universe = universe_of(&[partition(
             (2021, 10, 1),
-            &[("AAPL", "CS", Some("3571")), ("AGRI", "CS", Some("0100"))],
+            &[
+                ("AAPL", "CS", Some("3571")),
+                ("SFTW", "CS", Some("7372")),
+                ("AGRI", "CS", Some("0100")),
+            ],
         )])
         .expect("the universe must build");
 
         let sectors = universe.rows().column("sector").unwrap().str().unwrap();
         let industries = universe.rows().column("industry").unwrap().str().unwrap();
-        assert_eq!(sectors.get(0), Some("35"));
-        assert_eq!(industries.get(0), Some("3571"));
+
+        // Rows come back ordered by ticker, not in the order the partition listed them.
+        assert_eq!(sectors.get(0), Some("BusinessEquipment"));
+        assert_eq!(industries.get(0), Some("Computers"));
         // The leading zero is significant, which is why the code is stored as a string.
-        assert_eq!(sectors.get(1), Some("01"));
-        assert_eq!(industries.get(1), Some("0100"));
+        assert_eq!(sectors.get(1), Some("ConsumerNondurables"));
+        assert_eq!(industries.get(1), Some("Agriculture"));
+        // Split from AAPL by the major group, joined to it here.
+        assert_eq!(sectors.get(2), Some("BusinessEquipment"));
+        assert_eq!(industries.get(2), Some("ComputerSoftware"));
     }
 
-    /// 595 common stocks carry no SIC. Spelling the gap keeps them in the universe and counts them
-    /// as one sector, matching the retired CSV; dropping them would shrink the market silently.
+    /// 901 of 5,217 common stocks carry no SIC, measured 2026-09-17. Spelling the gap keeps them in
+    /// the universe; dropping them would shrink the market silently. What the sentinel means is the
+    /// reader's decision, not this one's — the screen pools them and the residual panel refuses them.
     #[test]
     fn test_a_common_stock_without_a_sic_stays_in_the_universe() {
         let universe = universe_of(&[partition((2021, 10, 1), &[("ZZZZ", "CS", None)])])
@@ -469,8 +491,8 @@ mod tests {
 
         let industries = joined.column("industry").unwrap().str().unwrap();
         assert_eq!(joined.height(), 2);
-        assert_eq!(industries.get(0), Some("3571"));
-        assert_eq!(industries.get(1), Some("7372"));
+        assert_eq!(industries.get(0), Some("Computers"));
+        assert_eq!(industries.get(1), Some("ComputerSoftware"));
     }
 
     /// The survivorship fix itself. A name that traded and then delisted keeps the sessions it
@@ -528,7 +550,7 @@ mod tests {
         assert_eq!(joined.height(), 1, "a 404 is not a delisting");
         assert_eq!(
             joined.column("industry").unwrap().str().unwrap().get(0),
-            Some("3571")
+            Some("Computers")
         );
     }
 

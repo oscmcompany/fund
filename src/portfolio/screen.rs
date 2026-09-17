@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::common::journal::ExclusionReason;
 use crate::common::types::{PairID, Ticker};
+use crate::data::classification_table::Sector;
 
 /// Sessions of daily closes the correlation and the spread distribution are fitted over.
 pub const CORRELATION_WINDOW_SESSIONS: usize = 60;
@@ -771,17 +772,38 @@ fn orient_one(
     .map_err(OrientationRejection::Candidate)
 }
 
+/// The bucket one leg's sector allowance is counted against.
+///
+/// A name the feed gave no SIC code has *unknown* factor exposure, so it is pooled rather than
+/// allowed to escape the cap that exists to bound exposure it cannot see. [`Sector::Other`] is a
+/// separate, real group and is never folded in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SectorAllowance {
+    Classified(Sector),
+    Unclassified,
+}
+
+impl SectorAllowance {
+    fn of(sector: Option<Sector>) -> Self {
+        match sector {
+            Some(sector) => SectorAllowance::Classified(sector),
+            None => SectorAllowance::Unclassified,
+        }
+    }
+}
+
 /// Greedily takes up to `limit` candidates that share no ticker with each other or with `held`,
 /// and that keep every sector within [`MAXIMUM_LEGS_PER_SECTOR`].
 ///
 /// The sector cap is seeded from the book, not from this pass, so a sector at its limit stays there
-/// rather than being handed a fresh allowance every five minutes. A held ticker whose sector is
-/// unknown contributes to no sector rather than to a fabricated one, and still blocks re-entry.
+/// rather than being handed a fresh allowance every five minutes. A held ticker absent from the
+/// universe entirely contributes to no sector rather than to a fabricated one, and still blocks
+/// re-entry; one the feed declined to classify counts against the shared unclassified allowance.
 pub fn select_disjoint(
     candidates: &[PairCandidate],
     limit: usize,
     held: &HashSet<Ticker>,
-    sectors: &HashMap<Ticker, String>,
+    sectors: &HashMap<Ticker, Option<Sector>>,
 ) -> Vec<PairCandidate> {
     if limit == 0 {
         return Vec::new();
@@ -790,10 +812,14 @@ pub fn select_disjoint(
     let mut used: HashSet<Ticker> = held.clone();
     let mut selected: Vec<PairCandidate> = Vec::with_capacity(limit);
 
-    let mut legs_per_sector: HashMap<&str, usize> = HashMap::new();
+    let allowance_of = |ticker: &Ticker| -> Option<SectorAllowance> {
+        sectors.get(ticker).copied().map(SectorAllowance::of)
+    };
+
+    let mut legs_per_sector: HashMap<SectorAllowance, usize> = HashMap::new();
     for ticker in held {
-        if let Some(sector) = sectors.get(ticker) {
-            *legs_per_sector.entry(sector.as_str()).or_default() += 1;
+        if let Some(allowance) = allowance_of(ticker) {
+            *legs_per_sector.entry(allowance).or_default() += 1;
         }
     }
 
@@ -805,9 +831,9 @@ pub fn select_disjoint(
             continue;
         }
 
-        let long_sector = sectors.get(candidate.long_ticker()).map(String::as_str);
-        let short_sector = sectors.get(candidate.short_ticker()).map(String::as_str);
-        let taken = |sector: &str| legs_per_sector.get(sector).copied().unwrap_or(0);
+        let long_sector = allowance_of(candidate.long_ticker());
+        let short_sector = allowance_of(candidate.short_ticker());
+        let taken = |sector: SectorAllowance| legs_per_sector.get(&sector).copied().unwrap_or(0);
 
         // Both legs are weighed together, and the same-sector case is why: asking twice for one
         // allowance, a leg at a time, would let such a pair take its sector one past the cap.
@@ -824,8 +850,8 @@ pub fn select_disjoint(
         if !fits {
             continue;
         }
-        for sector in [long_sector, short_sector].into_iter().flatten() {
-            *legs_per_sector.entry(sector).or_default() += 1;
+        for allowance in [long_sector, short_sector].into_iter().flatten() {
+            *legs_per_sector.entry(allowance).or_default() += 1;
         }
         used.insert(candidate.long_ticker().clone());
         used.insert(candidate.short_ticker().clone());
@@ -1624,10 +1650,13 @@ mod tests {
     }
 
     /// Assigns every named ticker to one sector, for the selection tests.
-    fn sector_map(assignments: &[(&str, &str)]) -> HashMap<Ticker, String> {
+    ///
+    /// `None` is a ticker the feed gave no SIC code, which is distinct from a ticker absent from
+    /// the map entirely — the two reach different arms of the cap.
+    fn sector_map(assignments: &[(&str, Option<Sector>)]) -> HashMap<Ticker, Option<Sector>> {
         assignments
             .iter()
-            .map(|(symbol, sector)| (ticker(symbol), (*sector).to_string()))
+            .map(|(symbol, sector)| (ticker(symbol), *sector))
             .collect()
     }
 
@@ -1644,15 +1673,15 @@ mod tests {
     /// `count` distinct pairs, both legs of each in `sector`, ranked best first.
     fn same_sector_candidates(
         count: usize,
-        sector: &str,
-    ) -> (Vec<PairCandidate>, HashMap<Ticker, String>) {
+        sector: Option<Sector>,
+    ) -> (Vec<PairCandidate>, HashMap<Ticker, Option<Sector>>) {
         let symbols: Vec<(String, String)> = (0..count).map(pair_for_index).collect();
         let candidates = symbols
             .iter()
             .enumerate()
             .map(|(index, (long, short))| candidate(long, short, (count - index) as f64))
             .collect();
-        let assignments: Vec<(&str, &str)> = symbols
+        let assignments: Vec<(&str, Option<Sector>)> = symbols
             .iter()
             .flat_map(|(long, short)| [(long.as_str(), sector), (short.as_str(), sector)])
             .collect();
@@ -1663,7 +1692,7 @@ mod tests {
     /// Both legs sit in the sector, so each pair spends two of the six legs on offer.
     #[test]
     fn test_selection_stops_at_the_sector_cap() {
-        let (candidates, sectors) = same_sector_candidates(6, "Technology");
+        let (candidates, sectors) = same_sector_candidates(6, Some(Sector::BusinessEquipment));
 
         let selected = select_disjoint(&candidates, 10, &HashSet::new(), &sectors);
 
@@ -1688,12 +1717,12 @@ mod tests {
             .enumerate()
             .map(|(index, (long, short))| candidate(long, short, (6 - index) as f64))
             .collect();
-        let assignments: Vec<(&str, &str)> = symbols
+        let assignments: Vec<(&str, Option<Sector>)> = symbols
             .iter()
             .flat_map(|(long, short)| {
                 [
-                    (long.as_str(), "Technology"),
-                    (short.as_str(), "Healthcare"),
+                    (long.as_str(), Some(Sector::BusinessEquipment)),
+                    (short.as_str(), Some(Sector::Healthcare)),
                 ]
             })
             .collect();
@@ -1712,13 +1741,13 @@ mod tests {
     /// fresh allowance every five minutes.
     #[test]
     fn test_the_cap_counts_legs_already_held() {
-        let (candidates, mut sectors) = same_sector_candidates(3, "Technology");
+        let (candidates, mut sectors) = same_sector_candidates(3, Some(Sector::BusinessEquipment));
         let held: HashSet<Ticker> = ["HELDA", "HELDB", "HELDC", "HELDD"]
             .iter()
             .map(|symbol| ticker(symbol))
             .collect();
         for symbol in ["HELDA", "HELDB", "HELDC", "HELDD"] {
-            sectors.insert(ticker(symbol), "Technology".to_string());
+            sectors.insert(ticker(symbol), Some(Sector::BusinessEquipment));
         }
 
         let selected = select_disjoint(&candidates, 10, &held, &sectors);
@@ -1734,12 +1763,62 @@ mod tests {
     /// and still blocks re-entry through the disjointness check.
     #[test]
     fn test_a_held_ticker_without_a_sector_does_not_consume_an_allowance() {
-        let (candidates, sectors) = same_sector_candidates(3, "Technology");
+        let (candidates, sectors) = same_sector_candidates(3, Some(Sector::BusinessEquipment));
         let held: HashSet<Ticker> = ["ZZZZ"].iter().map(|symbol| ticker(symbol)).collect();
 
         let selected = select_disjoint(&candidates, 10, &held, &sectors);
 
         assert_eq!(selected.len(), 3);
+    }
+
+    /// Names the feed declined to classify share one allowance rather than escaping the cap.
+    ///
+    /// The conservative reading, and the reason it is the right one: an unclassified name has
+    /// unknown factor exposure, so letting each take a free slot is exactly the concentration the
+    /// cap exists to bound. Six unclassified legs buy three pairs, the same as any one sector.
+    #[test]
+    fn test_unclassified_names_share_one_allowance() {
+        let (candidates, sectors) = same_sector_candidates(6, None);
+
+        let selected = select_disjoint(&candidates, 10, &HashSet::new(), &sectors);
+
+        assert_eq!(
+            selected.len(),
+            3,
+            "six unclassified legs allow three pairs, not six"
+        );
+    }
+
+    /// The catch-all sector and an unclassified name are different buckets.
+    ///
+    /// `Sector::Other` is a real group the definitions assign names to — mines, construction,
+    /// transport, hotels — and folding an unclassified name into it would both understate that
+    /// group's concentration and invent a factor for a name that has none.
+    #[test]
+    fn test_the_catch_all_sector_is_not_the_unclassified_bucket() {
+        let symbols: Vec<(String, String)> = (0..6).map(pair_for_index).collect();
+        let candidates: Vec<PairCandidate> = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, (long, short))| candidate(long, short, (6 - index) as f64))
+            .collect();
+        let assignments: Vec<(&str, Option<Sector>)> = symbols
+            .iter()
+            .flat_map(|(long, short)| {
+                [(long.as_str(), Some(Sector::Other)), (short.as_str(), None)]
+            })
+            .collect();
+        let sectors = sector_map(&assignments);
+
+        let selected = select_disjoint(&candidates, 10, &HashSet::new(), &sectors);
+
+        // Six, not three: if the two collapsed into one bucket each pair would spend two legs of
+        // the same allowance and only three would fit.
+        assert_eq!(
+            selected.len(),
+            6,
+            "Other and unclassified are separate allowances, so one leg lands in each"
+        );
     }
 
     /// An empty sector map caps nothing.
@@ -1748,7 +1827,7 @@ mod tests {
     /// ticker with no sector upstream, so what this pins is that the cap is the only thing capping.
     #[test]
     fn test_an_empty_sector_map_constrains_nothing() {
-        let (candidates, _) = same_sector_candidates(5, "Technology");
+        let (candidates, _) = same_sector_candidates(5, Some(Sector::BusinessEquipment));
 
         let selected = select_disjoint(&candidates, 10, &HashSet::new(), &HashMap::new());
 

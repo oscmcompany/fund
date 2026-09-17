@@ -211,7 +211,11 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let mut server = mockito::Server::new_async().await;
 
     common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    common::seed_details(&pool, &[("AAAA", "Technology"), ("BBBB", "Utilities")]).await;
+    common::seed_details(
+        &pool,
+        &[("AAAA", "BusinessEquipment"), ("BBBB", "Utilities")],
+    )
+    .await;
     // The long leg is forecast to out-return the short, so the model agrees with the spread.
     common::seed_predictions(
         &pool,
@@ -544,7 +548,11 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
     let mut server = mockito::Server::new_async().await;
 
     common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    common::seed_details(&pool, &[("AAAA", "Technology"), ("BBBB", "Utilities")]).await;
+    common::seed_details(
+        &pool,
+        &[("AAAA", "BusinessEquipment"), ("BBBB", "Utilities")],
+    )
+    .await;
     common::seed_predictions(
         &pool,
         "run-1",

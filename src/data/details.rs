@@ -1,7 +1,6 @@
 //! Ticker metadata: sector and industry, which is what makes the screen's sector cap bind.
 //!
-//! Seeded from the archive's point-in-time reference dataset, which is the only thing that knows
-//! what a symbol was rather than what today's ticker table says it is.
+//! Seeded from the point-in-time reference dataset; the buckets come from `classification`.
 
 use std::collections::HashMap;
 
@@ -10,13 +9,35 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::types::{EquityDetail, Ticker};
+use crate::data::classification;
+use crate::data::classification_table::{Industry, Sector};
 
-/// Value stored when the source has no sector or industry for a ticker.
+/// Value stored when the source has no SIC code, and so no sector or industry, for a ticker.
 ///
-/// Spelled rather than left null so the screen's different-sector comparison has something total to
-/// work with. Two tickers both marked unavailable are treated as the same sector, which is the
-/// conservative reading: unknown sectors should not be assumed to diversify.
+/// Spelled rather than left null because the prediction path filters null classifications out of
+/// its join and would drop these names from the universe entirely. Distinct from `Sector::Other`,
+/// which is a real group the definitions assign names to.
 pub const UNKNOWN: &str = "NOT AVAILABLE";
+
+/// The stored spelling of a sector, which round-trips through [`sector_of_stored`].
+pub fn sector_code(sector: Option<Sector>) -> String {
+    sector.map_or(UNKNOWN, |sector| sector.as_str()).to_string()
+}
+
+/// The stored spelling of an industry.
+pub fn industry_code(industry: Option<Industry>) -> String {
+    industry
+        .map_or(UNKNOWN, |industry| industry.as_str())
+        .to_string()
+}
+
+/// Reads a stored sector back into the domain type.
+///
+/// Unrecognised text reads as absent rather than as a bucket, because a value this cannot place
+/// names no group and inventing one would put a name into a factor it has no claim to.
+pub fn sector_of_stored(stored: &str) -> Option<Sector> {
+    classification::sector_from_code(stored)
+}
 
 /// Rows per insert chunk. Three columns, so a thousand rows is well inside the bind parameter limit.
 const INSERT_CHUNK_ROWS: usize = 1_000;
@@ -123,16 +144,32 @@ pub async fn store_details(pool: &PgPool, details: &[EquityDetail]) -> Result<u6
 ///
 /// A map rather than a frame because the screen looks a ticker up per candidate combination, and a
 /// frame join per lookup in a quadratic loop is the wrong shape entirely.
-pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, String>, DetailsError> {
+///
+/// `None` against a ticker is the feed having given it no SIC code; a ticker absent from the map is
+/// one the universe does not carry at all, and the two reach different arms of the cap.
+pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, Option<Sector>>, DetailsError> {
     let rows =
         sqlx::query!(r#"SELECT ticker AS "ticker!", sector AS "sector!" FROM equity_details"#)
             .fetch_all(pool)
             .await?;
 
     let supplied = rows.len();
-    let sectors: HashMap<Ticker, String> = rows
+    let mut unclassified: usize = 0;
+    let mut unrecognised: usize = 0;
+    let sectors: HashMap<Ticker, Option<Sector>> = rows
         .into_iter()
-        .filter_map(|row| Ticker::new(&row.ticker).map(|ticker| (ticker, row.sector)))
+        .filter_map(|row| {
+            let ticker = Ticker::new(&row.ticker)?;
+            let sector = sector_of_stored(&row.sector);
+            // Separated because they send an operator to different places: a feed that declined
+            // to classify, against a stored value written by a build with a different table.
+            match (&sector, row.sector.as_str()) {
+                (None, UNKNOWN) => unclassified += 1,
+                (None, _) => unrecognised += 1,
+                (Some(_), _) => {}
+            }
+            Some((ticker, sector))
+        })
         .collect();
 
     // Counted and reported, as `details_from_universe` does. A dropped ticker removes a symbol from
@@ -141,7 +178,16 @@ pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, String>, Deta
     if skipped > 0 {
         warn!(skipped, "Skipped equity sector rows with unusable tickers");
     }
-    info!(tickers = sectors.len(), "Equity sectors loaded");
+    if unrecognised > 0 {
+        warn!(
+            unrecognised,
+            "Stored sectors name no known group; re-run the details refresh"
+        );
+    }
+    info!(
+        tickers = sectors.len(),
+        unclassified, "Equity sectors loaded"
+    );
     Ok(sectors)
 }
 

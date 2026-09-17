@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+# Regenerates src/data/classification_table.rs from the Fama-French industry definitions.
+#
+# The table decides which names share a sector, which is what the screen's concentration cap and the
+# laboratory's sector factor are both read off, so it is baked into the binary rather than fetched at
+# read time: a study run today and the book selected tonight must group names identically, and a
+# table that moved under either would make the two incomparable. Re-run this when Dartmouth
+# republishes the definitions, and commit the diff.
+#
+#   tools/fetch-industry-classifications
+#   tools/fetch-industry-classifications --check
+#
+# `--check` rewrites nothing and exits non-zero when the definitions have moved, matching
+# `fetch-trade-conditions`. Deliberately not a test: it needs the network, and a suite that fails
+# when Dartmouth is down stops meaning anything.
+#
+# Two granularities from one source. The 12-industry file is the sector -- coarse enough that the
+# screen's per-sector cap can bind at all -- and the 49-industry file is the subgroup beneath it.
+# They are separate files rather than a rollup, because Fama and French fit each independently: a
+# 49-industry bucket is not guaranteed to sit inside one 12-industry bucket, and deriving the coarse
+# level from the fine one would invent a nesting the source does not claim.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Entered rather than merely resolved: `cargo fmt` below reads the manifest from the working
+# directory, so a run from anywhere but the repository root would format nothing and say so quietly.
+cd "${ROOT}"
+OUTPUT="${ROOT}/src/data/classification_table.rs"
+
+BASE_URL="https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp"
+
+CHECK_ONLY=false
+if [[ "${1:-}" == "--check" ]]; then
+  CHECK_ONLY=true
+elif [[ -n "${1:-}" ]]; then
+  echo "Usage: $(basename "$0") [--check]" >&2
+  exit 1
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
+for granularity in 12 49; do
+  echo "Fetching Siccodes${granularity} from ${BASE_URL}"
+  curl -sS --fail-with-body -L -o "${WORK}/Siccodes${granularity}.zip" \
+    "${BASE_URL}/Siccodes${granularity}.zip"
+  unzip -o -q -d "${WORK}" "${WORK}/Siccodes${granularity}.zip"
+done
+
+TARGET="${OUTPUT}"
+if [[ "${CHECK_ONLY}" == true ]]; then
+  TARGET="${WORK}/generated.rs"
+fi
+
+python3 - "${WORK}" "${TARGET}" <<'PYTHON'
+import re
+import sys
+from datetime import date
+
+work, output = sys.argv[1], sys.argv[2]
+
+# The name each bucket is spelled with, keyed by the source's own short code.
+#
+# Curated rather than derived, because neither end of the source is usable on its own: the short
+# codes are abbreviations ("Enrgy", "Hshld", "RlEst") and the full labels are descriptions that would
+# read as "OilGasAndCoalExtractionAndProducts". These are the shortest full-word names that keep the
+# label's meaning; the label itself is carried verbatim onto each variant's doc comment, so nothing
+# the source says is lost. Asserted complete below, so a bucket added upstream fails the generation
+# rather than quietly falling back to an abbreviation.
+SECTOR_NAMES = {
+    "NoDur": "ConsumerNondurables",
+    "Durbl": "ConsumerDurables",
+    "Manuf": "Manufacturing",
+    "Enrgy": "Energy",
+    "Chems": "Chemicals",
+    "BusEq": "BusinessEquipment",
+    "Telcm": "Telecommunications",
+    "Utils": "Utilities",
+    "Shops": "WholesaleAndRetail",
+    "Hlth": "Healthcare",
+    "Money": "Finance",
+    "Other": "Other",
+}
+
+INDUSTRY_NAMES = {
+    "Agric": "Agriculture",
+    "Food": "FoodProducts",
+    "Soda": "CandyAndSoda",
+    "Beer": "BeerAndLiquor",
+    "Smoke": "TobaccoProducts",
+    "Toys": "Recreation",
+    "Fun": "Entertainment",
+    "Books": "PrintingAndPublishing",
+    "Hshld": "ConsumerGoods",
+    "Clths": "Apparel",
+    "Hlth": "Healthcare",
+    "MedEq": "MedicalEquipment",
+    "Drugs": "PharmaceuticalProducts",
+    "Chems": "Chemicals",
+    "Rubbr": "RubberAndPlasticProducts",
+    "Txtls": "Textiles",
+    "BldMt": "ConstructionMaterials",
+    "Cnstr": "Construction",
+    "Steel": "SteelWorks",
+    "FabPr": "FabricatedProducts",
+    "Mach": "Machinery",
+    "ElcEq": "ElectricalEquipment",
+    "Autos": "AutomobilesAndTrucks",
+    "Aero": "Aircraft",
+    "Ships": "ShipbuildingAndRailroadEquipment",
+    "Guns": "Defense",
+    "Gold": "PreciousMetals",
+    "Mines": "NonMetallicAndIndustrialMetalMining",
+    "Coal": "Coal",
+    "Oil": "PetroleumAndNaturalGas",
+    "Util": "Utilities",
+    "Telcm": "Communication",
+    "PerSv": "PersonalServices",
+    "BusSv": "BusinessServices",
+    "Hardw": "Computers",
+    "Softw": "ComputerSoftware",
+    "Chips": "ElectronicEquipment",
+    "LabEq": "MeasuringAndControlEquipment",
+    "Paper": "BusinessSupplies",
+    "Boxes": "ShippingContainers",
+    "Trans": "Transportation",
+    "Whlsl": "Wholesale",
+    "Rtail": "Retail",
+    "Meals": "RestaurantsHotelsMotels",
+    "Banks": "Banking",
+    "Insur": "Insurance",
+    "RlEst": "RealEstate",
+    "Fin": "Trading",
+    "Other": "Other",
+}
+
+
+def named(buckets, names, granularity):
+    """Attaches the spelled-out name to each bucket, refusing a source the map does not cover."""
+    missing = [bucket["code"] for bucket in buckets if bucket["code"] not in names]
+    if missing:
+        sys.exit(
+            f"Error: Siccodes{granularity} names buckets the generator has no full name for: "
+            f"{missing}. Add them to the map above rather than letting an abbreviation through."
+        )
+    for bucket in buckets:
+        bucket["name"] = names[bucket["code"]]
+    spelled = [bucket["name"] for bucket in buckets]
+    if len(set(spelled)) != len(spelled):
+        sys.exit(f"Error: two Siccodes{granularity} buckets spell the same name: {spelled}")
+    return buckets
+
+
+def parse(granularity):
+    """The buckets in file order, each with the SIC ranges assigned to it.
+
+    Order is the source's own, which is what makes a variant list reviewable against the published
+    file. The catch-all bucket is last in both files and is the only one allowed to carry no ranges.
+    """
+    buckets = []
+    # Latin-1 rather than UTF-8: the 49-industry file spells at least one range description with a
+    # byte that is not valid UTF-8, and decoding it strictly would fail on a line this reads past.
+    with open(f"{work}/Siccodes{granularity}.txt", encoding="latin-1") as handle:
+        for line in handle:
+            heading = re.match(r"\s*(\d+)\s+(\w+)\s+(.*?)\s*$", line)
+            span = re.match(r"\s+(\d{4})-(\d{4})", line)
+            if span and buckets:
+                buckets[-1]["ranges"].append((int(span.group(1)), int(span.group(2))))
+            elif heading:
+                buckets.append(
+                    {
+                        "number": int(heading.group(1)),
+                        "code": heading.group(2),
+                        "label": heading.group(3),
+                        "ranges": [],
+                    }
+                )
+    if len(buckets) != granularity:
+        sys.exit(f"Error: Siccodes{granularity} named {len(buckets)} buckets, not {granularity}")
+    if [bucket["number"] for bucket in buckets] != list(range(1, granularity + 1)):
+        sys.exit(f"Error: Siccodes{granularity} is not numbered 1..{granularity} in file order")
+    for bucket in buckets[:-1]:
+        if not bucket["ranges"]:
+            sys.exit(f"Error: Siccodes{granularity} bucket {bucket['code']} carries no ranges")
+    codes = [bucket["code"] for bucket in buckets]
+    if len(set(codes)) != len(codes):
+        sys.exit(f"Error: Siccodes{granularity} repeats a bucket code, so the variants would collide")
+    for code in codes:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", code):
+            sys.exit(f"Error: {code!r} is not usable as a Rust variant name")
+    return buckets
+
+
+def overlaps(buckets, granularity):
+    """Every SIC range, sorted, refusing two buckets that claim the same code.
+
+    A published overlap would make the lookup depend on file order, so it is refused here rather
+    than resolved: first-match would silently pick one and the two granularities would disagree
+    about a name for a reason no reader could see.
+    """
+    spans = [
+        (low, high, bucket["name"]) for bucket in buckets for (low, high) in bucket["ranges"]
+    ]
+    spans.sort()
+
+    # Every span on its own before any pair, because a pairwise loop never reaches the last span --
+    # and reaches none at all in a one-span file.
+    for low, high, code in spans:
+        if low > high:
+            sys.exit(
+                f"Error: Siccodes{granularity} assigns {low}-{high} to {code}, which runs backwards"
+            )
+
+    for (low, high, code), (next_low, next_high, next_code) in zip(spans, spans[1:]):
+        if next_low <= high:
+            sys.exit(
+                f"Error: Siccodes{granularity} assigns {next_low}-{next_high} to {next_code} while "
+                f"{low}-{high} already belongs to {code}"
+            )
+    return spans
+
+
+def render_enum(name, buckets, doc, fallback_doc):
+    lines = [
+        *doc,
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]",
+        f"pub enum {name} {{",
+    ]
+    for bucket in buckets:
+        label = bucket["label"]
+        if bucket is buckets[-1]:
+            lines.extend(f"    /// {line}" for line in fallback_doc)
+        else:
+            lines.append(f"    /// {label}")
+        lines.append(f"    {bucket['name']},")
+    lines.append("}")
+    lines.append("")
+    lines.append(f"impl {name} {{")
+    lines.append("    /// The stored form, which round-trips through the module's decode.")
+    lines.append("    pub fn as_str(&self) -> &'static str {")
+    lines.append("        match self {")
+    for bucket in buckets:
+        lines.append(f'            {name}::{bucket["name"]} => "{bucket["name"]}",')
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    /// Every bucket, in the source's own order.")
+    lines.append(f"    pub const ALL: [{name}; {len(buckets)}] = [")
+    for bucket in buckets:
+        lines.append(f"        {name}::{bucket['name']},")
+    lines.append("    ];")
+    lines.append("}")
+    lines.append("")
+    return lines
+
+
+sectors = named(parse(12), SECTOR_NAMES, 12)
+industries = named(parse(49), INDUSTRY_NAMES, 49)
+sector_spans = overlaps(sectors, 12)
+industry_spans = overlaps(industries, 49)
+
+lines = [
+    "//! The Fama-French industry definitions, generated — see `tools/fetch-industry-classifications`.",
+    "//!",
+    "//! Edit the script, never this file. [`FETCHED_ON`] carries the date it was read.",
+    "",
+    "/// The date the published definitions were last read into this file.",
+    "///",
+    "/// The only line in this file that changes with the clock, which is what lets `--check` compare",
+    "/// two generations by ignoring exactly one line.",
+    f'pub const FETCHED_ON: &str = "{date.today().isoformat()}";',
+    "",
+]
+
+lines.extend(
+    render_enum(
+        "Sector",
+        sectors,
+        [
+            "/// The twelve Fama-French industries, which is what this system means by a sector.",
+            "///",
+            "/// Coarse on purpose. The screen's concentration cap is a question about how much of the",
+            "/// book sits on one common factor, and a partition fine enough to separate two names that",
+            "/// move together answers a different question.",
+        ],
+        [
+            "Everything the source assigns to no other bucket.",
+            "",
+            "A real bucket -- mines, construction, building materials, transport, hotels, business",
+            "services, entertainment -- and not a synonym for an unclassified name. A name with no SIC",
+            "code at all is `None`, and the two must not be folded together: this one names a group",
+            "that shares a factor, and the other names the absence of an answer.",
+        ],
+    )
+)
+
+lines.extend(
+    render_enum(
+        "Industry",
+        industries,
+        [
+            "/// The forty-nine Fama-French industries, the subgroup beneath [`Sector`].",
+            "///",
+            "/// Not nested inside `Sector`: the two are fitted independently by the source, so a name's",
+            "/// industry does not determine its sector and neither is derived from the other.",
+        ],
+        [
+            "Everything the source assigns to no other bucket.",
+            "",
+            "Named \"Almost Nothing\" in the source, and carrying ranges of its own rather than being",
+            "purely a fallback. As with `Sector::Other`, this is a group and not an absence.",
+        ],
+    )
+)
+
+lines.extend(
+    [
+        "/// One contiguous run of SIC codes, and the bucket the source assigns it to.",
+        "///",
+        "/// Both bounds are inclusive, and the runs are disjoint and ascending — the generator refuses",
+        "/// a published overlap rather than resolving it, so a lookup may stop at the first hit.",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+        "pub struct SicRange<Bucket: 'static> {",
+        "    pub low: u16,",
+        "    pub high: u16,",
+        "    pub bucket: Bucket,",
+        "}",
+        "",
+        "/// Every SIC run the twelve-industry definition assigns, ascending by `low`.",
+        f"pub const SECTOR_RANGES: [SicRange<Sector>; {len(sector_spans)}] = [",
+    ]
+)
+for low, high, code in sector_spans:
+    lines.append(
+        f"    SicRange {{ low: {low}, high: {high}, bucket: Sector::{code} }},"
+    )
+lines.append("];")
+lines.append("")
+lines.append("/// Every SIC run the forty-nine-industry definition assigns, ascending by `low`.")
+lines.append(f"pub const INDUSTRY_RANGES: [SicRange<Industry>; {len(industry_spans)}] = [")
+for low, high, code in industry_spans:
+    lines.append(
+        f"    SicRange {{ low: {low}, high: {high}, bucket: Industry::{code} }},"
+    )
+lines.append("];")
+lines.append("")
+
+rendered = "\n".join(lines)
+
+# `--check` compares two generations by ignoring the one dated line, so a second one would make an
+# unchanged table read as drift a day later. That is exactly the bug this guard exists to prevent,
+# and it is asserted here rather than trusted because the failure only appears the next morning.
+dated = [
+    line
+    for line in rendered.splitlines()
+    if re.search(r"\d{4}-\d{2}-\d{2}", line) and not line.startswith("pub const FETCHED_ON")
+]
+if dated:
+    sys.exit(
+        "Error: the generated file carries a date outside FETCHED_ON, which would make --check "
+        f"report drift every day: {dated}"
+    )
+
+with open(output, "w") as handle:
+    handle.write(rendered)
+
+print(
+    f"Wrote {len(sectors)} sectors over {len(sector_spans)} ranges and "
+    f"{len(industries)} industries over {len(industry_spans)} ranges to {output}"
+)
+PYTHON
+
+# Both paths, and `--check` is why. The committed table is formatted, so comparing it against an
+# unformatted generation reports drift on every run: rustfmt splits each `SicRange` literal across
+# five lines and the generator emits it on one. `rustfmt` directly rather than `cargo fmt`, which
+# takes its file list relative to the manifest and cannot reach the temporary file below.
+echo "Formatting"
+rustfmt --edition 2021 "${TARGET}"
+
+if [[ "${CHECK_ONLY}" == true ]]; then
+  # Ignoring FETCHED_ON, which moves with the clock and says nothing about the source. It is the
+  # only dated line by construction — the generator refuses to emit a second one — so this compares
+  # the definitions themselves rather than the day they were read.
+  undated() { grep -v '^pub const FETCHED_ON' "$1"; }
+  if diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null; then
+    echo "Up to date: the committed table matches the published definitions"
+    exit 0
+  fi
+  echo "DRIFT: the published definitions no longer match the committed table" >&2
+  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
+  echo >&2
+  echo "Re-run without --check, review the diff, and commit it." >&2
+  exit 1
+fi
+
+echo "Done. Review the diff and commit it."

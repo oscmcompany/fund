@@ -1722,9 +1722,10 @@ impl EquityTrade {
 
 /// A Standard Industrial Classification code: four digits, leading zeros significant.
 ///
-/// A validated value rather than a `String` because the first two digits are the major group a
-/// sector reads off, so a malformed code must be refused where it arrives — stored, it would read as
-/// a name with no sector, which is indistinguishable from the 595 that genuinely have none.
+/// A validated value rather than a `String` because the whole code is what the sector and industry
+/// lookups take, so a malformed one must be refused where it arrives — stored, it would read as a
+/// name with no classification, which is indistinguishable from the 901 of 5,217 common stocks that
+/// genuinely have none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SicCode(String);
 
@@ -1737,11 +1738,6 @@ impl SicCode {
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    /// The two-digit major group, which is what a sector is read off.
-    pub fn major_group(&self) -> &str {
-        &self.0[..2]
     }
 }
 
@@ -1917,14 +1913,6 @@ impl EquityReference {
 
     pub fn primary_exchange(&self) -> Option<&str> {
         self.primary_exchange.as_deref()
-    }
-
-    /// The two-digit SIC major group, which is what a sector is read off.
-    ///
-    /// No validation here: [`SicCode`] admits nothing that lacks a major group, so this reads one
-    /// off rather than re-checking whether there is one.
-    pub fn sic_major_group(&self) -> Option<&str> {
-        self.sic_code.as_ref().map(SicCode::major_group)
     }
 
     /// Whether the universe admits this symbol, which requires the feed to have classified it.
@@ -3067,12 +3055,6 @@ mod tests {
         assert!(!unclassified.is_tradeable_equity());
     }
 
-    #[test]
-    fn test_the_major_group_is_the_leading_two_digits() {
-        assert_eq!(reference(None, Some("3571")).sic_major_group(), Some("35"));
-        assert_eq!(reference(None, Some("0100")).sic_major_group(), Some("01"));
-    }
-
     /// A malformed code is refused where it arrives rather than stored and re-checked downstream.
     #[test]
     fn test_a_code_that_is_not_four_digits_is_not_a_sic_code() {
@@ -3082,12 +3064,12 @@ mod tests {
                 "{malformed:?} must not construct"
             );
             assert_eq!(
-                reference(None, Some(malformed)).sic_major_group(),
+                reference(None, Some(malformed)).sic_code(),
                 None,
-                "{malformed:?} must not yield a major group"
+                "{malformed:?} must not reach the classification lookups"
             );
         }
-        assert_eq!(reference(None, None).sic_major_group(), None);
+        assert_eq!(reference(None, None).sic_code(), None);
     }
 
     /// Leading zeros are significant, which is why the code is a string and not a number.
@@ -3096,7 +3078,6 @@ mod tests {
         let agriculture = SicCode::new("0100").expect("four digits");
 
         assert_eq!(agriculture.as_str(), "0100");
-        assert_eq!(agriculture.major_group(), "01");
     }
 
     /// Zero shares is a missing measurement wearing a number, so it is refused at construction.
