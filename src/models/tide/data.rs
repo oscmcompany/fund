@@ -2296,6 +2296,33 @@ mod tests {
         assert_eq!(cleaned.height(), 1);
     }
 
+    /// A null share count must cost a name its size factor, not its bars.
+    ///
+    /// `shares_outstanding` rides the consolidated frame for the residual panel and is deliberately
+    /// absent from `CONTINUOUS_COLUMNS`. That absence is what keeps the 4% of common stock the feed
+    /// stops reporting shares for from 2025-07 inside the dataset at all, and it is a silent
+    /// dependency on a list in this module until something asserts it.
+    #[test]
+    fn test_a_null_share_count_does_not_drop_the_row() {
+        let mut engineered = engineer_features(raw_two_ticker_frame()).unwrap();
+        let baseline = clean_data(engineered.clone()).unwrap().height();
+
+        engineered
+            .with_column(Column::new(
+                "shares_outstanding".into(),
+                vec![None::<f64>, None, None, None],
+            ))
+            .unwrap();
+
+        let cleaned = clean_data(engineered).unwrap();
+        assert_eq!(
+            cleaned.height(),
+            baseline,
+            "a column of null share counts must not shorten the frame"
+        );
+        assert!(baseline > 0, "the fixture must survive cleaning at all");
+    }
+
     #[test]
     fn test_engineer_features_day_of_week_is_monday_based_one_to_seven() {
         // Monday = 1 .. Sunday = 7, stamped at the session close the way ingestion writes a bar.

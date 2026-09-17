@@ -21,8 +21,9 @@ use crate::laboratory::stability::{Association, SignAgreement};
 ///
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. v2 added
 /// `liquidity_floor` to the `dataset_built` fingerprint and v3 added `reference_digest` beside it,
-/// naming the point-in-time universe the rows were classified against.
-pub const SCHEMA_VERSION: u32 = 3;
+/// naming the point-in-time universe the rows were classified against. v4 added
+/// `factor_specification`, naming the factor set a residual panel was fitted against.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Where the laboratory writes when `FUND_LABORATORY_JOURNAL_DIRECTORY` says nothing.
 const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund/laboratory";
@@ -386,6 +387,10 @@ mod tests {
             splits_digest: 0xAB,
             boundaries_digest: 0xCD,
             reference_digest: Some(0xEF),
+            factor_specification: Some(
+                crate::laboratory::residual::FactorSpecification::new(45, 0.25)
+                    .expect("the fixture must be a usable specification"),
+            ),
         }
     }
 
@@ -613,7 +618,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["schema_version"], serde_json::json!(3));
+        assert_eq!(value["schema_version"], serde_json::json!(4));
         assert_eq!(value["run_id"], serde_json::json!(run_id.to_string()));
         assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
         assert_eq!(
@@ -629,6 +634,17 @@ mod tests {
         assert_eq!(
             value["payload"]["fingerprint"]["reference_digest"],
             serde_json::json!(0xEF)
+        );
+        // Both fields, not just the lookback: a panel fitted at a different variance share measures
+        // a different set of names, and a record carrying only one of them cannot say which.
+        assert_eq!(
+            value["payload"]["fingerprint"]["factor_specification"]["volatility_sessions"],
+            serde_json::json!(45)
+        );
+        assert_eq!(
+            value["payload"]["fingerprint"]["factor_specification"]
+                ["minimum_residual_variance_share"],
+            serde_json::json!(0.25)
         );
         assert!(
             value.get("session_date").is_none(),

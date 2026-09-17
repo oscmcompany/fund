@@ -76,6 +76,9 @@ struct Observation {
     security_type: Option<String>,
     sector: String,
     industry: String,
+    /// `None` where the feed declined to report it, which is 4% of common stock from 2025-07 and
+    /// under 1% before. Never defaulted: a zero share count is not a company with no equity.
+    shares_outstanding: Option<f64>,
     /// Observations since the feed last answered for this symbol. Zero on a fresh answer.
     carried: u32,
 }
@@ -114,6 +117,7 @@ pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, 
     let mut observed_at: Vec<i64> = Vec::new();
     let mut sectors: Vec<String> = Vec::new();
     let mut industries: Vec<String> = Vec::new();
+    let mut shares: Vec<Option<f64>> = Vec::new();
 
     for (as_of, frame) in ordered {
         // Aged first, so a symbol this observation answers for is reset to zero below and only the
@@ -138,6 +142,7 @@ pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, 
             observed_at.push(stamp);
             sectors.push(observation.sector.clone());
             industries.push(observation.industry.clone());
+            shares.push(observation.shares_outstanding);
         }
     }
 
@@ -147,6 +152,7 @@ pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, 
             Column::new(AS_OF_COLUMN.into(), observed_at),
             Column::new("sector".into(), sectors),
             Column::new("industry".into(), industries),
+            Column::new("shares_outstanding".into(), shares),
         ])?,
         observations,
     })
@@ -157,6 +163,7 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
     let tickers = frame.column("ticker")?.str()?;
     let security_types = frame.column("security_type")?.str()?;
     let sic_codes = frame.column("sic_code")?.str()?;
+    let shares = frame.column("shares_outstanding")?.f64()?;
 
     let mut observations = Vec::with_capacity(frame.height());
     for index in 0..frame.height() {
@@ -169,6 +176,9 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
             Observation {
                 security_type: security_types.get(index).map(str::to_string),
                 carried: 0,
+                // A non-positive count is refused rather than carried: it cannot denominate a market
+                // capitalization, and admitting it would make a zero look like a measured size.
+                shares_outstanding: shares.get(index).filter(|count| *count > 0.0),
                 // Spelled rather than left null, matching the retired CSV: an unknown sector must
                 // not be assumed to diversify, so two unclassified names count as one group.
                 sector: sic_code
@@ -220,6 +230,9 @@ pub fn join_point_in_time(bars: DataFrame, universe: &Universe) -> Result<DataFr
             col("volume_weighted_average_price"),
             col("sector"),
             col("industry"),
+            // Nullable, and deliberately absent from the model's continuous columns: a name the feed
+            // has no share count for must lose its size factor, not its bars.
+            col("shares_outstanding"),
         ])
         .collect()
 }
@@ -292,9 +305,20 @@ mod tests {
         as_of: (i32, u32, u32),
         rows: &[(&str, &str, Option<&str>)],
     ) -> (SessionDate, DataFrame) {
+        let with_shares: Vec<(&str, &str, Option<&str>, Option<f64>)> = rows
+            .iter()
+            .map(|(ticker, code, sic)| (*ticker, *code, *sic, None))
+            .collect();
+        partition_with_shares(as_of, &with_shares)
+    }
+
+    fn partition_with_shares(
+        as_of: (i32, u32, u32),
+        rows: &[(&str, &str, Option<&str>, Option<f64>)],
+    ) -> (SessionDate, DataFrame) {
         let references: Vec<EquityReference> = rows
             .iter()
-            .map(|(ticker, code, sic)| {
+            .map(|(ticker, code, sic, shares)| {
                 EquityReference::new(
                     Ticker::new(ticker).expect("a valid test symbol"),
                     SessionDate::from_date(
@@ -304,7 +328,7 @@ mod tests {
                     Some(SecurityType::from_code(code)),
                     sic.and_then(SicCode::new),
                     None,
-                    None,
+                    *shares,
                     None,
                     None,
                 )
@@ -565,6 +589,100 @@ mod tests {
         assert_eq!(
             joined.column("timestamp").unwrap().i64().unwrap().get(0),
             Some(instant(2021, 11, 15))
+        );
+    }
+
+    #[test]
+    fn test_a_bar_carries_the_share_count_current_when_it_printed() {
+        let universe = universe_of(&[
+            partition_with_shares(
+                (2021, 10, 1),
+                &[("AAPL", "CS", Some("3571"), Some(16.53e9))],
+            ),
+            partition_with_shares((2022, 1, 3), &[("AAPL", "CS", Some("3571"), Some(14.59e9))]),
+        ])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(
+            bars(&[
+                ("AAPL", instant(2021, 11, 15)),
+                ("AAPL", instant(2022, 2, 15)),
+            ]),
+            &universe,
+        )
+        .expect("the join must run");
+
+        let shares = joined.column("shares_outstanding").unwrap().f64().unwrap();
+        // The point-in-time part of the size factor, and it is not cosmetic: the two readings differ
+        // by 13%, so a bar priced against today's count is mis-sized by that much.
+        assert_eq!(shares.get(0), Some(16.53e9));
+        assert_eq!(shares.get(1), Some(14.59e9));
+    }
+
+    /// A share count the feed declines to report must cost the name its size, not its bars.
+    ///
+    /// The feed stops answering for 4% of common stock from 2025-07, against under 1% before, so a
+    /// null here is a dated coverage change rather than a stray row.
+    #[test]
+    fn test_a_missing_share_count_keeps_the_bar_and_nulls_the_count() {
+        let universe = universe_of(&[partition_with_shares(
+            (2021, 10, 1),
+            &[("AAPL", "CS", Some("3571"), None)],
+        )])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 11, 15))]), &universe)
+            .expect("the join must run");
+
+        assert_eq!(joined.height(), 1);
+        assert_eq!(
+            joined
+                .column("shares_outstanding")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            None
+        );
+    }
+
+    /// Zero shares is not a company with no equity; it is the feed answering with a placeholder.
+    ///
+    /// Built as a stored frame rather than through `EquityReference::new`, which refuses it at the
+    /// write boundary. This guard is the read boundary, where the input is whatever parquet holds.
+    #[test]
+    fn test_a_non_positive_share_count_is_refused_rather_than_carried() {
+        let stored = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAPL"]),
+            Column::new("as_of".into(), vec!["2021-10-01"]),
+            Column::new("security_type".into(), vec![Some("CS")]),
+            Column::new("sic_code".into(), vec![Some("3571")]),
+            Column::new("sic_description".into(), vec![None::<&str>]),
+            Column::new("shares_outstanding".into(), vec![Some(0.0_f64)]),
+            Column::new("reported_market_capitalization".into(), vec![None::<f64>]),
+            Column::new("primary_exchange".into(), vec![None::<&str>]),
+        ])
+        .expect("the stored fixture must build");
+
+        let universe = universe_of(&[(
+            SessionDate::from_date(
+                chrono::NaiveDate::from_ymd_opt(2021, 10, 1).expect("a valid date"),
+            ),
+            stored,
+        )])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 11, 15))]), &universe)
+            .expect("the join must run");
+
+        assert_eq!(
+            joined
+                .column("shares_outstanding")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            None
         );
     }
 

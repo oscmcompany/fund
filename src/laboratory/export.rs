@@ -281,6 +281,7 @@ mod tests {
                     splits_digest: 0xAB,
                     boundaries_digest: 0xCD,
                     reference_digest: Some(0xEF),
+                    factor_specification: None,
                 },
                 revision: None,
             }),
