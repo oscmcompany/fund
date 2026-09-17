@@ -624,6 +624,12 @@ mod tests {
             value["payload"]["fingerprint"]["splits_digest"],
             serde_json::json!(0xAB)
         );
+        // The universe is part of the result, so it has to reach the file rather than only the
+        // struct: two runs over the same window and different universes must not read as one.
+        assert_eq!(
+            value["payload"]["fingerprint"]["reference_digest"],
+            serde_json::json!(0xEF)
+        );
         assert!(
             value.get("session_date").is_none(),
             "an experiment belongs to no trading day"

@@ -2139,15 +2139,17 @@ pub async fn reference_partition_dates(
 pub async fn current_universe(
     s3_client: &S3Client,
     bucket: &str,
-) -> Result<DataFrame, ArchiveError> {
+) -> Result<reference::Universe, ArchiveError> {
     let dates = reference_partition_dates(s3_client, bucket).await?;
     let newest = dates.last().copied().ok_or_else(|| ArchiveError::Read {
         bucket: bucket.to_string(),
         key: REFERENCE_ARCHIVE_PREFIX.to_string(),
         message: "the reference dataset holds no partitions".to_string(),
     })?;
-    let partitions = read_reference_window(s3_client, bucket, newest, newest).await?;
-    Ok(reference::universe_of(&partitions)?)
+    // Read directly rather than through `read_reference_window`, which would list a second time: if
+    // the newest key vanished between the two listings its nearest-prior rule returns an older one.
+    let frame = read_reference_partition(s3_client, bucket, newest).await?;
+    Ok(reference::universe_of(&[(newest, frame)])?)
 }
 
 /// Which of the `available` observations answer for the sessions in `[start, end]`.
@@ -2191,15 +2193,32 @@ pub async fn read_reference_window(
 
     let mut partitions = Vec::with_capacity(wanted.len());
     for as_of in wanted {
-        let key = date_partitioned_key(REFERENCE_ARCHIVE_PREFIX, as_of.date());
-        match read_partition(s3_client, bucket, &key).await? {
-            Some(frame) => partitions.push((as_of, frame)),
-            // Listed a moment ago, so its disappearance is a concurrent delete rather than a gap in
-            // the backfill, and reporting it is worth more than a read that silently narrows.
-            None => warn!(key, "A listed reference partition could not be read"),
-        }
+        partitions.push((
+            as_of,
+            read_reference_partition(s3_client, bucket, as_of).await?,
+        ));
     }
     Ok(partitions)
+}
+
+/// Reads one `as_of` partition, refusing a key that was listed and is no longer there.
+///
+/// A skip would narrow the sequence silently, and the carry-forward in
+/// [`crate::data::reference::universe_of`] would hold the previous observation across the hole --
+/// reclassifying a quarter of bars by a stale one with nothing recording that it happened.
+async fn read_reference_partition(
+    s3_client: &S3Client,
+    bucket: &str,
+    as_of: SessionDate,
+) -> Result<DataFrame, ArchiveError> {
+    let key = date_partitioned_key(REFERENCE_ARCHIVE_PREFIX, as_of.date());
+    read_partition(s3_client, bucket, &key)
+        .await?
+        .ok_or_else(|| ArchiveError::Read {
+            bucket: bucket.to_string(),
+            key,
+            message: "a listed reference partition was gone before it could be read".to_string(),
+        })
 }
 
 /// Names folded at once.

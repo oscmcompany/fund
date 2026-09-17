@@ -72,7 +72,14 @@ pub fn details_from_universe(universe: &DataFrame) -> Result<Vec<EquityDetail>, 
     Ok(details)
 }
 
-/// Upserts details into `equity_details`.
+/// Replaces `equity_details` with the supplied snapshot, inside one transaction.
+///
+/// A replace rather than an upsert, because the source is a point-in-time universe that genuinely
+/// shrinks: a name that delists or reclassifies out of common stock leaves it, and an upsert would
+/// keep admitting that name through the screen's inner join forever.
+///
+/// An empty snapshot writes nothing and leaves the stored table alone, because a sweep that answered
+/// for nothing is a failed read rather than an empty market.
 pub async fn store_details(pool: &PgPool, details: &[EquityDetail]) -> Result<u64, DetailsError> {
     if details.is_empty() {
         return Ok(0);
@@ -80,6 +87,12 @@ pub async fn store_details(pool: &PgPool, details: &[EquityDetail]) -> Result<u6
 
     let mut rows_affected: u64 = 0;
     let mut transaction = pool.begin().await?;
+
+    // Inside the transaction that refills it, so a failed insert leaves the previous universe in
+    // place rather than an empty table the screen would read as a market with no names in it.
+    sqlx::query!("DELETE FROM equity_details")
+        .execute(&mut *transaction)
+        .await?;
 
     for chunk in details.chunks(INSERT_CHUNK_ROWS) {
         let mut query_builder =
@@ -92,12 +105,8 @@ pub async fn store_details(pool: &PgPool, details: &[EquityDetail]) -> Result<u6
                 .push_bind(detail.industry().to_string());
         });
 
-        query_builder.push(
-            " ON CONFLICT (ticker) DO UPDATE SET \
-             sector = EXCLUDED.sector, \
-             industry = EXCLUDED.industry",
-        );
-
+        // No `ON CONFLICT`: the delete above means a collision can only be a duplicate inside the
+        // snapshot, and failing the transaction keeps the previous universe rather than picking one.
         rows_affected += query_builder
             .build()
             .execute(&mut *transaction)
@@ -126,8 +135,8 @@ pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, String>, Deta
         .filter_map(|row| Ticker::new(&row.ticker).map(|ticker| (ticker, row.sector)))
         .collect();
 
-    // Counted and reported, as `parse_details` does for the CSV path. A dropped ticker removes a
-    // symbol from the screen, and an `info!` reporting only the survivors leaves no trace of it.
+    // Counted and reported, as `details_from_universe` does. A dropped ticker removes a symbol from
+    // the screen, and an `info!` reporting only the survivors leaves no trace of it.
     let skipped = supplied - sectors.len();
     if skipped > 0 {
         warn!(skipped, "Skipped equity sector rows with unusable tickers");
@@ -138,8 +147,7 @@ pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, String>, Deta
 
 /// Builds the detail frame from validated details.
 ///
-/// Shared by the application, which reads them from PostgreSQL, and the trainer, which has no
-/// database and parses the embedded CSV. One builder because the two paths feed the same
+/// One builder because the application's PostgreSQL read and any other caller feed the same
 /// `consolidate_data`, and a column name or order that differed between them would surface as a
 /// model trained on features the inference path does not produce.
 pub fn details_to_dataframe(details: &[EquityDetail]) -> Result<DataFrame, PolarsError> {

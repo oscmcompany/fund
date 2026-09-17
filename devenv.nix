@@ -906,7 +906,7 @@ in {
   scripts.seed-equity-details-postgres.exec = ''
     set -euo pipefail
 
-    echo "Seeding equity details into PostgreSQL from the embedded CSV"
+    echo "Seeding equity details into PostgreSQL from the newest reference partition"
     ${runtimeEnv}
     secretspec run -- cargo run --release --bin seed -- equity-details postgres
   '';
@@ -967,12 +967,25 @@ in {
       equity-bars daily s3 $START_FLAG $END_FLAG
   '';
 
-  scripts.seed-equity-details-s3.exec = ''
+  # One partition per *date* in the window, so this takes a narrow range rather than a repair span:
+  # the grid is the first trading day of each quarter, and a year-wide window would fetch ~250
+  # whole-market sweeps instead of four. Run it once per quarter date.
+  scripts.seed-equity-reference-s3.exec = ''
     set -euo pipefail
 
-    echo "Archiving equity details to S3 from the embedded CSV"
+    if [ -z "''${SEED_START_DATE:-}" ] || [ -z "''${SEED_END_DATE:-}" ]; then
+      echo "Usage: SEED_START_DATE=YYYY-MM-DD SEED_END_DATE=YYYY-MM-DD devenv tasks run data:reference:seed"
+      echo ""
+      echo "  Writes one point-in-time reference partition per date in the window. The archive's"
+      echo "  grid is the first trading day of each quarter, so pass a single date, or the narrow"
+      echo "  range covering the quarter starts you want -- not a repair span."
+      exit 1
+    fi
+
+    echo "Archiving the point-in-time reference from $SEED_START_DATE to $SEED_END_DATE"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed -- equity-details s3
+    secretspec run -- cargo run --release --bin seed -- \
+      equity-reference archive --start "$SEED_START_DATE" --end "$SEED_END_DATE"
   '';
 
   tasks = {
@@ -1098,6 +1111,15 @@ in {
           exit 1
         fi
 
+        # The ticker metadata now comes from the archive's reference dataset rather than a CSV
+        # compiled into the binary, so this half needs AWS and a populated reference prefix.
+        if [ -z "''${AWS_S3_ARCHIVE_BUCKET_NAME:-}" ]; then
+          echo "AWS_S3_ARCHIVE_BUCKET_NAME is not set."
+          echo "  Ticker metadata is read from the archive's point-in-time reference dataset, so"
+          echo "  this half needs the bucket even though it writes to PostgreSQL."
+          exit 1
+        fi
+
         if [ -z "''${SEED_START_DATE:-}" ]; then
           echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed:postgres"
           echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
@@ -1107,7 +1129,10 @@ in {
           exit 1
         fi
 
-        echo "=== Seeding equity details into PostgreSQL ==="
+        echo "=== Seeding equity details into PostgreSQL from the reference archive ==="
+        echo "  If this fails with 'the reference dataset holds no partitions', run"
+        echo "  'devenv tasks run data:reference:seed' first -- it is not part of data:seed:s3"
+        echo "  because its grid is quarterly rather than a repair span."
         seed-equity-details-postgres
 
         echo ""
@@ -1136,12 +1161,29 @@ in {
           exit 1
         fi
 
-        echo "=== Archiving equity details to S3 ==="
-        seed-equity-details-s3
-
-        echo ""
         echo "=== Seeding the S3 equity bar archive ==="
         seed-equity-bars-s3
+      '';
+    };
+
+    # Named outside the `data:seed` prefix on purpose: prefix group execution would otherwise sweep
+    # it into `data:seed` and hand it the bars' range. The bar archive repairs by set difference over
+    # a whole span; this writes one whole-market sweep per date in its window, and its grid is the
+    # first trading day of each quarter. A range-based seed would turn four requests a year into two
+    # hundred and fifty.
+    "data:reference:seed" = {
+      exec = ''
+        set -euo pipefail
+
+        if [ -z "''${AWS_S3_ARCHIVE_BUCKET_NAME:-}" ]; then
+          echo "AWS_S3_ARCHIVE_BUCKET_NAME is not set."
+          echo "  The point-in-time reference is what defines the tradeable universe, and both"
+          echo "  the laboratory and 'data:seed:postgres' read it from the archive."
+          exit 1
+        fi
+
+        echo "=== Archiving the point-in-time reference ==="
+        seed-equity-reference-s3
       '';
     };
 

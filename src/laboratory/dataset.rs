@@ -249,9 +249,9 @@ async fn read_window(
     )
     .await?;
     let universe = reference::universe_of(&partitions)?;
-    let reference_digest = digest_of(&universe)?;
+    let reference_digest = digest_of(universe.rows())?;
     let consolidated =
-        reference::join_point_in_time(predict::prepare_bars(equity_bars)?, universe)?;
+        reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;
     let floor = LiquidityFloor::CURRENT;
     let filtered = filter_training_bars(consolidated, floor)?;
 
@@ -608,6 +608,46 @@ mod tests {
         assert_ne!(strictly, loosely, "two floors must not share a fingerprint");
         assert_ne!(unscreened, strictly, "a screen and no screen must differ");
         assert_eq!(unscreened.liquidity_floor, None);
+    }
+
+    /// The universe is an input to the result, not a description of it. Two runs over the same
+    /// window and the same adjustment tables, one before the reference backfill extended and one
+    /// after, measure different sets of names and must not report the same identity.
+    #[test]
+    fn test_two_universes_over_the_same_rows_do_not_share_a_fingerprint() {
+        const DAY: i64 = 86_400_000;
+        let rows = frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]);
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap());
+        let with = |reference| {
+            fingerprint_of(
+                &rows,
+                session,
+                365,
+                None,
+                Digests {
+                    splits: 0xAB,
+                    boundaries: 0xCD,
+                    reference,
+                },
+            )
+            .unwrap()
+        };
+
+        let unjoined = with(None);
+        let one = with(Some(0x11));
+        let another = with(Some(0x22));
+
+        assert_eq!(
+            one.rows, another.rows,
+            "the fixture must isolate the universe"
+        );
+        assert_eq!(
+            one.tickers, another.tickers,
+            "the fixture must isolate the universe"
+        );
+        assert_ne!(one, another, "two universes must not share a fingerprint");
+        assert_ne!(unjoined, one, "a joined universe and none must differ");
+        assert_eq!(unjoined.reference_digest, None);
     }
 
     #[test]

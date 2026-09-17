@@ -742,9 +742,19 @@ async fn handle_market_data_sync(
 
     // Today's classification, not a point-in-time join: the screen's sector cap is a question about
     // what a name is now, and the application only ever trades the current session.
-    let universe = archive::current_universe(&state.s3_client, &state.archive_bucket).await?;
-    let detail_rows =
-        details::store_details(&state.pool, &details::details_from_universe(&universe)?).await?;
+    //
+    // Warns rather than propagating, unlike the bars above. The bars are the half no provider can be
+    // re-asked about and they are already committed; a metadata refresh that is one night stale is a
+    // far better trade than a sync that returns here, leaving the close history cached stale and the
+    // export never requested.
+    let refreshed = refresh_equity_details(state).await;
+    let (detail_rows, detail_error) = match &refreshed {
+        Ok(rows) => (Some(*rows), None),
+        Err(error) => {
+            warn!(%error, "Equity detail refresh failed; the database keeps the previous universe");
+            (None, Some(error.to_string()))
+        }
+    };
 
     // The cached history now predates the rows just written, so it is dropped rather than
     // overwritten with an empty map -- an empty map keyed to today would pin "no history" for the
@@ -768,8 +778,24 @@ async fn handle_market_data_sync(
         "bars_fetched": fetched.bars.len(),
         "bar_rows_written": bar_rows,
         "detail_rows_written": detail_rows,
+        // The cause travels with the absence: a null row count and no reason would read exactly like
+        // a refresh that found nothing to write.
+        "detail_refresh_error": detail_error,
         "export_chained": true,
     }))
+}
+
+/// Replaces the stored ticker metadata from the archive's newest reference partition.
+///
+/// Lifted out of the sync so its failure is a value the caller decides about rather than a `?` that
+/// returns past the cache invalidation and the export.
+async fn refresh_equity_details(state: &ServiceState) -> Result<u64, HandlerError> {
+    let universe = archive::current_universe(&state.s3_client, &state.archive_bucket).await?;
+    Ok(details::store_details(
+        &state.pool,
+        &details::details_from_universe(universe.rows())?,
+    )
+    .await?)
 }
 
 /// Chained from a completed market data sync: seal the journal, export to S3, then purge.

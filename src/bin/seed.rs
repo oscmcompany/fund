@@ -1219,7 +1219,7 @@ async fn seed_database_details() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
     let universe = archive::current_universe(&s3_client, &bucket).await?;
-    let details = details::details_from_universe(&universe)?;
+    let details = details::details_from_universe(universe.rows())?;
     info!(tickers = details.len(), "Read the reference universe");
 
     let pool = connect_pool().await?;
