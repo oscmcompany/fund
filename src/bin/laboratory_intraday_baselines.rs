@@ -106,8 +106,7 @@ async fn main() {
 }
 
 async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> {
-    let bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
+    let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
 
     info!(

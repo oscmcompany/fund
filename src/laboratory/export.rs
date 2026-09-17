@@ -280,6 +280,7 @@ mod tests {
                     last_timestamp: DateTime::from_timestamp_millis(86_400_000),
                     splits_digest: 0xAB,
                     boundaries_digest: 0xCD,
+                    reference_digest: Some(0xEF),
                 },
                 revision: None,
             }),

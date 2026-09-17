@@ -318,8 +318,6 @@ enum DailyTarget {
 enum DetailsTarget {
     /// Into `equity_details`, which the pair screen's per-sector cap reads.
     Postgres,
-    /// Into `data/derived/equity/details/details.csv`, which DuckDB's `training_details` view resolves to.
-    S3,
 }
 
 #[derive(Debug, Args)]
@@ -1086,7 +1084,6 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         Command::EquityDetails { target } => {
             match target {
                 DetailsTarget::Postgres => seed_database_details().await?,
-                DetailsTarget::S3 => seed_archive_details().await?,
             }
             Ok(Outcome::Complete)
         }
@@ -1214,13 +1211,16 @@ async fn seed_archive_bars(
 
 // --- Details --------------------------------------------------------------------------------
 
-/// Seeds ticker metadata into the database from the embedded CSV.
+/// Seeds ticker metadata into the database from the archive's newest reference partition.
 ///
-/// Nothing in the running service writes `equity_details`: Alpaca does not publish sector or
-/// industry, so the metadata has one source and it is compiled into this binary.
+/// The newest rather than a point-in-time read, because the screen that consumes `equity_details`
+/// only ever runs against the current session.
 async fn seed_database_details() -> Result<(), Box<dyn std::error::Error>> {
-    let details = details::parse_embedded_details()?;
-    info!(tickers = details.len(), "Parsed embedded ticker metadata");
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let universe = archive::current_universe(&s3_client, &bucket).await?;
+    let details = details::details_from_universe(&universe)?;
+    info!(tickers = details.len(), "Read the reference universe");
 
     let pool = connect_pool().await?;
     let stored = details::store_details(&pool, &details).await?;
@@ -1228,29 +1228,6 @@ async fn seed_database_details() -> Result<(), Box<dyn std::error::Error>> {
         destination = "postgres",
         rows = stored,
         "Equity details seeded"
-    );
-    Ok(())
-}
-
-/// Uploads the embedded ticker metadata beside the S3 bar archive.
-///
-/// Training does not read this object — the trainer parses the embedded CSV directly, so a model run
-/// cannot be broken by its absence. It exists for readers outside the process.
-async fn seed_archive_details() -> Result<(), Box<dyn std::error::Error>> {
-    let bucket = bucket_name()?;
-    let s3_client = fund::common::aws::s3_client().await;
-
-    // Parsed before it is uploaded, so a malformed embedded CSV fails here rather than becoming an
-    // object every downstream reader has to discover is unusable.
-    let parsed = details::parse_embedded_details()?;
-    let csv = details::embedded_csv();
-    info!(bucket, tickers = parsed.len(), "Archiving equity details");
-
-    archive::archive_details(&s3_client, &bucket, csv).await?;
-    info!(
-        destination = "s3",
-        bytes = csv.len(),
-        "Equity details archived"
     );
     Ok(())
 }
@@ -2439,8 +2416,7 @@ async fn check_cadence(action: &CadenceAction) -> Result<Outcome, SeedError> {
 
 /// The bucket every S3 subcommand writes into.
 fn bucket_name() -> Result<String, Box<dyn std::error::Error>> {
-    std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)".into())
+    Ok(fund::common::aws::archive_bucket()?)
 }
 
 /// Boxes a concrete error, which `?` cannot reach [`SeedError`] through in one conversion.

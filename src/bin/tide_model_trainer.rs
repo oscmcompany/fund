@@ -13,7 +13,6 @@ use fund::common::massive::MassiveClient;
 use fund::common::types::SessionDate;
 use fund::data::archive;
 use fund::data::calendar::TradingCalendar;
-use fund::data::details;
 use fund::laboratory::dataset;
 use fund::laboratory::journal as laboratory;
 use fund::models::tide::artifact::{
@@ -64,8 +63,7 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Two buckets: `data/**` is the shared corpus this reads and repairs, and the model artifact
     // below belongs to the one instance that trained it.
-    let archive_bucket = std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME")
-        .map_err(|_| "AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")?;
+    let archive_bucket = fund::common::aws::archive_bucket()?;
     let records_bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME").map_err(|_| {
         "AWS_S3_RECORDS_BUCKET_NAME must be set (this instance's own, not the shared archive)"
     })?;
@@ -170,16 +168,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(error) => warn!(%error, "No Massive client; training on the existing archive"),
-    }
-
-    // Outside the arm above, because the metadata comes from a CSV compiled into this binary and
-    // reaching S3 with it needs no Massive credential. Gating it on one meant a bad key left
-    // DuckDB's `training_details` view resolving a stale copy for a reason that had nothing to do
-    // with it.
-    if let Err(error) =
-        archive::archive_details(&s3_client, &archive_bucket, details::embedded_csv()).await
-    {
-        warn!(%error, "Ticker metadata upload failed; the archive keeps the previous copy");
     }
 
     // The one thing here that needs a broker rather than a data vendor: Massive reports splits and
