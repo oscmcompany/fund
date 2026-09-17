@@ -176,9 +176,11 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
             Observation {
                 security_type: security_types.get(index).map(str::to_string),
                 carried: 0,
-                // A non-positive count is refused rather than carried: it cannot denominate a market
-                // capitalization, and admitting it would make a zero look like a measured size.
-                shares_outstanding: shares.get(index).filter(|count| *count > 0.0),
+                // Finite and positive: a stored partition reaches here without passing through
+                // `EquityReference::new`, and an infinity would surface as an unmeasured size.
+                shares_outstanding: shares
+                    .get(index)
+                    .filter(|count| count.is_finite() && *count > 0.0),
                 // Spelled rather than left null, matching the retired CSV: an unknown sector must
                 // not be assumed to diversify, so two unclassified names count as one group.
                 sector: sic_code
@@ -644,6 +646,49 @@ mod tests {
                 .get(0),
             None
         );
+    }
+
+    /// An infinity is not a share count either, and it reaches here the same way a zero does.
+    ///
+    /// Left admitted, it survives to the size factor and is booked as an unmeasured share count —
+    /// a real cause attached to the wrong defect.
+    #[test]
+    fn test_a_non_finite_share_count_is_refused_at_the_read_boundary() {
+        for count in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let stored = DataFrame::new(vec![
+                Column::new("ticker".into(), vec!["AAPL"]),
+                Column::new("as_of".into(), vec!["2021-10-01"]),
+                Column::new("security_type".into(), vec![Some("CS")]),
+                Column::new("sic_code".into(), vec![Some("3571")]),
+                Column::new("sic_description".into(), vec![None::<&str>]),
+                Column::new("shares_outstanding".into(), vec![Some(count)]),
+                Column::new("reported_market_capitalization".into(), vec![None::<f64>]),
+                Column::new("primary_exchange".into(), vec![None::<&str>]),
+            ])
+            .expect("the stored fixture must build");
+
+            let universe = universe_of(&[(
+                SessionDate::from_date(
+                    chrono::NaiveDate::from_ymd_opt(2021, 10, 1).expect("a valid date"),
+                ),
+                stored,
+            )])
+            .expect("the universe must build");
+
+            let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 11, 15))]), &universe)
+                .expect("the join must run");
+
+            assert_eq!(
+                joined
+                    .column("shares_outstanding")
+                    .unwrap()
+                    .f64()
+                    .unwrap()
+                    .get(0),
+                None,
+                "{count} must not reach the size factor"
+            );
+        }
     }
 
     /// Zero shares is not a company with no equity; it is the feed answering with a placeholder.

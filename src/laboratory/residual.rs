@@ -3,7 +3,7 @@
 //! A cross-sectional fit per session, exposed as a column studies read in place of `daily_return`.
 //! Names the fit explains perfectly are refused rather than returned as a residual of zero.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use polars::prelude::*;
 use serde::Serialize;
@@ -47,15 +47,17 @@ impl FactorSpecification {
         minimum_residual_variance_share: 0.5,
     };
 
-    /// `None` unless the lookback is positive and the variance share lies in `(0, 1]`.
+    /// `None` unless the lookback holds at least two sessions and the variance share lies in
+    /// `(0, 1]`.
     ///
-    /// A share of zero would admit a name the fit explains exactly, which is the refusal this type
-    /// exists to make; a share above one is unreachable, since leverage is never negative.
+    /// One session has no sample standard deviation, so it would refuse every row while reporting a
+    /// short window; a share of zero would admit a name the fit explains exactly, which is the
+    /// refusal this type exists to make.
     pub fn new(volatility_sessions: usize, minimum_residual_variance_share: f64) -> Option<Self> {
         let usable = minimum_residual_variance_share > 0.0
             && minimum_residual_variance_share <= 1.0
             && minimum_residual_variance_share.is_finite();
-        (volatility_sessions > 0 && usable).then_some(Self {
+        (volatility_sessions > 1 && usable).then_some(Self {
             volatility_sessions,
             minimum_residual_variance_share,
         })
@@ -193,10 +195,10 @@ pub fn residual_returns(
     for rows in by_ticker.values_mut() {
         rows.sort_by_key(|row| timestamps.get(*row));
     }
+    let ranks = session_ranks(timestamps);
 
-    // Every factor loading is read off sessions strictly before the one being explained. A size
-    // built from the session's own close would be circular: a name that rose would look larger for
-    // having risen.
+    // Every loading is read off sessions strictly before the one explained; a size built from the
+    // session's own close would be circular.
     let mut sessions: BTreeMap<i64, Vec<Candidate>> = BTreeMap::new();
     for rows in by_ticker.values() {
         for (position, &row) in rows.iter().enumerate() {
@@ -208,19 +210,16 @@ pub fn residual_returns(
             };
             let sector = match sectors.get(row) {
                 Some(sector) if sector != UNKNOWN => sector.to_string(),
-                // Both readings of the sentinel are deliberate and opposite: the pair screen merges
-                // unclassified names so two of them never count as diversified, and here merging
-                // them would remove a shared return from businesses with nothing in common.
+                // The pair screen merges on this sentinel and this refuses on it, deliberately.
                 _ => {
                     refuse(ResidualRefusal::SectorUnknown);
                     continue;
                 }
             };
-            // The lookback is tested first, and the order is load-bearing rather than incidental: a
-            // name's first session in the window has no prior close either, so testing size first
-            // would report every one of them as a feed coverage gap.
+            // Order is load-bearing: a name's first session has no prior close either, so testing
+            // size first would report every one of them as a feed coverage gap.
             let Some(volatility) =
-                trailing_volatility(rows, position, daily_returns, specification)
+                trailing_volatility(rows, position, daily_returns, &ranks, specification)
             else {
                 refuse(ResidualRefusal::VolatilityWindowShort);
                 continue;
@@ -265,8 +264,9 @@ pub fn residual_returns(
 
 /// Log market capitalization from the session *before* the one being explained.
 ///
-/// `None` where there is no prior session for the name, or no share count on it. A gap in the
-/// series is allowed: shares outstanding move over quarters, so a stale reading is still a size.
+/// `None` where there is no prior row for the name, or no share count on it. The caller has already
+/// established that the prior row is the immediately preceding session, so this cannot reach across
+/// a gap for a stale price.
 fn previous_log_size(
     rows: &[usize],
     position: usize,
@@ -282,16 +282,21 @@ fn previous_log_size(
 
 /// Standard deviation of the name's returns over the lookback, ending before this session.
 ///
-/// `None` unless the window is full. A volatility fitted on three observations is a different
-/// quantity from one fitted on sixty, and admitting both would put two of them in one column.
+/// `None` unless the window is full *and* consecutive. `clean_data` compacts a name's rows, so a
+/// window counted by position alone can span a gap and label a longer horizon as `window` sessions,
+/// putting two differently-measured quantities in one column of the same cross-section.
 fn trailing_volatility(
     rows: &[usize],
     position: usize,
     daily_returns: &Float64Chunked,
+    ranks: &[usize],
     specification: FactorSpecification,
 ) -> Option<f64> {
     let window = specification.volatility_sessions();
     let start = position.checked_sub(window)?;
+    if !consecutive_sessions(&rows[start..=position], ranks) {
+        return None;
+    }
     let observations: Vec<f64> = rows[start..position]
         .iter()
         .filter_map(|row| daily_returns.get(*row).filter(|value| value.is_finite()))
@@ -306,6 +311,35 @@ fn trailing_volatility(
         .sum::<f64>()
         / (observations.len() - 1) as f64;
     variance.is_finite().then(|| variance.sqrt())
+}
+
+/// Each frame row's session, numbered in time order across the whole panel.
+///
+/// Indexed by row so the window check is an array read. Ranked over the panel's own sessions rather
+/// than a trading calendar, because what matters is adjacency *within the window being measured*.
+fn session_ranks(timestamps: &Int64Chunked) -> Vec<usize> {
+    let mut sessions: Vec<i64> = timestamps
+        .into_no_null_iter()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    sessions.sort_unstable();
+    let rank: HashMap<i64, usize> = sessions
+        .into_iter()
+        .enumerate()
+        .map(|(rank, session)| (session, rank))
+        .collect();
+
+    timestamps
+        .into_no_null_iter()
+        .map(|session| rank[&session])
+        .collect()
+}
+
+/// Whether `rows` occupy consecutive sessions, with no gap in the name's history.
+fn consecutive_sessions(rows: &[usize], ranks: &[usize]) -> bool {
+    rows.windows(2)
+        .all(|pair| ranks[pair[1]] == ranks[pair[0]] + 1)
 }
 
 /// Whether this session's two continuous factors support a fit at all.
@@ -338,12 +372,9 @@ fn identified(candidates: &[Candidate], demeaned: &Demeaned) -> bool {
 
 /// Fits one session's cross-section and returns each name's residual or its refusal.
 ///
-/// Sector enters as a full set of dummies, so this is a regression on dummies plus two continuous
-/// factors. It is computed by demeaning both sides within sector and fitting the two continuous
-/// factors on what is left, which is the same fit by the Frisch-Waugh-Lovell theorem: a two-by-two
-/// solve rather than a sixty-five-column one, and the singleton sector falls out as arithmetic
-/// instead of a special case. The market is not identified separately from the sector dummies —
-/// it lies in their span — but the residual does not depend on how that span is parameterised.
+/// Sector enters as a full set of dummies, fitted by demeaning within sector and regressing the two
+/// continuous factors on what is left — the same fit by Frisch-Waugh-Lovell, as a two-by-two solve.
+/// The market is not separately identified, because it lies in the dummies' span.
 fn fit_session(
     candidates: &[Candidate],
     specification: FactorSpecification,
@@ -516,9 +547,9 @@ mod tests {
 
     /// Four sessions each for `names` per sector, with size and volatility varying independently.
     ///
-    /// Independently is the point. An earlier fixture made both increase with the same index, which
-    /// is a near-collinear cross-section: it inflated leverage until ordinary names were refused as
-    /// fitted exactly, and it would have made the collinearity test below pass for the wrong reason.
+    /// Independently is the point, and so is the return depending on *both*: an earlier fixture made
+    /// the return a pure function of volatility, which left the true size coefficient at zero and
+    /// made the orthogonality test below unable to detect a wrong one.
     fn panel(sectors: &[&str], names: usize) -> Vec<Row<'static>> {
         let mut rows = Vec::new();
         for (sector_index, sector) in sectors.iter().enumerate() {
@@ -530,6 +561,9 @@ mod tests {
                 // Coprime stride, so the volatility ordering is a permutation of the size ordering
                 // rather than the same one.
                 let scale = ((step * 7) % 11 + 1) as f64;
+                // A per-name constant offset, which a standard deviation cancels: it puts a genuine
+                // size component in the return without disturbing the volatility measured from it.
+                let by_size = 0.0004 * step as f64;
                 for session in 0..4i64 {
                     rows.push((
                         ticker,
@@ -537,7 +571,7 @@ mod tests {
                         100.0 + 10.0 * step as f64,
                         Some(1.0e6 * (step as f64 + 1.0)),
                         sector,
-                        Some(0.001 * scale * (session as f64 + 1.0)),
+                        Some(0.001 * scale * (session as f64 + 1.0) + by_size),
                     ));
                 }
             }
@@ -654,45 +688,64 @@ mod tests {
         let rows = panel(&["35", "73", "60"], 8);
         let computed = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
-        // Rebuilt from the same inputs the fit used, so this checks the fit rather than restating it.
-        let mut by_session: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
-        for row in 0..computed.frame.height() {
-            let Some(residual) = residual_at(&computed, row) else {
-                continue;
-            };
-            let session = computed
-                .frame
-                .column("timestamp")
-                .unwrap()
-                .i64()
-                .unwrap()
-                .get(row);
-            let close = computed
-                .frame
-                .column("close_price")
-                .unwrap()
-                .f64()
-                .unwrap()
-                .get(row);
-            by_session
-                .entry(session.unwrap())
-                .or_default()
-                .push((residual, close.unwrap().ln()));
+        // Both loadings rebuilt the way the fit reads them: the *prior* session's close times its
+        // share count, and the standard deviation of the two returns before that.
+        let mut by_session: BTreeMap<i64, Vec<(f64, f64, f64)>> = BTreeMap::new();
+        for sessions in ticker_rows(&rows).values() {
+            for (position, row) in sessions.iter().enumerate() {
+                let Some(residual) = residual_at(&computed, *row) else {
+                    continue;
+                };
+                let previous = sessions[position - 1];
+                let size =
+                    (rows[previous].2 * rows[previous].3.expect("the fixture sets shares")).ln();
+                let window = [
+                    rows[sessions[position - 2]].5.expect("a return"),
+                    rows[previous].5.expect("a return"),
+                ];
+                let mean = (window[0] + window[1]) / 2.0;
+                // Sample standard deviation over two observations, so the divisor is one.
+                let volatility = ((window[0] - mean).powi(2) + (window[1] - mean).powi(2)).sqrt();
+                by_session
+                    .entry(rows[*row].1)
+                    .or_default()
+                    .push((residual, size, volatility));
+            }
         }
 
-        assert!(!by_session.is_empty());
-        for (session, pairs) in by_session {
-            let product: f64 = pairs.iter().map(|(residual, size)| residual * size).sum();
-            let total: f64 = pairs.iter().map(|(residual, _size)| residual).sum();
-            let mean_size: f64 =
-                pairs.iter().map(|(_r, size)| size).sum::<f64>() / pairs.len() as f64;
-            // Orthogonal to the *demeaned* size, which is what the fit projects onto.
+        assert_eq!(by_session.len(), 2, "two sessions carry a full lookback");
+        for (session, triples) in by_session {
             assert!(
-                (product - total * mean_size).abs() < 1e-8,
-                "session {session} left {} of size in the residual",
-                product - total * mean_size
+                triples.len() > 2,
+                "session {session} must hold a cross-section"
             );
+            // Orthogonal to each *demeaned* loading, which is what the fit projects onto.
+            for (name, loading) in [("size", 1usize), ("volatility", 2usize)] {
+                let value =
+                    |triple: &(f64, f64, f64)| if loading == 1 { triple.1 } else { triple.2 };
+                let mean = triples.iter().map(value).sum::<f64>() / triples.len() as f64;
+                let left: f64 = triples
+                    .iter()
+                    .map(|triple| triple.0 * (value(triple) - mean))
+                    .sum();
+                assert!(
+                    left.abs() < 1e-8,
+                    "session {session} left {left} of {name} in the residual"
+                );
+            }
         }
+    }
+
+    /// Row indices per ticker in session order, as the fit itself lays them out.
+    fn ticker_rows<'a>(rows: &'a [Row<'a>]) -> BTreeMap<&'a str, Vec<usize>> {
+        let mut by_ticker: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (row, entry) in rows.iter().enumerate() {
+            by_ticker.entry(entry.0).or_default().push(row);
+        }
+        for sessions in by_ticker.values_mut() {
+            sessions.sort_by_key(|row| rows[*row].1);
+        }
+        by_ticker
     }
 
     /// Every factor loading is read off strictly prior sessions, so this session's close cannot
@@ -834,6 +887,68 @@ mod tests {
         assert_eq!(computed.measured, 48);
     }
 
+    /// A window counted by position can span a gap once `clean_data` compacts a name's rows.
+    ///
+    /// The gapped name must be refused on the sessions whose window crosses its hole, rather than
+    /// carrying a factor measured over a longer horizon than the one the column is named for.
+    #[test]
+    fn test_a_window_spanning_a_gap_is_refused_rather_than_measured_over_a_longer_horizon() {
+        let full = panel(&["35", "73", "60"], 8);
+        // Exactly one respect differs: T00 loses session 1, so its remaining rows are compacted and
+        // sessions 2 and 3 would otherwise take a two-session window spanning three sessions.
+        let gapped: Vec<Row<'_>> = full
+            .iter()
+            .filter(|row| !(row.0 == "T00" && row.1 == 1))
+            .copied()
+            .collect();
+
+        let measured_rows = |rows: &[Row<'_>]| {
+            let computed =
+                residual_returns(&frame(rows), specification()).expect("the fit must run");
+            (0..computed.frame.height())
+                .filter(|row| {
+                    computed
+                        .frame
+                        .column("ticker")
+                        .unwrap()
+                        .str()
+                        .unwrap()
+                        .get(*row)
+                        == Some("T00")
+                })
+                .filter(|row| residual_at(&computed, *row).is_some())
+                .count()
+        };
+
+        assert_eq!(
+            measured_rows(&full),
+            2,
+            "the ungapped control must measure both sessions"
+        );
+        assert_eq!(
+            measured_rows(&gapped),
+            0,
+            "every remaining T00 window crosses the hole and must be refused"
+        );
+    }
+
+    /// The control for the test above: a gap in one name must not cost its peers anything.
+    #[test]
+    fn test_a_gap_in_one_name_leaves_the_rest_of_the_cross_section_measured() {
+        let gapped: Vec<Row<'_>> = panel(&["35", "73", "60"], 8)
+            .into_iter()
+            .filter(|row| !(row.0 == "T00" && row.1 == 1))
+            .collect();
+
+        let computed =
+            residual_returns(&frame(&gapped), specification()).expect("the fit must run");
+
+        // 24 names over 4 sessions less T00's dropped row, less the 2 warm-up sessions each name
+        // owes, less T00's two refused sessions.
+        assert_eq!(computed.frame.height(), 95);
+        assert_eq!(computed.measured, 46);
+    }
+
     /// A cross-section where every name is the same size identifies neither continuous factor.
     ///
     /// This is the case that motivated checking each factor against its own level. A constant column
@@ -863,9 +978,8 @@ mod tests {
         let mut rows = panel(&["35", "73", "60"], 8);
         for row in rows.iter_mut() {
             row.3 = Some(1.0e6);
-            // Volatility made an exact affine function of *log size*, which is what the two-by-two
-            // determinant is there to catch once each column is known to vary on its own. The
-            // returns are scaled so the two-session sample standard deviation lands on that target.
+            // Volatility made an exact affine function of *log size*, with the returns scaled so
+            // the two-session standard deviation lands on that target.
             let target = 0.001 * ((row.2 * 1.0e6).ln() - 15.0);
             row.5 = Some(target * std::f64::consts::SQRT_2 * (row.1 as f64 + 1.0));
         }
@@ -975,6 +1089,10 @@ mod tests {
     #[test]
     fn test_a_specification_that_cannot_measure_anything_is_refused() {
         assert!(FactorSpecification::new(0, 0.5).is_none());
+        // A sample standard deviation needs two observations. One divides by zero, so it would
+        // refuse every row while reporting a short window — the wrong cause for a full one.
+        assert!(FactorSpecification::new(1, 0.5).is_none());
+        assert!(FactorSpecification::new(2, 0.5).is_some());
         // A share of zero would admit a name the fit reproduces exactly, which is the refusal the
         // whole type exists to make.
         assert!(FactorSpecification::new(60, 0.0).is_none());

@@ -289,6 +289,9 @@ async fn read_window(
     let reference_digest = digest_of(universe.rows())?;
     let consolidated =
         reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;
+    // The prices arrived restated onto this session's share basis and the counts did not, so their
+    // product is out by the split factor until this runs.
+    let consolidated = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
     let floor = LiquidityFloor::CURRENT;
     let filtered = filter_training_bars(consolidated, floor)?;
 
