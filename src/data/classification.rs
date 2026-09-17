@@ -1,10 +1,12 @@
 //! What a name's SIC code says it does, at two granularities.
 //!
-//! The lookup only. The buckets and the ranges are generated into `industry_table.rs` from the
+//! The lookup only. The buckets and the ranges are generated into `classification_table.rs` from the
 //! published definitions, and this is the code that reads them.
 
 use crate::common::types::SicCode;
-use crate::data::industry_table::{Industry, Sector, SicRange, INDUSTRY_RANGES, SECTOR_RANGES};
+use crate::data::classification_table::{
+    Industry, Sector, SicRange, INDUSTRY_RANGES, SECTOR_RANGES,
+};
 
 /// The bucket `code` falls in, or the source's catch-all when it claims no range.
 ///

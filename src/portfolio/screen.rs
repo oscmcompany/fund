@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::common::journal::ExclusionReason;
 use crate::common::types::{PairID, Ticker};
-use crate::data::industry_table::Sector;
+use crate::data::classification_table::Sector;
 
 /// Sessions of daily closes the correlation and the spread distribution are fitted over.
 pub const CORRELATION_WINDOW_SESSIONS: usize = 60;

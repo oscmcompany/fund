@@ -10,7 +10,7 @@ use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, EquityDetail, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
-use fund::data::industry_table::Sector;
+use fund::data::classification_table::Sector;
 use fund::data::truncate::BoundaryTable;
 use fund::data::universe;
 

@@ -27,8 +27,8 @@ use crate::common::types::{
     CloseReason, EquityPrediction, EquityQuote, PairID, SessionDate, Ticker,
 };
 use crate::data::calendar::TradingCalendar;
+use crate::data::classification_table::Sector;
 use crate::data::details::{self, DetailsError};
-use crate::data::industry_table::Sector;
 use crate::data::universe::Universe;
 use crate::models::tide::predict;
 use crate::portfolio::account::{self, AccountError};

@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use polars::prelude::*;
 use serde::Serialize;
 
+use crate::data::classification_table::Sector;
 use crate::data::details::sector_of_stored;
-use crate::data::industry_table::Sector;
 
 /// The column this module adds, null wherever the residual was refused.
 pub const RESIDUAL_COLUMN: &str = "residual_return";

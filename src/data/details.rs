@@ -11,8 +11,8 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::types::{EquityDetail, Ticker};
-use crate::data::industry;
-use crate::data::industry_table::{Industry, Sector};
+use crate::data::classification;
+use crate::data::classification_table::{Industry, Sector};
 
 /// Value stored when the source has no SIC code, and so no sector or industry, for a ticker.
 ///
@@ -44,7 +44,7 @@ pub fn industry_code(industry: Option<Industry>) -> String {
 /// claim to. The count of them is what says whether the table moved under the rows, so callers that
 /// can report it should.
 pub fn sector_of_stored(stored: &str) -> Option<Sector> {
-    industry::sector_from_code(stored)
+    classification::sector_from_code(stored)
 }
 
 /// Rows per insert chunk. Three columns, so a thousand rows is well inside the bind parameter limit.

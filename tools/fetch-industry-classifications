@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates src/data/industry_table.rs from the Fama-French industry definitions.
+# Regenerates src/data/classification_table.rs from the Fama-French industry definitions.
 #
 # The table decides which names share a sector, which is what the screen's concentration cap and the
 # laboratory's sector factor are both read off, so it is baked into the binary rather than fetched at
@@ -25,7 +25,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Entered rather than merely resolved: `cargo fmt` below reads the manifest from the working
 # directory, so a run from anywhere but the repository root would format nothing and say so quietly.
 cd "${ROOT}"
-OUTPUT="${ROOT}/src/data/industry_table.rs"
+OUTPUT="${ROOT}/src/data/classification_table.rs"
 
 BASE_URL="https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp"
 
@@ -363,6 +363,13 @@ print(
 )
 PYTHON
 
+# Both paths, and `--check` is why. The committed table is formatted, so comparing it against an
+# unformatted generation reports drift on every run: rustfmt splits each `SicRange` literal across
+# five lines and the generator emits it on one. `rustfmt` directly rather than `cargo fmt`, which
+# takes its file list relative to the manifest and cannot reach the temporary file below.
+echo "Formatting"
+rustfmt --edition 2021 "${TARGET}"
+
 if [[ "${CHECK_ONLY}" == true ]]; then
   # Ignoring FETCHED_ON, which moves with the clock and says nothing about the source. It is the
   # only dated line by construction — the generator refuses to emit a second one — so this compares
@@ -379,6 +386,4 @@ if [[ "${CHECK_ONLY}" == true ]]; then
   exit 1
 fi
 
-echo "Formatting"
-cargo fmt -- "${OUTPUT}" 2>/dev/null || cargo fmt
 echo "Done. Review the diff and commit it."

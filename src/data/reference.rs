@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use polars::prelude::*;
 
 use crate::common::types::{EquityReference, SecurityType, SessionDate, SicCode};
+use crate::data::classification;
+use crate::data::classification_table::{Industry, Sector};
 use crate::data::details::{industry_code, sector_code};
-use crate::data::industry;
-use crate::data::industry_table::{Industry, Sector};
 
 /// The column carrying which `as_of` observation a row was classified by.
 ///
@@ -192,10 +192,10 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
                 // carries exactly one meaning: the feed declined to say.
                 sector: sic_code
                     .and_then(SicCode::new)
-                    .map(|code| industry::sector_of(&code)),
+                    .map(|code| classification::sector_of(&code)),
                 industry: sic_code
                     .and_then(SicCode::new)
-                    .map(|code| industry::industry_of(&code)),
+                    .map(|code| classification::industry_of(&code)),
             },
         ));
     }
