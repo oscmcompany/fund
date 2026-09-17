@@ -10,10 +10,10 @@ use tracing::warn;
 
 use crate::common::aws::date_partitioned_key;
 use crate::common::types::{BarInterval, LiquidityFloor, SessionDate};
-use crate::data::{adjust, archive, bars, details, truncate};
+use crate::data::{adjust, archive, bars, reference, truncate};
 use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
-use crate::models::tide::predict::consolidate_data;
+use crate::models::tide::predict;
 use crate::models::tide::TideError;
 
 /// Errors building a dataset.
@@ -25,9 +25,9 @@ pub enum DatasetError {
     Frame(#[from] PolarsError),
     #[error("preprocessing failed: {0}")]
     Tide(#[from] TideError),
-    #[error("failed to read the embedded ticker details: {0}")]
+    #[error("failed to read the reference universe: {0}")]
     Details(#[from] crate::data::details::DetailsError),
-    #[error("failed to consolidate bars with details: {0}")]
+    #[error("failed to consolidate bars with their classification: {0}")]
     Consolidation(#[from] crate::models::tide::predict::PredictionError),
     /// A window that cannot produce a dataset, named rather than returned empty.
     #[error("{0}")]
@@ -56,6 +56,13 @@ pub struct DatasetFingerprint {
     pub splits_digest: u64,
     /// Content of the boundary table the series were stitched and bounded against.
     pub boundaries_digest: u64,
+    /// Content of the point-in-time universe the bars were classified against, or `None` where none
+    /// was joined.
+    ///
+    /// The universe *is* part of the result: two runs over the same window and the same splits, one
+    /// before the reference backfill extended and one after, measure different sets of names and
+    /// would otherwise be indistinguishable.
+    pub reference_digest: Option<u64>,
 }
 
 /// Folds a frame's contents into one value that changes when any cell does.
@@ -176,8 +183,11 @@ pub async fn intraday(
         session,
         lookback_days,
         None,
-        adjustments.splits_digest,
-        adjustments.boundaries_digest,
+        Digests {
+            splits: adjustments.splits_digest,
+            boundaries: adjustments.boundaries_digest,
+            reference: None,
+        },
     )?;
 
     Ok(IntradayDataset { bars, fingerprint })
@@ -229,8 +239,19 @@ async fn read_window(
     )
     .await?;
 
-    let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
-    let consolidated = consolidate_data(equity_bars, equity_details)?;
+    // The universe is point-in-time, not a table taken today: 2,159 of the 5,485 common stocks
+    // listed on 2021-09-15 no longer exist, and every earlier measurement was made on the survivors.
+    let partitions = archive::read_reference_window(
+        s3_client,
+        bucket,
+        session.plus_calendar_days(-lookback_days),
+        session,
+    )
+    .await?;
+    let universe = reference::universe_of(&partitions)?;
+    let reference_digest = digest_of(universe.rows())?;
+    let consolidated =
+        reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;
     let floor = LiquidityFloor::CURRENT;
     let filtered = filter_training_bars(consolidated, floor)?;
 
@@ -239,8 +260,11 @@ async fn read_window(
         session,
         lookback_days,
         Some(floor),
-        adjustments.splits_digest,
-        adjustments.boundaries_digest,
+        Digests {
+            splits: adjustments.splits_digest,
+            boundaries: adjustments.boundaries_digest,
+            reference: Some(reference_digest),
+        },
     )?;
 
     Ok((filtered, fingerprint))
@@ -305,8 +329,7 @@ fn fingerprint_of(
     session: SessionDate,
     lookback_days: i64,
     liquidity_floor: Option<LiquidityFloor>,
-    splits_digest: u64,
-    boundaries_digest: u64,
+    digests: Digests,
 ) -> Result<DatasetFingerprint, DatasetError> {
     let timestamps = frame.column("timestamp")?.i64()?;
     let tickers = frame.column("ticker")?.str()?;
@@ -322,9 +345,24 @@ fn fingerprint_of(
             .len(),
         first_timestamp: timestamps.min().and_then(DateTime::from_timestamp_millis),
         last_timestamp: timestamps.max().and_then(DateTime::from_timestamp_millis),
-        splits_digest,
-        boundaries_digest,
+        splits_digest: digests.splits,
+        boundaries_digest: digests.boundaries,
+        reference_digest: digests.reference,
     })
+}
+
+/// The content digests of every table a window was folded or joined through.
+///
+/// Passed as one value rather than three parameters for the reason the fingerprint's own fields are
+/// named: all three are `u64`, so swapping two would compile and would silently report two different
+/// windows as the same one.
+#[derive(Debug, Clone, Copy)]
+struct Digests {
+    splits: u64,
+    boundaries: u64,
+    /// `None` on a path that joins no universe, distinguishing that from one that joined an empty
+    /// universe — the second is a defect and the first is the intraday path working as intended.
+    reference: Option<u64>,
 }
 
 /// Reads every weekday partition in the window, then stitches, bounds, and folds it once.
@@ -406,6 +444,15 @@ async fn load_archived_bars(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two adjustment digests, for tests that vary those and join no universe.
+    fn digests(splits: u64, boundaries: u64) -> Digests {
+        Digests {
+            splits,
+            boundaries,
+            reference: None,
+        }
+    }
 
     /// A partition written before `bar_interval` joined the frame, and one written after. Both must
     /// project to the same schema, because `concat` rejects the window when one member differs.
@@ -544,9 +591,11 @@ mod tests {
         let strict = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
         let loose = LiquidityFloor::new(1.0, 1_000_000.0).unwrap();
 
-        let unscreened = fingerprint_of(&rows, session, 365, None, 0xAB, 0xCD).unwrap();
-        let strictly = fingerprint_of(&rows, session, 365, Some(strict), 0xAB, 0xCD).unwrap();
-        let loosely = fingerprint_of(&rows, session, 365, Some(loose), 0xAB, 0xCD).unwrap();
+        let unscreened = fingerprint_of(&rows, session, 365, None, digests(0xAB, 0xCD)).unwrap();
+        let strictly =
+            fingerprint_of(&rows, session, 365, Some(strict), digests(0xAB, 0xCD)).unwrap();
+        let loosely =
+            fingerprint_of(&rows, session, 365, Some(loose), digests(0xAB, 0xCD)).unwrap();
 
         assert_eq!(
             strictly.rows, loosely.rows,
@@ -561,6 +610,46 @@ mod tests {
         assert_eq!(unscreened.liquidity_floor, None);
     }
 
+    /// The universe is an input to the result, not a description of it. Two runs over the same
+    /// window and the same adjustment tables, one before the reference backfill extended and one
+    /// after, measure different sets of names and must not report the same identity.
+    #[test]
+    fn test_two_universes_over_the_same_rows_do_not_share_a_fingerprint() {
+        const DAY: i64 = 86_400_000;
+        let rows = frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]);
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap());
+        let with = |reference| {
+            fingerprint_of(
+                &rows,
+                session,
+                365,
+                None,
+                Digests {
+                    splits: 0xAB,
+                    boundaries: 0xCD,
+                    reference,
+                },
+            )
+            .unwrap()
+        };
+
+        let unjoined = with(None);
+        let one = with(Some(0x11));
+        let another = with(Some(0x22));
+
+        assert_eq!(
+            one.rows, another.rows,
+            "the fixture must isolate the universe"
+        );
+        assert_eq!(
+            one.tickers, another.tickers,
+            "the fixture must isolate the universe"
+        );
+        assert_ne!(one, another, "two universes must not share a fingerprint");
+        assert_ne!(unjoined, one, "a joined universe and none must differ");
+        assert_eq!(unjoined.reference_digest, None);
+    }
+
     #[test]
     fn test_fingerprint_counts_distinct_tickers_not_rows() {
         const DAY: i64 = 86_400_000;
@@ -569,8 +658,7 @@ mod tests {
             SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()),
             365,
             None,
-            0xAB,
-            0xCD,
+            digests(0xAB, 0xCD),
         )
         .unwrap();
 
@@ -608,10 +696,22 @@ mod tests {
         let after = splits(4.0);
         assert_eq!(before.height(), after.height());
 
-        let before =
-            fingerprint_of(&rows, session, 365, None, digest_of(&before).unwrap(), 0).unwrap();
-        let after =
-            fingerprint_of(&rows, session, 365, None, digest_of(&after).unwrap(), 0).unwrap();
+        let before = fingerprint_of(
+            &rows,
+            session,
+            365,
+            None,
+            digests(digest_of(&before).unwrap(), 0),
+        )
+        .unwrap();
+        let after = fingerprint_of(
+            &rows,
+            session,
+            365,
+            None,
+            digests(digest_of(&after).unwrap(), 0),
+        )
+        .unwrap();
 
         assert_ne!(
             before, after,

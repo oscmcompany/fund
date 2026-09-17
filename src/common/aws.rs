@@ -10,6 +10,19 @@ pub async fn s3_client() -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::new(&load_config().await)
 }
 
+/// Raised when the shared archive bucket is not named in the environment.
+#[derive(Debug, thiserror::Error)]
+#[error("AWS_S3_ARCHIVE_BUCKET_NAME must be set (the shared data/** archive)")]
+pub struct MissingArchiveBucket;
+
+/// The shared archive bucket every `data/**` reader and writer resolves through.
+///
+/// One accessor rather than the same `env::var` in each binary: seven copies of a variable name are
+/// seven spellings that agree by coincidence, and a typo in one reads as an unset environment.
+pub fn archive_bucket() -> Result<String, MissingArchiveBucket> {
+    std::env::var("AWS_S3_ARCHIVE_BUCKET_NAME").map_err(|_| MissingArchiveBucket)
+}
+
 /// Build the Hive-partitioned S3 key for one day of parquet data, e.g.
 /// `data/derived/equity/bars/interval=one_day/year=2026/month=06/day=10/data.parquet`. The single
 /// source of truth for the date-partition layout: the data manager's daily

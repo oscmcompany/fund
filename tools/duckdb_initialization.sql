@@ -58,13 +58,19 @@ FROM read_parquet(
     hive_partitioning = true
 );
 
-.print 'Loading training_details...'
-DROP VIEW IF EXISTS training_details;
-CREATE OR REPLACE VIEW training_details AS
+-- What each symbol was on a given date, one partition per quarterly observation. Point-in-time,
+-- which the hand-made CSV this replaced was not: 39% of the common stocks listed in 2021 no longer
+-- exist, and a join against today's ticker table silently drops every one of them.
+--
+-- Read the row whose as_of is the greatest at or before the session being measured. sic_code is a
+-- string because its leading zero is significant, and its first two digits are the major group.
+.print 'Loading training_reference...'
+DROP VIEW IF EXISTS training_reference;
+CREATE OR REPLACE VIEW training_reference AS
 SELECT *
-FROM read_csv(
-    's3://' || getvariable('archive_bucket') || '/data/derived/equity/details/details.csv',
-    auto_detect = true
+FROM read_parquet(
+    's3://' || getvariable('archive_bucket') || '/data/derived/equity/reference/**/*.parquet',
+    hive_partitioning = true
 );
 
 -- Every stock split Massive reports, historical and announced, refreshed whole each night. Named
@@ -79,7 +85,7 @@ FROM read_csv(
 --
 -- On a bucket where the trainer has not yet run, the object does not exist and this one CREATE
 -- prints an IO error and is skipped; every other view still loads, and this one appears after the
--- first refresh. training_details has the same fixed-key exposure.
+-- first refresh. training_reference is partitioned and so has no such fixed-key exposure.
 .print 'Loading training_stock_splits...'
 DROP VIEW IF EXISTS training_stock_splits;
 CREATE OR REPLACE VIEW training_stock_splits AS
@@ -117,7 +123,7 @@ FROM read_parquet(
 
 -- Bars and ticker metadata are not here. They were exported under this prefix as well as archived
 -- under data/, from the same Massive endpoint, and the trainer's archive is now their single
--- owner -- query `training_bars` and `training_details` above for them.
+-- owner -- query `training_bars` and `training_reference` above for them.
 
 .print 'Loading equity_predictions...'
 DROP VIEW IF EXISTS equity_predictions;

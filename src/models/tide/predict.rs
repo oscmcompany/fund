@@ -37,11 +37,12 @@ pub enum PredictionError {
     Postprocessing(String),
 }
 
-pub fn consolidate_data(
-    equity_bars: DataFrame,
-    equity_details: DataFrame,
-) -> Result<DataFrame, PredictionError> {
-    let bars = resolve_duplicate_bars(equity_bars)?
+/// Collapses duplicate bars and drops the non-positive ones, before any classification is joined.
+///
+/// Separate from [`consolidate_data`] because the laboratory joins a point-in-time universe instead
+/// of a ticker table, and two copies of this filter would be two rules agreeing by coincidence.
+pub fn prepare_bars(equity_bars: DataFrame) -> Result<DataFrame, PredictionError> {
+    resolve_duplicate_bars(equity_bars)?
         .lazy()
         .filter(
             col("open_price")
@@ -51,7 +52,14 @@ pub fn consolidate_data(
                 .and(col("close_price").gt(lit(0.0))),
         )
         .collect()
-        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))
+}
+
+pub fn consolidate_data(
+    equity_bars: DataFrame,
+    equity_details: DataFrame,
+) -> Result<DataFrame, PredictionError> {
+    let bars = prepare_bars(equity_bars)?;
 
     let details = equity_details
         .lazy()

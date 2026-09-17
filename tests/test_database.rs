@@ -7,7 +7,7 @@ mod common;
 use chrono::{Duration, NaiveDate, Utc};
 use fund::common::alpaca::{ActivityType, OrderSide};
 use fund::common::events::{self, Command, EventType, Outcome};
-use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
+use fund::common::types::{BarInterval, EquityDetail, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
 use fund::data::truncate::BoundaryTable;
@@ -45,6 +45,66 @@ async fn fresh_pool() -> PgPool {
     let pool = common::test_pool("database").await;
     common::reset_tables(&pool).await;
     pool
+}
+
+/// The universe shrinks. A name that delists or reclassifies out of common stock leaves the
+/// snapshot, and an upsert would keep it in `equity_details` — where the screen's inner join would
+/// go on admitting it forever.
+#[tokio::test]
+#[serial]
+async fn test_storing_details_replaces_the_table_rather_than_merging_into_it() {
+    let pool = fresh_pool().await;
+    let detail = |symbol: &str, sector: &str| {
+        EquityDetail::new(ticker(symbol), sector.to_string(), "3571".to_string())
+    };
+
+    fund::data::details::store_details(&pool, &[detail("AAPL", "35"), detail("TWTR", "73")])
+        .await
+        .expect("the first snapshot must store");
+
+    // TWTR is gone from the second snapshot, and AAPL's sector has been restated.
+    let written = fund::data::details::store_details(&pool, &[detail("AAPL", "36")])
+        .await
+        .expect("the second snapshot must store");
+
+    assert_eq!(written, 1);
+    let stored = fund::data::details::load_sectors(&pool)
+        .await
+        .expect("the sectors must load");
+    assert_eq!(stored.len(), 1, "the departed name must not survive");
+    assert_eq!(stored.get(&ticker("AAPL")).map(String::as_str), Some("36"));
+    assert!(stored.get(&ticker("TWTR")).is_none());
+}
+
+/// A snapshot that answered for nothing is a failed read, not an empty market, so it must leave the
+/// stored universe alone rather than emptying the table the screen depends on.
+#[tokio::test]
+#[serial]
+async fn test_an_empty_snapshot_leaves_the_stored_universe_alone() {
+    let pool = fresh_pool().await;
+    fund::data::details::store_details(
+        &pool,
+        &[EquityDetail::new(
+            ticker("AAPL"),
+            "35".to_string(),
+            "3571".to_string(),
+        )],
+    )
+    .await
+    .expect("the snapshot must store");
+
+    let written = fund::data::details::store_details(&pool, &[])
+        .await
+        .expect("an empty snapshot must not fail");
+
+    assert_eq!(written, 0);
+    assert_eq!(
+        fund::data::details::load_sectors(&pool)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -2,9 +2,18 @@
 //!
 //! One partition per `as_of`, because these are dated observations rather than a table revised once.
 
+use std::collections::BTreeMap;
+
 use polars::prelude::*;
 
-use crate::common::types::EquityReference;
+use crate::common::types::{EquityReference, SecurityType, SessionDate};
+use crate::data::details::UNKNOWN;
+
+/// The column carrying which `as_of` observation a row was classified by.
+///
+/// Named once because the universe builder writes it and the bar join reads it, and a literal in
+/// both places is two names that agree by coincidence.
+pub const AS_OF_COLUMN: &str = "reference_as_of";
 
 /// Builds the frame written to one `as_of` partition.
 ///
@@ -47,6 +56,172 @@ pub fn reference_to_dataframe(references: &[EquityReference]) -> Result<DataFram
         Column::new("reported_market_capitalization".into(), capitalizations),
         Column::new("primary_exchange".into(), exchanges),
     ])
+}
+
+/// Observations a symbol keeps its classification across while the feed has no record of it.
+///
+/// One, not unbounded. The gap being repaired is a transient `404` on a name that traded, which is 7
+/// to 18 symbols a quarter; a name the feed has not seen for two consecutive quarters while it keeps
+/// printing bars is a different question, and on at least one measured ticker it is the same symbol
+/// reused by a different company. Carrying a 2021 sector across five years onto a later listing
+/// would classify one company's bars as another's.
+const CARRY_FORWARD_OBSERVATIONS: u32 = 1;
+
+/// One symbol as a single `as_of` observation saw it.
+///
+/// Carries the type alongside the classification because the common-stock filter runs *after* the
+/// carry-forward below, and a row that has dropped its type cannot be filtered on later.
+#[derive(Clone)]
+struct Observation {
+    security_type: Option<String>,
+    sector: String,
+    industry: String,
+    /// Observations since the feed last answered for this symbol. Zero on a fresh answer.
+    carried: u32,
+}
+
+/// The tradeable universe, and the grid of observations it was built from.
+///
+/// The two travel together because the grid is not recoverable from the rows: an observation where
+/// every name left common stock contributes no rows at all, and a join that inferred its boundaries
+/// from the rows alone would extend the previous observation straight past it.
+pub struct Universe {
+    rows: DataFrame,
+    observations: Vec<i64>,
+}
+
+impl Universe {
+    /// One row per (ticker, `as_of`) that was common stock then.
+    pub fn rows(&self) -> &DataFrame {
+        &self.rows
+    }
+}
+
+/// The tradeable universe at each `as_of`, one row per (ticker, `as_of`), common stock only.
+///
+/// Each observation carries every symbol seen at or before it, not only the symbols that observation
+/// answered for. The feed returns a 404 for 7 to 18 symbols a quarter that traded, and an inner join
+/// against the raw partitions would drop each of those names for a whole quarter.
+pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, PolarsError> {
+    // Ascending here rather than trusting the caller: the carry-forward is only correct in order,
+    // and a caller that listed the prefix differently would silently invert it.
+    let mut ordered: Vec<&(SessionDate, DataFrame)> = partitions.iter().collect();
+    ordered.sort_by_key(|(as_of, _frame)| *as_of);
+
+    let mut current: BTreeMap<String, Observation> = BTreeMap::new();
+    let mut observations: Vec<i64> = Vec::with_capacity(ordered.len());
+    let mut tickers: Vec<String> = Vec::new();
+    let mut observed_at: Vec<i64> = Vec::new();
+    let mut sectors: Vec<String> = Vec::new();
+    let mut industries: Vec<String> = Vec::new();
+
+    for (as_of, frame) in ordered {
+        // Aged first, so a symbol this observation answers for is reset to zero below and only the
+        // ones it stayed silent about advance.
+        current.retain(|_ticker, observation| {
+            observation.carried += 1;
+            observation.carried <= CARRY_FORWARD_OBSERVATIONS
+        });
+        for (ticker, observation) in observations_of(frame)? {
+            // A newer observation supersedes an older one, which is what makes a reclassification
+            // out of common stock take effect rather than being carried past.
+            current.insert(ticker, observation);
+        }
+
+        let stamp = as_of.midnight().timestamp_millis();
+        observations.push(stamp);
+        for (ticker, observation) in &current {
+            if observation.security_type.as_deref() != Some(SecurityType::CommonStock.as_code()) {
+                continue;
+            }
+            tickers.push(ticker.clone());
+            observed_at.push(stamp);
+            sectors.push(observation.sector.clone());
+            industries.push(observation.industry.clone());
+        }
+    }
+
+    Ok(Universe {
+        rows: DataFrame::new(vec![
+            Column::new("ticker".into(), tickers),
+            Column::new(AS_OF_COLUMN.into(), observed_at),
+            Column::new("sector".into(), sectors),
+            Column::new("industry".into(), industries),
+        ])?,
+        observations,
+    })
+}
+
+/// Reads one stored partition into the per-symbol observations it declares.
+fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, PolarsError> {
+    let tickers = frame.column("ticker")?.str()?;
+    let security_types = frame.column("security_type")?.str()?;
+    let sic_codes = frame.column("sic_code")?.str()?;
+
+    let mut observations = Vec::with_capacity(frame.height());
+    for index in 0..frame.height() {
+        let Some(ticker) = tickers.get(index) else {
+            continue;
+        };
+        let sic_code = sic_codes.get(index);
+        observations.push((
+            ticker.to_string(),
+            Observation {
+                security_type: security_types.get(index).map(str::to_string),
+                carried: 0,
+                // Spelled rather than left null, matching the retired CSV: an unknown sector must
+                // not be assumed to diversify, so two unclassified names count as one group.
+                sector: sic_code
+                    .and_then(|code| code.get(..2))
+                    .unwrap_or(UNKNOWN)
+                    .to_string(),
+                industry: sic_code.unwrap_or(UNKNOWN).to_string(),
+            },
+        ));
+    }
+    Ok(observations)
+}
+
+/// Joins each bar to the classification that was current when it printed.
+///
+/// A plain equi-join on a bucket assigned first, rather than an as-of join: the bucket is the
+/// greatest `as_of` at or before the bar's own timestamp, which is what makes the universe
+/// look-ahead-free by construction rather than by a rule someone has to remember.
+pub fn join_point_in_time(bars: DataFrame, universe: &Universe) -> Result<DataFrame, PolarsError> {
+    let mut observations = universe.observations.clone();
+    observations.sort_unstable();
+    observations.dedup();
+
+    // Ascending, so each later observation overrides the earlier ones and the greatest at or before
+    // the bar survives. A bar older than every observation keeps a null and the join drops it.
+    let mut bucket = lit(NULL).cast(DataType::Int64);
+    for observation in observations {
+        bucket = when(col("timestamp").gt_eq(lit(observation)))
+            .then(lit(observation))
+            .otherwise(bucket);
+    }
+
+    bars.lazy()
+        .with_column(bucket.alias(AS_OF_COLUMN))
+        .join(
+            universe.rows.clone().lazy(),
+            [col("ticker"), col(AS_OF_COLUMN)],
+            [col("ticker"), col(AS_OF_COLUMN)],
+            JoinArgs::new(JoinType::Inner),
+        )
+        .select([
+            col("ticker"),
+            col("timestamp"),
+            col("open_price"),
+            col("high_price"),
+            col("low_price"),
+            col("close_price"),
+            col("volume"),
+            col("volume_weighted_average_price"),
+            col("sector"),
+            col("industry"),
+        ])
+        .collect()
 }
 
 /// What one `as_of` sweep did, including what it could not answer.
@@ -111,6 +286,320 @@ mod tests {
             Some("XNAS".to_string()),
         )
         .expect("the fixture must be constructible")
+    }
+
+    fn partition(
+        as_of: (i32, u32, u32),
+        rows: &[(&str, &str, Option<&str>)],
+    ) -> (SessionDate, DataFrame) {
+        let references: Vec<EquityReference> = rows
+            .iter()
+            .map(|(ticker, code, sic)| {
+                EquityReference::new(
+                    Ticker::new(ticker).expect("a valid test symbol"),
+                    SessionDate::from_date(
+                        chrono::NaiveDate::from_ymd_opt(as_of.0, as_of.1, as_of.2)
+                            .expect("a valid date"),
+                    ),
+                    Some(SecurityType::from_code(code)),
+                    sic.and_then(SicCode::new),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("the fixture must be constructible")
+            })
+            .collect();
+        (
+            SessionDate::from_date(
+                chrono::NaiveDate::from_ymd_opt(as_of.0, as_of.1, as_of.2).expect("a valid date"),
+            ),
+            reference_to_dataframe(&references).expect("the frame must build"),
+        )
+    }
+
+    fn bars(rows: &[(&str, i64)]) -> DataFrame {
+        DataFrame::new(vec![
+            Column::new(
+                "ticker".into(),
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "timestamp".into(),
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            ),
+            Column::new("open_price".into(), vec![1.0_f64; rows.len()]),
+            Column::new("high_price".into(), vec![1.0_f64; rows.len()]),
+            Column::new("low_price".into(), vec![1.0_f64; rows.len()]),
+            Column::new("close_price".into(), vec![1.0_f64; rows.len()]),
+            Column::new("volume".into(), vec![1_i64; rows.len()]),
+            Column::new(
+                "volume_weighted_average_price".into(),
+                vec![1.0_f64; rows.len()],
+            ),
+        ])
+        .expect("the bar fixture must build")
+    }
+
+    fn instant(year: i32, month: u32, day: u32) -> i64 {
+        SessionDate::from_date(
+            chrono::NaiveDate::from_ymd_opt(year, month, day).expect("a valid date"),
+        )
+        .midnight()
+        .timestamp_millis()
+    }
+
+    /// The whole point of joining a classification at all: 47% of what the archive holds is not
+    /// common stock, and a pairs screen handed two index trackers finds them cointegrated.
+    #[test]
+    fn test_only_common_stock_reaches_the_universe() {
+        let universe = universe_of(&[partition(
+            (2021, 10, 1),
+            &[
+                ("AAPL", "CS", Some("3571")),
+                ("SPY", "ETF", None),
+                ("XYZW", "WARRANT", None),
+            ],
+        )])
+        .expect("the universe must build");
+
+        let tickers: Vec<&str> = universe
+            .rows()
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(tickers, vec!["AAPL"]);
+    }
+
+    #[test]
+    fn test_the_sector_is_the_major_group_and_the_industry_the_whole_code() {
+        let universe = universe_of(&[partition(
+            (2021, 10, 1),
+            &[("AAPL", "CS", Some("3571")), ("AGRI", "CS", Some("0100"))],
+        )])
+        .expect("the universe must build");
+
+        let sectors = universe.rows().column("sector").unwrap().str().unwrap();
+        let industries = universe.rows().column("industry").unwrap().str().unwrap();
+        assert_eq!(sectors.get(0), Some("35"));
+        assert_eq!(industries.get(0), Some("3571"));
+        // The leading zero is significant, which is why the code is stored as a string.
+        assert_eq!(sectors.get(1), Some("01"));
+        assert_eq!(industries.get(1), Some("0100"));
+    }
+
+    /// 595 common stocks carry no SIC. Spelling the gap keeps them in the universe and counts them
+    /// as one sector, matching the retired CSV; dropping them would shrink the market silently.
+    #[test]
+    fn test_a_common_stock_without_a_sic_stays_in_the_universe() {
+        let universe = universe_of(&[partition((2021, 10, 1), &[("ZZZZ", "CS", None)])])
+            .expect("the universe must build");
+
+        assert_eq!(universe.rows().height(), 1);
+        assert_eq!(
+            universe
+                .rows()
+                .column("sector")
+                .unwrap()
+                .str()
+                .unwrap()
+                .get(0),
+            Some("NOT AVAILABLE")
+        );
+    }
+
+    #[test]
+    fn test_an_empty_archive_yields_an_empty_universe_with_the_same_schema() {
+        let empty = universe_of(&[]).expect("an empty universe must build");
+        let populated = universe_of(&[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])])
+            .expect("the universe must build");
+
+        assert_eq!(empty.rows().height(), 0);
+        assert_eq!(empty.rows().schema(), populated.rows().schema());
+    }
+
+    /// A bar is classified by the observation current when it printed, never by a later one. This
+    /// is what makes the universe look-ahead-free by construction rather than by a remembered rule.
+    #[test]
+    fn test_a_bar_takes_the_observation_current_when_it_printed() {
+        let universe = universe_of(&[
+            partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))]),
+            partition((2022, 1, 3), &[("AAPL", "CS", Some("7372"))]),
+        ])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(
+            bars(&[
+                ("AAPL", instant(2021, 11, 15)),
+                ("AAPL", instant(2022, 2, 10)),
+            ]),
+            &universe,
+        )
+        .expect("the join must run");
+
+        let industries = joined.column("industry").unwrap().str().unwrap();
+        assert_eq!(joined.height(), 2);
+        assert_eq!(industries.get(0), Some("3571"));
+        assert_eq!(industries.get(1), Some("7372"));
+    }
+
+    /// The survivorship fix itself. A name that traded and then delisted keeps the sessions it
+    /// traded for, where the retired CSV — taken in 2026 — dropped every one of its bars.
+    ///
+    /// Its absence from the later observation is not what removes it: a delisted name simply stops
+    /// printing bars, and a classification carried forward onto no bars costs nothing.
+    #[test]
+    fn test_a_delisted_name_keeps_the_sessions_it_traded() {
+        let universe = universe_of(&[
+            partition(
+                (2021, 10, 1),
+                &[("AAPL", "CS", Some("3571")), ("TWTR", "CS", Some("7370"))],
+            ),
+            partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
+        ])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(
+            bars(&[
+                ("TWTR", instant(2021, 11, 15)),
+                ("AAPL", instant(2022, 2, 10)),
+            ]),
+            &universe,
+        )
+        .expect("the join must run");
+
+        let tickers: Vec<&str> = joined
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(joined.height(), 2);
+        assert!(tickers.contains(&"TWTR"), "the session it traded survives");
+    }
+
+    /// The feed answers `404` for 7 to 18 symbols a quarter that traded, and a partition is written
+    /// anyway. A name missing from one observation but still printing bars must keep its last known
+    /// classification rather than vanish for the whole quarter.
+    #[test]
+    fn test_a_name_absent_from_one_observation_keeps_its_classification() {
+        let universe = universe_of(&[
+            partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))]),
+            // AAPL traded through this quarter; the feed simply had no record for it that day.
+            partition((2022, 1, 3), &[("MSFT", "CS", Some("7372"))]),
+            partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
+        ])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(bars(&[("AAPL", instant(2022, 2, 10))]), &universe)
+            .expect("the join must run");
+
+        assert_eq!(joined.height(), 1, "a 404 is not a delisting");
+        assert_eq!(
+            joined.column("industry").unwrap().str().unwrap().get(0),
+            Some("3571")
+        );
+    }
+
+    /// The bound on the carry. A symbol the feed has not seen for two consecutive observations
+    /// while it keeps printing bars is not a transient `404`; on at least one measured ticker it is
+    /// the same symbol reused by a different company, and carrying the old sector onto the new
+    /// listing's bars would classify one company's history as another's.
+    #[test]
+    fn test_a_classification_is_not_carried_past_one_silent_observation() {
+        let universe = universe_of(&[
+            partition((2021, 10, 1), &[("ECHO", "CS", Some("4731"))]),
+            partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
+            partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
+        ])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(
+            bars(&[
+                // One observation of silence: still carried.
+                ("ECHO", instant(2022, 2, 10)),
+                // Two: the symbol is no longer answered for, and a guess is worse than nothing.
+                ("ECHO", instant(2022, 5, 10)),
+            ]),
+            &universe,
+        )
+        .expect("the join must run");
+
+        assert_eq!(joined.height(), 1);
+        assert_eq!(
+            joined.column("timestamp").unwrap().i64().unwrap().get(0),
+            Some(instant(2022, 2, 10))
+        );
+    }
+
+    /// The case that stops the carry-forward from being wrong. A name reclassified out of common
+    /// stock is dropped from that observation on, because the newer observation supersedes rather
+    /// than being invisible behind the common-stock filter.
+    #[test]
+    fn test_a_name_reclassified_out_of_common_stock_is_dropped_from_then_on() {
+        let universe = universe_of(&[
+            partition((2021, 10, 1), &[("XYZ", "CS", Some("6726"))]),
+            partition((2022, 1, 3), &[("XYZ", "ETF", None)]),
+        ])
+        .expect("the universe must build");
+
+        let joined = join_point_in_time(
+            bars(&[
+                ("XYZ", instant(2021, 11, 15)),
+                ("XYZ", instant(2022, 2, 10)),
+            ]),
+            &universe,
+        )
+        .expect("the join must run");
+
+        assert_eq!(
+            joined.height(),
+            1,
+            "only the session it was common stock for"
+        );
+        assert_eq!(
+            joined.column("timestamp").unwrap().i64().unwrap().get(0),
+            Some(instant(2021, 11, 15))
+        );
+    }
+
+    /// A bar older than every observation cannot be classified, and the honest answer is to drop it
+    /// rather than reach forward for the first observation that postdates it.
+    #[test]
+    fn test_a_bar_predating_every_observation_is_dropped() {
+        let universe = universe_of(&[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])])
+            .expect("the universe must build");
+
+        let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 9, 15))]), &universe)
+            .expect("the join must run");
+
+        assert_eq!(joined.height(), 0);
+    }
+
+    #[test]
+    fn test_a_bar_for_a_name_outside_the_universe_is_dropped() {
+        let universe = universe_of(&[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])])
+            .expect("the universe must build");
+
+        let joined = join_point_in_time(
+            bars(&[
+                ("AAPL", instant(2021, 11, 1)),
+                ("SPY", instant(2021, 11, 1)),
+            ]),
+            &universe,
+        )
+        .expect("the join must run");
+
+        assert_eq!(joined.height(), 1);
+        assert_eq!(
+            joined.column("ticker").unwrap().str().unwrap().get(0),
+            Some("AAPL")
+        );
     }
 
     #[test]

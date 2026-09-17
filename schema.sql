@@ -46,7 +46,7 @@ SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => 
 
 -- equity_details: ticker metadata used to constrain pair selection to cross-sector matches.
 --
--- Seeded from data/equity_details.csv via seed_equity_details; refreshed by the post-close
+-- Seeded from the archive's reference dataset via seed_equity_details; refreshed by the post-close
 -- market data sync.
 CREATE TABLE IF NOT EXISTS equity_details (
     ticker    TEXT NOT NULL PRIMARY KEY,

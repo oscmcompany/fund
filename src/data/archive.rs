@@ -46,13 +46,6 @@ pub fn bar_archive_prefix(interval: BarInterval) -> String {
     format!("{BAR_ARCHIVE_PREFIX}/interval={interval}")
 }
 
-/// S3 key for the ticker metadata that accompanies the archive.
-///
-/// Written for external readers — DuckDB's `training_details` view resolves here. Training does not
-/// read it: the trainer parses the CSV compiled into its own binary, so this copy can be absent
-/// without a model run noticing.
-pub const DETAILS_ARCHIVE_KEY: &str = "data/derived/equity/details/details.csv";
-
 /// S3 key for the stock splits the bars are adjusted against.
 ///
 /// One object rather than a partition per session, unlike the bars beside it: the feed revises and
@@ -2111,6 +2104,123 @@ pub fn trade_archive_prefix(interval: BarInterval) -> String {
     format!("{TRADE_ARCHIVE_PREFIX}/interval={interval}")
 }
 
+/// Every `as_of` the reference dataset holds a partition for, ascending.
+///
+/// Listed rather than derived from the quarterly grid, because the grid is a policy about what
+/// *should* be fetched and a reader has to know what is actually there. A key whose hive components
+/// do not parse is skipped with a warning rather than failing the read.
+pub async fn reference_partition_dates(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<Vec<SessionDate>, ArchiveError> {
+    let (partitions, _sidecars) =
+        partitions_and_sidecars(s3_client, bucket, REFERENCE_ARCHIVE_PREFIX, "data.parquet")
+            .await?;
+
+    let mut dates: Vec<SessionDate> = Vec::with_capacity(partitions.len());
+    for key in &partitions {
+        match session_from_key(key, "data.parquet") {
+            Some(date) => dates.push(date),
+            None => warn!(
+                key,
+                "Skipped a reference partition whose key carries no date"
+            ),
+        }
+    }
+    dates.sort_unstable();
+    Ok(dates)
+}
+
+/// The newest point-in-time universe the archive holds.
+///
+/// The newest observation rather than one chosen per session, for readers that classify the current
+/// session only: the screen's sector cap is a question about what a name is now. A study reading a
+/// historical window wants [`read_reference_window`] instead, and the two must not be confused.
+pub async fn current_universe(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<reference::Universe, ArchiveError> {
+    let dates = reference_partition_dates(s3_client, bucket).await?;
+    let newest = dates.last().copied().ok_or_else(|| ArchiveError::Read {
+        bucket: bucket.to_string(),
+        key: REFERENCE_ARCHIVE_PREFIX.to_string(),
+        message: "the reference dataset holds no partitions".to_string(),
+    })?;
+    // Read directly rather than through `read_reference_window`, which would list a second time: if
+    // the newest key vanished between the two listings its nearest-prior rule returns an older one.
+    let frame = read_reference_partition(s3_client, bucket, newest).await?;
+    Ok(reference::universe_of(&[(newest, frame)])?)
+}
+
+/// Which of the `available` observations answer for the sessions in `[start, end]`.
+///
+/// The window opens at the nearest `as_of` at or before `start`, not the first one inside it. Where
+/// nothing precedes the window the earliest available is used instead, which leaves the opening
+/// sessions unclassified rather than classified by an observation that postdates them.
+fn covering_partitions(
+    available: &[SessionDate],
+    start: SessionDate,
+    end: SessionDate,
+) -> Vec<SessionDate> {
+    let Some(opening) = available
+        .iter()
+        .rev()
+        .find(|date| **date <= start)
+        .or_else(|| available.first())
+    else {
+        return Vec::new();
+    };
+    available
+        .iter()
+        .copied()
+        .filter(|date| date >= opening && *date <= end)
+        .collect()
+}
+
+/// Every reference partition that answers for a session in `[start, end]`, ascending by `as_of`.
+///
+/// The first is the nearest `as_of` at or before `start` rather than the first one inside the
+/// window: a session is answered for by the most recent observation preceding it, so a window
+/// opening mid-quarter would otherwise lose every name until the next quarter began.
+pub async fn read_reference_window(
+    s3_client: &S3Client,
+    bucket: &str,
+    start: SessionDate,
+    end: SessionDate,
+) -> Result<Vec<(SessionDate, DataFrame)>, ArchiveError> {
+    let available = reference_partition_dates(s3_client, bucket).await?;
+    let wanted = covering_partitions(&available, start, end);
+
+    let mut partitions = Vec::with_capacity(wanted.len());
+    for as_of in wanted {
+        partitions.push((
+            as_of,
+            read_reference_partition(s3_client, bucket, as_of).await?,
+        ));
+    }
+    Ok(partitions)
+}
+
+/// Reads one `as_of` partition, refusing a key that was listed and is no longer there.
+///
+/// A skip would narrow the sequence silently, and the carry-forward in
+/// [`crate::data::reference::universe_of`] would hold the previous observation across the hole --
+/// reclassifying a quarter of bars by a stale one with nothing recording that it happened.
+async fn read_reference_partition(
+    s3_client: &S3Client,
+    bucket: &str,
+    as_of: SessionDate,
+) -> Result<DataFrame, ArchiveError> {
+    let key = date_partitioned_key(REFERENCE_ARCHIVE_PREFIX, as_of.date());
+    read_partition(s3_client, bucket, &key)
+        .await?
+        .ok_or_else(|| ArchiveError::Read {
+            bucket: bucket.to_string(),
+            key,
+            message: "a listed reference partition was gone before it could be read".to_string(),
+        })
+}
+
 /// Names folded at once.
 ///
 /// Eight because the endpoint's throughput is the ceiling rather than ours: measured at roughly
@@ -3587,24 +3697,6 @@ pub async fn archive_boundaries(
     Ok(fetched.len())
 }
 
-/// Writes the ticker metadata that accompanies the archive.
-pub async fn archive_details(
-    s3_client: &S3Client,
-    bucket: &str,
-    csv: &str,
-) -> Result<(), ArchiveError> {
-    put_bytes(
-        s3_client,
-        bucket,
-        DETAILS_ARCHIVE_KEY,
-        csv.as_bytes().to_vec(),
-        "text/csv",
-    )
-    .await?;
-    info!(key = DETAILS_ARCHIVE_KEY, "Ticker metadata archived");
-    Ok(())
-}
-
 /// Reads one archived partition, distinguishing a missing object from a failed request.
 ///
 /// `Ok(None)` means the partition genuinely does not exist yet; every other failure propagates,
@@ -3864,35 +3956,66 @@ fn merge_partitions(existing: DataFrame, fetched: DataFrame) -> Result<DataFrame
     Ok(combined)
 }
 
-/// Puts bytes at `key`, matching the pattern `export::write_frame` uses for the other prefix.
-async fn put_bytes(
-    s3_client: &S3Client,
-    bucket: &str,
-    key: &str,
-    body: Vec<u8>,
-    content_type: &str,
-) -> Result<(), ArchiveError> {
-    s3_client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(body))
-        .content_type(content_type)
-        .send()
-        .await
-        .map_err(|error| ArchiveError::Write {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            message: error.to_string(),
-        })?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    fn as_of(year: i32, month: u32, day: u32) -> SessionDate {
+        SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).expect("a valid date"))
+    }
+
+    /// The quarterly grid the backfill actually wrote, so the selection is exercised against real
+    /// spacing rather than a convenient one.
+    fn grid() -> Vec<SessionDate> {
+        vec![
+            as_of(2021, 8, 23),
+            as_of(2021, 10, 1),
+            as_of(2022, 1, 3),
+            as_of(2022, 4, 1),
+            as_of(2022, 7, 1),
+        ]
+    }
+
+    /// A window opening mid-quarter must reach back for the observation that answers for its first
+    /// sessions. Taking only the observations inside the window leaves every name unclassified
+    /// until the next quarter begins, which reads as a thin archive rather than a bad read.
+    #[test]
+    fn test_the_window_opens_at_the_nearest_observation_at_or_before_it() {
+        let covering = covering_partitions(&grid(), as_of(2021, 11, 15), as_of(2022, 2, 10));
+
+        assert_eq!(covering, vec![as_of(2021, 10, 1), as_of(2022, 1, 3)]);
+    }
+
+    #[test]
+    fn test_an_observation_landing_exactly_on_the_start_is_the_opening_one() {
+        let covering = covering_partitions(&grid(), as_of(2022, 1, 3), as_of(2022, 4, 1));
+
+        assert_eq!(covering, vec![as_of(2022, 1, 3), as_of(2022, 4, 1)]);
+    }
+
+    /// Nothing precedes the window, so the opening sessions genuinely cannot be classified. The
+    /// earliest available is used rather than none, and the bars before it are dropped by the join.
+    #[test]
+    fn test_a_window_starting_before_every_observation_takes_the_earliest() {
+        let covering = covering_partitions(&grid(), as_of(2020, 1, 2), as_of(2021, 10, 1));
+
+        assert_eq!(covering, vec![as_of(2021, 8, 23), as_of(2021, 10, 1)]);
+    }
+
+    #[test]
+    fn test_a_window_after_every_observation_takes_only_the_last() {
+        let covering = covering_partitions(&grid(), as_of(2026, 9, 1), as_of(2026, 9, 17));
+
+        assert_eq!(covering, vec![as_of(2022, 7, 1)]);
+    }
+
+    #[test]
+    fn test_an_empty_archive_covers_nothing() {
+        assert!(covering_partitions(&[], as_of(2022, 1, 3), as_of(2022, 4, 1)).is_empty());
+    }
+
     use crate::common::alpaca::TradeTick;
     use crate::common::types::TradeConditions;
     use aws_smithy_http_client::test_util::infallible_client_fn;

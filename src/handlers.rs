@@ -23,6 +23,7 @@ use crate::common::journal::{
 use crate::common::massive::MassiveClient;
 use crate::common::types::{BarInterval, SessionDate};
 use crate::data::adjust::{SplitTable, SplitTableCache};
+use crate::data::archive;
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
 use crate::data::calendar::{CalendarCache, TradingCalendar};
 use crate::data::details;
@@ -93,6 +94,8 @@ pub struct ServiceState {
     massive: MassiveClient,
     s3_client: aws_sdk_s3::Client,
     records_bucket: String,
+    /// The shared `data/**` archive, which the nightly detail refresh reads its universe from.
+    archive_bucket: String,
     artifact_prefix: String,
     model_version: String,
     calendar_cache: CalendarCache,
@@ -128,6 +131,8 @@ impl ServiceState {
         let records_bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME").map_err(|_| {
             HandlerError::Configuration("AWS_S3_RECORDS_BUCKET_NAME is not set".to_string())
         })?;
+        let archive_bucket = crate::common::aws::archive_bucket()
+            .map_err(|error| HandlerError::Configuration(error.to_string()))?;
         let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
             .unwrap_or_else(|_| "models/tide/".to_string());
         let model_version = std::env::var("MODEL_VERSION").unwrap_or_else(|_| "latest".to_string());
@@ -141,6 +146,7 @@ impl ServiceState {
             massive,
             s3_client: crate::common::aws::s3_client().await,
             records_bucket,
+            archive_bucket,
             artifact_prefix,
             model_version,
             calendar_cache: CalendarCache::new(),
@@ -734,8 +740,21 @@ async fn handle_market_data_sync(
         )
         .await;
 
-    let detail_rows =
-        details::store_details(&state.pool, &details::parse_embedded_details()?).await?;
+    // Today's classification, not a point-in-time join: the screen's sector cap is a question about
+    // what a name is now, and the application only ever trades the current session.
+    //
+    // Warns rather than propagating, unlike the bars above. The bars are the half no provider can be
+    // re-asked about and they are already committed; a metadata refresh that is one night stale is a
+    // far better trade than a sync that returns here, leaving the close history cached stale and the
+    // export never requested.
+    let refreshed = refresh_equity_details(state).await;
+    let (detail_rows, detail_error) = match &refreshed {
+        Ok(rows) => (Some(*rows), None),
+        Err(error) => {
+            warn!(%error, "Equity detail refresh failed; the database keeps the previous universe");
+            (None, Some(error.to_string()))
+        }
+    };
 
     // The cached history now predates the rows just written, so it is dropped rather than
     // overwritten with an empty map -- an empty map keyed to today would pin "no history" for the
@@ -759,8 +778,24 @@ async fn handle_market_data_sync(
         "bars_fetched": fetched.bars.len(),
         "bar_rows_written": bar_rows,
         "detail_rows_written": detail_rows,
+        // The cause travels with the absence: a null row count and no reason would read exactly like
+        // a refresh that found nothing to write.
+        "detail_refresh_error": detail_error,
         "export_chained": true,
     }))
+}
+
+/// Replaces the stored ticker metadata from the archive's newest reference partition.
+///
+/// Lifted out of the sync so its failure is a value the caller decides about rather than a `?` that
+/// returns past the cache invalidation and the export.
+async fn refresh_equity_details(state: &ServiceState) -> Result<u64, HandlerError> {
+    let universe = archive::current_universe(&state.s3_client, &state.archive_bucket).await?;
+    Ok(details::store_details(
+        &state.pool,
+        &details::details_from_universe(universe.rows())?,
+    )
+    .await?)
 }
 
 /// Chained from a completed market data sync: seal the journal, export to S3, then purge.
