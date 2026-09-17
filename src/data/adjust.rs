@@ -54,6 +54,14 @@ impl AdjustmentFactor {
         (volume as f64 / self.0).round() as i64
     }
 
+    /// Shares outstanding restated onto this basis, kept in floating point.
+    ///
+    /// The same direction as volume, for the same reason. Unrounded because a market capitalization
+    /// is this multiplied by a price, where rounding a count in the billions moves real dollars.
+    pub fn apply_to_share_count(self, count: f64) -> f64 {
+        count / self.0
+    }
+
     pub fn value(self) -> f64 {
         self.0
     }
@@ -272,6 +280,36 @@ pub fn adjust_bars(
     Ok(adjusted)
 }
 
+/// Restates a joined frame's `shares_outstanding` onto `as_of`'s share basis.
+///
+/// Separate from [`adjust_bars`] because the count arrives on a later join than the prices do, and
+/// a second `adjust_bars` pass would restate those prices twice. A capitalization is split-invariant,
+/// so an adjusted price against a point-in-time count is wrong by the factor until this runs.
+pub fn adjust_share_counts(
+    frame: DataFrame,
+    table: &SplitTable,
+    as_of: SessionDate,
+) -> Result<DataFrame, PolarsError> {
+    if table.is_empty() {
+        return Ok(frame);
+    }
+
+    let factors = bar_factors(&frame, table, as_of)?;
+    let mut adjusted = frame;
+    let Ok(column) = adjusted.column("shares_outstanding") else {
+        return Ok(adjusted);
+    };
+    let scaled: Float64Chunked = column
+        .f64()?
+        .into_iter()
+        .zip(&factors)
+        .map(|(count, factor)| count.map(|count| factor.apply_to_share_count(count)))
+        .collect();
+    adjusted.with_column(scaled.into_series().with_name("shares_outstanding".into()))?;
+
+    Ok(adjusted)
+}
+
 /// One factor per row, in frame order.
 fn bar_factors(
     frame: &DataFrame,
@@ -334,6 +372,41 @@ mod tests {
         assert!(
             (factor.apply_to_price(96.38) - 48.19).abs() < 1e-9,
             "factor was {factor:?}"
+        );
+    }
+
+    /// A market capitalization is split-invariant, so restating the price without the count breaks it.
+    ///
+    /// `CRWD` split four-for-one on 2026-07-02, one of 120 materially-sized splits touching the
+    /// screened universe in a two-year window. Before this, a pre-split bar's size factor was out by
+    /// `ln(4)` — most of the cross-section's whole log-size spread.
+    #[test]
+    fn test_a_capitalization_does_not_step_across_a_split() {
+        let table = table(&[split("CRWD", "2026-07-02", 1.0, 4.0)]);
+        let before = table.factor_at("CRWD", session("2026-06-30"), session("2026-08-14"));
+        let after = table.factor_at("CRWD", session("2026-07-06"), session("2026-08-14"));
+
+        // Raw figures either side: the count quadruples as the price quarters, so the product holds.
+        let (raw_price, raw_count) = (480.0_f64, 250_000_000.0_f64);
+        let capitalization = |factor: AdjustmentFactor, price: f64, count: f64| {
+            factor.apply_to_price(price) * factor.apply_to_share_count(count)
+        };
+
+        let pre = capitalization(before, raw_price, raw_count);
+        let post = capitalization(after, raw_price / 4.0, raw_count * 4.0);
+
+        assert!(
+            (pre - 120_000_000_000.0).abs() < 1e-3,
+            "pre-split was {pre}"
+        );
+        assert!(
+            (pre - post).abs() < 1e-3,
+            "{pre} stepped to {post} at the split"
+        );
+        // The control: the price alone does step, which is what made the unadjusted count wrong.
+        assert!(
+            (before.apply_to_price(raw_price) - after.apply_to_price(raw_price)).abs() > 1.0,
+            "the fixture must cross a split that moves the price"
         );
     }
 
@@ -503,6 +576,68 @@ mod tests {
                 .abs()
                 < 1e-9,
             "the volume-weighted price is a price too"
+        );
+    }
+
+    /// The count arrives on a later join than the prices, so it needs its own pass over the frame.
+    #[test]
+    fn test_the_share_count_fold_scales_the_count_and_leaves_the_prices_alone() {
+        let table = table(&[split("MNST", "2026-08-11", 1.0, 2.0)]);
+        let mut frame = bars("MNST", "2026-06-26", 96.38, 1_000_000);
+        frame
+            .with_column(Column::new(
+                "shares_outstanding".into(),
+                vec![Some(1_000_000_000.0_f64)],
+            ))
+            .expect("the fixture must build");
+
+        let adjusted =
+            adjust_share_counts(frame, &table, session("2026-08-14")).expect("the fold must apply");
+
+        assert_eq!(
+            adjusted
+                .column("shares_outstanding")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            Some(2_000_000_000.0)
+        );
+        // Prices untouched, so running this after `adjust_bars` cannot restate them twice.
+        assert!(
+            (adjusted
+                .column("close_price")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                - 96.38)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// A null count must survive the fold as a null rather than becoming a number.
+    #[test]
+    fn test_the_share_count_fold_leaves_an_unreported_count_unmeasured() {
+        let table = table(&[split("MNST", "2026-08-11", 1.0, 2.0)]);
+        let mut frame = bars("MNST", "2026-06-26", 96.38, 1_000_000);
+        frame
+            .with_column(Column::new("shares_outstanding".into(), vec![None::<f64>]))
+            .expect("the fixture must build");
+
+        let adjusted =
+            adjust_share_counts(frame, &table, session("2026-08-14")).expect("the fold must apply");
+
+        assert_eq!(
+            adjusted
+                .column("shares_outstanding")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0),
+            None
         );
     }
 

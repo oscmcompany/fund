@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::common::aws::date_partitioned_key;
 use crate::common::types::{BarInterval, LiquidityFloor, SessionDate};
 use crate::data::{adjust, archive, bars, reference, truncate};
+use crate::laboratory::residual::{residual_returns, FactorSpecification, ResidualPanel};
 use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
 use crate::models::tide::predict;
@@ -29,6 +30,8 @@ pub enum DatasetError {
     Details(#[from] crate::data::details::DetailsError),
     #[error("failed to consolidate bars with their classification: {0}")]
     Consolidation(#[from] crate::models::tide::predict::PredictionError),
+    #[error("failed to residualize returns: {0}")]
+    Residual(#[from] crate::laboratory::residual::ResidualError),
     /// A window that cannot produce a dataset, named rather than returned empty.
     #[error("{0}")]
     Window(String),
@@ -63,6 +66,11 @@ pub struct DatasetFingerprint {
     /// before the reference backfill extended and one after, measure different sets of names and
     /// would otherwise be indistinguishable.
     pub reference_digest: Option<u64>,
+    /// The factor set the returns were residualized against, or `None` on a path that fits none.
+    ///
+    /// Load-bearing for the reason `liquidity_floor` is: two panels over the same window and a
+    /// different volatility lookback are different measurements, and every other field would agree.
+    pub factor_specification: Option<FactorSpecification>,
 }
 
 /// Folds a frame's contents into one value that changes when any cell does.
@@ -188,6 +196,7 @@ pub async fn intraday(
             boundaries: adjustments.boundaries_digest,
             reference: None,
         },
+        None,
     )?;
 
     Ok(IntradayDataset { bars, fingerprint })
@@ -214,6 +223,34 @@ pub async fn returns(
         returns: cleaned,
         fingerprint,
     })
+}
+
+/// One window's returns with the cross-section's common movement stripped out.
+pub struct ResidualDataset {
+    pub panel: ResidualPanel,
+    pub fingerprint: DatasetFingerprint,
+}
+
+/// Reads the same window as [`returns`] and residualizes it against the declared factor set.
+///
+/// The fingerprint names the specification, so a study quoting a figure off this panel is quoting
+/// the factor set as well as the window. The panel's own refusal counts travel with it, because a
+/// residual defined on part of the cross-section reads exactly like one defined on all of it.
+pub async fn residuals(
+    s3_client: &S3Client,
+    bucket: &str,
+    lookback_days: i64,
+    session: SessionDate,
+    specification: FactorSpecification,
+) -> Result<ResidualDataset, DatasetError> {
+    let ReturnsDataset {
+        returns,
+        mut fingerprint,
+    } = self::returns(s3_client, bucket, lookback_days, session).await?;
+    let panel = residual_returns(&returns, specification)?;
+    fingerprint.factor_specification = Some(specification);
+
+    Ok(ResidualDataset { panel, fingerprint })
 }
 
 /// Everything both paths share: the archive read, the folds applied to it, and its identity.
@@ -252,6 +289,9 @@ async fn read_window(
     let reference_digest = digest_of(universe.rows())?;
     let consolidated =
         reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;
+    // The prices arrived restated onto this session's share basis and the counts did not, so their
+    // product is out by the split factor until this runs.
+    let consolidated = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
     let floor = LiquidityFloor::CURRENT;
     let filtered = filter_training_bars(consolidated, floor)?;
 
@@ -265,6 +305,7 @@ async fn read_window(
             boundaries: adjustments.boundaries_digest,
             reference: Some(reference_digest),
         },
+        None,
     )?;
 
     Ok((filtered, fingerprint))
@@ -330,6 +371,7 @@ fn fingerprint_of(
     lookback_days: i64,
     liquidity_floor: Option<LiquidityFloor>,
     digests: Digests,
+    factor_specification: Option<FactorSpecification>,
 ) -> Result<DatasetFingerprint, DatasetError> {
     let timestamps = frame.column("timestamp")?.i64()?;
     let tickers = frame.column("ticker")?.str()?;
@@ -348,6 +390,7 @@ fn fingerprint_of(
         splits_digest: digests.splits,
         boundaries_digest: digests.boundaries,
         reference_digest: digests.reference,
+        factor_specification,
     })
 }
 
@@ -591,11 +634,12 @@ mod tests {
         let strict = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
         let loose = LiquidityFloor::new(1.0, 1_000_000.0).unwrap();
 
-        let unscreened = fingerprint_of(&rows, session, 365, None, digests(0xAB, 0xCD)).unwrap();
+        let unscreened =
+            fingerprint_of(&rows, session, 365, None, digests(0xAB, 0xCD), None).unwrap();
         let strictly =
-            fingerprint_of(&rows, session, 365, Some(strict), digests(0xAB, 0xCD)).unwrap();
+            fingerprint_of(&rows, session, 365, Some(strict), digests(0xAB, 0xCD), None).unwrap();
         let loosely =
-            fingerprint_of(&rows, session, 365, Some(loose), digests(0xAB, 0xCD)).unwrap();
+            fingerprint_of(&rows, session, 365, Some(loose), digests(0xAB, 0xCD), None).unwrap();
 
         assert_eq!(
             strictly.rows, loosely.rows,
@@ -629,6 +673,7 @@ mod tests {
                     boundaries: 0xCD,
                     reference,
                 },
+                None,
             )
             .unwrap()
         };
@@ -659,6 +704,7 @@ mod tests {
             365,
             None,
             digests(0xAB, 0xCD),
+            None,
         )
         .unwrap();
 
@@ -674,6 +720,44 @@ mod tests {
         );
         assert_eq!(fingerprint.splits_digest, 0xAB);
         assert_eq!(fingerprint.boundaries_digest, 0xCD);
+    }
+
+    /// A factor set is an input to the result, exactly as the liquidity floor is. Two panels over
+    /// the same window and a different lookback measure different things and must not read as one.
+    #[test]
+    fn test_two_factor_specifications_over_the_same_rows_do_not_share_a_fingerprint() {
+        const DAY: i64 = 86_400_000;
+        let rows = frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]);
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap());
+        let with = |specification| {
+            fingerprint_of(
+                &rows,
+                session,
+                365,
+                None,
+                digests(0xAB, 0xCD),
+                specification,
+            )
+            .unwrap()
+        };
+
+        // Literals rather than `FactorSpecification::CURRENT`, so this keeps failing if it moves.
+        let unfitted = with(None);
+        let short = with(FactorSpecification::new(20, 0.5));
+        let long = with(FactorSpecification::new(60, 0.5));
+        let strict = with(FactorSpecification::new(60, 0.75));
+
+        assert_eq!(
+            short.rows, long.rows,
+            "the fixture must isolate the factors"
+        );
+        assert_ne!(short, long, "two lookbacks must not share a fingerprint");
+        assert_ne!(
+            long, strict,
+            "two variance shares must not share one either"
+        );
+        assert_ne!(unfitted, long, "fitting and not fitting must differ");
+        assert_eq!(unfitted.factor_specification, None);
     }
 
     /// The two table sizes are the whole reason the fingerprint is not just a row count: a
@@ -702,6 +786,7 @@ mod tests {
             365,
             None,
             digests(digest_of(&before).unwrap(), 0),
+            None,
         )
         .unwrap();
         let after = fingerprint_of(
@@ -710,6 +795,7 @@ mod tests {
             365,
             None,
             digests(digest_of(&after).unwrap(), 0),
+            None,
         )
         .unwrap();
 
