@@ -48,6 +48,11 @@ SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => 
 --
 -- Seeded from the archive's reference dataset via seed_equity_details; refreshed by the post-close
 -- market data sync.
+--
+-- Both columns hold a Fama-French bucket short name -- sector one of twelve, industry one of
+-- forty-nine -- looked up from the whole four-digit SIC code, never sliced from it. The default
+-- spells the absence of a SIC code rather than naming a group, and 'Other' is a real bucket that
+-- must not be confused with it; src/data/industry.rs is the only thing that reads either back.
 CREATE TABLE IF NOT EXISTS equity_details (
     ticker    TEXT NOT NULL PRIMARY KEY,
     sector    TEXT NOT NULL DEFAULT 'NOT AVAILABLE',

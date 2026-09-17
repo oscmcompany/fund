@@ -1013,11 +1013,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL", "GOOG"]),
-            Column::new("sector".into(), vec![Some("Technology"), None::<&str>]),
-            Column::new(
-                "industry".into(),
-                vec![Some("Consumer Electronics"), Some("Internet")],
-            ),
+            Column::new("sector".into(), vec![Some("BusEq"), None::<&str>]),
+            Column::new("industry".into(), vec![Some("Hardw"), Some("Softw")]),
         ])
         .unwrap();
 
@@ -1052,8 +1049,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL", "GOOG"]),
-            Column::new("sector".into(), vec!["Technology", "Technology"]),
-            Column::new("industry".into(), vec!["Consumer Electronics", "Internet"]),
+            Column::new("sector".into(), vec!["BusEq", "BusEq"]),
+            Column::new("industry".into(), vec!["Hardw", "Softw"]),
         ])
         .unwrap();
 
@@ -1079,8 +1076,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL"]),
-            Column::new("sector".into(), vec!["Technology"]),
-            Column::new("industry".into(), vec!["Consumer Electronics"]),
+            Column::new("sector".into(), vec!["BusEq"]),
+            Column::new("industry".into(), vec!["Hardw"]),
         ])
         .unwrap();
 
@@ -1109,8 +1106,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL"]),
-            Column::new("sector".into(), vec!["Technology"]),
-            Column::new("industry".into(), vec!["Consumer Electronics"]),
+            Column::new("sector".into(), vec!["BusEq"]),
+            Column::new("industry".into(), vec!["Hardw"]),
         ])
         .unwrap();
 
@@ -1137,8 +1134,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["BCPC"]),
-            Column::new("sector".into(), vec!["Industrials"]),
-            Column::new("industry".into(), vec!["Specialty Chemicals"]),
+            Column::new("sector".into(), vec!["Manuf"]),
+            Column::new("industry".into(), vec!["Chems"]),
         ])
         .unwrap();
 
@@ -1188,8 +1185,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL"]),
-            Column::new("sector".into(), vec!["Technology"]),
-            Column::new("industry".into(), vec!["Consumer Electronics"]),
+            Column::new("sector".into(), vec!["BusEq"]),
+            Column::new("industry".into(), vec!["Hardw"]),
         ])
         .unwrap();
 
@@ -1372,8 +1369,8 @@ mod tests {
 
         let details = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL"]),
-            Column::new("sector".into(), vec!["Technology"]),
-            Column::new("industry".into(), vec!["Consumer Electronics"]),
+            Column::new("sector".into(), vec!["BusEq"]),
+            Column::new("industry".into(), vec!["Hardw"]),
         ])
         .unwrap();
 

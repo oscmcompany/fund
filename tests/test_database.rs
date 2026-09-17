@@ -10,6 +10,7 @@ use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, EquityDetail, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
+use fund::data::industry_table::Sector;
 use fund::data::truncate::BoundaryTable;
 use fund::data::universe;
 
@@ -54,16 +55,23 @@ async fn fresh_pool() -> PgPool {
 #[serial]
 async fn test_storing_details_replaces_the_table_rather_than_merging_into_it() {
     let pool = fresh_pool().await;
-    let detail = |symbol: &str, sector: &str| {
-        EquityDetail::new(ticker(symbol), sector.to_string(), "3571".to_string())
+    let detail = |symbol: &str, sector: Sector| {
+        EquityDetail::new(
+            ticker(symbol),
+            sector.as_str().to_string(),
+            "Hardw".to_string(),
+        )
     };
 
-    fund::data::details::store_details(&pool, &[detail("AAPL", "35"), detail("TWTR", "73")])
-        .await
-        .expect("the first snapshot must store");
+    fund::data::details::store_details(
+        &pool,
+        &[detail("AAPL", Sector::BusEq), detail("TWTR", Sector::Other)],
+    )
+    .await
+    .expect("the first snapshot must store");
 
     // TWTR is gone from the second snapshot, and AAPL's sector has been restated.
-    let written = fund::data::details::store_details(&pool, &[detail("AAPL", "36")])
+    let written = fund::data::details::store_details(&pool, &[detail("AAPL", Sector::Manuf)])
         .await
         .expect("the second snapshot must store");
 
@@ -72,7 +80,7 @@ async fn test_storing_details_replaces_the_table_rather_than_merging_into_it() {
         .await
         .expect("the sectors must load");
     assert_eq!(stored.len(), 1, "the departed name must not survive");
-    assert_eq!(stored.get(&ticker("AAPL")).map(String::as_str), Some("36"));
+    assert_eq!(stored.get(&ticker("AAPL")), Some(&Some(Sector::Manuf)));
     assert!(stored.get(&ticker("TWTR")).is_none());
 }
 
@@ -764,11 +772,23 @@ async fn test_every_event_type_round_trips_through_the_trigger() {
 #[serial]
 async fn test_sectors_load_as_a_lookup_map() {
     let pool = fresh_pool().await;
-    common::seed_details(&pool, &[("AAAA", "Technology"), ("BBBB", "Utilities")]).await;
+    common::seed_details(
+        &pool,
+        &[
+            ("AAAA", "BusEq"),
+            ("BBBB", "Utils"),
+            ("CCCC", "NOT AVAILABLE"),
+        ],
+    )
+    .await;
 
     let sectors = fund::data::details::load_sectors(&pool).await.unwrap();
-    assert_eq!(sectors.len(), 2);
-    assert_eq!(sectors[&ticker("AAAA")], "Technology");
+    assert_eq!(sectors.len(), 3);
+    assert_eq!(sectors[&ticker("AAAA")], Some(Sector::BusEq));
+    // Present with no sector, which is the feed declining to classify the name. Distinct from a
+    // ticker absent from the map, which is one outside the universe.
+    assert_eq!(sectors[&ticker("CCCC")], None);
+    assert!(!sectors.contains_key(&ticker("DDDD")));
 }
 
 /// A pair identifier is stored as text and parsed back on read. A leg whose symbol contains a dot

@@ -14,6 +14,8 @@ pub mod conditions;
 pub mod conditions_table;
 pub mod details;
 pub mod export;
+pub mod industry;
+pub mod industry_table;
 pub mod purge;
 pub mod quotes;
 pub mod reference;

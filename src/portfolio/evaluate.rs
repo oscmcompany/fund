@@ -28,6 +28,7 @@ use crate::common::types::{
 };
 use crate::data::calendar::TradingCalendar;
 use crate::data::details::{self, DetailsError};
+use crate::data::industry_table::Sector;
 use crate::data::universe::Universe;
 use crate::models::tide::predict;
 use crate::portfolio::account::{self, AccountError};
@@ -1301,7 +1302,10 @@ pub struct ScreenedUniverse {
     pub predictions_available: usize,
     /// Every ticker's sector, not just the screened ones. `select_disjoint` needs the held legs
     /// too, and those are filtered out of `inputs` before it ever sees them.
-    pub sectors: HashMap<Ticker, String>,
+    ///
+    /// A present `None` is a name the feed gave no SIC code, which is still in the universe and
+    /// still tradeable; only an absent key is outside it, and that is what `NoSector` reports.
+    pub sectors: HashMap<Ticker, Option<Sector>>,
 }
 
 /// Assembles the screen's inputs, fetching only the prices the exit half did not already have.
