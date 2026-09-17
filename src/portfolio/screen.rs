@@ -1695,7 +1695,7 @@ mod tests {
     /// Both legs sit in the sector, so each pair spends two of the six legs on offer.
     #[test]
     fn test_selection_stops_at_the_sector_cap() {
-        let (candidates, sectors) = same_sector_candidates(6, Some(Sector::BusEq));
+        let (candidates, sectors) = same_sector_candidates(6, Some(Sector::BusinessEquipment));
 
         let selected = select_disjoint(&candidates, 10, &HashSet::new(), &sectors);
 
@@ -1724,8 +1724,8 @@ mod tests {
             .iter()
             .flat_map(|(long, short)| {
                 [
-                    (long.as_str(), Some(Sector::BusEq)),
-                    (short.as_str(), Some(Sector::Hlth)),
+                    (long.as_str(), Some(Sector::BusinessEquipment)),
+                    (short.as_str(), Some(Sector::Healthcare)),
                 ]
             })
             .collect();
@@ -1744,13 +1744,13 @@ mod tests {
     /// fresh allowance every five minutes.
     #[test]
     fn test_the_cap_counts_legs_already_held() {
-        let (candidates, mut sectors) = same_sector_candidates(3, Some(Sector::BusEq));
+        let (candidates, mut sectors) = same_sector_candidates(3, Some(Sector::BusinessEquipment));
         let held: HashSet<Ticker> = ["HELDA", "HELDB", "HELDC", "HELDD"]
             .iter()
             .map(|symbol| ticker(symbol))
             .collect();
         for symbol in ["HELDA", "HELDB", "HELDC", "HELDD"] {
-            sectors.insert(ticker(symbol), Some(Sector::BusEq));
+            sectors.insert(ticker(symbol), Some(Sector::BusinessEquipment));
         }
 
         let selected = select_disjoint(&candidates, 10, &held, &sectors);
@@ -1766,7 +1766,7 @@ mod tests {
     /// and still blocks re-entry through the disjointness check.
     #[test]
     fn test_a_held_ticker_without_a_sector_does_not_consume_an_allowance() {
-        let (candidates, sectors) = same_sector_candidates(3, Some(Sector::BusEq));
+        let (candidates, sectors) = same_sector_candidates(3, Some(Sector::BusinessEquipment));
         let held: HashSet<Ticker> = ["ZZZZ"].iter().map(|symbol| ticker(symbol)).collect();
 
         let selected = select_disjoint(&candidates, 10, &held, &sectors);
@@ -1830,7 +1830,7 @@ mod tests {
     /// ticker with no sector upstream, so what this pins is that the cap is the only thing capping.
     #[test]
     fn test_an_empty_sector_map_constrains_nothing() {
-        let (candidates, _) = same_sector_candidates(5, Some(Sector::BusEq));
+        let (candidates, _) = same_sector_candidates(5, Some(Sector::BusinessEquipment));
 
         let selected = select_disjoint(&candidates, 10, &HashSet::new(), &HashMap::new());
 

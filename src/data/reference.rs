@@ -430,14 +430,14 @@ mod tests {
         let industries = universe.rows().column("industry").unwrap().str().unwrap();
 
         // Rows come back ordered by ticker, not in the order the partition listed them.
-        assert_eq!(sectors.get(0), Some("BusEq"));
-        assert_eq!(industries.get(0), Some("Hardw"));
+        assert_eq!(sectors.get(0), Some("BusinessEquipment"));
+        assert_eq!(industries.get(0), Some("Computers"));
         // The leading zero is significant, which is why the code is stored as a string.
-        assert_eq!(sectors.get(1), Some("NoDur"));
-        assert_eq!(industries.get(1), Some("Agric"));
+        assert_eq!(sectors.get(1), Some("ConsumerNondurables"));
+        assert_eq!(industries.get(1), Some("Agriculture"));
         // Split from AAPL by the major group, joined to it here.
-        assert_eq!(sectors.get(2), Some("BusEq"));
-        assert_eq!(industries.get(2), Some("Softw"));
+        assert_eq!(sectors.get(2), Some("BusinessEquipment"));
+        assert_eq!(industries.get(2), Some("ComputerSoftware"));
     }
 
     /// 901 of 5,217 common stocks carry no SIC, measured 2026-09-17. Spelling the gap keeps them in
@@ -492,8 +492,8 @@ mod tests {
 
         let industries = joined.column("industry").unwrap().str().unwrap();
         assert_eq!(joined.height(), 2);
-        assert_eq!(industries.get(0), Some("Hardw"));
-        assert_eq!(industries.get(1), Some("Softw"));
+        assert_eq!(industries.get(0), Some("Computers"));
+        assert_eq!(industries.get(1), Some("ComputerSoftware"));
     }
 
     /// The survivorship fix itself. A name that traded and then delisted keeps the sessions it
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(joined.height(), 1, "a 404 is not a delisting");
         assert_eq!(
             joined.column("industry").unwrap().str().unwrap().get(0),
-            Some("Hardw")
+            Some("Computers")
         );
     }
 

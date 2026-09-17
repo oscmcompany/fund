@@ -59,28 +59,35 @@ async fn test_storing_details_replaces_the_table_rather_than_merging_into_it() {
         EquityDetail::new(
             ticker(symbol),
             sector.as_str().to_string(),
-            "Hardw".to_string(),
+            "Computers".to_string(),
         )
     };
 
     fund::data::details::store_details(
         &pool,
-        &[detail("AAPL", Sector::BusEq), detail("TWTR", Sector::Other)],
+        &[
+            detail("AAPL", Sector::BusinessEquipment),
+            detail("TWTR", Sector::Other),
+        ],
     )
     .await
     .expect("the first snapshot must store");
 
     // TWTR is gone from the second snapshot, and AAPL's sector has been restated.
-    let written = fund::data::details::store_details(&pool, &[detail("AAPL", Sector::Manuf)])
-        .await
-        .expect("the second snapshot must store");
+    let written =
+        fund::data::details::store_details(&pool, &[detail("AAPL", Sector::Manufacturing)])
+            .await
+            .expect("the second snapshot must store");
 
     assert_eq!(written, 1);
     let stored = fund::data::details::load_sectors(&pool)
         .await
         .expect("the sectors must load");
     assert_eq!(stored.len(), 1, "the departed name must not survive");
-    assert_eq!(stored.get(&ticker("AAPL")), Some(&Some(Sector::Manuf)));
+    assert_eq!(
+        stored.get(&ticker("AAPL")),
+        Some(&Some(Sector::Manufacturing))
+    );
     assert!(stored.get(&ticker("TWTR")).is_none());
 }
 
@@ -775,20 +782,29 @@ async fn test_sectors_load_as_a_lookup_map() {
     common::seed_details(
         &pool,
         &[
-            ("AAAA", "BusEq"),
-            ("BBBB", "Utils"),
+            ("AAAA", "BusinessEquipment"),
+            ("BBBB", "Utilities"),
             ("CCCC", "NOT AVAILABLE"),
+            // A two-digit major group, which is what rows written before this change carry.
+            ("DDDD", "35"),
+            // The source's own short code, which is not the stored spelling.
+            ("EEEE", "BusEq"),
         ],
     )
     .await;
 
     let sectors = fund::data::details::load_sectors(&pool).await.unwrap();
-    assert_eq!(sectors.len(), 3);
-    assert_eq!(sectors[&ticker("AAAA")], Some(Sector::BusEq));
+    assert_eq!(sectors.len(), 5);
+    assert_eq!(sectors[&ticker("AAAA")], Some(Sector::BusinessEquipment));
+    assert_eq!(sectors[&ticker("BBBB")], Some(Sector::Utilities));
     // Present with no sector, which is the feed declining to classify the name. Distinct from a
     // ticker absent from the map, which is one outside the universe.
     assert_eq!(sectors[&ticker("CCCC")], None);
-    assert!(!sectors.contains_key(&ticker("DDDD")));
+    // Stale rows read as unclassified rather than as some sector, which is what keeps the window
+    // between deploy and the first post-close refresh conservative instead of wrong.
+    assert_eq!(sectors[&ticker("DDDD")], None);
+    assert_eq!(sectors[&ticker("EEEE")], None);
+    assert!(!sectors.contains_key(&ticker("FFFF")));
 }
 
 /// A pair identifier is stored as text and parsed back on read. A leg whose symbol contains a dot

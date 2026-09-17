@@ -601,14 +601,14 @@ mod tests {
     /// read as "no idiosyncratic move".
     #[test]
     fn test_a_name_alone_in_its_sector_is_refused_rather_than_given_a_residual_of_zero() {
-        let mut rows = panel(&[Sector::Manuf, Sector::BusEq], 8);
+        let mut rows = panel(&[Sector::Manufacturing, Sector::BusinessEquipment], 8);
         for session in 0..4i64 {
             rows.push((
                 "SOLO",
                 session,
                 50.0,
                 Some(2.0e6),
-                Sector::Money.as_str(),
+                Sector::Finance.as_str(),
                 Some(0.02),
             ));
         }
@@ -648,7 +648,14 @@ mod tests {
     /// fails, the sector coefficient is not the sector's own mean.
     #[test]
     fn test_residuals_sum_to_zero_within_each_sector() {
-        let rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         let computed = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
         assert!(computed.measured > 0, "the fixture must measure something");
@@ -697,7 +704,14 @@ mod tests {
     /// The residual is orthogonal to both continuous factors, which is what "stripped" means.
     #[test]
     fn test_the_residual_is_orthogonal_to_size_and_to_volatility() {
-        let rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         let computed = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
         // Both loadings rebuilt the way the fit reads them: the *prior* session's close times its
@@ -764,7 +778,14 @@ mod tests {
     /// reach the answer. A size built from the session's own close would be circular.
     #[test]
     fn test_the_session_being_explained_does_not_price_its_own_size() {
-        let rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         let baseline = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
         // Exactly one respect differs: the close on the last session, which is the only session the
@@ -794,7 +815,14 @@ mod tests {
     /// this, the invariance test above would pass on a function that ignored size entirely.
     #[test]
     fn test_changing_a_prior_close_does_move_the_residual() {
-        let rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         let baseline = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
         let mut moved = rows.clone();
@@ -818,7 +846,7 @@ mod tests {
     /// property is that absence. Pooling them would remove a return they never shared.
     #[test]
     fn test_a_name_with_no_sic_code_is_refused_rather_than_pooled_with_the_others() {
-        let mut rows = panel(&[Sector::Manuf, Sector::BusEq], 8);
+        let mut rows = panel(&[Sector::Manufacturing, Sector::BusinessEquipment], 8);
         for name in 0..3 {
             let ticker: &'static str = Box::leak(format!("U{name}").into_boxed_str());
             for session in 0..4i64 {
@@ -851,7 +879,14 @@ mod tests {
     /// names their size, and must not cost their sector peers anything.
     #[test]
     fn test_a_missing_share_count_refuses_the_name_and_leaves_its_peers_measured() {
-        let mut rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let mut rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         for row in rows.iter_mut() {
             if row.0 == "T01" {
                 row.3 = None;
@@ -884,7 +919,14 @@ mod tests {
     /// A volatility fitted on three observations is a different quantity from one fitted on sixty.
     #[test]
     fn test_a_short_lookback_is_refused_rather_than_fitted_on_what_is_there() {
-        let rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
 
         let computed = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
@@ -905,7 +947,14 @@ mod tests {
     /// carrying a factor measured over a longer horizon than the one the column is named for.
     #[test]
     fn test_a_window_spanning_a_gap_is_refused_rather_than_measured_over_a_longer_horizon() {
-        let full = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let full = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         // Exactly one respect differs: T00 loses session 1, so its remaining rows are compacted and
         // sessions 2 and 3 would otherwise take a two-session window spanning three sessions.
         let gapped: Vec<Row<'_>> = full
@@ -947,10 +996,17 @@ mod tests {
     /// The control for the test above: a gap in one name must not cost its peers anything.
     #[test]
     fn test_a_gap_in_one_name_leaves_the_rest_of_the_cross_section_measured() {
-        let gapped: Vec<Row<'_>> = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8)
-            .into_iter()
-            .filter(|row| !(row.0 == "T00" && row.1 == 1))
-            .collect();
+        let gapped: Vec<Row<'_>> = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        )
+        .into_iter()
+        .filter(|row| !(row.0 == "T00" && row.1 == 1))
+        .collect();
 
         let computed =
             residual_returns(&frame(&gapped), specification()).expect("the fit must run");
@@ -969,7 +1025,14 @@ mod tests {
     /// fit went ahead on a coefficient amplified by `1/3e-28`.
     #[test]
     fn test_a_cross_section_with_no_variation_in_size_is_refused_rather_than_solved() {
-        let mut rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let mut rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         for row in rows.iter_mut() {
             row.2 = 100.0;
             row.3 = Some(1.0e6);
@@ -987,7 +1050,14 @@ mod tests {
     /// The other arm: both factors vary, but only together, so neither is separately identified.
     #[test]
     fn test_two_factors_that_move_only_together_are_refused() {
-        let mut rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let mut rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         for row in rows.iter_mut() {
             row.3 = Some(1.0e6);
             // Volatility made an exact affine function of *log size*, with the returns scaled so
@@ -1008,7 +1078,14 @@ mod tests {
     /// An estimator defined on part of its input reads exactly like a complete one without this.
     #[test]
     fn test_the_undefined_share_is_reported_and_the_refusals_account_for_every_row() {
-        let rows = panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8);
+        let rows = panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        );
         let computed = residual_returns(&frame(&rows), specification()).expect("the fit must run");
 
         let refused: usize = computed.refused.values().sum();
@@ -1031,7 +1108,14 @@ mod tests {
     /// must leave the rest alone; if it refused nothing, the guard would be unfalsifiable.
     #[test]
     fn test_raising_the_variance_share_refuses_the_corner_of_the_design() {
-        let rows = frame(&panel(&[Sector::Manuf, Sector::BusEq, Sector::Money], 8));
+        let rows = frame(&panel(
+            &[
+                Sector::Manufacturing,
+                Sector::BusinessEquipment,
+                Sector::Finance,
+            ],
+            8,
+        ));
 
         let loose = residual_returns(&rows, specification()).expect("the fit must run");
         let strict = residual_returns(

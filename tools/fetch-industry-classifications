@@ -59,6 +59,97 @@ from datetime import date
 
 work, output = sys.argv[1], sys.argv[2]
 
+# The name each bucket is spelled with, keyed by the source's own short code.
+#
+# Curated rather than derived, because neither end of the source is usable on its own: the short
+# codes are abbreviations ("Enrgy", "Hshld", "RlEst") and the full labels are descriptions that would
+# read as "OilGasAndCoalExtractionAndProducts". These are the shortest full-word names that keep the
+# label's meaning; the label itself is carried verbatim onto each variant's doc comment, so nothing
+# the source says is lost. Asserted complete below, so a bucket added upstream fails the generation
+# rather than quietly falling back to an abbreviation.
+SECTOR_NAMES = {
+    "NoDur": "ConsumerNondurables",
+    "Durbl": "ConsumerDurables",
+    "Manuf": "Manufacturing",
+    "Enrgy": "Energy",
+    "Chems": "Chemicals",
+    "BusEq": "BusinessEquipment",
+    "Telcm": "Telecommunications",
+    "Utils": "Utilities",
+    "Shops": "WholesaleAndRetail",
+    "Hlth": "Healthcare",
+    "Money": "Finance",
+    "Other": "Other",
+}
+
+INDUSTRY_NAMES = {
+    "Agric": "Agriculture",
+    "Food": "FoodProducts",
+    "Soda": "CandyAndSoda",
+    "Beer": "BeerAndLiquor",
+    "Smoke": "TobaccoProducts",
+    "Toys": "Recreation",
+    "Fun": "Entertainment",
+    "Books": "PrintingAndPublishing",
+    "Hshld": "ConsumerGoods",
+    "Clths": "Apparel",
+    "Hlth": "Healthcare",
+    "MedEq": "MedicalEquipment",
+    "Drugs": "PharmaceuticalProducts",
+    "Chems": "Chemicals",
+    "Rubbr": "RubberAndPlasticProducts",
+    "Txtls": "Textiles",
+    "BldMt": "ConstructionMaterials",
+    "Cnstr": "Construction",
+    "Steel": "SteelWorks",
+    "FabPr": "FabricatedProducts",
+    "Mach": "Machinery",
+    "ElcEq": "ElectricalEquipment",
+    "Autos": "AutomobilesAndTrucks",
+    "Aero": "Aircraft",
+    "Ships": "ShipbuildingAndRailroadEquipment",
+    "Guns": "Defense",
+    "Gold": "PreciousMetals",
+    "Mines": "NonMetallicAndIndustrialMetalMining",
+    "Coal": "Coal",
+    "Oil": "PetroleumAndNaturalGas",
+    "Util": "Utilities",
+    "Telcm": "Communication",
+    "PerSv": "PersonalServices",
+    "BusSv": "BusinessServices",
+    "Hardw": "Computers",
+    "Softw": "ComputerSoftware",
+    "Chips": "ElectronicEquipment",
+    "LabEq": "MeasuringAndControlEquipment",
+    "Paper": "BusinessSupplies",
+    "Boxes": "ShippingContainers",
+    "Trans": "Transportation",
+    "Whlsl": "Wholesale",
+    "Rtail": "Retail",
+    "Meals": "RestaurantsHotelsMotels",
+    "Banks": "Banking",
+    "Insur": "Insurance",
+    "RlEst": "RealEstate",
+    "Fin": "Trading",
+    "Other": "Other",
+}
+
+
+def named(buckets, names, granularity):
+    """Attaches the spelled-out name to each bucket, refusing a source the map does not cover."""
+    missing = [bucket["code"] for bucket in buckets if bucket["code"] not in names]
+    if missing:
+        sys.exit(
+            f"Error: Siccodes{granularity} names buckets the generator has no full name for: "
+            f"{missing}. Add them to the map above rather than letting an abbreviation through."
+        )
+    for bucket in buckets:
+        bucket["name"] = names[bucket["code"]]
+    spelled = [bucket["name"] for bucket in buckets]
+    if len(set(spelled)) != len(spelled):
+        sys.exit(f"Error: two Siccodes{granularity} buckets spell the same name: {spelled}")
+    return buckets
+
 
 def parse(granularity):
     """The buckets in file order, each with the SIC ranges assigned to it.
@@ -108,9 +199,7 @@ def overlaps(buckets, granularity):
     about a name for a reason no reader could see.
     """
     spans = [
-        (low, high, bucket["code"])
-        for bucket in buckets
-        for (low, high) in bucket["ranges"]
+        (low, high, bucket["name"]) for bucket in buckets for (low, high) in bucket["ranges"]
     ]
     spans.sort()
     for (low, high, code), (next_low, next_high, next_code) in zip(spans, spans[1:]):
@@ -136,30 +225,30 @@ def render_enum(name, buckets, doc, fallback_doc):
             lines.extend(f"    /// {line}" for line in fallback_doc)
         else:
             lines.append(f"    /// {label}")
-        lines.append(f"    {bucket['code']},")
+        lines.append(f"    {bucket['name']},")
     lines.append("}")
     lines.append("")
     lines.append(f"impl {name} {{")
-    lines.append("    /// The source's own short name, which is the stored form.")
+    lines.append("    /// The stored form, which round-trips through the module's decode.")
     lines.append("    pub fn as_str(&self) -> &'static str {")
     lines.append("        match self {")
     for bucket in buckets:
-        lines.append(f'            {name}::{bucket["code"]} => "{bucket["code"]}",')
+        lines.append(f'            {name}::{bucket["name"]} => "{bucket["name"]}",')
     lines.append("        }")
     lines.append("    }")
     lines.append("")
     lines.append("    /// Every bucket, in the source's own order.")
     lines.append(f"    pub const ALL: [{name}; {len(buckets)}] = [")
     for bucket in buckets:
-        lines.append(f"        {name}::{bucket['code']},")
+        lines.append(f"        {name}::{bucket['name']},")
     lines.append("    ];")
     lines.append("}")
     lines.append("")
     return lines
 
 
-sectors = parse(12)
-industries = parse(49)
+sectors = named(parse(12), SECTOR_NAMES, 12)
+industries = named(parse(49), INDUSTRY_NAMES, 49)
 sector_spans = overlaps(sectors, 12)
 industry_spans = overlaps(industries, 49)
 

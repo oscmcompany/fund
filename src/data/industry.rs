@@ -96,18 +96,18 @@ mod tests {
     #[test]
     fn test_the_major_group_pairs_resolve_correctly() {
         // Split by the major group -- computers is 35, prepackaged software is 73 -- and joined here.
-        assert_eq!(sector_of(&sic("3571")), Sector::BusEq);
-        assert_eq!(sector_of(&sic("7372")), Sector::BusEq);
+        assert_eq!(sector_of(&sic("3571")), Sector::BusinessEquipment);
+        assert_eq!(sector_of(&sic("7372")), Sector::BusinessEquipment);
 
         // Merged by the major group: construction machinery is also 35.
-        assert_eq!(sector_of(&sic("3531")), Sector::Manuf);
+        assert_eq!(sector_of(&sic("3531")), Sector::Manufacturing);
 
         // Split by the major group -- pharmaceuticals is 28, medical instruments is 38.
-        assert_eq!(sector_of(&sic("2834")), Sector::Hlth);
-        assert_eq!(sector_of(&sic("3841")), Sector::Hlth);
+        assert_eq!(sector_of(&sic("2834")), Sector::Healthcare);
+        assert_eq!(sector_of(&sic("3841")), Sector::Healthcare);
 
         // Merged by the major group: industrial gases is also 28.
-        assert_eq!(sector_of(&sic("2813")), Sector::Chems);
+        assert_eq!(sector_of(&sic("2813")), Sector::Chemicals);
     }
 
     /// A code inside no published range lands in the catch-all rather than failing.
@@ -120,8 +120,8 @@ mod tests {
     /// The finer granularity separates names the sector deliberately holds together.
     #[test]
     fn test_the_industry_is_finer_than_the_sector() {
-        assert_eq!(sector_of(&sic("3571")), Sector::BusEq);
-        assert_eq!(sector_of(&sic("7372")), Sector::BusEq);
+        assert_eq!(sector_of(&sic("3571")), Sector::BusinessEquipment);
+        assert_eq!(sector_of(&sic("7372")), Sector::BusinessEquipment);
         assert_ne!(industry_of(&sic("3571")), industry_of(&sic("7372")));
     }
 
@@ -205,6 +205,10 @@ mod tests {
         assert_eq!(sector_from_code("NOT AVAILABLE"), None);
         // A two-digit major group, which is what this table replaces.
         assert_eq!(sector_from_code("35"), None);
+        // The source's own short code. Spelled out in the stored form, so the abbreviation names
+        // no bucket and a row carrying one is drift rather than a sector.
+        assert_eq!(sector_from_code("BusEq"), None);
+        assert_eq!(industry_from_code("Hardw"), None);
         assert_eq!(industry_from_code(""), None);
     }
 }
