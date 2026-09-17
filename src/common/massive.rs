@@ -1216,7 +1216,6 @@ mod tests {
         assert_eq!(reference.ticker().as_str(), "AAPL");
         assert_eq!(reference.security_type(), Some(&SecurityType::CommonStock));
         assert_eq!(reference.sic_code().map(SicCode::as_str), Some("3571"));
-        assert_eq!(reference.sic_code().map(SicCode::as_str), Some("3571"));
         assert_eq!(reference.shares_outstanding(), Some(16_530_169_999.0));
         assert_eq!(
             reference.reported_market_capitalization(),

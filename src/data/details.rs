@@ -1,8 +1,6 @@
 //! Ticker metadata: sector and industry, which is what makes the screen's sector cap bind.
 //!
-//! Seeded from the archive's point-in-time reference dataset, which is the only thing that knows
-//! what a symbol was rather than what today's ticker table says it is. The buckets themselves come
-//! from `industry`, and the stored spelling is this module's.
+//! Seeded from the point-in-time reference dataset; the buckets come from `classification`.
 
 use std::collections::HashMap;
 
@@ -16,13 +14,9 @@ use crate::data::classification_table::{Industry, Sector};
 
 /// Value stored when the source has no SIC code, and so no sector or industry, for a ticker.
 ///
-/// A storage encoding and not a bucket. Spelled rather than left null because the prediction path
-/// filters null classifications out of the join and would drop these names from the universe
-/// entirely; in memory the same absence is an `Option`, and each caller decides what it means. The
-/// screen counts them as one allowance, the residual panel refuses them, and neither reading is
-/// available to a caller handed a bare string.
-///
-/// Distinct from `Sector::Other`, which is a real group the definitions assign names to.
+/// Spelled rather than left null because the prediction path filters null classifications out of
+/// its join and would drop these names from the universe entirely. Distinct from `Sector::Other`,
+/// which is a real group the definitions assign names to.
 pub const UNKNOWN: &str = "NOT AVAILABLE";
 
 /// The stored spelling of a sector, which round-trips through [`sector_of_stored`].
@@ -39,10 +33,8 @@ pub fn industry_code(industry: Option<Industry>) -> String {
 
 /// Reads a stored sector back into the domain type.
 ///
-/// Unrecognised text reads as absent, which is the same answer the retired spelling gives: a value
-/// this cannot place names no group, and inventing one would put a name into a factor it has no
-/// claim to. The count of them is what says whether the table moved under the rows, so callers that
-/// can report it should.
+/// Unrecognised text reads as absent rather than as a bucket, because a value this cannot place
+/// names no group and inventing one would put a name into a factor it has no claim to.
 pub fn sector_of_stored(stored: &str) -> Option<Sector> {
     classification::sector_from_code(stored)
 }
@@ -169,9 +161,8 @@ pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, Option<Sector
         .filter_map(|row| {
             let ticker = Ticker::new(&row.ticker)?;
             let sector = sector_of_stored(&row.sector);
-            // Separated because they send an operator to different places: one is the feed
-            // declining to classify a name, and the other is a stored value this build cannot
-            // place, which only happens when the table moved under rows written by an older one.
+            // Separated because they send an operator to different places: a feed that declined
+            // to classify, against a stored value written by a build with a different table.
             match (&sector, row.sector.as_str()) {
                 (None, UNKNOWN) => unclassified += 1,
                 (None, _) => unrecognised += 1,

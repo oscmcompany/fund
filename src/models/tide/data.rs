@@ -1043,6 +1043,7 @@ pub(crate) fn encode_categoricals(
             // path, but that guard lives in another module and nothing enforces the ordering, so
             // the invariant is also enforced here where it is relied upon.
             let is_static = STATIC_CATEGORICAL_COLUMNS.contains(&column_name);
+            let rows = values.len();
             let unmapped = values.iter().filter(|value| value.is_none()).count();
             let keep: BooleanChunked = values.iter().map(|value| value.is_some()).collect();
             let encoded: Vec<i32> = values
@@ -1052,6 +1053,13 @@ pub(crate) fn encode_categoricals(
             result.with_column(Column::new(column_name.into(), encoded))?;
 
             if is_static && unmapped > 0 {
+                // Named here because the caller's next failure is an empty dataset, which reports
+                // that no samples were created and not which vocabulary moved underneath it.
+                if unmapped == rows {
+                    return Err(TideError::Data(format!(
+                        "Every row's `{column_name}` is absent from the artifact's training                          mapping ({rows} rows), so the artifact predates the current                          `{column_name}` vocabulary and must be retrained"
+                    )));
+                }
                 result = result.filter(&keep)?;
                 tracing::warn!(
                     column = column_name,
@@ -2109,6 +2117,40 @@ mod tests {
             );
         }
         encode_categoricals(cleaned, &mappings).unwrap()
+    }
+
+    /// A stale vocabulary names the column rather than emptying the frame silently.
+    ///
+    /// Renaming a sector taxonomy makes every stored label unmappable at once, and the caller's
+    /// next failure is `PredictionError::DatasetCreation("No prediction samples created")`, which
+    /// names nothing. This is the only place that still knows which column moved.
+    #[test]
+    fn test_a_static_column_absent_from_the_mapping_names_itself() {
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAAA", "BBBB"]),
+            Column::new("sector".into(), vec!["BUSINESSEQUIPMENT", "UTILITIES"]),
+            Column::new("industry".into(), vec!["COMPUTERS", "UTILITIES"]),
+        ])
+        .unwrap();
+
+        let mut mappings: FeatureMappings = FeatureMappings::new();
+        for column in STATIC_CATEGORICAL_COLUMNS {
+            // The vocabulary an artifact trained on the retired two-digit labels would carry.
+            mappings.insert(
+                (*column).to_string(),
+                [("35".to_string(), 0), ("73".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            );
+        }
+
+        let error = encode_categoricals(frame, &mappings)
+            .expect_err("a wholly unmapped static column must fail rather than empty the frame");
+        let message = error.to_string();
+        assert!(
+            message.contains("ticker") && message.contains("retrained"),
+            "the error must name the column and the remedy, got: {message}"
+        );
     }
 
     #[test]

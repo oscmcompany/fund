@@ -1,7 +1,6 @@
 //! What a name's SIC code says it does, at two granularities.
 //!
-//! The lookup only. The buckets and the ranges are generated into `classification_table.rs` from the
-//! published definitions, and this is the code that reads them.
+//! The lookup only; the buckets and ranges are generated into `classification_table.rs`.
 
 use crate::common::types::SicCode;
 use crate::data::classification_table::{
@@ -54,20 +53,20 @@ pub fn industry_of(code: &SicCode) -> Industry {
 
 /// Reads a stored sector back. `None` when the text names no bucket.
 ///
-/// Unknown text is refused rather than folded into [`Sector::Other`], which is a real group: a
-/// stored value this does not recognise means the table moved under the rows, and answering
-/// "Other" would hide that behind a bucket that shares a factor.
+/// Unknown text is refused rather than folded into [`Sector::Other`], which is a real group that
+/// would hide a moved table behind a bucket sharing a factor. Case-insensitive because the
+/// laboratory reads these back downstream of `clean_data`, which uppercases the column.
 pub fn sector_from_code(code: &str) -> Option<Sector> {
     Sector::ALL
         .into_iter()
-        .find(|sector| sector.as_str() == code)
+        .find(|sector| sector.as_str().eq_ignore_ascii_case(code))
 }
 
 /// Reads a stored industry back. `None` when the text names no bucket.
 pub fn industry_from_code(code: &str) -> Option<Industry> {
     Industry::ALL
         .into_iter()
-        .find(|industry| industry.as_str() == code)
+        .find(|industry| industry.as_str().eq_ignore_ascii_case(code))
 }
 
 impl std::fmt::Display for Sector {
@@ -147,22 +146,27 @@ mod tests {
     /// wrong bucket rather than failing if this stops holding.
     #[test]
     fn test_the_ranges_are_ascending_and_disjoint() {
-        for window in SECTOR_RANGES.windows(2) {
-            assert!(window[0].low <= window[0].high);
+        assert_ascending_and_disjoint(&SECTOR_RANGES, "sector");
+        assert_ascending_and_disjoint(&INDUSTRY_RANGES, "industry");
+    }
+
+    /// Every range's own bounds first, then every adjacent pair.
+    ///
+    /// Two loops rather than one: a pairwise walk never reaches the last range's own bounds, so a
+    /// table whose final range ran backwards would pass a check that only looked at `windows(2)`.
+    fn assert_ascending_and_disjoint<Bucket: Copy>(ranges: &[SicRange<Bucket>], label: &str) {
+        for range in ranges {
             assert!(
-                window[0].high < window[1].low,
-                "sector ranges {}-{} and {}-{} overlap or descend",
-                window[0].low,
-                window[0].high,
-                window[1].low,
-                window[1].high
+                range.low <= range.high,
+                "{label} range {}-{} runs backwards",
+                range.low,
+                range.high
             );
         }
-        for window in INDUSTRY_RANGES.windows(2) {
-            assert!(window[0].low <= window[0].high);
+        for window in ranges.windows(2) {
             assert!(
                 window[0].high < window[1].low,
-                "industry ranges {}-{} and {}-{} overlap or descend",
+                "{label} ranges {}-{} and {}-{} overlap or descend",
                 window[0].low,
                 window[0].high,
                 window[1].low,
@@ -197,6 +201,27 @@ mod tests {
         }
         for industry in Industry::ALL {
             assert_eq!(industry_from_code(industry.as_str()), Some(industry));
+        }
+    }
+
+    /// The round trip survives the case `clean_data` writes.
+    ///
+    /// `models::tide::data::clean_data` uppercases the sector and industry columns, and the
+    /// laboratory reads them back on the far side of it, so an exact-match decoder would refuse
+    /// every classified row and measure nothing.
+    #[test]
+    fn test_the_stored_form_round_trips_through_an_uppercased_column() {
+        for sector in Sector::ALL {
+            assert_eq!(
+                sector_from_code(&sector.as_str().to_uppercase()),
+                Some(sector)
+            );
+        }
+        for industry in Industry::ALL {
+            assert_eq!(
+                industry_from_code(&industry.as_str().to_uppercase()),
+                Some(industry)
+            );
         }
     }
 

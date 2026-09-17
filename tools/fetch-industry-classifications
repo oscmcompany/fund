@@ -202,14 +202,21 @@ def overlaps(buckets, granularity):
         (low, high, bucket["name"]) for bucket in buckets for (low, high) in bucket["ranges"]
     ]
     spans.sort()
+
+    # Every span on its own before any pair, because a pairwise loop never reaches the last span --
+    # and reaches none at all in a one-span file.
+    for low, high, code in spans:
+        if low > high:
+            sys.exit(
+                f"Error: Siccodes{granularity} assigns {low}-{high} to {code}, which runs backwards"
+            )
+
     for (low, high, code), (next_low, next_high, next_code) in zip(spans, spans[1:]):
         if next_low <= high:
             sys.exit(
                 f"Error: Siccodes{granularity} assigns {next_low}-{next_high} to {next_code} while "
                 f"{low}-{high} already belongs to {code}"
             )
-        if low > high:
-            sys.exit(f"Error: Siccodes{granularity} range {low}-{high} runs backwards")
     return spans
 
 

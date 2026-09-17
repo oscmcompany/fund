@@ -209,10 +209,8 @@ pub fn residual_returns(
                 refuse(ResidualRefusal::ReturnUnmeasured);
                 continue;
             };
-            // Decoded rather than compared against the sentinel: a stored value naming no known
-            // group is not a sector either, and grouping on the raw text would fit a factor to
-            // whatever an older table happened to write. The pair screen pools these into one
-            // allowance and this refuses them, deliberately.
+            // Decoded rather than compared against the sentinel, because grouping on raw text
+            // would fit a factor to whatever an older table happened to write.
             let sector = match sectors.get(row).and_then(sector_of_stored) {
                 Some(sector) => sector,
                 None => {
@@ -504,7 +502,9 @@ impl Demeaned {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::classification_table::Industry;
     use crate::data::details::UNKNOWN;
+    use crate::models::tide::data::clean_data;
 
     /// A lookback of two keeps the fixtures readable; the shape under test is the same at sixty.
     ///
@@ -582,6 +582,35 @@ mod tests {
         rows
     }
 
+    /// The fixture widened to what `clean_data` reads: an industry, and every continuous column.
+    ///
+    /// The added values only have to be finite — `clean_data` drops a row for a null or non-finite
+    /// continuous value and reads nothing else off them.
+    fn with_model_columns(rows: &[Row<'_>]) -> DataFrame {
+        let mut frame = frame(rows);
+        let closes: Vec<f64> = rows.iter().map(|row| row.2).collect();
+        frame
+            .with_column(Column::new(
+                "industry".into(),
+                rows.iter()
+                    .map(|_| Industry::Machinery.as_str())
+                    .collect::<Vec<_>>(),
+            ))
+            .expect("the industry column must attach");
+        for column in [
+            "open_price",
+            "high_price",
+            "low_price",
+            "volume",
+            "volume_weighted_average_price",
+        ] {
+            frame
+                .with_column(Column::new(column.into(), closes.clone()))
+                .expect("the continuous column must attach");
+        }
+        frame
+    }
+
     fn residual_at(panel: &ResidualPanel, row: usize) -> Option<f64> {
         panel
             .frame
@@ -639,6 +668,39 @@ mod tests {
             computed.refused.get(&ResidualRefusal::FullyExplained),
             Some(&2),
             "the two SOLO sessions with a full lookback must be refused for being fitted exactly"
+        );
+    }
+
+    /// The panel still measures names after the frame crosses `clean_data`.
+    ///
+    /// The real seam, not a restatement of it: `laboratory::dataset::returns` hands
+    /// `residual_returns` a frame that `clean_data` has already uppercased, so a decoder matching
+    /// only the canonical spelling refuses every classified row and the panel measures nothing.
+    /// The two-digit codes this replaced were uppercase-invariant and hid the dependency.
+    #[test]
+    fn test_the_panel_measures_names_after_the_frame_crosses_clean_data() {
+        let rows = panel(&[Sector::Manufacturing, Sector::BusinessEquipment], 8);
+        let cleaned = clean_data(with_model_columns(&rows)).expect("clean_data must accept it");
+
+        // The premise: if this stops holding, the test below passes for the wrong reason.
+        let sectors = cleaned.column("sector").unwrap().str().unwrap();
+        assert!(
+            sectors
+                .into_no_null_iter()
+                .any(|value| value == "MANUFACTURING"),
+            "clean_data must still uppercase, or this test is not exercising the seam"
+        );
+
+        let computed = residual_returns(&cleaned, specification()).expect("the fit must run");
+
+        assert_eq!(
+            computed.refused.get(&ResidualRefusal::SectorUnknown),
+            None,
+            "no row may be refused for an unknown sector after clean_data uppercases the column"
+        );
+        assert!(
+            (0..computed.frame.height()).any(|row| residual_at(&computed, row).is_some()),
+            "the panel must measure at least one name"
         );
     }
 

@@ -187,9 +187,8 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
                 shares_outstanding: shares
                     .get(index)
                     .filter(|count| count.is_finite() && *count > 0.0),
-                // `None` only where the feed reported no usable code. Both lookups are total over
-                // four-digit codes, so a classified name always lands in a bucket and absence here
-                // carries exactly one meaning: the feed declined to say.
+                // Both lookups are total over four-digit codes, so `None` here carries exactly
+                // one meaning: the feed reported no usable code.
                 sector: sic_code
                     .and_then(SicCode::new)
                     .map(|code| classification::sector_of(&code)),

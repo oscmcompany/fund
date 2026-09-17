@@ -774,12 +774,9 @@ fn orient_one(
 
 /// The bucket one leg's sector allowance is counted against.
 ///
-/// Two variants rather than an `Option<Sector>` because the absence is a deliberate reading and not
-/// a missing value: a name the feed gave no SIC code has *unknown* factor exposure, and the cap
-/// exists to bound exposure it cannot see. Pooling them costs candidates, and the alternative —
-/// letting each escape the cap — is the concentration the cap was written to prevent.
-///
-/// [`Sector::Other`] is a separate, real group, and is never folded in here.
+/// A name the feed gave no SIC code has *unknown* factor exposure, so it is pooled rather than
+/// allowed to escape the cap that exists to bound exposure it cannot see. [`Sector::Other`] is a
+/// separate, real group and is never folded in here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectorAllowance {
     Classified(Sector),
