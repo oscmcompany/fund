@@ -20,13 +20,13 @@ use crate::common::provenance::{
     AlpacaPlan, MassivePlan, MassiveTransport, PartitionProvenance, Provenance,
 };
 use crate::common::types::{
-    BarInterval, EquityBar, IntradayCadence, LiquidityFloor, QuoteSummary, SessionDate, Ticker,
-    TradeSummary,
+    BarInterval, EquityBar, EquityReference, IntradayCadence, LiquidityFloor, QuoteSummary,
+    SessionDate, Ticker, TradeSummary,
 };
 use crate::data::attribution::{Attribution, Declaration};
 use crate::data::cadence::{CadenceCheck, CadenceError, CadenceTotals, SessionOutcome};
 use crate::data::calendar::TradingCalendar;
-use crate::data::{bars, boundaries, quotes, splits, trades};
+use crate::data::{bars, boundaries, quotes, reference, splits, trades};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
 /// cadence, and a key built without one collides with every other cadence of the same session.
@@ -554,16 +554,18 @@ pub enum DerivedDataset {
     Trades,
     Splits,
     Boundaries,
+    Reference,
 }
 
 impl DerivedDataset {
     /// Every dataset, so a pass cannot iterate a subset by accident.
-    pub const ALL: [DerivedDataset; 5] = [
+    pub const ALL: [DerivedDataset; 6] = [
         DerivedDataset::Bars,
         DerivedDataset::Quotes,
         DerivedDataset::Trades,
         DerivedDataset::Splits,
         DerivedDataset::Boundaries,
+        DerivedDataset::Reference,
     ];
 
     /// The name a provenance record carries, and the name a declaration matches on.
@@ -574,6 +576,7 @@ impl DerivedDataset {
             DerivedDataset::Trades => "equity_trades",
             DerivedDataset::Splits => "equity_corporate_action_splits",
             DerivedDataset::Boundaries => "equity_corporate_action_boundaries",
+            DerivedDataset::Reference => "equity_reference",
         }
     }
 }
@@ -608,6 +611,14 @@ fn stampable_prefixes() -> Vec<StampablePrefix> {
             // One object, not a partition tree, so the prefix is its parent and the object its name.
             DerivedDataset::Splits => found.push(whole_table(dataset, SPLITS_ARCHIVE_KEY)),
             DerivedDataset::Boundaries => found.push(whole_table(dataset, BOUNDARIES_ARCHIVE_KEY)),
+            // Date-partitioned like the folds but without a cadence: a reference row describes a
+            // symbol on a date, and there is no intraday version of that.
+            DerivedDataset::Reference => found.push(StampablePrefix {
+                dataset: dataset.as_str().to_string(),
+                interval: None,
+                prefix: REFERENCE_ARCHIVE_PREFIX.to_string(),
+                object: "data.parquet",
+            }),
         }
     }
     for raw in [
@@ -2088,6 +2099,13 @@ pub fn quote_archive_prefix(interval: BarInterval) -> String {
 /// Root of the trade-summary archive, beside the quotes it will eventually be differenced against.
 pub const TRADE_ARCHIVE_PREFIX: &str = "data/derived/equity/trades";
 
+/// Root of the point-in-time symbol reference, one partition per `as_of` date.
+///
+/// Partitioned rather than a whole table, unlike the corporate-action objects: those are one table
+/// the feed revises in place, and these are dated observations that only ever accumulate. An append
+/// is a new key, so a failed backfill cannot damage the quarters that already landed.
+pub const REFERENCE_ARCHIVE_PREFIX: &str = "data/derived/equity/reference";
+
 /// The archive prefix for one trade cadence, hive-partitioned like the quotes.
 pub fn trade_archive_prefix(interval: BarInterval) -> String {
     format!("{TRADE_ARCHIVE_PREFIX}/interval={interval}")
@@ -3353,6 +3371,167 @@ pub async fn archive_splits(
         "Splits table archived"
     );
     Ok(splits.len())
+}
+
+/// Every symbol that traded on `session`, read from the daily bar partition.
+///
+/// This is the archive's own membership list and the reason the reference sweep needs no separate
+/// membership fetch: a bar exists for an instrument that traded, which is the operational form of
+/// "was listed". Measured on 2021-09-15 it agreed with the vendor's listing on 10,199 of 10,207
+/// symbols, the residual being the exchange test tickers.
+pub async fn session_symbols(
+    s3_client: &S3Client,
+    bucket: &str,
+    session: SessionDate,
+) -> Result<Vec<Ticker>, ArchiveError> {
+    let key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
+    let Some(frame) = read_partition(s3_client, bucket, &key).await? else {
+        return Ok(Vec::new());
+    };
+
+    let column = frame.column("ticker")?.str()?;
+    let mut symbols: BTreeSet<Ticker> = BTreeSet::new();
+    let mut unreadable = 0usize;
+    for row in 0..frame.height() {
+        match column.get(row).and_then(Ticker::new) {
+            Some(ticker) => {
+                symbols.insert(ticker);
+            }
+            None => unreadable += 1,
+        }
+    }
+    if unreadable > 0 {
+        // Counted rather than silent: a partition holding names no validator accepts is a finding
+        // about the fold, not a routine skip.
+        warn!(
+            key,
+            unreadable,
+            rows = frame.height(),
+            "Bar partition holds symbols that are not usable tickers"
+        );
+    }
+    Ok(symbols.into_iter().collect())
+}
+
+/// Symbols fetched at once when sweeping a reference date.
+///
+/// Measured against the live endpoint 2026-09-16: sequential is 18 requests a second and the feed
+/// does not throttle, giving 157 at eight, 278 at sixteen and 504 at thirty-two, all successful.
+/// Thirty-two turns a ten-thousand-symbol sweep into about twenty seconds; higher was not probed,
+/// so this is the fastest rate observed rather than the fastest available.
+const REFERENCE_FETCH_CONCURRENCY: usize = 32;
+
+/// Fetches the reference record for every symbol in `tickers` as of `as_of` and writes one partition.
+///
+/// The symbol list belongs to the caller because the archive's own bar index is the membership list:
+/// a name with a bar traded that session, so the feed having no record for it is a finding rather
+/// than a routine miss. Both kinds of silence are counted and returned rather than logged away.
+pub async fn archive_reference(
+    s3_client: &S3Client,
+    massive: &MassiveClient,
+    bucket: &str,
+    as_of: SessionDate,
+    tickers: &[Ticker],
+) -> Result<reference::ReferenceSweep, ArchiveError> {
+    let mut sweep = reference::ReferenceSweep {
+        requested: tickers.len(),
+        ..Default::default()
+    };
+    let mut references: Vec<EquityReference> = Vec::with_capacity(tickers.len());
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut queued = tickers.iter();
+
+    loop {
+        while in_flight.len() < REFERENCE_FETCH_CONCURRENCY {
+            let Some(ticker) = queued.next() else { break };
+            let (client, ticker) = (massive.clone(), ticker.clone());
+            in_flight.spawn(async move {
+                let outcome = client.fetch_reference(&ticker, as_of).await;
+                (ticker, outcome)
+            });
+        }
+        let Some(joined) = in_flight.join_next().await else {
+            break;
+        };
+
+        // A panicked task is neither an absence nor a feed failure, so it is not folded into either.
+        let (ticker, outcome) = joined.map_err(|error| ArchiveError::Feed {
+            vendor: "Massive",
+            message: format!("a reference fetch task did not complete: {error}"),
+        })?;
+
+        match outcome {
+            Ok(Some(found)) => {
+                sweep.found += 1;
+                references.push(found);
+            }
+            Ok(None) => sweep.absent.push(ticker.as_str().to_string()),
+            Err(error) => {
+                warn!(%ticker, %as_of, %error, "Reference fetch failed for a symbol");
+                sweep.failed.push(reference::ReferenceFailure {
+                    ticker: ticker.as_str().to_string(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+
+    // A claim replaces the partition, so a sweep that could not ask every symbol would overwrite a
+    // complete stored answer with a shorter one. Refused rather than merged: a retry is cheap.
+    if !sweep.failed.is_empty() {
+        warn!(
+            %as_of,
+            requested = sweep.requested,
+            found = sweep.found,
+            failed = sweep.failed.len(),
+            "Reference sweep left symbols unanswered; keeping the stored partition"
+        );
+        return Ok(sweep);
+    }
+
+    // Refused before the write for the reason `archive_splits` gives: a feed answering success with
+    // nothing is an outage, and an empty partition would record it as a date with no instruments.
+    if references.is_empty() {
+        warn!(
+            %as_of,
+            requested = sweep.requested,
+            "Reference sweep found nothing; writing no partition"
+        );
+        return Ok(sweep);
+    }
+
+    // Sorted so two sweeps of the same date produce byte-comparable partitions, which is what makes
+    // a re-run checkable against its predecessor.
+    references.sort_by(|left, right| left.ticker().as_str().cmp(right.ticker().as_str()));
+
+    let key = date_partitioned_key(REFERENCE_ARCHIVE_PREFIX, as_of.date());
+    let frame = reference::reference_to_dataframe(&references)?;
+    write_merged(
+        s3_client,
+        bucket,
+        key.clone(),
+        frame,
+        // A claim rather than a merge, which the guard above is what licenses: every symbol was
+        // answered for, so these rows are the whole answer and a stored row absent from them is stale.
+        |_existing, fetched, _key| Ok(fetched),
+        DerivedDataset::Reference,
+        Authorship::claiming(Provenance::massive(
+            MassivePlan::StocksStarter,
+            MassiveTransport::Rest,
+        )),
+    )
+    .await?;
+
+    info!(
+        key,
+        %as_of,
+        requested = sweep.requested,
+        found = sweep.found,
+        absent = sweep.absent.len(),
+        failed = sweep.failed.len(),
+        "Reference partition archived"
+    );
+    Ok(sweep)
 }
 
 /// Refreshes the series-boundary table over `start..=end`, merging it with what is stored.

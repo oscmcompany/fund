@@ -16,6 +16,7 @@ pub mod details;
 pub mod export;
 pub mod purge;
 pub mod quotes;
+pub mod reference;
 pub mod splits;
 pub mod trades;
 pub mod truncate;
