@@ -733,7 +733,7 @@ mod tests {
         // Literals rather than the constants, so moving either shows up here as a decision.
         assert_eq!(
             live.window(),
-            ScreenWindow::Trailing(std::num::NonZeroI64::new(30).unwrap())
+            ScreenWindow::Trailing(std::num::NonZeroU32::new(30).unwrap())
         );
         assert_eq!(RESEARCH_SCREEN.window(), ScreenWindow::WholeFrame);
     }
@@ -762,7 +762,7 @@ mod tests {
         };
 
         let trailing = with(ScreenWindow::Trailing(
-            std::num::NonZeroI64::new(30).unwrap(),
+            std::num::NonZeroU32::new(30).unwrap(),
         ));
         let whole = with(ScreenWindow::WholeFrame);
 

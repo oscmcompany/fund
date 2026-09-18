@@ -3,7 +3,7 @@
 //! Computed once at pre-open and held for the Eastern date, because it cannot change intraday.
 
 use std::collections::HashSet;
-use std::num::NonZeroI64;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
@@ -24,20 +24,19 @@ use crate::data::cache::DailyCache;
 /// Long enough that a single quiet week does not evict a normally liquid name, short enough to
 /// notice one that has genuinely dried up. Declared by the live path at `ServiceState::from_env`
 /// rather than read here, so the number keeps one home and the screens keep none.
-pub const LIQUIDITY_LOOKBACK_DAYS: i64 = 30;
+pub const LIQUIDITY_LOOKBACK_DAYS: u32 = 30;
 
 /// The same window as a value, for the screen to carry.
-const LIQUIDITY_LOOKBACK: NonZeroI64 = match NonZeroI64::new(LIQUIDITY_LOOKBACK_DAYS) {
+const LIQUIDITY_LOOKBACK: NonZeroU32 = match NonZeroU32::new(LIQUIDITY_LOOKBACK_DAYS) {
     Some(days) => days,
     None => panic!("the liquidity lookback must be a positive number of days"),
 };
 
 /// The screen the live book both trades and predicts through.
 ///
-/// One declaration for the two live call sites rather than one each: `ServiceState` hands it to the
-/// universe cache and the predict path reads it back off that cache, so the traded set and the
-/// predicted set are the same population by construction. The research paths declare their own,
-/// which is the point of the parameter — this is the live book's answer, not a default.
+/// One declaration for the two live call sites rather than one each, so they cannot drift apart on
+/// the bounds or the window's length. They can still differ on where the window is anchored — see
+/// [`trailing_window`] — which is a separate question and not yet settled.
 pub const LIVE_SCREEN: Screen = Screen::new(
     LiquidityFloor::CURRENT,
     ScreenWindow::Trailing(LIQUIDITY_LOOKBACK),
@@ -81,22 +80,15 @@ impl LiquidityRow {
 
 /// Screens a bar frame down to the tickers that clear `screen`.
 ///
-/// The one expression of liquidity in dataframe terms, and the same pair of statistics
-/// [`load_liquidity`] reads in SQL: `MIN(close_price)` against the price bound and
-/// `MEAN(close_price * volume)` against the notional bound, per ticker. A screen that computes a
-/// different pair makes the traded, predicted and trained populations three different sets — and so
-/// does a screen that computes the same pair over a different stretch of history, which is why the
-/// window is measured here rather than by each caller cutting its own frame first.
+/// `MIN(close_price)` against the price bound and `MEAN(close_price * volume)` against the notional
+/// bound, per ticker, measured over the window and applied to the whole frame — an admitted name
+/// keeps the history its features need.
 ///
-/// Surviving names keep their **whole** history, not just the windowed part: the window decides
-/// admission and the features need the rest.
-///
-/// `bars` must carry `ticker`, `close_price`, and `volume`, and additionally `timestamp` when the
-/// window is [`ScreenWindow::Trailing`].
+/// `bars` must carry `ticker`, `close_price` and `volume`, plus `timestamp` for a trailing window.
 pub fn filter_liquid_bars(bars: DataFrame, screen: Screen) -> PolarsResult<DataFrame> {
     let measured = match screen.window() {
         ScreenWindow::WholeFrame => bars.clone(),
-        ScreenWindow::Trailing(days) => trailing_window(&bars, days.get())?,
+        ScreenWindow::Trailing(days) => trailing_window(&bars, i64::from(days.get()))?,
     };
     let floor = screen.floor();
 
@@ -131,15 +123,13 @@ pub fn filter_liquid_bars(bars: DataFrame, screen: Screen) -> PolarsResult<DataF
         .collect()
 }
 
-/// The rows within `days` Eastern calendar days of the frame's newest bar.
+/// The rows within `days` Eastern calendar days of the frame's newest bar, inclusive at the edge.
 ///
-/// Eastern calendar days rather than a multiple of 24 hours, and inclusive at the lower edge,
-/// because that is what [`load_liquidity`] asks Postgres for; a fixed 30 x 24 hours is not 30
-/// calendar days across a daylight-saving transition. Anchored on the frame's own newest bar rather
-/// than on today, so a screen reads the window the frame ends in and not one that may hold no rows.
+/// **Anchored on the frame's newest bar, where [`load_liquidity`] anchors on its `as_of`.** At
+/// pre-open the newest daily bar is the previous session's, so the two windows reach back to
+/// different days and can classify a name near the bound differently.
 ///
-/// An empty frame has no newest bar and therefore no window, and is returned unchanged rather than
-/// as a window that admitted nothing.
+/// An empty frame has no newest bar and so no window, and is returned unchanged.
 fn trailing_window(bars: &DataFrame, days: i64) -> PolarsResult<DataFrame> {
     let Some(newest) = bars.column("timestamp")?.i64()?.max() else {
         return Ok(bars.clone());
@@ -249,30 +239,24 @@ impl Universe {
 
 /// Reads per-ticker minimum close and average dollar volume over `screen`'s window, ending `as_of`.
 ///
-/// The SQL twin of [`filter_liquid_bars`], and the same two statistics: a screen that computes a
-/// different pair — or the same pair over a different stretch of history — makes the traded and the
-/// predicted populations two sets.
-///
-/// Read over daily bars specifically: the liquidity thresholds are calibrated on daily dynamics,
-/// and averaging intraday bars would compare a per-bar notional against a per-day threshold and
-/// reject the entire universe. The product is taken per session and then averaged, because the
-/// average of a product is not the product of the averages once price and volume move together.
-///
-/// [`ScreenWindow::WholeFrame`] means every bar the table holds, because a table has no frame to be
-/// whole: the bound is dropped rather than reinterpreted. Note the standing constraint it interacts
-/// with — the nightly ingest must stay wider than this window, or a name outside the universe never
-/// accumulates the bars that would admit it and the universe can only shrink.
+/// The SQL twin of [`filter_liquid_bars`], reading daily bars because the thresholds are calibrated
+/// on daily dynamics and a per-bar notional would not clear a per-day bound. `as_of` bounds the
+/// query at both ends, so a historical call reads history and not the rows ingested since.
 pub async fn load_liquidity(
     pool: &PgPool,
     as_of: SessionDate,
     screen: Screen,
 ) -> Result<Vec<LiquidityRow>, sqlx::Error> {
     let start = match screen.window() {
-        ScreenWindow::Trailing(days) => as_of.plus_calendar_days(-days.get()).midnight(),
+        ScreenWindow::Trailing(days) => as_of.plus_calendar_days(-i64::from(days.get())).midnight(),
         // The epoch rather than an `Option<DateTime>` threaded through the query: no equity bar
         // predates it, so an unbounded lower edge and this one select the same rows.
         ScreenWindow::WholeFrame => DateTime::<Utc>::from_timestamp_nanos(0),
     };
+    // Exclusive, and applied to both windows: `as_of` is the anchor and the window says only how far
+    // back to reach, so a whole-frame call that read past it would be a second rule. A daily bar is
+    // stamped at the 16:00 Eastern close, so the next midnight admits `as_of`'s own bar and no more.
+    let end = as_of.plus_calendar_days(1).midnight();
     let rows = sqlx::query!(
         r#"
         SELECT ticker AS "ticker!",
@@ -281,10 +265,12 @@ pub async fn load_liquidity(
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
+          AND timestamp < $3
         GROUP BY ticker
         "#,
         BarInterval::OneDay.as_str(),
         start,
+        end,
     )
     .fetch_all(pool)
     .await?;
@@ -424,10 +410,10 @@ mod tests {
     }
 
     /// The same floor over a trailing window of `days`.
-    fn trailing(days: i64) -> Screen {
+    fn trailing(days: u32) -> Screen {
         Screen::new(
             floor(),
-            ScreenWindow::Trailing(NonZeroI64::new(days).expect("a positive window")),
+            ScreenWindow::Trailing(NonZeroU32::new(days).expect("a positive window")),
         )
     }
 
@@ -635,7 +621,7 @@ mod tests {
     fn test_a_bar_exactly_on_the_window_edge_is_inside_it() {
         let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
         let edge = newest
-            .plus_calendar_days(-LIQUIDITY_LOOKBACK_DAYS)
+            .plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS))
             .midnight()
             .timestamp_millis();
         let frame = DataFrame::new(vec![
@@ -665,9 +651,9 @@ mod tests {
     fn test_the_window_counts_calendar_days_across_a_daylight_saving_transition() {
         // 2026-03-08 is the spring transition; a window ending 2026-03-20 spans it.
         let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap());
-        let oldest = newest.plus_calendar_days(-LIQUIDITY_LOOKBACK_DAYS);
+        let oldest = newest.plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS));
         let fixed_offset_start =
-            newest.midnight().timestamp_millis() - LIQUIDITY_LOOKBACK_DAYS * 86_400_000;
+            newest.midnight().timestamp_millis() - i64::from(LIQUIDITY_LOOKBACK_DAYS) * 86_400_000;
 
         assert_eq!(
             oldest.midnight().timestamp_millis() - fixed_offset_start,

@@ -935,7 +935,7 @@ fn erfc_by_continued_fraction(x: f64) -> f64 {
 mod tests {
     use super::*;
 
-    use std::num::NonZeroI64;
+    use std::num::NonZeroU32;
 
     use chrono::{TimeZone, Utc};
 
@@ -1220,7 +1220,7 @@ mod tests {
             "5 five_minute bars"
         );
 
-        let thirty = NonZeroI64::new(30).expect("a positive window");
+        let thirty = NonZeroU32::new(30).expect("a positive window");
         assert_eq!(
             ScreenWindow::Trailing(thirty).to_string(),
             "trailing 30 days"
@@ -1244,7 +1244,7 @@ mod tests {
     fn test_a_trailing_window_universe_assembles_against_its_own_floor() {
         let floor = LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
         let trailing =
-            ScreenWindow::Trailing(NonZeroI64::new(30).expect("a positive trailing window"));
+            ScreenWindow::Trailing(NonZeroU32::new(30).expect("a positive trailing window"));
         let result = Study::new(
             Declaration::new(
                 "does the traded book behave differently",
@@ -1277,7 +1277,7 @@ mod tests {
     fn test_the_right_floor_over_the_wrong_window_is_refused() {
         let floor = LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
         let trailing =
-            ScreenWindow::Trailing(NonZeroI64::new(30).expect("a positive trailing window"));
+            ScreenWindow::Trailing(NonZeroU32::new(30).expect("a positive trailing window"));
 
         let refusal = Study::new(
             Declaration::new(
@@ -1343,7 +1343,7 @@ mod tests {
             DeclaredUniverse::Screened {
                 name: "liquid".to_string(),
                 floor: LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor"),
-                window: ScreenWindow::Trailing(NonZeroI64::new(30).expect("a positive window")),
+                window: ScreenWindow::Trailing(NonZeroU32::new(30).expect("a positive window")),
             },
             unpriced(),
         );

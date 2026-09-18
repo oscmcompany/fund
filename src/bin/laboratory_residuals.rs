@@ -2,7 +2,7 @@
 //!
 //! Fits nothing beyond the per-session cross-section, so a run is one archive read and arithmetic.
 
-use std::num::{NonZeroI64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use chrono::Utc;
 use rand::prelude::*;
@@ -106,13 +106,19 @@ impl Parameters {
 
         // Absent means the research screen, which is every session the frame holds. A number is a
         // trailing window in Eastern calendar days, the same unit the traded universe screens over.
+        // Only the window moves: a caller naming one half of a screen has not renamed the other.
         let screen = match window_days {
             None => dataset::RESEARCH_SCREEN,
             Some(days) => Screen::new(
                 dataset::RESEARCH_SCREEN.floor(),
-                ScreenWindow::Trailing(NonZeroI64::new(days).ok_or_else(|| {
-                    format!("SCREEN_WINDOW_DAYS must be greater than zero\n{USAGE}")
-                })?),
+                ScreenWindow::Trailing(
+                    u32::try_from(days)
+                        .ok()
+                        .and_then(NonZeroU32::new)
+                        .ok_or_else(|| {
+                            format!("SCREEN_WINDOW_DAYS must be a positive number of days, got {days}\n{USAGE}")
+                        })?,
+                ),
             ),
         };
 
@@ -727,6 +733,62 @@ mod tests {
                 "{classified} must not be handed the sentinel"
             );
         }
+    }
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// An absent window screens every session the frame holds, which is what the archive paths have
+    /// always done and what every figure on record was measured over.
+    #[test]
+    fn test_an_absent_screen_window_is_the_research_screen() {
+        for given in [
+            vec![],
+            vec!["730"],
+            vec!["730", "60"],
+            vec!["730", "60", "0.5"],
+        ] {
+            let parsed = Parameters::parse(&arguments(&given)).expect("a usable window");
+            assert_eq!(
+                parsed.screen,
+                dataset::RESEARCH_SCREEN,
+                "{given:?} must default to the research screen"
+            );
+        }
+    }
+
+    /// A caller naming the window has not renamed the floor.
+    ///
+    /// The bug worth guarding: a screen that quietly moved both halves when the caller moved one
+    /// would make the two runs of the measurement differ in two respects rather than the one.
+    #[test]
+    fn test_a_declared_window_moves_the_window_and_not_the_floor() {
+        let parsed =
+            Parameters::parse(&arguments(&["730", "60", "0.5", "30"])).expect("a usable window");
+
+        assert_eq!(
+            parsed.screen.window(),
+            ScreenWindow::Trailing(NonZeroU32::new(30).expect("a positive window"))
+        );
+        assert_eq!(
+            parsed.screen.floor(),
+            dataset::RESEARCH_SCREEN.floor(),
+            "naming the window must leave the bounds alone"
+        );
+    }
+
+    /// Zero is not a narrower window, it is no window, and a typo is not a default.
+    #[test]
+    fn test_an_unusable_screen_window_is_refused() {
+        for window in ["0", "-1", "thirty", "", "30.5"] {
+            assert!(
+                Parameters::parse(&arguments(&["730", "60", "0.5", window])).is_err(),
+                "{window:?} must be refused"
+            );
+        }
+        // A fifth argument is not a window either.
+        assert!(Parameters::parse(&arguments(&["730", "60", "0.5", "30", "7"])).is_err());
     }
 
     /// Two sessions, and every row shared. The second is deliberately the quieter of the two.

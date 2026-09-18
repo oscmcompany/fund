@@ -2,7 +2,7 @@
 //!
 //! Fields are private and constructors validate, so a value in scope is proof its invariants held.
 
-use std::num::NonZeroI64;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -130,7 +130,10 @@ impl std::fmt::Display for LiquidityFloor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ScreenWindow {
     /// The trailing calendar days the traded universe screens over.
-    Trailing(NonZeroI64),
+    ///
+    /// Unsigned because a negative window is not a narrower one: it puts the lower bound *after* the
+    /// upper and selects nothing, which both readers would report as a name that went quiet.
+    Trailing(NonZeroU32),
     /// Every session the frame holds, so a name that dipped once anywhere in it is refused.
     WholeFrame,
 }

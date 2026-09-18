@@ -185,17 +185,14 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
     Ok(names)
 }
 
-/// Drops tickers that do not clear `screen`.
+/// Drops tickers that do not clear `screen`, keeping the surviving names' whole history.
 ///
-/// The frame carries a longer history than the screen reads, because the features need it and the
-/// universe does not — so the caller passes the trailing window the traded universe screens over and
-/// the surviving names keep their whole history. Screening the whole frame instead would let a name
-/// that has since dried up keep a prediction on the strength of history the universe has already
-/// stopped counting; that is now a property of the value passed in rather than of this function.
+/// Nothing here but the count: the statistic and the window both live in
+/// [`universe::filter_liquid_bars`], so the predicted set and the traded set read one definition.
 ///
-/// Nothing here but the count: the window and the statistic both live in
-/// [`universe::filter_liquid_bars`], so the predicted set is the traded set by construction rather
-/// than by two expressions agreeing.
+/// They do not yet read one *anchor*. This screens the window ending at the frame's newest bar and
+/// the traded universe screens the window ending at its own session, so at pre-open the two reach
+/// back to different days.
 pub fn filter_equity_bars(data: DataFrame, screen: Screen) -> Result<DataFrame, PredictionError> {
     let before_count = data.height();
 
