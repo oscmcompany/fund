@@ -2,6 +2,8 @@
 //!
 //! Fields are private and constructors validate, so a value in scope is proof its invariants held.
 
+use std::num::NonZeroI64;
+
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
@@ -117,6 +119,28 @@ impl std::fmt::Display for LiquidityFloor {
             "${} close on ${} traded",
             self.minimum_close_price, self.minimum_dollar_volume
         )
+    }
+}
+
+/// The stretch of history a [`LiquidityFloor`] is applied over before a name is admitted.
+///
+/// Beside the floor rather than with the screens, because the pair is one decision: the same bounds
+/// over a trailing month and over two years admit different sets, and the tree currently holds both
+/// and calls each "the universe".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ScreenWindow {
+    /// The trailing calendar days the traded universe screens over.
+    Trailing(NonZeroI64),
+    /// Every session the frame holds, so a name that dipped once anywhere in it is refused.
+    WholeFrame,
+}
+
+impl std::fmt::Display for ScreenWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScreenWindow::Trailing(days) => write!(formatter, "trailing {days} days"),
+            ScreenWindow::WholeFrame => write!(formatter, "the whole frame"),
+        }
     }
 }
 

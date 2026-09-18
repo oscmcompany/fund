@@ -9,7 +9,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::common::aws::date_partitioned_key;
-use crate::common::types::{BarInterval, LiquidityFloor, SessionDate};
+use crate::common::types::{BarInterval, LiquidityFloor, ScreenWindow, SessionDate};
 use crate::data::{adjust, archive, bars, reference, truncate};
 use crate::laboratory::residual::{residual_returns, FactorSpecification, ResidualPanel};
 use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
@@ -51,6 +51,13 @@ pub struct DatasetFingerprint {
     /// `tickers`, which is also what two runs over different windows differ in. Without this field
     /// the fingerprint cannot tell those apart, and the floor is about to become configurable.
     pub liquidity_floor: Option<LiquidityFloor>,
+    /// The stretch of history that floor was applied over, or `None` where no screen was applied.
+    ///
+    /// Moves with `liquidity_floor` on every path — a screen is a floor *and* a window, and the same
+    /// bounds over a trailing month and over two years admit different sets. Read the pair through
+    /// [`DatasetFingerprint::screen`] rather than field by field, which is what keeps the two from
+    /// being consulted apart.
+    pub screen_window: Option<ScreenWindow>,
     pub rows: usize,
     pub tickers: usize,
     pub first_timestamp: Option<DateTime<Utc>>,
@@ -71,6 +78,18 @@ pub struct DatasetFingerprint {
     /// Load-bearing for the reason `liquidity_floor` is: two panels over the same window and a
     /// different volatility lookback are different measurements, and every other field would agree.
     pub factor_specification: Option<FactorSpecification>,
+}
+
+impl DatasetFingerprint {
+    /// The screen the rows were filtered through, floor and window together.
+    ///
+    /// `Some` only when both halves are present, so a caller cannot read a window that no floor was
+    /// applied over. The two are written together and are meaningless apart; returning them as a
+    /// pair is what stops a reader treating `screen_window: None` as "no window" on a screened
+    /// frame rather than as "no screen".
+    pub fn screen(&self) -> Option<(LiquidityFloor, ScreenWindow)> {
+        self.liquidity_floor.zip(self.screen_window)
+    }
 }
 
 /// Folds a frame's contents into one value that changes when any cell does.
@@ -190,6 +209,8 @@ pub async fn intraday(
         &bars,
         session,
         lookback_days,
+        // `None`: these bars are the whole archive for the window, unscreened — no floor and so no
+        // window for one to have been applied over.
         None,
         Digests {
             splits: adjustments.splits_digest,
@@ -299,7 +320,9 @@ async fn read_window(
         &filtered,
         session,
         lookback_days,
-        Some(floor),
+        // `filter_training_bars` imposes no time cut of its own, so the floor is applied across
+        // every session loaded — not the trailing window the traded universe screens over.
+        Some((floor, ScreenWindow::WholeFrame)),
         Digests {
             splits: adjustments.splits_digest,
             boundaries: adjustments.boundaries_digest,
@@ -369,7 +392,7 @@ fn fingerprint_of(
     frame: &DataFrame,
     session: SessionDate,
     lookback_days: i64,
-    liquidity_floor: Option<LiquidityFloor>,
+    screen: Option<(LiquidityFloor, ScreenWindow)>,
     digests: Digests,
     factor_specification: Option<FactorSpecification>,
 ) -> Result<DatasetFingerprint, DatasetError> {
@@ -379,7 +402,9 @@ fn fingerprint_of(
     Ok(DatasetFingerprint {
         session,
         lookback_days,
-        liquidity_floor,
+        // Taken apart here and only here, so the two can never be set independently.
+        liquidity_floor: screen.map(|(floor, _)| floor),
+        screen_window: screen.map(|(_, window)| window),
         rows: frame.height(),
         tickers: tickers
             .into_no_null_iter()
@@ -636,10 +661,24 @@ mod tests {
 
         let unscreened =
             fingerprint_of(&rows, session, 365, None, digests(0xAB, 0xCD), None).unwrap();
-        let strictly =
-            fingerprint_of(&rows, session, 365, Some(strict), digests(0xAB, 0xCD), None).unwrap();
-        let loosely =
-            fingerprint_of(&rows, session, 365, Some(loose), digests(0xAB, 0xCD), None).unwrap();
+        let strictly = fingerprint_of(
+            &rows,
+            session,
+            365,
+            Some((strict, ScreenWindow::WholeFrame)),
+            digests(0xAB, 0xCD),
+            None,
+        )
+        .unwrap();
+        let loosely = fingerprint_of(
+            &rows,
+            session,
+            365,
+            Some((loose, ScreenWindow::WholeFrame)),
+            digests(0xAB, 0xCD),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             strictly.rows, loosely.rows,
@@ -652,6 +691,74 @@ mod tests {
         assert_ne!(strictly, loosely, "two floors must not share a fingerprint");
         assert_ne!(unscreened, strictly, "a screen and no screen must differ");
         assert_eq!(unscreened.liquidity_floor, None);
+    }
+
+    /// The same bounds over a different stretch of history are a different population.
+    ///
+    /// A name that dipped below the floor once in two years is refused by a whole-frame screen and
+    /// admitted by a trailing one, so the window is as load-bearing as the bounds. Without it in the
+    /// fingerprint the two runs are indistinguishable, and a study can declare either and pass.
+    #[test]
+    fn test_two_screen_windows_over_the_same_rows_do_not_share_a_fingerprint() {
+        const DAY: i64 = 86_400_000;
+        let rows = frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]);
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap());
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
+        let with = |window| {
+            fingerprint_of(
+                &rows,
+                session,
+                365,
+                Some((floor, window)),
+                digests(0xAB, 0xCD),
+                None,
+            )
+            .unwrap()
+        };
+
+        let trailing = with(ScreenWindow::Trailing(
+            std::num::NonZeroI64::new(30).unwrap(),
+        ));
+        let whole = with(ScreenWindow::WholeFrame);
+
+        assert_eq!(
+            trailing.liquidity_floor, whole.liquidity_floor,
+            "the fixture must isolate the window"
+        );
+        assert_ne!(trailing, whole, "two windows must not share a fingerprint");
+    }
+
+    /// The floor and the window are written together, so they can only be read together.
+    ///
+    /// `screen` returning a pair is what stops a reader treating an absent window on a screened
+    /// frame as "no window" rather than as the unreachable state it would be.
+    #[test]
+    fn test_a_screen_is_read_as_a_pair_or_not_at_all() {
+        const DAY: i64 = 86_400_000;
+        let rows = frame(vec!["AAA", "AAA", "BBB"], vec![0, DAY, DAY]);
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap());
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).unwrap();
+
+        let screened = fingerprint_of(
+            &rows,
+            session,
+            365,
+            Some((floor, ScreenWindow::WholeFrame)),
+            digests(0xAB, 0xCD),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            screened.screen(),
+            Some((floor, ScreenWindow::WholeFrame)),
+            "a screened frame reports both halves"
+        );
+
+        let unscreened =
+            fingerprint_of(&rows, session, 365, None, digests(0xAB, 0xCD), None).unwrap();
+        assert_eq!(unscreened.screen(), None);
+        assert_eq!(unscreened.liquidity_floor, None);
+        assert_eq!(unscreened.screen_window, None);
     }
 
     /// The universe is an input to the result, not a description of it. Two runs over the same

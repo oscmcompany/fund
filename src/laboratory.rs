@@ -7,6 +7,7 @@ pub mod cost;
 pub mod dataset;
 pub mod export;
 pub mod forecast;
+pub mod harness;
 pub mod information;
 pub mod intraday;
 pub mod intraday_convergence;

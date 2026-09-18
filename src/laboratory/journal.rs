@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::common::types::SessionDate;
 use crate::laboratory::convergence::Curve;
 use crate::laboratory::dataset::DatasetFingerprint;
+use crate::laboratory::harness::{
+    DeclaredUniverse, Horizon, NetOfCost, Pairing, Quantity, StudyResult,
+};
 use crate::laboratory::metrics::Distribution;
 use crate::laboratory::predictor::Evaluation;
 use crate::laboratory::stability::{Association, SignAgreement};
@@ -22,8 +25,12 @@ use crate::laboratory::stability::{Association, SignAgreement};
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. v2 added
 /// `liquidity_floor` to the `dataset_built` fingerprint and v3 added `reference_digest` beside it,
 /// naming the point-in-time universe the rows were classified against. v4 added
-/// `factor_specification`, naming the factor set a residual panel was fitted against.
-pub const SCHEMA_VERSION: u32 = 4;
+/// `factor_specification`, naming the factor set a residual panel was fitted against. v5 adds the
+/// `study_measured` observation — the first record carrying a declaration alongside a reading — and
+/// `screen_window` beside the fingerprint's floor, because a screen is a floor *and* the stretch of
+/// history it was applied over. Both land in v5 rather than v5 and v6: v5 has not shipped, so no
+/// reader will ever see one without the other.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Where the laboratory writes when `FUND_LABORATORY_JOURNAL_DIRECTORY` says nothing.
 const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund/laboratory";
@@ -58,6 +65,7 @@ pub enum Observation {
     StabilityMeasured(StabilityMeasured),
     RegimeMeasured(RegimeMeasured),
     ConvergenceMeasured(ConvergenceMeasured),
+    StudyMeasured(StudyMeasured),
 }
 
 impl Observation {
@@ -70,6 +78,63 @@ impl Observation {
             Observation::StabilityMeasured(_) => "stability_measured",
             Observation::RegimeMeasured(_) => "regime_measured",
             Observation::ConvergenceMeasured(_) => "convergence_measured",
+            Observation::StudyMeasured(_) => "study_measured",
+        }
+    }
+}
+
+/// One declared comparison and what it read.
+///
+/// The declaration travels with the reading rather than being recoverable from the binary that
+/// produced it, because a threshold is only a threshold relative to the family it was spent
+/// against: a record carrying the statistic without `family_tests` is a number nobody can judge.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StudyMeasured {
+    pub question: String,
+    pub family: String,
+    /// Tests sharing the family, which is the denominator `required_standard_errors` came from.
+    pub family_tests: usize,
+    pub universe: DeclaredUniverse,
+    pub horizon: Horizon,
+    pub quantity: Quantity,
+    pub pairing: Pairing,
+    pub treatment: String,
+    pub control: String,
+    /// Rows both arms were folded from, beside the per-arm session counts inside each distribution.
+    pub observations: usize,
+    pub treatment_reading: Option<Distribution>,
+    pub control_reading: Option<Distribution>,
+    pub difference: Option<Distribution>,
+    pub standard_errors: Option<f64>,
+    pub required_standard_errors: f64,
+    pub family_wise_error_rate: f64,
+    /// `None` where nothing was measurable, which is not the same as a reading that failed the bar.
+    pub clears_haircut: Option<bool>,
+    pub net_of_cost: NetOfCost,
+}
+
+impl From<&StudyResult> for StudyMeasured {
+    fn from(result: &StudyResult) -> Self {
+        let declaration = result.declaration();
+        Self {
+            question: declaration.question().to_string(),
+            family: declaration.family().name().to_string(),
+            family_tests: declaration.family().tests().get(),
+            universe: declaration.universe().clone(),
+            horizon: declaration.horizon(),
+            quantity: declaration.quantity(),
+            pairing: result.pairing(),
+            treatment: result.treatment_name().to_string(),
+            control: result.control_name().to_string(),
+            observations: result.observations(),
+            treatment_reading: result.treatment(),
+            control_reading: result.control(),
+            difference: result.difference(),
+            standard_errors: result.standard_errors(),
+            required_standard_errors: result.haircut().required_standard_errors(),
+            family_wise_error_rate: result.haircut().family_wise_error_rate(),
+            clears_haircut: result.clears_haircut(),
+            net_of_cost: result.net_of_cost(),
         }
     }
 }
@@ -380,6 +445,7 @@ mod tests {
             session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()),
             lookback_days: 365,
             liquidity_floor: None,
+            screen_window: None,
             rows: 10,
             tickers: 2,
             first_timestamp: DateTime::from_timestamp_millis(0),
@@ -569,6 +635,91 @@ mod tests {
         );
     }
 
+    /// The denominator has to reach the file, not only the terminal.
+    ///
+    /// A record carrying the statistic without the family it was spent against is a number nobody
+    /// can judge later — which is exactly the state every prior laboratory record is in, and the
+    /// reason this one exists.
+    #[test]
+    fn test_a_study_record_carries_the_family_that_set_its_threshold() {
+        use std::num::NonZeroUsize;
+
+        use crate::laboratory::harness::{
+            Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study,
+        };
+
+        let one = NonZeroUsize::new(1).expect("a positive count");
+        // One session a day, the same four for both arms, which is what `Pairing::Matched` requires.
+        let arm = |name: &str, readings: [f64; 4]| {
+            let keyed: Vec<(i64, Option<f64>)> = readings
+                .into_iter()
+                .enumerate()
+                .map(|(index, reading)| (index as i64 * 86_400_000, Some(reading)))
+                .collect();
+            Arm::new(name, keyed, 4).expect("a usable arm")
+        };
+        let result = Study::new(
+            Declaration::new(
+                "does the sector factor explain anything",
+                Family::new(
+                    "residual-panel",
+                    NonZeroUsize::new(7).expect("a positive count"),
+                ),
+                Horizon::Sessions(one),
+                DeclaredUniverse::Unscreened,
+                Quantity::Unpriced { units: "share" },
+            ),
+            Pairing::Matched,
+            arm("real sectors", [0.30, 0.25, 0.28, 0.26]),
+            arm("permuted sectors", [0.22, 0.20, 0.21, 0.19]),
+            &fingerprint(),
+        )
+        .expect("the fixture must assemble")
+        .measure();
+
+        let observation = Observation::StudyMeasured(StudyMeasured::from(&result));
+        assert_eq!(observation.experiment_type(), "study_measured");
+
+        let value: serde_json::Value = serde_json::to_value(&observation).unwrap();
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("study_measured")
+        );
+        assert_eq!(
+            value["experiment_type"].as_str(),
+            Some(observation.experiment_type())
+        );
+        assert_eq!(value["payload"]["family_tests"], serde_json::json!(7));
+        assert_eq!(
+            value["payload"]["family"],
+            serde_json::json!("residual-panel")
+        );
+        assert_eq!(
+            value["payload"]["universe"],
+            serde_json::json!("Unscreened")
+        );
+        assert_eq!(value["payload"]["pairing"], serde_json::json!("Matched"));
+        assert_eq!(
+            value["payload"]["treatment"],
+            serde_json::json!("real sectors")
+        );
+        // The threshold itself, so a reader does not have to rebuild it from the count.
+        assert!(
+            (value["payload"]["required_standard_errors"]
+                .as_f64()
+                .expect("a number")
+                - 2.690_109_527_158_866)
+                .abs()
+                < 1e-9,
+            "{value}"
+        );
+        assert_eq!(value["payload"]["clears_haircut"], serde_json::json!(true));
+        assert_eq!(
+            value["payload"]["net_of_cost"]["outcome"],
+            serde_json::json!("not_a_return")
+        );
+    }
+
     /// The application's journal names its files by session date. Reading one of those as a
     /// laboratory file would file an instant under a trading day.
     #[test]
@@ -618,7 +769,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["schema_version"], serde_json::json!(4));
+        assert_eq!(value["schema_version"], serde_json::json!(5));
         assert_eq!(value["run_id"], serde_json::json!(run_id.to_string()));
         assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
         assert_eq!(
@@ -634,6 +785,19 @@ mod tests {
         assert_eq!(
             value["payload"]["fingerprint"]["reference_digest"],
             serde_json::json!(0xEF)
+        );
+        // The window is half the screen, and a floor without it does not name a population: the
+        // same bounds over a trailing month and over two years admit different sets of names.
+        assert!(
+            value["payload"]["fingerprint"]
+                .as_object()
+                .expect("the fingerprint is an object")
+                .contains_key("screen_window"),
+            "{value}"
+        );
+        assert_eq!(
+            value["payload"]["fingerprint"]["screen_window"],
+            serde_json::json!(null)
         );
         // Both fields, not just the lookback: a panel fitted at a different variance share measures
         // a different set of names, and a record carrying only one of them cannot say which.

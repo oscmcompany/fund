@@ -274,6 +274,7 @@ mod tests {
                     session: session(2026, 8, 17),
                     lookback_days: 365,
                     liquidity_floor: None,
+                    screen_window: None,
                     rows: 10,
                     tickers: 2,
                     first_timestamp: DateTime::from_timestamp_millis(0),
