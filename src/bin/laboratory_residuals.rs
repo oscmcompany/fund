@@ -2,14 +2,14 @@
 //!
 //! Fits nothing beyond the per-session cross-section, so a run is one archive read and arithmetic.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroI64, NonZeroUsize};
 
 use chrono::Utc;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use tracing::{error, info, warn};
 
-use fund::common::types::{ScreenWindow, SessionDate};
+use fund::common::types::{Screen, ScreenWindow, SessionDate};
 use fund::data::details::UNKNOWN;
 use fund::laboratory::dataset;
 use fund::laboratory::dataset::DatasetFingerprint;
@@ -38,7 +38,9 @@ const CONTROL_ARM: &str = "permuted sectors";
 const BASELINE_ARM: &str = "session mean";
 
 const USAGE: &str =
-    "Usage: laboratory_residuals [LOOKBACK_DAYS] [VOLATILITY_SESSIONS] [MINIMUM_VARIANCE_SHARE]";
+    "Usage: laboratory_residuals [LOOKBACK_DAYS] [VOLATILITY_SESSIONS] [MINIMUM_VARIANCE_SHARE] \
+     [SCREEN_WINDOW_DAYS]\n\
+     SCREEN_WINDOW_DAYS absent screens every session loaded; a number screens that trailing window.";
 
 /// Calendar days of archive to measure over by default, matching the baselines binary.
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
@@ -50,33 +52,47 @@ const PERMUTATION_SEED: u64 = 0x5EED;
 struct Parameters {
     lookback_days: i64,
     specification: FactorSpecification,
+    /// The population the study declares and the loader screens by.
+    ///
+    /// An argument rather than a constant because the two windows the tree holds admit different
+    /// sets of names, and which one a figure was measured over is part of the figure. Defaults to
+    /// the research screen so a plain run reproduces what the archive paths have always done.
+    screen: Screen,
 }
 
 impl Parameters {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let current = FactorSpecification::CURRENT;
-        let (lookback_days, sessions, share) = match arguments {
+        let (lookback_days, sessions, share, window_days) = match arguments {
             [] => (
                 DEFAULT_LOOKBACK_DAYS,
                 current.volatility_sessions() as i64,
                 current.minimum_residual_variance_share(),
+                None,
             ),
             [lookback] => (
                 positive(lookback, "LOOKBACK_DAYS")?,
                 current.volatility_sessions() as i64,
                 current.minimum_residual_variance_share(),
+                None,
             ),
             [lookback, sessions] => (
                 positive(lookback, "LOOKBACK_DAYS")?,
                 positive(sessions, "VOLATILITY_SESSIONS")?,
                 current.minimum_residual_variance_share(),
+                None,
             ),
             [lookback, sessions, share] => (
                 positive(lookback, "LOOKBACK_DAYS")?,
                 positive(sessions, "VOLATILITY_SESSIONS")?,
-                share.trim().parse::<f64>().map_err(|_| {
-                    format!("MINIMUM_VARIANCE_SHARE must be a number, got {share:?}\n{USAGE}")
-                })?,
+                variance_share(share)?,
+                None,
+            ),
+            [lookback, sessions, share, window] => (
+                positive(lookback, "LOOKBACK_DAYS")?,
+                positive(sessions, "VOLATILITY_SESSIONS")?,
+                variance_share(share)?,
+                Some(positive(window, "SCREEN_WINDOW_DAYS")?),
             ),
             _ => return Err(format!("Too many arguments\n{USAGE}")),
         };
@@ -88,11 +104,31 @@ impl Parameters {
             format!("{sessions} sessions at a {share} variance share cannot measure a residual\n{USAGE}")
         })?;
 
+        // Absent means the research screen, which is every session the frame holds. A number is a
+        // trailing window in Eastern calendar days, the same unit the traded universe screens over.
+        let screen = match window_days {
+            None => dataset::RESEARCH_SCREEN,
+            Some(days) => Screen::new(
+                dataset::RESEARCH_SCREEN.floor(),
+                ScreenWindow::Trailing(NonZeroI64::new(days).ok_or_else(|| {
+                    format!("SCREEN_WINDOW_DAYS must be greater than zero\n{USAGE}")
+                })?),
+            ),
+        };
+
         Ok(Self {
             lookback_days,
             specification,
+            screen,
         })
     }
+}
+
+/// Parses the minimum residual variance share, refusing anything that is not a number.
+fn variance_share(raw: &str) -> Result<f64, String> {
+    raw.trim()
+        .parse::<f64>()
+        .map_err(|_| format!("MINIMUM_VARIANCE_SHARE must be a number, got {raw:?}\n{USAGE}"))
 }
 
 /// Parses a positive integer, refusing a typo rather than falling back to the default.
@@ -173,6 +209,7 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         &bucket,
         parameters.lookback_days,
         session,
+        parameters.screen,
         parameters.specification,
     )
     .await?;
@@ -195,7 +232,13 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
     let control = residual_returns(&permuted, parameters.specification)?;
 
     let shared = measured_in_both(&dataset.panel, &control);
-    let measured = measure(&dataset.panel, &control, &shared, &dataset.fingerprint)?;
+    let measured = measure(
+        &dataset.panel,
+        &control,
+        &shared,
+        parameters.screen,
+        &dataset.fingerprint,
+    )?;
 
     if let Some(journal) = journal.as_ref() {
         for result in &measured.studies {
@@ -238,6 +281,7 @@ fn measure(
     panel: &ResidualPanel,
     control: &ResidualPanel,
     shared: &[usize],
+    screen: Screen,
     fingerprint: &DatasetFingerprint,
 ) -> Result<Measured, Box<dyn std::error::Error>> {
     let unreadable = || -> Box<dyn std::error::Error> {
@@ -266,7 +310,7 @@ fn measure(
                 // The panel fits one cross-section at a time and forecasts nothing, so the reading
                 // is about the session it was fitted on rather than any session after it.
                 Horizon::Sessions(NonZeroUsize::new(1).expect("a positive count")),
-                declared_universe(fingerprint),
+                declared_universe(screen),
                 Quantity::Unpriced {
                     units: "variance share",
                 },
@@ -307,19 +351,21 @@ fn measure(
     })
 }
 
-/// The population the dataset was actually screened by, named and versioned.
+/// The population the study declares, built from the screen it handed the loader.
 ///
-/// Read off the fingerprint rather than asserted, because the harness refuses a study whose
-/// declaration disagrees with it — and the window is stated as [`ScreenWindow::WholeFrame`]
-/// because that is what `filter_training_bars` does, not what the traded universe does.
-fn declared_universe(fingerprint: &DatasetFingerprint) -> DeclaredUniverse {
-    match fingerprint.liquidity_floor {
-        Some(floor) => DeclaredUniverse::Screened {
-            name: "training-liquid-v1".to_string(),
-            floor,
-            window: ScreenWindow::WholeFrame,
-        },
-        None => DeclaredUniverse::Unscreened,
+/// Declared from the same value that did the screening rather than read back off the fingerprint:
+/// with the screen an input, reading it back would restate the input and the harness would be
+/// checking a value against itself. What `Study::new` verifies from here is that the **loader
+/// honoured** the declaration — which is a narrower guarantee than it was, and still catches the
+/// composition error most likely to happen, a screened declaration over `dataset::intraday`, which
+/// screens nothing.
+fn declared_universe(screen: Screen) -> DeclaredUniverse {
+    DeclaredUniverse::Screened {
+        // Versioned rather than derived from the bounds: two studies quoting "liquid" should be
+        // comparable or visibly not, and a name is the only part of this a reader can hold on to.
+        name: "training-liquid-v1".to_string(),
+        floor: screen.floor(),
+        window: screen.window(),
     }
 }
 

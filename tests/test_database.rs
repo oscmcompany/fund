@@ -475,7 +475,9 @@ async fn test_liquidity_reports_the_window_low_not_its_average() {
         common::seed_bar(&pool, "AAAA", today.plus_calendar_days(offset), close).await;
     }
 
-    let liquidity = universe::load_liquidity(&pool, today).await.unwrap();
+    let liquidity = universe::load_liquidity(&pool, today, fund::data::universe::LIVE_SCREEN)
+        .await
+        .unwrap();
 
     assert_eq!(
         liquidity,
@@ -507,7 +509,9 @@ async fn test_liquidity_averages_the_session_product_not_the_product_of_averages
         .await;
     }
 
-    let liquidity = universe::load_liquidity(&pool, today).await.unwrap();
+    let liquidity = universe::load_liquidity(&pool, today, fund::data::universe::LIVE_SCREEN)
+        .await
+        .unwrap();
 
     assert_eq!(
         liquidity,

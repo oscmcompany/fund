@@ -210,6 +210,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &archive_bucket,
         lookback_days,
         session,
+        dataset::RESEARCH_SCREEN,
         training_fraction,
         // The published artifact keeps the raw target; the demeaned one is a laboratory experiment
         // until it is shown to produce a model that ranks.

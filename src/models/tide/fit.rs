@@ -7,7 +7,7 @@ use std::path::Path;
 
 use polars::prelude::*;
 
-use crate::common::types::LiquidityFloor;
+use crate::common::types::Screen;
 use crate::data::universe::filter_liquid_bars;
 use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{
@@ -131,10 +131,10 @@ fn build_mapping(data: &DataFrame, column: &str) -> Result<CategoryMapping, Tide
 /// Liquidity is delegated to [`filter_liquid_bars`] rather than tested per row, so the population
 /// the model is fitted on is the population the universe trades: a per-session test admits a
 /// name's good days and refuses its quiet ones, which is not a set the screen can ever produce.
-pub fn filter_training_bars(
-    data: DataFrame,
-    floor: LiquidityFloor,
-) -> Result<DataFrame, TideError> {
+///
+/// The window travels inside `screen` rather than being chosen here, so training screens whatever
+/// stretch of history its caller declares and not, silently, every session it happens to hold.
+pub fn filter_training_bars(data: DataFrame, screen: Screen) -> Result<DataFrame, TideError> {
     let tickers = data.column("ticker")?.str()?;
     let mask: BooleanChunked = tickers
         .into_iter()
@@ -143,7 +143,7 @@ pub fn filter_training_bars(
         })
         .collect();
 
-    Ok(filter_liquid_bars(data.filter(&mask)?, floor)?)
+    Ok(filter_liquid_bars(data.filter(&mask)?, screen)?)
 }
 
 /// Write the three artifact JSON files (scaler, mappings, parameters) the inference loader reads,
@@ -214,9 +214,17 @@ mod tests {
 
     /// Pinned to literals rather than `LiquidityFloor::CURRENT`, so these tests fail if the screen
     /// changes rather than moving with it.
-    fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> LiquidityFloor {
-        LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
-            .expect("test floor must be valid")
+    /// The screen these tests apply: given bounds, over every session the fixture holds.
+    ///
+    /// Whole-frame rather than trailing, because the fixtures carry a handful of sessions and the
+    /// question each asks is about the bounds. The trailing arithmetic is tested where it lives,
+    /// in `data::universe`.
+    fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> Screen {
+        Screen::new(
+            crate::common::types::LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
+                .expect("test floor must be valid"),
+            crate::common::types::ScreenWindow::WholeFrame,
+        )
     }
 
     /// The fraction the trainer runs with, so the tests exercise the split production uses.

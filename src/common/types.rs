@@ -144,6 +144,38 @@ impl std::fmt::Display for ScreenWindow {
     }
 }
 
+/// A liquidity screen: the bounds, and the stretch of history they are measured over.
+///
+/// One value rather than two arguments, for the reason [`LiquidityFloor`] is one value rather than
+/// two bounds — the pair is meaningless apart. The same bounds over a trailing month and over two
+/// years admit different sets of names, so a caller that supplies only a floor has not said which
+/// population it means, and three callers that each supply their own window produce three.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Screen {
+    floor: LiquidityFloor,
+    window: ScreenWindow,
+}
+
+impl Screen {
+    pub const fn new(floor: LiquidityFloor, window: ScreenWindow) -> Self {
+        Self { floor, window }
+    }
+
+    pub const fn floor(&self) -> LiquidityFloor {
+        self.floor
+    }
+
+    pub const fn window(&self) -> ScreenWindow {
+        self.window
+    }
+}
+
+impl std::fmt::Display for Screen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} over {}", self.floor, self.window)
+    }
+}
+
 /// Serializes a [`Decimal`] as a JSON number rather than a quoted string.
 ///
 /// `Decimal`'s own `Serialize` writes a string, which a reader has to cast before it can do

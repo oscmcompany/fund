@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 
 use serde::Serialize;
 
-use crate::common::types::{BarInterval, BasisPoints, LiquidityFloor, ScreenWindow};
+use crate::common::types::{BarInterval, BasisPoints, LiquidityFloor, Screen, ScreenWindow};
 use crate::laboratory::cost::{CostModel, CostRefusal};
 use crate::laboratory::dataset::DatasetFingerprint;
 use crate::laboratory::metrics::{summarize, Distribution};
@@ -131,9 +131,9 @@ impl DeclaredUniverse {
     /// The name is deliberately not part of it: a name is a label the caller picks, and no property
     /// of a frame can confirm or deny it. The floor and the window are facts about the rows and are
     /// checked against the fingerprint; the name is recorded on the caller's word alone.
-    fn screen(&self) -> Option<(LiquidityFloor, ScreenWindow)> {
+    fn screen(&self) -> Option<Screen> {
         match self {
-            DeclaredUniverse::Screened { floor, window, .. } => Some((*floor, *window)),
+            DeclaredUniverse::Screened { floor, window, .. } => Some(Screen::new(*floor, *window)),
             DeclaredUniverse::Unscreened => None,
         }
     }
@@ -299,8 +299,8 @@ pub enum StudyRefusal {
     /// Both halves of the screen travel in the refusal, because a study declaring the right floor
     /// over the wrong window is the case a floor-only comparison cannot see.
     UniverseDisagrees {
-        declared: Option<(LiquidityFloor, ScreenWindow)>,
-        measured: Option<(LiquidityFloor, ScreenWindow)>,
+        declared: Option<Screen>,
+        measured: Option<Screen>,
     },
     /// Matched arms must read the same number of sessions.
     ArmsNotAligned { treatment: usize, control: usize },
@@ -326,8 +326,8 @@ pub enum StudyRefusal {
 
 impl std::fmt::Display for StudyRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let screen = |value: &Option<(LiquidityFloor, ScreenWindow)>| match value {
-            Some((floor, window)) => format!("{floor} over {window}"),
+        let screen = |value: &Option<Screen>| match value {
+            Some(screen) => screen.to_string(),
             None => "unscreened".to_string(),
         };
         match self {
@@ -946,12 +946,12 @@ mod tests {
         NonZeroUsize::new(count).expect("the fixture must declare at least one test")
     }
 
-    fn fingerprint(screen: Option<(LiquidityFloor, ScreenWindow)>) -> DatasetFingerprint {
+    fn fingerprint(screen: Option<Screen>) -> DatasetFingerprint {
         DatasetFingerprint {
             session: SessionDate::at(Utc.with_ymd_and_hms(2026, 9, 17, 20, 0, 0).unwrap()),
             lookback_days: 730,
-            liquidity_floor: screen.map(|(floor, _)| floor),
-            screen_window: screen.map(|(_, window)| window),
+            liquidity_floor: screen.map(|screen| screen.floor()),
+            screen_window: screen.map(|screen| screen.window()),
             rows: 578_581,
             tickers: 1_253,
             first_timestamp: None,
@@ -1260,7 +1260,7 @@ mod tests {
             Pairing::Matched,
             arm("treatment", &[0.3, 0.1]),
             arm("control", &[0.1, 0.1]),
-            &fingerprint(Some((floor, trailing))),
+            &fingerprint(Some(Screen::new(floor, trailing))),
         )
         .expect("the declaration matches the screen the dataset was built under")
         .measure();
@@ -1295,15 +1295,15 @@ mod tests {
             arm("treatment", &[0.3, 0.1]),
             arm("control", &[0.1, 0.1]),
             // The same floor, applied across every session the frame held.
-            &fingerprint(Some((floor, ScreenWindow::WholeFrame))),
+            &fingerprint(Some(Screen::new(floor, ScreenWindow::WholeFrame))),
         )
         .expect_err("the same bounds over a different window are a different population");
 
         assert_eq!(
             refusal,
             StudyRefusal::UniverseDisagrees {
-                declared: Some((floor, trailing)),
-                measured: Some((floor, ScreenWindow::WholeFrame)),
+                declared: Some(Screen::new(floor, trailing)),
+                measured: Some(Screen::new(floor, ScreenWindow::WholeFrame)),
             }
         );
         // The refusal has to say which window, or a reader sees two identical-looking floors.
@@ -1375,7 +1375,10 @@ mod tests {
             Pairing::Matched,
             arm("sector", &[0.1, 0.2]),
             arm("permuted", &[0.0, 0.0]),
-            &fingerprint(Some((LiquidityFloor::CURRENT, ScreenWindow::WholeFrame))),
+            &fingerprint(Some(Screen::new(
+                LiquidityFloor::CURRENT,
+                ScreenWindow::WholeFrame,
+            ))),
         )
         .expect_err("an unscreened declaration over a screened dataset must be refused");
 
@@ -1956,7 +1959,7 @@ mod tests {
             Pairing::Matched,
             arm("treatment", &[0.3, 0.1]),
             arm("control", &[0.1, 0.1]),
-            &fingerprint(Some((floor, ScreenWindow::WholeFrame))),
+            &fingerprint(Some(Screen::new(floor, ScreenWindow::WholeFrame))),
         )
         .expect("the fixture must assemble")
         .measure();

@@ -135,7 +135,14 @@ async fn run(
         "Measuring session stability"
     );
 
-    let dataset = dataset::returns(&s3_client, &bucket, parameters.lookback_days, session).await?;
+    let dataset = dataset::returns(
+        &s3_client,
+        &bucket,
+        parameters.lookback_days,
+        session,
+        dataset::RESEARCH_SCREEN,
+    )
+    .await?;
     let fingerprint = dataset.fingerprint.clone();
     info!(
         rows = fingerprint.rows,
