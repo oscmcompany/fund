@@ -475,7 +475,9 @@ async fn test_liquidity_reports_the_window_low_not_its_average() {
         common::seed_bar(&pool, "AAAA", today.plus_calendar_days(offset), close).await;
     }
 
-    let liquidity = universe::load_liquidity(&pool, today).await.unwrap();
+    let liquidity = universe::load_liquidity(&pool, today, fund::data::universe::LIVE_SCREEN)
+        .await
+        .unwrap();
 
     assert_eq!(
         liquidity,
@@ -485,6 +487,80 @@ async fn test_liquidity_reports_the_window_low_not_its_average() {
             53_380_000.0
         )],
         "the averaged close would have reported 10.676 and passed the floor"
+    );
+}
+
+/// A bar after `as_of` is outside the window, whichever window was asked for.
+///
+/// `as_of` is the anchor and the screen says only how far back to reach, so a historical call has to
+/// read history. Without the upper bound the query returned every row ingested since, and a name
+/// that only became liquid afterwards would have been admitted to a universe it was not in.
+#[tokio::test]
+#[serial]
+async fn test_liquidity_stops_at_the_session_it_was_asked_for() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let asked = today.plus_calendar_days(-5);
+
+    // Thin through the window, then liquid afterwards. Reading past `asked` admits it; stopping
+    // there does not.
+    for offset in [-8, -7, -6, -5] {
+        common::seed_bar_with_volume(&pool, "AAAA", today.plus_calendar_days(offset), 50.0, 1)
+            .await;
+    }
+    for offset in [-4, -3, -2, -1, 0] {
+        common::seed_bar_with_volume(
+            &pool,
+            "AAAA",
+            today.plus_calendar_days(offset),
+            50.0,
+            100_000_000,
+        )
+        .await;
+    }
+
+    let floor =
+        fund::common::types::LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
+    for window in [
+        fund::common::types::ScreenWindow::Trailing(
+            std::num::NonZeroU32::new(30).expect("a positive window"),
+        ),
+        // The whole-frame window reaches back forever and must still stop at `as_of`, or the two
+        // variants would obey different rules about which end is the anchor.
+        fund::common::types::ScreenWindow::WholeFrame,
+    ] {
+        let screen = fund::common::types::Screen::new(floor, window);
+        let liquidity = universe::load_liquidity(&pool, asked, screen)
+            .await
+            .unwrap();
+
+        assert_eq!(liquidity.len(), 1, "{window} read no rows at all");
+        assert_eq!(
+            liquidity[0],
+            universe::LiquidityRow::new(ticker("AAAA"), 50.0, 50.0),
+            "{window} read the volume ingested after the session it was asked for"
+        );
+    }
+
+    // The control: asked for today, the later sessions are inside the window and do count.
+    let today_screen = fund::common::types::Screen::new(
+        floor,
+        fund::common::types::ScreenWindow::Trailing(
+            std::num::NonZeroU32::new(30).expect("a positive window"),
+        ),
+    );
+    let current = universe::load_liquidity(&pool, today, today_screen)
+        .await
+        .unwrap();
+    // Four thin sessions at 50 and five heavy ones at 5,000,000,000 average to 2,777,777,800.
+    assert_eq!(
+        current,
+        vec![universe::LiquidityRow::new(
+            ticker("AAAA"),
+            50.0,
+            2_777_777_800.0
+        )],
+        "the bound must exclude the future and not the present"
     );
 }
 
@@ -507,7 +583,9 @@ async fn test_liquidity_averages_the_session_product_not_the_product_of_averages
         .await;
     }
 
-    let liquidity = universe::load_liquidity(&pool, today).await.unwrap();
+    let liquidity = universe::load_liquidity(&pool, today, fund::data::universe::LIVE_SCREEN)
+        .await
+        .unwrap();
 
     assert_eq!(
         liquidity,

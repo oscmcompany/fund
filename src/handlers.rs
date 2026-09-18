@@ -30,7 +30,7 @@ use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
 use crate::data::truncate::{BoundaryTable, BoundaryTableCache};
-use crate::data::universe::{UniverseCache, UniverseError};
+use crate::data::universe::{UniverseCache, UniverseError, LIVE_SCREEN};
 use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
 use crate::portfolio::evaluate::{self, EvaluationContext};
@@ -150,7 +150,7 @@ impl ServiceState {
             artifact_prefix,
             model_version,
             calendar_cache: CalendarCache::new(),
-            universe_cache: UniverseCache::new(crate::common::types::LiquidityFloor::CURRENT),
+            universe_cache: UniverseCache::new(LIVE_SCREEN),
             close_history_cache: CloseHistoryCache::new(),
             split_table_cache: SplitTableCache::new(),
             boundary_table_cache: BoundaryTableCache::new(),
@@ -527,9 +527,10 @@ async fn run_inference(
 
     let consolidated = predict::consolidate_data(equity_bars, equity_details)
         .map_err(|error| at("consolidate")(error.to_string()))?;
-    let filtered =
-        predict::filter_equity_bars(consolidated, crate::common::types::LiquidityFloor::CURRENT)
-            .map_err(|error| at("filter_bars")(error.to_string()))?;
+    // Read off the cache rather than declared again here: the predicted set and the traded set are
+    // then one value, where two declarations would be two that happen to agree today.
+    let filtered = predict::filter_equity_bars(consolidated, state.universe_cache.screen())
+        .map_err(|error| at("filter_bars")(error.to_string()))?;
     let trained = predict::filter_to_trained_tickers(filtered, model_state)
         .map_err(|error| at("filter_tickers")(error.to_string()))?;
 

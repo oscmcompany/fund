@@ -248,6 +248,7 @@ async fn run(parameters: &Parameters) -> Result<Report, Box<dyn std::error::Erro
         &bucket,
         parameters.lookback_days,
         session,
+        dataset::RESEARCH_SCREEN,
         training_fraction,
         parameters.target,
     )
@@ -362,7 +363,14 @@ async fn run(parameters: &Parameters) -> Result<Report, Box<dyn std::error::Erro
     // A second read of the same window, because `build` consumed the first into the fit. The
     // archive is written nightly, so a partition landing between the two would measure the
     // baselines over a snapshot the model never saw — which is the one comparison this binary is for.
-    let returns = dataset::returns(&s3_client, &bucket, parameters.lookback_days, session).await?;
+    let returns = dataset::returns(
+        &s3_client,
+        &bucket,
+        parameters.lookback_days,
+        session,
+        dataset::RESEARCH_SCREEN,
+    )
+    .await?;
     if returns.fingerprint != fingerprint {
         return Err(format!(
             "the archive moved between the two reads of this window: the model was fitted on {} \

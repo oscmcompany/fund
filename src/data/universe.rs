@@ -3,6 +3,7 @@
 //! Computed once at pre-open and held for the Eastern date, because it cannot change intraday.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
@@ -13,14 +14,33 @@ use uuid::Uuid;
 
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
 use crate::common::journal::{Journal, Observation, UniverseRefreshed};
-use crate::common::types::{BarInterval, LiquidityFloor, LiquidityRefusal, SessionDate, Ticker};
+use crate::common::types::{
+    BarInterval, LiquidityFloor, LiquidityRefusal, Screen, ScreenWindow, SessionDate, Ticker,
+};
 use crate::data::cache::DailyCache;
 
 /// Trailing window over which liquidity is averaged.
 ///
 /// Long enough that a single quiet week does not evict a normally liquid name, short enough to
-/// notice one that has genuinely dried up.
-pub const LIQUIDITY_LOOKBACK_DAYS: i64 = 30;
+/// notice one that has genuinely dried up. Declared by the live path at `ServiceState::from_env`
+/// rather than read here, so the number keeps one home and the screens keep none.
+pub const LIQUIDITY_LOOKBACK_DAYS: u32 = 30;
+
+/// The same window as a value, for the screen to carry.
+const LIQUIDITY_LOOKBACK: NonZeroU32 = match NonZeroU32::new(LIQUIDITY_LOOKBACK_DAYS) {
+    Some(days) => days,
+    None => panic!("the liquidity lookback must be a positive number of days"),
+};
+
+/// The screen the live book both trades and predicts through.
+///
+/// One declaration for the two live call sites rather than one each, so they cannot drift apart on
+/// the bounds or the window's length. They can still differ on where the window is anchored — see
+/// [`trailing_window`] — which is a separate question and not yet settled.
+pub const LIVE_SCREEN: Screen = Screen::new(
+    LiquidityFloor::CURRENT,
+    ScreenWindow::Trailing(LIQUIDITY_LOOKBACK),
+);
 
 /// Errors building the universe.
 #[derive(Debug, thiserror::Error)]
@@ -58,17 +78,21 @@ impl LiquidityRow {
     }
 }
 
-/// Screens a bar frame down to the tickers that clear `floor` over the window it holds.
+/// Screens a bar frame down to the tickers that clear `screen`.
 ///
-/// The one expression of liquidity in dataframe terms, and the same pair of statistics
-/// [`load_liquidity`] reads in SQL: `MIN(close_price)` against the price bound and
-/// `MEAN(close_price * volume)` against the notional bound, per ticker. A screen that computes a
-/// different pair makes the traded, predicted and trained populations three different sets.
+/// `MIN(close_price)` against the price bound and `MEAN(close_price * volume)` against the notional
+/// bound, per ticker, measured over the window and applied to the whole frame — an admitted name
+/// keeps the history its features need.
 ///
-/// `bars` must carry `ticker`, `close_price`, and `volume`.
-pub fn filter_liquid_bars(bars: DataFrame, floor: LiquidityFloor) -> PolarsResult<DataFrame> {
-    let liquid_tickers = bars
-        .clone()
+/// `bars` must carry `ticker`, `close_price` and `volume`, plus `timestamp` for a trailing window.
+pub fn filter_liquid_bars(bars: DataFrame, screen: Screen) -> PolarsResult<DataFrame> {
+    let measured = match screen.window() {
+        ScreenWindow::WholeFrame => bars.clone(),
+        ScreenWindow::Trailing(days) => trailing_window(&bars, i64::from(days.get()))?,
+    };
+    let floor = screen.floor();
+
+    let liquid_tickers = measured
         .lazy()
         .group_by([col("ticker")])
         .agg([
@@ -96,6 +120,31 @@ pub fn filter_liquid_bars(bars: DataFrame, floor: LiquidityFloor) -> PolarsResul
             [col("ticker")],
             JoinArgs::new(JoinType::Semi),
         )
+        .collect()
+}
+
+/// The rows within `days` Eastern calendar days of the frame's newest bar, inclusive at the edge.
+///
+/// **Anchored on the frame's newest bar, where [`load_liquidity`] anchors on its `as_of`.** At
+/// pre-open the newest daily bar is the previous session's, so the two windows reach back to
+/// different days and can classify a name near the bound differently.
+///
+/// An empty frame has no newest bar and so no window, and is returned unchanged.
+fn trailing_window(bars: &DataFrame, days: i64) -> PolarsResult<DataFrame> {
+    let Some(newest) = bars.column("timestamp")?.i64()?.max() else {
+        return Ok(bars.clone());
+    };
+    let newest = DateTime::from_timestamp_millis(newest).ok_or_else(|| {
+        PolarsError::ComputeError(format!("bar timestamp {newest} is not an instant").into())
+    })?;
+    let start = SessionDate::at(newest)
+        .plus_calendar_days(-days)
+        .midnight()
+        .timestamp_millis();
+
+    bars.clone()
+        .lazy()
+        .filter(col("timestamp").gt_eq(lit(start)))
         .collect()
 }
 
@@ -188,17 +237,26 @@ impl Universe {
     }
 }
 
-/// Reads per-ticker minimum close and average dollar volume over the trailing window.
+/// Reads per-ticker minimum close and average dollar volume over `screen`'s window, ending `as_of`.
 ///
-/// Read over daily bars specifically: the liquidity thresholds are calibrated on daily dynamics,
-/// and averaging intraday bars would compare a per-bar notional against a per-day threshold and
-/// reject the entire universe. The product is taken per session and then averaged, because the
-/// average of a product is not the product of the averages once price and volume move together.
+/// The SQL twin of [`filter_liquid_bars`], reading daily bars because the thresholds are calibrated
+/// on daily dynamics and a per-bar notional would not clear a per-day bound. `as_of` bounds the
+/// query at both ends, so a historical call reads history and not the rows ingested since.
 pub async fn load_liquidity(
     pool: &PgPool,
     as_of: SessionDate,
+    screen: Screen,
 ) -> Result<Vec<LiquidityRow>, sqlx::Error> {
-    let start = as_of.plus_calendar_days(-LIQUIDITY_LOOKBACK_DAYS);
+    let start = match screen.window() {
+        ScreenWindow::Trailing(days) => as_of.plus_calendar_days(-i64::from(days.get())).midnight(),
+        // The epoch rather than an `Option<DateTime>` threaded through the query: no equity bar
+        // predates it, so an unbounded lower edge and this one select the same rows.
+        ScreenWindow::WholeFrame => DateTime::<Utc>::from_timestamp_nanos(0),
+    };
+    // Exclusive, and applied to both windows: `as_of` is the anchor and the window says only how far
+    // back to reach, so a whole-frame call that read past it would be a second rule. A daily bar is
+    // stamped at the 16:00 Eastern close, so the next midnight admits `as_of`'s own bar and no more.
+    let end = as_of.plus_calendar_days(1).midnight();
     let rows = sqlx::query!(
         r#"
         SELECT ticker AS "ticker!",
@@ -207,10 +265,12 @@ pub async fn load_liquidity(
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
+          AND timestamp < $3
         GROUP BY ticker
         "#,
         BarInterval::OneDay.as_str(),
-        start.midnight(),
+        start,
+        end,
     )
     .fetch_all(pool)
     .await?;
@@ -229,19 +289,25 @@ pub async fn load_liquidity(
 ///
 /// Warmed by the pre-open handler and refreshed on demand by anything that finds it cold, so a
 /// restart mid-session repopulates rather than trading an empty universe until the next morning.
-/// The floor is held here rather than passed per call, so every rebuild within a process screens
-/// the same way.
+/// The screen is held here rather than passed per call, so every rebuild within a process screens
+/// the same way — and so does the predict path, which reads it back off the cache rather than
+/// declaring a second one that agrees by inspection.
 pub struct UniverseCache {
     inner: DailyCache<Universe>,
-    floor: LiquidityFloor,
+    screen: Screen,
 }
 
 impl UniverseCache {
-    pub fn new(floor: LiquidityFloor) -> Self {
+    pub fn new(screen: Screen) -> Self {
         Self {
             inner: DailyCache::default(),
-            floor,
+            screen,
         }
+    }
+
+    /// The screen this cache builds its universe with.
+    pub fn screen(&self) -> Screen {
+        self.screen
     }
 
     /// Returns today's universe, rebuilding it if the cache is cold or was filled on an earlier
@@ -268,8 +334,8 @@ impl UniverseCache {
                 today,
                 || async {
                     let assets = client.fetch_tradable_assets().await?;
-                    let liquidity = load_liquidity(pool, today).await?;
-                    let universe = Universe::build(&assets, &liquidity, self.floor);
+                    let liquidity = load_liquidity(pool, today, self.screen).await?;
+                    let universe = Universe::build(&assets, &liquidity, self.screen.floor());
 
                     info!(
                         alpaca_tradable = assets.tradable_count(),
@@ -298,7 +364,7 @@ impl UniverseCache {
                                 alpaca_shortable: assets.shortable_count(),
                                 liquid: liquidity
                                     .iter()
-                                    .filter(|row| row.admission(self.floor).is_ok())
+                                    .filter(|row| row.admission(self.screen.floor()).is_ok())
                                     .count(),
                                 universe_size: universe.len(),
                                 admitted,
@@ -333,6 +399,22 @@ mod tests {
     /// changes rather than moving with it.
     fn floor() -> LiquidityFloor {
         LiquidityFloor::new(10.0, 50_000_000.0).expect("test floor must be valid")
+    }
+
+    /// The test floor applied across every session the fixture holds.
+    ///
+    /// The `bars` fixture below carries no `timestamp` column at all, which is how the claim that a
+    /// whole-frame screen never reads one is enforced rather than merely written down.
+    fn screen() -> Screen {
+        Screen::new(floor(), ScreenWindow::WholeFrame)
+    }
+
+    /// The same floor over a trailing window of `days`.
+    fn trailing(days: u32) -> Screen {
+        Screen::new(
+            floor(),
+            ScreenWindow::Trailing(NonZeroU32::new(days).expect("a positive window")),
+        )
     }
 
     fn assets() -> TradableAssets {
@@ -480,12 +562,12 @@ mod tests {
         let frame = bars(&[("EDGE", 10.0, 5_000_000), ("EDGE", 10.0, 5_000_000)]);
         assert_eq!(floor().admits(10.0, 50_000_000.0), Ok(()));
         assert_eq!(
-            surviving_tickers(&filter_liquid_bars(frame, floor()).unwrap()),
+            surviving_tickers(&filter_liquid_bars(frame, screen()).unwrap()),
             vec!["EDGE".to_string()]
         );
 
         let under = bars(&[("EDGE", 9.99, 5_000_000), ("EDGE", 9.99, 5_000_000)]);
-        assert!(filter_liquid_bars(under, floor()).unwrap().is_empty());
+        assert!(filter_liquid_bars(under, screen()).unwrap().is_empty());
     }
 
     /// Price on the window minimum and notional on the window average, which is the definition the
@@ -495,15 +577,126 @@ mod tests {
     fn test_the_dataframe_screen_takes_the_minimum_price_and_the_average_notional() {
         // Mean close 55, minimum close 5: the minimum is what binds, so this is refused.
         let dipped = bars(&[("DIPS", 105.0, 1_000_000), ("DIPS", 5.0, 20_000_000)]);
-        assert!(filter_liquid_bars(dipped, floor()).unwrap().is_empty());
+        assert!(filter_liquid_bars(dipped, screen()).unwrap().is_empty());
 
         // One quiet session against one heavy one: the average carries it, which the price
         // treatment deliberately does not do.
         let quiet = bars(&[("FLOW", 100.0, 10_000), ("FLOW", 100.0, 2_000_000)]);
         assert_eq!(
-            surviving_tickers(&filter_liquid_bars(quiet, floor()).unwrap()),
+            surviving_tickers(&filter_liquid_bars(quiet, screen()).unwrap()),
             vec!["FLOW".to_string()]
         );
+    }
+
+    /// A name whose liquidity predates the window is not admitted by it.
+    ///
+    /// Moved here with the arithmetic it tests: the window used to be cut by the predict path
+    /// before it called this screen, so the behaviour was exercised a layer above the code.
+    #[test]
+    fn test_liquidity_older_than_the_window_does_not_admit_a_name() {
+        let day = 24 * 60 * 60 * 1_000i64;
+        let newest = 1_000 * day;
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["FADED", "FADED"]),
+            // One bar inside the 30-day window, one 60 days before it.
+            Column::new("timestamp".into(), vec![newest - 60 * day, newest]),
+            Column::new("close_price".into(), vec![50.0, 50.0]),
+            Column::new("volume".into(), vec![10_000_000i64, 100]),
+        ])
+        .expect("the fixture frame must build");
+
+        assert!(filter_liquid_bars(frame.clone(), trailing(30))
+            .unwrap()
+            .is_empty());
+        // The same rows over the whole frame do admit it, which is what makes the window the
+        // difference rather than the bounds.
+        assert_eq!(filter_liquid_bars(frame, screen()).unwrap().height(), 2);
+    }
+
+    /// The window's own lower edge is inside it, matching `load_liquidity`'s `timestamp >= $2`.
+    ///
+    /// An exclusive bound here and an inclusive one in SQL disagree on exactly one session, which is
+    /// the session most likely to decide a marginal name.
+    #[test]
+    fn test_a_bar_exactly_on_the_window_edge_is_inside_it() {
+        let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
+        let edge = newest
+            .plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS))
+            .midnight()
+            .timestamp_millis();
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["EDGE", "EDGE"]),
+            // The older bar sits on the edge and carries all the notional; drop it and the name
+            // averages below the floor.
+            Column::new(
+                "timestamp".into(),
+                vec![edge, newest.midnight().timestamp_millis()],
+            ),
+            Column::new("close_price".into(), vec![50.0, 50.0]),
+            Column::new("volume".into(), vec![4_000_000i64, 0]),
+        ])
+        .expect("the fixture frame must build");
+
+        let result = filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS)).unwrap();
+
+        assert_eq!(result.height(), 2);
+    }
+
+    /// The window is Eastern calendar days, not multiples of 24 hours.
+    ///
+    /// A window ending after the March transition opens an hour later in UTC than a fixed offset
+    /// does, so a fixed offset reaches back into a session the universe has already stopped counting
+    /// and can admit a name on liquidity that is outside the window.
+    #[test]
+    fn test_the_window_counts_calendar_days_across_a_daylight_saving_transition() {
+        // 2026-03-08 is the spring transition; a window ending 2026-03-20 spans it.
+        let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap());
+        let oldest = newest.plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS));
+        let fixed_offset_start =
+            newest.midnight().timestamp_millis() - i64::from(LIQUIDITY_LOOKBACK_DAYS) * 86_400_000;
+
+        assert_eq!(
+            oldest.midnight().timestamp_millis() - fixed_offset_start,
+            3_600_000,
+            "the calendar bound must open an hour after the fixed-offset one across the transition"
+        );
+
+        // All of the name's notional sits in that one disputed hour, so whether it clears the floor
+        // is exactly the question of which bound is used.
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["SPRUNG", "SPRUNG"]),
+            Column::new(
+                "timestamp".into(),
+                vec![fixed_offset_start, newest.midnight().timestamp_millis()],
+            ),
+            Column::new("close_price".into(), vec![50.0, 50.0]),
+            Column::new("volume".into(), vec![4_000_000i64, 0]),
+        ])
+        .expect("the fixture frame must build");
+
+        let result = filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS)).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a bar an hour outside the calendar window must not admit the name"
+        );
+    }
+
+    /// An empty frame has no newest bar, so a trailing window has nothing to anchor on.
+    ///
+    /// Returned unchanged rather than treated as a window that admitted nothing, which would be the
+    /// same answer by accident and a different one the moment the frame is not empty.
+    #[test]
+    fn test_a_trailing_window_over_an_empty_frame_is_empty_rather_than_refused() {
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), Vec::<&str>::new()),
+            Column::new("timestamp".into(), Vec::<i64>::new()),
+            Column::new("close_price".into(), Vec::<f64>::new()),
+            Column::new("volume".into(), Vec::<i64>::new()),
+        ])
+        .expect("the fixture frame must build");
+
+        assert!(filter_liquid_bars(frame, trailing(30)).unwrap().is_empty());
     }
 
     /// Every bar of an admitted ticker survives, and none of a refused one: the screen is per
@@ -516,14 +709,14 @@ mod tests {
             ("DROP", 100.0, 1),
             ("DROP", 100.0, 1),
         ]);
-        let filtered = filter_liquid_bars(frame, floor()).unwrap();
+        let filtered = filter_liquid_bars(frame, screen()).unwrap();
         assert_eq!(filtered.height(), 2);
         assert_eq!(surviving_tickers(&filtered), vec!["KEEP".to_string()]);
     }
 
     #[tokio::test]
     async fn test_cache_serves_installed_universe_without_fetching() {
-        let cache = UniverseCache::new(floor());
+        let cache = UniverseCache::new(screen());
         let now = "2026-06-10T14:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let universe = Universe::build(&assets(), &[liquid("AAPL")], floor());
         cache.install(now, universe).await;

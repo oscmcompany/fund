@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::common::types::{EquityPrediction, LiquidityFloor, SessionDate, Ticker};
+use crate::common::types::{EquityPrediction, Screen, SessionDate, Ticker};
 use crate::data::universe;
 
 use crate::models::tide::artifact::ModelState;
@@ -185,66 +185,24 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
     Ok(names)
 }
 
-/// Drops tickers that do not clear `floor` over the same window the traded universe screens.
+/// Drops tickers that do not clear `screen`, keeping the surviving names' whole history.
 ///
-/// The frame carries a longer history than the screen reads, because the features need it and the
-/// universe does not: the statistics are taken over the trailing
-/// [`universe::LIQUIDITY_LOOKBACK_DAYS`], so the predicted set is the traded set rather than a
-/// superset of it. Screening the whole frame would let a name that has since dried up keep a
-/// prediction on the strength of history the universe has already stopped counting.
-pub fn filter_equity_bars(
-    data: DataFrame,
-    floor: LiquidityFloor,
-) -> Result<DataFrame, PredictionError> {
+/// Nothing here but the count: the statistic and the window both live in
+/// [`universe::filter_liquid_bars`], so the predicted set and the traded set read one definition.
+///
+/// They do not yet read one *anchor*. This screens the window ending at the frame's newest bar and
+/// the traded universe screens the window ending at its own session, so at pre-open the two reach
+/// back to different days.
+pub fn filter_equity_bars(data: DataFrame, screen: Screen) -> Result<DataFrame, PredictionError> {
     let before_count = data.height();
-    let consolidation = |error: PolarsError| PredictionError::DataConsolidation(error.to_string());
 
-    let newest_timestamp = data
-        .column("timestamp")
-        .map_err(consolidation)?
-        .i64()
-        .map_err(consolidation)?
-        .max();
-    let Some(newest_timestamp) = newest_timestamp else {
-        return Ok(data);
-    };
-    // Eastern calendar days rather than a multiple of 24 hours, and inclusive at the lower edge,
-    // because that is what `universe::load_liquidity` asks Postgres for.
-    let newest_instant = DateTime::from_timestamp_millis(newest_timestamp).ok_or_else(|| {
-        PredictionError::DataConsolidation(format!(
-            "bar timestamp {newest_timestamp} is not an instant"
-        ))
-    })?;
-    let window_start = SessionDate::at(newest_instant)
-        .plus_calendar_days(-universe::LIQUIDITY_LOOKBACK_DAYS)
-        .midnight()
-        .timestamp_millis();
-
-    let window = data
-        .clone()
-        .lazy()
-        .filter(col("timestamp").gt_eq(lit(window_start)))
-        .collect()
-        .map_err(consolidation)?;
-    let liquid = universe::filter_liquid_bars(window, floor).map_err(consolidation)?;
-
-    let filtered = data
-        .lazy()
-        .join(
-            liquid
-                .lazy()
-                .select([col("ticker")])
-                .unique(None, UniqueKeepStrategy::Any),
-            [col("ticker")],
-            [col("ticker")],
-            JoinArgs::new(JoinType::Semi),
-        )
-        .collect()
-        .map_err(consolidation)?;
+    let filtered = universe::filter_liquid_bars(data, screen)
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     info!(
         before = before_count,
         after = filtered.height(),
+        %screen,
         "Filtered equity bars by price and volume thresholds"
     );
 
@@ -625,9 +583,17 @@ mod tests {
 
     /// Pinned to literals rather than `LiquidityFloor::CURRENT`, so these tests fail if the screen
     /// changes rather than moving with it.
-    fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> LiquidityFloor {
-        LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
-            .expect("test floor must be valid")
+    /// The screen these tests apply: given bounds, over every session the fixture holds.
+    ///
+    /// Whole-frame rather than trailing, because the fixtures carry a handful of sessions and the
+    /// question each asks is about the bounds. The trailing arithmetic is tested where it lives,
+    /// in `data::universe`.
+    fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> Screen {
+        Screen::new(
+            crate::common::types::LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
+                .expect("test floor must be valid"),
+            crate::common::types::ScreenWindow::WholeFrame,
+        )
     }
 
     /// A scaler over the target column alone, which is all `unscale_and_sort_quantiles` reads.
@@ -758,99 +724,6 @@ mod tests {
         let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
 
         assert_eq!(result.height(), 0);
-    }
-
-    /// The window is the traded universe's, not the whole frame the features need, so liquidity
-    /// that predates the window cannot keep a name that has since dried up.
-    #[test]
-    fn test_liquidity_older_than_the_window_does_not_admit_a_name() {
-        let day = 24 * 60 * 60 * 1_000i64;
-        let newest = 1_000 * day;
-        let data = DataFrame::new(vec![
-            Column::new("ticker".into(), vec!["FADED", "FADED"]),
-            Column::new(
-                "timestamp".into(),
-                // One bar inside the 30-day window, one 60 days before it.
-                vec![newest - 60 * day, newest],
-            ),
-            Column::new("close_price".into(), vec![50.0, 50.0]),
-            Column::new("volume".into(), vec![10_000_000i64, 100]),
-        ])
-        .unwrap();
-
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
-
-        assert_eq!(result.height(), 0);
-    }
-
-    /// The window's own lower edge is inside it, matching `load_liquidity`'s `timestamp >= $2`.
-    ///
-    /// An exclusive bound here and an inclusive one in SQL disagree on exactly one session, which is
-    /// the session most likely to decide a marginal name.
-    #[test]
-    fn test_a_bar_exactly_on_the_window_edge_is_inside_it() {
-        let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
-        let edge = newest
-            .plus_calendar_days(-universe::LIQUIDITY_LOOKBACK_DAYS)
-            .midnight()
-            .timestamp_millis();
-        let data = DataFrame::new(vec![
-            Column::new("ticker".into(), vec!["EDGE", "EDGE"]),
-            // The older bar sits on the edge and carries all the notional; drop it and the name
-            // averages below the floor.
-            Column::new(
-                "timestamp".into(),
-                vec![edge, newest.midnight().timestamp_millis()],
-            ),
-            Column::new("close_price".into(), vec![50.0, 50.0]),
-            Column::new("volume".into(), vec![4_000_000i64, 0]),
-        ])
-        .unwrap();
-
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
-
-        assert_eq!(result.height(), 2);
-    }
-
-    /// The window is 30 Eastern calendar days, not 30 multiples of 24 hours.
-    ///
-    /// A window ending after the March transition opens an hour later in UTC than a fixed offset
-    /// does, so a fixed offset reaches back into a session the universe has already stopped counting
-    /// and can admit a name on liquidity that is outside the window.
-    #[test]
-    fn test_the_window_counts_calendar_days_across_a_daylight_saving_transition() {
-        // 2026-03-08 is the spring transition; a window ending 2026-03-20 spans it.
-        let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap());
-        let oldest = newest.plus_calendar_days(-universe::LIQUIDITY_LOOKBACK_DAYS);
-        let fixed_offset_start =
-            newest.midnight().timestamp_millis() - universe::LIQUIDITY_LOOKBACK_DAYS * 86_400_000;
-
-        assert_eq!(
-            oldest.midnight().timestamp_millis() - fixed_offset_start,
-            3_600_000,
-            "the calendar bound must open an hour after the fixed-offset one across the transition"
-        );
-
-        // All of the name's notional sits in that one disputed hour, so whether it clears the floor
-        // is exactly the question of which bound is used.
-        let data = DataFrame::new(vec![
-            Column::new("ticker".into(), vec!["SPRUNG", "SPRUNG"]),
-            Column::new(
-                "timestamp".into(),
-                vec![fixed_offset_start, newest.midnight().timestamp_millis()],
-            ),
-            Column::new("close_price".into(), vec![50.0, 50.0]),
-            Column::new("volume".into(), vec![4_000_000i64, 0]),
-        ])
-        .unwrap();
-
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
-
-        assert_eq!(
-            result.height(),
-            0,
-            "a bar an hour outside the calendar window must not admit the name"
-        );
     }
 
     #[test]

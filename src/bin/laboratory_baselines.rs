@@ -8,7 +8,7 @@ use chrono::Utc;
 use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
-use fund::common::types::{BasisPoints, ScreenWindow, SessionDate};
+use fund::common::types::{BasisPoints, Screen, SessionDate};
 use fund::laboratory::cost::{CostModel, FillStyle, RoundTrip};
 use fund::laboratory::dataset::{self, DatasetFingerprint};
 use fund::laboratory::harness::{
@@ -193,7 +193,14 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         "Measuring the baselines"
     );
 
-    let dataset = dataset::returns(&s3_client, &bucket, parameters.lookback_days, session).await?;
+    let dataset = dataset::returns(
+        &s3_client,
+        &bucket,
+        parameters.lookback_days,
+        session,
+        dataset::RESEARCH_SCREEN,
+    )
+    .await?;
     let fingerprint = dataset.fingerprint;
     info!(
         rows = fingerprint.rows,
@@ -264,7 +271,13 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
     let sessions: Vec<i64> = (0..panel.sessions())
         .map(|index| panel.session_at(index))
         .collect();
-    let studies = measure(parameters, &evaluations, &sessions, &fingerprint)?;
+    let studies = measure(
+        parameters,
+        &evaluations,
+        &sessions,
+        dataset::RESEARCH_SCREEN,
+        &fingerprint,
+    )?;
     if let Some(journal) = journal.as_ref() {
         for result in &studies {
             journal
@@ -297,6 +310,7 @@ fn measure(
     parameters: &Parameters,
     evaluations: &[Evaluation],
     sessions: &[i64],
+    screen: Screen,
     fingerprint: &DatasetFingerprint,
 ) -> Result<Vec<StudyResult>, Box<dyn std::error::Error>> {
     let control = evaluations
@@ -342,7 +356,7 @@ fn measure(
                     Family::new(FAMILY, tests),
                     // One session ahead: the panel's target is the next session's return.
                     Horizon::Sessions(NonZeroUsize::new(1).expect("a positive count")),
-                    declared_universe(fingerprint),
+                    declared_universe(screen),
                     Quantity::ReturnPerRoundTrip {
                         // A decile long-short crosses one name on each side per dollar deployed,
                         // whatever the decile's width, so the round trip is a pair.
@@ -361,19 +375,21 @@ fn measure(
         .collect()
 }
 
-/// The population the dataset was actually screened by, named and versioned.
+/// The population the study declares, built from the screen it handed the loader.
 ///
-/// Read off the fingerprint rather than asserted, because the harness refuses a study whose
-/// declaration disagrees with it — and the window is stated as [`ScreenWindow::WholeFrame`] because
-/// that is what `filter_training_bars` does, not what the traded universe does.
-fn declared_universe(fingerprint: &DatasetFingerprint) -> DeclaredUniverse {
-    match fingerprint.liquidity_floor {
-        Some(floor) => DeclaredUniverse::Screened {
-            name: "training-liquid-v1".to_string(),
-            floor,
-            window: ScreenWindow::WholeFrame,
-        },
-        None => DeclaredUniverse::Unscreened,
+/// Declared from the same value that did the screening rather than read back off the fingerprint:
+/// with the screen an input, reading it back would restate the input and the harness would be
+/// checking a value against itself. What `Study::new` verifies from here is that the **loader
+/// honoured** the declaration — which is a narrower guarantee than it was, and still catches the
+/// composition error most likely to happen, a screened declaration over `dataset::intraday`, which
+/// screens nothing.
+fn declared_universe(screen: Screen) -> DeclaredUniverse {
+    DeclaredUniverse::Screened {
+        // Versioned rather than derived from the bounds: two studies quoting "liquid" should be
+        // comparable or visibly not, and a name is the only part of this a reader can hold on to.
+        name: "training-liquid-v1".to_string(),
+        floor: screen.floor(),
+        window: screen.window(),
     }
 }
 
@@ -482,8 +498,8 @@ mod tests {
                 chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap(),
             ),
             lookback_days: 365,
-            liquidity_floor: Some(fund::common::types::LiquidityFloor::CURRENT),
-            screen_window: Some(ScreenWindow::WholeFrame),
+            liquidity_floor: Some(dataset::RESEARCH_SCREEN.floor()),
+            screen_window: Some(dataset::RESEARCH_SCREEN.window()),
             rows: 317_465,
             tickers: 1_334,
             first_timestamp: None,
@@ -527,8 +543,14 @@ mod tests {
             evaluation(CONTROL, [Some(0.0); 4]),
         ];
 
-        let studies =
-            measure(&parameters(), &evaluations, &sessions(), &fingerprint()).expect("scorable");
+        let studies = measure(
+            &parameters(),
+            &evaluations,
+            &sessions(),
+            dataset::RESEARCH_SCREEN,
+            &fingerprint(),
+        )
+        .expect("scorable");
 
         assert_eq!(studies.len(), 2, "the control is not a test of itself");
         for study in &studies {
@@ -552,8 +574,14 @@ mod tests {
             evaluation(CONTROL, [Some(0.0); 4]),
         ];
 
-        let studies =
-            measure(&parameters(), &evaluations, &sessions(), &fingerprint()).expect("scorable");
+        let studies = measure(
+            &parameters(),
+            &evaluations,
+            &sessions(),
+            dataset::RESEARCH_SCREEN,
+            &fingerprint(),
+        )
+        .expect("scorable");
         let difference = studies[0].difference().expect("measurable");
 
         assert!((difference.mean - 10.0).abs() < 1e-9, "{difference:?}");
@@ -570,10 +598,24 @@ mod tests {
     #[test]
     fn test_a_run_with_no_control_arm_is_refused() {
         let evaluations = vec![evaluation("persistence", [Some(0.001); 4])];
-        assert!(measure(&parameters(), &evaluations, &sessions(), &fingerprint()).is_err());
+        assert!(measure(
+            &parameters(),
+            &evaluations,
+            &sessions(),
+            dataset::RESEARCH_SCREEN,
+            &fingerprint(),
+        )
+        .is_err());
 
         let only_control = vec![evaluation(CONTROL, [Some(0.0); 4])];
-        assert!(measure(&parameters(), &only_control, &sessions(), &fingerprint()).is_err());
+        assert!(measure(
+            &parameters(),
+            &only_control,
+            &sessions(),
+            dataset::RESEARCH_SCREEN,
+            &fingerprint(),
+        )
+        .is_err());
     }
 
     fn scored(

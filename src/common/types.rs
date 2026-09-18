@@ -2,7 +2,7 @@
 //!
 //! Fields are private and constructors validate, so a value in scope is proof its invariants held.
 
-use std::num::NonZeroI64;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -130,7 +130,10 @@ impl std::fmt::Display for LiquidityFloor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ScreenWindow {
     /// The trailing calendar days the traded universe screens over.
-    Trailing(NonZeroI64),
+    ///
+    /// Unsigned because a negative window is not a narrower one: it puts the lower bound *after* the
+    /// upper and selects nothing, which both readers would report as a name that went quiet.
+    Trailing(NonZeroU32),
     /// Every session the frame holds, so a name that dipped once anywhere in it is refused.
     WholeFrame,
 }
@@ -141,6 +144,38 @@ impl std::fmt::Display for ScreenWindow {
             ScreenWindow::Trailing(days) => write!(formatter, "trailing {days} days"),
             ScreenWindow::WholeFrame => write!(formatter, "the whole frame"),
         }
+    }
+}
+
+/// A liquidity screen: the bounds, and the stretch of history they are measured over.
+///
+/// One value rather than two arguments, for the reason [`LiquidityFloor`] is one value rather than
+/// two bounds — the pair is meaningless apart. The same bounds over a trailing month and over two
+/// years admit different sets of names, so a caller that supplies only a floor has not said which
+/// population it means, and three callers that each supply their own window produce three.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Screen {
+    floor: LiquidityFloor,
+    window: ScreenWindow,
+}
+
+impl Screen {
+    pub const fn new(floor: LiquidityFloor, window: ScreenWindow) -> Self {
+        Self { floor, window }
+    }
+
+    pub const fn floor(&self) -> LiquidityFloor {
+        self.floor
+    }
+
+    pub const fn window(&self) -> ScreenWindow {
+        self.window
+    }
+}
+
+impl std::fmt::Display for Screen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} over {}", self.floor, self.window)
     }
 }
 

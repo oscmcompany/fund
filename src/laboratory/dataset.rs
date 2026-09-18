@@ -9,7 +9,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::common::aws::date_partitioned_key;
-use crate::common::types::{BarInterval, LiquidityFloor, ScreenWindow, SessionDate};
+use crate::common::types::{BarInterval, LiquidityFloor, Screen, ScreenWindow, SessionDate};
 use crate::data::{adjust, archive, bars, reference, truncate};
 use crate::laboratory::residual::{residual_returns, FactorSpecification, ResidualPanel};
 use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
@@ -36,6 +36,15 @@ pub enum DatasetError {
     #[error("{0}")]
     Window(String),
 }
+
+/// The screen the research paths read the archive through, unless a caller declares another.
+///
+/// Named here rather than repeated at each of the nine callers, and deliberately *not* the same
+/// value as [`crate::data::universe::LIVE_SCREEN`]: the live book screens a trailing month, and the
+/// archive paths screen every session they load. That gap is the thing task 14's measurement exists
+/// to price, so it is written down as two named screens rather than left to emerge from whichever
+/// frame each caller happened to pass.
+pub const RESEARCH_SCREEN: Screen = Screen::new(LiquidityFloor::CURRENT, ScreenWindow::WholeFrame);
 
 /// What a dataset was built from, recorded so two runs can be told apart.
 ///
@@ -87,8 +96,10 @@ impl DatasetFingerprint {
     /// applied over. The two are written together and are meaningless apart; returning them as a
     /// pair is what stops a reader treating `screen_window: None` as "no window" on a screened
     /// frame rather than as "no screen".
-    pub fn screen(&self) -> Option<(LiquidityFloor, ScreenWindow)> {
-        self.liquidity_floor.zip(self.screen_window)
+    pub fn screen(&self) -> Option<Screen> {
+        self.liquidity_floor
+            .zip(self.screen_window)
+            .map(|(floor, window)| Screen::new(floor, window))
     }
 }
 
@@ -153,10 +164,12 @@ pub async fn build(
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
+    screen: Screen,
     training_fraction: TrainingFraction,
     target: Target,
 ) -> Result<PreparedDataset, DatasetError> {
-    let (filtered, fingerprint) = read_window(s3_client, bucket, lookback_days, session).await?;
+    let (filtered, fingerprint) =
+        read_window(s3_client, bucket, lookback_days, session, screen).await?;
     let fit = fit(filtered, training_fraction, target)?;
 
     Ok(PreparedDataset { fit, fingerprint })
@@ -233,8 +246,10 @@ pub async fn returns(
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
+    screen: Screen,
 ) -> Result<ReturnsDataset, DatasetError> {
-    let (filtered, fingerprint) = read_window(s3_client, bucket, lookback_days, session).await?;
+    let (filtered, fingerprint) =
+        read_window(s3_client, bucket, lookback_days, session, screen).await?;
     // The model's own two steps, not just the first: `clean_data` drops any row holding a null or
     // non-finite value in any continuous column, so skipping it would measure names the model never
     // sees — a missing vendor VWAP costs a row there and none here.
@@ -262,12 +277,13 @@ pub async fn residuals(
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
+    screen: Screen,
     specification: FactorSpecification,
 ) -> Result<ResidualDataset, DatasetError> {
     let ReturnsDataset {
         returns,
         mut fingerprint,
-    } = self::returns(s3_client, bucket, lookback_days, session).await?;
+    } = self::returns(s3_client, bucket, lookback_days, session, screen).await?;
     let panel = residual_returns(&returns, specification)?;
     fingerprint.factor_specification = Some(specification);
 
@@ -283,6 +299,7 @@ async fn read_window(
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
+    screen: Screen,
 ) -> Result<(DataFrame, DatasetFingerprint), DatasetError> {
     let adjustments = read_adjustments(s3_client, bucket).await?;
 
@@ -313,16 +330,15 @@ async fn read_window(
     // The prices arrived restated onto this session's share basis and the counts did not, so their
     // product is out by the split factor until this runs.
     let consolidated = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
-    let floor = LiquidityFloor::CURRENT;
-    let filtered = filter_training_bars(consolidated, floor)?;
+    let filtered = filter_training_bars(consolidated, screen)?;
 
     let fingerprint = fingerprint_of(
         &filtered,
         session,
         lookback_days,
-        // `filter_training_bars` imposes no time cut of its own, so the floor is applied across
-        // every session loaded — not the trailing window the traded universe screens over.
-        Some((floor, ScreenWindow::WholeFrame)),
+        // Recorded from the value that did the screening, so the fingerprint describes what happened
+        // rather than restating what the caller meant.
+        Some(screen),
         Digests {
             splits: adjustments.splits_digest,
             boundaries: adjustments.boundaries_digest,
@@ -392,7 +408,7 @@ fn fingerprint_of(
     frame: &DataFrame,
     session: SessionDate,
     lookback_days: i64,
-    screen: Option<(LiquidityFloor, ScreenWindow)>,
+    screen: Option<Screen>,
     digests: Digests,
     factor_specification: Option<FactorSpecification>,
 ) -> Result<DatasetFingerprint, DatasetError> {
@@ -403,8 +419,8 @@ fn fingerprint_of(
         session,
         lookback_days,
         // Taken apart here and only here, so the two can never be set independently.
-        liquidity_floor: screen.map(|(floor, _)| floor),
-        screen_window: screen.map(|(_, window)| window),
+        liquidity_floor: screen.map(|screen| screen.floor()),
+        screen_window: screen.map(|screen| screen.window()),
         rows: frame.height(),
         tickers: tickers
             .into_no_null_iter()
@@ -665,7 +681,7 @@ mod tests {
             &rows,
             session,
             365,
-            Some((strict, ScreenWindow::WholeFrame)),
+            Some(Screen::new(strict, ScreenWindow::WholeFrame)),
             digests(0xAB, 0xCD),
             None,
         )
@@ -674,7 +690,7 @@ mod tests {
             &rows,
             session,
             365,
-            Some((loose, ScreenWindow::WholeFrame)),
+            Some(Screen::new(loose, ScreenWindow::WholeFrame)),
             digests(0xAB, 0xCD),
             None,
         )
@@ -693,6 +709,35 @@ mod tests {
         assert_eq!(unscreened.liquidity_floor, None);
     }
 
+    /// The two screens the tree declares are the same bounds over different history.
+    ///
+    /// Pinned because it is the whole subject of this change: the live book screens a trailing
+    /// month and the archive paths screen every session they load, so the traded population and the
+    /// trained one are not the same set. Task 14's measurement prices that gap; this test is what
+    /// stops it closing or widening silently in the meantime.
+    #[test]
+    fn test_the_live_and_research_screens_share_a_floor_and_not_a_window() {
+        let live = crate::data::universe::LIVE_SCREEN;
+
+        assert_eq!(
+            live.floor(),
+            RESEARCH_SCREEN.floor(),
+            "the bounds are one decision and must not drift apart"
+        );
+        assert_ne!(
+            live.window(),
+            RESEARCH_SCREEN.window(),
+            "if these ever agree, the gap this change exists to measure has been closed \
+             and the measurement should be retired with it"
+        );
+        // Literals rather than the constants, so moving either shows up here as a decision.
+        assert_eq!(
+            live.window(),
+            ScreenWindow::Trailing(std::num::NonZeroU32::new(30).unwrap())
+        );
+        assert_eq!(RESEARCH_SCREEN.window(), ScreenWindow::WholeFrame);
+    }
+
     /// The same bounds over a different stretch of history are a different population.
     ///
     /// A name that dipped below the floor once in two years is refused by a whole-frame screen and
@@ -709,7 +754,7 @@ mod tests {
                 &rows,
                 session,
                 365,
-                Some((floor, window)),
+                Some(Screen::new(floor, window)),
                 digests(0xAB, 0xCD),
                 None,
             )
@@ -717,7 +762,7 @@ mod tests {
         };
 
         let trailing = with(ScreenWindow::Trailing(
-            std::num::NonZeroI64::new(30).unwrap(),
+            std::num::NonZeroU32::new(30).unwrap(),
         ));
         let whole = with(ScreenWindow::WholeFrame);
 
@@ -743,14 +788,14 @@ mod tests {
             &rows,
             session,
             365,
-            Some((floor, ScreenWindow::WholeFrame)),
+            Some(Screen::new(floor, ScreenWindow::WholeFrame)),
             digests(0xAB, 0xCD),
             None,
         )
         .unwrap();
         assert_eq!(
             screened.screen(),
-            Some((floor, ScreenWindow::WholeFrame)),
+            Some(Screen::new(floor, ScreenWindow::WholeFrame)),
             "a screened frame reports both halves"
         );
 
