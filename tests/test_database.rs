@@ -490,6 +490,104 @@ async fn test_liquidity_reports_the_window_low_not_its_average() {
     );
 }
 
+/// The SQL screen and the in-frame screen admit the same names from the same bars.
+///
+/// They are two implementations of one definition and each is separately unit-tested, which is
+/// exactly the case where both can be right and jointly wrong. The anchor is deliberately a session
+/// *after* the newest bar, which is the pre-open shape: reading it off the frame instead reaches
+/// back a day further and the two sides part company on a name sitting on the window's edge.
+#[tokio::test]
+#[serial]
+async fn test_the_two_liquidity_screens_admit_the_same_names() {
+    let pool = fresh_pool().await;
+    // The newest bar is yesterday and the screen is asked about today, as at pre-open.
+    let as_of = SessionDate::at(Utc::now());
+    let newest = as_of.plus_calendar_days(-1);
+    let window = 30u32;
+
+    // EDGER carries all of its notional on the session that the frame-anchored window would
+    // include and the today-anchored one excludes; HOLDS clears either way; THIN clears neither.
+    let edge = newest.plus_calendar_days(-i64::from(window));
+    common::seed_bar_with_volume(&pool, "EDGER", edge, 50.0, 4_000_000).await;
+    common::seed_bar_with_volume(&pool, "EDGER", newest, 50.0, 0).await;
+    for offset in [-2, -1, 0] {
+        common::seed_bar_with_volume(
+            &pool,
+            "HOLDS",
+            newest.plus_calendar_days(offset),
+            50.0,
+            4_000_000,
+        )
+        .await;
+        common::seed_bar_with_volume(&pool, "THIN", newest.plus_calendar_days(offset), 50.0, 10)
+            .await;
+    }
+
+    let floor =
+        fund::common::types::LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
+    let screen = fund::common::types::Screen::new(
+        floor,
+        fund::common::types::ScreenWindow::Trailing(
+            std::num::NonZeroU32::new(window).expect("a positive window"),
+        ),
+    );
+
+    // Through `Universe::build`, which is how the live path turns these rows into a traded set, so
+    // the comparison is between the two screens as their callers actually see them.
+    let tradable: std::collections::HashSet<Ticker> =
+        ["EDGER", "HOLDS", "THIN"].into_iter().map(ticker).collect();
+    let liquidity = universe::load_liquidity(&pool, as_of, screen)
+        .await
+        .unwrap();
+    let traded = universe::Universe::build(
+        &fund::common::alpaca::TradableAssets::from_sets(tradable, Default::default()),
+        &liquidity,
+        floor,
+    );
+    let mut from_sql: Vec<String> = traded
+        .tickers()
+        .iter()
+        .map(|ticker| ticker.as_str().to_string())
+        .collect();
+    from_sql.sort();
+
+    // Read back through the real loader rather than hand-built, so the frame side is the frame the
+    // live path screens and not a fixture agreeing with the belief under test.
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        400,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .unwrap();
+    let screened = universe::filter_liquid_bars(frame, screen, as_of).unwrap();
+    let from_frame: Vec<String> = screened
+        .column("ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .into_no_null_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    // The population beside the agreement: three names were seeded and one is expected through, so
+    // an empty result agreeing with an empty result cannot read as a pass.
+    assert_eq!(
+        from_sql,
+        vec!["HOLDS".to_string()],
+        "the SQL screen must admit exactly the name that clears the today-anchored window"
+    );
+    assert_eq!(
+        from_frame, from_sql,
+        "the two screens read the same bars over the same window and must admit the same names"
+    );
+}
+
 /// A bar after `as_of` is outside the window, whichever window was asked for.
 ///
 /// `as_of` is the anchor and the screen says only how far back to reach, so a historical call has to

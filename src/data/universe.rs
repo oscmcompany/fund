@@ -35,8 +35,7 @@ const LIQUIDITY_LOOKBACK: NonZeroU32 = match NonZeroU32::new(LIQUIDITY_LOOKBACK_
 /// The screen the live book both trades and predicts through.
 ///
 /// One declaration for the two live call sites rather than one each, so they cannot drift apart on
-/// the bounds or the window's length. They can still differ on where the window is anchored — see
-/// [`trailing_window`] — which is a separate question and not yet settled.
+/// the bounds, the window's length, or — since both now name their anchor — the days it covers.
 pub const LIVE_SCREEN: Screen = Screen::new(
     LiquidityFloor::CURRENT,
     ScreenWindow::Trailing(LIQUIDITY_LOOKBACK),
@@ -78,17 +77,26 @@ impl LiquidityRow {
     }
 }
 
-/// Screens a bar frame down to the tickers that clear `screen`.
+/// Screens a bar frame down to the tickers that clear `screen` as of `as_of`.
 ///
 /// `MIN(close_price)` against the price bound and `MEAN(close_price * volume)` against the notional
 /// bound, per ticker, measured over the window and applied to the whole frame — an admitted name
 /// keeps the history its features need.
 ///
+/// `as_of` is the session the screen is being asked about, and a trailing window reaches back from
+/// it. A whole-frame window measures the frame as given: in-frame the caller has already bounded
+/// the history by choosing what to pass, where [`load_liquidity`] reads a table that holds every
+/// session and so has to cap itself.
+///
 /// `bars` must carry `ticker`, `close_price` and `volume`, plus `timestamp` for a trailing window.
-pub fn filter_liquid_bars(bars: DataFrame, screen: Screen) -> PolarsResult<DataFrame> {
+pub fn filter_liquid_bars(
+    bars: DataFrame,
+    screen: Screen,
+    as_of: SessionDate,
+) -> PolarsResult<DataFrame> {
     let measured = match screen.window() {
         ScreenWindow::WholeFrame => bars.clone(),
-        ScreenWindow::Trailing(days) => trailing_window(&bars, i64::from(days.get()))?,
+        ScreenWindow::Trailing(days) => trailing_window(&bars, i64::from(days.get()), as_of)?,
     };
     let floor = screen.floor();
 
@@ -123,21 +131,14 @@ pub fn filter_liquid_bars(bars: DataFrame, screen: Screen) -> PolarsResult<DataF
         .collect()
 }
 
-/// The rows within `days` Eastern calendar days of the frame's newest bar, inclusive at the edge.
+/// The rows within `days` Eastern calendar days of `as_of`, inclusive at the edge.
 ///
-/// **Anchored on the frame's newest bar, where [`load_liquidity`] anchors on its `as_of`.** At
-/// pre-open the newest daily bar is the previous session's, so the two windows reach back to
-/// different days and can classify a name near the bound differently.
-///
-/// An empty frame has no newest bar and so no window, and is returned unchanged.
-fn trailing_window(bars: &DataFrame, days: i64) -> PolarsResult<DataFrame> {
-    let Some(newest) = bars.column("timestamp")?.i64()?.max() else {
-        return Ok(bars.clone());
-    };
-    let newest = DateTime::from_timestamp_millis(newest).ok_or_else(|| {
-        PolarsError::ComputeError(format!("bar timestamp {newest} is not an instant").into())
-    })?;
-    let start = SessionDate::at(newest)
+/// Anchored on the caller's `as_of`, which is the anchor [`load_liquidity`] reads, so the two
+/// halves of one screen cover the same days. It previously anchored on the frame's own newest bar,
+/// which at pre-open is the *previous* session's and reached back a day further than the traded
+/// universe did.
+fn trailing_window(bars: &DataFrame, days: i64, as_of: SessionDate) -> PolarsResult<DataFrame> {
+    let start = as_of
         .plus_calendar_days(-days)
         .midnight()
         .timestamp_millis();
@@ -240,8 +241,11 @@ impl Universe {
 /// Reads per-ticker minimum close and average dollar volume over `screen`'s window, ending `as_of`.
 ///
 /// The SQL twin of [`filter_liquid_bars`], reading daily bars because the thresholds are calibrated
-/// on daily dynamics and a per-bar notional would not clear a per-day bound. `as_of` bounds the
-/// query at both ends, so a historical call reads history and not the rows ingested since.
+/// on daily dynamics and a per-bar notional would not clear a per-day bound. Both twins now take
+/// `as_of` as the anchor, so one screen means one stretch of days whichever side reads it.
+///
+/// `as_of` bounds the query at both ends, so a historical call reads history and not the rows
+/// ingested since.
 pub async fn load_liquidity(
     pool: &PgPool,
     as_of: SessionDate,
@@ -417,6 +421,21 @@ mod tests {
         )
     }
 
+    fn session(year: i32, month: u32, day: u32) -> SessionDate {
+        SessionDate::from_date(
+            chrono::NaiveDate::from_ymd_opt(year, month, day).expect("a real calendar date"),
+        )
+    }
+
+    /// An anchor for the whole-frame cases, which never consult one.
+    ///
+    /// That it is never consulted is asserted by
+    /// `test_a_whole_frame_screen_reads_the_frame_whatever_the_anchor`, so this helper leans on a
+    /// test rather than on its own name.
+    fn unread_anchor() -> SessionDate {
+        session(2026, 6, 30)
+    }
+
     fn assets() -> TradableAssets {
         TradableAssets::from_sets(
             HashSet::from([
@@ -562,12 +581,14 @@ mod tests {
         let frame = bars(&[("EDGE", 10.0, 5_000_000), ("EDGE", 10.0, 5_000_000)]);
         assert_eq!(floor().admits(10.0, 50_000_000.0), Ok(()));
         assert_eq!(
-            surviving_tickers(&filter_liquid_bars(frame, screen()).unwrap()),
+            surviving_tickers(&filter_liquid_bars(frame, screen(), unread_anchor()).unwrap()),
             vec!["EDGE".to_string()]
         );
 
         let under = bars(&[("EDGE", 9.99, 5_000_000), ("EDGE", 9.99, 5_000_000)]);
-        assert!(filter_liquid_bars(under, screen()).unwrap().is_empty());
+        assert!(filter_liquid_bars(under, screen(), unread_anchor())
+            .unwrap()
+            .is_empty());
     }
 
     /// Price on the window minimum and notional on the window average, which is the definition the
@@ -577,13 +598,15 @@ mod tests {
     fn test_the_dataframe_screen_takes_the_minimum_price_and_the_average_notional() {
         // Mean close 55, minimum close 5: the minimum is what binds, so this is refused.
         let dipped = bars(&[("DIPS", 105.0, 1_000_000), ("DIPS", 5.0, 20_000_000)]);
-        assert!(filter_liquid_bars(dipped, screen()).unwrap().is_empty());
+        assert!(filter_liquid_bars(dipped, screen(), unread_anchor())
+            .unwrap()
+            .is_empty());
 
         // One quiet session against one heavy one: the average carries it, which the price
         // treatment deliberately does not do.
         let quiet = bars(&[("FLOW", 100.0, 10_000), ("FLOW", 100.0, 2_000_000)]);
         assert_eq!(
-            surviving_tickers(&filter_liquid_bars(quiet, screen()).unwrap()),
+            surviving_tickers(&filter_liquid_bars(quiet, screen(), unread_anchor()).unwrap()),
             vec!["FLOW".to_string()]
         );
     }
@@ -595,7 +618,8 @@ mod tests {
     #[test]
     fn test_liquidity_older_than_the_window_does_not_admit_a_name() {
         let day = 24 * 60 * 60 * 1_000i64;
-        let newest = 1_000 * day;
+        let as_of = session(2026, 6, 30);
+        let newest = as_of.midnight().timestamp_millis();
         let frame = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["FADED", "FADED"]),
             // One bar inside the 30-day window, one 60 days before it.
@@ -605,12 +629,17 @@ mod tests {
         ])
         .expect("the fixture frame must build");
 
-        assert!(filter_liquid_bars(frame.clone(), trailing(30))
+        assert!(filter_liquid_bars(frame.clone(), trailing(30), as_of)
             .unwrap()
             .is_empty());
         // The same rows over the whole frame do admit it, which is what makes the window the
         // difference rather than the bounds.
-        assert_eq!(filter_liquid_bars(frame, screen()).unwrap().height(), 2);
+        assert_eq!(
+            filter_liquid_bars(frame, screen(), unread_anchor())
+                .unwrap()
+                .height(),
+            2
+        );
     }
 
     /// The window's own lower edge is inside it, matching `load_liquidity`'s `timestamp >= $2`.
@@ -619,7 +648,7 @@ mod tests {
     /// the session most likely to decide a marginal name.
     #[test]
     fn test_a_bar_exactly_on_the_window_edge_is_inside_it() {
-        let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
+        let newest = session(2026, 6, 30);
         let edge = newest
             .plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS))
             .midnight()
@@ -637,7 +666,7 @@ mod tests {
         ])
         .expect("the fixture frame must build");
 
-        let result = filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS)).unwrap();
+        let result = filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS), newest).unwrap();
 
         assert_eq!(result.height(), 2);
     }
@@ -650,7 +679,7 @@ mod tests {
     #[test]
     fn test_the_window_counts_calendar_days_across_a_daylight_saving_transition() {
         // 2026-03-08 is the spring transition; a window ending 2026-03-20 spans it.
-        let newest = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap());
+        let newest = session(2026, 3, 20);
         let oldest = newest.plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS));
         let fixed_offset_start =
             newest.midnight().timestamp_millis() - i64::from(LIQUIDITY_LOOKBACK_DAYS) * 86_400_000;
@@ -674,7 +703,7 @@ mod tests {
         ])
         .expect("the fixture frame must build");
 
-        let result = filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS)).unwrap();
+        let result = filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS), newest).unwrap();
 
         assert!(
             result.is_empty(),
@@ -682,10 +711,74 @@ mod tests {
         );
     }
 
-    /// An empty frame has no newest bar, so a trailing window has nothing to anchor on.
+    /// A trailing window reaches back from the caller's session, not from the frame's newest bar.
     ///
-    /// Returned unchanged rather than treated as a window that admitted nothing, which would be the
-    /// same answer by accident and a different one the moment the frame is not empty.
+    /// This is the pre-open case the live book actually runs: the newest daily bar belongs to the
+    /// previous session while the traded universe is being built for today. Inferring the anchor
+    /// from the data reached back one day further and admitted a name the universe refuses.
+    #[test]
+    fn test_a_trailing_window_reads_the_callers_anchor_not_the_frames_newest_bar() {
+        let newest = session(2026, 6, 30);
+        let today = newest.plus_calendar_days(1);
+        // The whole of this name's notional sits on the window's far edge as measured from the
+        // frame's newest bar, which is one session outside the window measured from today.
+        let edge = newest
+            .plus_calendar_days(-i64::from(LIQUIDITY_LOOKBACK_DAYS))
+            .midnight()
+            .timestamp_millis();
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["MARGIN", "MARGIN"]),
+            Column::new(
+                "timestamp".into(),
+                vec![edge, newest.midnight().timestamp_millis()],
+            ),
+            Column::new("close_price".into(), vec![50.0, 50.0]),
+            Column::new("volume".into(), vec![4_000_000i64, 0]),
+        ])
+        .expect("the fixture frame must build");
+
+        let from_the_frame =
+            filter_liquid_bars(frame.clone(), trailing(LIQUIDITY_LOOKBACK_DAYS), newest).unwrap();
+        let from_today =
+            filter_liquid_bars(frame, trailing(LIQUIDITY_LOOKBACK_DAYS), today).unwrap();
+
+        assert_eq!(
+            from_the_frame.height(),
+            2,
+            "anchored on the frame's newest bar, the edge session is inside the window"
+        );
+        assert!(
+            from_today.is_empty(),
+            "anchored on today, the edge session is one day outside it and the name is refused"
+        );
+    }
+
+    /// A whole-frame screen reads the frame it was handed, whatever session it is asked about.
+    ///
+    /// The frame's own extent is the window there, because the caller already chose it. Asserted
+    /// rather than left to a parameter name, since `unread_anchor` claims exactly this.
+    #[test]
+    fn test_a_whole_frame_screen_reads_the_frame_whatever_the_anchor() {
+        let frame = bars(&[
+            ("KEEP", 100.0, 1_000_000),
+            ("KEEP", 100.0, 1_000_000),
+            ("DROP", 100.0, 1),
+            ("DROP", 100.0, 1),
+        ]);
+
+        let early = filter_liquid_bars(frame.clone(), screen(), session(2001, 1, 2)).unwrap();
+        let late = filter_liquid_bars(frame, screen(), session(2049, 12, 31)).unwrap();
+
+        assert_eq!(surviving_tickers(&early), vec!["KEEP".to_string()]);
+        assert_eq!(surviving_tickers(&late), surviving_tickers(&early));
+        assert_eq!(late.height(), early.height());
+    }
+
+    /// An empty frame yields an empty window, by the same arithmetic as a full one.
+    ///
+    /// It used to be a branch: with no newest bar there was no anchor, so the frame was returned
+    /// unchanged and happened to be empty. The anchor now arrives from the caller, so the window is
+    /// computed the one way and the empty case is a consequence rather than a special case.
     #[test]
     fn test_a_trailing_window_over_an_empty_frame_is_empty_rather_than_refused() {
         let frame = DataFrame::new(vec![
@@ -696,7 +789,11 @@ mod tests {
         ])
         .expect("the fixture frame must build");
 
-        assert!(filter_liquid_bars(frame, trailing(30)).unwrap().is_empty());
+        assert!(
+            filter_liquid_bars(frame, trailing(30), session(2026, 6, 30))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Every bar of an admitted ticker survives, and none of a refused one: the screen is per
@@ -709,7 +806,7 @@ mod tests {
             ("DROP", 100.0, 1),
             ("DROP", 100.0, 1),
         ]);
-        let filtered = filter_liquid_bars(frame, screen()).unwrap();
+        let filtered = filter_liquid_bars(frame, screen(), unread_anchor()).unwrap();
         assert_eq!(filtered.height(), 2);
         assert_eq!(surviving_tickers(&filtered), vec!["KEEP".to_string()]);
     }

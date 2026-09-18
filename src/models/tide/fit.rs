@@ -7,7 +7,7 @@ use std::path::Path;
 
 use polars::prelude::*;
 
-use crate::common::types::Screen;
+use crate::common::types::{Screen, SessionDate};
 use crate::data::universe::filter_liquid_bars;
 use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{
@@ -132,9 +132,13 @@ fn build_mapping(data: &DataFrame, column: &str) -> Result<CategoryMapping, Tide
 /// the model is fitted on is the population the universe trades: a per-session test admits a
 /// name's good days and refuses its quiet ones, which is not a set the screen can ever produce.
 ///
-/// The window travels inside `screen` rather than being chosen here, so training screens whatever
-/// stretch of history its caller declares and not, silently, every session it happens to hold.
-pub fn filter_training_bars(data: DataFrame, screen: Screen) -> Result<DataFrame, TideError> {
+/// The window travels inside `screen` and its anchor arrives as `as_of`, so training screens
+/// whatever stretch of history its caller declares, ending where the caller says it ends.
+pub fn filter_training_bars(
+    data: DataFrame,
+    screen: Screen,
+    as_of: SessionDate,
+) -> Result<DataFrame, TideError> {
     let tickers = data.column("ticker")?.str()?;
     let mask: BooleanChunked = tickers
         .into_iter()
@@ -143,7 +147,7 @@ pub fn filter_training_bars(data: DataFrame, screen: Screen) -> Result<DataFrame
         })
         .collect();
 
-    Ok(filter_liquid_bars(data.filter(&mask)?, screen)?)
+    Ok(filter_liquid_bars(data.filter(&mask)?, screen, as_of)?)
 }
 
 /// Write the three artifact JSON files (scaler, mappings, parameters) the inference loader reads,
@@ -219,6 +223,13 @@ mod tests {
     /// Whole-frame rather than trailing, because the fixtures carry a handful of sessions and the
     /// question each asks is about the bounds. The trailing arithmetic is tested where it lives,
     /// in `data::universe`.
+    /// A whole-frame screen never reads the anchor; `universe` asserts that, this leans on it.
+    fn unread_anchor() -> crate::common::types::SessionDate {
+        crate::common::types::SessionDate::from_date(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 30).expect("a real calendar date"),
+        )
+    }
+
     fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> Screen {
         Screen::new(
             crate::common::types::LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
@@ -435,7 +446,7 @@ mod tests {
         ])
         .unwrap();
 
-        let filtered = filter_training_bars(data, floor(1.0, 100_000.0)).unwrap();
+        let filtered = filter_training_bars(data, floor(1.0, 100_000.0), unread_anchor()).unwrap();
 
         let tickers: Vec<&str> = filtered
             .column("ticker")
@@ -461,7 +472,7 @@ mod tests {
         ])
         .unwrap();
 
-        let filtered = filter_training_bars(data, floor(1.0, 48_001.0)).unwrap();
+        let filtered = filter_training_bars(data, floor(1.0, 48_001.0), unread_anchor()).unwrap();
         let tickers: Vec<&str> = filtered
             .column("ticker")
             .unwrap()
@@ -487,7 +498,7 @@ mod tests {
         ])
         .unwrap();
 
-        let filtered = filter_training_bars(data, floor(1.0, 100_000.0)).unwrap();
+        let filtered = filter_training_bars(data, floor(1.0, 100_000.0), unread_anchor()).unwrap();
         let tickers: Vec<&str> = filtered
             .column("ticker")
             .unwrap()

@@ -290,17 +290,32 @@ pub async fn residuals(
     Ok(ResidualDataset { panel, fingerprint })
 }
 
-/// Everything both paths share: the archive read, the folds applied to it, and its identity.
+/// One window read from the archive, folded and classified, with no screen applied yet.
 ///
-/// The fingerprint is taken here rather than in either caller, so a baseline run and a training run
-/// over the same window report the same one and their journal records join.
-async fn read_window(
+/// Separated from [`read_window`] so a caller can screen one frame several ways and compare the
+/// populations, which is otherwise a re-read of the archive per screen and a different frame each
+/// time. The screen is the only step between this and a dataset.
+pub struct UnscreenedWindow {
+    /// Every bar in the window, split-folded, bounded and joined to the point-in-time universe.
+    pub bars: DataFrame,
+    /// The last session the window holds, which is what a trailing screen over it anchors on.
+    ///
+    /// Read off the frame rather than taken as `session`: the archive ends where the last fold
+    /// wrote, which is weeks before today, so anchoring a trailing window on today would reach back
+    /// over a stretch the archive has no bars in and screen the window away.
+    pub last_session: Option<SessionDate>,
+    reference_digest: u64,
+    splits_digest: u64,
+    boundaries_digest: u64,
+}
+
+/// Reads and folds one archive window without screening it.
+pub async fn unscreened_window(
     s3_client: &S3Client,
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
-    screen: Screen,
-) -> Result<(DataFrame, DatasetFingerprint), DatasetError> {
+) -> Result<UnscreenedWindow, DatasetError> {
     let adjustments = read_adjustments(s3_client, bucket).await?;
 
     let equity_bars = load_archived_bars(
@@ -329,8 +344,51 @@ async fn read_window(
         reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;
     // The prices arrived restated onto this session's share basis and the counts did not, so their
     // product is out by the split factor until this runs.
-    let consolidated = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
-    let filtered = filter_training_bars(consolidated, screen)?;
+    let bars = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
+    let last_session = newest_session(&bars)?;
+
+    Ok(UnscreenedWindow {
+        bars,
+        last_session,
+        reference_digest,
+        splits_digest: adjustments.splits_digest,
+        boundaries_digest: adjustments.boundaries_digest,
+    })
+}
+
+/// The Eastern session of the newest bar in `frame`, or `None` where it holds none.
+///
+/// `None` is unmeasurable rather than a default date: a frame with no bars has no last session, and
+/// substituting today's would silently anchor a window on a day the frame cannot reach.
+fn newest_session(frame: &DataFrame) -> Result<Option<SessionDate>, DatasetError> {
+    let Some(newest) = frame.column("timestamp")?.i64()?.max() else {
+        return Ok(None);
+    };
+    DateTime::from_timestamp_millis(newest)
+        .map(|instant| Some(SessionDate::at(instant)))
+        .ok_or_else(|| DatasetError::Window(format!("bar timestamp {newest} is not an instant")))
+}
+
+/// Everything both paths share: the archive read, the folds applied to it, and its identity.
+///
+/// The fingerprint is taken here rather than in either caller, so a baseline run and a training run
+/// over the same window report the same one and their journal records join.
+///
+/// A trailing screen anchors on the window's own last session rather than on `session`, which is
+/// today and weeks past where the archive ends. That anchor is not a fingerprint field because
+/// `last_timestamp` already carries it — deriving it is what stops the two disagreeing.
+async fn read_window(
+    s3_client: &S3Client,
+    bucket: &str,
+    lookback_days: i64,
+    session: SessionDate,
+    screen: Screen,
+) -> Result<(DataFrame, DatasetFingerprint), DatasetError> {
+    let window = unscreened_window(s3_client, bucket, lookback_days, session).await?;
+    // An empty window has no last session to anchor on; `session` screens it to the same nothing
+    // and reaches the fingerprint below, which is where an empty window is named.
+    let anchor = window.last_session.unwrap_or(session);
+    let filtered = filter_training_bars(window.bars, screen, anchor)?;
 
     let fingerprint = fingerprint_of(
         &filtered,
@@ -340,9 +398,9 @@ async fn read_window(
         // rather than restating what the caller meant.
         Some(screen),
         Digests {
-            splits: adjustments.splits_digest,
-            boundaries: adjustments.boundaries_digest,
-            reference: Some(reference_digest),
+            splits: window.splits_digest,
+            boundaries: window.boundaries_digest,
+            reference: Some(window.reference_digest),
         },
         None,
     )?;

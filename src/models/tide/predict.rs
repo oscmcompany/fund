@@ -185,24 +185,26 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
     Ok(names)
 }
 
-/// Drops tickers that do not clear `screen`, keeping the surviving names' whole history.
+/// Drops tickers that do not clear `screen` as of `as_of`, keeping the surviving names' history.
 ///
-/// Nothing here but the count: the statistic and the window both live in
-/// [`universe::filter_liquid_bars`], so the predicted set and the traded set read one definition.
-///
-/// They do not yet read one *anchor*. This screens the window ending at the frame's newest bar and
-/// the traded universe screens the window ending at its own session, so at pre-open the two reach
-/// back to different days.
-pub fn filter_equity_bars(data: DataFrame, screen: Screen) -> Result<DataFrame, PredictionError> {
+/// Nothing here but the count: the statistic, the window and the anchor all live in
+/// [`universe::filter_liquid_bars`], so the predicted set and the traded set read one definition
+/// over one stretch of days — provided `as_of` is the session the traded universe was built for.
+pub fn filter_equity_bars(
+    data: DataFrame,
+    screen: Screen,
+    as_of: SessionDate,
+) -> Result<DataFrame, PredictionError> {
     let before_count = data.height();
 
-    let filtered = universe::filter_liquid_bars(data, screen)
+    let filtered = universe::filter_liquid_bars(data, screen, as_of)
         .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     info!(
         before = before_count,
         after = filtered.height(),
         %screen,
+        %as_of,
         "Filtered equity bars by price and volume thresholds"
     );
 
@@ -588,6 +590,13 @@ mod tests {
     /// Whole-frame rather than trailing, because the fixtures carry a handful of sessions and the
     /// question each asks is about the bounds. The trailing arithmetic is tested where it lives,
     /// in `data::universe`.
+    /// A whole-frame screen never reads the anchor; `universe` asserts that, this leans on it.
+    fn unread_anchor() -> crate::common::types::SessionDate {
+        crate::common::types::SessionDate::from_date(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 30).expect("a real calendar date"),
+        )
+    }
+
     fn floor(minimum_close_price: f64, minimum_dollar_volume: f64) -> Screen {
         Screen::new(
             crate::common::types::LiquidityFloor::new(minimum_close_price, minimum_dollar_volume)
@@ -624,7 +633,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
         assert_eq!(result.height(), 4);
     }
 
@@ -643,7 +652,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
         assert_eq!(result.height(), 2);
         let tickers: Vec<&str> = result
             .column("ticker")
@@ -671,7 +680,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
         assert_eq!(result.height(), 2);
         let tickers: Vec<&str> = result
             .column("ticker")
@@ -699,7 +708,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
 
         assert_eq!(
             result.height(),
@@ -721,7 +730,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
 
         assert_eq!(result.height(), 0);
     }
@@ -736,7 +745,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
         assert_eq!(result.height(), 0);
     }
 
@@ -1217,7 +1226,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
         assert_eq!(result.height(), 0);
     }
 
@@ -1231,7 +1240,7 @@ mod tests {
         ])
         .unwrap();
 
-        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0)).unwrap();
+        let result = filter_equity_bars(data, floor(10.0, 50_000_000.0), unread_anchor()).unwrap();
         assert_eq!(result.height(), 1);
     }
 
