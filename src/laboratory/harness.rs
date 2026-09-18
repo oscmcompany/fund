@@ -1,14 +1,13 @@
-//! One comparison, declared before it is measured and scored against the tests that share its family.
+//! One comparison, declared before it is measured and scored against the tests sharing its family.
 //!
-//! A substrate that lowers the cost of testing without raising the bar for believing is a machine
-//! for generating confident nonsense, so the multiple-testing count is a constructor argument here
-//! rather than a convention a caller may remember.
+//! Lowering the cost of testing without raising the bar for believing generates confident nonsense
+//! at scale, so the multiple-testing count is a constructor argument rather than a convention.
 
-use std::num::{NonZeroI64, NonZeroUsize};
+use std::num::NonZeroUsize;
 
 use serde::Serialize;
 
-use crate::common::types::{BarInterval, BasisPoints, LiquidityFloor};
+use crate::common::types::{BarInterval, BasisPoints, LiquidityFloor, ScreenWindow};
 use crate::laboratory::cost::{CostModel, CostRefusal};
 use crate::laboratory::dataset::DatasetFingerprint;
 use crate::laboratory::metrics::{summarize, Distribution};
@@ -111,27 +110,6 @@ impl std::fmt::Display for Horizon {
     }
 }
 
-/// The stretch of history a liquidity screen reads before admitting a name.
-///
-/// Named rather than assumed because the tree currently holds two of these and calls both "the
-/// universe": the traded set screens a trailing window, and training screens everything it loaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum ScreenWindow {
-    /// The trailing calendar days the traded universe screens over.
-    Trailing(NonZeroI64),
-    /// Every session the frame holds, so a name that dipped once anywhere in it is refused.
-    WholeFrame,
-}
-
-impl std::fmt::Display for ScreenWindow {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScreenWindow::Trailing(days) => write!(formatter, "trailing {days} days"),
-            ScreenWindow::WholeFrame => write!(formatter, "the whole frame"),
-        }
-    }
-}
-
 /// The population a study measured over, named rather than described by a bare threshold.
 ///
 /// `Unscreened` is a variant rather than an absent floor because it is a real and common answer —
@@ -148,10 +126,14 @@ pub enum DeclaredUniverse {
 }
 
 impl DeclaredUniverse {
-    /// The floor this declaration claims the dataset was screened by.
-    fn floor(&self) -> Option<LiquidityFloor> {
+    /// The screen this declaration claims the dataset was built under.
+    ///
+    /// The name is deliberately not part of it: a name is a label the caller picks, and no property
+    /// of a frame can confirm or deny it. The floor and the window are facts about the rows and are
+    /// checked against the fingerprint; the name is recorded on the caller's word alone.
+    fn screen(&self) -> Option<(LiquidityFloor, ScreenWindow)> {
         match self {
-            DeclaredUniverse::Screened { floor, .. } => Some(*floor),
+            DeclaredUniverse::Screened { floor, window, .. } => Some((*floor, *window)),
             DeclaredUniverse::Unscreened => None,
         }
     }
@@ -208,29 +190,52 @@ pub enum Pairing {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Arm {
     name: String,
-    sessions: Vec<Option<f64>>,
+    readings: Vec<(SessionKey, Option<f64>)>,
     observations: usize,
 }
 
+/// A session's epoch milliseconds, used here only as an identity.
+///
+/// A bare `i64` rather than a newtype, because that is how the laboratory already keys a session —
+/// [`crate::laboratory::predictor::Panel`] and [`crate::laboratory::convergence::Closes`] both do —
+/// and what makes the pairing safe is the comparison below, not a wrapper around the number.
+type SessionKey = i64;
+
 impl Arm {
-    /// `None` on an unnamed arm, on no sessions at all, or on fewer observations than readings.
+    /// `None` on an unnamed arm, on no readings at all, on a session read twice, or on fewer
+    /// observations than readings.
     ///
-    /// The last of those is the one worth having: a reading is folded from observations, so an
+    /// The observation bound is the one worth having: a reading is folded from observations, so an
     /// arm claiming more readings than rows has counted something twice.
     pub fn new(
         name: impl Into<String>,
-        sessions: Vec<Option<f64>>,
+        readings: Vec<(SessionKey, Option<f64>)>,
         observations: usize,
     ) -> Option<Self> {
         let name = name.into();
-        let measured = sessions.iter().flatten().count();
-        (!name.trim().is_empty() && !sessions.is_empty() && observations >= measured).then_some(
-            Self {
+        let measured = readings.iter().filter(|(_, value)| value.is_some()).count();
+        let distinct: std::collections::HashSet<SessionKey> =
+            readings.iter().map(|(session, _)| *session).collect();
+
+        (!name.trim().is_empty()
+            && !readings.is_empty()
+            && distinct.len() == readings.len()
+            && observations >= measured)
+            .then_some(Self {
                 name,
-                sessions,
+                readings,
                 observations,
-            },
-        )
+            })
+    }
+
+    /// The sessions this arm read, in the order it read them.
+    fn sessions(&self) -> impl Iterator<Item = SessionKey> + '_ {
+        self.readings.iter().map(|(session, _)| *session)
+    }
+
+    /// What it read on each of them, in the same order.
+    fn values(&self) -> impl Iterator<Item = Option<f64>> + '_ {
+        self.readings.iter().map(|(_, value)| *value)
     }
 }
 
@@ -290,12 +295,29 @@ impl Declaration {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StudyRefusal {
     /// The declared universe is not the one the dataset was actually screened by.
+    ///
+    /// Both halves of the screen travel in the refusal, because a study declaring the right floor
+    /// over the wrong window is the case a floor-only comparison cannot see.
     UniverseDisagrees {
-        declared: Option<LiquidityFloor>,
-        measured: Option<LiquidityFloor>,
+        declared: Option<(LiquidityFloor, ScreenWindow)>,
+        measured: Option<(LiquidityFloor, ScreenWindow)>,
     },
-    /// Matched arms must read the same sessions in the same order.
+    /// Matched arms must read the same number of sessions.
     ArmsNotAligned { treatment: usize, control: usize },
+    /// Matched arms read the same count of sessions, but not the same sessions.
+    ///
+    /// Separate from the length case because the remedy differs: a length mismatch is a caller that
+    /// built one arm over a different window, where this is one that built both over the same window
+    /// and lost their alignment. `measure` zips the two, so this would subtract unrelated readings.
+    ArmsReadDifferentSessions {
+        index: usize,
+        treatment: SessionKey,
+        control: SessionKey,
+    },
+    /// Disjoint arms must not read any session twice between them.
+    ///
+    /// Their errors are added in quadrature, which is only right where the two are independent.
+    ArmsOverlap { shared: usize },
     /// Two arms under one name are one arm counted twice.
     ArmsNotDistinct { name: String },
     /// The family-wise error rate is not a probability.
@@ -304,21 +326,34 @@ pub enum StudyRefusal {
 
 impl std::fmt::Display for StudyRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let floor = |value: &Option<LiquidityFloor>| match value {
-            Some(floor) => floor.to_string(),
+        let screen = |value: &Option<(LiquidityFloor, ScreenWindow)>| match value {
+            Some((floor, window)) => format!("{floor} over {window}"),
             None => "unscreened".to_string(),
         };
         match self {
             StudyRefusal::UniverseDisagrees { declared, measured } => write!(
                 formatter,
                 "the study declares {} but the dataset was screened by {}",
-                floor(declared),
-                floor(measured)
+                screen(declared),
+                screen(measured)
             ),
             StudyRefusal::ArmsNotAligned { treatment, control } => write!(
                 formatter,
                 "matched arms must read the same sessions, but the treatment read {treatment} and \
                  the control {control}"
+            ),
+            StudyRefusal::ArmsReadDifferentSessions {
+                index,
+                treatment,
+                control,
+            } => write!(
+                formatter,
+                "matched arms diverge at reading {index}: the treatment read session {treatment} \
+                 where the control read {control}"
+            ),
+            StudyRefusal::ArmsOverlap { shared } => write!(
+                formatter,
+                "disjoint arms share {shared} session(s), so their errors do not add in quadrature"
             ),
             StudyRefusal::ArmsNotDistinct { name } => {
                 write!(
@@ -349,9 +384,12 @@ pub struct Study {
 impl Study {
     /// Assembles a study, refusing the shapes whose readings would not mean what they say.
     ///
-    /// The fingerprint is required rather than optional: the declared universe is checked against
-    /// the population the dataset was actually built over, so a study cannot claim to have measured
-    /// the traded book while reading a frame screened by something else.
+    /// The fingerprint is required rather than optional: the declared **floor and window** are
+    /// checked against the screen the dataset was actually built under, so a study cannot claim to
+    /// have measured the traded book while reading a frame screened by something else.
+    ///
+    /// The universe's *name* is not checked and cannot be — it is a label the caller chooses, and no
+    /// property of a frame confirms it. It reaches the journal on the caller's word.
     pub fn new(
         declaration: Declaration,
         pairing: Pairing,
@@ -364,18 +402,49 @@ impl Study {
                 name: treatment.name,
             });
         }
-        let declared = declaration.universe.floor();
-        if declared != fingerprint.liquidity_floor {
+        let declared = declaration.universe.screen();
+        if declared != fingerprint.screen() {
             return Err(StudyRefusal::UniverseDisagrees {
                 declared,
-                measured: fingerprint.liquidity_floor,
+                measured: fingerprint.screen(),
             });
         }
-        if pairing == Pairing::Matched && treatment.sessions.len() != control.sessions.len() {
-            return Err(StudyRefusal::ArmsNotAligned {
-                treatment: treatment.sessions.len(),
-                control: control.sessions.len(),
-            });
+        // Each variant of `Pairing` is a claim about how the arms relate, and each is checked here
+        // rather than trusted: `measure` reads the claim and cannot tell a false one from a true one.
+        match pairing {
+            Pairing::Matched => {
+                if treatment.readings.len() != control.readings.len() {
+                    return Err(StudyRefusal::ArmsNotAligned {
+                        treatment: treatment.readings.len(),
+                        control: control.readings.len(),
+                    });
+                }
+                // Equal lengths are not equal sessions, and `measure` zips: two arms built over the
+                // same window but offset by a session would subtract unrelated readings and report
+                // a difference with nothing wrong on its face.
+                let divergence = treatment
+                    .sessions()
+                    .zip(control.sessions())
+                    .enumerate()
+                    .find(|(_, (arm, control))| arm != control);
+                if let Some((index, (arm, control))) = divergence {
+                    return Err(StudyRefusal::ArmsReadDifferentSessions {
+                        index,
+                        treatment: arm,
+                        control,
+                    });
+                }
+            }
+            Pairing::Disjoint => {
+                let read: std::collections::HashSet<SessionKey> = treatment.sessions().collect();
+                let shared = control
+                    .sessions()
+                    .filter(|session| read.contains(session))
+                    .count();
+                if shared > 0 {
+                    return Err(StudyRefusal::ArmsOverlap { shared });
+                }
+            }
         }
         let haircut = Haircut::new(declaration.family.tests, FAMILY_WISE_ERROR_RATE).ok_or(
             StudyRefusal::RateUnusable {
@@ -394,16 +463,16 @@ impl Study {
 
     /// Scores the study, consuming it so the declaration travels with the number it produced.
     pub fn measure(self) -> StudyResult {
-        let treatment = summarize(self.treatment.sessions.iter().copied());
-        let control = summarize(self.control.sessions.iter().copied());
+        let treatment = summarize(self.treatment.values());
+        let control = summarize(self.control.values());
         let difference = match self.pairing {
             // Per session, so the variation both arms share cancels instead of being counted twice.
+            // The zip is sound because `new` refused any matched pair whose sessions disagree.
             Pairing::Matched => summarize(
                 self.treatment
-                    .sessions
-                    .iter()
-                    .zip(&self.control.sessions)
-                    .map(|(arm, control)| Some(arm.as_ref()? - control.as_ref()?)),
+                    .values()
+                    .zip(self.control.values())
+                    .map(|(arm, control)| Some(arm? - control?)),
             ),
             Pairing::Disjoint => disjoint_difference(treatment, control),
         };
@@ -565,16 +634,57 @@ impl StudyResult {
     }
 }
 
-/// One table for a set of studies, with the threshold they are all read against stated above it.
+/// One table per family, with the threshold that family's readings are judged against above it.
 ///
-/// The haircut is rendered once in the header rather than per row because it is a property of the
+/// The haircut is rendered once per header rather than per row because it is a property of the
 /// family: printing it beside each reading invites comparing a row against its own threshold, which
 /// is the habit the count exists to break.
+///
+/// Results are **grouped** rather than assumed homogeneous. The header describes a family, a
+/// universe and a horizon, so a slice spanning two of any of those has no single header — taking one
+/// from the first row would file every later reading under a bar and a population that are not its
+/// own. Grouping removes the invariant instead of checking it, and a slice that was already
+/// homogeneous renders exactly as it did before.
 pub fn render(results: &[StudyResult]) -> String {
-    let Some(first) = results.first() else {
+    if results.is_empty() {
         return "No studies were measured.\n".to_string();
-    };
+    }
 
+    let mut rendered = String::new();
+    for (index, group) in group_by_header(results).into_iter().enumerate() {
+        if index > 0 {
+            rendered.push('\n');
+        }
+        rendered.push_str(&render_group(&group));
+    }
+    rendered
+}
+
+/// Splits results into runs sharing a header, preserving the order they were first seen in.
+///
+/// Linear scan: a family holds a handful of studies, and preserving caller order matters more than
+/// the lookup, because a table whose rows are reordered is a table a reader cannot check against the
+/// binary that produced it.
+fn group_by_header(results: &[StudyResult]) -> Vec<Vec<&StudyResult>> {
+    let mut groups: Vec<Vec<&StudyResult>> = Vec::new();
+    for result in results {
+        let matching = groups.iter_mut().find(|group| {
+            let first: &StudyResult = group[0];
+            first.declaration.family == result.declaration.family
+                && first.declaration.universe == result.declaration.universe
+                && first.declaration.horizon == result.declaration.horizon
+        });
+        match matching {
+            Some(group) => group.push(result),
+            None => groups.push(vec![result]),
+        }
+    }
+    groups
+}
+
+/// One family's table. Every row here shares the header above it by construction.
+fn render_group(results: &[&StudyResult]) -> String {
+    let first = results[0];
     let mut rendered = format!(
         "Family {}\n  {:.2} standard errors required at a {:.0}% family-wise error rate, \
          Bonferroni over {} tests\n  universe {}, horizon {}\n\n",
@@ -615,10 +725,20 @@ pub fn render(results: &[StudyResult]) -> String {
             net_of_cost_cell(result.net_of_cost),
         ));
     }
-    rendered.push_str(&format!(
-        "\n  rows folded into these readings: {}\n",
-        first.observations
-    ));
+
+    // Per study, not per family: two studies in one family can be folded from different row counts,
+    // and quoting the first row's number for all of them overstates how well the rest are supported.
+    let counts: Vec<usize> = results.iter().map(|result| result.observations).collect();
+    let (fewest, most) = (
+        counts.iter().min().copied().unwrap_or(0),
+        counts.iter().max().copied().unwrap_or(0),
+    );
+    let folded = if fewest == most {
+        most.to_string()
+    } else {
+        format!("{fewest} to {most}")
+    };
+    rendered.push_str(&format!("\n  rows folded into these readings: {folded}\n"));
     rendered
 }
 
@@ -815,6 +935,8 @@ fn erfc_by_continued_fraction(x: f64) -> f64 {
 mod tests {
     use super::*;
 
+    use std::num::NonZeroI64;
+
     use chrono::{TimeZone, Utc};
 
     use crate::common::types::SessionDate;
@@ -824,11 +946,12 @@ mod tests {
         NonZeroUsize::new(count).expect("the fixture must declare at least one test")
     }
 
-    fn fingerprint(liquidity_floor: Option<LiquidityFloor>) -> DatasetFingerprint {
+    fn fingerprint(screen: Option<(LiquidityFloor, ScreenWindow)>) -> DatasetFingerprint {
         DatasetFingerprint {
             session: SessionDate::at(Utc.with_ymd_and_hms(2026, 9, 17, 20, 0, 0).unwrap()),
             lookback_days: 730,
-            liquidity_floor,
+            liquidity_floor: screen.map(|(floor, _)| floor),
+            screen_window: screen.map(|(_, window)| window),
             rows: 578_581,
             tickers: 1_253,
             first_timestamp: None,
@@ -854,13 +977,35 @@ mod tests {
         Quantity::Unpriced { units: "share" }
     }
 
+    /// One session a day, so every fixture arm reads the same sessions in the same order.
+    const DAY: i64 = 86_400_000;
+
+    /// Attaches sequential session keys to a list of readings.
+    fn keyed(values: &[Option<f64>]) -> Vec<(SessionKey, Option<f64>)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as i64 * DAY, *value))
+            .collect()
+    }
+
+    /// The same, from a slice of readings that were all measurable.
+    fn measurable(values: &[f64]) -> Vec<(SessionKey, Option<f64>)> {
+        keyed(&values.iter().copied().map(Some).collect::<Vec<_>>())
+    }
+
     fn arm(name: &str, sessions: &[f64]) -> Arm {
-        Arm::new(
-            name,
-            sessions.iter().copied().map(Some).collect(),
-            sessions.len(),
-        )
-        .expect("the fixture must be a usable arm")
+        Arm::new(name, measurable(sessions), sessions.len())
+            .expect("the fixture must be a usable arm")
+    }
+
+    /// An arm reading the same count of sessions as `arm` does, but a different set of them.
+    fn shifted(name: &str, sessions: &[f64], by: i64) -> Arm {
+        let readings: Vec<(SessionKey, Option<f64>)> = measurable(sessions)
+            .into_iter()
+            .map(|(session, value)| (session + by * DAY, value))
+            .collect();
+        Arm::new(name, readings, sessions.len()).expect("the fixture must be a usable arm")
     }
 
     fn study(pairing: Pairing, treatment: Arm, control: Arm) -> Study {
@@ -1098,6 +1243,8 @@ mod tests {
     #[test]
     fn test_a_trailing_window_universe_assembles_against_its_own_floor() {
         let floor = LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
+        let trailing =
+            ScreenWindow::Trailing(NonZeroI64::new(30).expect("a positive trailing window"));
         let result = Study::new(
             Declaration::new(
                 "does the traded book behave differently",
@@ -1106,36 +1253,82 @@ mod tests {
                 DeclaredUniverse::Screened {
                     name: "traded-v1".to_string(),
                     floor,
-                    window: ScreenWindow::Trailing(NonZeroI64::new(30).expect("positive")),
+                    window: trailing,
                 },
                 unpriced(),
             ),
             Pairing::Matched,
             arm("treatment", &[0.3, 0.1]),
             arm("control", &[0.1, 0.1]),
-            &fingerprint(Some(floor)),
+            &fingerprint(Some((floor, trailing))),
         )
-        .expect("the declaration matches the dataset's floor")
+        .expect("the declaration matches the screen the dataset was built under")
         .measure();
 
         assert!(render(&[result]).contains("trailing 30 days"));
+    }
+
+    /// The case a floor-only comparison cannot see: the right bounds over the wrong window.
+    ///
+    /// The whole point of carrying the window in the fingerprint, and the half of the universe
+    /// check that was missing. A study screened over two years is not a study screened over the
+    /// trailing month, whatever the two bounds say.
+    #[test]
+    fn test_the_right_floor_over_the_wrong_window_is_refused() {
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
+        let trailing =
+            ScreenWindow::Trailing(NonZeroI64::new(30).expect("a positive trailing window"));
+
+        let refusal = Study::new(
+            Declaration::new(
+                "does the traded book behave differently",
+                Family::new("traded", tests(1)),
+                Horizon::Sessions(tests(1)),
+                DeclaredUniverse::Screened {
+                    name: "traded-v1".to_string(),
+                    floor,
+                    window: trailing,
+                },
+                unpriced(),
+            ),
+            Pairing::Matched,
+            arm("treatment", &[0.3, 0.1]),
+            arm("control", &[0.1, 0.1]),
+            // The same floor, applied across every session the frame held.
+            &fingerprint(Some((floor, ScreenWindow::WholeFrame))),
+        )
+        .expect_err("the same bounds over a different window are a different population");
+
+        assert_eq!(
+            refusal,
+            StudyRefusal::UniverseDisagrees {
+                declared: Some((floor, trailing)),
+                measured: Some((floor, ScreenWindow::WholeFrame)),
+            }
+        );
+        // The refusal has to say which window, or a reader sees two identical-looking floors.
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("trailing 30 days"), "{rendered}");
+        assert!(rendered.contains("the whole frame"), "{rendered}");
     }
 
     // --- the arms ----------------------------------------------------------
 
     #[test]
     fn test_an_arm_claiming_more_readings_than_rows_is_refused() {
-        assert!(Arm::new("momentum", vec![Some(0.1), Some(0.2)], 1).is_none());
-        assert!(Arm::new("momentum", vec![Some(0.1), Some(0.2)], 2).is_some());
+        assert!(Arm::new("momentum", keyed(&[Some(0.1), Some(0.2)]), 1).is_none());
+        assert!(Arm::new("momentum", keyed(&[Some(0.1), Some(0.2)]), 2).is_some());
         // A session that could not be read does not need a row behind it.
-        assert!(Arm::new("momentum", vec![Some(0.1), None], 1).is_some());
+        assert!(Arm::new("momentum", keyed(&[Some(0.1), None]), 1).is_some());
     }
 
     #[test]
     fn test_an_unnamed_or_empty_arm_is_refused() {
-        assert!(Arm::new("", vec![Some(0.1)], 1).is_none());
-        assert!(Arm::new("   ", vec![Some(0.1)], 1).is_none());
+        assert!(Arm::new("", keyed(&[Some(0.1)]), 1).is_none());
+        assert!(Arm::new("   ", keyed(&[Some(0.1)]), 1).is_none());
         assert!(Arm::new("momentum", Vec::new(), 0).is_none());
+        // One session read twice is one session counted twice.
+        assert!(Arm::new("momentum", vec![(0, Some(0.1)), (0, Some(0.2))], 2).is_none());
     }
 
     // --- assembling a study ------------------------------------------------
@@ -1182,7 +1375,7 @@ mod tests {
             Pairing::Matched,
             arm("sector", &[0.1, 0.2]),
             arm("permuted", &[0.0, 0.0]),
-            &fingerprint(Some(LiquidityFloor::CURRENT)),
+            &fingerprint(Some((LiquidityFloor::CURRENT, ScreenWindow::WholeFrame))),
         )
         .expect_err("an unscreened declaration over a screened dataset must be refused");
 
@@ -1219,10 +1412,63 @@ mod tests {
             declaration(unpriced()),
             Pairing::Disjoint,
             arm("first half", &[0.1, 0.2, 0.3]),
-            arm("second half", &[0.0, 0.0]),
+            // Sessions 3 and 4, where the first half read 0 through 2: disjoint in fact and not
+            // only in the label.
+            shifted("second half", &[0.0, 0.0], 3),
             &fingerprint(None),
         )
         .is_ok());
+    }
+
+    /// Equal lengths are not equal sessions, and this is the case the length check cannot see.
+    ///
+    /// `measure` zips the two arms, so an offset pair would subtract a session's treatment from a
+    /// different session's control and report a difference with nothing wrong on its face. Both
+    /// arms read three sessions; they are simply not the same three.
+    #[test]
+    fn test_matched_arms_reading_different_sessions_are_refused() {
+        let refusal = Study::new(
+            declaration(unpriced()),
+            Pairing::Matched,
+            arm("sector", &[0.1, 0.2, 0.3]),
+            shifted("permuted", &[0.0, 0.0, 0.0], 1),
+            &fingerprint(None),
+        )
+        .expect_err("matched arms must read the same sessions, not merely as many");
+
+        assert_eq!(
+            refusal,
+            StudyRefusal::ArmsReadDifferentSessions {
+                // The very first reading already disagrees, and the refusal says which sessions.
+                index: 0,
+                treatment: 0,
+                control: DAY,
+            }
+        );
+    }
+
+    /// One session read twice is one session counted twice, whatever the other arm holds.
+    #[test]
+    fn test_an_arm_reading_one_session_twice_is_refused() {
+        assert!(Arm::new("momentum", vec![(0, Some(0.1)), (DAY, Some(0.2))], 2).is_some());
+        assert!(Arm::new("momentum", vec![(0, Some(0.1)), (0, Some(0.2))], 2).is_none());
+    }
+
+    /// `Disjoint` adds the arms' errors in quadrature, which is only right where they are
+    /// independent. Two arms sharing sessions are not, so the claim is refused rather than priced.
+    #[test]
+    fn test_disjoint_arms_that_share_sessions_are_refused() {
+        let refusal = Study::new(
+            declaration(unpriced()),
+            Pairing::Disjoint,
+            arm("first half", &[0.1, 0.2, 0.3]),
+            // Overlaps on two of the treatment's three sessions.
+            shifted("second half", &[0.0, 0.0], 1),
+            &fingerprint(None),
+        )
+        .expect_err("arms that share sessions are not disjoint");
+
+        assert_eq!(refusal, StudyRefusal::ArmsOverlap { shared: 2 });
     }
 
     #[test]
@@ -1274,17 +1520,21 @@ mod tests {
         assert!(treatment.standard_error > 0.4, "{treatment:?}");
     }
 
-    /// The same two arms read as disjoint: the errors add instead of cancelling, so the identical
-    /// gap is no longer significant. The pairing is a declaration about the data, not a style.
+    /// The same readings over *different* sessions: the errors add instead of cancelling, so the
+    /// identical gap is no longer significant. The pairing is a claim about the data, not a style.
+    ///
+    /// The control is shifted six sessions clear of the treatment, because the same readings over
+    /// the *same* sessions are not disjoint and `Study::new` now refuses to call them so — which is
+    /// the whole reason the two arms cannot simply be relabelled from the matched test above.
     #[test]
-    fn test_the_same_gap_read_as_disjoint_carries_both_arms_errors() {
+    fn test_the_same_gap_read_over_separate_sessions_carries_both_arms_errors() {
         let common = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
         let treatment: Vec<f64> = common.iter().map(|value| value + 0.1).collect();
 
         let result = study(
             Pairing::Disjoint,
             arm("treatment", &treatment),
-            arm("control", &common),
+            shifted("control", &common, 6),
         )
         .measure();
 
@@ -1299,10 +1549,18 @@ mod tests {
     /// A session either arm could not read is not a difference, and must not be folded in as zero.
     #[test]
     fn test_a_session_only_one_arm_read_is_skipped_rather_than_zeroed() {
-        let treatment = Arm::new("treatment", vec![Some(0.3), None, Some(0.5), Some(0.4)], 4)
-            .expect("a usable arm");
-        let control = Arm::new("control", vec![Some(0.1), Some(0.9), None, Some(0.2)], 4)
-            .expect("a usable arm");
+        let treatment = Arm::new(
+            "treatment",
+            keyed(&[Some(0.3), None, Some(0.5), Some(0.4)]),
+            4,
+        )
+        .expect("a usable arm");
+        let control = Arm::new(
+            "control",
+            keyed(&[Some(0.1), Some(0.9), None, Some(0.2)]),
+            4,
+        )
+        .expect("a usable arm");
 
         let result = study(Pairing::Matched, treatment, control).measure();
 
@@ -1318,17 +1576,23 @@ mod tests {
     /// as it is, and it is the one number a reader uses to judge that.
     #[test]
     fn test_matched_arms_are_not_counted_twice() {
-        let readings = |values: [f64; 3]| values.into_iter().map(Some).collect::<Vec<_>>();
         let treatment =
-            Arm::new("treatment", readings([0.3, 0.1, 0.2]), 217_691).expect("a usable arm");
+            Arm::new("treatment", measurable(&[0.3, 0.1, 0.2]), 217_691).expect("a usable arm");
         let control =
-            Arm::new("control", readings([0.1, 0.1, 0.1]), 217_691).expect("a usable arm");
+            Arm::new("control", measurable(&[0.1, 0.1, 0.1]), 217_691).expect("a usable arm");
 
         let matched = study(Pairing::Matched, treatment.clone(), control.clone()).measure();
         assert_eq!(matched.observations(), 217_691);
 
-        // Disjoint arms read different rows, so there the total genuinely is the sum.
-        let disjoint = study(Pairing::Disjoint, treatment, control).measure();
+        // Disjoint arms read different rows, so there the total genuinely is the sum — and they
+        // have to read different sessions too, which is what the shift supplies.
+        let elsewhere = Arm::new(
+            "control",
+            shifted("control", &[0.1, 0.1, 0.1], 3).readings,
+            217_691,
+        )
+        .expect("a usable arm");
+        let disjoint = study(Pairing::Disjoint, treatment, elsewhere).measure();
         assert_eq!(disjoint.observations(), 435_382);
     }
 
@@ -1352,8 +1616,8 @@ mod tests {
 
     #[test]
     fn test_an_unmeasurable_study_has_not_failed_its_threshold() {
-        let treatment = Arm::new("treatment", vec![None, None], 0).expect("a usable arm");
-        let control = Arm::new("control", vec![Some(0.1), Some(0.2)], 2).expect("a usable arm");
+        let treatment = Arm::new("treatment", keyed(&[None, None]), 0).expect("a usable arm");
+        let control = Arm::new("control", keyed(&[Some(0.1), Some(0.2)]), 2).expect("a usable arm");
 
         let result = study(Pairing::Matched, treatment, control).measure();
 
@@ -1576,8 +1840,8 @@ mod tests {
     /// An unmeasurable reading rendered as zero would read as a measurement that found nothing.
     #[test]
     fn test_an_unmeasurable_reading_is_not_rendered_as_zero() {
-        let treatment = Arm::new("treatment", vec![None, None], 0).expect("a usable arm");
-        let control = Arm::new("control", vec![Some(0.1), Some(0.2)], 2).expect("a usable arm");
+        let treatment = Arm::new("treatment", keyed(&[None, None]), 0).expect("a usable arm");
+        let control = Arm::new("control", keyed(&[Some(0.1), Some(0.2)]), 2).expect("a usable arm");
         let rendered = render(&[study(Pairing::Matched, treatment, control).measure()]);
 
         assert!(rendered.contains("unmeasurable"), "{rendered}");
@@ -1586,27 +1850,29 @@ mod tests {
 
     #[test]
     fn test_a_long_question_does_not_shift_the_columns_beneath_it() {
-        let long = Study::new(
-            Declaration::new(
-                "a question far longer than the column it has been given to sit in",
-                Family::new("intraday", tests(2)),
-                Horizon::Sessions(tests(1)),
-                DeclaredUniverse::Unscreened,
-                unpriced(),
-            ),
-            Pairing::Matched,
-            arm("treatment", &[0.3, 0.1, 0.2]),
-            arm("control", &[0.1, 0.1, 0.1]),
-            &fingerprint(None),
-        )
-        .expect("the fixture must assemble")
-        .measure();
-        let short = study(
-            Pairing::Matched,
-            arm("treatment", &[0.3, 0.1, 0.2]),
-            arm("control", &[0.1, 0.1, 0.1]),
-        )
-        .measure();
+        // Both in one family, so they land in one table and their rows can be compared at all.
+        let asked = |question: &str, treatment: &str| {
+            Study::new(
+                Declaration::new(
+                    question,
+                    Family::new("intraday", tests(2)),
+                    Horizon::Sessions(tests(1)),
+                    DeclaredUniverse::Unscreened,
+                    unpriced(),
+                ),
+                Pairing::Matched,
+                arm(treatment, &[0.3, 0.1, 0.2]),
+                arm("control", &[0.1, 0.1, 0.1]),
+                &fingerprint(None),
+            )
+            .expect("the fixture must assemble")
+            .measure()
+        };
+        let long = asked(
+            "a question far longer than the column it has been given to sit in",
+            "treatment",
+        );
+        let short = asked("short", "second");
 
         let rendered = render(&[long, short]);
         // Columns, not bytes: `±` is two bytes and the ellipsis is three, so a byte count would
@@ -1626,5 +1892,139 @@ mod tests {
     #[test]
     fn test_no_studies_renders_as_no_studies_rather_than_an_empty_table() {
         assert_eq!(render(&[]), "No studies were measured.\n");
+    }
+
+    /// Studies from two families get two headers, because one header cannot describe both.
+    ///
+    /// The defect this closes: the header states a family, a threshold, a universe and a horizon,
+    /// and taking them from the first row filed every later reading under a bar that was not its
+    /// own. A reading needing 3.23 errors rendered under a 1.96 header reads as comfortably clear.
+    #[test]
+    fn test_studies_from_two_families_are_not_rendered_under_one_header() {
+        let measured = |family: &str, count: usize| {
+            Study::new(
+                Declaration::new(
+                    format!("does {family} pay"),
+                    Family::new(family, tests(count)),
+                    Horizon::Sessions(tests(1)),
+                    DeclaredUniverse::Unscreened,
+                    unpriced(),
+                ),
+                Pairing::Matched,
+                arm("treatment", &[0.30, 0.10, 0.25, 0.15, 0.20, 0.20]),
+                arm("control", &[0.0; 6]),
+                &fingerprint(None),
+            )
+            .expect("the fixture must assemble")
+            .measure()
+        };
+
+        let rendered = render(&[measured("alone", 1), measured("crowded", 40)]);
+
+        assert_eq!(rendered.matches("Family ").count(), 2, "{rendered}");
+        assert!(rendered.contains("Family alone"), "{rendered}");
+        assert!(rendered.contains("Family crowded"), "{rendered}");
+        // Each family's own bar, not the first one's applied to both.
+        assert!(
+            rendered.contains("1.96 standard errors required"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("3.23 standard errors required"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Bonferroni over 1 tests"), "{rendered}");
+        assert!(rendered.contains("Bonferroni over 40 tests"), "{rendered}");
+    }
+
+    /// Two universes are two populations, so they do not share a header either.
+    #[test]
+    fn test_studies_over_two_universes_are_not_rendered_under_one_header() {
+        let floor = LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
+        let screened = Study::new(
+            Declaration::new(
+                "does the traded book pay",
+                Family::new("one", tests(1)),
+                Horizon::Sessions(tests(1)),
+                DeclaredUniverse::Screened {
+                    name: "traded-v1".to_string(),
+                    floor,
+                    window: ScreenWindow::WholeFrame,
+                },
+                unpriced(),
+            ),
+            Pairing::Matched,
+            arm("treatment", &[0.3, 0.1]),
+            arm("control", &[0.1, 0.1]),
+            &fingerprint(Some((floor, ScreenWindow::WholeFrame))),
+        )
+        .expect("the fixture must assemble")
+        .measure();
+        let unscreened = study(
+            Pairing::Matched,
+            arm("treatment", &[0.3, 0.1]),
+            arm("control", &[0.1, 0.1]),
+        )
+        .measure();
+
+        let rendered = render(&[screened, unscreened]);
+
+        assert_eq!(rendered.matches("Family ").count(), 2, "{rendered}");
+        assert!(rendered.contains("universe traded-v1"), "{rendered}");
+        assert!(rendered.contains("universe unscreened"), "{rendered}");
+    }
+
+    /// A homogeneous slice renders exactly one table, which is what both binaries pass.
+    #[test]
+    fn test_one_family_still_renders_as_one_table() {
+        let rendered = render(&[
+            study(
+                Pairing::Matched,
+                arm("treatment", &[0.3, 0.1, 0.2]),
+                arm("control", &[0.1, 0.1, 0.1]),
+            )
+            .measure(),
+            study(
+                Pairing::Matched,
+                arm("second", &[0.4, 0.2, 0.3]),
+                arm("control", &[0.1, 0.1, 0.1]),
+            )
+            .measure(),
+        ]);
+
+        assert_eq!(rendered.matches("Family ").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("question ").count(), 1, "{rendered}");
+    }
+
+    /// The footer counts rows per study, and two studies in a family need not share a population.
+    ///
+    /// Quoting the first row's count for every row is what the footer used to do, and it overstates
+    /// how well the rest of the table is supported.
+    #[test]
+    fn test_the_footer_reports_the_range_when_the_studies_read_different_row_counts() {
+        let build = |name: &str, observations: usize| {
+            Study::new(
+                declaration(unpriced()),
+                Pairing::Matched,
+                Arm::new(name, measurable(&[0.3, 0.1, 0.2]), observations).expect("a usable arm"),
+                Arm::new("control", measurable(&[0.1, 0.1, 0.1]), observations)
+                    .expect("a usable arm"),
+                &fingerprint(None),
+            )
+            .expect("the fixture must assemble")
+            .measure()
+        };
+
+        let same = render(&[build("first", 500), build("second", 500)]);
+        assert!(
+            same.contains("rows folded into these readings: 500"),
+            "{same}"
+        );
+
+        let differing = render(&[build("first", 500), build("second", 1_200)]);
+        assert!(
+            differing.contains("rows folded into these readings: 500 to 1200"),
+            "{differing}"
+        );
     }
 }

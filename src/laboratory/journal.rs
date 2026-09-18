@@ -25,9 +25,11 @@ use crate::laboratory::stability::{Association, SignAgreement};
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. v2 added
 /// `liquidity_floor` to the `dataset_built` fingerprint and v3 added `reference_digest` beside it,
 /// naming the point-in-time universe the rows were classified against. v4 added
-/// `factor_specification`, naming the factor set a residual panel was fitted against. v5 added the
-/// `study_measured` observation, which is the first record carrying a declaration alongside a
-/// reading.
+/// `factor_specification`, naming the factor set a residual panel was fitted against. v5 adds the
+/// `study_measured` observation — the first record carrying a declaration alongside a reading — and
+/// `screen_window` beside the fingerprint's floor, because a screen is a floor *and* the stretch of
+/// history it was applied over. Both land in v5 rather than v5 and v6: v5 has not shipped, so no
+/// reader will ever see one without the other.
 pub const SCHEMA_VERSION: u32 = 5;
 
 /// Where the laboratory writes when `FUND_LABORATORY_JOURNAL_DIRECTORY` says nothing.
@@ -443,6 +445,7 @@ mod tests {
             session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()),
             lookback_days: 365,
             liquidity_floor: None,
+            screen_window: None,
             rows: 10,
             tickers: 2,
             first_timestamp: DateTime::from_timestamp_millis(0),
@@ -646,8 +649,14 @@ mod tests {
         };
 
         let one = NonZeroUsize::new(1).expect("a positive count");
+        // One session a day, the same four for both arms, which is what `Pairing::Matched` requires.
         let arm = |name: &str, readings: [f64; 4]| {
-            Arm::new(name, readings.into_iter().map(Some).collect(), 4).expect("a usable arm")
+            let keyed: Vec<(i64, Option<f64>)> = readings
+                .into_iter()
+                .enumerate()
+                .map(|(index, reading)| (index as i64 * 86_400_000, Some(reading)))
+                .collect();
+            Arm::new(name, keyed, 4).expect("a usable arm")
         };
         let result = Study::new(
             Declaration::new(
@@ -776,6 +785,19 @@ mod tests {
         assert_eq!(
             value["payload"]["fingerprint"]["reference_digest"],
             serde_json::json!(0xEF)
+        );
+        // The window is half the screen, and a floor without it does not name a population: the
+        // same bounds over a trailing month and over two years admit different sets of names.
+        assert!(
+            value["payload"]["fingerprint"]
+                .as_object()
+                .expect("the fingerprint is an object")
+                .contains_key("screen_window"),
+            "{value}"
+        );
+        assert_eq!(
+            value["payload"]["fingerprint"]["screen_window"],
+            serde_json::json!(null)
         );
         // Both fields, not just the lookback: a panel fitted at a different variance share measures
         // a different set of names, and a record carrying only one of them cannot say which.

@@ -8,12 +8,11 @@ use chrono::Utc;
 use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
-use fund::common::types::{BasisPoints, SessionDate};
+use fund::common::types::{BasisPoints, ScreenWindow, SessionDate};
 use fund::laboratory::cost::{CostModel, FillStyle, RoundTrip};
 use fund::laboratory::dataset::{self, DatasetFingerprint};
 use fund::laboratory::harness::{
-    Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, ScreenWindow, Study,
-    StudyResult,
+    Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study, StudyResult,
 };
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::metrics::Distribution;
@@ -97,9 +96,13 @@ impl Parameters {
                 format!("MOMENTUM_SESSIONS is larger than this platform can index\n{USAGE}")
             })?,
             // Zero is admissible and means a locked book, which is a cost assumption rather than a
-            // missing one; a negative width is not a book at all.
+            // missing one. Everything `BasisPoints` refuses is named, not just the negative case: a
+            // NaN told it "must not be negative" sends an operator looking for a minus sign.
             quoted_spread: BasisPoints::new(spread).ok_or_else(|| {
-                format!("QUOTED_SPREAD_BASIS_POINTS must not be negative, got {spread}\n{USAGE}")
+                format!(
+                    "QUOTED_SPREAD_BASIS_POINTS must be a finite width of zero or more, got \
+                     {spread}\n{USAGE}"
+                )
             })?,
         })
     }
@@ -256,7 +259,12 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         evaluations.push(evaluation);
     }
 
-    let studies = measure(parameters, &evaluations, &fingerprint)?;
+    // The panel's own session keys, so each arm records which sessions it read and the harness can
+    // refuse a matched pair that does not line up rather than zipping two lists regardless.
+    let sessions: Vec<i64> = (0..panel.sessions())
+        .map(|index| panel.session_at(index))
+        .collect();
+    let studies = measure(parameters, &evaluations, &sessions, &fingerprint)?;
     if let Some(journal) = journal.as_ref() {
         for result in &studies {
             journal
@@ -288,6 +296,7 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
 fn measure(
     parameters: &Parameters,
     evaluations: &[Evaluation],
+    sessions: &[i64],
     fingerprint: &DatasetFingerprint,
 ) -> Result<Vec<StudyResult>, Box<dyn std::error::Error>> {
     let control = evaluations
@@ -310,12 +319,12 @@ fn measure(
     let arm = |evaluation: &Evaluation| {
         Arm::new(
             &evaluation.predictor,
-            evaluation
-                .sessions
+            sessions
                 .iter()
+                .zip(&evaluation.sessions)
                 // The target is a fraction and the cost is in basis points, so the reading is
                 // converted here rather than left for the subtraction to get wrong.
-                .map(|session| session.decile_spread.map(|spread| spread * 10_000.0))
+                .map(|(key, session)| (*key, session.decile_spread.map(|spread| spread * 10_000.0)))
                 .collect(),
             fingerprint.rows,
         )
@@ -474,6 +483,7 @@ mod tests {
             ),
             lookback_days: 365,
             liquidity_floor: Some(fund::common::types::LiquidityFloor::CURRENT),
+            screen_window: Some(ScreenWindow::WholeFrame),
             rows: 317_465,
             tickers: 1_334,
             first_timestamp: None,
@@ -483,6 +493,11 @@ mod tests {
             reference_digest: None,
             factor_specification: None,
         }
+    }
+
+    /// The four session keys every fixture arm reads, one a day.
+    fn sessions() -> Vec<i64> {
+        (0..4).map(|index| index * 86_400_000).collect()
     }
 
     /// Four sessions of decile spreads, in fractions of a return as the panel produces them.
@@ -512,7 +527,8 @@ mod tests {
             evaluation(CONTROL, [Some(0.0); 4]),
         ];
 
-        let studies = measure(&parameters(), &evaluations, &fingerprint()).expect("scorable");
+        let studies =
+            measure(&parameters(), &evaluations, &sessions(), &fingerprint()).expect("scorable");
 
         assert_eq!(studies.len(), 2, "the control is not a test of itself");
         for study in &studies {
@@ -536,7 +552,8 @@ mod tests {
             evaluation(CONTROL, [Some(0.0); 4]),
         ];
 
-        let studies = measure(&parameters(), &evaluations, &fingerprint()).expect("scorable");
+        let studies =
+            measure(&parameters(), &evaluations, &sessions(), &fingerprint()).expect("scorable");
         let difference = studies[0].difference().expect("measurable");
 
         assert!((difference.mean - 10.0).abs() < 1e-9, "{difference:?}");
@@ -553,10 +570,10 @@ mod tests {
     #[test]
     fn test_a_run_with_no_control_arm_is_refused() {
         let evaluations = vec![evaluation("persistence", [Some(0.001); 4])];
-        assert!(measure(&parameters(), &evaluations, &fingerprint()).is_err());
+        assert!(measure(&parameters(), &evaluations, &sessions(), &fingerprint()).is_err());
 
         let only_control = vec![evaluation(CONTROL, [Some(0.0); 4])];
-        assert!(measure(&parameters(), &only_control, &fingerprint()).is_err());
+        assert!(measure(&parameters(), &only_control, &sessions(), &fingerprint()).is_err());
     }
 
     fn scored(

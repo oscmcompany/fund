@@ -9,13 +9,12 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use tracing::{error, info, warn};
 
-use fund::common::types::SessionDate;
+use fund::common::types::{ScreenWindow, SessionDate};
 use fund::data::details::UNKNOWN;
 use fund::laboratory::dataset;
 use fund::laboratory::dataset::DatasetFingerprint;
 use fund::laboratory::harness::{
-    Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, ScreenWindow, Study,
-    StudyResult,
+    Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study, StudyResult,
 };
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::residual::{
@@ -250,7 +249,7 @@ fn measure(
     let baseline = session_mean_variance(panel, &sessions).ok_or_else(unreadable)?;
 
     let arm = |name: &str, variances: &[SessionVariance]| {
-        Arm::new(name, shares(variances), shared.len()).ok_or_else(
+        Arm::new(name, shares(&sessions, variances), shared.len()).ok_or_else(
             || -> Box<dyn std::error::Error> {
                 format!("{name} produced no readings to score").into()
             },
@@ -287,8 +286,14 @@ fn measure(
             arm(TREATMENT_ARM, &treatment)?,
             arm(CONTROL_ARM, &permuted)?,
         )?,
+        // Named for the arm it actually has. The treatment here is the *whole* permuted fit —
+        // random sector dummies alongside size and volatility — so its lift over the session mean
+        // cannot be attributed to size and volatility, which fit jointly with dummies that explain
+        // noise on their own. Isolating those two would need a fit without sector dummies, and
+        // `residual_returns` demeans within sector by construction, so that is a different study.
+        // What this does measure is worth reporting: whether the floor is above the trivial one.
         study(
-            "do size and volatility explain more than the session mean",
+            "does the permuted fit beat the session mean",
             arm(CONTROL_ARM, &permuted)?,
             arm(BASELINE_ARM, &baseline)?,
         )?,
@@ -390,20 +395,23 @@ fn measured_in_both(panel: &ResidualPanel, control: &ResidualPanel) -> Vec<usize
         .collect()
 }
 
-/// The shared rows grouped into sessions, in session order.
+/// The shared rows grouped into sessions, each keyed by the session it belongs to, in session order.
 ///
 /// Built once and handed to every arm, so the three readings are aligned session for session and
-/// can be differenced as a matched pair rather than compared as two summaries. Sessions are the
-/// level that varies here: a cross-section is fitted jointly, so an error over rows would divide by
-/// far more independence than one session's 1,200 names contain.
-fn sessions_of(panel: &ResidualPanel, rows: &[usize]) -> Option<Vec<Vec<usize>>> {
+/// can be differenced as a matched pair rather than compared as two summaries. The key travels with
+/// the group rather than being dropped: the harness refuses a matched pair whose sessions disagree,
+/// and it can only do that if the arms carry which sessions they read.
+///
+/// Sessions are the level that varies here: a cross-section is fitted jointly, so an error over rows
+/// would divide by far more independence than one session's 1,200 names contain.
+fn sessions_of(panel: &ResidualPanel, rows: &[usize]) -> Option<Vec<(i64, Vec<usize>)>> {
     let timestamps = panel.frame.column("timestamp").ok()?.i64().ok()?;
 
     let mut grouped: std::collections::BTreeMap<i64, Vec<usize>> = Default::default();
     for row in rows {
         grouped.entry(timestamps.get(*row)?).or_default().push(*row);
     }
-    Some(grouped.into_values().collect())
+    Some(grouped.into_iter().collect())
 }
 
 /// One session's raw variation and what a fit left of it.
@@ -417,13 +425,16 @@ struct SessionVariance {
 }
 
 /// What the panel's own fit left behind, per session.
-fn fitted_variance(panel: &ResidualPanel, sessions: &[Vec<usize>]) -> Option<Vec<SessionVariance>> {
+fn fitted_variance(
+    panel: &ResidualPanel,
+    sessions: &[(i64, Vec<usize>)],
+) -> Option<Vec<SessionVariance>> {
     let returns = returns_of(panel)?;
     let residuals = panel.frame.column(RESIDUAL_COLUMN).ok()?.f64().ok()?;
 
     sessions
         .iter()
-        .map(|rows| {
+        .map(|(_session, rows)| {
             let mut variance = SessionVariance {
                 raw: 0.0,
                 left: 0.0,
@@ -448,13 +459,13 @@ fn fitted_variance(panel: &ResidualPanel, sessions: &[Vec<usize>]) -> Option<Vec
 /// subtracted from each other at all.
 fn session_mean_variance(
     panel: &ResidualPanel,
-    sessions: &[Vec<usize>],
+    sessions: &[(i64, Vec<usize>)],
 ) -> Option<Vec<SessionVariance>> {
     let returns = returns_of(panel)?;
 
     sessions
         .iter()
-        .map(|rows| {
+        .map(|(_session, rows)| {
             let mut total = 0.0;
             for row in rows {
                 total += returns.get(*row)?;
@@ -475,14 +486,24 @@ fn session_mean_variance(
         .collect()
 }
 
-/// Share of the raw variation removed, one reading per session.
+/// Share of the raw variation removed, one reading per session, keyed by that session.
 ///
 /// `None` on a session whose returns carry no variation, because a ratio against nothing is not
-/// zero explanatory power — it is no reading at all.
-fn shares(variances: &[SessionVariance]) -> Vec<Option<f64>> {
-    variances
+/// zero explanatory power — it is no reading at all. The key travels with the reading so the harness
+/// can refuse a matched pair whose sessions do not line up rather than zipping them regardless.
+fn shares(
+    sessions: &[(i64, Vec<usize>)],
+    variances: &[SessionVariance],
+) -> Vec<(i64, Option<f64>)> {
+    sessions
         .iter()
-        .map(|variance| (variance.raw > 0.0).then(|| 1.0 - variance.left / variance.raw))
+        .zip(variances)
+        .map(|((session, _), variance)| {
+            (
+                *session,
+                (variance.raw > 0.0).then(|| 1.0 - variance.left / variance.raw),
+            )
+        })
         .collect()
 }
 
@@ -681,11 +702,11 @@ mod tests {
     fn test_the_shared_rows_group_into_sessions_in_order() {
         let panel = panel(&[0.0; 4]);
         let sessions = sessions_of(&panel, &[0, 1, 2, 3]).expect("the fixture groups");
-        assert_eq!(sessions, vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(sessions, vec![(0_i64, vec![0, 1]), (1_i64, vec![2, 3])]);
 
         // Only the rows handed in, so an arm scored on an intersection stays on it.
         let sessions = sessions_of(&panel, &[1, 2]).expect("the fixture groups");
-        assert_eq!(sessions, vec![vec![1], vec![2]]);
+        assert_eq!(sessions, vec![(0_i64, vec![1]), (1_i64, vec![2])]);
     }
 
     /// The whole-window figure is not the mean of the per-session ones, and the two must not be
@@ -700,8 +721,8 @@ mod tests {
         let sessions = sessions_of(&panel, &[0, 1, 2, 3]).expect("the fixture groups");
         let variances = fitted_variance(&panel, &sessions).expect("the fixture measures");
 
-        let per_session = shares(&variances);
-        assert_eq!(per_session, vec![Some(1.0), Some(0.0)]);
+        let per_session = shares(&sessions, &variances);
+        assert_eq!(per_session, vec![(0_i64, Some(1.0)), (1_i64, Some(0.0))]);
 
         let pooled = pooled_share(&variances).expect("the window carries variation");
         assert!(
@@ -730,7 +751,7 @@ mod tests {
 
         let sessions = sessions_of(&panel, &[0, 1]).expect("the fixture groups");
         let variances = fitted_variance(&panel, &sessions).expect("the fixture measures");
-        assert_eq!(shares(&variances), vec![None]);
+        assert_eq!(shares(&sessions, &variances), vec![(0_i64, None)]);
         assert_eq!(pooled_share(&variances), None);
     }
 
@@ -754,9 +775,9 @@ mod tests {
         let variances = session_mean_variance(&panel, &sessions).expect("the fixture measures");
 
         // Both names moved +2%, so the session mean leaves nothing.
-        assert_eq!(shares(&variances)[0], Some(1.0));
+        assert_eq!(shares(&sessions, &variances)[0], (0_i64, Some(1.0)));
         // They moved opposite ways, so the mean is zero and removes nothing.
-        assert_eq!(shares(&variances)[1], Some(0.0));
+        assert_eq!(shares(&sessions, &variances)[1], (1_i64, Some(0.0)));
     }
 
     #[test]
