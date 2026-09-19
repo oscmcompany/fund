@@ -40,7 +40,8 @@ const BASELINE_ARM: &str = "session mean";
 const USAGE: &str =
     "Usage: laboratory_residuals [LOOKBACK_DAYS] [VOLATILITY_SESSIONS] [MINIMUM_VARIANCE_SHARE] \
      [SCREEN_WINDOW_DAYS]\n\
-     SCREEN_WINDOW_DAYS absent screens every session loaded; a number screens that trailing window.";
+     SCREEN_WINDOW_DAYS absent screens every session loaded; a number screens that trailing \
+     window; `per-session:N` re-anchors that window on every session.";
 
 /// Calendar days of archive to measure over by default, matching the baselines binary.
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
@@ -92,7 +93,7 @@ impl Parameters {
                 positive(lookback, "LOOKBACK_DAYS")?,
                 positive(sessions, "VOLATILITY_SESSIONS")?,
                 variance_share(share)?,
-                Some(positive(window, "SCREEN_WINDOW_DAYS")?),
+                Some(window.as_str()),
             ),
             _ => return Err(format!("Too many arguments\n{USAGE}")),
         };
@@ -104,22 +105,13 @@ impl Parameters {
             format!("{sessions} sessions at a {share} variance share cannot measure a residual\n{USAGE}")
         })?;
 
-        // Absent means the research screen, which is every session the frame holds. A number is a
-        // trailing window in Eastern calendar days, the same unit the traded universe screens over.
-        // Only the window moves: a caller naming one half of a screen has not renamed the other.
+        // Absent means the research screen, which is every session the frame holds. Present means
+        // a trailing window in Eastern calendar days, the same unit the traded universe screens
+        // over, optionally re-anchored on every session. Only the window moves: a caller naming one
+        // half of a screen has not renamed the other.
         let screen = match window_days {
             None => dataset::RESEARCH_SCREEN,
-            Some(days) => Screen::new(
-                dataset::RESEARCH_SCREEN.floor(),
-                ScreenWindow::Trailing(
-                    u32::try_from(days)
-                        .ok()
-                        .and_then(NonZeroU32::new)
-                        .ok_or_else(|| {
-                            format!("SCREEN_WINDOW_DAYS must be a positive number of days, got {days}\n{USAGE}")
-                        })?,
-                ),
-            ),
+            Some(raw) => Screen::new(dataset::RESEARCH_SCREEN.floor(), screen_window(raw)?),
         };
 
         Ok(Self {
@@ -128,6 +120,32 @@ impl Parameters {
             screen,
         })
     }
+}
+
+/// Parses `SCREEN_WINDOW_DAYS`: `30` is a trailing window, `per-session:30` re-anchors it.
+///
+/// One argument rather than a window and a mode, because the two are never independently useful and
+/// a mode argument silently ignored on the default path is a bug waiting for its first caller.
+fn screen_window(raw: &str) -> Result<ScreenWindow, String> {
+    let (per_session, digits) = match raw.trim().strip_prefix("per-session:") {
+        Some(rest) => (true, rest),
+        None => (false, raw.trim()),
+    };
+    let days = digits
+        .parse::<u32>()
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            format!(
+                "SCREEN_WINDOW_DAYS must be a positive number of days, optionally prefixed \
+                 `per-session:`, got {raw:?}\n{USAGE}"
+            )
+        })?;
+    Ok(if per_session {
+        ScreenWindow::PerSession(days)
+    } else {
+        ScreenWindow::Trailing(days)
+    })
 }
 
 /// Parses the minimum residual variance share, refusing anything that is not a number.
@@ -639,6 +657,60 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(arguments: &[&str]) -> Result<Parameters, String> {
+        Parameters::parse(
+            &arguments
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The prefix chooses the window's shape and must leave the floor alone.
+    ///
+    /// A screen is a floor and a window, and a caller naming one half has not renamed the other --
+    /// silently moving the floor with the window would be the bug this argument could most easily
+    /// introduce.
+    #[test]
+    fn test_the_per_session_prefix_moves_the_window_and_not_the_floor() {
+        let trailing = parse(&["731", "60", "0.5", "30"]).expect("a trailing window");
+        let per_session =
+            parse(&["731", "60", "0.5", "per-session:30"]).expect("a per-session one");
+        let thirty = NonZeroU32::new(30).unwrap();
+
+        assert_eq!(trailing.screen.window(), ScreenWindow::Trailing(thirty));
+        assert_eq!(
+            per_session.screen.window(),
+            ScreenWindow::PerSession(thirty)
+        );
+        assert_eq!(per_session.screen.floor(), dataset::RESEARCH_SCREEN.floor());
+        assert_eq!(trailing.screen.floor(), per_session.screen.floor());
+    }
+
+    #[test]
+    fn test_an_absent_window_is_still_the_research_screen() {
+        let parameters = parse(&["731", "60", "0.5"]).expect("three arguments");
+        assert_eq!(parameters.screen, dataset::RESEARCH_SCREEN);
+        assert_eq!(parameters.screen.window(), ScreenWindow::WholeFrame);
+    }
+
+    #[test]
+    fn test_a_malformed_window_is_refused_rather_than_read_as_a_default() {
+        for argument in [
+            "0",
+            "per-session:0",
+            "per-session:",
+            "per-session",
+            "thirty",
+            "-30",
+        ] {
+            assert!(
+                parse(&["731", "60", "0.5", argument]).is_err(),
+                "{argument:?} must be refused"
+            );
+        }
+    }
 
     fn frame(rows: &[(&str, i64, &str)]) -> DataFrame {
         DataFrame::new(vec![

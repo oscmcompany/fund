@@ -3,7 +3,7 @@
 //! Screens nothing new: it reads one archive window and applies the screens the tree already
 //! declares, so the populations behind every laboratory figure can be read rather than argued.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use polars::prelude::*;
@@ -62,12 +62,30 @@ fn positive(raw: &str, name: &str) -> Result<i64, String> {
     Ok(value)
 }
 
-/// One screen, the anchor it was applied at, and the names it admitted.
+/// One screen, the anchor it was applied at, and what it admitted.
 struct Admitted {
     name: String,
     screen: Screen,
     anchor: SessionDate,
     tickers: BTreeSet<String>,
+    /// Rows surviving the screen, which is the panel a study actually measures over.
+    ///
+    /// Carried beside the name count because the two come apart exactly where this pull request
+    /// does: a per-session screen can admit every name and still refuse half the panel.
+    rows: usize,
+}
+
+/// What a per-session screen costs beyond the names it refuses.
+///
+/// A name that leaves and returns loses its first session back as well, because `engineer_features`
+/// gives that row no `daily_return` -- the frame-wide session rank says it does not follow the row
+/// before it. So the panel pays for the churn twice, and the second charge is invisible here unless
+/// it is counted.
+struct Churn {
+    names_ever_admitted: usize,
+    names_always_admitted: usize,
+    spells: usize,
+    re_entries: usize,
 }
 
 /// Calendar days past the window's last session to re-anchor the trailing screen at.
@@ -158,6 +176,17 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
     ];
     // The same trailing screen re-anchored ahead of the window, which is the pre-open shape: the
     // universe is built for today and the newest daily bar is the last session's.
+    declarations.push((
+        "per-session".to_string(),
+        Screen::new(
+            floor,
+            ScreenWindow::PerSession(
+                std::num::NonZeroU32::new(parameters.trailing_days)
+                    .ok_or("a positive trailing window")?,
+            ),
+        ),
+        last_session,
+    ));
     declarations.extend(ANCHOR_SHIFT_DAYS.map(|shift| {
         (
             format!("trailing+{shift}d"),
@@ -166,20 +195,89 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         )
     }));
 
+    let mut churn: Option<Churn> = None;
     let mut measured = Vec::with_capacity(declarations.len());
     for (name, screen, anchor) in declarations {
         let screened = filter_liquid_bars(window.bars.clone(), screen, anchor)?;
         let tickers = distinct_tickers(&screened)?;
-        info!(screen = %name, %screen, %anchor, admitted = tickers.len(), "Screened the window");
+        info!(screen = %name, %screen, %anchor, admitted = tickers.len(), rows = screened.height(), "Screened the window");
+        if screen.window().is_per_session() {
+            churn = Some(churn_of(&screened)?);
+        }
         measured.push(Admitted {
             name,
             screen,
             anchor,
             tickers,
+            rows: screened.height(),
         });
     }
 
-    Ok(render(&population, &measured))
+    Ok(render(
+        &population,
+        window.bars.height(),
+        &measured,
+        churn.as_ref(),
+    ))
+}
+
+/// Counts each name's admitted spells, and how many of them were re-entries.
+///
+/// A spell is a run of consecutive admitted sessions in the frame's own session calendar. Counting
+/// against that calendar rather than row adjacency is what makes a gap a gap: two rows either side
+/// of a refused session are adjacent in the screened frame and are not consecutive sessions.
+fn churn_of(screened: &DataFrame) -> PolarsResult<Churn> {
+    let sorted = screened.sort(
+        ["ticker", "timestamp"],
+        SortMultipleOptions::default().with_maintain_order(true),
+    )?;
+    let ranks = session_ranks(sorted.column("timestamp")?.i64()?);
+    let tickers = sorted.column("ticker")?.str()?;
+    let timestamps = sorted.column("timestamp")?.i64()?;
+
+    let mut spells_by_ticker: BTreeMap<String, usize> = BTreeMap::new();
+    let mut previous: Option<(&str, usize)> = None;
+    for row in 0..sorted.height() {
+        let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
+            continue;
+        };
+        let rank = ranks[&timestamp];
+        let opens_a_spell = match previous {
+            Some((name, last_rank)) => name != ticker || rank != last_rank + 1,
+            None => true,
+        };
+        if opens_a_spell {
+            *spells_by_ticker.entry(ticker.to_string()).or_default() += 1;
+        }
+        previous = Some((ticker, rank));
+    }
+
+    let spells: usize = spells_by_ticker.values().sum();
+    Ok(Churn {
+        names_ever_admitted: spells_by_ticker.len(),
+        names_always_admitted: spells_by_ticker
+            .values()
+            .filter(|count| **count == 1)
+            .count(),
+        spells,
+        // Every spell after a name's first is a re-entry, and each costs one row's `daily_return`.
+        re_entries: spells - spells_by_ticker.len(),
+    })
+}
+
+/// Each distinct session in the frame, numbered in time order.
+fn session_ranks(timestamps: &Int64Chunked) -> BTreeMap<i64, usize> {
+    let mut sessions: Vec<i64> = timestamps
+        .into_no_null_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    sessions.sort_unstable();
+    sessions
+        .into_iter()
+        .enumerate()
+        .map(|(rank, session)| (session, rank))
+        .collect()
 }
 
 fn distinct_tickers(frame: &DataFrame) -> PolarsResult<BTreeSet<String>> {
@@ -195,22 +293,37 @@ fn distinct_tickers(frame: &DataFrame) -> PolarsResult<BTreeSet<String>> {
 ///
 /// Both directions because neither set contains the other: a longer window can only lower a name's
 /// minimum close and so makes the price bound harder, while its mean notional moves either way.
-fn render(population: &BTreeSet<String>, measured: &[Admitted]) -> String {
+fn render(
+    population: &BTreeSet<String>,
+    population_rows: usize,
+    measured: &[Admitted],
+    churn: Option<&Churn>,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "Window population: {} names\n\n{:<20} {:>9}  {}\n",
+        "Window population: {} names over {} rows\n\n{:<20} {:>9} {:>10}  {}\n",
         population.len(),
+        population_rows,
         "screen",
         "admitted",
+        "rows",
         "declared as"
     ));
     for entry in measured {
         out.push_str(&format!(
-            "{:<20} {:>9}  {} anchored {}\n",
+            "{:<20} {:>9} {:>10}  {} anchored {}\n",
             entry.name,
             entry.tickers.len(),
+            entry.rows,
             entry.screen,
             entry.anchor
+        ));
+    }
+    if let Some(churn) = churn {
+        out.push_str(&format!(
+            "\nper-session churn: {} names ever admitted, {} of them without a break\n\
+             {} spells, so {} re-entries -- each one costs a row its daily return\n",
+            churn.names_ever_admitted, churn.names_always_admitted, churn.spells, churn.re_entries
         ));
     }
 
@@ -308,18 +421,23 @@ mod tests {
                 screen,
                 anchor,
                 tickers: names(&["AAA", "BBB"]),
+                rows: 4,
             },
             Admitted {
                 name: "narrow".to_string(),
                 screen,
                 anchor,
                 tickers: names(&["BBB", "CCC"]),
+                rows: 4,
             },
         ];
 
-        let report = render(&population, &measured);
+        let report = render(&population, 9, &measured, None);
 
-        assert!(report.contains("Window population: 3 names"), "{report}");
+        assert!(
+            report.contains("Window population: 3 names over 9 rows"),
+            "{report}"
+        );
         // One row per pair carrying both directions: AAA is in wide only, CCC in narrow only.
         assert!(
             report.contains("wide                 narrow                       1         1"),
