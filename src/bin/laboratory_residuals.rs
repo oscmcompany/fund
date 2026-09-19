@@ -105,10 +105,8 @@ impl Parameters {
             format!("{sessions} sessions at a {share} variance share cannot measure a residual\n{USAGE}")
         })?;
 
-        // Absent means the research screen, which is every session the frame holds. Present means
-        // a trailing window in Eastern calendar days, the same unit the traded universe screens
-        // over, optionally re-anchored on every session. Only the window moves: a caller naming one
-        // half of a screen has not renamed the other.
+        // Only the window moves: naming one half of a screen has not renamed the other, and the
+        // floor stays the research one whichever window a caller asks for.
         let screen = match window_days {
             None => dataset::RESEARCH_SCREEN,
             Some(raw) => Screen::new(dataset::RESEARCH_SCREEN.floor(), screen_window(raw)?),

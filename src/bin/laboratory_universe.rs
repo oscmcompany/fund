@@ -83,7 +83,7 @@ struct Admitted {
 /// it is counted.
 struct Churn {
     names_ever_admitted: usize,
-    names_always_admitted: usize,
+    names_without_a_break: usize,
     spells: usize,
     re_entries: usize,
 }
@@ -202,7 +202,7 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         let tickers = distinct_tickers(&screened)?;
         info!(screen = %name, %screen, %anchor, admitted = tickers.len(), rows = screened.height(), "Screened the window");
         if screen.window().is_per_session() {
-            churn = Some(churn_of(&screened)?);
+            churn = Some(churn_of(&window.bars, &screened)?);
         }
         measured.push(Admitted {
             name,
@@ -223,61 +223,58 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
 
 /// Counts each name's admitted spells, and how many of them were re-entries.
 ///
-/// A spell is a run of consecutive admitted sessions in the frame's own session calendar. Counting
-/// against that calendar rather than row adjacency is what makes a gap a gap: two rows either side
-/// of a refused session are adjacent in the screened frame and are not consecutive sessions.
-fn churn_of(screened: &DataFrame) -> PolarsResult<Churn> {
-    let sorted = screened.sort(
-        ["ticker", "timestamp"],
-        SortMultipleOptions::default().with_maintain_order(true),
-    )?;
-    let ranks = session_ranks(sorted.column("timestamp")?.i64()?);
-    let tickers = sorted.column("ticker")?.str()?;
-    let timestamps = sorted.column("timestamp")?.i64()?;
+/// A break is "had a bar, was refused", so the calendar each name is walked against is **its own
+/// bars in the unscreened window** rather than any shared one. Ranking against the screened frame
+/// loses a session no ticker survived and merges two spells into one; ranking against the whole
+/// population charges a name for a session it simply had no bar on — a halt, a late listing, an
+/// absent print — which is churn the screen did not cause.
+fn churn_of(unscreened: &DataFrame, screened: &DataFrame) -> PolarsResult<Churn> {
+    let present = sessions_by_ticker(unscreened)?;
+    let admitted = sessions_by_ticker(screened)?;
 
-    let mut spells_by_ticker: BTreeMap<String, usize> = BTreeMap::new();
-    let mut previous: Option<(&str, usize)> = None;
-    for row in 0..sorted.height() {
-        let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
+    let mut spells_by_ticker: BTreeMap<&String, usize> = BTreeMap::new();
+    for (ticker, admitted_sessions) in &admitted {
+        let Some(own_sessions) = present.get(ticker) else {
             continue;
         };
-        let rank = ranks[&timestamp];
-        let opens_a_spell = match previous {
-            Some((name, last_rank)) => name != ticker || rank != last_rank + 1,
-            None => true,
-        };
-        if opens_a_spell {
-            *spells_by_ticker.entry(ticker.to_string()).or_default() += 1;
+        let mut previous_was_admitted = false;
+        for session in own_sessions {
+            let is_admitted = admitted_sessions.contains(session);
+            if is_admitted && !previous_was_admitted {
+                *spells_by_ticker.entry(ticker).or_default() += 1;
+            }
+            previous_was_admitted = is_admitted;
         }
-        previous = Some((ticker, rank));
     }
 
     let spells: usize = spells_by_ticker.values().sum();
     Ok(Churn {
         names_ever_admitted: spells_by_ticker.len(),
-        names_always_admitted: spells_by_ticker
+        names_without_a_break: spells_by_ticker
             .values()
             .filter(|count| **count == 1)
             .count(),
         spells,
-        // Every spell after a name's first is a re-entry, and each costs one row's `daily_return`.
+        // Every spell after a name's first is a re-entry, and each costs one row its daily return.
         re_entries: spells - spells_by_ticker.len(),
     })
 }
 
-/// Each distinct session in the frame, numbered in time order.
-fn session_ranks(timestamps: &Int64Chunked) -> BTreeMap<i64, usize> {
-    let mut sessions: Vec<i64> = timestamps
-        .into_no_null_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    sessions.sort_unstable();
-    sessions
-        .into_iter()
-        .enumerate()
-        .map(|(rank, session)| (session, rank))
-        .collect()
+/// Each ticker's sessions in time order, as the given frame holds them.
+fn sessions_by_ticker(frame: &DataFrame) -> PolarsResult<BTreeMap<String, BTreeSet<i64>>> {
+    let tickers = frame.column("ticker")?.str()?;
+    let timestamps = frame.column("timestamp")?.i64()?;
+    let mut by_ticker: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+    for (ticker, timestamp) in tickers.into_iter().zip(timestamps.into_iter()) {
+        let (Some(ticker), Some(timestamp)) = (ticker, timestamp) else {
+            continue;
+        };
+        by_ticker
+            .entry(ticker.to_string())
+            .or_default()
+            .insert(timestamp);
+    }
+    Ok(by_ticker)
 }
 
 fn distinct_tickers(frame: &DataFrame) -> PolarsResult<BTreeSet<String>> {
@@ -323,7 +320,7 @@ fn render(
         out.push_str(&format!(
             "\nper-session churn: {} names ever admitted, {} of them without a break\n\
              {} spells, so {} re-entries -- each one costs a row its daily return\n",
-            churn.names_ever_admitted, churn.names_always_admitted, churn.spells, churn.re_entries
+            churn.names_ever_admitted, churn.names_without_a_break, churn.spells, churn.re_entries
         ));
     }
 
