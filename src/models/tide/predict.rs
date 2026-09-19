@@ -187,9 +187,11 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
 
 /// Drops tickers that do not clear `screen` as of `as_of`, keeping the surviving names' history.
 ///
-/// Nothing here but the count: the statistic, the window and the anchor all live in
-/// [`universe::filter_liquid_bars`], so the predicted set and the traded set read one definition
-/// over one stretch of days — provided `as_of` is the session the traded universe was built for.
+/// The statistic, the window and the anchor all live in [`universe::filter_liquid_bars`], so this
+/// and the traded universe apply one definition over one stretch of days, provided `as_of` is the
+/// session that universe was built for. They do not read the same *prices*: these arrive
+/// split-adjusted and boundary-stitched where `load_liquidity` reads the raw table, and an adjusted
+/// minimum is weakly the lower of the two, so through a split this is the harder floor.
 pub fn filter_equity_bars(
     data: DataFrame,
     screen: Screen,

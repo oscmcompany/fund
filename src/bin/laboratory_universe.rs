@@ -64,11 +64,20 @@ fn positive(raw: &str, name: &str) -> Result<i64, String> {
 
 /// One screen, the anchor it was applied at, and the names it admitted.
 struct Admitted {
-    name: &'static str,
+    name: String,
     screen: Screen,
     anchor: SessionDate,
     tickers: BTreeSet<String>,
 }
+
+/// Calendar days past the window's last session to re-anchor the trailing screen at.
+///
+/// Deliberately calendar days and not trading sessions. At pre-open the traded universe is built
+/// for today while the newest daily bar is the last session's, and how far apart those are is a
+/// property of the weekend rather than of the screen: one day midweek, three across a weekend, four
+/// after a Monday holiday. Naming one of them "the next session" would claim a tradability
+/// `SessionDate` does not carry, so the sweep reports the range instead of picking from it.
+const ANCHOR_SHIFT_DAYS: [i64; 3] = [1, 2, 3];
 
 #[tokio::main]
 async fn main() {
@@ -135,23 +144,33 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         std::num::NonZeroU32::new(parameters.trailing_days).ok_or("a positive trailing window")?,
     );
     let floor = dataset::RESEARCH_SCREEN.floor();
-    // The third screen is the second one asked about the *next* session, which is the shape the live
-    // book runs at pre-open: the newest daily bar is yesterday's and the universe is built for today.
-    let declarations = [
-        ("research", dataset::RESEARCH_SCREEN, last_session),
-        ("trailing", Screen::new(floor, trailing), last_session),
+    let mut declarations = vec![
         (
-            "trailing-pre-open",
+            "research".to_string(),
+            dataset::RESEARCH_SCREEN,
+            last_session,
+        ),
+        (
+            "trailing".to_string(),
             Screen::new(floor, trailing),
-            last_session.plus_calendar_days(1),
+            last_session,
         ),
     ];
+    // The same trailing screen re-anchored ahead of the window, which is the pre-open shape: the
+    // universe is built for today and the newest daily bar is the last session's.
+    declarations.extend(ANCHOR_SHIFT_DAYS.map(|shift| {
+        (
+            format!("trailing+{shift}d"),
+            Screen::new(floor, trailing),
+            last_session.plus_calendar_days(shift),
+        )
+    }));
 
     let mut measured = Vec::with_capacity(declarations.len());
     for (name, screen, anchor) in declarations {
         let screened = filter_liquid_bars(window.bars.clone(), screen, anchor)?;
         let tickers = distinct_tickers(&screened)?;
-        info!(screen = name, %screen, %anchor, admitted = tickers.len(), "Screened the window");
+        info!(screen = %name, %screen, %anchor, admitted = tickers.len(), "Screened the window");
         measured.push(Admitted {
             name,
             screen,
@@ -235,6 +254,15 @@ mod tests {
         assert_eq!(parameters.trailing_days, 30);
     }
 
+    /// The sweep is calendar days and says so, because the alternative claims tradability.
+    ///
+    /// Pinned to literals: +1 is the midweek pre-open gap and +3 is the Monday one, and a sweep that
+    /// silently lost its far end would report the midweek figure as though it were the whole range.
+    #[test]
+    fn test_the_anchor_sweep_spans_the_midweek_gap_and_the_weekend_one() {
+        assert_eq!(ANCHOR_SHIFT_DAYS, [1, 2, 3]);
+    }
+
     #[test]
     fn test_the_trailing_window_defaults_to_the_live_books_own() {
         // The comparison is only meaningful against the window the live book actually screens on.
@@ -276,13 +304,13 @@ mod tests {
         let population = names(&["AAA", "BBB", "CCC"]);
         let measured = vec![
             Admitted {
-                name: "wide",
+                name: "wide".to_string(),
                 screen,
                 anchor,
                 tickers: names(&["AAA", "BBB"]),
             },
             Admitted {
-                name: "narrow",
+                name: "narrow".to_string(),
                 screen,
                 anchor,
                 tickers: names(&["BBB", "CCC"]),

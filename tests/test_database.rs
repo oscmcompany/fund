@@ -490,15 +490,18 @@ async fn test_liquidity_reports_the_window_low_not_its_average() {
     );
 }
 
-/// The SQL screen and the in-frame screen admit the same names from the same bars.
+/// The SQL screen and the in-frame screen cover the same days from the same anchor.
 ///
 /// They are two implementations of one definition and each is separately unit-tested, which is
 /// exactly the case where both can be right and jointly wrong. The anchor is deliberately a session
 /// *after* the newest bar, which is the pre-open shape: reading it off the frame instead reaches
 /// back a day further and the two sides part company on a name sitting on the window's edge.
+///
+/// **Scoped to the window and the anchor.** The prices are unadjusted on both sides here, which is
+/// the one thing these two paths do not share in production — see the test below.
 #[tokio::test]
 #[serial]
-async fn test_the_two_liquidity_screens_admit_the_same_names() {
+async fn test_the_two_liquidity_screens_agree_on_the_window_and_the_anchor() {
     let pool = fresh_pool().await;
     // The newest bar is yesterday and the screen is asked about today, as at pre-open.
     let as_of = SessionDate::at(Utc::now());
@@ -585,6 +588,103 @@ async fn test_the_two_liquidity_screens_admit_the_same_names() {
     assert_eq!(
         from_frame, from_sql,
         "the two screens read the same bars over the same window and must admit the same names"
+    );
+}
+
+/// The two screens read different prices through a split, and this pins how far apart that puts them.
+///
+/// A characterization test, not an approval: `load_liquidity` aggregates raw `equity_bars` while the
+/// live predict path screens the split-adjusted, boundary-stitched output of `load_bars_dataframe`.
+/// An adjusted minimum close is weakly lower than the raw one, so through a split the predicted set
+/// applies the harder price floor and refuses a name the traded universe admits. Sharing the anchor
+/// does not close this, and a docstring saying so is a sentence where this is a number — when the
+/// two bases are unified, this test fails and says where.
+#[tokio::test]
+#[serial]
+async fn test_the_two_liquidity_screens_part_company_across_a_split() {
+    let pool = fresh_pool().await;
+    let as_of = SessionDate::at(Utc::now());
+    let executed = as_of.plus_calendar_days(-2);
+
+    // SPLIT trades at 36 before a one-for-four, which restates those closes to 9 -- under the $10
+    // bound on the adjusted side and over it on the raw one. CLEAN splits nothing and clears both.
+    for offset in [-5, -4, -3] {
+        let session = as_of.plus_calendar_days(offset);
+        common::seed_bar_with_volume(&pool, "SPLIT", session, 36.0, 2_000_000).await;
+        common::seed_bar_with_volume(&pool, "CLEAN", session, 50.0, 2_000_000).await;
+    }
+
+    let splits = SplitTable::from_dataframe(
+        &polars::prelude::DataFrame::new(vec![
+            polars::prelude::Column::new("ticker".into(), vec!["SPLIT"]),
+            polars::prelude::Column::new(
+                "execution_date".into(),
+                vec![executed.date().format("%Y-%m-%d").to_string()],
+            ),
+            polars::prelude::Column::new("split_from".into(), vec![1.0f64]),
+            polars::prelude::Column::new("split_to".into(), vec![4.0f64]),
+        ])
+        .expect("the splits fixture must build"),
+    )
+    .expect("the splits table must index");
+
+    let floor =
+        fund::common::types::LiquidityFloor::new(10.0, 50_000_000.0).expect("a usable floor");
+    let screen = fund::common::types::Screen::new(
+        floor,
+        fund::common::types::ScreenWindow::Trailing(
+            std::num::NonZeroU32::new(30).expect("a positive window"),
+        ),
+    );
+
+    let tradable: std::collections::HashSet<Ticker> =
+        ["SPLIT", "CLEAN"].into_iter().map(ticker).collect();
+    let traded = universe::Universe::build(
+        &fund::common::alpaca::TradableAssets::from_sets(tradable, Default::default()),
+        &universe::load_liquidity(&pool, as_of, screen)
+            .await
+            .unwrap(),
+        floor,
+    );
+    let mut from_sql: Vec<String> = traded
+        .tickers()
+        .iter()
+        .map(|ticker| ticker.as_str().to_string())
+        .collect();
+    from_sql.sort();
+
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        400,
+        &splits,
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .unwrap();
+    let from_frame: Vec<String> = universe::filter_liquid_bars(frame, screen, as_of)
+        .unwrap()
+        .column("ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .into_no_null_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Both populations printed, so "they differ" cannot be satisfied by one side reading nothing.
+    assert_eq!(
+        from_sql,
+        vec!["CLEAN".to_string(), "SPLIT".to_string()],
+        "the raw minimum close is 36 and clears the bound"
+    );
+    assert_eq!(
+        from_frame,
+        vec!["CLEAN".to_string()],
+        "the adjusted minimum close is 9 and does not, so the split name is refused here alone"
     );
 }
 

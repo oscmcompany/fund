@@ -83,10 +83,9 @@ impl LiquidityRow {
 /// bound, per ticker, measured over the window and applied to the whole frame — an admitted name
 /// keeps the history its features need.
 ///
-/// `as_of` is the session the screen is being asked about, and a trailing window reaches back from
-/// it. A whole-frame window measures the frame as given: in-frame the caller has already bounded
-/// the history by choosing what to pass, where [`load_liquidity`] reads a table that holds every
-/// session and so has to cap itself.
+/// `as_of` is the session the screen is being asked about. A window defined relative to it is
+/// closed at both ends; a whole-frame window is the frame, which is why it reads no `timestamp` at
+/// all rather than being capped at an anchor it does not use.
 ///
 /// `bars` must carry `ticker`, `close_price` and `volume`, plus `timestamp` for a trailing window.
 pub fn filter_liquid_bars(
@@ -131,21 +130,29 @@ pub fn filter_liquid_bars(
         .collect()
 }
 
-/// The rows within `days` Eastern calendar days of `as_of`, inclusive at the edge.
+/// The rows within `days` Eastern calendar days of `as_of`, inclusive at the lower edge.
 ///
-/// Anchored on the caller's `as_of`, which is the anchor [`load_liquidity`] reads, so the two
-/// halves of one screen cover the same days. It previously anchored on the frame's own newest bar,
-/// which at pre-open is the *previous* session's and reached back a day further than the traded
-/// universe did.
+/// The same half-open interval [`load_liquidity`] reads, on both edges rather than just the one:
+/// anchored on the caller's `as_of` where it used to read the frame's newest bar, and closed above
+/// it where it used to run to the end of the frame. A bar after `as_of` is outside the window
+/// however the frame came to hold it, which is not something a `pub` function can leave to its
+/// callers to have arranged.
 fn trailing_window(bars: &DataFrame, days: i64, as_of: SessionDate) -> PolarsResult<DataFrame> {
     let start = as_of
         .plus_calendar_days(-days)
         .midnight()
         .timestamp_millis();
+    // A daily bar is stamped at the 16:00 Eastern close, so the next midnight admits `as_of`'s own
+    // bar and no more.
+    let end = as_of.plus_calendar_days(1).midnight().timestamp_millis();
 
     bars.clone()
         .lazy()
-        .filter(col("timestamp").gt_eq(lit(start)))
+        .filter(
+            col("timestamp")
+                .gt_eq(lit(start))
+                .and(col("timestamp").lt(lit(end))),
+        )
         .collect()
 }
 
@@ -240,12 +247,11 @@ impl Universe {
 
 /// Reads per-ticker minimum close and average dollar volume over `screen`'s window, ending `as_of`.
 ///
-/// The SQL twin of [`filter_liquid_bars`], reading daily bars because the thresholds are calibrated
-/// on daily dynamics and a per-bar notional would not clear a per-day bound. Both twins now take
-/// `as_of` as the anchor, so one screen means one stretch of days whichever side reads it.
-///
-/// `as_of` bounds the query at both ends, so a historical call reads history and not the rows
-/// ingested since.
+/// The SQL twin of [`filter_liquid_bars`], over daily bars because the thresholds are calibrated on
+/// daily dynamics, and bounded by `as_of` at both ends so a historical call reads history rather
+/// than the rows ingested since. It reads the table raw where the frame twin is handed
+/// split-adjusted prices, so the two agree on the window and not on what a name's minimum close was
+/// across a split — `test_the_two_liquidity_screens_part_company_across_a_split` holds the size.
 pub async fn load_liquidity(
     pool: &PgPool,
     as_of: SessionDate,
@@ -750,6 +756,45 @@ mod tests {
         assert!(
             from_today.is_empty(),
             "anchored on today, the edge session is one day outside it and the name is refused"
+        );
+    }
+
+    /// A bar after `as_of` is outside the trailing window, matching `load_liquidity`'s upper bound.
+    ///
+    /// The frame's extent used to be the window's upper edge, which was a promise about callers
+    /// rather than a property of the function. A historical screen over a frame that runs past its
+    /// anchor would have admitted a name on liquidity it did not yet have.
+    #[test]
+    fn test_a_bar_after_the_anchor_is_outside_the_trailing_window() {
+        let as_of = session(2026, 6, 30);
+        // All of the notional arrives the session after the one being screened for.
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["LATER", "LATER"]),
+            Column::new(
+                "timestamp".into(),
+                vec![
+                    as_of.midnight().timestamp_millis(),
+                    as_of.plus_calendar_days(1).midnight().timestamp_millis(),
+                ],
+            ),
+            Column::new("close_price".into(), vec![50.0, 50.0]),
+            Column::new("volume".into(), vec![0i64, 4_000_000]),
+        ])
+        .expect("the fixture frame must build");
+
+        assert!(
+            filter_liquid_bars(frame.clone(), trailing(30), as_of)
+                .unwrap()
+                .is_empty(),
+            "liquidity arriving after the anchor must not admit the name"
+        );
+        // The control: asked about the later session, the same bar is inside the window and does
+        // admit it, so the bound is excluding the future rather than the name.
+        assert_eq!(
+            filter_liquid_bars(frame, trailing(30), as_of.plus_calendar_days(1))
+                .unwrap()
+                .height(),
+            2
         );
     }
 
