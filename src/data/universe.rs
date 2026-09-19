@@ -2,7 +2,7 @@
 //!
 //! Computed once at pre-open and held for the Eastern date, because it cannot change intraday.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
@@ -96,6 +96,21 @@ pub fn filter_liquid_bars(
     let measured = match screen.window() {
         ScreenWindow::WholeFrame => bars.clone(),
         ScreenWindow::Trailing(days) => trailing_window(&bars, i64::from(days.get()), as_of)?,
+        // Answers a different question and so returns before the per-ticker aggregate below: this
+        // one admits `(ticker, session)` pairs, and there is no single set of names to reduce to.
+        ScreenWindow::PerSession(days) => {
+            let admitted =
+                per_session_admission(&bars, screen.floor(), i64::from(days.get()), as_of)?;
+            return bars
+                .lazy()
+                .join(
+                    admitted.lazy(),
+                    [col("ticker"), col("timestamp")],
+                    [col("ticker"), col("timestamp")],
+                    JoinArgs::new(JoinType::Semi),
+                )
+                .collect();
+        }
     };
     let floor = screen.floor();
 
@@ -142,9 +157,7 @@ fn trailing_window(bars: &DataFrame, days: i64, as_of: SessionDate) -> PolarsRes
         .plus_calendar_days(-days)
         .midnight()
         .timestamp_millis();
-    // A daily bar is stamped at the 16:00 Eastern close, so the next midnight admits `as_of`'s own
-    // bar and no more.
-    let end = as_of.plus_calendar_days(1).midnight().timestamp_millis();
+    let end = window_closes_at(as_of);
 
     bars.clone()
         .lazy()
@@ -154,6 +167,176 @@ fn trailing_window(bars: &DataFrame, days: i64, as_of: SessionDate) -> PolarsRes
                 .and(col("timestamp").lt(lit(end))),
         )
         .collect()
+}
+
+/// The exclusive instant a window anchored on `as_of` closes at.
+///
+/// One expression for the three windows that have an upper edge, because a daily bar is stamped at
+/// the 16:00 Eastern close and the next midnight is what admits `as_of`'s own bar and no more.
+fn window_closes_at(as_of: SessionDate) -> i64 {
+    as_of.plus_calendar_days(1).midnight().timestamp_millis()
+}
+
+/// The `(ticker, timestamp)` pairs that clear `floor` over the `days` ending at their own session.
+///
+/// One sliding window per ticker rather than one aggregate per ticker: the answer for a session is
+/// what the live screen would have said that morning, so a name can be admitted in March and
+/// refused in April on the same bars.
+///
+/// The window bound is computed once per distinct session and looked up, because Eastern calendar
+/// arithmetic per row over two years of bars is the same thousand answers half a million times.
+/// The two aggregates are taken over different row sets, exactly as the other three paths take them:
+/// a null volume drops out of the average and still binds the minimum.
+fn per_session_admission(
+    bars: &DataFrame,
+    floor: LiquidityFloor,
+    days: i64,
+    as_of: SessionDate,
+) -> PolarsResult<DataFrame> {
+    // Capped like every other window anchored on `as_of`, before anything is measured: a frame
+    // running past it would otherwise screen sessions the caller did not ask about.
+    let sorted = bars
+        .clone()
+        .lazy()
+        .filter(col("timestamp").lt(lit(window_closes_at(as_of))))
+        .collect()?
+        .sort(
+            ["ticker", "timestamp"],
+            SortMultipleOptions::default().with_maintain_order(true),
+        )?;
+    let tickers = sorted.column("ticker")?.str()?;
+    let timestamps = sorted.column("timestamp")?.i64()?;
+    let close_prices = sorted.column("close_price")?.cast(&DataType::Float64)?;
+    let close_prices = close_prices.f64()?;
+    let volumes = sorted.column("volume")?.cast(&DataType::Float64)?;
+    let volumes = volumes.f64()?;
+
+    let window_starts = window_starts_by_session(timestamps, days)?;
+
+    let mut admitted_tickers: Vec<&str> = Vec::new();
+    let mut admitted_timestamps: Vec<i64> = Vec::new();
+    let mut window = LiquidityWindow::default();
+    let mut start = 0usize;
+    for row in 0..sorted.height() {
+        let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
+            continue;
+        };
+        if row == 0 || tickers.get(row - 1) != Some(ticker) {
+            start = row;
+            window.clear();
+        }
+        window.push(row, close_prices.get(row), volumes.get(row));
+
+        let opens_at = window_starts[&timestamp];
+        while start < row && timestamps.get(start).is_some_and(|value| value < opens_at) {
+            window.pop(start, close_prices.get(start), volumes.get(start));
+            start += 1;
+        }
+
+        // No usable bar in the window is unmeasurable, not a refusal at zero: the aggregate has no
+        // value to compare, and `f64::INFINITY` would clear any price bound if it reached one.
+        let (Some(minimum_close), Some(average_notional)) =
+            (window.minimum_close(), window.average_notional())
+        else {
+            continue;
+        };
+        if floor.admits(minimum_close, average_notional).is_ok() {
+            admitted_tickers.push(ticker);
+            admitted_timestamps.push(timestamp);
+        }
+    }
+
+    DataFrame::new(vec![
+        Column::new("ticker".into(), admitted_tickers),
+        Column::new("timestamp".into(), admitted_timestamps),
+    ])
+}
+
+/// One ticker's trailing window, kept as aggregates rather than re-read per session.
+///
+/// The minimum rides a monotonic deque of `(row, close)` with non-decreasing closes, so the front is
+/// always the window's minimum and every row is pushed and popped at most once. The notional is a
+/// running sum; it drifts by roughly 1e-7 of its own magnitude over a full archive, the same order
+/// Polars' `mean()` carries on the three paths this one has to agree with.
+#[derive(Default)]
+struct LiquidityWindow {
+    closes: std::collections::VecDeque<(usize, f64)>,
+    total_notional: f64,
+    notional_observations: usize,
+}
+
+impl LiquidityWindow {
+    fn clear(&mut self) {
+        self.closes.clear();
+        self.total_notional = 0.0;
+        self.notional_observations = 0;
+    }
+
+    fn push(&mut self, row: usize, close: Option<f64>, volume: Option<f64>) {
+        let Some(close) = close else {
+            return;
+        };
+        // Anything at or above the incoming close can never be the minimum again: it leaves the
+        // window no later than this row does, and is no smaller while it stays.
+        while self.closes.back().is_some_and(|(_, back)| *back >= close) {
+            self.closes.pop_back();
+        }
+        self.closes.push_back((row, close));
+        if let Some(volume) = volume {
+            self.total_notional += close * volume;
+            self.notional_observations += 1;
+        }
+    }
+
+    fn pop(&mut self, row: usize, close: Option<f64>, volume: Option<f64>) {
+        let Some(close) = close else {
+            return;
+        };
+        // Only if it is still there: a row dropped by `push` for being no smaller left long ago.
+        if self.closes.front().is_some_and(|(index, _)| *index == row) {
+            self.closes.pop_front();
+        }
+        if volume.is_some() {
+            self.total_notional -= close * volume.unwrap_or_default();
+            self.notional_observations -= 1;
+        }
+    }
+
+    /// `None` when the window holds no close at all, which is unmeasurable rather than a refusal.
+    fn minimum_close(&self) -> Option<f64> {
+        self.closes.front().map(|(_, close)| *close)
+    }
+
+    /// `None` when no bar in the window carried both a close and a volume.
+    fn average_notional(&self) -> Option<f64> {
+        (self.notional_observations > 0)
+            .then(|| self.total_notional / self.notional_observations as f64)
+    }
+}
+
+/// Each distinct session's window opening instant, in milliseconds.
+///
+/// Computed per session rather than per row, and through [`SessionDate`] rather than a fixed
+/// offset, so the window opens at the same Eastern midnight the other two screens use.
+fn window_starts_by_session(
+    timestamps: &Int64Chunked,
+    days: i64,
+) -> PolarsResult<HashMap<i64, i64>> {
+    let mut starts = HashMap::new();
+    for timestamp in timestamps.into_no_null_iter() {
+        if starts.contains_key(&timestamp) {
+            continue;
+        }
+        let instant = DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
+            PolarsError::ComputeError(format!("bar timestamp {timestamp} is not an instant").into())
+        })?;
+        let opens_at = SessionDate::at(instant)
+            .plus_calendar_days(-days)
+            .midnight()
+            .timestamp_millis();
+        starts.insert(timestamp, opens_at);
+    }
+    Ok(starts)
 }
 
 /// The symbols eligible to trade today, and which of them can be shorted.
@@ -258,7 +441,12 @@ pub async fn load_liquidity(
     screen: Screen,
 ) -> Result<Vec<LiquidityRow>, sqlx::Error> {
     let start = match screen.window() {
-        ScreenWindow::Trailing(days) => as_of.plus_calendar_days(-i64::from(days.get())).midnight(),
+        // A per-session window asked about one session *is* the trailing one: the anchor it
+        // re-anchors on is `as_of`. The live path only ever asks about today, which is why the
+        // generalisation costs this reader nothing.
+        ScreenWindow::Trailing(days) | ScreenWindow::PerSession(days) => {
+            as_of.plus_calendar_days(-i64::from(days.get())).midnight()
+        }
         // The epoch rather than an `Option<DateTime>` threaded through the query: no equity bar
         // predates it, so an unbounded lower edge and this one select the same rows.
         ScreenWindow::WholeFrame => DateTime::<Utc>::from_timestamp_nanos(0),
@@ -795,6 +983,215 @@ mod tests {
                 .unwrap()
                 .height(),
             2
+        );
+    }
+
+    /// The same floor over `PerSession`, for the per-session cases.
+    fn per_session(days: u32) -> Screen {
+        Screen::new(
+            floor(),
+            ScreenWindow::PerSession(NonZeroU32::new(days).expect("a positive window")),
+        )
+    }
+
+    /// Every `(ticker, session)` pair a screened frame holds, sorted.
+    fn surviving_pairs(frame: &DataFrame) -> Vec<(String, i64)> {
+        let tickers = frame.column("ticker").unwrap();
+        let tickers = tickers.str().unwrap();
+        let timestamps = frame.column("timestamp").unwrap();
+        let timestamps = timestamps.i64().unwrap();
+        let mut pairs: Vec<(String, i64)> = tickers
+            .into_no_null_iter()
+            .zip(timestamps.into_no_null_iter())
+            .map(|(ticker, timestamp)| (ticker.to_string(), timestamp))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// A frame of one ticker's closes and volumes over consecutive sessions ending `last`.
+    fn series(ticker: &str, last: SessionDate, rows: &[(f64, i64)]) -> DataFrame {
+        let offsets: Vec<i64> = (0..rows.len() as i64).rev().map(|back| -back).collect();
+        DataFrame::new(vec![
+            Column::new("ticker".into(), vec![ticker; rows.len()]),
+            Column::new(
+                "timestamp".into(),
+                offsets
+                    .iter()
+                    .map(|offset| {
+                        last.plus_calendar_days(*offset)
+                            .midnight()
+                            .timestamp_millis()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "close_price".into(),
+                rows.iter().map(|(close, _)| *close).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "volume".into(),
+                rows.iter().map(|(_, volume)| *volume).collect::<Vec<_>>(),
+            ),
+        ])
+        .expect("the fixture frame must build")
+    }
+
+    /// A per-session screen admits a name for some sessions and refuses it for others.
+    ///
+    /// The whole point of the variant, and the case where the two single-anchor windows give
+    /// *opposite* answers on the same bars: whole-frame averages the quiet sessions away and admits
+    /// the name throughout, trailing-at-the-end sees only the quiet ones and refuses it throughout.
+    /// Both are wrong about most of the window.
+    #[test]
+    fn test_a_per_session_screen_admits_a_name_for_part_of_its_history() {
+        let last = session(2026, 6, 30);
+        // Three liquid sessions at 100M notional, then two dead ones. Over the whole frame that
+        // averages 60M and clears; over the trailing two days it averages 33M and does not.
+        let frame = series(
+            "FADES",
+            last,
+            &[
+                (50.0, 2_000_000),
+                (50.0, 2_000_000),
+                (50.0, 2_000_000),
+                (50.0, 0),
+                (50.0, 0),
+            ],
+        );
+
+        let admitted =
+            surviving_pairs(&filter_liquid_bars(frame.clone(), per_session(2), last).unwrap());
+
+        assert_eq!(
+            admitted.len(),
+            4,
+            "the last session's trailing two days average 33M and are refused; the rest clear"
+        );
+        assert_eq!(
+            filter_liquid_bars(frame.clone(), screen(), last)
+                .unwrap()
+                .height(),
+            5,
+            "a whole-frame screen averages 60M and admits every session, including the dead ones"
+        );
+        assert_eq!(
+            filter_liquid_bars(frame, trailing(2), last)
+                .unwrap()
+                .height(),
+            0,
+            "a trailing screen at the end sees only the dead sessions and refuses every one"
+        );
+    }
+
+    /// At a single session, the per-session screen and the trailing screen are the same screen.
+    ///
+    /// The generalisation has to collapse: `load_liquidity` reads them through one arm, and that is
+    /// only sound if a one-session frame cannot tell them apart.
+    #[test]
+    fn test_a_per_session_screen_is_the_trailing_screen_over_one_session() {
+        let last = session(2026, 6, 30);
+        for rows in [
+            vec![(50.0, 2_000_000)],
+            vec![(50.0, 1)],
+            vec![(9.99, 2_000_000)],
+        ] {
+            let frame = series("SOLO", last, &rows);
+            assert_eq!(
+                surviving_pairs(&filter_liquid_bars(frame.clone(), per_session(30), last).unwrap()),
+                surviving_pairs(&filter_liquid_bars(frame, trailing(30), last).unwrap()),
+                "the two windows must agree on a frame holding one session"
+            );
+        }
+    }
+
+    /// A per-session window is anchored too, so a session after `as_of` is outside it.
+    ///
+    /// It is `Trailing` re-anchored, which means it inherits the upper bound and not only the
+    /// length. Without it a historical call screens and returns sessions the caller did not ask
+    /// about, where the trailing branch and `load_liquidity` both refuse them.
+    #[test]
+    fn test_a_per_session_screen_is_capped_at_the_anchor() {
+        let last = session(2026, 6, 30);
+        let as_of = last.plus_calendar_days(-1);
+        // Both sessions clear the floor on their own, so only the cap can exclude the later one.
+        let frame = series("AFTER", last, &[(50.0, 2_000_000), (50.0, 2_000_000)]);
+
+        let admitted = surviving_pairs(&filter_liquid_bars(frame, per_session(30), as_of).unwrap());
+        let expected = vec![("AFTER".to_string(), as_of.midnight().timestamp_millis())];
+
+        assert_eq!(
+            admitted, expected,
+            "the session after the anchor must not be screened or returned"
+        );
+    }
+
+    /// A close with no volume still binds the minimum, as it does on all three other paths.
+    ///
+    /// The two aggregates are taken over different row sets: `MIN(close_price)` reads every present
+    /// close and `MEAN(close * volume)` reads only the rows carrying both. Skipping the whole row
+    /// on a null volume would let a sub-floor close escape the price bound here alone.
+    #[test]
+    fn test_a_null_volume_drops_from_the_average_and_still_binds_the_minimum() {
+        let last = session(2026, 6, 30);
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["NULLV", "NULLV"]),
+            Column::new(
+                "timestamp".into(),
+                vec![
+                    last.plus_calendar_days(-1).midnight().timestamp_millis(),
+                    last.midnight().timestamp_millis(),
+                ],
+            ),
+            // The sub-floor close carries no volume, so only the minimum can refuse the name.
+            Column::new("close_price".into(), vec![Some(9.0), Some(50.0)]),
+            Column::new("volume".into(), vec![None, Some(4_000_000i64)]),
+        ])
+        .expect("the fixture frame must build");
+
+        let admitted = surviving_pairs(&filter_liquid_bars(frame, per_session(30), last).unwrap());
+
+        assert!(
+            admitted.is_empty(),
+            "a 9.00 close is below the 10.00 bound whether or not it traded"
+        );
+    }
+
+    /// A name that recovers is re-admitted, because the screen has no memory of the refusal.
+    ///
+    /// The property that makes this point-in-time rather than a one-way eviction, and the source of
+    /// the re-entry cost: `engineer_features` gives the first session back no return, because the
+    /// frame-wide session rank says it does not follow the row before it.
+    #[test]
+    fn test_a_per_session_screen_readmits_a_name_that_recovers() {
+        let last = session(2026, 6, 30);
+        // 60M notional when liquid, so a one-day window holding one dead session averages 30M and
+        // refuses -- the recovery therefore lags by a session, which is the trailing mean working.
+        let frame = series(
+            "RETRY",
+            last,
+            &[
+                (50.0, 1_200_000),
+                (50.0, 0),
+                (50.0, 0),
+                (50.0, 1_200_000),
+                (50.0, 1_200_000),
+            ],
+        );
+
+        let sessions: Vec<i64> =
+            surviving_pairs(&filter_liquid_bars(frame, per_session(1), last).unwrap())
+                .iter()
+                .map(|(_, session)| *session)
+                .collect();
+        let expected: Vec<i64> = [-4i64, 0]
+            .iter()
+            .map(|back| last.plus_calendar_days(*back).midnight().timestamp_millis())
+            .collect();
+
+        assert_eq!(
+            sessions, expected,
+            "out for the middle three sessions and back for the last, not evicted for good"
         );
     }
 
