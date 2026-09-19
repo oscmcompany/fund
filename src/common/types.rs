@@ -136,6 +136,23 @@ pub enum ScreenWindow {
     Trailing(NonZeroU32),
     /// Every session the frame holds, so a name that dipped once anywhere in it is refused.
     WholeFrame,
+    /// [`ScreenWindow::Trailing`] re-anchored on every session, admitting a name *per session*.
+    ///
+    /// The other two admit a set of names; this admits a set of `(name, session)` pairs, which is
+    /// what the live book actually does — it screens each morning and trades what clears that
+    /// morning. A name that goes quiet leaves and comes back, where a single anchor has to choose
+    /// between refusing its whole history and admitting it throughout.
+    PerSession(NonZeroU32),
+}
+
+impl ScreenWindow {
+    /// Whether this window admits a name for some sessions and not others.
+    ///
+    /// The distinction a caller has to respect: a per-ticker window leaves every admitted name's
+    /// history intact, and a per-session one punches holes in it.
+    pub const fn is_per_session(&self) -> bool {
+        matches!(self, ScreenWindow::PerSession(_))
+    }
 }
 
 impl std::fmt::Display for ScreenWindow {
@@ -143,6 +160,9 @@ impl std::fmt::Display for ScreenWindow {
         match self {
             ScreenWindow::Trailing(days) => write!(formatter, "trailing {days} days"),
             ScreenWindow::WholeFrame => write!(formatter, "the whole frame"),
+            ScreenWindow::PerSession(days) => {
+                write!(formatter, "trailing {days} days, re-anchored each session")
+            }
         }
     }
 }
