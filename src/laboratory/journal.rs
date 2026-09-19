@@ -246,6 +246,12 @@ pub struct FeatureTriaged {
     pub target_entropy_bits: Option<Distribution>,
     /// `excess_bits` as a share of that ceiling, which is the only figure comparable across targets.
     pub excess_share: Option<Distribution>,
+    /// Rows the feature was actually defined on.
+    ///
+    /// Not every column covers the panel: the quote and trade summaries are short of a handful of
+    /// names a session, and a ranking that folded that away would print the same number for a
+    /// feature measured on all of the panel and one measured on two thirds of it.
+    pub defined_rows: usize,
 }
 
 /// One frame prepared for an experiment to read.
@@ -457,6 +463,7 @@ mod tests {
                 crate::laboratory::residual::FactorSpecification::new(45, 0.25)
                     .expect("the fixture must be a usable specification"),
             ),
+            microstructure: crate::laboratory::dataset::Microstructure::Omitted,
         }
     }
 
@@ -488,6 +495,7 @@ mod tests {
         assert_ne!(forecast.experiment_type(), observation().experiment_type());
 
         let triaged = Observation::FeatureTriaged(FeatureTriaged {
+            defined_rows: 1_000,
             feature: "daily_return".to_string(),
             sessions: 499,
             bits: None,

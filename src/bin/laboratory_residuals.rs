@@ -233,6 +233,7 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         session,
         parameters.screen,
         parameters.specification,
+        dataset::Microstructure::Omitted,
     )
     .await?;
 

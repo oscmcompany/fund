@@ -283,6 +283,7 @@ mod tests {
                     boundaries_digest: 0xCD,
                     reference_digest: Some(0xEF),
                     factor_specification: None,
+                    microstructure: crate::laboratory::dataset::Microstructure::Omitted,
                 },
                 revision: None,
             }),

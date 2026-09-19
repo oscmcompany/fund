@@ -38,9 +38,27 @@ const CONTINUOUS_FEATURES: &[&str] = &[
     "volume",
     "volume_weighted_average_price",
     "daily_return",
+    // The microstructure columns, read for the first time by any study in this tree. They are the
+    // whole reason the quote and trade archives exist, and until this ranking runs there is no
+    // evidence either carries anything a daily bar does not already say.
+    "quoted_spread_basis_points_mean",
+    "quoted_spread_basis_points_median",
+    "quoted_spread_basis_points_ninetieth_percentile",
+    "quote_count",
+    "covered_seconds",
+    "signed_volume",
+    "trade_count",
+    "median_trade_size",
+    "ninetieth_percentile_trade_size",
 ];
 
 const CATEGORICAL_FEATURES: &[&str] = &["sector", "industry"];
+
+/// The frame restricted to the rows where `column` holds a value.
+fn defined_rows(frame: &DataFrame, column: &str) -> Result<DataFrame, PolarsError> {
+    let defined = frame.column(column)?.is_not_null();
+    frame.filter(&defined)
+}
 
 /// A feature with nothing in it, triaged alongside the real ones.
 ///
@@ -168,6 +186,7 @@ async fn run(
         parameters.lookback_days,
         session,
         dataset::RESEARCH_SCREEN,
+        dataset::Microstructure::Joined,
     )
     .await?;
     let fingerprint = dataset.fingerprint.clone();
@@ -201,6 +220,12 @@ async fn run(
     let mut triaged = Vec::new();
     for feature in CONTINUOUS_FEATURES.iter().chain([&CONTROL_FEATURE]) {
         let column = *feature;
+        // Ranked over the rows where it is defined, and the share it is not is reported rather than
+        // folded away: a feature measured on 70% of the panel is a different instrument from one
+        // measured on all of it, and the two print the same number. Dropping rows cannot smuggle a
+        // pair across a gap, because `pair_with_next_session` tests session adjacency itself.
+        let frame = defined_rows(&frame, column)?;
+        let defined = frame.height();
         let paired = information::pair_with_next_session(
             &frame,
             column,
@@ -216,7 +241,9 @@ async fn run(
                 ))
             },
         )?;
-        triaged.push(triage(column, &paired, parameters.seed));
+        let mut reading = triage(column, &paired, parameters.seed);
+        reading.defined_rows = defined;
+        triaged.push(reading);
     }
     for feature in CATEGORICAL_FEATURES {
         let column = *feature;
@@ -276,6 +303,8 @@ fn triage(feature: &str, paired: &Paired, seed: u64) -> laboratory::FeatureTriag
 
     laboratory::FeatureTriaged {
         feature: feature.to_string(),
+        // Overwritten by the caller, which is the only place that knows how many rows it kept.
+        defined_rows: 0,
         sessions: paired.len(),
         bits: metrics::summarize(measured.iter().map(|value| value.map(|value| value.bits))),
         null_bits: metrics::summarize(
@@ -394,6 +423,7 @@ mod tests {
     #[test]
     fn test_the_share_of_the_target_entropy_is_what_is_ranked_and_rendered() {
         let record = laboratory::FeatureTriaged {
+            defined_rows: 500,
             feature: "daily_return".to_string(),
             sessions: 499,
             bits: Some(distribution_of(3.1000)),

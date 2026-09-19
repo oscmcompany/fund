@@ -960,6 +960,7 @@ mod tests {
             boundaries_digest: 0,
             reference_digest: None,
             factor_specification: None,
+            microstructure: crate::laboratory::dataset::Microstructure::Omitted,
         }
     }
 

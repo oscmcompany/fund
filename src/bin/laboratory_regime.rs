@@ -140,6 +140,7 @@ async fn run(
         parameters.lookback_days,
         session,
         dataset::RESEARCH_SCREEN,
+        dataset::Microstructure::Omitted,
     )
     .await?;
     let fingerprint = dataset.fingerprint.clone();
