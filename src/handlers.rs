@@ -528,9 +528,15 @@ async fn run_inference(
     let consolidated = predict::consolidate_data(equity_bars, equity_details)
         .map_err(|error| at("consolidate")(error.to_string()))?;
     // Read off the cache rather than declared again here: the predicted set and the traded set are
-    // then one value, where two declarations would be two that happen to agree today.
-    let filtered = predict::filter_equity_bars(consolidated, state.universe_cache.screen())
-        .map_err(|error| at("filter_bars")(error.to_string()))?;
+    // then one value, where two declarations would be two that happen to agree today. The anchor is
+    // the session the cache itself keys on, so the two windows cover the same days and not merely
+    // the same number of them.
+    let filtered = predict::filter_equity_bars(
+        consolidated,
+        state.universe_cache.screen(),
+        SessionDate::at(now),
+    )
+    .map_err(|error| at("filter_bars")(error.to_string()))?;
     let trained = predict::filter_to_trained_tickers(filtered, model_state)
         .map_err(|error| at("filter_tickers")(error.to_string()))?;
 
