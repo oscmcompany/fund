@@ -1,0 +1,20 @@
+[Unit]
+# Runs on every boot, because the nightly schedule starts the instance and stopping again is the
+# run's own last step. Touch /etc/fund-archive-worker.inhibit to start the box without folding.
+Description=Fold whatever the archive is missing, then stop this instance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fund
+# ExecStart points into the checkout rather than carrying the logic, so `git pull` updates what the
+# worker does and this file only changes when the entry point itself moves.
+ExecStart=/home/ubuntu/fund/tools/run-archive-worker
+StandardOutput=append:/var/log/fund/archive-worker.log
+StandardError=append:/var/log/fund/archive-worker.log
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

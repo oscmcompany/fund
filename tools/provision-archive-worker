@@ -22,8 +22,7 @@ ARCHIVE_PREFIX="data/*"
 # day. tests/test_schedules.rs pins this literal.
 SCHEDULE_EXPRESSION="cron(0 7 * * ? *)"
 
-# No nightly fold verb exists yet, so the trigger is recorded but off.
-SCHEDULE_STATE="DISABLED"
+SCHEDULE_STATE="ENABLED"
 
 STALL_PERIOD_SECONDS=300
 STALL_EVALUATION_PERIODS=12
@@ -247,6 +246,9 @@ apt-get install -y git curl unzip build-essential pkg-config libssl-dev cmake
 curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip
 unzip -q /tmp/awscli.zip -d /tmp
 /tmp/aws/install --update
+printf '%s' "${PROFILE}" > /etc/fund-profile
+mkdir -p /var/log/fund
+chown ubuntu:ubuntu /var/log/fund
 sudo -u ubuntu -H bash -c '
   set -euxo pipefail
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -257,6 +259,10 @@ sudo -u ubuntu -H bash -c '
   cargo build --release --bin seed
   git rev-parse HEAD > target/release/.seed-built-from
 '
+install -m 0644 /home/ubuntu/fund/tools/fund-archive-worker.service \
+  /etc/systemd/system/fund-archive-worker.service
+systemctl daemon-reload
+systemctl enable fund-archive-worker.service
 CLOUDINIT
 )"
 

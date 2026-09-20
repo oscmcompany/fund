@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# run-archive-worker -- What the worker does when the nightly schedule wakes it.
+#
+# Sync, fold whatever the recent sessions are missing, stop. The schedule fires every night
+# including weekends, because `seed` asks the calendar and the set difference decides what is owed.
+#
+# Stopping is this script's job. The stall alarm is the backstop for a hang, not the normal way the
+# box turns off -- a finished run once sat burning an hour waiting for an idle alarm.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REGION="${AWS_REGION:-us-east-1}"
+PROFILE_FILE=/etc/fund-profile
+INHIBIT_FILE=/etc/fund-archive-worker.inhibit
+
+log() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+instance_id() {
+  local token
+  token="$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)"
+  curl -sf -H "X-aws-ec2-metadata-token: $token" \
+    "http://169.254.169.254/latest/meta-data/instance-id" || true
+}
+
+stop_self() {
+  local status=$?
+  local instance
+  instance="$(instance_id)"
+  if [[ -z "$instance" ]]; then
+    log "ERROR: could not read instance id; leaving the box up for the stall alarm"
+    exit "$status"
+  fi
+  log "Stopping $instance (exit $status)"
+  aws ec2 stop-instances --region "$REGION" --instance-ids "$instance" >/dev/null
+  exit "$status"
+}
+
+# An operator debugging the box starts it by hand, and a boot service that folded and then stopped
+# underneath them would make that impossible.
+if [[ -e "$INHIBIT_FILE" ]]; then
+  log "$INHIBIT_FILE present; not folding and not stopping"
+  exit 0
+fi
+
+trap stop_self EXIT
+
+if [[ ! -r "$PROFILE_FILE" ]]; then
+  log "ERROR: $PROFILE_FILE is missing; it names the profile whose keys this box may read"
+  exit 1
+fi
+FUND_PROFILE="$(cat "$PROFILE_FILE")"
+export FUND_PROFILE
+
+cd "$REPO_ROOT"
+
+log "Syncing"
+if ! tools/sync-archive-worker; then
+  log "ERROR: sync failed; not folding tonight"
+  exit 1
+fi
+
+log "Folding as $FUND_PROFILE"
+tools/run-backfill archive-nightly "$@"
+log "Fold complete"
