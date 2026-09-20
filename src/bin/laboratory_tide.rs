@@ -369,6 +369,7 @@ async fn run(parameters: &Parameters) -> Result<Report, Box<dyn std::error::Erro
         parameters.lookback_days,
         session,
         dataset::RESEARCH_SCREEN,
+        dataset::Microstructure::Omitted,
     )
     .await?;
     if returns.fingerprint != fingerprint {

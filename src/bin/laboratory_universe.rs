@@ -73,6 +73,92 @@ struct Admitted {
     /// Carried beside the name count because the two come apart exactly where this pull request
     /// does: a per-session screen can admit every name and still refuse half the panel.
     rows: usize,
+    /// What the admitted set pays to cross, read from the quote archive rather than assumed.
+    cost: Cost,
+}
+
+/// The quoted spread over one screen's admitted rows.
+///
+/// Screened first and averaged second, which is the whole point: a subset's cost read off the whole
+/// market's distribution is the wrong number, and the whole-market median is known contaminated by
+/// thousands of names nothing would ever trade.
+struct Cost {
+    /// Rows carrying a spread at all. Printed because a median over 12% of the panel is a different
+    /// statistic from one over 98%, and the two render identically.
+    measured: usize,
+    median: Option<f64>,
+    /// Equal-weighted, which is what every basket in the tree actually pays.
+    ///
+    /// Beside the dollar-weighted figure because the two answer different books and the gap between
+    /// them is large: dollar volume concentrates in the tight names, so weighting by it prices a
+    /// book nobody here trades.
+    mean: Option<f64>,
+    /// Weighted by each row's dollar volume, which is what a capitalisation-weighted basket pays.
+    dollar_weighted_mean: Option<f64>,
+    tenth_percentile: Option<f64>,
+    ninetieth_percentile: Option<f64>,
+}
+
+/// Reads the spread distribution over whatever rows survived a screen.
+fn cost_of(screened: &DataFrame) -> PolarsResult<Cost> {
+    let spreads = screened
+        .column("quoted_spread_basis_points_mean")?
+        .f64()?
+        .clone();
+    let closes = screened.column("close_price")?.cast(&DataType::Float64)?;
+    let volumes = screened.column("volume")?.cast(&DataType::Float64)?;
+    let closes = closes.f64()?;
+    let volumes = volumes.f64()?;
+
+    let mut observed: Vec<f64> = Vec::new();
+    let mut weighted_total = 0.0;
+    let mut weight_total = 0.0;
+    for row in 0..screened.height() {
+        let Some(spread) = spreads.get(row).filter(|value| value.is_finite()) else {
+            continue;
+        };
+        observed.push(spread);
+        // Dollar volume from the bar rather than the trade summary, so the weight exists on every
+        // row the panel holds and the two archives cannot disagree about it.
+        if let (Some(close), Some(volume)) = (closes.get(row), volumes.get(row)) {
+            let notional = close * volume;
+            if notional.is_finite() && notional > 0.0 {
+                weighted_total += spread * notional;
+                weight_total += notional;
+            }
+        }
+    }
+    observed.sort_by(f64::total_cmp);
+
+    let mean = (!observed.is_empty()).then(|| observed.iter().sum::<f64>() / observed.len() as f64);
+    Ok(Cost {
+        measured: observed.len(),
+        median: percentile(&observed, 0.5),
+        mean,
+        dollar_weighted_mean: (weight_total > 0.0).then(|| weighted_total / weight_total),
+        tenth_percentile: percentile(&observed, 0.1),
+        ninetieth_percentile: percentile(&observed, 0.9),
+    })
+}
+
+/// A reading or the reason there is none, never a zero standing in for one.
+fn basis_points(value: Option<f64>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| format!("{value:.2}"))
+}
+
+/// The `fraction` quantile of a sorted slice, by nearest rank.
+///
+/// `ceil(n * fraction)` is the nearest-rank definition and the previous `round((n - 1) * fraction)`
+/// was not: over `1..=10` it answered 2 for the tenth percentile where nearest rank answers 1, and
+/// it took the upper middle of an even-sized median rather than the lower.
+fn percentile(sorted: &[f64], fraction: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = (sorted.len() as f64 * fraction).ceil() as usize;
+    sorted
+        .get(rank.saturating_sub(1).min(sorted.len() - 1))
+        .copied()
 }
 
 /// What a per-session screen costs beyond the names it refuses.
@@ -145,8 +231,14 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         "Measuring what each declared screen admits"
     );
 
-    let window =
-        dataset::unscreened_window(&s3_client, &bucket, parameters.lookback_days, session).await?;
+    let window = dataset::unscreened_window(
+        &s3_client,
+        &bucket,
+        parameters.lookback_days,
+        session,
+        dataset::Microstructure::Joined,
+    )
+    .await?;
     let population = distinct_tickers(&window.bars)?;
     let last_session = window
         .last_session
@@ -204,12 +296,14 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         if screen.window().is_per_session() {
             churn = Some(churn_of(&window.bars, &screened)?);
         }
+        let cost = cost_of(&screened)?;
         measured.push(Admitted {
             name,
             screen,
             anchor,
             tickers,
             rows: screened.height(),
+            cost,
         });
     }
 
@@ -316,6 +410,32 @@ fn render(
             entry.anchor
         ));
     }
+
+    // The point of reading the quote archive at all: every study in the tree costs turnover at one
+    // market-wide literal, and this is what the set it would actually trade pays instead.
+    out.push_str(&format!(
+        "\nquoted spread in basis points, over the rows each screen admits\n\
+         {:<20} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}\n",
+        "screen", "measured", "p10", "median", "p90", "mean", "$-weighted"
+    ));
+    for entry in measured {
+        out.push_str(&format!(
+            "{:<20} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}\n",
+            entry.name,
+            // Two decimals, because a hundredth of a percent of this panel is sixty rows and
+            // `{:.0}%` rendered 99.97% as a clean 100 -- which is how a coverage gap became a
+            // claim of complete coverage in the body of the pull request this fixes.
+            format!(
+                "{:.2}%",
+                100.0 * entry.cost.measured as f64 / entry.rows.max(1) as f64
+            ),
+            basis_points(entry.cost.tenth_percentile),
+            basis_points(entry.cost.median),
+            basis_points(entry.cost.ninetieth_percentile),
+            basis_points(entry.cost.mean),
+            basis_points(entry.cost.dollar_weighted_mean),
+        ));
+    }
     if let Some(churn) = churn {
         out.push_str(&format!(
             "\nper-session churn: {} names ever admitted, {} of them without a break\n\
@@ -362,6 +482,24 @@ mod tests {
         // Literals rather than the constants, so a change to either has to be made deliberately.
         assert_eq!(parameters.lookback_days, 730);
         assert_eq!(parameters.trailing_days, 30);
+    }
+
+    /// Nearest rank, on a slice where the two definitions disagree.
+    ///
+    /// Over `1..=10` nearest rank answers 1 for the tenth percentile; the interpolate-and-round
+    /// formula this replaced answered 2, and took the upper middle of an even-sized median. Pinned
+    /// to the values rather than recomputed, so a change to the rule has to be made deliberately.
+    #[test]
+    fn test_the_percentile_is_the_nearest_rank_its_name_claims() {
+        let ten: Vec<f64> = (1..=10).map(f64::from).collect();
+
+        assert_eq!(percentile(&ten, 0.1), Some(1.0));
+        assert_eq!(percentile(&ten, 0.5), Some(5.0));
+        assert_eq!(percentile(&ten, 0.9), Some(9.0));
+        // The edges, where a rank can fall outside the slice if it is not clamped.
+        assert_eq!(percentile(&ten, 0.0), Some(1.0));
+        assert_eq!(percentile(&ten, 1.0), Some(10.0));
+        assert_eq!(percentile(&[], 0.5), None);
     }
 
     /// The sweep is calendar days and says so, because the alternative claims tradability.
@@ -419,6 +557,14 @@ mod tests {
                 anchor,
                 tickers: names(&["AAA", "BBB"]),
                 rows: 4,
+                cost: Cost {
+                    measured: 4,
+                    median: Some(2.5),
+                    mean: Some(3.0),
+                    dollar_weighted_mean: Some(1.75),
+                    tenth_percentile: Some(0.5),
+                    ninetieth_percentile: Some(9.0),
+                },
             },
             Admitted {
                 name: "narrow".to_string(),
@@ -426,6 +572,14 @@ mod tests {
                 anchor,
                 tickers: names(&["BBB", "CCC"]),
                 rows: 4,
+                cost: Cost {
+                    measured: 2,
+                    median: None,
+                    mean: None,
+                    dollar_weighted_mean: None,
+                    tenth_percentile: None,
+                    ninetieth_percentile: None,
+                },
             },
         ];
 
@@ -440,10 +594,32 @@ mod tests {
             report.contains("wide                 narrow                       1         1"),
             "{report}"
         );
+        // Counted in the difference block itself rather than by mentions of a name, which the cost
+        // table would otherwise inflate: one pair, one row, both directions on it.
+        let differences = report
+            .split("but not in")
+            .nth(1)
+            .expect("the report must carry a difference block")
+            .lines()
+            // The header's own tail is the first line after the split point.
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(differences, 1, "one pair must produce one row\n{report}");
+
+        // An unmeasured cost reads as `none`, never as a zero that would price a free round trip,
+        // and coverage carries decimals so a gap cannot round away. Asserted on the row's fields
+        // rather than its spacing, which is a column width nobody should have to count.
+        let coverage_row = report
+            .lines()
+            .find(|line| line.starts_with("narrow") && line.contains('%'))
+            .expect("the cost table must carry a row per screen");
+        let fields: Vec<&str> = coverage_row.split_whitespace().collect();
+        assert_eq!(fields[1], "50.00%", "{report}");
         assert_eq!(
-            report.matches("narrow").count(),
-            2,
-            "the pair must appear once as a row and once as a screen, never twice as a row\n{report}"
+            &fields[2..],
+            ["none", "none", "none", "none", "none"],
+            "an unmeasured reading must name itself, never read as zero\n{report}"
         );
     }
 }

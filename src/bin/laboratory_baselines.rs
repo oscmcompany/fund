@@ -199,6 +199,7 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
         parameters.lookback_days,
         session,
         dataset::RESEARCH_SCREEN,
+        dataset::Microstructure::Omitted,
     )
     .await?;
     let fingerprint = dataset.fingerprint;
@@ -508,6 +509,9 @@ mod tests {
             boundaries_digest: 0,
             reference_digest: None,
             factor_specification: None,
+            microstructure: dataset::Microstructure::Omitted,
+            quote_summary_digest: None,
+            trade_summary_digest: None,
         }
     }
 

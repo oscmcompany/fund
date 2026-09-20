@@ -135,6 +135,7 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
         parameters.lookback_days + 150,
         parameters.session,
         dataset::RESEARCH_SCREEN,
+        dataset::Microstructure::Omitted,
     )
     .await?;
     let closes = Closes::from_frame(&daily.returns)?;

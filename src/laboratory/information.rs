@@ -277,6 +277,7 @@ pub enum Outcome {
 /// is binned.
 pub fn pair_with_next_session(
     frame: &DataFrame,
+    calendar: &DataFrame,
     feature: &str,
     outcome: Outcome,
     read: impl Fn(&DataFrame) -> Result<Feature, TideError>,
@@ -297,7 +298,10 @@ pub fn pair_with_next_session(
         }
     }
 
-    let ranks = session_ranks(&sorted)?;
+    // Ranked against `calendar` rather than `sorted`, because a caller that drops a feature's
+    // undefined rows can empty a whole session out of `frame` -- and two rows either side of a
+    // session that is missing only from this feature are not adjacent sessions.
+    let ranks = session_ranks(calendar)?;
     let tickers: Vec<&str> = sorted
         .column("ticker")?
         .str()?
@@ -557,6 +561,72 @@ mod tests {
 
     /// Two names over four sessions, with the third session missing for BBB so its pair would span
     /// a gap. Feature and target are distinct columns so a pairing off by one is visible.
+    /// A session no row survives in the filtered frame is still a gap, not an adjacency.
+    ///
+    /// The caller drops a feature's undefined rows before pairing, so a session where the feature
+    /// is null for every name vanishes from the frame. Ranking on that frame would make the rows
+    /// either side consecutive and pair a value with a session two on, which is the whole error the
+    /// gap check exists to prevent.
+    #[test]
+    fn test_a_session_missing_only_from_the_filtered_frame_is_still_a_gap() {
+        let calendar = gapped_frame();
+        // Session two dropped for every name, as a wholly undefined feature would leave it.
+        let filtered = calendar
+            .clone()
+            .lazy()
+            .filter(col("timestamp").neq(lit(2 * DAY)))
+            .collect()
+            .expect("the fixture must filter");
+
+        let against_the_panel = pair_with_next_session(
+            &filtered,
+            &calendar,
+            "close_price",
+            Outcome::Signed,
+            |frame| {
+                Ok(Feature::Continuous(
+                    frame
+                        .column("close_price")?
+                        .f64()?
+                        .into_no_null_iter()
+                        .collect(),
+                ))
+            },
+        )
+        .expect("the pairing must run");
+        let against_itself = pair_with_next_session(
+            &filtered,
+            &filtered,
+            "close_price",
+            Outcome::Signed,
+            |frame| {
+                Ok(Feature::Continuous(
+                    frame
+                        .column("close_price")?
+                        .f64()?
+                        .into_no_null_iter()
+                        .collect(),
+                ))
+            },
+        )
+        .expect("the pairing must run");
+
+        let paired_against_the_panel: usize = against_the_panel
+            .values()
+            .map(|(features, _)| features.len())
+            .sum();
+        let paired_against_itself: usize = against_itself
+            .values()
+            .map(|(features, _)| features.len())
+            .sum();
+
+        assert!(
+            paired_against_itself > paired_against_the_panel,
+            "ranking on the filtered frame must manufacture pairs the panel refuses: \
+             {paired_against_itself} against {paired_against_the_panel}"
+        );
+    }
+
     fn gapped_frame() -> DataFrame {
         let rows: Vec<(&str, i64, f64, f64)> = vec![
             ("AAA", 0, 10.0, 0.01),
@@ -608,6 +678,7 @@ mod tests {
     fn test_a_feature_is_paired_with_the_following_session() {
         let paired = pair_with_next_session(
             &gapped_frame(),
+            &gapped_frame(),
             "close_price",
             Outcome::Signed,
             continuous("close_price"),
@@ -626,6 +697,7 @@ mod tests {
     #[test]
     fn test_a_pair_is_not_formed_across_a_session_gap() {
         let paired = pair_with_next_session(
+            &gapped_frame(),
             &gapped_frame(),
             "close_price",
             Outcome::Signed,
@@ -785,6 +857,7 @@ mod tests {
 
         let error = pair_with_next_session(
             &frame,
+            &frame,
             "close_price",
             Outcome::Signed,
             continuous("close_price"),
@@ -814,6 +887,7 @@ mod tests {
             .unwrap();
 
         let paired = pair_with_next_session(
+            &frame,
             &frame,
             "close_price",
             Outcome::Direction,
