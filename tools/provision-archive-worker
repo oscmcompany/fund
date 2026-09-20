@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# provision-archive-worker -- Reconcile the EC2 instance that writes the archive
+#
+# Run locally: bash tools/provision-archive-worker --profile <profile> [--apply]
+#
+# Every resource is named for the profile, so two profiles never share a role or an instance.
+# Mutable settings are corrected on each run; a mismatch in something that cannot be changed in
+# place is reported and refused rather than silently accepted. Replaces the hand-rolled
+# `fund-quote-backfill` box, which was recorded nowhere.
+# --------------------------------------------------------------------------- #
+
+REGION="${AWS_REGION:-us-east-1}"
+INSTANCE_TYPE="r6i.2xlarge"
+VOLUME_SIZE_GB=100
+ARCHIVE_BUCKET="oscm-fund-archive"
+ARCHIVE_PREFIX="data/*"
+
+# 03:00 Eastern in summer, 02:00 in winter, folding the session that closed the previous Eastern
+# day. tests/test_schedules.rs pins this literal.
+SCHEDULE_EXPRESSION="cron(0 7 * * ? *)"
+
+# No nightly fold verb exists yet, so the trigger is recorded but off.
+SCHEDULE_STATE="DISABLED"
+
+STALL_PERIOD_SECONDS=300
+STALL_EVALUATION_PERIODS=12
+STALL_THRESHOLD_BYTES=1000000
+
+PROFILE=""
+APPLY=false
+
+usage() {
+  echo "Usage: $(basename "$0") --profile <profile> [--apply]"
+  echo ""
+  echo "Reconcile the archive worker: IAM role, instance profile, security group,"
+  echo "instance, stall alarm, and the nightly schedule that starts it."
+  echo ""
+  echo "Options:"
+  echo "  --profile   Required. production or development/<name>."
+  echo "  --apply     Make changes. Without it, report what would change and exit."
+  echo "  -h, --help  Show this help message"
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      [[ -z "${2:-}" ]] && { echo "Error: --profile requires a value" >&2; usage 1; }
+      PROFILE="$2"; shift 2 ;;
+    --apply) APPLY=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "Error: unknown option '$1'" >&2; usage 1 ;;
+  esac
+done
+
+# The shape `create-bucket` and `run-backfill` accept. This names the secretspec profile whose keys
+# the box may read, so a non-profile would widen the grant rather than fail.
+if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
+  echo "Error: --profile must be production or development/<name>; got \"$PROFILE\"." >&2
+  exit 1
+fi
+
+SLUG="${PROFILE//[\/.]/-}"
+NAME="fund-archive-worker-${SLUG}"
+
+# IAM caps role names at 64, and the scheduler role is the longest thing derived from this one.
+if [[ ${#NAME} -gt 54 ]]; then
+  echo "Error: \"$NAME\" is ${#NAME} characters; ${NAME}-scheduler would exceed IAM's 64 limit." >&2
+  exit 1
+fi
+
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+DRIFT=0
+
+step() {
+  echo ""
+  echo "==> $1"
+}
+
+changed() {
+  if [[ "$APPLY" == true ]]; then
+    echo "    CHANGED: $1"
+  else
+    echo "    WOULD CHANGE: $1"
+  fi
+}
+
+unchanged() {
+  echo "    ok: $1"
+}
+
+# Recorded rather than raised, so one run reports every mismatch instead of the first.
+drift() {
+  echo "    DRIFT: $1" >&2
+  DRIFT=$((DRIFT + 1))
+}
+
+if [[ "$APPLY" != true ]]; then
+  echo "DRY RUN -- pass --apply to make changes"
+fi
+echo "Profile:  $PROFILE"
+echo "Names:    $NAME"
+echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
+echo "Region:   $REGION"
+
+# --------------------------------------------------------------------------- #
+# IAM role
+# --------------------------------------------------------------------------- #
+
+step "IAM role $NAME"
+
+TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+"Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
+  unchanged "role exists"
+  changed "refresh trust policy"
+  if [[ "$APPLY" == true ]]; then
+    aws iam update-assume-role-policy --role-name "$NAME" \
+      --policy-document "$TRUST_POLICY"
+  fi
+else
+  changed "create role"
+  if [[ "$APPLY" == true ]]; then
+    aws iam create-role --role-name "$NAME" \
+      --assume-role-policy-document "$TRUST_POLICY" >/dev/null
+    aws iam wait role-exists --role-name "$NAME"
+  fi
+fi
+
+if [[ "$APPLY" == true ]]; then
+  aws iam attach-role-policy --role-name "$NAME" \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+fi
+
+step "Instance profile $NAME"
+
+if aws iam get-instance-profile --instance-profile-name "$NAME" >/dev/null 2>&1; then
+  ATTACHED="$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+    --query 'InstanceProfile.Roles[].RoleName' --output text)"
+  if [[ "$ATTACHED" == "$NAME" ]]; then
+    unchanged "instance profile carries $NAME"
+  elif [[ -z "$ATTACHED" || "$ATTACHED" == "None" ]]; then
+    changed "attach $NAME to the empty instance profile"
+    if [[ "$APPLY" == true ]]; then
+      aws iam add-role-to-instance-profile \
+        --instance-profile-name "$NAME" --role-name "$NAME"
+    fi
+  else
+    drift "instance profile $NAME carries role \"$ATTACHED\", not $NAME"
+  fi
+else
+  changed "create instance profile"
+  if [[ "$APPLY" == true ]]; then
+    aws iam create-instance-profile --instance-profile-name "$NAME" >/dev/null
+    aws iam add-role-to-instance-profile \
+      --instance-profile-name "$NAME" --role-name "$NAME"
+    # An immediate RunInstances against a fresh profile fails on the ARN.
+    aws iam wait instance-profile-exists --instance-profile-name "$NAME"
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# Network
+# --------------------------------------------------------------------------- #
+
+step "Security group $NAME"
+
+VPC_ID="$(aws ec2 describe-vpcs --region "$REGION" \
+  --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)"
+if [[ "$VPC_ID" == "None" || -z "$VPC_ID" ]]; then
+  echo "Error: no default VPC in $REGION; the worker needs a subnet with outbound access." >&2
+  exit 1
+fi
+
+SECURITY_GROUP_ID="$(aws ec2 describe-security-groups --region "$REGION" \
+  --filters "Name=group-name,Values=$NAME" "Name=vpc-id,Values=$VPC_ID" \
+  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo None)"
+
+if [[ "$SECURITY_GROUP_ID" != "None" && -n "$SECURITY_GROUP_ID" ]]; then
+  INGRESS="$(aws ec2 describe-security-groups --region "$REGION" \
+    --group-ids "$SECURITY_GROUP_ID" \
+    --query 'length(SecurityGroups[0].IpPermissions)' --output text)"
+  if [[ "$INGRESS" == "0" ]]; then
+    unchanged "security group $SECURITY_GROUP_ID, no ingress"
+  else
+    drift "security group $SECURITY_GROUP_ID has $INGRESS ingress rules; it should have none"
+  fi
+else
+  changed "create security group (no ingress; SSM reaches it outbound)"
+  if [[ "$APPLY" == true ]]; then
+    SECURITY_GROUP_ID="$(aws ec2 create-security-group --region "$REGION" \
+      --group-name "$NAME" --vpc-id "$VPC_ID" \
+      --description "Archive worker ($PROFILE): outbound only, reached via SSM" \
+      --query GroupId --output text)"
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# Instance
+# --------------------------------------------------------------------------- #
+
+step "Instance $NAME"
+
+# Filtered on the profile as well as the role: without it, provisioning a second profile would
+# adopt the first profile's box and hand it this profile's secrets.
+read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS <<<"$(
+  aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:fund-role,Values=archive-worker" \
+      "Name=tag:fund-profile,Values=$PROFILE" \
+      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,IamInstanceProfile.Arn,MetadataOptions.HttpTokens]' \
+    --output text 2>/dev/null || echo "None None None None"
+)"
+
+if [[ "$INSTANCE_ID" != "None" && -n "$INSTANCE_ID" ]]; then
+  unchanged "instance $INSTANCE_ID"
+  [[ "$FOUND_TYPE" == "$INSTANCE_TYPE" ]] \
+    || drift "instance $INSTANCE_ID is $FOUND_TYPE, not $INSTANCE_TYPE (replace it to change this)"
+  [[ "$FOUND_PROFILE_ARN" == *"/$NAME" ]] \
+    || drift "instance $INSTANCE_ID carries instance profile $FOUND_PROFILE_ARN, not $NAME"
+  [[ "$FOUND_TOKENS" == "required" ]] \
+    || drift "instance $INSTANCE_ID has IMDS tokens \"$FOUND_TOKENS\", not required"
+  ATTACHED_GROUPS="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].SecurityGroups[].GroupId' --output text)"
+  [[ "$ATTACHED_GROUPS" == *"$SECURITY_GROUP_ID"* ]] \
+    || drift "instance $INSTANCE_ID is in $ATTACHED_GROUPS, not $SECURITY_GROUP_ID"
+else
+  # Resolved rather than pinned so a first provision gets current security updates; the resolved id
+  # is tagged onto the instance so what is running stays auditable.
+  AMI_ID="$(aws ssm get-parameter --region "$REGION" \
+    --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+    --query 'Parameter.Value' --output text)"
+
+  # cloud-init runs this once, as root, on first boot. Without it the box has no checkout, no
+  # toolchain and no binary, and sync-archive-worker has nothing to run from.
+  USER_DATA="$(cat <<CLOUDINIT
+#!/bin/bash
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y git curl unzip build-essential pkg-config libssl-dev cmake
+curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip
+unzip -q /tmp/awscli.zip -d /tmp
+/tmp/aws/install --update
+sudo -u ubuntu -H bash -c '
+  set -euxo pipefail
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  export PATH="\$HOME/.cargo/bin:\$PATH"
+  git clone https://github.com/oscmcompany/fund.git "\$HOME/fund"
+  cd "\$HOME/fund"
+  export SQLX_OFFLINE=true
+  cargo build --release --bin seed
+  git rev-parse HEAD > target/release/.seed-built-from
+'
+CLOUDINIT
+)"
+
+  changed "run instance $INSTANCE_TYPE from $AMI_ID, bootstrapping the checkout and toolchain"
+  if [[ "$APPLY" == true ]]; then
+    INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
+      --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
+      --iam-instance-profile "Name=$NAME" \
+      --security-group-ids "$SECURITY_GROUP_ID" \
+      --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_SIZE_GB,VolumeType=gp3}" \
+      --metadata-options "HttpTokens=required" \
+      --user-data "$USER_DATA" \
+      --tag-specifications "ResourceType=instance,Tags=[\
+{Key=Name,Value=$NAME},{Key=fund-role,Value=archive-worker},\
+{Key=fund-profile,Value=$PROFILE},{Key=fund-ami,Value=$AMI_ID}]" \
+      --query 'Instances[0].InstanceId' --output text)"
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+    echo "    instance $INSTANCE_ID running; cloud-init is still building seed"
+    echo "    follow it with: aws ssm start-session --target $INSTANCE_ID"
+    echo "    then: tail -f /var/log/cloud-init-output.log"
+  fi
+fi
+
+if [[ "$DRIFT" -gt 0 ]]; then
+  echo "" >&2
+  echo "Error: $DRIFT drifted field(s) above. Fix or replace the instance; this script will not" >&2
+  echo "  silently adopt a box whose settings it cannot correct in place." >&2
+  exit 1
+fi
+
+# --------------------------------------------------------------------------- #
+# Inline policy
+#
+# Written after the instance so the stop grant names it rather than every instance carrying the tag.
+# --------------------------------------------------------------------------- #
+
+step "Inline policy archive-and-secrets"
+
+if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; then
+  echo "Error: no instance id, so the stop grant cannot be scoped to one." >&2
+  exit 1
+fi
+
+# `seed` resolves only AWS_S3_ARCHIVE_BUCKET_NAME and writes every key under data/**. The records
+# bucket belongs to the application and the trainer, and the worker has no reason to reach it.
+ROLE_POLICY="$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteArchiveData",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}"
+    },
+    {
+      "Sid": "ListArchive",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}"
+    },
+    {
+      "Sid": "ReadOwnSecretspecKeys",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"
+    },
+    {
+      "Sid": "StopSelfWhenDone",
+      "Effect": "Allow",
+      "Action": ["ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/${INSTANCE_ID}"
+    }
+  ]
+}
+JSON
+)"
+
+changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX and $INSTANCE_ID"
+if [[ "$APPLY" == true ]]; then
+  aws iam put-role-policy --role-name "$NAME" \
+    --policy-name archive-and-secrets --policy-document "$ROLE_POLICY"
+fi
+
+# --------------------------------------------------------------------------- #
+# Stall alarm and nightly schedule
+# --------------------------------------------------------------------------- #
+
+step "Stall alarm $NAME-stalled"
+
+changed "put alarm ($STALL_EVALUATION_PERIODS x ${STALL_PERIOD_SECONDS}s under $STALL_THRESHOLD_BYTES bytes)"
+if [[ "$APPLY" == true ]]; then
+  aws cloudwatch put-metric-alarm --region "$REGION" \
+    --alarm-name "$NAME-stalled" \
+    --alarm-description "Stop the archive worker when its fetch has been dead for an hour" \
+    --namespace AWS/EC2 --metric-name NetworkIn --statistic Sum \
+    --dimensions "Name=InstanceId,Value=$INSTANCE_ID" \
+    --period "$STALL_PERIOD_SECONDS" --evaluation-periods "$STALL_EVALUATION_PERIODS" \
+    --threshold "$STALL_THRESHOLD_BYTES" --comparison-operator LessThanThreshold \
+    --treat-missing-data notBreaching \
+    --alarm-actions "arn:aws:automate:${REGION}:ec2:stop"
+fi
+
+step "Nightly schedule $NAME-nightly"
+
+SCHEDULER_ROLE="${NAME}-scheduler"
+SCHEDULER_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+"Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+if aws iam get-role --role-name "$SCHEDULER_ROLE" >/dev/null 2>&1; then
+  unchanged "scheduler role exists"
+  if [[ "$APPLY" == true ]]; then
+    aws iam update-assume-role-policy --role-name "$SCHEDULER_ROLE" \
+      --policy-document "$SCHEDULER_TRUST"
+  fi
+else
+  changed "create scheduler role"
+  if [[ "$APPLY" == true ]]; then
+    aws iam create-role --role-name "$SCHEDULER_ROLE" \
+      --assume-role-policy-document "$SCHEDULER_TRUST" >/dev/null
+    aws iam wait role-exists --role-name "$SCHEDULER_ROLE"
+  fi
+fi
+
+changed "ensure schedule at $SCHEDULE_EXPRESSION ($SCHEDULE_STATE)"
+if [[ "$APPLY" == true ]]; then
+  aws iam put-role-policy --role-name "$SCHEDULER_ROLE" --policy-name start-archive-worker \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",
+\"Action\":[\"ec2:StartInstances\"],
+\"Resource\":\"arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/${INSTANCE_ID}\"}]}"
+
+  SCHEDULE_TARGET="{\"Arn\":\"arn:aws:scheduler:::aws-sdk:ec2:startInstances\",
+\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULER_ROLE}\",
+\"Input\":\"{\\\"InstanceIds\\\":[\\\"${INSTANCE_ID}\\\"]}\"}"
+
+  if aws scheduler get-schedule --region "$REGION" --name "$NAME-nightly" >/dev/null 2>&1; then
+    aws scheduler update-schedule --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
+      --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
+      --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null
+  else
+    aws scheduler create-schedule --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
+      --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
+      --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null
+  fi
+fi
+
+step "Done"
+echo ""
+echo "  Instance: ${INSTANCE_ID}"
+echo "  Schedule: ${SCHEDULE_EXPRESSION} UTC ($SCHEDULE_STATE)"
+echo ""
+if [[ "$APPLY" != true ]]; then
+  echo "  Dry run. Re-run with --apply to make these changes."
+fi

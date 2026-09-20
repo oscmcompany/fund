@@ -591,3 +591,83 @@ fn test_the_gate_parser_refuses_disjunction() {
         "an OR-joined gate must be refused"
     );
 }
+
+/// The archive worker's trigger, which lives in a provisioning script rather than in `schema.sql`.
+///
+/// Compiled in for the same reason as `SCHEMA`: a copy that drifted from the working tree would
+/// otherwise pass.
+const PROVISION_ARCHIVE_WORKER: &str = include_str!("../tools/provision-archive-worker");
+
+/// The `SCHEDULE_EXPRESSION` literal the provisioning script assigns.
+fn archive_worker_expression() -> String {
+    let line = PROVISION_ARCHIVE_WORKER
+        .lines()
+        .find(|line| line.starts_with("SCHEDULE_EXPRESSION="))
+        .expect("provision-archive-worker must assign SCHEDULE_EXPRESSION");
+    line.trim_start_matches("SCHEDULE_EXPRESSION=")
+        .trim_matches('"')
+        .to_string()
+}
+
+/// The `(minute, hour)` an EventBridge `cron(M H * * ? *)` expression fires at.
+///
+/// Only the once-daily form is modelled, because that is the only form the worker uses; anything
+/// else panics rather than being read as midnight.
+fn archive_worker_firing() -> (u32, u32) {
+    let expression = archive_worker_expression();
+    let fields: Vec<&str> = expression
+        .strip_prefix("cron(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{expression} is not a cron(...) expression"))
+        .split_whitespace()
+        .collect();
+    assert_eq!(fields.len(), 6, "EventBridge cron takes six fields");
+    assert_eq!(
+        &fields[2..],
+        &["*", "*", "?", "*"],
+        "only a daily every-day trigger is modelled"
+    );
+    (
+        fields[0].parse().expect("a literal minute"),
+        fields[1].parse().expect("a literal hour"),
+    )
+}
+
+#[test]
+fn test_the_archive_worker_fires_after_eastern_midnight_all_year() {
+    // Pinned to the literal rather than read back from the script, so an edit to the trigger has to
+    // be made here too and cannot pass by agreeing with itself.
+    assert_eq!(
+        archive_worker_expression(),
+        "cron(0 7 * * ? *)",
+        "the archive worker's trigger changed; confirm it still clears Eastern midnight"
+    );
+
+    // The hour comes from the expression, not from a literal here. An earlier draft hardcoded 7 in
+    // the loop, so the walk below agreed with any trigger the pin was edited to accept.
+    let (minute, hour) = archive_worker_firing();
+
+    // The job folds "the previous Eastern date". That phrase only names one session if the trigger
+    // lands after Eastern midnight on the same calendar date it fires on in UTC -- at 03:00Z the
+    // EDT half of the year would fire at 23:00 the day before and silently mean a different session.
+    let mut date = NaiveDate::from_ymd_opt(YEAR, 1, 1).expect("1 January is a date");
+    let end = NaiveDate::from_ymd_opt(YEAR, 12, 31).expect("31 December is a date");
+    while date <= end {
+        let instant = Utc
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, 0)
+            .single()
+            .expect("the trigger instant is unambiguous in UTC");
+        let eastern = eastern_datetime(instant);
+        assert_eq!(
+            eastern.date(),
+            date,
+            "{hour:02}:{minute:02}Z on {date} lands on a different Eastern date"
+        );
+        assert!(
+            eastern.time() >= time("01:00"),
+            "{hour:02}:{minute:02}Z on {date} lands at {} Eastern, too close to midnight",
+            eastern.time()
+        );
+        date = date.succ_opt().expect("the year has a next day");
+    }
+}
