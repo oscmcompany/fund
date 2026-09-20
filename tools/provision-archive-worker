@@ -6,13 +6,13 @@ set -euo pipefail
 #
 # Run locally: bash tools/provision-archive-worker --profile <profile> [--apply]
 #
-# Every resource is ensured rather than created, so a second run is a no-op and a field that
-# drifted is corrected. Replaces the hand-rolled `fund-quote-backfill` box, which was recorded
-# nowhere.
+# Every resource is named for the profile, so two profiles never share a role or an instance.
+# Mutable settings are corrected on each run; a mismatch in something that cannot be changed in
+# place is reported and refused rather than silently accepted. Replaces the hand-rolled
+# `fund-quote-backfill` box, which was recorded nowhere.
 # --------------------------------------------------------------------------- #
 
 REGION="${AWS_REGION:-us-east-1}"
-NAME="fund-archive-worker"
 INSTANCE_TYPE="r6i.2xlarge"
 VOLUME_SIZE_GB=100
 ARCHIVE_BUCKET="oscm-fund-archive"
@@ -63,7 +63,18 @@ if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
   exit 1
 fi
 
+SLUG="${PROFILE//[\/.]/-}"
+NAME="fund-archive-worker-${SLUG}"
+
+# IAM caps role names at 64, and the scheduler role is the longest thing derived from this one.
+if [[ ${#NAME} -gt 54 ]]; then
+  echo "Error: \"$NAME\" is ${#NAME} characters; ${NAME}-scheduler would exceed IAM's 64 limit." >&2
+  exit 1
+fi
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+DRIFT=0
 
 step() {
   echo ""
@@ -82,10 +93,17 @@ unchanged() {
   echo "    ok: $1"
 }
 
+# Recorded rather than raised, so one run reports every mismatch instead of the first.
+drift() {
+  echo "    DRIFT: $1" >&2
+  DRIFT=$((DRIFT + 1))
+}
+
 if [[ "$APPLY" != true ]]; then
   echo "DRY RUN -- pass --apply to make changes"
 fi
 echo "Profile:  $PROFILE"
+echo "Names:    $NAME"
 echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
 echo "Region:   $REGION"
 
@@ -100,6 +118,11 @@ TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
   unchanged "role exists"
+  changed "refresh trust policy"
+  if [[ "$APPLY" == true ]]; then
+    aws iam update-assume-role-policy --role-name "$NAME" \
+      --policy-document "$TRUST_POLICY"
+  fi
 else
   changed "create role"
   if [[ "$APPLY" == true ]]; then
@@ -117,7 +140,19 @@ fi
 step "Instance profile $NAME"
 
 if aws iam get-instance-profile --instance-profile-name "$NAME" >/dev/null 2>&1; then
-  unchanged "instance profile exists"
+  ATTACHED="$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+    --query 'InstanceProfile.Roles[].RoleName' --output text)"
+  if [[ "$ATTACHED" == "$NAME" ]]; then
+    unchanged "instance profile carries $NAME"
+  elif [[ -z "$ATTACHED" || "$ATTACHED" == "None" ]]; then
+    changed "attach $NAME to the empty instance profile"
+    if [[ "$APPLY" == true ]]; then
+      aws iam add-role-to-instance-profile \
+        --instance-profile-name "$NAME" --role-name "$NAME"
+    fi
+  else
+    drift "instance profile $NAME carries role \"$ATTACHED\", not $NAME"
+  fi
 else
   changed "create instance profile"
   if [[ "$APPLY" == true ]]; then
@@ -147,13 +182,20 @@ SECURITY_GROUP_ID="$(aws ec2 describe-security-groups --region "$REGION" \
   --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo None)"
 
 if [[ "$SECURITY_GROUP_ID" != "None" && -n "$SECURITY_GROUP_ID" ]]; then
-  unchanged "security group $SECURITY_GROUP_ID"
+  INGRESS="$(aws ec2 describe-security-groups --region "$REGION" \
+    --group-ids "$SECURITY_GROUP_ID" \
+    --query 'length(SecurityGroups[0].IpPermissions)' --output text)"
+  if [[ "$INGRESS" == "0" ]]; then
+    unchanged "security group $SECURITY_GROUP_ID, no ingress"
+  else
+    drift "security group $SECURITY_GROUP_ID has $INGRESS ingress rules; it should have none"
+  fi
 else
   changed "create security group (no ingress; SSM reaches it outbound)"
   if [[ "$APPLY" == true ]]; then
     SECURITY_GROUP_ID="$(aws ec2 create-security-group --region "$REGION" \
       --group-name "$NAME" --vpc-id "$VPC_ID" \
-      --description "Archive worker: outbound only, reached via SSM" \
+      --description "Archive worker ($PROFILE): outbound only, reached via SSM" \
       --query GroupId --output text)"
   fi
 fi
@@ -164,20 +206,61 @@ fi
 
 step "Instance $NAME"
 
-INSTANCE_ID="$(aws ec2 describe-instances --region "$REGION" \
-  --filters "Name=tag:fund-role,Values=archive-worker" \
-    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo None)"
+# Filtered on the profile as well as the role: without it, provisioning a second profile would
+# adopt the first profile's box and hand it this profile's secrets.
+read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS <<<"$(
+  aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:fund-role,Values=archive-worker" \
+      "Name=tag:fund-profile,Values=$PROFILE" \
+      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,IamInstanceProfile.Arn,MetadataOptions.HttpTokens]' \
+    --output text 2>/dev/null || echo "None None None None"
+)"
 
 if [[ "$INSTANCE_ID" != "None" && -n "$INSTANCE_ID" ]]; then
   unchanged "instance $INSTANCE_ID"
+  [[ "$FOUND_TYPE" == "$INSTANCE_TYPE" ]] \
+    || drift "instance $INSTANCE_ID is $FOUND_TYPE, not $INSTANCE_TYPE (replace it to change this)"
+  [[ "$FOUND_PROFILE_ARN" == *"/$NAME" ]] \
+    || drift "instance $INSTANCE_ID carries instance profile $FOUND_PROFILE_ARN, not $NAME"
+  [[ "$FOUND_TOKENS" == "required" ]] \
+    || drift "instance $INSTANCE_ID has IMDS tokens \"$FOUND_TOKENS\", not required"
+  ATTACHED_GROUPS="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].SecurityGroups[].GroupId' --output text)"
+  [[ "$ATTACHED_GROUPS" == *"$SECURITY_GROUP_ID"* ]] \
+    || drift "instance $INSTANCE_ID is in $ATTACHED_GROUPS, not $SECURITY_GROUP_ID"
 else
   # Resolved rather than pinned so a first provision gets current security updates; the resolved id
   # is tagged onto the instance so what is running stays auditable.
   AMI_ID="$(aws ssm get-parameter --region "$REGION" \
     --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
     --query 'Parameter.Value' --output text)"
-  changed "run instance $INSTANCE_TYPE from $AMI_ID"
+
+  # cloud-init runs this once, as root, on first boot. Without it the box has no checkout, no
+  # toolchain and no binary, and sync-archive-worker has nothing to run from.
+  USER_DATA="$(cat <<CLOUDINIT
+#!/bin/bash
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y git curl unzip build-essential pkg-config libssl-dev cmake
+curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip
+unzip -q /tmp/awscli.zip -d /tmp
+/tmp/aws/install --update
+sudo -u ubuntu -H bash -c '
+  set -euxo pipefail
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  export PATH="\$HOME/.cargo/bin:\$PATH"
+  git clone https://github.com/oscmcompany/fund.git "\$HOME/fund"
+  cd "\$HOME/fund"
+  export SQLX_OFFLINE=true
+  cargo build --release --bin seed
+  git rev-parse HEAD > target/release/.seed-built-from
+'
+CLOUDINIT
+)"
+
+  changed "run instance $INSTANCE_TYPE from $AMI_ID, bootstrapping the checkout and toolchain"
   if [[ "$APPLY" == true ]]; then
     INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
       --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
@@ -185,13 +268,23 @@ else
       --security-group-ids "$SECURITY_GROUP_ID" \
       --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_SIZE_GB,VolumeType=gp3}" \
       --metadata-options "HttpTokens=required" \
+      --user-data "$USER_DATA" \
       --tag-specifications "ResourceType=instance,Tags=[\
 {Key=Name,Value=$NAME},{Key=fund-role,Value=archive-worker},\
 {Key=fund-profile,Value=$PROFILE},{Key=fund-ami,Value=$AMI_ID}]" \
       --query 'Instances[0].InstanceId' --output text)"
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
-    echo "    instance $INSTANCE_ID running; bootstrap it with tools/sync-archive-worker"
+    echo "    instance $INSTANCE_ID running; cloud-init is still building seed"
+    echo "    follow it with: aws ssm start-session --target $INSTANCE_ID"
+    echo "    then: tail -f /var/log/cloud-init-output.log"
   fi
+fi
+
+if [[ "$DRIFT" -gt 0 ]]; then
+  echo "" >&2
+  echo "Error: $DRIFT drifted field(s) above. Fix or replace the instance; this script will not" >&2
+  echo "  silently adopt a box whose settings it cannot correct in place." >&2
+  exit 1
 fi
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +368,10 @@ SCHEDULER_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 
 if aws iam get-role --role-name "$SCHEDULER_ROLE" >/dev/null 2>&1; then
   unchanged "scheduler role exists"
+  if [[ "$APPLY" == true ]]; then
+    aws iam update-assume-role-policy --role-name "$SCHEDULER_ROLE" \
+      --policy-document "$SCHEDULER_TRUST"
+  fi
 else
   changed "create scheduler role"
   if [[ "$APPLY" == true ]]; then

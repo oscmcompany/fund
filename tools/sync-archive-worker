@@ -9,9 +9,19 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="$REPO_ROOT/target/release/seed"
 
+# Which commit the binary was actually built from. The checkout's own HEAD cannot answer that: it
+# moves to the new revision before the build, so a failed build leaves the two disagreeing.
+STAMP="$REPO_ROOT/target/release/.seed-built-from"
+
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
 }
+
+# An SSM session and a cron entry both start without a login shell's PATH, so rustup's own entry
+# is not there and cargo would be missing. HOME can be unset under cron, which `set -u` makes fatal.
+if [[ -d "${HOME:-}/.cargo/bin" ]]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
 
 cd "$REPO_ROOT"
 
@@ -20,28 +30,29 @@ if ! git fetch origin master 2>&1; then
   exit 0
 fi
 
-local_head="$(git rev-parse HEAD)"
 remote_head="$(git rev-parse origin/master)"
+built_from="$(cat "$STAMP" 2>/dev/null || echo none)"
 
-if [[ "$local_head" == "$remote_head" && -x "$BINARY" ]]; then
-  log "Already at $(git rev-parse --short HEAD) with a binary; nothing to do"
+if [[ "$built_from" == "$remote_head" && -x "$BINARY" ]]; then
+  log "Binary already built from ${remote_head:0:8}; nothing to do"
   exit 0
 fi
 
-log "Building $remote_head (local=$local_head)"
+log "Building $remote_head (binary is from $built_from)"
 git reset --hard origin/master
 
-# cargo replaces the binary only on a successful link, so a failed build leaves the previous one
-# runnable; the branches below say which case happened.
+# Written only on success, so an interrupted or failed build leaves the stamp naming the commit the
+# binary really came from and the next run retries.
 if cargo build --release --bin seed; then
-  log "Built $(git rev-parse --short HEAD)"
+  echo "$remote_head" > "$STAMP"
+  log "Built ${remote_head:0:8}"
   exit 0
 fi
 
 if [[ -x "$BINARY" ]]; then
-  log "ERROR: build failed at $(git rev-parse --short HEAD); keeping the previous binary"
+  log "ERROR: build failed at ${remote_head:0:8}; the binary is still from $built_from"
   exit 1
 fi
 
-log "ERROR: build failed at $(git rev-parse --short HEAD) and there is no previous binary"
+log "ERROR: build failed at ${remote_head:0:8} and there is no previous binary"
 exit 1
