@@ -7,10 +7,9 @@
 #
 #   run-backfill equity-trades archive --start 2021-08-26 --end 2026-08-28 --source vendor-keeping-raw
 #
-# The instance role this runs under is `backfill-box-role-policy.json` beside this file:
-#   aws iam put-role-policy --role-name fund-quote-backfill \
-#     --policy-name archive-and-secrets \
-#     --policy-document file://tools/backfill-box-role-policy.json
+# The instance role this runs under is reconciled by `provision-archive-worker` beside this file,
+# which derives the policy from the profile rather than reading a fixed document:
+#   bash tools/provision-archive-worker --profile development/<name> --apply
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"

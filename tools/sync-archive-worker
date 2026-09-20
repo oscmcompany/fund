@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sync-archive-worker -- Bring the archive worker's checkout and binary up to origin/master.
+#
+# Runs on the worker itself, before each night's fold. The `sync-application` counterpart signals a
+# running process-compose; there is nothing running here, so this only has to leave a good binary
+# behind. A build failure keeps the previous one and reports it: a worker that syncs itself into a
+# non-building state would stop writing the archive silently, which is the failure this whole task
+# exists to make impossible.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BINARY="$REPO_ROOT/target/release/seed"
+
+log() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+cd "$REPO_ROOT"
+
+if ! git fetch origin master 2>&1; then
+  log "git fetch failed; keeping $(git rev-parse --short HEAD)"
+  exit 0
+fi
+
+local_head="$(git rev-parse HEAD)"
+remote_head="$(git rev-parse origin/master)"
+
+if [[ "$local_head" == "$remote_head" && -x "$BINARY" ]]; then
+  log "Already at $(git rev-parse --short HEAD) with a binary; nothing to do"
+  exit 0
+fi
+
+log "Building $remote_head (local=$local_head)"
+git reset --hard origin/master
+
+# cargo replaces the binary only on a successful link, so a failed build leaves the previous one
+# runnable; the branches below report which case happened rather than assuming the good one.
+if cargo build --release --bin seed; then
+  log "Built $(git rev-parse --short HEAD)"
+  exit 0
+fi
+
+if [[ -x "$BINARY" ]]; then
+  log "ERROR: build failed at $(git rev-parse --short HEAD); keeping the previous binary"
+  exit 1
+fi
+
+log "ERROR: build failed at $(git rev-parse --short HEAD) and there is no previous binary"
+exit 1
