@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -21,6 +22,7 @@ use fund::common::types::{
 use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
+use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport};
 use fund::data::{attribution, bars, details, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
@@ -105,6 +107,24 @@ enum Command {
         #[command(subcommand)]
         action: CadenceAction,
     },
+    /// Whatever the recent sessions are still missing, cheapest family first, under a wall clock
+    /// budget. What the nightly schedule runs.
+    ArchiveNightly(NightlyArguments),
+}
+
+/// What one scheduled nightly run may do.
+#[derive(Debug, Args)]
+struct NightlyArguments {
+    /// How many recent trading sessions to check for gaps. More than one because the run repairs
+    /// by set difference, so a missed night is healed by the next rather than by anyone noticing.
+    #[arg(long, default_value_t = 5)]
+    lookback_sessions: u32,
+    /// Stop starting new families after this many minutes. A budget rather than a session cap: a
+    /// cap of N sessions would take forty nights to heal a two-hundred-session hole.
+    #[arg(long, default_value_t = 240)]
+    budget_minutes: u64,
+    #[command(flatten)]
+    files: FlatFileArguments,
 }
 
 /// Which family to fold up and compare. Both arms read the archive and write nothing.
@@ -222,6 +242,7 @@ impl Command {
             Command::EquityReference { .. } => "seed-equity-reference",
             Command::ArchiveProvenance { .. } => "seed-archive-provenance",
             Command::ArchiveCadence { .. } => "seed-archive-cadence",
+            Command::ArchiveNightly(_) => "seed-archive-nightly",
         }
     }
 }
@@ -941,6 +962,8 @@ enum Outcome {
     Chunked(ChunkedSummary),
     /// A read-only check, which always finished and reports whether what it read agreed.
     Checked(CadenceTotals),
+    /// A scheduled night, which reports every leg it owed whatever became of it.
+    Nightly(NightlyReport),
     /// A run with nothing to step over: it did all of its work, or returned an error instead of it.
     Complete,
 }
@@ -973,6 +996,7 @@ impl Outcome {
                     }
                 ))
             }
+            Outcome::Nightly(report) => Some(report.to_string()),
             Outcome::Complete => None,
         }
     }
@@ -1006,6 +1030,14 @@ impl Outcome {
                 agrees = totals.agrees(),
                 "Check finished"
             ),
+            Outcome::Nightly(report) => info!(
+                written = report.written(),
+                failed = ?report.failed(),
+                skipped = ?report.skipped(),
+                incomplete = ?report.incomplete(),
+                complete = report.is_complete(),
+                "Nightly archive run finished"
+            ),
             Outcome::Complete => {}
         }
     }
@@ -1019,6 +1051,7 @@ impl Outcome {
             // A disagreement is what this run exists to find, so it is the one outcome that must
             // not exit zero: nothing downstream reads the report, and automation reads only this.
             Outcome::Checked(totals) => totals.agrees(),
+            Outcome::Nightly(report) => report.is_complete(),
             Outcome::Complete => true,
         };
         if complete {
@@ -1091,6 +1124,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         Command::EquityTrades { action } => seed_trades(action).await,
         Command::EquityReference { action } => seed_reference(action).await,
         Command::ArchiveProvenance { action } => seed_provenance(action).await,
+        Command::ArchiveNightly(arguments) => archive_nightly(arguments, today).await,
         Command::ArchiveCadence { action } => check_cadence(action).await,
     }
 }
@@ -1591,6 +1625,121 @@ async fn fold_sampled(
     Ok(Outcome::Pass(
         fold_quotes(&source, &calendar, &sampled, &scope, cadence, foreign).await?,
     ))
+}
+
+/// Folds whatever the recent sessions are still missing, cheapest family first.
+///
+/// Every leg repairs by set difference against the bucket, so this is safe to run nightly and safe
+/// to run twice. A leg that errors is stepped over rather than aborting the night, because the
+/// families are independent and losing the quote fold should not also lose the daily bars.
+async fn archive_nightly(
+    arguments: &NightlyArguments,
+    today: SessionDate,
+) -> Result<Outcome, SeedError> {
+    let horizon = Window::new(
+        today.plus_calendar_days(-(i64::from(arguments.lookback_sessions) * 2 + 7)),
+        today,
+    )
+    .map_err(SeedError::Usage)?;
+    let calendar = trading_calendar(&horizon)
+        .await
+        .map_err(SeedError::Failed)?;
+    let plan = nightly::plan(today, arguments.lookback_sessions, &calendar)
+        .map_err(|refusal| SeedError::Usage(refusal.to_string()))?;
+
+    let budget = nightly::Budget::starting_now(Duration::from_secs(arguments.budget_minutes * 60));
+    let mut report = NightlyReport::over(&plan);
+
+    info!(
+        window_start = %plan.window_start(),
+        window_end = %plan.window_end(),
+        sessions = plan.sessions().len(),
+        budget_minutes = arguments.budget_minutes,
+        "Starting the nightly archive run"
+    );
+
+    for leg in Leg::ALL {
+        if !budget.may_start_another() {
+            report.record(leg, LegOutcome::Skipped);
+            continue;
+        }
+        let outcome = match run_leg(leg, &plan, &calendar, &arguments.files).await {
+            Ok(summary) => LegOutcome::Folded {
+                complete: summary.is_complete(),
+                written: summary.sessions_written(),
+            },
+            Err(error) => {
+                error!(%leg, %error, "Nightly leg failed, continuing to the next");
+                LegOutcome::Failed(error.to_string())
+            }
+        };
+        info!(%leg, remaining_seconds = budget.remaining().as_secs(), "Leg finished");
+        report.record(leg, outcome);
+    }
+
+    Ok(Outcome::Nightly(report))
+}
+
+/// Runs one leg over the plan's sessions.
+async fn run_leg(
+    leg: Leg,
+    plan: &nightly::NightlyPlan,
+    calendar: &TradingCalendar,
+    files: &FlatFileArguments,
+) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let sessions = plan.sessions();
+    let scope = Scope::new(NameSelection::WholeMarket, SessionSelection::Absent)?;
+
+    match leg {
+        Leg::DailyBars => Ok(archive::archive_missing_sessions(
+            &s3_client,
+            &MassiveClient::from_env()?,
+            &bucket,
+            plan.window_start(),
+            plan.window_end(),
+            Some(calendar),
+        )
+        .await?),
+        Leg::IntradayBars(_) => Ok(archive::archive_intraday_sessions(
+            &s3_client,
+            &MassiveClient::from_env()?,
+            &bucket,
+            leg.interval(),
+            plan.window_start(),
+            plan.window_end(),
+            &scope,
+            Some(calendar),
+        )
+        .await?),
+        Leg::Quotes(cadence) => {
+            let flat_files = flat_file_client(files).await?;
+            Ok(archive::archive_quote_sessions(
+                &s3_client,
+                &archive::QuoteSource::WholeSession(&flat_files),
+                calendar,
+                &bucket,
+                sessions,
+                &scope,
+                cadence,
+                ForeignProvider::Refuse,
+            )
+            .await?)
+        }
+        Leg::Trades => {
+            let flat_files = flat_file_client(files).await?;
+            Ok(archive::archive_trade_sessions(
+                &s3_client,
+                &archive::TradeSource::WholeSession(&flat_files),
+                calendar,
+                &bucket,
+                sessions,
+                &scope,
+            )
+            .await?)
+        }
+    }
 }
 
 /// The flat-file client the pass's source names.

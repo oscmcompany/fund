@@ -16,6 +16,7 @@ pub mod conditions;
 pub mod conditions_table;
 pub mod details;
 pub mod export;
+pub mod nightly;
 pub mod purge;
 pub mod quotes;
 pub mod reference;
