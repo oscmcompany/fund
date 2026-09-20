@@ -1679,9 +1679,12 @@ async fn archive_nightly(
 
 /// Runs one leg, stopping between sessions once the budget is spent.
 ///
-/// Daily bars are the exception and run as one windowed call: they are one request per session,
-/// and `sessions_to_request` derives its correction window from the whole window, so feeding it
-/// one session at a time would re-request every session every night.
+/// Daily bars are the exception twice over: they run as one windowed call, and so they are the one
+/// leg the budget cannot interrupt. `sessions_to_request` derives its correction window from the
+/// whole window, so feeding it a session at a time would re-request every session every night
+/// rather than only the recent ones Massive still restates. The overrun that buys is bounded by
+/// `--lookback-sessions` grouped requests, which is seconds at any sane lookback, and it is why
+/// this leg runs first.
 async fn run_leg(
     leg: Leg,
     plan: &nightly::NightlyPlan,

@@ -194,10 +194,11 @@ pub enum LegOutcome {
     Failed(String),
 }
 
-/// What a nightly run did, leg by leg.
+/// What a nightly run did, leg by leg, at session granularity.
 ///
 /// Every leg appears whatever happened to it: a report that listed only the legs that ran would
-/// read as a clean night when the budget cut it in half.
+/// read as a clean night when the budget cut it in half. Symbol-level gaps are invisible here --
+/// a partition missing one name reads as present, and the scan is what answers that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NightlyReport {
     window_start: SessionDate,
@@ -259,12 +260,19 @@ impl NightlyReport {
             .collect()
     }
 
-    /// Whether the night owes the archive nothing further.
+    /// Whether the night owes the archive nothing further, at session granularity.
     ///
-    /// A skipped leg counts against this. The next run heals it, but the exit code is the only
-    /// thing automation reads and a half-finished night must not report as a whole one.
+    /// Session granularity is the whole claim: a partition written while one name's fetch failed
+    /// reads exactly like a complete one, which is what `SessionSelection::Present` exists for.
+    ///
+    /// Every leg must have been recorded. The three emptiness tests below are all vacuously true
+    /// over a report where nothing ran, and this predicate is what the exit code is taken from.
     pub fn is_complete(&self) -> bool {
-        self.failed().is_empty() && self.skipped().is_empty() && self.incomplete().is_empty()
+        let recorded: Vec<Leg> = self.legs.iter().map(|(leg, _)| *leg).collect();
+        Leg::ALL.iter().all(|leg| recorded.contains(leg))
+            && self.failed().is_empty()
+            && self.skipped().is_empty()
+            && self.incomplete().is_empty()
     }
 
     /// Total partitions written across every leg.
@@ -463,9 +471,8 @@ mod report_tests {
 
     #[test]
     fn test_a_night_that_ran_out_of_budget_does_not_report_as_complete() {
-        // The lesson this encodes: a pass can report success over an incomplete result. A leg the
-        // budget never reached wrote nothing, and nothing downstream can tell that from a leg that
-        // had nothing to write.
+        // A pass can report success over an incomplete result: nothing downstream separates a leg
+        // the budget never reached from one that had nothing to write.
         let plan = plan_over(&["2026-09-14", "2026-09-18"]);
         let mut report = NightlyReport::over(&plan);
         report.record(
@@ -518,6 +525,37 @@ mod report_tests {
         assert_eq!(
             report.skipped(),
             vec![&Leg::Quotes(IntradayCadence::FiveMinute)]
+        );
+    }
+
+    #[test]
+    fn test_a_report_with_no_legs_recorded_is_not_complete() {
+        // Every emptiness test in `is_complete` is vacuously true here, and this predicate is what
+        // the exit code is taken from -- a run that never started must not exit zero.
+        let plan = plan_over(&["2026-09-18"]);
+        let report = NightlyReport::over(&plan);
+        assert!(report.failed().is_empty());
+        assert!(report.skipped().is_empty());
+        assert!(report.incomplete().is_empty());
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn test_a_report_missing_one_leg_is_not_complete() {
+        let plan = plan_over(&["2026-09-18"]);
+        let mut report = NightlyReport::over(&plan);
+        for leg in Leg::ALL.iter().take(5) {
+            report.record(
+                *leg,
+                LegOutcome::Folded {
+                    complete: true,
+                    written: 0,
+                },
+            );
+        }
+        assert!(
+            !report.is_complete(),
+            "five of six legs is not a whole night"
         );
     }
 
