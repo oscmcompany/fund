@@ -6,32 +6,25 @@ set -euo pipefail
 #
 # Run locally: bash tools/provision-archive-worker --profile <profile> [--apply]
 #
-# Every resource is ensured rather than created, on `create-bucket`'s shape, so a second run is a
-# no-op and a field that drifted is corrected. It is the replacement for the hand-rolled
-# `fund-quote-backfill` box, which carried four long passes and was recorded nowhere.
-#
-# The IAM policy is derived from the profile rather than read from a file beside this one. The
-# records bucket and the secretspec prefix are both functions of the profile, and the file this
-# replaced had already drifted from the live role -- Git said `development/john.forstmeier/*` while
-# the role allowed all of `secretspec/fund/*`.
+# Every resource is ensured rather than created, so a second run is a no-op and a field that
+# drifted is corrected. Replaces the hand-rolled `fund-quote-backfill` box, which was recorded
+# nowhere.
 # --------------------------------------------------------------------------- #
 
 REGION="${AWS_REGION:-us-east-1}"
 NAME="fund-archive-worker"
 INSTANCE_TYPE="r6i.2xlarge"
 VOLUME_SIZE_GB=100
+ARCHIVE_BUCKET="oscm-fund-archive"
+ARCHIVE_PREFIX="data/*"
 
 # 03:00 Eastern in summer, 02:00 in winter, folding the session that closed the previous Eastern
-# day. `seed` re-asks `TradingCalendar` on waking, so this fires every night and the code decides
-# whether there is a session to write. tests/test_schedules.rs pins this literal.
+# day. tests/test_schedules.rs pins this literal.
 SCHEDULE_EXPRESSION="cron(0 7 * * ? *)"
 
-# The worker has no nightly fold verb yet -- `archive-cadence` reads and writes nothing, and the
-# writer is task 10. Until that lands the trigger is recorded but off.
+# No nightly fold verb exists yet, so the trigger is recorded but off.
 SCHEDULE_STATE="DISABLED"
 
-# Idle for an hour with the fetch dead. The backstop for a hang, never the normal way the box stops
-# -- `run-archive-worker` stops itself, and an idle alarm left a finished run burning an hour once.
 STALL_PERIOD_SECONDS=300
 STALL_EVALUATION_PERIODS=12
 STALL_THRESHOLD_BYTES=1000000
@@ -63,16 +56,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# The shape `create-bucket` and `run-backfill` accept, and for the same reason: the records bucket is
-# derived from this string, so `archive` would resolve records to the shared archive bucket.
+# The shape `create-bucket` and `run-backfill` accept. This names the secretspec profile whose keys
+# the box may read, so a non-profile would widen the grant rather than fail.
 if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
   echo "Error: --profile must be production or development/<name>; got \"$PROFILE\"." >&2
   exit 1
 fi
 
-SLUG="${PROFILE//[\/.]/-}"
-RECORDS_BUCKET="oscm-fund-${SLUG}"
-ARCHIVE_BUCKET="oscm-fund-archive"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 step() {
@@ -96,50 +86,17 @@ if [[ "$APPLY" != true ]]; then
   echo "DRY RUN -- pass --apply to make changes"
 fi
 echo "Profile:  $PROFILE"
-echo "Records:  $RECORDS_BUCKET"
+echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
 echo "Region:   $REGION"
 
 # --------------------------------------------------------------------------- #
-# IAM role and inline policy
+# IAM role
 # --------------------------------------------------------------------------- #
 
 step "IAM role $NAME"
 
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-
-ROLE_POLICY="$(cat <<JSON
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ArchiveObjects",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:AbortMultipartUpload"],
-      "Resource": [
-        "arn:aws:s3:::${RECORDS_BUCKET}",
-        "arn:aws:s3:::${RECORDS_BUCKET}/*",
-        "arn:aws:s3:::${ARCHIVE_BUCKET}",
-        "arn:aws:s3:::${ARCHIVE_BUCKET}/*"
-      ]
-    },
-    {
-      "Sid": "ReadOwnSecretspecKeys",
-      "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"
-    },
-    {
-      "Sid": "StopSelfWhenDone",
-      "Effect": "Allow",
-      "Action": ["ec2:StopInstances"],
-      "Resource": "arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/*",
-      "Condition": {"StringEquals": {"ec2:ResourceTag/fund-role": "archive-worker"}}
-    }
-  ]
-}
-JSON
-)"
 
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
   unchanged "role exists"
@@ -148,14 +105,11 @@ else
   if [[ "$APPLY" == true ]]; then
     aws iam create-role --role-name "$NAME" \
       --assume-role-policy-document "$TRUST_POLICY" >/dev/null
+    aws iam wait role-exists --role-name "$NAME"
   fi
 fi
 
-# Always written. This is the reconciliation that closes the drift the file-based policy allowed.
-changed "put inline policy archive-and-secrets"
 if [[ "$APPLY" == true ]]; then
-  aws iam put-role-policy --role-name "$NAME" \
-    --policy-name archive-and-secrets --policy-document "$ROLE_POLICY"
   aws iam attach-role-policy --role-name "$NAME" \
     --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 fi
@@ -170,8 +124,7 @@ else
     aws iam create-instance-profile --instance-profile-name "$NAME" >/dev/null
     aws iam add-role-to-instance-profile \
       --instance-profile-name "$NAME" --role-name "$NAME"
-    # The profile is not usable the instant it is created; an immediate RunInstances gets
-    # InvalidParameterValue on the ARN.
+    # An immediate RunInstances against a fresh profile fails on the ARN.
     aws iam wait instance-profile-exists --instance-profile-name "$NAME"
   fi
 fi
@@ -242,12 +195,67 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# Inline policy
+#
+# Written after the instance so the stop grant names it rather than every instance carrying the tag.
+# --------------------------------------------------------------------------- #
+
+step "Inline policy archive-and-secrets"
+
+if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; then
+  echo "Error: no instance id, so the stop grant cannot be scoped to one." >&2
+  exit 1
+fi
+
+# `seed` resolves only AWS_S3_ARCHIVE_BUCKET_NAME and writes every key under data/**. The records
+# bucket belongs to the application and the trainer, and the worker has no reason to reach it.
+ROLE_POLICY="$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteArchiveData",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/${ARCHIVE_PREFIX}"
+    },
+    {
+      "Sid": "ListArchive",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}"
+    },
+    {
+      "Sid": "ReadOwnSecretspecKeys",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"
+    },
+    {
+      "Sid": "StopSelfWhenDone",
+      "Effect": "Allow",
+      "Action": ["ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/${INSTANCE_ID}"
+    }
+  ]
+}
+JSON
+)"
+
+changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX and $INSTANCE_ID"
+if [[ "$APPLY" == true ]]; then
+  aws iam put-role-policy --role-name "$NAME" \
+    --policy-name archive-and-secrets --policy-document "$ROLE_POLICY"
+fi
+
+# --------------------------------------------------------------------------- #
 # Stall alarm and nightly schedule
 # --------------------------------------------------------------------------- #
 
 step "Stall alarm $NAME-stalled"
 
-if [[ "$APPLY" == true && "$INSTANCE_ID" != "None" ]]; then
+changed "put alarm ($STALL_EVALUATION_PERIODS x ${STALL_PERIOD_SECONDS}s under $STALL_THRESHOLD_BYTES bytes)"
+if [[ "$APPLY" == true ]]; then
   aws cloudwatch put-metric-alarm --region "$REGION" \
     --alarm-name "$NAME-stalled" \
     --alarm-description "Stop the archive worker when its fetch has been dead for an hour" \
@@ -257,9 +265,6 @@ if [[ "$APPLY" == true && "$INSTANCE_ID" != "None" ]]; then
     --threshold "$STALL_THRESHOLD_BYTES" --comparison-operator LessThanThreshold \
     --treat-missing-data notBreaching \
     --alarm-actions "arn:aws:automate:${REGION}:ec2:stop"
-  changed "alarm bound to $INSTANCE_ID"
-else
-  changed "put alarm"
 fi
 
 step "Nightly schedule $NAME-nightly"
@@ -279,43 +284,32 @@ else
   fi
 fi
 
-if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; then
-  echo "Error: no instance to target; the schedule would start nothing." >&2
-  exit 1
-fi
-
+changed "ensure schedule at $SCHEDULE_EXPRESSION ($SCHEDULE_STATE)"
 if [[ "$APPLY" == true ]]; then
   aws iam put-role-policy --role-name "$SCHEDULER_ROLE" --policy-name start-archive-worker \
     --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",
-\"Action\":[\"ec2:StartInstances\"],\"Resource\":\"*\",
-\"Condition\":{\"StringEquals\":{\"ec2:ResourceTag/fund-role\":\"archive-worker\"}}}]}"
+\"Action\":[\"ec2:StartInstances\"],
+\"Resource\":\"arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/${INSTANCE_ID}\"}]}"
 
   SCHEDULE_TARGET="{\"Arn\":\"arn:aws:scheduler:::aws-sdk:ec2:startInstances\",
 \"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULER_ROLE}\",
 \"Input\":\"{\\\"InstanceIds\\\":[\\\"${INSTANCE_ID}\\\"]}\"}"
 
-  # DISABLED until task 10 lands the nightly fold verb and the boot service that calls it. Creating
-  # it now records the trigger in Git and keeps the enable to one flag; starting a box every night
-  # to run nothing would just be a nightly bill.
   if aws scheduler get-schedule --region "$REGION" --name "$NAME-nightly" >/dev/null 2>&1; then
     aws scheduler update-schedule --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
       --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
       --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null
-    changed "schedule updated to $SCHEDULE_EXPRESSION ($SCHEDULE_STATE)"
   else
     aws scheduler create-schedule --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
       --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
       --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null
-    changed "schedule created at $SCHEDULE_EXPRESSION ($SCHEDULE_STATE)"
   fi
-else
-  changed "ensure schedule at $SCHEDULE_EXPRESSION ($SCHEDULE_STATE)"
 fi
 
 step "Done"
 echo ""
 echo "  Instance: ${INSTANCE_ID}"
-echo "  Schedule: ${SCHEDULE_EXPRESSION} UTC, gated in seed on the Eastern calendar"
+echo "  Schedule: ${SCHEDULE_EXPRESSION} UTC ($SCHEDULE_STATE)"
 echo ""
 if [[ "$APPLY" != true ]]; then
   echo "  Dry run. Re-run with --apply to make these changes."
