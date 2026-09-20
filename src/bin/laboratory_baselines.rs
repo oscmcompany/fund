@@ -510,6 +510,8 @@ mod tests {
             reference_digest: None,
             factor_specification: None,
             microstructure: dataset::Microstructure::Omitted,
+            quote_summary_digest: None,
+            trade_summary_digest: None,
         }
     }
 

@@ -54,6 +54,15 @@ const CONTINUOUS_FEATURES: &[&str] = &[
 
 const CATEGORICAL_FEATURES: &[&str] = &["sector", "industry"];
 
+/// Every feature's reading, and the panel they are shares of.
+///
+/// Carried together because a coverage figure is meaningless without the denominator it was taken
+/// against, and the two would otherwise be recovered from different places by whoever renders them.
+struct Triaged {
+    readings: Vec<laboratory::FeatureTriaged>,
+    panel_rows: usize,
+}
+
 /// The frame restricted to the rows where `column` holds a value.
 fn defined_rows(frame: &DataFrame, column: &str) -> Result<DataFrame, PolarsError> {
     let defined = frame.column(column)?.is_not_null();
@@ -138,7 +147,7 @@ async fn main() {
 
     let code = match run(&parameters).await {
         Ok(triaged) => {
-            println!("{}", render(&triaged));
+            println!("{}", render(&triaged.readings, triaged.panel_rows));
             0
         }
         Err(error) => {
@@ -152,9 +161,7 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn run(
-    parameters: &Parameters,
-) -> Result<Vec<laboratory::FeatureTriaged>, Box<dyn std::error::Error>> {
+async fn run(parameters: &Parameters) -> Result<Triaged, Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
 
@@ -210,24 +217,23 @@ async fn run(
 
     // The control is drawn once over the whole frame rather than per session, so it is independent
     // of everything including the session it lands in.
-    let mut frame = dataset.returns;
+    let mut panel = dataset.returns;
     let mut generator = StdRng::seed_from_u64(parameters.seed);
-    let control: Vec<f64> = (0..frame.height())
+    let control: Vec<f64> = (0..panel.height())
         .map(|_| generator.random::<f64>())
         .collect();
-    frame.with_column(Column::new(CONTROL_FEATURE.into(), control))?;
+    panel.with_column(Column::new(CONTROL_FEATURE.into(), control))?;
 
     let mut triaged = Vec::new();
     for feature in CONTINUOUS_FEATURES.iter().chain([&CONTROL_FEATURE]) {
         let column = *feature;
-        // Ranked over the rows where it is defined, and the share it is not is reported rather than
-        // folded away: a feature measured on 70% of the panel is a different instrument from one
-        // measured on all of it, and the two print the same number. Dropping rows cannot smuggle a
-        // pair across a gap, because `pair_with_next_session` tests session adjacency itself.
-        let frame = defined_rows(&frame, column)?;
-        let defined = frame.height();
+        // Ranked over the rows where it is defined; the panel stays behind as the calendar, so a
+        // session this feature is wholly absent from is still a gap rather than an adjacency.
+        let defined = defined_rows(&panel, column)?;
+        let measured_rows = defined.height();
         let paired = information::pair_with_next_session(
-            &frame,
+            &defined,
+            &panel,
             column,
             parameters.outcome,
             move |frame| {
@@ -242,13 +248,19 @@ async fn run(
             },
         )?;
         let mut reading = triage(column, &paired, parameters.seed);
-        reading.defined_rows = defined;
+        reading.defined_rows = measured_rows;
         triaged.push(reading);
     }
     for feature in CATEGORICAL_FEATURES {
         let column = *feature;
+        // `clean_data` fills these for every row, so the defined set is the panel -- but recorded
+        // from the frame rather than assumed, because "it is always defined" is how the continuous
+        // loop's count came to be the only one that was true.
+        let defined = defined_rows(&panel, column)?;
+        let measured_rows = defined.height();
         let paired = information::pair_with_next_session(
-            &frame,
+            &defined,
+            &panel,
             column,
             parameters.outcome,
             move |frame| {
@@ -256,7 +268,9 @@ async fn run(
                 Ok(Feature::Nominal(information::category_bins(&values)))
             },
         )?;
-        triaged.push(triage(column, &paired, parameters.seed));
+        let mut reading = triage(column, &paired, parameters.seed);
+        reading.defined_rows = measured_rows;
+        triaged.push(reading);
     }
 
     // Ranked by the share rather than the raw bits: bits are capped by the target's own entropy, so
@@ -287,7 +301,10 @@ async fn run(
         }
     }
 
-    Ok(triaged)
+    Ok(Triaged {
+        readings: triaged,
+        panel_rows: panel.height(),
+    })
 }
 
 /// Measures every session's cross-section and summarizes the three figures across them.
@@ -337,15 +354,31 @@ fn share_of(record: &laboratory::FeatureTriaged) -> f64 {
         .map_or(f64::NEG_INFINITY, |value| value.mean)
 }
 
-fn render(triaged: &[laboratory::FeatureTriaged]) -> String {
+/// The ranking, with each feature's coverage beside its reading.
+///
+/// `coverage` is the share of the panel the feature was defined on. Printed rather than journalled
+/// alone because the directive is to report the undefined share *alongside* the estimate, and a
+/// feature measured on two thirds of the panel renders identically to one measured on all of it.
+fn render(triaged: &[laboratory::FeatureTriaged], panel_rows: usize) -> String {
     let mut rendered = format!(
-        "{:<32}{:>10}{:>28}{:>28}{:>28}{:>28}\n",
-        "feature", "sessions", "excess_share", "excess_bits", "target_entropy_bits", "null_bits"
+        "{:<32}{:>10}{:>10}{:>28}{:>28}{:>28}{:>28}\n",
+        "feature",
+        "coverage",
+        "sessions",
+        "excess_share",
+        "excess_bits",
+        "target_entropy_bits",
+        "null_bits"
     );
     for record in triaged {
         rendered.push_str(&format!(
-            "{:<32}{:>10}{:>28}{:>28}{:>28}{:>28}\n",
+            "{:<32}{:>10}{:>10}{:>28}{:>28}{:>28}{:>28}\n",
             record.feature,
+            // Two decimals, so a gap of a few hundred rows in half a million cannot round to 100.
+            format!(
+                "{:.2}%",
+                100.0 * record.defined_rows as f64 / panel_rows.max(1) as f64
+            ),
             record.sessions,
             distribution(record.excess_share),
             distribution(record.excess_bits),
@@ -435,7 +468,7 @@ mod tests {
 
         assert!((share_of(&record) - 0.0301).abs() < 1e-12);
 
-        let rendered = render(std::slice::from_ref(&record));
+        let rendered = render(std::slice::from_ref(&record), 1_000);
         assert!(rendered.contains("excess_share"), "{rendered}");
         assert!(rendered.contains("target_entropy_bits"), "{rendered}");
         assert!(rendered.contains("+0.030100"), "{rendered}");

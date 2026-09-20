@@ -93,6 +93,15 @@ pub struct DatasetFingerprint {
     /// one carrying these columns and one not, are different measurements that every other field
     /// reports identically.
     pub microstructure: Microstructure,
+    /// Content of the quote summaries that were joined, or `None` where none were.
+    ///
+    /// Beside `microstructure` for the reason `splits_digest` sits beside the window: knowing the
+    /// summaries were joined does not say *which* summaries, and a partition rewritten in place
+    /// changes every feature value while leaving the bars and therefore every other field alone.
+    /// A year of these was rewritten under this archive in September 2026.
+    pub quote_summary_digest: Option<u64>,
+    /// Content of the trade summaries that were joined, or `None` where none were.
+    pub trade_summary_digest: Option<u64>,
 }
 
 impl DatasetFingerprint {
@@ -245,6 +254,7 @@ pub async fn intraday(
         },
         None,
         Microstructure::Omitted,
+        None,
     )?;
 
     Ok(IntradayDataset { bars, fingerprint })
@@ -364,13 +374,16 @@ const TRADE_COLUMNS: &[&str] = &[
 /// Reads the window's daily quote and trade summaries, joined to each other on `(ticker, session)`.
 ///
 /// All three archives stamp a session at the 16:00 Eastern close, so the key is exact rather than
-/// approximate — verified against the stored partitions before this was written.
+/// approximate — verified against the stored partitions before this was written. The *symbol* is
+/// not exact until `boundaries` is applied: the bars have been stitched onto each company's current
+/// ticker and these partitions are still filed under the one in force at the time.
 async fn load_microstructure(
     s3_client: &S3Client,
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
-) -> Result<DataFrame, DatasetError> {
+    boundaries: &truncate::BoundaryTable,
+) -> Result<(DataFrame, u64, u64), DatasetError> {
     let quotes = load_summaries(
         s3_client,
         bucket,
@@ -380,6 +393,7 @@ async fn load_microstructure(
         session,
     )
     .await?;
+    let quotes = stitch_summaries(quotes, boundaries, "covered_seconds")?;
     let trades = load_summaries(
         s3_client,
         bucket,
@@ -389,16 +403,64 @@ async fn load_microstructure(
         session,
     )
     .await?;
+    let trades = stitch_summaries(trades, boundaries, "trade_count")?;
+
+    // Digested as loaded, so a partition rewritten in place changes the fingerprint even though the
+    // bars did not move. This archive has had a year of quote partitions rewritten under it.
+    let quotes_digest = digest_of(&quotes)?;
+    let trades_digest = digest_of(&trades)?;
 
     // Outer: a session can hold one family and not the other, and dropping the rows that only one
     // covers would make a gap in either archive read as a gap in both.
-    Ok(quotes
+    let joined = quotes
         .lazy()
         .join(
             trades.lazy(),
             [col("ticker"), col("timestamp")],
             [col("ticker"), col("timestamp")],
             JoinArgs::new(JoinType::Full).with_coalesce(JoinCoalesce::CoalesceColumns),
+        )
+        .collect()?;
+    Ok((joined, quotes_digest, trades_digest))
+}
+
+/// The schema an absent family presents, so the join still contributes its columns as nulls.
+fn empty_summary_schema(columns: &[&str]) -> Schema {
+    let mut schema = Schema::default();
+    schema.insert(PlSmallStr::from("ticker"), DataType::String);
+    schema.insert(PlSmallStr::from("timestamp"), DataType::Int64);
+    for name in columns {
+        schema.insert(PlSmallStr::from(*name), DataType::Float64);
+    }
+    schema
+}
+
+/// Moves each summary row onto the symbol its company trades as now, and collapses the collisions.
+///
+/// Without this a renamed security's bars say `NEW` while its summaries say `OLD`, the join misses,
+/// and every reading for its pre-rename sessions is absent rather than wrong — which understates
+/// coverage and conditions the result on a set that excludes renames, a set that is anything but
+/// random. Two predecessors can land on one successor, so `keep_by` decides which row survives: the
+/// one that saw the most of the session, mirroring how a collided bar keeps its highest volume.
+fn stitch_summaries(
+    frame: DataFrame,
+    boundaries: &truncate::BoundaryTable,
+    keep_by: &str,
+) -> Result<DataFrame, DatasetError> {
+    let stitched = truncate::stitch_bars(frame, boundaries)?;
+    Ok(stitched
+        .lazy()
+        // Ascending, so `Last` keeps the fullest row of a collided pair.
+        .sort(
+            [keep_by],
+            SortMultipleOptions::default().with_maintain_order(true),
+        )
+        .unique_stable(
+            Some(polars::prelude::Selector::ByName {
+                names: vec![PlSmallStr::from("ticker"), PlSmallStr::from("timestamp")].into(),
+                strict: false,
+            }),
+            UniqueKeepStrategy::Last,
         )
         .collect()?)
 }
@@ -453,10 +515,20 @@ async fn load_summaries(
             "Some summary partitions were skipped; the sessions they cover will read as null"
         );
     }
+    // Absent and unreadable are different events. Nothing found is a family this window does not
+    // cover, which the contract above says must read as nulls; partitions that failed to project
+    // are a schema problem and stay fatal, because silently nulling those would hide it.
     if frames.is_empty() {
-        return Err(DatasetError::Window(format!(
-            "no readable partitions under {prefix} in the lookback window"
-        )));
+        if unreadable > 0 {
+            return Err(DatasetError::Window(format!(
+                "all {unreadable} partitions under {prefix} failed projection; none could be read"
+            )));
+        }
+        warn!(
+            prefix,
+            "No partitions under this prefix in the window; its columns will read as null"
+        );
+        return Ok(DataFrame::empty_with_schema(&empty_summary_schema(columns)));
     }
     Ok(concat(&frames, UnionArgs::default())?.collect()?)
 }
@@ -479,6 +551,8 @@ pub struct UnscreenedWindow {
     splits_digest: u64,
     boundaries_digest: u64,
     microstructure: Microstructure,
+    /// The quote and trade summary contents, or `None` where none were joined.
+    summary_digests: Option<(u64, u64)>,
 }
 
 /// Reads and folds one archive window without screening it.
@@ -520,10 +594,19 @@ pub async fn unscreened_window(
     let bars = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
     // Left, and after every fold: these columns are an addition to the panel the bars define, so a
     // session either archive is short of must leave nulls rather than remove the bar row.
+    let mut summary_digests: Option<(u64, u64)> = None;
     let bars = match microstructure {
         Microstructure::Omitted => bars,
         Microstructure::Joined => {
-            let summaries = load_microstructure(s3_client, bucket, lookback_days, session).await?;
+            let (summaries, quotes, trades) = load_microstructure(
+                s3_client,
+                bucket,
+                lookback_days,
+                session,
+                &adjustments.boundaries,
+            )
+            .await?;
+            summary_digests = Some((quotes, trades));
             let before = bars.height();
             let joined = bars
                 .lazy()
@@ -553,6 +636,7 @@ pub async fn unscreened_window(
         splits_digest: adjustments.splits_digest,
         boundaries_digest: adjustments.boundaries_digest,
         microstructure,
+        summary_digests,
     })
 }
 
@@ -606,6 +690,7 @@ async fn read_window(
         },
         None,
         window.microstructure,
+        window.summary_digests,
     )?;
 
     Ok((filtered, fingerprint))
@@ -673,6 +758,7 @@ fn fingerprint_of(
     digests: Digests,
     factor_specification: Option<FactorSpecification>,
     microstructure: Microstructure,
+    summary_digests: Option<(u64, u64)>,
 ) -> Result<DatasetFingerprint, DatasetError> {
     let timestamps = frame.column("timestamp")?.i64()?;
     let tickers = frame.column("ticker")?.str()?;
@@ -695,6 +781,8 @@ fn fingerprint_of(
         reference_digest: digests.reference,
         factor_specification,
         microstructure,
+        quote_summary_digest: summary_digests.map(|(quotes, _)| quotes),
+        trade_summary_digest: summary_digests.map(|(_, trades)| trades),
     })
 }
 
@@ -791,6 +879,51 @@ async fn load_archived_bars(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renamed security's summaries follow its bars onto the successor symbol.
+    ///
+    /// `load_archived_bars` stitches a bar onto the company's current ticker while these partitions
+    /// stay filed under the one in force at the time, so without the relabel the join misses every
+    /// pre-rename session — silently, as absence rather than error.
+    #[test]
+    fn test_a_renamed_security_keeps_its_summaries() {
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
+        let renamed_on =
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap());
+        let boundaries = truncate::BoundaryTable::from_dataframe(
+            &polars::prelude::df![
+                "ticker" => ["OLD"],
+                "date" => [renamed_on.date().format("%Y-%m-%d").to_string()],
+                "reason" => ["renamed"],
+                "related_ticker" => ["NEW"],
+            ]
+            .expect("the boundary fixture must build"),
+        )
+        .expect("the boundary table must index");
+
+        let summaries = polars::prelude::df![
+            "ticker" => ["OLD"],
+            "timestamp" => [session.plus_calendar_days(-30).midnight().timestamp_millis()],
+            "covered_seconds" => [100.0f64],
+        ]
+        .expect("the summary fixture must build");
+
+        let stitched = stitch_summaries(summaries, &boundaries, "covered_seconds")
+            .expect("the relabel must run");
+        let tickers: Vec<&str> = stitched
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+
+        assert_eq!(
+            tickers,
+            vec!["NEW"],
+            "a pre-rename summary must carry the symbol its bar now carries"
+        );
+    }
 
     /// The two adjustment digests, for tests that vary those and join no universe.
     fn digests(splits: u64, boundaries: u64) -> Digests {
@@ -946,6 +1079,7 @@ mod tests {
             digests(0xAB, 0xCD),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
         let strictly = fingerprint_of(
@@ -956,6 +1090,7 @@ mod tests {
             digests(0xAB, 0xCD),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
         let loosely = fingerprint_of(
@@ -966,6 +1101,7 @@ mod tests {
             digests(0xAB, 0xCD),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
 
@@ -1031,6 +1167,7 @@ mod tests {
                 digests(0xAB, 0xCD),
                 None,
                 Microstructure::Omitted,
+                None,
             )
             .unwrap()
         };
@@ -1066,6 +1203,7 @@ mod tests {
             digests(0xAB, 0xCD),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1082,6 +1220,7 @@ mod tests {
             digests(0xAB, 0xCD),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
         assert_eq!(unscreened.screen(), None);
@@ -1110,6 +1249,7 @@ mod tests {
                 },
                 None,
                 Microstructure::Omitted,
+                None,
             )
             .unwrap()
         };
@@ -1142,6 +1282,7 @@ mod tests {
             digests(0xAB, 0xCD),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
 
@@ -1175,6 +1316,7 @@ mod tests {
                 digests(0xAB, 0xCD),
                 specification,
                 Microstructure::Omitted,
+                None,
             )
             .unwrap()
         };
@@ -1226,6 +1368,7 @@ mod tests {
             digests(digest_of(&before).unwrap(), 0),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
         let after = fingerprint_of(
@@ -1236,6 +1379,7 @@ mod tests {
             digests(digest_of(&after).unwrap(), 0),
             None,
             Microstructure::Omitted,
+            None,
         )
         .unwrap();
 

@@ -147,12 +147,18 @@ fn basis_points(value: Option<f64>) -> String {
 }
 
 /// The `fraction` quantile of a sorted slice, by nearest rank.
+///
+/// `ceil(n * fraction)` is the nearest-rank definition and the previous `round((n - 1) * fraction)`
+/// was not: over `1..=10` it answered 2 for the tenth percentile where nearest rank answers 1, and
+/// it took the upper middle of an even-sized median rather than the lower.
 fn percentile(sorted: &[f64], fraction: f64) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
-    let rank = ((sorted.len() - 1) as f64 * fraction).round() as usize;
-    sorted.get(rank).copied()
+    let rank = (sorted.len() as f64 * fraction).ceil() as usize;
+    sorted
+        .get(rank.saturating_sub(1).min(sorted.len() - 1))
+        .copied()
 }
 
 /// What a per-session screen costs beyond the names it refuses.
@@ -416,8 +422,11 @@ fn render(
         out.push_str(&format!(
             "{:<20} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}\n",
             entry.name,
+            // Two decimals, because a hundredth of a percent of this panel is sixty rows and
+            // `{:.0}%` rendered 99.97% as a clean 100 -- which is how a coverage gap became a
+            // claim of complete coverage in the body of the pull request this fixes.
             format!(
-                "{:.0}%",
+                "{:.2}%",
                 100.0 * entry.cost.measured as f64 / entry.rows.max(1) as f64
             ),
             basis_points(entry.cost.tenth_percentile),
@@ -473,6 +482,24 @@ mod tests {
         // Literals rather than the constants, so a change to either has to be made deliberately.
         assert_eq!(parameters.lookback_days, 730);
         assert_eq!(parameters.trailing_days, 30);
+    }
+
+    /// Nearest rank, on a slice where the two definitions disagree.
+    ///
+    /// Over `1..=10` nearest rank answers 1 for the tenth percentile; the interpolate-and-round
+    /// formula this replaced answered 2, and took the upper middle of an even-sized median. Pinned
+    /// to the values rather than recomputed, so a change to the rule has to be made deliberately.
+    #[test]
+    fn test_the_percentile_is_the_nearest_rank_its_name_claims() {
+        let ten: Vec<f64> = (1..=10).map(f64::from).collect();
+
+        assert_eq!(percentile(&ten, 0.1), Some(1.0));
+        assert_eq!(percentile(&ten, 0.5), Some(5.0));
+        assert_eq!(percentile(&ten, 0.9), Some(9.0));
+        // The edges, where a rank can fall outside the slice if it is not clamped.
+        assert_eq!(percentile(&ten, 0.0), Some(1.0));
+        assert_eq!(percentile(&ten, 1.0), Some(10.0));
+        assert_eq!(percentile(&[], 0.5), None);
     }
 
     /// The sweep is calendar days and says so, because the alternative claims tradability.
@@ -580,11 +607,19 @@ mod tests {
             .count();
         assert_eq!(differences, 1, "one pair must produce one row\n{report}");
 
-        // An unmeasured cost reads as `none`, never as a zero that would price a free round trip.
-        assert!(
-            report
-                .contains("narrow                     50%      none      none      none      none"),
-            "{report}"
+        // An unmeasured cost reads as `none`, never as a zero that would price a free round trip,
+        // and coverage carries decimals so a gap cannot round away. Asserted on the row's fields
+        // rather than its spacing, which is a column width nobody should have to count.
+        let coverage_row = report
+            .lines()
+            .find(|line| line.starts_with("narrow") && line.contains('%'))
+            .expect("the cost table must carry a row per screen");
+        let fields: Vec<&str> = coverage_row.split_whitespace().collect();
+        assert_eq!(fields[1], "50.00%", "{report}");
+        assert_eq!(
+            &fields[2..],
+            ["none", "none", "none", "none", "none"],
+            "an unmeasured reading must name itself, never read as zero\n{report}"
         );
     }
 }

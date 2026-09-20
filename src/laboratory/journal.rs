@@ -464,6 +464,8 @@ mod tests {
                     .expect("the fixture must be a usable specification"),
             ),
             microstructure: crate::laboratory::dataset::Microstructure::Omitted,
+            quote_summary_digest: None,
+            trade_summary_digest: None,
         }
     }
 

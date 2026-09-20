@@ -284,6 +284,8 @@ mod tests {
                     reference_digest: Some(0xEF),
                     factor_specification: None,
                     microstructure: crate::laboratory::dataset::Microstructure::Omitted,
+                    quote_summary_digest: None,
+                    trade_summary_digest: None,
                 },
                 revision: None,
             }),
