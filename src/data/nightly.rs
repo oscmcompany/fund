@@ -183,8 +183,11 @@ pub fn plan(
 /// ran out of budget is healed by the next one and a night that errored is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegOutcome {
-    /// Ran to its own end. Carries whether the pass considered itself complete.
+    /// Reached every session it was given. Carries whether the passes considered themselves
+    /// complete.
     Folded { complete: bool, written: usize },
+    /// The budget ran out partway, so some of this leg's sessions were never reached.
+    CutShort { written: usize, unreached: usize },
     /// The budget was spent before this leg started.
     Skipped,
     /// The leg returned an error, which the run stepped over to reach the next one.
@@ -228,11 +231,13 @@ impl NightlyReport {
             .collect()
     }
 
-    /// Legs the budget did not reach.
+    /// Legs the budget did not reach, or reached and then ran out on.
     pub fn skipped(&self) -> Vec<&Leg> {
         self.legs
             .iter()
-            .filter(|(_, outcome)| matches!(outcome, LegOutcome::Skipped))
+            .filter(|(_, outcome)| {
+                matches!(outcome, LegOutcome::Skipped | LegOutcome::CutShort { .. })
+            })
             .map(|(leg, _)| leg)
             .collect()
     }
@@ -267,7 +272,9 @@ impl NightlyReport {
         self.legs
             .iter()
             .map(|(_, outcome)| match outcome {
-                LegOutcome::Folded { written, .. } => *written,
+                LegOutcome::Folded { written, .. } | LegOutcome::CutShort { written, .. } => {
+                    *written
+                }
                 LegOutcome::Skipped | LegOutcome::Failed(_) => 0,
             })
             .sum()
@@ -491,6 +498,27 @@ mod report_tests {
         assert!(report
             .to_string()
             .contains("skipped for budget: bars/one_day"));
+    }
+
+    #[test]
+    fn test_a_leg_cut_off_partway_is_not_a_clean_fold() {
+        // The distinction that matters: this leg wrote real partitions, and everything downstream
+        // reads those as finished sessions. Only the exit code says the rest were never reached.
+        let plan = plan_over(&["2026-09-14", "2026-09-18"]);
+        let mut report = NightlyReport::over(&plan);
+        report.record(
+            Leg::Quotes(IntradayCadence::FiveMinute),
+            LegOutcome::CutShort {
+                written: 2,
+                unreached: 3,
+            },
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.written(), 2);
+        assert_eq!(
+            report.skipped(),
+            vec![&Leg::Quotes(IntradayCadence::FiveMinute)]
+        );
     }
 
     #[test]

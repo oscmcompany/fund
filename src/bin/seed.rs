@@ -1663,11 +1663,8 @@ async fn archive_nightly(
             report.record(leg, LegOutcome::Skipped);
             continue;
         }
-        let outcome = match run_leg(leg, &plan, &calendar, &arguments.files).await {
-            Ok(summary) => LegOutcome::Folded {
-                complete: summary.is_complete(),
-                written: summary.sessions_written(),
-            },
+        let outcome = match run_leg(leg, &plan, &calendar, &arguments.files, &budget).await {
+            Ok(outcome) => outcome,
             Err(error) => {
                 error!(%leg, %error, "Nightly leg failed, continuing to the next");
                 LegOutcome::Failed(error.to_string())
@@ -1680,20 +1677,24 @@ async fn archive_nightly(
     Ok(Outcome::Nightly(report))
 }
 
-/// Runs one leg over the plan's sessions.
+/// Runs one leg, stopping between sessions once the budget is spent.
+///
+/// Daily bars are the exception and run as one windowed call: they are one request per session,
+/// and `sessions_to_request` derives its correction window from the whole window, so feeding it
+/// one session at a time would re-request every session every night.
 async fn run_leg(
     leg: Leg,
     plan: &nightly::NightlyPlan,
     calendar: &TradingCalendar,
     files: &FlatFileArguments,
-) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
+    budget: &nightly::Budget,
+) -> Result<LegOutcome, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
-    let sessions = plan.sessions();
     let scope = Scope::new(NameSelection::WholeMarket, SessionSelection::Absent)?;
 
-    match leg {
-        Leg::DailyBars => Ok(archive::archive_missing_sessions(
+    if let Leg::DailyBars = leg {
+        let summary = archive::archive_missing_sessions(
             &s3_client,
             &MassiveClient::from_env()?,
             &bucket,
@@ -1701,45 +1702,80 @@ async fn run_leg(
             plan.window_end(),
             Some(calendar),
         )
-        .await?),
-        Leg::IntradayBars(_) => Ok(archive::archive_intraday_sessions(
-            &s3_client,
-            &MassiveClient::from_env()?,
-            &bucket,
-            leg.interval(),
-            plan.window_start(),
-            plan.window_end(),
-            &scope,
-            Some(calendar),
-        )
-        .await?),
-        Leg::Quotes(cadence) => {
-            let flat_files = flat_file_client(files).await?;
-            Ok(archive::archive_quote_sessions(
-                &s3_client,
-                &archive::QuoteSource::WholeSession(&flat_files),
-                calendar,
-                &bucket,
-                sessions,
-                &scope,
-                cadence,
-                ForeignProvider::Refuse,
-            )
-            .await?)
-        }
-        Leg::Trades => {
-            let flat_files = flat_file_client(files).await?;
-            Ok(archive::archive_trade_sessions(
-                &s3_client,
-                &archive::TradeSource::WholeSession(&flat_files),
-                calendar,
-                &bucket,
-                sessions,
-                &scope,
-            )
-            .await?)
-        }
+        .await?;
+        return Ok(LegOutcome::Folded {
+            complete: summary.is_complete(),
+            written: summary.sessions_written(),
+        });
     }
+
+    let sessions = plan.sessions();
+    let mut written = 0;
+    let mut complete = true;
+
+    for (index, session) in sessions.iter().enumerate() {
+        // Asked between sessions and never inside one, so a fold cannot be cut off having written
+        // a session at one cadence and not the other.
+        if !budget.may_start_another() {
+            warn!(
+                %leg,
+                unreached = sessions.len() - index,
+                "Budget spent; the next run will reach the rest"
+            );
+            return Ok(LegOutcome::CutShort {
+                written,
+                unreached: sessions.len() - index,
+            });
+        }
+
+        let one = [*session];
+        let summary = match leg {
+            Leg::DailyBars => unreachable!("handled above, before the per-session loop"),
+            Leg::IntradayBars(_) => {
+                archive::archive_intraday_sessions(
+                    &s3_client,
+                    &MassiveClient::from_env()?,
+                    &bucket,
+                    leg.interval(),
+                    *session,
+                    *session,
+                    &scope,
+                    Some(calendar),
+                )
+                .await?
+            }
+            Leg::Quotes(cadence) => {
+                let flat_files = flat_file_client(files).await?;
+                archive::archive_quote_sessions(
+                    &s3_client,
+                    &archive::QuoteSource::WholeSession(&flat_files),
+                    calendar,
+                    &bucket,
+                    &one,
+                    &scope,
+                    cadence,
+                    ForeignProvider::Refuse,
+                )
+                .await?
+            }
+            Leg::Trades => {
+                let flat_files = flat_file_client(files).await?;
+                archive::archive_trade_sessions(
+                    &s3_client,
+                    &archive::TradeSource::WholeSession(&flat_files),
+                    calendar,
+                    &bucket,
+                    &one,
+                    &scope,
+                )
+                .await?
+            }
+        };
+        written += summary.sessions_written();
+        complete &= summary.is_complete();
+    }
+
+    Ok(LegOutcome::Folded { complete, written })
 }
 
 /// The flat-file client the pass's source names.
