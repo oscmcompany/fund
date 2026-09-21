@@ -22,8 +22,7 @@ ARCHIVE_PREFIX="data/*"
 # day. tests/test_schedules.rs pins this literal.
 SCHEDULE_EXPRESSION="cron(0 7 * * ? *)"
 
-# No nightly fold verb exists yet, so the trigger is recorded but off.
-SCHEDULE_STATE="DISABLED"
+SCHEDULE_STATE="ENABLED"
 
 STALL_PERIOD_SECONDS=300
 STALL_EVALUATION_PERIODS=12
@@ -206,6 +205,8 @@ fi
 
 step "Instance $NAME"
 
+CREATED_INSTANCE=false
+
 # Filtered on the profile as well as the role: without it, provisioning a second profile would
 # adopt the first profile's box and hand it this profile's secrets.
 read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS <<<"$(
@@ -247,6 +248,9 @@ apt-get install -y git curl unzip build-essential pkg-config libssl-dev cmake
 curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip
 unzip -q /tmp/awscli.zip -d /tmp
 /tmp/aws/install --update
+printf '%s' "${PROFILE}" > /etc/fund-profile
+mkdir -p /var/log/fund
+chown ubuntu:ubuntu /var/log/fund
 sudo -u ubuntu -H bash -c '
   set -euxo pipefail
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -257,26 +261,129 @@ sudo -u ubuntu -H bash -c '
   cargo build --release --bin seed
   git rev-parse HEAD > target/release/.seed-built-from
 '
+install -m 0644 /home/ubuntu/fund/tools/fund-archive-worker.service \
+  /etc/systemd/system/fund-archive-worker.service
+systemctl daemon-reload
+systemctl enable fund-archive-worker.service
 CLOUDINIT
 )"
 
   changed "run instance $INSTANCE_TYPE from $AMI_ID, bootstrapping the checkout and toolchain"
   if [[ "$APPLY" == true ]]; then
-    INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
-      --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
-      --iam-instance-profile "Name=$NAME" \
-      --security-group-ids "$SECURITY_GROUP_ID" \
-      --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_SIZE_GB,VolumeType=gp3}" \
-      --metadata-options "HttpTokens=required" \
-      --user-data "$USER_DATA" \
-      --tag-specifications "ResourceType=instance,Tags=[\
+    # EC2 sees a new instance profile later than IAM does, so `wait instance-profile-exists` is not
+    # enough on a first provision; RunInstances rejects the name until its own view catches up.
+    # One token for every attempt, so a lost response is retried rather than duplicated: EC2 can
+    # accept RunInstances and still fail to answer, and a second token would be a second worker.
+    CLIENT_TOKEN="$(uuidgen)"
+    INSTANCE_ID=""
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" \
+        --client-token "$CLIENT_TOKEN" \
+        --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
+        --iam-instance-profile "Name=$NAME" \
+        --security-group-ids "$SECURITY_GROUP_ID" \
+        --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_SIZE_GB,VolumeType=gp3}" \
+        --metadata-options "HttpTokens=required" \
+        --user-data "$USER_DATA" \
+        --tag-specifications "ResourceType=instance,Tags=[\
 {Key=Name,Value=$NAME},{Key=fund-role,Value=archive-worker},\
 {Key=fund-profile,Value=$PROFILE},{Key=fund-ami,Value=$AMI_ID}]" \
-      --query 'Instances[0].InstanceId' --output text)"
+        --query 'Instances[0].InstanceId' --output text 2>/dev/null)"; then
+        break
+      fi
+      echo "    instance profile not visible to EC2 yet; retry $attempt of 10"
+      INSTANCE_ID=""
+      sleep 10
+    done
+    if [[ -z "$INSTANCE_ID" ]]; then
+      echo "Error: RunInstances kept rejecting instance profile $NAME after 10 attempts." >&2
+      exit 1
+    fi
+    CREATED_INSTANCE=true
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
     echo "    instance $INSTANCE_ID running; cloud-init is still building seed"
     echo "    follow it with: aws ssm start-session --target $INSTANCE_ID"
     echo "    then: tail -f /var/log/cloud-init-output.log"
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# Boot service
+#
+# cloud-init installs these on a new instance. An existing one predates them, or predates a change
+# to them, and the schedule would otherwise start a box with nothing to run and nothing to stop it.
+# --------------------------------------------------------------------------- #
+
+step "Boot service on ${INSTANCE_ID}"
+
+if [[ "$CREATED_INSTANCE" == true ]]; then
+  unchanged "cloud-init installs the profile and unit on a new instance"
+elif [[ "$APPLY" != true ]]; then
+  changed "reconcile /etc/fund-profile and fund-archive-worker.service over SSM"
+else
+  ORIGINAL_STATE="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text)"
+  if [[ "$ORIGINAL_STATE" != "running" ]]; then
+    echo "    starting $INSTANCE_ID to reach it over SSM (it was $ORIGINAL_STATE)"
+    # A maintenance start is indistinguishable from a scheduled one to the box, so the boot service
+    # may already be folding; the first commands below stop it rather than race a self-stop.
+    aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+  fi
+
+  echo "    waiting for the SSM agent"
+  SSM_READY=false
+  for _ in $(seq 1 30); do
+    if [[ "$(aws ssm describe-instance-information --region "$REGION" \
+      --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+      --query 'length(InstanceInformationList)' --output text 2>/dev/null)" == "1" ]]; then
+      SSM_READY=true
+      break
+    fi
+    sleep 10
+  done
+  if [[ "$SSM_READY" != true ]]; then
+    echo "Error: $INSTANCE_ID never registered with SSM; cannot install the boot service." >&2
+    exit 1
+  fi
+
+  RECONCILE_COMMANDS="$(mktemp)"
+  trap 'rm -f "$RECONCILE_COMMANDS"' EXIT
+  cat > "$RECONCILE_COMMANDS" <<JSON
+{"commands":[
+"touch /etc/fund-archive-worker.inhibit",
+"systemctl stop fund-archive-worker.service 2>/dev/null || true",
+"printf '%s' '${PROFILE}' > /etc/fund-profile",
+"mkdir -p /var/log/fund && chown ubuntu:ubuntu /var/log/fund",
+"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
+"install -m 0644 /home/ubuntu/fund/tools/fund-archive-worker.service /etc/systemd/system/fund-archive-worker.service",
+"systemctl daemon-reload",
+"systemctl enable fund-archive-worker.service",
+"systemctl is-enabled fund-archive-worker.service",
+"rm -f /etc/fund-archive-worker.inhibit"
+]}
+JSON
+
+  RECONCILE_ID="$(aws ssm send-command --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --document-name AWS-RunShellScript --parameters "file://$RECONCILE_COMMANDS" \
+    --query 'Command.CommandId' --output text)"
+  aws ssm wait command-executed --region "$REGION" \
+    --command-id "$RECONCILE_ID" --instance-id "$INSTANCE_ID" 2>/dev/null || true
+  RECONCILE_STATUS="$(aws ssm get-command-invocation --region "$REGION" \
+    --command-id "$RECONCILE_ID" --instance-id "$INSTANCE_ID" --query Status --output text)"
+  rm -f "$RECONCILE_COMMANDS"
+
+  if [[ "$RECONCILE_STATUS" != "Success" ]]; then
+    echo "Error: installing the boot service failed ($RECONCILE_STATUS)." >&2
+    aws ssm get-command-invocation --region "$REGION" --command-id "$RECONCILE_ID" \
+      --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text >&2
+    exit 1
+  fi
+  changed "installed the profile and enabled fund-archive-worker.service"
+
+  if [[ "$ORIGINAL_STATE" != "running" ]]; then
+    echo "    returning $INSTANCE_ID to stopped"
+    aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
   fi
 fi
 
@@ -393,14 +500,26 @@ if [[ "$APPLY" == true ]]; then
 \"Input\":\"{\\\"InstanceIds\\\":[\\\"${INSTANCE_ID}\\\"]}\"}"
 
   if aws scheduler get-schedule --region "$REGION" --name "$NAME-nightly" >/dev/null 2>&1; then
-    aws scheduler update-schedule --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
-      --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
-      --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null
+    VERB=update-schedule
   else
-    aws scheduler create-schedule --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
-      --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
-      --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null
+    VERB=create-schedule
   fi
+
+  # Scheduler validates that it can assume the role, and a freshly written trust policy is not
+  # visible to it immediately.
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if aws scheduler "$VERB" --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
+      --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
+      --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null 2>&1; then
+      break
+    fi
+    if [[ "$attempt" == 10 ]]; then
+      echo "Error: $VERB kept failing; $SCHEDULER_ROLE is not assumable by scheduler yet." >&2
+      exit 1
+    fi
+    echo "    scheduler cannot assume $SCHEDULER_ROLE yet; retry $attempt of 10"
+    sleep 10
+  done
 fi
 
 step "Done"

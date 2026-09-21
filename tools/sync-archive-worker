@@ -9,8 +9,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="$REPO_ROOT/target/release/seed"
 
-# Which commit the binary was actually built from. The checkout's own HEAD cannot answer that: it
-# moves to the new revision before the build, so a failed build leaves the two disagreeing.
+# Which commit last built successfully here. Reported, never consulted to skip work: cargo decides
+# freshness from the source files themselves, and a second answer to the same question is a second
+# thing to be wrong. A hand-run `cargo build` desynchronises this file and must stay harmless.
 STAMP="$REPO_ROOT/target/release/.seed-built-from"
 
 log() {
@@ -33,16 +34,12 @@ fi
 remote_head="$(git rev-parse origin/master)"
 built_from="$(cat "$STAMP" 2>/dev/null || echo none)"
 
-if [[ "$built_from" == "$remote_head" && -x "$BINARY" ]]; then
-  log "Binary already built from ${remote_head:0:8}; nothing to do"
-  exit 0
-fi
-
-log "Building $remote_head (binary is from $built_from)"
+log "Syncing to ${remote_head:0:8} (last successful build: ${built_from:0:8})"
 git reset --hard origin/master
 
-# Written only on success, so an interrupted or failed build leaves the stamp naming the commit the
-# binary really came from and the next run retries.
+# Built unconditionally. An up-to-date build is a freshness check cargo answers in seconds, and
+# skipping on a stamp is what let a failed build leave the worker on stale code until the next
+# commit landed.
 if cargo build --release --bin seed; then
   echo "$remote_head" > "$STAMP"
   log "Built ${remote_head:0:8}"
@@ -50,7 +47,7 @@ if cargo build --release --bin seed; then
 fi
 
 if [[ -x "$BINARY" ]]; then
-  log "ERROR: build failed at ${remote_head:0:8}; the binary is still from $built_from"
+  log "ERROR: build failed at ${remote_head:0:8}; the binary is whatever last built here"
   exit 1
 fi
 
