@@ -17,12 +17,15 @@ set -euo pipefail
 #                     starts it and the run stops it -- so it bills ~35 minutes a night.
 #   EBS volume        The instance's root disk, and the only one. Ubuntu, the checkout, the Rust
 #                     toolchain, target/release/seed, and staging room for a session's pull.
-#                     It is the one resource that bills while the box is off, ~$8/month.
-#   IAM role          What the box may touch: archive data, its own profile's secrets, and the
-#                     StopInstances call it ends with. Nothing else.
+#                     The main thing that bills while the box is off, ~$8/month.
+#   IAM role          Archive data, this profile's secrets, and the StopInstances call the run
+#                     ends with, plus AmazonSSMManagedInstanceCore so SSM can reach the box.
 #   instance profile  The wrapper EC2 needs to hand the role to the instance. No settings.
 #   security group    No ingress. SSM reaches the box outbound, so nothing listens on a port.
-#   stall alarm       A cost backstop, not a notifier -- see the alarm section below.
+#   stall alarm       A cost backstop, not a notifier -- see the alarm section below. Bills a
+#                     CloudWatch alarm-metric while it exists.
+#   scheduler role    Lets EventBridge Scheduler call StartInstances on this instance, and
+#                     nothing else. Separate from the instance role: a different principal.
 #   schedule          Starts the instance nightly -- see the schedule section below.
 # --------------------------------------------------------------------------- #
 
@@ -474,13 +477,9 @@ fi
 # --------------------------------------------------------------------------- #
 # Stall alarm
 #
-# Nobody is listening to this and nobody is meant to. Its only action is the EC2 stop API, so it
-# exists to stop a hung run from billing all day -- not to tell anyone the run hung. A failed
-# nightly is silent today; the exit code goes nowhere.
-#
-# It must not become the normal way the box turns off. `run-archive-worker` ends with its own stop
-# call, and relying on an idle alarm instead is how a finished run sat running for an hour on
-# 2026-09-19. An hour under a megabyte of NetworkIn is dead, not slow: the fold pulls continuously.
+# Its only action is the EC2 stop API, so it stops a hung run from billing all day and tells nobody
+# it happened -- a failed nightly is silent. It is the backstop, not how the box normally turns
+# off: `run-archive-worker` ends with its own stop call.
 # --------------------------------------------------------------------------- #
 
 step "Stall alarm $NAME-stalled"
@@ -501,13 +500,9 @@ fi
 # --------------------------------------------------------------------------- #
 # Nightly schedule
 #
-# EventBridge Scheduler calls StartInstances directly. EC2 has no native scheduled start -- its
-# Scheduled Instances are capacity reservations, not power control -- so the alternatives are a
-# Lambda on a timer doing the same call, or leaving the box running. This costs nothing at one
-# invocation a day and keeps the expression in Git, where tests/test_schedules.rs asserts it.
-#
-# The schedule decides nothing beyond when to wake the box. Whether there is a session to fold is
-# `TradingCalendar`'s answer, asked in `seed` after boot.
+# EventBridge Scheduler calls StartInstances, because EC2 has no native scheduled start -- its
+# Scheduled Instances are capacity reservations, not power control. It decides only when to wake
+# the box; whether there is a session to fold is `TradingCalendar`'s answer, asked in `seed`.
 # --------------------------------------------------------------------------- #
 
 step "Nightly schedule $NAME-nightly"
