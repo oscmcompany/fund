@@ -2071,10 +2071,9 @@ fn merge_or_refuse(
     fetched: DataFrame,
     key: &str,
 ) -> Result<DataFrame, ArchiveError> {
-    merge_partitions(existing, fetched).map_err(|error| ArchiveError::SchemaConflict {
-        key: key.to_string(),
-        message: error.to_string(),
-    })
+    let disagreement = schema_disagreement(&existing, &fetched);
+    merge_partitions(existing, fetched)
+        .map_err(|error| classify_merge_failure(error, disagreement, key))
 }
 
 /// The same refusal for the splits table, which merges on its own rule rather than the bar key.
@@ -2086,10 +2085,65 @@ fn merge_splits_or_refuse(
     fetched: DataFrame,
     key: &str,
 ) -> Result<DataFrame, ArchiveError> {
-    splits::merge_splits(existing, fetched).map_err(|error| ArchiveError::SchemaConflict {
-        key: key.to_string(),
-        message: error.to_string(),
-    })
+    let disagreement = schema_disagreement(&existing, &fetched);
+    splits::merge_splits(existing, fetched)
+        .map_err(|error| classify_merge_failure(error, disagreement, key))
+}
+
+/// Calls a failed merge a schema conflict only when the two frames actually disagreed.
+///
+/// The disagreement is established before the merge rather than read off the failure: polars
+/// reports a mismatched `concat` as `InvalidOperation`, the same variant it raises for faults that
+/// have nothing to do with schema, so the error alone cannot tell the two apart. A merge that fails
+/// while the columns agree keeps its own error, because telling an operator to re-fold a partition
+/// that is not malformed sends them to repair the wrong thing.
+fn classify_merge_failure(
+    error: PolarsError,
+    disagreement: Option<String>,
+    key: &str,
+) -> ArchiveError {
+    match disagreement {
+        Some(message) => ArchiveError::SchemaConflict {
+            key: key.to_string(),
+            message,
+        },
+        None => ArchiveError::Frame(error),
+    }
+}
+
+/// How a stored frame's columns differ from the ones being written, or `None` when they agree.
+fn schema_disagreement(existing: &DataFrame, fetched: &DataFrame) -> Option<String> {
+    let stored = existing.schema();
+    let incoming = fetched.schema();
+    if stored == incoming {
+        return None;
+    }
+
+    let missing: Vec<&str> = stored
+        .iter_names()
+        .filter(|name| !incoming.contains(name))
+        .map(|name| name.as_str())
+        .collect();
+    let added: Vec<&str> = incoming
+        .iter_names()
+        .filter(|name| !stored.contains(name))
+        .map(|name| name.as_str())
+        .collect();
+
+    // Neither list is populated when the columns match by name but differ in type or in order,
+    // which `concat` rejects just as firmly.
+    if missing.is_empty() && added.is_empty() {
+        return Some(
+            "the stored columns match by name but differ in type or order from this write"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "the stored partition holds [{}] that this write does not, and this write holds [{}] that \
+         it does not",
+        missing.join(", "),
+        added.join(", ")
+    ))
 }
 
 /// Root of the quote-summary archive, beside the bars rather than under them.
@@ -3941,7 +3995,7 @@ async fn put_object_with_precondition(
 /// archive and the table agree about what constitutes a duplicate. The fetched rows are appended
 /// last and `UniqueKeepStrategy::Last` keeps them, which makes a re-fetch a correction rather than a
 /// duplicate.
-fn merge_partitions(existing: DataFrame, fetched: DataFrame) -> Result<DataFrame, ArchiveError> {
+fn merge_partitions(existing: DataFrame, fetched: DataFrame) -> Result<DataFrame, PolarsError> {
     let combined = concat([existing.lazy(), fetched.lazy()], UnionArgs::default())?
         .unique_stable(
             Some(polars::prelude::Selector::ByName {
@@ -6000,9 +6054,57 @@ mod tests {
             .expect_err("a schema that will not combine is a refusal, not a replacement");
 
         match error {
-            ArchiveError::SchemaConflict { key, .. } => assert_eq!(key, "some/key"),
+            ArchiveError::SchemaConflict { key, message } => {
+                assert_eq!(key, "some/key");
+                // Asserted, not just the key: a constant message would satisfy a key-only check
+                // while telling an operator nothing about which column moved.
+                assert!(message.contains("a_retired_column"), "{message}");
+                assert!(message.contains("close_price"), "{message}");
+            }
             other => panic!("expected a schema conflict, got {other}"),
         }
+    }
+
+    /// A merge can fail for reasons that are not the two frames disagreeing, and those must keep
+    /// their own error — a refusal that names the wrong cause sends the repair to the wrong place.
+    #[test]
+    fn test_frames_that_agree_on_their_columns_report_no_disagreement() {
+        let stored = df![
+            "ticker" => ["AAPL"],
+            "bar_interval" => ["one_day"],
+            "timestamp" => [1_i64],
+        ]
+        .unwrap();
+        let incoming = df![
+            "ticker" => ["MSFT"],
+            "bar_interval" => ["one_day"],
+            "timestamp" => [2_i64],
+        ]
+        .unwrap();
+
+        assert_eq!(schema_disagreement(&stored, &incoming), None);
+        assert_eq!(
+            classify_merge_failure(
+                PolarsError::ComputeError("ran out of memory".into()),
+                None,
+                "some/key"
+            )
+            .to_string(),
+            ArchiveError::Frame(PolarsError::ComputeError("ran out of memory".into())).to_string(),
+        );
+    }
+
+    /// Columns that match by name but not by type are still a disagreement `concat` refuses, and
+    /// the name-difference lists are both empty there — so that branch needs its own reading.
+    #[test]
+    fn test_a_type_change_is_a_disagreement_even_though_no_column_moved() {
+        let stored = df!["ticker" => ["AAPL"], "timestamp" => [1_i64]].unwrap();
+        let incoming = df!["ticker" => ["AAPL"], "timestamp" => [1.0_f64]].unwrap();
+
+        let disagreement =
+            schema_disagreement(&stored, &incoming).expect("a changed type is a disagreement");
+
+        assert!(disagreement.contains("type or order"), "{disagreement}");
     }
 
     /// The refusal has to name the object, or an operator reading a failed nightly cannot tell
@@ -6044,7 +6146,10 @@ mod tests {
             .expect_err("a stored table that will not combine is a refusal");
 
         match error {
-            ArchiveError::SchemaConflict { key, .. } => assert_eq!(key, SPLITS_ARCHIVE_KEY),
+            ArchiveError::SchemaConflict { key, message } => {
+                assert_eq!(key, SPLITS_ARCHIVE_KEY);
+                assert!(message.contains("a_retired_column"), "{message}");
+            }
             other => panic!("expected a schema conflict, got {other}"),
         }
     }
