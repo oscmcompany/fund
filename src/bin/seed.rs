@@ -1758,24 +1758,33 @@ async fn run_reference(
             unwritten.push((*as_of, "the budget was spent".to_string()));
             continue;
         }
-        let tickers = archive::session_symbols(&s3_client, &bucket, *as_of).await?;
+        // Stepped over rather than propagated, the way the leg loop steps over a failed leg: the
+        // grid points are independent, so one historical hole must not block the current quarter.
+        let tickers = match archive::session_symbols(&s3_client, &bucket, *as_of).await {
+            Ok(tickers) => tickers,
+            Err(error) => {
+                error!(%as_of, %error, "Could not read the session's symbols");
+                unwritten.push((*as_of, error.to_string()));
+                continue;
+            }
+        };
         if tickers.is_empty() {
             unwritten.push((*as_of, "no bar partition to take symbols from".to_string()));
             continue;
         }
         let sweep =
-            archive::archive_reference(&s3_client, &massive, &bucket, *as_of, &tickers).await?;
-        if sweep.wrote_partition() {
-            written.push(*as_of);
-        } else {
-            unwritten.push((
-                *as_of,
-                format!(
-                    "{} of {} symbols unanswered",
-                    sweep.failed.len(),
-                    sweep.requested
-                ),
-            ));
+            match archive::archive_reference(&s3_client, &massive, &bucket, *as_of, &tickers).await
+            {
+                Ok(sweep) => sweep,
+                Err(error) => {
+                    error!(%as_of, %error, "The reference sweep failed for this quarter");
+                    unwritten.push((*as_of, error.to_string()));
+                    continue;
+                }
+            };
+        match sweep.refusal() {
+            None => written.push(*as_of),
+            Some(refusal) => unwritten.push((*as_of, refusal.to_string())),
         }
     }
 

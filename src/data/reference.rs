@@ -261,6 +261,32 @@ pub struct ReferenceSweep {
     pub failed: Vec<ReferenceFailure>,
 }
 
+/// Why a sweep left the partition it was writing alone.
+///
+/// Each variant carries the count that produced it, because "unanswered" and "no records" are read
+/// off a failed nightly run by someone who then has to decide whether to retry or to investigate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepRefusal {
+    /// Symbols whose request never completed, so any partition written would be partial.
+    Unanswered { failed: usize, requested: usize },
+    /// Every request completed and the feed had a record for none of them.
+    NoRecords { requested: usize },
+}
+
+impl std::fmt::Display for SweepRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SweepRefusal::Unanswered { failed, requested } => {
+                write!(formatter, "{failed} of {requested} symbols unanswered")
+            }
+            SweepRefusal::NoRecords { requested } => write!(
+                formatter,
+                "the feed had no record for any of {requested} symbols"
+            ),
+        }
+    }
+}
+
 /// One symbol the feed was asked about and did not answer for, and why.
 ///
 /// The reason travels with the symbol rather than only reaching the log, because a sweep is judged
@@ -279,12 +305,27 @@ impl ReferenceSweep {
 
     /// Whether this sweep replaced the partition.
     ///
-    /// Distinct from [`ReferenceSweep::is_complete`], which asks about the symbols: the archive
-    /// refuses the write when any symbol went unanswered, so a non-zero `found` alone would call a
-    /// preserved partition a fresh one. Asked by every caller that counts written partitions, and
-    /// answered here so two of them cannot drift apart.
+    /// Distinct from [`ReferenceSweep::is_complete`], which asks about the symbols rather than the
+    /// object. Derived from [`ReferenceSweep::refusal`] so the two answers cannot disagree.
     pub fn wrote_partition(&self) -> bool {
-        self.failed.is_empty() && self.found > 0
+        self.refusal().is_none()
+    }
+
+    /// Why the partition was left alone, or `None` if it was replaced.
+    ///
+    /// The archive refuses the write on any unanswered symbol, and separately has nothing to write
+    /// when the feed had no record for any of them. Those are different facts about a night and the
+    /// operator reading a failed run needs to be told which one happened.
+    pub fn refusal(&self) -> Option<SweepRefusal> {
+        if !self.failed.is_empty() {
+            return Some(SweepRefusal::Unanswered {
+                failed: self.failed.len(),
+                requested: self.requested,
+            });
+        }
+        (self.found == 0).then_some(SweepRefusal::NoRecords {
+            requested: self.requested,
+        })
     }
 
     /// The share of requested symbols the feed had a record for.
@@ -302,9 +343,7 @@ mod sweep_tests {
 
     #[test]
     fn test_a_sweep_that_answered_nothing_wrote_nothing() {
-        // The case the two callers both have to get right: the feed was reachable, no symbol came
-        // back, and the archive preserved what was already there. Counting that as written is how a
-        // quarter reads as filled when the partition is the old one.
+        // The feed was reachable, no symbol came back, and the archive preserved what it had.
         let empty = ReferenceSweep {
             requested: 4_000,
             found: 0,
@@ -312,6 +351,14 @@ mod sweep_tests {
             failed: Vec::new(),
         };
         assert!(!empty.wrote_partition());
+        assert_eq!(
+            empty.refusal(),
+            Some(SweepRefusal::NoRecords { requested: 4_000 })
+        );
+        assert_eq!(
+            empty.refusal().expect("a refusal").to_string(),
+            "the feed had no record for any of 4000 symbols"
+        );
         assert!(
             empty.is_complete(),
             "no symbol failed or was refused, so the symbol-level question says complete"
@@ -330,12 +377,40 @@ mod sweep_tests {
             }],
         };
         assert!(!partial.wrote_partition());
+        assert_eq!(
+            partial.refusal(),
+            Some(SweepRefusal::Unanswered {
+                failed: 1,
+                requested: 4_000
+            })
+        );
+    }
+
+    #[test]
+    fn test_the_refusal_names_the_unanswered_symbols_before_the_empty_feed() {
+        // Both conditions at once, which is what an outage mid-sweep looks like. Reporting no
+        // records would send the operator to the feed when the run is what failed.
+        let outage = ReferenceSweep {
+            requested: 4_000,
+            found: 0,
+            absent: Vec::new(),
+            failed: vec![ReferenceFailure {
+                ticker: "AAPL".to_string(),
+                reason: "timed out".to_string(),
+            }],
+        };
+        assert_eq!(
+            outage.refusal(),
+            Some(SweepRefusal::Unanswered {
+                failed: 1,
+                requested: 4_000
+            })
+        );
     }
 
     #[test]
     fn test_an_absent_symbol_does_not_stop_the_write() {
-        // A 404 for a symbol that traded is the ordinary residual of a whole-market sweep, and the
-        // archive writes through it. Only a failure to ask stops the write.
+        // A 404 for a symbol that traded is the ordinary residual of a whole-market sweep.
         let swept = ReferenceSweep {
             requested: 4_000,
             found: 3_998,
@@ -343,6 +418,7 @@ mod sweep_tests {
             failed: Vec::new(),
         };
         assert!(swept.wrote_partition());
+        assert_eq!(swept.refusal(), None);
         assert!(!swept.is_complete());
     }
 }
