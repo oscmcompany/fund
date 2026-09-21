@@ -2223,9 +2223,15 @@ async fn read_reference_partition(
 
 /// Names folded at once.
 ///
-/// Eight because the endpoint's throughput is the ceiling rather than ours: measured at roughly
-/// 100,000 quotes a second on 2026-08-20, and thirty-two concurrent fetches moved no more than
-/// eight did. More concurrency buys only memory, since each fold holds its session's observations.
+/// Eight, and the reason recorded here in 2026-08-20 was wrong: thirty-two moved no more than eight
+/// did, which was read as the endpoint's ceiling. Re-measured 2026-09-19, the plateau is a
+/// straggler — a name is a serial pagination chain, so a short list is capped by its longest member
+/// rather than by Alpaca, and splitting the work by time range instead reached 286,000 quotes a
+/// second across thirty-two streams with no throttling.
+///
+/// Eight is kept because the whole-market universe is twelve thousand names, where one slow name is
+/// amortised and the bound is concurrency times per-stream rate: about 41 minutes for a session,
+/// inside the nightly budget. Raising it is an open measurement on the worker, not a known win.
 const QUOTE_CONCURRENCY: usize = 8;
 
 /// Attempts per symbol before a session gives up on it.

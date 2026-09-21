@@ -112,9 +112,26 @@ enum Command {
     ArchiveNightly(NightlyArguments),
 }
 
+/// Which vendor a nightly run takes its quotes and prints from.
+///
+/// A flag rather than a constant because the answer has a date on it: Massive Advanced lapses
+/// 2026-10-11 and the flat files stop existing, while the subscription could also be re-bought.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum NightlyProvider {
+    /// Alpaca, one request per name. Needs no subscription beyond the one the account already has.
+    Alpaca,
+    /// Massive's flat files, one object per session. Requires Advanced.
+    MassiveFlatFile,
+}
+
 /// What one scheduled nightly run may do.
 #[derive(Debug, Args)]
 struct NightlyArguments {
+    /// Which vendor the quote and trade legs read. Bars come from Massive either way.
+    ///
+    /// Named `--provider` because `--source` already names which copy of a flat file to read.
+    #[arg(long, value_enum, default_value_t = NightlyProvider::Alpaca)]
+    provider: NightlyProvider,
     /// How many recent trading sessions to check for gaps. More than one because the run repairs
     /// by set difference, so a missed night is healed by the next rather than by anyone noticing.
     #[arg(long, default_value_t = 5)]
@@ -1663,7 +1680,7 @@ async fn archive_nightly(
             report.record(leg, LegOutcome::Skipped);
             continue;
         }
-        let outcome = match run_leg(leg, &plan, &calendar, &arguments.files, &budget).await {
+        let outcome = match run_leg(leg, &plan, &calendar, arguments, &budget).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 error!(%leg, %error, "Nightly leg failed, continuing to the next");
@@ -1689,7 +1706,7 @@ async fn run_leg(
     leg: Leg,
     plan: &nightly::NightlyPlan,
     calendar: &TradingCalendar,
-    files: &FlatFileArguments,
+    arguments: &NightlyArguments,
     budget: &nightly::Budget,
 ) -> Result<LegOutcome, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
@@ -1748,10 +1765,23 @@ async fn run_leg(
                 .await?
             }
             Leg::Quotes(cadence) => {
-                let flat_files = flat_file_client(files).await?;
+                // Bound outside the match so it outlives the borrow, and built only on the arm that
+                // needs it: an Alpaca run must not demand flat-file credentials.
+                let flat_files;
+                let market_data;
+                let source = match arguments.provider {
+                    NightlyProvider::Alpaca => {
+                        market_data = market_data_client().await?;
+                        archive::QuoteSource::PerName(&market_data)
+                    }
+                    NightlyProvider::MassiveFlatFile => {
+                        flat_files = flat_file_client(&arguments.files).await?;
+                        archive::QuoteSource::WholeSession(&flat_files)
+                    }
+                };
                 archive::archive_quote_sessions(
                     &s3_client,
-                    &archive::QuoteSource::WholeSession(&flat_files),
+                    &source,
                     calendar,
                     &bucket,
                     &one,
@@ -1762,14 +1792,20 @@ async fn run_leg(
                 .await?
             }
             Leg::Trades => {
-                let flat_files = flat_file_client(files).await?;
+                let flat_files;
+                let market_data;
+                let source = match arguments.provider {
+                    NightlyProvider::Alpaca => {
+                        market_data = market_data_client().await?;
+                        archive::TradeSource::PerName(&market_data)
+                    }
+                    NightlyProvider::MassiveFlatFile => {
+                        flat_files = flat_file_client(&arguments.files).await?;
+                        archive::TradeSource::WholeSession(&flat_files)
+                    }
+                };
                 archive::archive_trade_sessions(
-                    &s3_client,
-                    &archive::TradeSource::WholeSession(&flat_files),
-                    calendar,
-                    &bucket,
-                    &one,
-                    &scope,
+                    &s3_client, &source, calendar, &bucket, &one, &scope,
                 )
                 .await?
             }
@@ -2411,6 +2447,17 @@ fn sip_market_data() -> Result<MarketDataClient, SeedError> {
     Ok(MarketDataClient::new(credentials, DataFeed::Sip))
 }
 
+/// The market data client, on the feed the archive is allowed to fold.
+///
+/// SIP is pinned rather than read from `ALPACA_DATA_FEED` for the reason `quote_sources` gives:
+/// IEX's best bid and offer is not the national one.
+async fn market_data_client() -> Result<MarketDataClient, Box<dyn std::error::Error>> {
+    Ok(MarketDataClient::new(
+        AlpacaCredentials::from_env()?,
+        DataFeed::Sip,
+    ))
+}
+
 async fn quote_sources(
     window: &Window,
 ) -> Result<(MarketDataClient, TradingCalendar), Box<dyn std::error::Error>> {
@@ -2484,7 +2531,7 @@ async fn measure(
     cadence: IntradayCadence,
 ) {
     println!(
-        "{:<8}{:<12}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
+        "{:<8}{:<12}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
         "ticker",
         "session",
         "mean_bp",
@@ -2492,6 +2539,8 @@ async fn measure(
         "p90_bp",
         "first_bp",
         "min_bp",
+        "bid_size",
+        "ask_size",
         "quotes",
         "covered_s"
     );
@@ -2543,7 +2592,7 @@ fn print_session_row(
         .map(basis_points)
         .fold(f64::NAN, |narrowest, bucket| bucket.min(narrowest));
     println!(
-        "{:<8}{:<12}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10}{:>12.0}",
+        "{:<8}{:<12}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10.1}{:>10.1}{:>10}{:>12.0}",
         ticker.as_str(),
         session.to_string(),
         basis_points(row),
@@ -2552,6 +2601,8 @@ fn print_session_row(
             .value(),
         opening,
         tightest,
+        row.bid_size_mean(),
+        row.ask_size_mean(),
         quotes_folded,
         row.covered_seconds()
     );
