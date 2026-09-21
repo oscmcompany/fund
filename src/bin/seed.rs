@@ -112,9 +112,26 @@ enum Command {
     ArchiveNightly(NightlyArguments),
 }
 
+/// Which vendor a nightly run takes its quotes and prints from.
+///
+/// The flat-file arm needs Massive Advanced, which lapses 2026-10-11.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum NightlyProvider {
+    /// Alpaca's REST endpoint, one request per name. Needs no subscription beyond the one the
+    /// account already has.
+    AlpacaRest,
+    /// Massive's flat files, one object per session. Requires Advanced.
+    MassiveFlatFile,
+}
+
 /// What one scheduled nightly run may do.
 #[derive(Debug, Args)]
 struct NightlyArguments {
+    /// Which vendor the quote and trade legs read. Bars come from Massive either way.
+    ///
+    /// Named `--provider` because `--source` already names which copy of a flat file to read.
+    #[arg(long, value_enum, default_value_t = NightlyProvider::AlpacaRest)]
+    provider: NightlyProvider,
     /// How many recent trading sessions to check for gaps. More than one because the run repairs
     /// by set difference, so a missed night is healed by the next rather than by anyone noticing.
     #[arg(long, default_value_t = 5)]
@@ -1663,7 +1680,7 @@ async fn archive_nightly(
             report.record(leg, LegOutcome::Skipped);
             continue;
         }
-        let outcome = match run_leg(leg, &plan, &calendar, &arguments.files, &budget).await {
+        let outcome = match run_leg(leg, &plan, &calendar, arguments, &budget).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 error!(%leg, %error, "Nightly leg failed, continuing to the next");
@@ -1689,7 +1706,7 @@ async fn run_leg(
     leg: Leg,
     plan: &nightly::NightlyPlan,
     calendar: &TradingCalendar,
-    files: &FlatFileArguments,
+    arguments: &NightlyArguments,
     budget: &nightly::Budget,
 ) -> Result<LegOutcome, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
@@ -1713,6 +1730,45 @@ async fn run_leg(
     }
 
     let sessions = plan.sessions();
+
+    // Bound before the loop so one client serves every session, and so the faithfulness floor is
+    // asked of the whole plan before a single print is fetched. Not built for intraday bars, which
+    // read Massive's API: a missing flat-file credential must not abort a leg that never needed it.
+    let flat_files;
+    let market_data;
+    let trade_source = match leg {
+        Leg::IntradayBars(_) => None,
+        _ => Some(match arguments.provider {
+            NightlyProvider::AlpacaRest => {
+                market_data = market_data_client().await?;
+                archive::TradeSource::PerName(&market_data)
+            }
+            NightlyProvider::MassiveFlatFile => {
+                flat_files = flat_file_client(&arguments.files).await?;
+                archive::TradeSource::WholeSession(&flat_files)
+            }
+        }),
+    };
+
+    if let (Leg::Trades, Some(trade_source)) = (leg, &trade_source) {
+        // Past the floor Alpaca folds an opening auction print the archive excludes, adding
+        // 0.3-2.2% of session volume and varying by name.
+        let unfaithful = trade_source.unfaithful_sessions(sessions);
+        if let Some(earliest) = unfaithful.first() {
+            return Err(format!(
+                "{trade_source} trades are not faithful before {}: {} of {} planned sessions are \
+                 earlier, from {earliest}. Writing them would add volume the archive correctly \
+                 excludes; re-fold from the raw tee instead.",
+                trade_source
+                    .faithful_from()
+                    .expect("a route that refuses a session has a floor"),
+                unfaithful.len(),
+                sessions.len(),
+            )
+            .into());
+        }
+    }
+
     let mut written = 0;
     let mut complete = true;
 
@@ -1748,10 +1804,18 @@ async fn run_leg(
                 .await?
             }
             Leg::Quotes(cadence) => {
-                let flat_files = flat_file_client(files).await?;
+                let Some(source) = &trade_source else {
+                    unreachable!("only intraday bars skip the source, and this is not that arm")
+                };
+                let quote_source = match source {
+                    archive::TradeSource::PerName(client) => archive::QuoteSource::PerName(client),
+                    archive::TradeSource::WholeSession(files) => {
+                        archive::QuoteSource::WholeSession(files)
+                    }
+                };
                 archive::archive_quote_sessions(
                     &s3_client,
-                    &archive::QuoteSource::WholeSession(&flat_files),
+                    &quote_source,
                     calendar,
                     &bucket,
                     &one,
@@ -1762,14 +1826,34 @@ async fn run_leg(
                 .await?
             }
             Leg::Trades => {
-                let flat_files = flat_file_client(files).await?;
+                let flat_files;
+                let market_data;
+                let source = match arguments.provider {
+                    NightlyProvider::AlpacaRest => {
+                        market_data = market_data_client().await?;
+                        archive::TradeSource::PerName(&market_data)
+                    }
+                    NightlyProvider::MassiveFlatFile => {
+                        flat_files = flat_file_client(&arguments.files).await?;
+                        archive::TradeSource::WholeSession(&flat_files)
+                    }
+                };
+                // Refused before a print is fetched: past the floor Alpaca folds an opening auction
+                // print the archive excludes, adding 0.3-2.2% of session volume.
+                let unfaithful = source.unfaithful_sessions(&one);
+                if let Some(earliest) = unfaithful.first() {
+                    return Err(format!(
+                        "{source} trades are not faithful before {}: {earliest} is earlier. \
+                         Writing it would add volume the archive correctly excludes; re-fold \
+                         from the raw tee instead.",
+                        source
+                            .faithful_from()
+                            .expect("a route that refuses a session has a floor"),
+                    )
+                    .into());
+                }
                 archive::archive_trade_sessions(
-                    &s3_client,
-                    &archive::TradeSource::WholeSession(&flat_files),
-                    calendar,
-                    &bucket,
-                    &one,
-                    &scope,
+                    &s3_client, &source, calendar, &bucket, &one, &scope,
                 )
                 .await?
             }
@@ -2411,6 +2495,17 @@ fn sip_market_data() -> Result<MarketDataClient, SeedError> {
     Ok(MarketDataClient::new(credentials, DataFeed::Sip))
 }
 
+/// The market data client, on the feed the archive is allowed to fold.
+///
+/// SIP is pinned rather than read from `ALPACA_DATA_FEED` for the reason `quote_sources` gives:
+/// IEX's best bid and offer is not the national one.
+async fn market_data_client() -> Result<MarketDataClient, Box<dyn std::error::Error>> {
+    Ok(MarketDataClient::new(
+        AlpacaCredentials::from_env()?,
+        DataFeed::Sip,
+    ))
+}
+
 async fn quote_sources(
     window: &Window,
 ) -> Result<(MarketDataClient, TradingCalendar), Box<dyn std::error::Error>> {
@@ -2484,7 +2579,7 @@ async fn measure(
     cadence: IntradayCadence,
 ) {
     println!(
-        "{:<8}{:<12}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
+        "{:<8}{:<12}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
         "ticker",
         "session",
         "mean_bp",
@@ -2492,6 +2587,8 @@ async fn measure(
         "p90_bp",
         "first_bp",
         "min_bp",
+        "bid_size",
+        "ask_size",
         "quotes",
         "covered_s"
     );
@@ -2543,7 +2640,7 @@ fn print_session_row(
         .map(basis_points)
         .fold(f64::NAN, |narrowest, bucket| bucket.min(narrowest));
     println!(
-        "{:<8}{:<12}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10}{:>12.0}",
+        "{:<8}{:<12}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10.2}{:>10.1}{:>10.1}{:>10}{:>12.0}",
         ticker.as_str(),
         session.to_string(),
         basis_points(row),
@@ -2552,6 +2649,8 @@ fn print_session_row(
             .value(),
         opening,
         tightest,
+        row.bid_size_mean(),
+        row.ask_size_mean(),
         quotes_folded,
         row.covered_seconds()
     );
@@ -2630,6 +2729,50 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> Result<Arguments, clap::Error> {
         Arguments::try_parse_from(std::iter::once("seed").chain(arguments.iter().copied()))
+    }
+
+    /// The nightly command's parsed arguments, or a panic naming what clap rejected.
+    fn nightly(arguments: &[&str]) -> NightlyArguments {
+        let parsed = parse(&[&["archive-nightly"], arguments].concat())
+            .unwrap_or_else(|error| panic!("archive-nightly {arguments:?} should parse: {error}"));
+        match parsed.command {
+            Command::ArchiveNightly(arguments) => arguments,
+            other => panic!("expected a nightly run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_nightly_run_reads_alpaca_unless_told_otherwise() {
+        // Pinned to the literal rather than to NightlyProvider::default(), so flipping the default
+        // back to the flat files after they lapse has to be done here too.
+        assert!(matches!(nightly(&[]).provider, NightlyProvider::AlpacaRest));
+    }
+
+    #[test]
+    fn test_both_provider_routes_are_reachable_by_name() {
+        assert!(matches!(
+            nightly(&["--provider", "alpaca-rest"]).provider,
+            NightlyProvider::AlpacaRest
+        ));
+        assert!(matches!(
+            nightly(&["--provider", "massive-flat-file"]).provider,
+            NightlyProvider::MassiveFlatFile
+        ));
+    }
+
+    #[test]
+    fn test_a_provider_that_is_not_a_route_is_refused() {
+        // `alpaca` alone named the vendor rather than the route, and Alpaca also has a stream this
+        // does not use. It must fail rather than resolve to the REST arm.
+        assert!(parse(&["archive-nightly", "--provider", "alpaca"]).is_err());
+        assert!(parse(&["archive-nightly", "--provider", "massive"]).is_err());
+    }
+
+    #[test]
+    fn test_the_nightly_defaults_are_a_working_night_not_a_placeholder() {
+        let arguments = nightly(&[]);
+        assert_eq!(arguments.lookback_sessions, 5);
+        assert_eq!(arguments.budget_minutes, 240);
     }
 
     fn session(value: &str) -> SessionDate {

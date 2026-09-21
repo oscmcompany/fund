@@ -2223,9 +2223,9 @@ async fn read_reference_partition(
 
 /// Names folded at once.
 ///
-/// Eight because the endpoint's throughput is the ceiling rather than ours: measured at roughly
-/// 100,000 quotes a second on 2026-08-20, and thirty-two concurrent fetches moved no more than
-/// eight did. More concurrency buys only memory, since each fold holds its session's observations.
+/// Thirty-two moving no more than eight is a straggler and not the endpoint's ceiling: a name is a
+/// serial pagination chain, so a short symbol list is bounded by its longest member. Across the
+/// whole-market universe that amortises, making this times the per-stream rate the real bound.
 const QUOTE_CONCURRENCY: usize = 8;
 
 /// Attempts per symbol before a session gives up on it.
