@@ -120,6 +120,16 @@ pub enum ArchiveError {
         existing: String,
         incoming: String,
     },
+    /// A stored partition's schema no longer combines with the one being written.
+    ///
+    /// Refused rather than replaced, on the same grounds as `MixedProvenance`: the fetched frame is
+    /// current-schema but it is not a superset, so overwriting silently drops whatever the stored
+    /// partition held that this response omits. Replacing is a repair an operator asks for.
+    #[error(
+        "{key} holds rows this write cannot be combined with ({message}); replacing it would \
+         discard whatever it holds that this response omits. Re-fold the partition deliberately."
+    )]
+    SchemaConflict { key: String, message: String },
     /// The trading calendar does not span the window, so which dates trade is unanswerable.
     ///
     /// Fatal rather than carried, unlike a failed session: a calendar short of the window drops real
@@ -1867,7 +1877,7 @@ async fn write_partition(
         bucket,
         key,
         fetched,
-        |existing, fetched, key| merge_or_replace(existing, fetched, key),
+        |existing, fetched, key| merge_or_refuse(existing, fetched, key),
         DerivedDataset::Bars,
         Authorship::refusing(provenance),
     )
@@ -2052,29 +2062,34 @@ async fn refuse_a_second_provider(
     })
 }
 
-/// Merges, or falls back to the fetched frame when the two schemas cannot be combined.
+/// Merges, or refuses when the stored partition's schema will not combine with the fetched one.
 ///
-/// A partition written before a column was added or renamed cannot be concatenated with a current
-/// one, and propagating that would cost every session after it in the pass. The fetched frame is
-/// authoritative and current-schema, so replacing is the recoverable outcome; what is lost is
-/// whatever the stale partition held that the fresh response omits, which is worth a warning rather
-/// than an aborted run.
-fn merge_or_replace(
+/// The caller decides what to do with one refused partition; what it must not do is decide for the
+/// rows, which is what replacing them silently did.
+fn merge_or_refuse(
     existing: DataFrame,
     fetched: DataFrame,
     key: &str,
 ) -> Result<DataFrame, ArchiveError> {
-    match merge_partitions(existing, fetched.clone()) {
-        Ok(merged) => Ok(merged),
-        Err(error) => {
-            warn!(
-                key,
-                %error,
-                "Could not merge the existing partition; replacing it with the fetched rows"
-            );
-            Ok(fetched)
-        }
-    }
+    merge_partitions(existing, fetched).map_err(|error| ArchiveError::SchemaConflict {
+        key: key.to_string(),
+        message: error.to_string(),
+    })
+}
+
+/// The same refusal for the splits table, which merges on its own rule rather than the bar key.
+///
+/// Separate from the write it guards so it can be tested; inline in an async S3 function, the
+/// fallback this replaces was unreachable from any test.
+fn merge_splits_or_refuse(
+    existing: DataFrame,
+    fetched: DataFrame,
+    key: &str,
+) -> Result<DataFrame, ArchiveError> {
+    splits::merge_splits(existing, fetched).map_err(|error| ArchiveError::SchemaConflict {
+        key: key.to_string(),
+        message: error.to_string(),
+    })
 }
 
 /// Root of the quote-summary archive, beside the bars rather than under them.
@@ -2747,7 +2762,7 @@ async fn write_quote_partition(
         bucket,
         key,
         frame,
-        |existing, fetched, key| merge_or_replace(existing, fetched, key),
+        |existing, fetched, key| merge_or_refuse(existing, fetched, key),
         DerivedDataset::Quotes,
         authorship,
     )
@@ -3389,7 +3404,7 @@ async fn write_trade_partitions(
             bucket,
             key,
             frame,
-            |existing, fetched, key| merge_or_replace(existing, fetched, key),
+            |existing, fetched, key| merge_or_refuse(existing, fetched, key),
             DerivedDataset::Trades,
             // Carried from the source rather than named here: a repair folds Alpaca into a partition
             // a flat file built, and filing that as Massive-only would hide the provider seam in the
@@ -3454,19 +3469,7 @@ pub async fn archive_splits(
         bucket,
         SPLITS_ARCHIVE_KEY.to_string(),
         frame,
-        // Falls back rather than propagating, for the reason `merge_or_replace` does: a stored
-        // object whose schema stopped matching would otherwise fail every future refresh too.
-        |existing, fetched, key| match splits::merge_splits(existing, fetched.clone()) {
-            Ok(merged) => Ok(merged),
-            Err(error) => {
-                warn!(
-                    key,
-                    %error,
-                    "Could not merge the stored splits table; replacing it with the fetched rows"
-                );
-                Ok(fetched)
-            }
-        },
+        |existing, fetched, key| merge_splits_or_refuse(existing, fetched, key),
         DerivedDataset::Splits,
         Authorship::refusing(Provenance::massive(
             MassivePlan::StocksStarter,
@@ -5976,10 +5979,10 @@ mod tests {
         );
     }
 
-    /// Schema drift must cost one partition's history, not the whole pass. The fetched rows are
-    /// current-schema and authoritative, so replacing is the recoverable outcome.
+    /// A partition that will not combine is refused, because the fetched frame is current-schema
+    /// without being a superset: writing it drops whatever the stored rows held that it omits.
     #[test]
-    fn test_a_partition_that_cannot_be_merged_is_replaced_by_the_fetched_rows() {
+    fn test_a_partition_that_cannot_be_merged_is_refused() {
         let existing = df![
             "ticker" => ["AAPL"],
             "a_retired_column" => [1_i64],
@@ -5993,10 +5996,82 @@ mod tests {
         ]
         .unwrap();
 
-        let result = merge_or_replace(existing, fetched.clone(), "some/key").unwrap();
+        let error = merge_or_refuse(existing, fetched, "some/key")
+            .expect_err("a schema that will not combine is a refusal, not a replacement");
 
-        assert_eq!(result.get_column_names(), fetched.get_column_names());
-        assert_eq!(result.height(), 1);
+        match error {
+            ArchiveError::SchemaConflict { key, .. } => assert_eq!(key, "some/key"),
+            other => panic!("expected a schema conflict, got {other}"),
+        }
+    }
+
+    /// The refusal has to name the object, or an operator reading a failed nightly cannot tell
+    /// which of a session's partitions to re-fold.
+    #[test]
+    fn test_a_schema_conflict_names_the_key_and_the_cause() {
+        let error = ArchiveError::SchemaConflict {
+            key: "data/derived/equity/bars/interval=one_day/date=2026-09-21/part.parquet"
+                .to_string(),
+            message: "lengths don't match".to_string(),
+        };
+
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("date=2026-09-21"), "{rendered}");
+        assert!(rendered.contains("lengths don't match"), "{rendered}");
+    }
+
+    /// The splits table is cumulative and the feed answers with a window, so a replacement drops
+    /// every split older than the current page — the most expensive instance of this defect.
+    #[test]
+    fn test_a_splits_table_that_cannot_be_merged_is_refused() {
+        let existing = df![
+            "ticker" => ["AAPL"],
+            "a_retired_column" => [1_i64],
+        ]
+        .unwrap();
+        let fetched = df![
+            "id" => ["some-id"],
+            "ticker" => ["AAPL"],
+            "execution_date" => ["2026-09-21"],
+            "split_from" => [1_i64],
+            "split_to" => [4_i64],
+            "first_seen" => [1_i64],
+        ]
+        .unwrap();
+
+        let error = merge_splits_or_refuse(existing, fetched, SPLITS_ARCHIVE_KEY)
+            .expect_err("a stored table that will not combine is a refusal");
+
+        match error {
+            ArchiveError::SchemaConflict { key, .. } => assert_eq!(key, SPLITS_ARCHIVE_KEY),
+            other => panic!("expected a schema conflict, got {other}"),
+        }
+    }
+
+    /// A merge that succeeds must still succeed; the refusal is the exceptional path, not the
+    /// normal one, and a guard that refuses everything would pass the test above.
+    #[test]
+    fn test_a_partition_that_combines_is_merged_rather_than_refused() {
+        let existing = df![
+            "ticker" => ["AAPL"],
+            "bar_interval" => ["one_day"],
+            "timestamp" => [1_i64],
+            "close_price" => [100.0_f64],
+        ]
+        .unwrap();
+        let fetched = df![
+            "ticker" => ["MSFT"],
+            "bar_interval" => ["one_day"],
+            "timestamp" => [1_i64],
+            "close_price" => [101.0_f64],
+        ]
+        .unwrap();
+
+        let merged = merge_or_refuse(existing, fetched, "some/key")
+            .expect("two frames of the same schema combine");
+
+        assert_eq!(merged.height(), 2);
     }
 
     #[test]
