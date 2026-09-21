@@ -277,12 +277,73 @@ impl ReferenceSweep {
         self.failed.is_empty() && self.absent.is_empty()
     }
 
+    /// Whether this sweep replaced the partition.
+    ///
+    /// Distinct from [`ReferenceSweep::is_complete`], which asks about the symbols: the archive
+    /// refuses the write when any symbol went unanswered, so a non-zero `found` alone would call a
+    /// preserved partition a fresh one. Asked by every caller that counts written partitions, and
+    /// answered here so two of them cannot drift apart.
+    pub fn wrote_partition(&self) -> bool {
+        self.failed.is_empty() && self.found > 0
+    }
+
     /// The share of requested symbols the feed had a record for.
     ///
     /// `None` on an empty request rather than a misleading 1.0, because a sweep that asked nothing
     /// did not achieve full coverage — it achieved no coverage.
     pub fn coverage(&self) -> Option<f64> {
         (self.requested > 0).then(|| self.found as f64 / self.requested as f64)
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_sweep_that_answered_nothing_wrote_nothing() {
+        // The case the two callers both have to get right: the feed was reachable, no symbol came
+        // back, and the archive preserved what was already there. Counting that as written is how a
+        // quarter reads as filled when the partition is the old one.
+        let empty = ReferenceSweep {
+            requested: 4_000,
+            found: 0,
+            absent: Vec::new(),
+            failed: Vec::new(),
+        };
+        assert!(!empty.wrote_partition());
+        assert!(
+            empty.is_complete(),
+            "no symbol failed or was refused, so the symbol-level question says complete"
+        );
+    }
+
+    #[test]
+    fn test_one_failed_symbol_stops_the_write() {
+        let partial = ReferenceSweep {
+            requested: 4_000,
+            found: 3_999,
+            absent: Vec::new(),
+            failed: vec![ReferenceFailure {
+                ticker: "AAPL".to_string(),
+                reason: "timed out".to_string(),
+            }],
+        };
+        assert!(!partial.wrote_partition());
+    }
+
+    #[test]
+    fn test_an_absent_symbol_does_not_stop_the_write() {
+        // A 404 for a symbol that traded is the ordinary residual of a whole-market sweep, and the
+        // archive writes through it. Only a failure to ask stops the write.
+        let swept = ReferenceSweep {
+            requested: 4_000,
+            found: 3_998,
+            absent: vec!["ZVZZT".to_string(), "ZXYZ.A".to_string()],
+            failed: Vec::new(),
+        };
+        assert!(swept.wrote_partition());
+        assert!(!swept.is_complete());
     }
 }
 
