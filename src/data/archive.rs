@@ -2223,15 +2223,9 @@ async fn read_reference_partition(
 
 /// Names folded at once.
 ///
-/// Eight, and the reason recorded here in 2026-08-20 was wrong: thirty-two moved no more than eight
-/// did, which was read as the endpoint's ceiling. Re-measured 2026-09-19, the plateau is a
-/// straggler — a name is a serial pagination chain, so a short list is capped by its longest member
-/// rather than by Alpaca, and splitting the work by time range instead reached 286,000 quotes a
-/// second across thirty-two streams with no throttling.
-///
-/// Eight is kept because the whole-market universe is twelve thousand names, where one slow name is
-/// amortised and the bound is concurrency times per-stream rate: about 41 minutes for a session,
-/// inside the nightly budget. Raising it is an open measurement on the worker, not a known win.
+/// Thirty-two moving no more than eight is a straggler and not the endpoint's ceiling: a name is a
+/// serial pagination chain, so a short symbol list is bounded by its longest member. Across the
+/// whole-market universe that amortises, making this times the per-stream rate the real bound.
 const QUOTE_CONCURRENCY: usize = 8;
 
 /// Attempts per symbol before a session gives up on it.
