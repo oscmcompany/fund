@@ -10,10 +10,30 @@ set -euo pipefail
 # Mutable settings are corrected on each run; a mismatch in something that cannot be changed in
 # place is reported and refused rather than silently accepted. Replaces the hand-rolled
 # `fund-quote-backfill` box, which was recorded nowhere.
+#
+# What each resource is for, since none of them is self-explanatory from the console:
+#
+#   instance          Runs the nightly fetch-and-fold. Off except during a run -- the schedule
+#                     starts it and the run stops it -- so it bills ~35 minutes a night.
+#   EBS volume        The instance's root disk, and the only one. Ubuntu, the checkout, the Rust
+#                     toolchain, target/release/seed, and staging room for a session's pull.
+#                     The main thing that bills while the box is off, ~$8/month.
+#   IAM role          Archive data, this profile's secrets, and the StopInstances call the run
+#                     ends with, plus AmazonSSMManagedInstanceCore so SSM can reach the box.
+#   instance profile  The wrapper EC2 needs to hand the role to the instance. No settings.
+#   security group    No ingress. SSM reaches the box outbound, so nothing listens on a port.
+#   stall alarm       A cost backstop, not a notifier -- see the alarm section below. Bills a
+#                     CloudWatch alarm-metric while it exists.
+#   scheduler role    Lets EventBridge Scheduler call StartInstances on this instance, and
+#                     nothing else. Separate from the instance role: a different principal.
+#   schedule          Starts the instance nightly -- see the schedule section below.
 # --------------------------------------------------------------------------- #
 
 REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="r6i.2xlarge"
+
+# The root disk. 100 GB because a session's quote pull stages ~65 GB and the 25 GB default cannot
+# hold it; the archive itself lives in S3 and nothing here is durable across a replacement.
 VOLUME_SIZE_GB=100
 ARCHIVE_BUCKET="oscm-fund-archive"
 ARCHIVE_PREFIX="data/*"
@@ -115,18 +135,24 @@ step "IAM role $NAME"
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
+# Carried on the resource as well as in this file, so the console says what the role is for.
+ROLE_DESCRIPTION="Archive worker ($PROFILE): nightly fetch-and-fold of market data into \
+s3://${ARCHIVE_BUCKET}. Managed by tools/provision-archive-worker."
+
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
   unchanged "role exists"
-  changed "refresh trust policy"
+  changed "refresh trust policy and description"
   if [[ "$APPLY" == true ]]; then
     aws iam update-assume-role-policy --role-name "$NAME" \
       --policy-document "$TRUST_POLICY"
+    aws iam update-role --role-name "$NAME" --description "$ROLE_DESCRIPTION" >/dev/null
   fi
 else
   changed "create role"
   if [[ "$APPLY" == true ]]; then
     aws iam create-role --role-name "$NAME" \
-      --assume-role-policy-document "$TRUST_POLICY" >/dev/null
+      --assume-role-policy-document "$TRUST_POLICY" \
+      --description "$ROLE_DESCRIPTION" >/dev/null
     aws iam wait role-exists --role-name "$NAME"
   fi
 fi
@@ -449,7 +475,11 @@ if [[ "$APPLY" == true ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Stall alarm and nightly schedule
+# Stall alarm
+#
+# Its only action is the EC2 stop API, so it stops a hung run from billing all day and tells nobody
+# it happened -- a failed nightly is silent. It is the backstop, not how the box normally turns
+# off: `run-archive-worker` ends with its own stop call.
 # --------------------------------------------------------------------------- #
 
 step "Stall alarm $NAME-stalled"
@@ -467,23 +497,37 @@ if [[ "$APPLY" == true ]]; then
     --alarm-actions "arn:aws:automate:${REGION}:ec2:stop"
 fi
 
+# --------------------------------------------------------------------------- #
+# Nightly schedule
+#
+# EventBridge Scheduler calls StartInstances, because EC2 has no native scheduled start -- its
+# Scheduled Instances are capacity reservations, not power control. It decides only when to wake
+# the box; whether there is a session to fold is `TradingCalendar`'s answer, asked in `seed`.
+# --------------------------------------------------------------------------- #
+
 step "Nightly schedule $NAME-nightly"
 
 SCHEDULER_ROLE="${NAME}-scheduler"
 SCHEDULER_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
+SCHEDULER_DESCRIPTION="Lets EventBridge Scheduler start the $PROFILE archive worker, and nothing \
+else. Managed by tools/provision-archive-worker."
+
 if aws iam get-role --role-name "$SCHEDULER_ROLE" >/dev/null 2>&1; then
   unchanged "scheduler role exists"
   if [[ "$APPLY" == true ]]; then
     aws iam update-assume-role-policy --role-name "$SCHEDULER_ROLE" \
       --policy-document "$SCHEDULER_TRUST"
+    aws iam update-role --role-name "$SCHEDULER_ROLE" \
+      --description "$SCHEDULER_DESCRIPTION" >/dev/null
   fi
 else
   changed "create scheduler role"
   if [[ "$APPLY" == true ]]; then
     aws iam create-role --role-name "$SCHEDULER_ROLE" \
-      --assume-role-policy-document "$SCHEDULER_TRUST" >/dev/null
+      --assume-role-policy-document "$SCHEDULER_TRUST" \
+      --description "$SCHEDULER_DESCRIPTION" >/dev/null
     aws iam wait role-exists --role-name "$SCHEDULER_ROLE"
   fi
 fi
@@ -509,6 +553,8 @@ if [[ "$APPLY" == true ]]; then
   # visible to it immediately.
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if aws scheduler "$VERB" --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
+      --description "Start the $PROFILE archive worker to fold the session that just closed. \
+The box stops itself when the run ends. Managed by tools/provision-archive-worker." \
       --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
       --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null 2>&1; then
       break
