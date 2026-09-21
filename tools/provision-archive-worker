@@ -10,10 +10,27 @@ set -euo pipefail
 # Mutable settings are corrected on each run; a mismatch in something that cannot be changed in
 # place is reported and refused rather than silently accepted. Replaces the hand-rolled
 # `fund-quote-backfill` box, which was recorded nowhere.
+#
+# What each resource is for, since none of them is self-explanatory from the console:
+#
+#   instance          Runs the nightly fetch-and-fold. Off except during a run -- the schedule
+#                     starts it and the run stops it -- so it bills ~35 minutes a night.
+#   EBS volume        The instance's root disk, and the only one. Ubuntu, the checkout, the Rust
+#                     toolchain, target/release/seed, and staging room for a session's pull.
+#                     It is the one resource that bills while the box is off, ~$8/month.
+#   IAM role          What the box may touch: archive data, its own profile's secrets, and the
+#                     StopInstances call it ends with. Nothing else.
+#   instance profile  The wrapper EC2 needs to hand the role to the instance. No settings.
+#   security group    No ingress. SSM reaches the box outbound, so nothing listens on a port.
+#   stall alarm       A cost backstop, not a notifier -- see the alarm section below.
+#   schedule          Starts the instance nightly -- see the schedule section below.
 # --------------------------------------------------------------------------- #
 
 REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="r6i.2xlarge"
+
+# The root disk. 100 GB because a session's quote pull stages ~65 GB and the 25 GB default cannot
+# hold it; the archive itself lives in S3 and nothing here is durable across a replacement.
 VOLUME_SIZE_GB=100
 ARCHIVE_BUCKET="oscm-fund-archive"
 ARCHIVE_PREFIX="data/*"
@@ -115,18 +132,24 @@ step "IAM role $NAME"
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
+# Carried on the resource as well as in this file, so the console says what the role is for.
+ROLE_DESCRIPTION="Archive worker ($PROFILE): nightly fetch-and-fold of market data into \
+s3://${ARCHIVE_BUCKET}. Managed by tools/provision-archive-worker."
+
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
   unchanged "role exists"
-  changed "refresh trust policy"
+  changed "refresh trust policy and description"
   if [[ "$APPLY" == true ]]; then
     aws iam update-assume-role-policy --role-name "$NAME" \
       --policy-document "$TRUST_POLICY"
+    aws iam update-role --role-name "$NAME" --description "$ROLE_DESCRIPTION" >/dev/null
   fi
 else
   changed "create role"
   if [[ "$APPLY" == true ]]; then
     aws iam create-role --role-name "$NAME" \
-      --assume-role-policy-document "$TRUST_POLICY" >/dev/null
+      --assume-role-policy-document "$TRUST_POLICY" \
+      --description "$ROLE_DESCRIPTION" >/dev/null
     aws iam wait role-exists --role-name "$NAME"
   fi
 fi
@@ -449,7 +472,15 @@ if [[ "$APPLY" == true ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Stall alarm and nightly schedule
+# Stall alarm
+#
+# Nobody is listening to this and nobody is meant to. Its only action is the EC2 stop API, so it
+# exists to stop a hung run from billing all day -- not to tell anyone the run hung. A failed
+# nightly is silent today; the exit code goes nowhere.
+#
+# It must not become the normal way the box turns off. `run-archive-worker` ends with its own stop
+# call, and relying on an idle alarm instead is how a finished run sat running for an hour on
+# 2026-09-19. An hour under a megabyte of NetworkIn is dead, not slow: the fold pulls continuously.
 # --------------------------------------------------------------------------- #
 
 step "Stall alarm $NAME-stalled"
@@ -467,23 +498,41 @@ if [[ "$APPLY" == true ]]; then
     --alarm-actions "arn:aws:automate:${REGION}:ec2:stop"
 fi
 
+# --------------------------------------------------------------------------- #
+# Nightly schedule
+#
+# EventBridge Scheduler calls StartInstances directly. EC2 has no native scheduled start -- its
+# Scheduled Instances are capacity reservations, not power control -- so the alternatives are a
+# Lambda on a timer doing the same call, or leaving the box running. This costs nothing at one
+# invocation a day and keeps the expression in Git, where tests/test_schedules.rs asserts it.
+#
+# The schedule decides nothing beyond when to wake the box. Whether there is a session to fold is
+# `TradingCalendar`'s answer, asked in `seed` after boot.
+# --------------------------------------------------------------------------- #
+
 step "Nightly schedule $NAME-nightly"
 
 SCHEDULER_ROLE="${NAME}-scheduler"
 SCHEDULER_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
+SCHEDULER_DESCRIPTION="Lets EventBridge Scheduler start the $PROFILE archive worker, and nothing \
+else. Managed by tools/provision-archive-worker."
+
 if aws iam get-role --role-name "$SCHEDULER_ROLE" >/dev/null 2>&1; then
   unchanged "scheduler role exists"
   if [[ "$APPLY" == true ]]; then
     aws iam update-assume-role-policy --role-name "$SCHEDULER_ROLE" \
       --policy-document "$SCHEDULER_TRUST"
+    aws iam update-role --role-name "$SCHEDULER_ROLE" \
+      --description "$SCHEDULER_DESCRIPTION" >/dev/null
   fi
 else
   changed "create scheduler role"
   if [[ "$APPLY" == true ]]; then
     aws iam create-role --role-name "$SCHEDULER_ROLE" \
-      --assume-role-policy-document "$SCHEDULER_TRUST" >/dev/null
+      --assume-role-policy-document "$SCHEDULER_TRUST" \
+      --description "$SCHEDULER_DESCRIPTION" >/dev/null
     aws iam wait role-exists --role-name "$SCHEDULER_ROLE"
   fi
 fi
@@ -509,6 +558,8 @@ if [[ "$APPLY" == true ]]; then
   # visible to it immediately.
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if aws scheduler "$VERB" --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
+      --description "Start the $PROFILE archive worker to fold the session that just closed. \
+The box stops itself when the run ends. Managed by tools/provision-archive-worker." \
       --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
       --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null 2>&1; then
       break
