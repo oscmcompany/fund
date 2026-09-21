@@ -22,7 +22,7 @@ use fund::common::types::{
 use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
-use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport};
+use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport, ReferenceOutcome};
 use fund::data::{attribution, bars, details, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
@@ -274,6 +274,12 @@ enum ReferenceAction {
     Archive(ReferenceArguments),
     /// Fetch and report, writing nothing.
     Probe(ReferenceArguments),
+    /// Report the quarterly grid and which of it the archive owes. Fetches nothing.
+    Grid {
+        /// The Eastern date to answer as of, for asking what a future night would owe.
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        as_of: Option<NaiveDate>,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -1691,7 +1697,98 @@ async fn archive_nightly(
         report.record(leg, outcome);
     }
 
+    let reference = if budget.may_start_another() {
+        match run_reference(today, &budget).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                error!(%error, "Reference sweep failed");
+                ReferenceOutcome::Failed(error.to_string())
+            }
+        }
+    } else {
+        ReferenceOutcome::Skipped
+    };
+    info!(%reference, "Reference sweep finished");
+    report.record_reference(reference);
+
     Ok(Outcome::Nightly(report))
+}
+
+/// Fills every quarterly reference observation the archive is missing.
+///
+/// Runs after the legs rather than beside them because it reads a session's symbol list out of the
+/// bar archive: the grid point for a new quarter is a session whose bars this same run has just
+/// written. Deferral is cheap here in a way it is not for a leg -- the work is defined by a set
+/// difference over quarters, so a night that skips it loses a day and never the quarter.
+async fn run_reference(
+    today: SessionDate,
+    budget: &nightly::Budget,
+) -> Result<ReferenceOutcome, Box<dyn std::error::Error>> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let present = archive::reference_partition_dates(&s3_client, &bucket).await?;
+
+    let anchor = nightly::reference_anchor(&present)
+        .ok_or_else(|| nightly::ReferenceRefusal::NoObservations.to_string())?;
+    let calendar = trading_calendar(&Window::new(anchor, today)?).await?;
+    let plan = nightly::plan_reference(today, &present, &calendar)
+        .map_err(|refusal| refusal.to_string())?;
+
+    info!(
+        %anchor,
+        grid = plan.grid().len(),
+        owed = plan.owed().len(),
+        "Planned the quarterly reference grid"
+    );
+
+    // Before the client is built, not after: on most nights nothing is owed, and a missing Massive
+    // credential must not fail a sweep that was never going to call the feed.
+    if plan.owed().is_empty() {
+        return Ok(ReferenceOutcome::Swept {
+            written: Vec::new(),
+            unwritten: Vec::new(),
+        });
+    }
+
+    let massive = MassiveClient::from_env()?;
+    let mut written = Vec::new();
+    let mut unwritten = Vec::new();
+    for as_of in plan.owed() {
+        if !budget.may_start_another() {
+            unwritten.push((*as_of, "the budget was spent".to_string()));
+            continue;
+        }
+        // Stepped over rather than propagated, the way the leg loop steps over a failed leg: the
+        // grid points are independent, so one historical hole must not block the current quarter.
+        let tickers = match archive::session_symbols(&s3_client, &bucket, *as_of).await {
+            Ok(tickers) => tickers,
+            Err(error) => {
+                error!(%as_of, %error, "Could not read the session's symbols");
+                unwritten.push((*as_of, error.to_string()));
+                continue;
+            }
+        };
+        if tickers.is_empty() {
+            unwritten.push((*as_of, "no bar partition to take symbols from".to_string()));
+            continue;
+        }
+        let sweep =
+            match archive::archive_reference(&s3_client, &massive, &bucket, *as_of, &tickers).await
+            {
+                Ok(sweep) => sweep,
+                Err(error) => {
+                    error!(%as_of, %error, "The reference sweep failed for this quarter");
+                    unwritten.push((*as_of, error.to_string()));
+                    continue;
+                }
+            };
+        match sweep.refusal() {
+            None => written.push(*as_of),
+            Some(refusal) => unwritten.push((*as_of, refusal.to_string())),
+        }
+    }
+
+    Ok(ReferenceOutcome::Swept { written, unwritten })
 }
 
 /// Runs one leg, stopping between sessions once the budget is spent.
@@ -1900,6 +1997,7 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
     let (arguments, writes) = match action {
         ReferenceAction::Archive(arguments) => (arguments, true),
         ReferenceAction::Probe(arguments) => (arguments, false),
+        ReferenceAction::Grid { as_of } => return report_reference_grid(*as_of).await,
     };
     let window = arguments.window.window()?;
     let bucket = bucket_name()?;
@@ -1961,9 +2059,7 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
         let sweep = archive::archive_reference(&s3_client, &massive, &bucket, *session, &tickers)
             .await
             .map_err(box_error)?;
-        // Written means the partition was replaced, which the archive refuses when any symbol went
-        // unanswered. A non-zero `found` alone would call a preserved partition a fresh one.
-        if sweep.failed.is_empty() && sweep.found > 0 {
+        if sweep.wrote_partition() {
             sessions_written += 1;
         } else {
             sessions_failed += 1;
@@ -1989,6 +2085,42 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
             failed: sessions_failed,
         }));
     }
+    Ok(Outcome::Complete)
+}
+
+/// Prints the quarterly grid and the set difference the nightly run would act on.
+///
+/// The read-only route to the planning half, so the question "is 2026-10-01 owed" can be asked
+/// without writing a partition to find out.
+///
+/// `as_of` answers it for a night that has not happened yet, which is the only way to watch this
+/// report name a quarter: against today's archive it prints nothing owed, and an instrument that
+/// can only report nothing has not been shown to work.
+async fn report_reference_grid(as_of: Option<NaiveDate>) -> Result<Outcome, SeedError> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let today = as_of.map_or_else(|| SessionDate::at(Utc::now()), SessionDate::from_date);
+    let present = archive::reference_partition_dates(&s3_client, &bucket)
+        .await
+        .map_err(box_error)?;
+    let anchor = nightly::reference_anchor(&present)
+        .ok_or_else(|| SeedError::Usage(nightly::ReferenceRefusal::NoObservations.to_string()))?;
+    let calendar = trading_calendar(&Window::new(anchor, today).map_err(SeedError::Usage)?)
+        .await
+        .map_err(SeedError::Failed)?;
+    let plan = nightly::plan_reference(today, &present, &calendar)
+        .map_err(|refusal| SeedError::Usage(refusal.to_string()))?;
+
+    for as_of in plan.grid() {
+        let owed = plan.owed().contains(as_of);
+        println!("{as_of}  {}", if owed { "OWED" } else { "present" });
+    }
+    println!(
+        "{} grid points from {anchor}, {} present, {} owed",
+        plan.grid().len(),
+        plan.grid().len() - plan.owed().len(),
+        plan.owed().len()
+    );
     Ok(Outcome::Complete)
 }
 
@@ -3551,6 +3683,37 @@ mod tests {
             panic!("expected a reference command");
         };
         assert!(matches!(action, ReferenceAction::Archive(_)));
+    }
+
+    #[test]
+    fn test_the_grid_report_takes_no_window_and_an_optional_date() {
+        // No window, because the grid is derived from the archive rather than supplied. The date is
+        // what lets the report name a quarter before one is actually owed.
+        let today = Arguments::try_parse_from(["seed", "equity-reference", "grid"])
+            .expect("grid must parse without a window");
+        let Command::EquityReference { action } = today.command else {
+            panic!("expected a reference command");
+        };
+        assert!(matches!(action, ReferenceAction::Grid { as_of: None }));
+
+        let dated = Arguments::try_parse_from([
+            "seed",
+            "equity-reference",
+            "grid",
+            "--as-of",
+            "2026-10-02",
+        ])
+        .expect("grid must accept a date");
+        let Command::EquityReference { action } = dated.command else {
+            panic!("expected a reference command");
+        };
+        let ReferenceAction::Grid { as_of } = action else {
+            panic!("expected the grid report");
+        };
+        assert_eq!(
+            as_of,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).expect("a date"))
+        );
     }
 
     /// A sweep that left a session unwritten reports the count rather than exiting quietly.

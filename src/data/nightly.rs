@@ -3,9 +3,11 @@
 //! The decision is pure so it can be tested across the hours and dates where the Eastern and UTC
 //! calendars disagree; `seed` owns the fetching half.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
+use chrono::{Datelike, NaiveDate};
 use tokio::time::Instant;
 
 use crate::common::types::{BarInterval, IntradayCadence, SessionDate};
@@ -177,6 +179,234 @@ pub fn plan(
     })
 }
 
+/// A calendar quarter, which is the grid the point-in-time reference is observed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Quarter {
+    year: i32,
+    index: u32,
+}
+
+impl Quarter {
+    /// The quarter a date falls in.
+    fn of(date: SessionDate) -> Self {
+        Quarter {
+            year: date.date().year(),
+            index: (date.date().month() - 1) / 3,
+        }
+    }
+
+    /// The quarter's first calendar day, which is not necessarily a trading day.
+    fn opens(self) -> NaiveDate {
+        NaiveDate::from_ymd_opt(self.year, self.index * 3 + 1, 1)
+            .expect("a quarter index of 0 to 3 names a real month")
+    }
+
+    /// The quarter's last calendar day.
+    fn closes(self) -> NaiveDate {
+        self.next()
+            .opens()
+            .pred_opt()
+            .expect("the day before a quarter start is in range")
+    }
+
+    fn next(self) -> Self {
+        match self.index {
+            3 => Quarter {
+                year: self.year + 1,
+                index: 0,
+            },
+            index => Quarter {
+                year: self.year,
+                index: index + 1,
+            },
+        }
+    }
+}
+
+/// Why a reference sweep had nothing it could plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceRefusal {
+    /// The archive holds no observation, so there is no anchor and no grid.
+    NoObservations,
+    /// The calendar does not span the grid, so a quarter's first trading day cannot be found.
+    CalendarTooShort {
+        window_start: SessionDate,
+        window_end: SessionDate,
+    },
+    /// No session has closed before today, so no grid point is observable yet.
+    NoClosedSession { window_end: SessionDate },
+    /// The calendar published no trading day inside a quarter it claims to cover, so that quarter's
+    /// grid point is unknowable and its absence cannot be told from a quarter with nothing owed.
+    NoPublishedQuarter {
+        window_start: SessionDate,
+        window_end: SessionDate,
+    },
+}
+
+impl fmt::Display for ReferenceRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReferenceRefusal::NoObservations => write!(
+                formatter,
+                "the reference archive holds no observation to anchor the grid to"
+            ),
+            ReferenceRefusal::CalendarTooShort {
+                window_start,
+                window_end,
+            } => write!(
+                formatter,
+                "the calendar does not span {window_start} to {window_end}"
+            ),
+            ReferenceRefusal::NoPublishedQuarter {
+                window_start,
+                window_end,
+            } => write!(
+                formatter,
+                "the calendar published no trading day between {window_start} and {window_end}"
+            ),
+            ReferenceRefusal::NoClosedSession { window_end } => write!(
+                formatter,
+                "no published trading day has closed before {window_end}"
+            ),
+        }
+    }
+}
+
+/// Which quarterly observations the archive owes, taken as a set difference rather than a date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferencePlan {
+    anchor: SessionDate,
+    grid: Vec<SessionDate>,
+    owed: Vec<SessionDate>,
+}
+
+impl ReferencePlan {
+    /// The oldest observation the archive holds, which is where the grid starts.
+    pub fn anchor(&self) -> SessionDate {
+        self.anchor
+    }
+
+    /// Every grid point from the quarter *after* the anchor's to today's, ascending.
+    ///
+    /// The anchor's own quarter is excluded, so this is one shorter than the number of quarters
+    /// spanned. [`plan_reference`] says why.
+    pub fn grid(&self) -> &[SessionDate] {
+        &self.grid
+    }
+
+    /// The grid points whose quarter holds no observation, ascending.
+    pub fn owed(&self) -> &[SessionDate] {
+        &self.owed
+    }
+}
+
+/// Where the grid starts, which is the archive's oldest observation.
+///
+/// Public because the caller has to span the same range when it fetches a calendar, and an anchor
+/// decided in two places is two rules that agree by coincidence.
+pub fn reference_anchor(present: &[SessionDate]) -> Option<SessionDate> {
+    present.iter().copied().min()
+}
+
+/// Decides which quarterly reference observations are missing, as of `today`.
+///
+/// The grid starts after the quarter of the archive's own oldest observation, and quarters are
+/// compared at quarter granularity rather than by date. Observations dated after `today` are not
+/// read, so the answer is the one that night would have given.
+pub fn plan_reference(
+    today: SessionDate,
+    present: &[SessionDate],
+    calendar: &TradingCalendar,
+) -> Result<ReferencePlan, ReferenceRefusal> {
+    // An observation the night could not have seen must not answer for a quarter on its behalf.
+    let observable: Vec<SessionDate> = present
+        .iter()
+        .copied()
+        .filter(|observed| *observed <= today)
+        .collect();
+
+    let Some(anchor) = reference_anchor(&observable) else {
+        return Err(ReferenceRefusal::NoObservations);
+    };
+    if !calendar.covers(anchor, today) {
+        return Err(ReferenceRefusal::CalendarTooShort {
+            window_start: anchor,
+            window_end: today,
+        });
+    }
+
+    // The same bound the session window uses: a grid point has to be a session that has closed.
+    let Some(last_closed) = calendar.previous_trading_day(today) else {
+        return Err(ReferenceRefusal::NoClosedSession { window_end: today });
+    };
+
+    let observed: BTreeSet<Quarter> = observable.iter().copied().map(Quarter::of).collect();
+    let current = Quarter::of(today);
+
+    // The anchor's own quarter holds the anchor by construction, so it can never be owed.
+    let mut grid = Vec::new();
+    let mut owed = Vec::new();
+    let mut quarter = Quarter::of(anchor).next();
+    while quarter <= current {
+        let opens = SessionDate::from_date(quarter.opens());
+        let closes = SessionDate::from_date(quarter.closes()).min(last_closed);
+        // Tested before the range is built: the calendar indexes a `BTreeMap`, which panics on a
+        // range whose start is past its end.
+        if closes < opens {
+            quarter = quarter.next();
+            continue;
+        }
+        // Refused rather than skipped: a quarter the calendar cannot answer for is indistinguishable
+        // from one with nothing owed, and `covers` tests the declared bounds rather than the days.
+        let Some(&first) = calendar.trading_days_in_range(opens, closes).first() else {
+            return Err(ReferenceRefusal::NoPublishedQuarter {
+                window_start: opens,
+                window_end: closes,
+            });
+        };
+        grid.push(first);
+        if !observed.contains(&quarter) {
+            owed.push(first);
+        }
+        quarter = quarter.next();
+    }
+
+    Ok(ReferencePlan { anchor, grid, owed })
+}
+
+/// What became of the reference sweep.
+///
+/// The unwritten half carries its cause per grid point: the ordinary reason is that the session's
+/// bar partition is not there yet, which is a different fact from the feed refusing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceOutcome {
+    /// Every owed grid point was attempted.
+    Swept {
+        written: Vec<SessionDate>,
+        unwritten: Vec<(SessionDate, String)>,
+    },
+    /// The budget was spent before the sweep started.
+    Skipped,
+    /// The sweep could not be planned or run at all.
+    Failed(String),
+}
+
+impl fmt::Display for ReferenceOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReferenceOutcome::Swept { written, unwritten } => {
+                write!(formatter, "{} written", written.len())?;
+                for (as_of, cause) in unwritten {
+                    write!(formatter, ", {as_of} unwritten ({cause})")?;
+                }
+                Ok(())
+            }
+            ReferenceOutcome::Skipped => write!(formatter, "skipped for budget"),
+            ReferenceOutcome::Failed(cause) => write!(formatter, "failed: {cause}"),
+        }
+    }
+}
+
 /// What became of one leg.
 ///
 /// Skipped and failed are separate variants rather than one "did not finish", because a night that
@@ -205,6 +435,7 @@ pub struct NightlyReport {
     window_end: SessionDate,
     sessions: usize,
     legs: Vec<(Leg, LegOutcome)>,
+    reference: Option<ReferenceOutcome>,
 }
 
 impl NightlyReport {
@@ -215,12 +446,23 @@ impl NightlyReport {
             window_end: plan.window_end(),
             sessions: plan.sessions().len(),
             legs: Vec::new(),
+            reference: None,
         }
     }
 
     /// Records what became of one leg.
     pub fn record(&mut self, leg: Leg, outcome: LegOutcome) {
         self.legs.push((leg, outcome));
+    }
+
+    /// Records what became of the quarterly reference sweep.
+    pub fn record_reference(&mut self, outcome: ReferenceOutcome) {
+        self.reference = Some(outcome);
+    }
+
+    /// What the reference sweep did, or `None` if it never ran.
+    pub fn reference(&self) -> Option<&ReferenceOutcome> {
+        self.reference.as_ref()
     }
 
     /// Legs that errored.
@@ -265,11 +507,17 @@ impl NightlyReport {
     /// Session granularity is the whole claim: a partition written while one name's fetch failed
     /// reads exactly like a complete one, which is what `SessionSelection::Present` exists for.
     ///
-    /// Every leg must have been recorded. The three emptiness tests below are all vacuously true
-    /// over a report where nothing ran, and this predicate is what the exit code is taken from.
+    /// Every leg must have been recorded, and so must the reference sweep. The emptiness tests
+    /// below are all vacuously true over a report where nothing ran, and this predicate is what the
+    /// exit code is taken from.
     pub fn is_complete(&self) -> bool {
         let recorded: Vec<Leg> = self.legs.iter().map(|(leg, _)| *leg).collect();
+        let swept = matches!(
+            self.reference,
+            Some(ReferenceOutcome::Swept { ref unwritten, .. }) if unwritten.is_empty()
+        );
         Leg::ALL.iter().all(|leg| recorded.contains(leg))
+            && swept
             && self.failed().is_empty()
             && self.skipped().is_empty()
             && self.incomplete().is_empty()
@@ -309,7 +557,10 @@ impl fmt::Display for NightlyReport {
                 write!(formatter, "; {label}: {}", names.join(", "))?;
             }
         }
-        Ok(())
+        match &self.reference {
+            Some(outcome) => write!(formatter, "; reference: {outcome}"),
+            None => write!(formatter, "; reference: not run"),
+        }
     }
 }
 
@@ -439,6 +690,225 @@ mod tests {
         assert!(fresh.may_start_another());
     }
 
+    /// Quarterly grid points, as the archive actually holds them.
+    ///
+    /// Anchored at 2021-08-23, which is the session the bar archive begins on and is mid-quarter.
+    fn archived_grid() -> Vec<SessionDate> {
+        [
+            "2021-08-23",
+            "2021-10-01",
+            "2022-01-03",
+            "2022-04-01",
+            "2022-07-01",
+            "2022-10-03",
+            "2023-01-03",
+            "2023-04-03",
+            "2023-07-03",
+            "2023-10-02",
+            "2024-01-02",
+            "2024-04-01",
+            "2024-07-01",
+            "2024-10-01",
+            "2025-01-02",
+            "2025-04-01",
+            "2025-07-01",
+            "2025-10-01",
+            "2026-01-02",
+            "2026-04-01",
+            "2026-07-01",
+        ]
+        .iter()
+        .map(|text| session(text))
+        .collect()
+    }
+
+    #[test]
+    fn test_the_anchor_quarter_is_not_on_the_grid() {
+        // 2021-08-23 is the session the bar archive begins on, and it lands mid-quarter. Its
+        // quarter holds it by construction, and the calendar cannot see that quarter's true open.
+        let calendar = calendar_over("2021-08-23", "2021-12-31", &[]);
+        let plan = plan_reference(session("2021-11-01"), &[session("2021-08-23")], &calendar)
+            .expect("a plan");
+        assert_eq!(plan.anchor(), session("2021-08-23"));
+        assert_eq!(plan.grid(), [session("2021-10-01")]);
+        assert_eq!(plan.owed(), [session("2021-10-01")]);
+    }
+
+    #[test]
+    fn test_a_quarter_is_satisfied_by_any_observation_inside_it() {
+        // An observation written mid-quarter by a repair answers for its quarter. Taken on dates
+        // this would be owed forever, asking for a date the archive already answered with another.
+        let calendar = calendar_over("2021-08-23", "2021-12-31", &[]);
+        let plan = plan_reference(
+            session("2021-11-01"),
+            &[session("2021-08-23"), session("2021-10-14")],
+            &calendar,
+        )
+        .expect("a plan");
+        assert_eq!(plan.grid(), [session("2021-10-01")]);
+        assert!(plan.owed().is_empty());
+    }
+
+    #[test]
+    fn test_a_new_quarter_is_owed_once_its_first_session_has_traded() {
+        // The case this job exists for: 2026-10-01 is the next grid point after the archive's
+        // newest, and nothing writes it today.
+        let calendar = calendar_over("2021-07-01", "2026-10-31", &[]);
+        let plan =
+            plan_reference(session("2026-10-02"), &archived_grid(), &calendar).expect("a plan");
+        assert_eq!(plan.owed(), [session("2026-10-01")]);
+    }
+
+    #[test]
+    fn test_a_quarter_that_has_not_opened_yet_is_not_owed() {
+        // Run the same archive through a date inside the quarter it already holds. Nothing is owed,
+        // which is what makes this safe to run every night rather than once a quarter.
+        let calendar = calendar_over("2021-07-01", "2026-09-30", &[]);
+        let plan =
+            plan_reference(session("2026-09-20"), &archived_grid(), &calendar).expect("a plan");
+        // Twenty, not twenty-one: the anchor's own quarter is not on the grid. Pinned to the number
+        // `seed equity-reference grid` prints against the live bucket.
+        assert_eq!(plan.grid().len(), 20);
+        assert_eq!(plan.grid().first().copied(), Some(session("2021-10-01")));
+        assert!(plan.owed().is_empty());
+    }
+
+    #[test]
+    fn test_a_hole_in_the_middle_of_the_grid_is_owed() {
+        // Self-healing is not only about the newest quarter: a quarter that failed two years ago is
+        // owed on the same terms, because the difference is taken over the whole grid.
+        let calendar = calendar_over("2021-07-01", "2026-09-30", &[]);
+        let holed: Vec<SessionDate> = archived_grid()
+            .into_iter()
+            .filter(|date| *date != session("2024-04-01"))
+            .collect();
+        let plan = plan_reference(session("2026-09-20"), &holed, &calendar).expect("a plan");
+        assert_eq!(plan.owed(), [session("2024-04-01")]);
+    }
+
+    #[test]
+    fn test_the_grid_point_is_the_first_trading_day_not_the_first_of_the_month() {
+        // 2023-01-01 is a Sunday and the holiday is observed on the Monday, so the quarter opens on
+        // the third. Pinned to the date the archive holds rather than to the calendar's own answer.
+        let calendar = calendar_over("2022-10-01", "2023-03-31", &["2023-01-02"]);
+        let plan = plan_reference(session("2023-02-01"), &[session("2022-10-03")], &calendar)
+            .expect("a plan");
+        assert_eq!(plan.grid(), [session("2023-01-03")]);
+        assert_eq!(plan.owed(), [session("2023-01-03")]);
+    }
+
+    #[test]
+    fn test_a_quarters_opening_day_is_not_owed_until_it_has_closed() {
+        // The nightly fires at three in the morning Eastern, so on 2026-10-01 the quarter has
+        // opened and has no bars yet. Owing it is a non-zero exit once a quarter, for nothing.
+        let calendar = calendar_over("2026-06-01", "2026-10-31", &[]);
+        let present = [session("2026-07-01")];
+
+        let opening = plan_reference(session("2026-10-01"), &present, &calendar).expect("a plan");
+        assert!(
+            opening.owed().is_empty(),
+            "the quarter's first session has not closed yet"
+        );
+
+        let after = plan_reference(session("2026-10-02"), &present, &calendar).expect("a plan");
+        assert_eq!(after.owed(), [session("2026-10-01")]);
+    }
+
+    #[test]
+    fn test_a_calendar_with_nothing_closed_before_today_is_refused() {
+        // Reachable rather than defensive: the bounds a calendar claims to cover and the days it
+        // actually holds are separate, so a calendar can span today and publish nothing before it.
+        let calendar = TradingCalendar::covering(
+            Vec::new(),
+            SessionDate::from_date(
+                chrono::NaiveDate::parse_from_str("2026-09-01", "%Y-%m-%d").expect("a date"),
+            ),
+            SessionDate::from_date(
+                chrono::NaiveDate::parse_from_str("2026-09-30", "%Y-%m-%d").expect("a date"),
+            ),
+        );
+        let refusal = plan_reference(session("2026-09-20"), &[session("2026-09-02")], &calendar)
+            .expect_err("a refusal");
+        assert_eq!(
+            refusal,
+            ReferenceRefusal::NoClosedSession {
+                window_end: session("2026-09-20")
+            }
+        );
+    }
+
+    #[test]
+    fn test_an_observation_after_the_as_of_date_does_not_answer_for_its_quarter() {
+        // The flag says "as of", so a partition written later in the quarter than the date being
+        // asked about must not make that quarter present on the night that had not seen it.
+        let calendar = calendar_over("2026-01-01", "2026-12-31", &[]);
+        let repaired_later = [session("2026-01-05"), session("2026-08-14")];
+
+        let blind =
+            plan_reference(session("2026-07-20"), &repaired_later, &calendar).expect("a plan");
+        assert_eq!(
+            blind.owed(),
+            [session("2026-04-01"), session("2026-07-01")],
+            "the 2026-08-14 observation had not been written yet"
+        );
+
+        let sighted =
+            plan_reference(session("2026-09-20"), &repaired_later, &calendar).expect("a plan");
+        assert_eq!(
+            sighted.owed(),
+            [session("2026-04-01")],
+            "once it is in the past it answers for the third quarter"
+        );
+    }
+
+    #[test]
+    fn test_a_quarter_the_calendar_cannot_answer_for_is_refused() {
+        // `covers` tests the bounds the calendar was handed, not the days it holds, so a calendar
+        // can claim a span and publish nothing inside part of it.
+        let published = |from: &str, to: &str| {
+            calendar_over(from, to, &[])
+                .trading_days_in_range(session(from), session(to))
+                .into_iter()
+                .map(|date| {
+                    CalendarDay::new(
+                        date.date(),
+                        chrono::NaiveTime::from_hms_opt(9, 30, 0).expect("a time"),
+                        chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("a time"),
+                    )
+                    .expect("a session")
+                })
+                .collect::<Vec<_>>()
+        };
+        // The whole span except the second quarter, which is the hole.
+        let mut days = published("2026-01-01", "2026-03-31");
+        days.extend(published("2026-07-01", "2026-09-30"));
+        let sparse = TradingCalendar::covering(days, session("2026-01-01"), session("2026-09-30"));
+
+        let refusal = plan_reference(session("2026-09-20"), &[session("2026-01-05")], &sparse)
+            .expect_err("a refusal");
+        assert!(
+            matches!(refusal, ReferenceRefusal::NoPublishedQuarter { .. }),
+            "the second quarter published no day, so its grid point is unknowable: {refusal}"
+        );
+    }
+
+    #[test]
+    fn test_an_archive_with_no_observation_is_refused_rather_than_backfilled() {
+        // A nightly job must not decide to fetch five years of history because a bucket looked
+        // empty. The grid has no anchor, so there is no answer to give.
+        let calendar = calendar_over("2026-09-01", "2026-09-30", &[]);
+        let refusal = plan_reference(session("2026-09-20"), &[], &calendar).expect_err("a refusal");
+        assert_eq!(refusal, ReferenceRefusal::NoObservations);
+    }
+
+    #[test]
+    fn test_a_calendar_that_does_not_span_the_grid_is_refused() {
+        let calendar = calendar_over("2026-09-01", "2026-09-30", &[]);
+        let refusal = plan_reference(session("2026-09-20"), &archived_grid(), &calendar)
+            .expect_err("a refusal");
+        assert!(matches!(refusal, ReferenceRefusal::CalendarTooShort { .. }));
+    }
+
     #[test]
     fn test_legs_are_ordered_cheapest_first() {
         // Pinned to the literal order rather than derived from ALL, so a reordering that put the
@@ -469,6 +939,14 @@ mod report_tests {
         }
     }
 
+    /// A sweep that found the grid complete, which is the ordinary night.
+    fn swept() -> ReferenceOutcome {
+        ReferenceOutcome::Swept {
+            written: Vec::new(),
+            unwritten: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_a_night_that_ran_out_of_budget_does_not_report_as_complete() {
         // A pass can report success over an incomplete result: nothing downstream separates a leg
@@ -483,12 +961,13 @@ mod report_tests {
             },
         );
         report.record(Leg::Quotes(IntradayCadence::OneMinute), LegOutcome::Skipped);
+        report.record_reference(swept());
 
         assert!(!report.is_complete());
         assert_eq!(report.written(), 3);
         assert_eq!(
             report.to_string(),
-            "2 sessions 2026-09-14 to 2026-09-18, 3 written; skipped for budget: quotes/one_minute"
+            "2 sessions 2026-09-14 to 2026-09-18, 3 written; skipped for budget: quotes/one_minute; reference: 0 written"
         );
     }
 
@@ -574,11 +1053,79 @@ mod report_tests {
                 },
             );
         }
+        report.record_reference(swept());
         assert!(report.is_complete());
         assert_eq!(report.written(), 0);
         assert_eq!(
             report.to_string(),
-            "1 sessions 2026-09-18 to 2026-09-18, 0 written"
+            "1 sessions 2026-09-18 to 2026-09-18, 0 written; reference: 0 written"
         );
+    }
+
+    #[test]
+    fn test_a_night_that_never_reached_the_reference_sweep_is_not_complete() {
+        // Six clean legs and no sweep. Without this the quarter the job exists to catch is missed
+        // by a run that exits zero -- which is how 2026-10-01 would pass unnoticed.
+        let plan = plan_over(&["2026-09-18"]);
+        let mut report = NightlyReport::over(&plan);
+        for leg in Leg::ALL {
+            report.record(
+                leg,
+                LegOutcome::Folded {
+                    complete: true,
+                    written: 0,
+                },
+            );
+        }
+        assert!(report.reference().is_none());
+        assert!(!report.is_complete());
+        assert!(report.to_string().ends_with("reference: not run"));
+    }
+
+    #[test]
+    fn test_a_sweep_that_left_a_quarter_unwritten_is_not_complete() {
+        // The grid point was owed, attempted, and not written. The cause travels with it, because
+        // a missing bar partition is tomorrow's problem and a refusing feed is tonight's.
+        let plan = plan_over(&["2026-09-18"]);
+        let mut report = NightlyReport::over(&plan);
+        for leg in Leg::ALL {
+            report.record(
+                leg,
+                LegOutcome::Folded {
+                    complete: true,
+                    written: 0,
+                },
+            );
+        }
+        report.record_reference(ReferenceOutcome::Swept {
+            written: Vec::new(),
+            unwritten: vec![(
+                SessionDate::from_date(
+                    chrono::NaiveDate::from_ymd_opt(2026, 10, 1).expect("a date"),
+                ),
+                "no bar partition".to_string(),
+            )],
+        });
+        assert!(!report.is_complete());
+        assert!(report
+            .to_string()
+            .contains("2026-10-01 unwritten (no bar partition)"));
+    }
+
+    #[test]
+    fn test_a_sweep_that_failed_outright_is_not_complete() {
+        let plan = plan_over(&["2026-09-18"]);
+        let mut report = NightlyReport::over(&plan);
+        for leg in Leg::ALL {
+            report.record(
+                leg,
+                LegOutcome::Folded {
+                    complete: true,
+                    written: 0,
+                },
+            );
+        }
+        report.record_reference(ReferenceOutcome::Failed("no credentials".to_string()));
+        assert!(!report.is_complete());
     }
 }
