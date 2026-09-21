@@ -1732,20 +1732,25 @@ async fn run_leg(
     let sessions = plan.sessions();
 
     // Bound before the loop so one client serves every session, and so the faithfulness floor is
-    // asked of the whole plan before a single print is fetched.
+    // asked of the whole plan before a single print is fetched. Not built for intraday bars, which
+    // read Massive's API: a missing flat-file credential must not abort a leg that never needed it.
     let flat_files;
     let market_data;
-    let trade_source = match arguments.provider {
-        NightlyProvider::AlpacaRest => {
-            market_data = market_data_client().await?;
-            archive::TradeSource::PerName(&market_data)
-        }
-        NightlyProvider::MassiveFlatFile => {
-            flat_files = flat_file_client(&arguments.files).await?;
-            archive::TradeSource::WholeSession(&flat_files)
-        }
+    let trade_source = match leg {
+        Leg::IntradayBars(_) => None,
+        _ => Some(match arguments.provider {
+            NightlyProvider::AlpacaRest => {
+                market_data = market_data_client().await?;
+                archive::TradeSource::PerName(&market_data)
+            }
+            NightlyProvider::MassiveFlatFile => {
+                flat_files = flat_file_client(&arguments.files).await?;
+                archive::TradeSource::WholeSession(&flat_files)
+            }
+        }),
     };
-    if let Leg::Trades = leg {
+
+    if let (Leg::Trades, Some(trade_source)) = (leg, &trade_source) {
         // Past the floor Alpaca folds an opening auction print the archive excludes, adding
         // 0.3-2.2% of session volume and varying by name.
         let unfaithful = trade_source.unfaithful_sessions(sessions);
@@ -1799,7 +1804,10 @@ async fn run_leg(
                 .await?
             }
             Leg::Quotes(cadence) => {
-                let quote_source = match &trade_source {
+                let Some(source) = &trade_source else {
+                    unreachable!("only intraday bars skip the source, and this is not that arm")
+                };
+                let quote_source = match source {
                     archive::TradeSource::PerName(client) => archive::QuoteSource::PerName(client),
                     archive::TradeSource::WholeSession(files) => {
                         archive::QuoteSource::WholeSession(files)
@@ -2721,6 +2729,50 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> Result<Arguments, clap::Error> {
         Arguments::try_parse_from(std::iter::once("seed").chain(arguments.iter().copied()))
+    }
+
+    /// The nightly command's parsed arguments, or a panic naming what clap rejected.
+    fn nightly(arguments: &[&str]) -> NightlyArguments {
+        let parsed = parse(&[&["archive-nightly"], arguments].concat())
+            .unwrap_or_else(|error| panic!("archive-nightly {arguments:?} should parse: {error}"));
+        match parsed.command {
+            Command::ArchiveNightly(arguments) => arguments,
+            other => panic!("expected a nightly run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_nightly_run_reads_alpaca_unless_told_otherwise() {
+        // Pinned to the literal rather than to NightlyProvider::default(), so flipping the default
+        // back to the flat files after they lapse has to be done here too.
+        assert!(matches!(nightly(&[]).provider, NightlyProvider::AlpacaRest));
+    }
+
+    #[test]
+    fn test_both_provider_routes_are_reachable_by_name() {
+        assert!(matches!(
+            nightly(&["--provider", "alpaca-rest"]).provider,
+            NightlyProvider::AlpacaRest
+        ));
+        assert!(matches!(
+            nightly(&["--provider", "massive-flat-file"]).provider,
+            NightlyProvider::MassiveFlatFile
+        ));
+    }
+
+    #[test]
+    fn test_a_provider_that_is_not_a_route_is_refused() {
+        // `alpaca` alone named the vendor rather than the route, and Alpaca also has a stream this
+        // does not use. It must fail rather than resolve to the REST arm.
+        assert!(parse(&["archive-nightly", "--provider", "alpaca"]).is_err());
+        assert!(parse(&["archive-nightly", "--provider", "massive"]).is_err());
+    }
+
+    #[test]
+    fn test_the_nightly_defaults_are_a_working_night_not_a_placeholder() {
+        let arguments = nightly(&[]);
+        assert_eq!(arguments.lookback_sessions, 5);
+        assert_eq!(arguments.budget_minutes, 240);
     }
 
     fn session(value: &str) -> SessionDate {
