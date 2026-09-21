@@ -78,7 +78,9 @@ This is a collection of guidelines and references.
 - Guard against division by zero when computing ratios or percentages from DataFrame aggregations, and
   handle the `None` that Polars `Series.sum()` returns on an empty or all-null series
 - Ensure Rust automated test suites achieve at least 75% line or statement coverage, excluding generated
-  code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
+  code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository;
+  coverage is a proxy for the real question, so judge new code on whether a mutation to it fails a test
+  rather than on the line rate alone
 - When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after
   the fix
 - Pin test expectations to literals, never to the constant or list the test is checking — an expectation
@@ -99,6 +101,10 @@ This is a collection of guidelines and references.
   machinery's own bias, and every real reading has to clear it
 - A control must differ from the treatment in exactly one respect, and it must be able to vary — a control
   that cannot fail is not a control
+- A baseline's free choices are fixed by an external specification or swept across a declared range, never
+  chosen by us, and every arm carries its own parameters in its name
+- Prefer the instrument that can lower your own number — a screen that costs a fifth of the panel and
+  changes no answer is a result, and an instrument that can only flatter is not a measurement
 - Before trusting a measurement that reports nothing, confirm the instrument reports something when
   something is there
 - State the trivial baseline before reading any metric, and quote skill against a named baseline rather
@@ -111,6 +117,11 @@ This is a collection of guidelines and references.
   pinned by the shape of the data rather than by anything the model learned
 - Magnitude before significance: ask whether the effect could pay for itself at measured cost before asking
   whether it is real
+- State a new direction's admission criteria before opening it — a returns bar, a reachable size, an
+  underserved gap, and a capability we actually hold — and record which of them it fails, because failing
+  three of four is a legitimate answer
+- Admit a dataset on the same questions: does it raise the average information, is it re-derivable, and
+  does it carry a dimension nothing else does
 - Split the sample and test the difference between the halves, never whether both halves point the same way
 - Fix every free choice before looking at the result, and record each one with the number it produced
 - Scope a kill precisely — say exactly what was refuted and under what conditions, because over-claiming a
@@ -135,6 +146,8 @@ This is a collection of guidelines and references.
   permutation-null baseline before reading the table
 - The universe is part of the answer, so journal it beside the result — the set of instruments collected
   and the set measured over are different questions with different answers
+- Buy what gets more expensive with time and rent what gets cheaper — a lapsing tick subscription and a
+  session never captured are purchases, while compute, storage and throughput are rentals
 - Before filtering a provider feed by date, check whether the filter matches the event's own date or the
   provider's record time — Alpaca's activity `date=`/`after=` match record time, so a date-only row dated
   D is returned by a query for D+1
