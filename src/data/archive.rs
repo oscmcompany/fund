@@ -2201,12 +2201,17 @@ pub async fn classification_as_of_dates(
     )
     .await?;
 
+    // Kept only when the date round-trips to the very key it was read from. Finding `as_of=` in any
+    // segment would accept `as_of=2099-01-01/backup/data.parquet` and then send the reader to a
+    // canonical key that does not exist, failing the load while a valid earlier partition sits there.
     let mut dates: Vec<chrono::NaiveDate> = partitions
         .iter()
         .filter_map(|key| {
-            key.split('/')
+            let date = key
+                .split('/')
                 .find_map(|segment| segment.strip_prefix("as_of="))
-                .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
+            (classification_key(date) == *key).then_some(date)
         })
         .collect();
     dates.sort_unstable();
@@ -6315,5 +6320,137 @@ mod tests {
             2,
             "a symbol absent from a later response must survive the merge"
         );
+    }
+
+    /// A `ListObjectsV2` body naming exactly `keys`.
+    fn listing_body(keys: &[&str]) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|key| {
+                format!(
+                    "<Contents><Key>{key}</Key><Size>1</Size>\
+<LastModified>2026-09-22T00:00:00.000Z</LastModified></Contents>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<Name>test-bucket</Name><KeyCount>{}</KeyCount><IsTruncated>false</IsTruncated>{contents}\
+</ListBucketResult>",
+            keys.len()
+        )
+    }
+
+    /// A mapping parquet holding one run per granularity, naming `sector_bucket` verbatim.
+    fn mapping_parquet(sector_bucket: &str) -> Vec<u8> {
+        let mut frame = DataFrame::new(vec![
+            Column::new("granularity".into(), vec!["sector", "industry"]),
+            Column::new("low".into(), vec![100_u32, 100]),
+            Column::new("high".into(), vec![999_u32, 999]),
+            Column::new("bucket".into(), vec![sector_bucket, "Agriculture"]),
+        ])
+        .expect("the fixture frame builds");
+        let mut buffer: Vec<u8> = Vec::new();
+        ParquetWriter::new(&mut buffer)
+            .finish(&mut frame)
+            .expect("the fixture frame serializes");
+        buffer
+    }
+
+    /// Answers a listing with `keys` and every object read with `object`.
+    fn classification_client(keys: Vec<String>, object: Vec<u8>) -> S3Client {
+        scripted_s3_client(move |_method, key| {
+            // The listing is the only request whose path carries no hive segment.
+            let payload = if key.contains("as_of=") {
+                SdkBody::from(object.clone())
+            } else {
+                let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+                SdkBody::from(listing_body(&borrowed))
+            };
+            http::Response::builder()
+                .status(200)
+                .header("etag", "\"an-etag\"")
+                .body(payload)
+                .expect("a canned response must build")
+        })
+    }
+
+    /// The newest `as_of` is the one loaded, not the first or last listed.
+    #[tokio::test]
+    async fn test_the_newest_classification_partition_is_the_one_read() {
+        let client = classification_client(
+            vec![
+                classification_key(date_of(2026, 6, 1)),
+                classification_key(date_of(2026, 9, 22)),
+                classification_key(date_of(2026, 7, 15)),
+            ],
+            mapping_parquet("ConsumerNondurables"),
+        );
+
+        let table = read_newest_classification(&client, "test-bucket")
+            .await
+            .expect("the mapping must load");
+
+        assert_eq!(table.as_of(), date_of(2026, 9, 22));
+    }
+
+    /// A key that merely contains `as_of=` is not a partition.
+    ///
+    /// Without the round-trip check the 2099 key wins, the reader is sent to a canonical object that
+    /// does not exist, and the load fails while a valid partition is sitting in the same prefix.
+    #[tokio::test]
+    async fn test_a_non_canonical_key_is_not_mistaken_for_a_partition() {
+        let client = classification_client(
+            vec![
+                "data/reference/classification/as_of=2099-01-01/backup/data.parquet".to_string(),
+                classification_key(date_of(2026, 9, 22)),
+            ],
+            mapping_parquet("ConsumerNondurables"),
+        );
+
+        let table = read_newest_classification(&client, "test-bucket")
+            .await
+            .expect("the valid partition must still load");
+
+        assert_eq!(table.as_of(), date_of(2026, 9, 22));
+    }
+
+    /// An absent dataset refuses rather than classifying every name as the fallback, which is the
+    /// failure with no visible symptom.
+    #[tokio::test]
+    async fn test_an_absent_classification_dataset_is_refused() {
+        let client = classification_client(Vec::new(), mapping_parquet("ConsumerNondurables"));
+
+        let error = read_newest_classification(&client, "test-bucket")
+            .await
+            .expect_err("an absent mapping must be refused");
+
+        assert!(
+            matches!(error, ArchiveError::Classification { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// A bucket name this build cannot place is refused at the read, not folded into the catch-all.
+    #[tokio::test]
+    async fn test_a_stored_mapping_naming_an_unknown_bucket_is_refused() {
+        let client = classification_client(
+            vec![classification_key(date_of(2026, 9, 22))],
+            mapping_parquet("CryptoMining"),
+        );
+
+        let error = read_newest_classification(&client, "test-bucket")
+            .await
+            .expect_err("an unknown bucket must be refused");
+
+        assert!(
+            error.to_string().contains("CryptoMining"),
+            "the refusal must name the bucket it could not place: {error}"
+        );
+    }
+
+    fn date_of(year: i32, month: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(year, month, day).expect("a real date")
     }
 }

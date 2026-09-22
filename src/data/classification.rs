@@ -37,6 +37,12 @@ pub enum ClassificationError {
     },
     #[error("the mapping holds no {granularity} ranges, which would classify every name as the fallback")]
     Empty { granularity: &'static str },
+    #[error("{granularity} range {low}-{high} runs past 9999, which is not a SIC code")]
+    OutsideTheSicDomain {
+        granularity: &'static str,
+        low: u16,
+        high: u16,
+    },
 }
 
 /// The SIC-to-bucket mapping, loaded rather than compiled in.
@@ -81,6 +87,9 @@ impl ClassificationTable {
         (&self.sector_ranges, &self.industry_ranges)
     }
 }
+
+/// The largest value a four-digit `SicCode` can hold, and so the largest legal range bound.
+const MAXIMUM_SIC_CODE: u16 = 9999;
 
 /// Column values of the `granularity` column, which is what splits one published table in two.
 const SECTOR: &str = "sector";
@@ -207,6 +216,15 @@ fn check_ordering<Bucket: Copy>(
     for range in ranges {
         if range.low > range.high {
             return Err(ClassificationError::InvertedRange {
+                granularity,
+                low: range.low,
+                high: range.high,
+            });
+        }
+        // A SicCode is exactly four digits, so the bound is <= 9999 and not merely <= u16::MAX.
+        // 8000-60000 would otherwise pass every other check and swallow every code from 8000 up.
+        if range.high > MAXIMUM_SIC_CODE {
+            return Err(ClassificationError::OutsideTheSicDomain {
                 granularity,
                 low: range.low,
                 high: range.high,
@@ -420,6 +438,34 @@ mod tests {
         assert_eq!(
             industry_of(&fixture(), &sic("7311")),
             Industry::BusinessServices
+        );
+    }
+
+    /// A bound past 9999 is not a wide code but a corrupt row, and it would silently claim every
+    /// code above its low bound.
+    #[test]
+    fn test_a_bound_outside_the_sic_domain_is_refused() {
+        let error = ClassificationTable::new(
+            date(),
+            vec![SicRange {
+                low: 8000,
+                high: 60000,
+                bucket: Sector::Finance,
+            }],
+            vec![SicRange {
+                low: 100,
+                high: 999,
+                bucket: Industry::Agriculture,
+            }],
+        )
+        .expect_err("a bound past 9999 must be refused");
+
+        assert!(
+            matches!(
+                error,
+                ClassificationError::OutsideTheSicDomain { high: 60000, .. }
+            ),
+            "got {error}"
         );
     }
 
