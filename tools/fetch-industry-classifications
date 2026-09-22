@@ -51,13 +51,16 @@ TARGET="${OUTPUT}"
 if [[ "${CHECK_ONLY}" == true ]]; then
   TARGET="${WORK}/generated.rs"
 fi
+RANGES_CSV="${WORK}/ranges.csv"
+RANGES_PARQUET="${WORK}/ranges.parquet"
 
-python3 - "${WORK}" "${TARGET}" <<'PYTHON'
+python3 - "${WORK}" "${TARGET}" "${RANGES_CSV}" <<'PYTHON'
+import csv
 import re
 import sys
 from datetime import date
 
-work, output = sys.argv[1], sys.argv[2]
+work, output, ranges_csv = sys.argv[1], sys.argv[2], sys.argv[3]
 
 # The name each bucket is spelled with, keyed by the source's own short code.
 #
@@ -326,24 +329,18 @@ lines.extend(
         "    pub bucket: Bucket,",
         "}",
         "",
-        "/// Every SIC run the twelve-industry definition assigns, ascending by `low`.",
-        f"pub const SECTOR_RANGES: [SicRange<Sector>; {len(sector_spans)}] = [",
     ]
 )
-for low, high, code in sector_spans:
-    lines.append(
-        f"    SicRange {{ low: {low}, high: {high}, bucket: Sector::{code} }},"
-    )
-lines.append("];")
-lines.append("")
-lines.append("/// Every SIC run the forty-nine-industry definition assigns, ascending by `low`.")
-lines.append(f"pub const INDUSTRY_RANGES: [SicRange<Industry>; {len(industry_spans)}] = [")
-for low, high, code in industry_spans:
-    lines.append(
-        f"    SicRange {{ low: {low}, high: {high}, bucket: Industry::{code} }},"
-    )
-lines.append("];")
-lines.append("")
+
+# The runs themselves are published as a dataset rather than emitted here, so moving one needs no
+# deploy. Only the vocabulary -- the bucket names the runs refer to -- stays compiled in.
+with open(ranges_csv, "w", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(["granularity", "low", "high", "bucket"])
+    for low, high, code in sector_spans:
+        writer.writerow(["sector", low, high, code])
+    for low, high, code in industry_spans:
+        writer.writerow(["industry", low, high, code])
 
 rendered = "\n".join(lines)
 
@@ -365,8 +362,8 @@ with open(output, "w") as handle:
     handle.write(rendered)
 
 print(
-    f"Wrote {len(sectors)} sectors over {len(sector_spans)} ranges and "
-    f"{len(industries)} industries over {len(industry_spans)} ranges to {output}"
+    f"Wrote {len(sectors)} sector and {len(industries)} industry names to {output}, "
+    f"and {len(sector_spans)} + {len(industry_spans)} ranges to {ranges_csv}"
 )
 PYTHON
 
@@ -377,20 +374,71 @@ PYTHON
 echo "Formatting"
 rustfmt --edition 2021 "${TARGET}"
 
+# The ranges go to S3 as a dataset. duckdb rather than a Rust helper, because nothing in the binary
+# should be able to write this: the archive reads it, and a writer in the same process is a way for a
+# run to quietly reclassify the universe it is measuring.
+echo "Encoding the ranges"
+duckdb -c "COPY (SELECT granularity, CAST(low AS UINTEGER) AS low, CAST(high AS UINTEGER) AS high, \
+  bucket FROM read_csv('${RANGES_CSV}', header = true)) TO '${RANGES_PARQUET}' (FORMAT parquet);"
+
+BUCKET="${AWS_S3_ARCHIVE_BUCKET_NAME:-oscm-fund-archive}"
+PREFIX="data/reference/classification"
+
+# The newest stored partition, so a run that changes nothing writes nothing. Writing every fetch
+# would make `as_of` mean "when we looked" rather than "when the definitions moved", and churn every
+# reader's provenance for no change.
+NEWEST_KEY="$(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${PREFIX}/" \
+  --query 'sort_by(Contents,&Key)[-1].Key' --output text 2>/dev/null || echo None)"
+
+UNCHANGED=false
+if [[ "${NEWEST_KEY}" != "None" && -n "${NEWEST_KEY}" ]]; then
+  aws s3 cp "s3://${BUCKET}/${NEWEST_KEY}" "${WORK}/stored.parquet" --quiet
+  # Compared as a set of rows, not as bytes: parquet encoding is not reproducible, so a byte diff
+  # would report drift on every run and stop meaning anything.
+  DIFFERENCES="$(duckdb -noheader -list -c "SELECT count(*) FROM ( \
+    (SELECT * FROM read_parquet('${RANGES_PARQUET}') EXCEPT SELECT * FROM read_parquet('${WORK}/stored.parquet')) \
+    UNION ALL \
+    (SELECT * FROM read_parquet('${WORK}/stored.parquet') EXCEPT SELECT * FROM read_parquet('${RANGES_PARQUET}')));")"
+  if [[ "${DIFFERENCES}" == "0" ]]; then
+    UNCHANGED=true
+  fi
+  echo "Stored ${NEWEST_KEY}: ${DIFFERENCES} differing row(s)"
+else
+  echo "No stored mapping yet; this run publishes the first"
+fi
+
 if [[ "${CHECK_ONLY}" == true ]]; then
   # Ignoring FETCHED_ON, which moves with the clock and says nothing about the source. It is the
   # only dated line by construction — the generator refuses to emit a second one — so this compares
   # the definitions themselves rather than the day they were read.
   undated() { grep -v '^pub const FETCHED_ON' "$1"; }
-  if diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null; then
-    echo "Up to date: the committed table matches the published definitions"
+  VOCABULARY_MOVED=false
+  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null || VOCABULARY_MOVED=true
+
+  if [[ "${VOCABULARY_MOVED}" == false && "${UNCHANGED}" == true ]]; then
+    echo "Up to date: both the vocabulary and the published ranges match"
     exit 0
   fi
-  echo "DRIFT: the published definitions no longer match the committed table" >&2
-  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
+  if [[ "${VOCABULARY_MOVED}" == true ]]; then
+    echo "DRIFT: the bucket names no longer match the committed vocabulary" >&2
+    diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
+  fi
+  if [[ "${UNCHANGED}" == false ]]; then
+    echo "DRIFT: the published ranges differ from the newest stored partition" >&2
+  fi
   echo >&2
-  echo "Re-run without --check, review the diff, and commit it." >&2
+  echo "Re-run without --check to republish, and commit any vocabulary diff." >&2
   exit 1
 fi
 
-echo "Done. Review the diff and commit it."
+if [[ "${UNCHANGED}" == true ]]; then
+  echo "Ranges unchanged; nothing published. Review any vocabulary diff and commit it."
+  exit 0
+fi
+
+AS_OF="$(date -u +%Y-%m-%d)"
+DESTINATION="s3://${BUCKET}/${PREFIX}/as_of=${AS_OF}/data.parquet"
+echo "Publishing ${DESTINATION}"
+aws s3 cp "${RANGES_PARQUET}" "${DESTINATION}"
+
+echo "Done. Review any vocabulary diff and commit it."

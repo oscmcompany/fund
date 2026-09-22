@@ -26,6 +26,7 @@ use crate::common::types::{
 use crate::data::attribution::{Attribution, Declaration};
 use crate::data::cadence::{CadenceCheck, CadenceError, CadenceTotals, SessionOutcome};
 use crate::data::calendar::TradingCalendar;
+use crate::data::classification::ClassificationTable;
 use crate::data::{bars, boundaries, quotes, reference, splits, trades};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
@@ -92,6 +93,8 @@ pub enum ArchiveError {
         prefix: String,
         message: String,
     },
+    #[error("the classification mapping could not be loaded: {message}")]
+    Classification { message: String },
     #[error("failed to read s3://{bucket}/{key}: {message}")]
     Read {
         bucket: String,
@@ -2173,6 +2176,74 @@ pub fn trade_archive_prefix(interval: BarInterval) -> String {
     format!("{TRADE_ARCHIVE_PREFIX}/interval={interval}")
 }
 
+/// Where the published SIC-to-bucket mapping lives, one partition per `as_of`.
+///
+/// A dataset rather than a table compiled into the binary, so republished definitions need no
+/// deploy. Partitioned by `as_of` and written only when the rows change, which makes the partition
+/// list the change history rather than a log of when someone last looked.
+pub const CLASSIFICATION_ARCHIVE_PREFIX: &str = "data/reference/classification";
+
+/// The key one `as_of` of the mapping is written to.
+pub fn classification_key(as_of: chrono::NaiveDate) -> String {
+    format!("{CLASSIFICATION_ARCHIVE_PREFIX}/as_of={as_of}/data.parquet")
+}
+
+/// Every `as_of` the mapping holds a partition for, ascending.
+pub async fn classification_as_of_dates(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<Vec<chrono::NaiveDate>, ArchiveError> {
+    let (partitions, _sidecars) = partitions_and_sidecars(
+        s3_client,
+        bucket,
+        CLASSIFICATION_ARCHIVE_PREFIX,
+        "data.parquet",
+    )
+    .await?;
+
+    let mut dates: Vec<chrono::NaiveDate> = partitions
+        .iter()
+        .filter_map(|key| {
+            key.split('/')
+                .find_map(|segment| segment.strip_prefix("as_of="))
+                .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        })
+        .collect();
+    dates.sort_unstable();
+    dates.dedup();
+    Ok(dates)
+}
+
+/// Loads the newest published mapping.
+///
+/// Refuses when the dataset is absent or empty rather than falling back to a default: an empty
+/// mapping classifies every name as the fallback bucket, which is a plausible-looking answer no
+/// caller could distinguish from a market where nothing is classifiable.
+pub async fn read_newest_classification(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<ClassificationTable, ArchiveError> {
+    let newest = classification_as_of_dates(s3_client, bucket)
+        .await?
+        .pop()
+        .ok_or_else(|| ArchiveError::Classification {
+            message: format!(
+                "no mapping partition under s3://{bucket}/{CLASSIFICATION_ARCHIVE_PREFIX}"
+            ),
+        })?;
+    let key = classification_key(newest);
+    let frame = read_partition(s3_client, bucket, &key)
+        .await?
+        .ok_or_else(|| ArchiveError::Classification {
+            message: format!("s3://{bucket}/{key} was listed and then could not be read"),
+        })?;
+    ClassificationTable::from_dataframe(newest, &frame).map_err(|error| {
+        ArchiveError::Classification {
+            message: format!("s3://{bucket}/{key} is not a usable mapping: {error}"),
+        }
+    })
+}
+
 /// Every `as_of` the reference dataset holds a partition for, ascending.
 ///
 /// Listed rather than derived from the quarterly grid, because the grid is a policy about what
@@ -2218,7 +2289,15 @@ pub async fn current_universe(
     // Read directly rather than through `read_reference_window`, which would list a second time: if
     // the newest key vanished between the two listings its nearest-prior rule returns an older one.
     let frame = read_reference_partition(s3_client, bucket, newest).await?;
-    Ok(reference::universe_of(&[(newest, frame)])?)
+    let table = read_newest_classification(s3_client, bucket).await?;
+    // Journalled because the grouping is re-derived on every read: two runs agree about which names
+    // share a sector only if they used the same mapping, and this is what says which one that was.
+    tracing::info!(
+        classification_as_of = %table.as_of(),
+        reference_as_of = %newest,
+        "Building the current universe"
+    );
+    Ok(reference::universe_of(&[(newest, frame)], &table)?)
 }
 
 /// Which of the `available` observations answer for the sessions in `[start, end]`.

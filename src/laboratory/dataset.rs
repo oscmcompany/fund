@@ -585,7 +585,14 @@ pub async fn unscreened_window(
         session,
     )
     .await?;
-    let universe = reference::universe_of(&partitions)?;
+    let classification = archive::read_newest_classification(s3_client, bucket).await?;
+    // Journalled beside the digest: the mapping is applied on every read, so a study repeated after
+    // Dartmouth republishes groups the same names differently, and the `as_of` is what says so.
+    tracing::info!(
+        classification_as_of = %classification.as_of(),
+        "Classifying the study universe"
+    );
+    let universe = reference::universe_of(&partitions, &classification)?;
     let reference_digest = digest_of(universe.rows())?;
     let consolidated =
         reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;

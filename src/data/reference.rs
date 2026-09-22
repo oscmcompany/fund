@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use polars::prelude::*;
 
 use crate::common::types::{EquityReference, SecurityType, SessionDate, SicCode};
-use crate::data::classification;
+use crate::data::classification::{self, ClassificationTable};
 use crate::data::classification_table::{Industry, Sector};
 use crate::data::details::{industry_code, sector_code};
 
@@ -111,7 +111,10 @@ impl Universe {
 /// Each observation carries every symbol seen at or before it, not only the symbols that observation
 /// answered for. The feed returns a 404 for 7 to 18 symbols a quarter that traded, and an inner join
 /// against the raw partitions would drop each of those names for a whole quarter.
-pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, PolarsError> {
+pub fn universe_of(
+    partitions: &[(SessionDate, DataFrame)],
+    table: &ClassificationTable,
+) -> Result<Universe, PolarsError> {
     // Ascending here rather than trusting the caller: the carry-forward is only correct in order,
     // and a caller that listed the prefix differently would silently invert it.
     let mut ordered: Vec<&(SessionDate, DataFrame)> = partitions.iter().collect();
@@ -132,7 +135,7 @@ pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, 
             observation.carried += 1;
             observation.carried <= CARRY_FORWARD_OBSERVATIONS
         });
-        for (ticker, observation) in observations_of(frame)? {
+        for (ticker, observation) in observations_of(frame, table)? {
             // A newer observation supersedes an older one, which is what makes a reclassification
             // out of common stock take effect rather than being carried past.
             current.insert(ticker, observation);
@@ -165,7 +168,10 @@ pub fn universe_of(partitions: &[(SessionDate, DataFrame)]) -> Result<Universe, 
 }
 
 /// Reads one stored partition into the per-symbol observations it declares.
-fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, PolarsError> {
+fn observations_of(
+    frame: &DataFrame,
+    table: &ClassificationTable,
+) -> Result<Vec<(String, Observation)>, PolarsError> {
     let tickers = frame.column("ticker")?.str()?;
     let security_types = frame.column("security_type")?.str()?;
     let sic_codes = frame.column("sic_code")?.str()?;
@@ -191,10 +197,10 @@ fn observations_of(frame: &DataFrame) -> Result<Vec<(String, Observation)>, Pola
                 // one meaning: the feed reported no usable code.
                 sector: sic_code
                     .and_then(SicCode::new)
-                    .map(|code| classification::sector_of(&code)),
+                    .map(|code| classification::sector_of(table, &code)),
                 industry: sic_code
                     .and_then(SicCode::new)
-                    .map(|code| classification::industry_of(&code)),
+                    .map(|code| classification::industry_of(table, &code)),
             },
         ));
     }
@@ -425,6 +431,53 @@ mod sweep_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The six published runs the universe tests actually exercise, copied from the dataset.
+    ///
+    /// A fixture rather than the whole mapping, because what is under test here is the
+    /// carry-forward and the common-stock filter; the classification is an input to that. Every
+    /// other code lands in the fallback, which no test in this module asserts on.
+    fn table() -> ClassificationTable {
+        use crate::data::classification_table::SicRange;
+        ClassificationTable::new(
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 22).expect("a real date"),
+            vec![
+                SicRange {
+                    low: 100,
+                    high: 999,
+                    bucket: Sector::ConsumerNondurables,
+                },
+                SicRange {
+                    low: 3570,
+                    high: 3579,
+                    bucket: Sector::BusinessEquipment,
+                },
+                SicRange {
+                    low: 7370,
+                    high: 7379,
+                    bucket: Sector::BusinessEquipment,
+                },
+            ],
+            vec![
+                SicRange {
+                    low: 100,
+                    high: 199,
+                    bucket: Industry::Agriculture,
+                },
+                SicRange {
+                    low: 3570,
+                    high: 3579,
+                    bucket: Industry::Computers,
+                },
+                SicRange {
+                    low: 7370,
+                    high: 7372,
+                    bucket: Industry::ComputerSoftware,
+                },
+            ],
+        )
+        .expect("the fixture runs are disjoint and ascending")
+    }
+
     use super::*;
     use crate::common::types::{SecurityType, SessionDate, SicCode, Ticker};
 
@@ -524,14 +577,17 @@ mod tests {
     /// common stock, and a pairs screen handed two index trackers finds them cointegrated.
     #[test]
     fn test_only_common_stock_reaches_the_universe() {
-        let universe = universe_of(&[partition(
-            (2021, 10, 1),
-            &[
-                ("AAPL", "CS", Some("3571")),
-                ("SPY", "ETF", None),
-                ("XYZW", "WARRANT", None),
-            ],
-        )])
+        let universe = universe_of(
+            &[partition(
+                (2021, 10, 1),
+                &[
+                    ("AAPL", "CS", Some("3571")),
+                    ("SPY", "ETF", None),
+                    ("XYZW", "WARRANT", None),
+                ],
+            )],
+            &table(),
+        )
         .expect("the universe must build");
 
         let tickers: Vec<&str> = universe
@@ -552,14 +608,17 @@ mod tests {
     /// rather than to the lookup, so a table that moves fails here instead of agreeing with itself.
     #[test]
     fn test_the_sector_and_industry_are_looked_up_from_the_whole_code() {
-        let universe = universe_of(&[partition(
-            (2021, 10, 1),
-            &[
-                ("AAPL", "CS", Some("3571")),
-                ("SFTW", "CS", Some("7372")),
-                ("AGRI", "CS", Some("0100")),
-            ],
-        )])
+        let universe = universe_of(
+            &[partition(
+                (2021, 10, 1),
+                &[
+                    ("AAPL", "CS", Some("3571")),
+                    ("SFTW", "CS", Some("7372")),
+                    ("AGRI", "CS", Some("0100")),
+                ],
+            )],
+            &table(),
+        )
         .expect("the universe must build");
 
         let sectors = universe.rows().column("sector").unwrap().str().unwrap();
@@ -581,8 +640,11 @@ mod tests {
     /// reader's decision, not this one's — the screen pools them and the residual panel refuses them.
     #[test]
     fn test_a_common_stock_without_a_sic_stays_in_the_universe() {
-        let universe = universe_of(&[partition((2021, 10, 1), &[("ZZZZ", "CS", None)])])
-            .expect("the universe must build");
+        let universe = universe_of(
+            &[partition((2021, 10, 1), &[("ZZZZ", "CS", None)])],
+            &table(),
+        )
+        .expect("the universe must build");
 
         assert_eq!(universe.rows().height(), 1);
         assert_eq!(
@@ -599,9 +661,12 @@ mod tests {
 
     #[test]
     fn test_an_empty_archive_yields_an_empty_universe_with_the_same_schema() {
-        let empty = universe_of(&[]).expect("an empty universe must build");
-        let populated = universe_of(&[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])])
-            .expect("the universe must build");
+        let empty = universe_of(&[], &table()).expect("an empty universe must build");
+        let populated = universe_of(
+            &[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])],
+            &table(),
+        )
+        .expect("the universe must build");
 
         assert_eq!(empty.rows().height(), 0);
         assert_eq!(empty.rows().schema(), populated.rows().schema());
@@ -611,10 +676,13 @@ mod tests {
     /// is what makes the universe look-ahead-free by construction rather than by a remembered rule.
     #[test]
     fn test_a_bar_takes_the_observation_current_when_it_printed() {
-        let universe = universe_of(&[
-            partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))]),
-            partition((2022, 1, 3), &[("AAPL", "CS", Some("7372"))]),
-        ])
+        let universe = universe_of(
+            &[
+                partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))]),
+                partition((2022, 1, 3), &[("AAPL", "CS", Some("7372"))]),
+            ],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(
@@ -639,13 +707,16 @@ mod tests {
     /// printing bars, and a classification carried forward onto no bars costs nothing.
     #[test]
     fn test_a_delisted_name_keeps_the_sessions_it_traded() {
-        let universe = universe_of(&[
-            partition(
-                (2021, 10, 1),
-                &[("AAPL", "CS", Some("3571")), ("TWTR", "CS", Some("7370"))],
-            ),
-            partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
-        ])
+        let universe = universe_of(
+            &[
+                partition(
+                    (2021, 10, 1),
+                    &[("AAPL", "CS", Some("3571")), ("TWTR", "CS", Some("7370"))],
+                ),
+                partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
+            ],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(
@@ -673,12 +744,15 @@ mod tests {
     /// classification rather than vanish for the whole quarter.
     #[test]
     fn test_a_name_absent_from_one_observation_keeps_its_classification() {
-        let universe = universe_of(&[
-            partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))]),
-            // AAPL traded through this quarter; the feed simply had no record for it that day.
-            partition((2022, 1, 3), &[("MSFT", "CS", Some("7372"))]),
-            partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
-        ])
+        let universe = universe_of(
+            &[
+                partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))]),
+                // AAPL traded through this quarter; the feed simply had no record for it that day.
+                partition((2022, 1, 3), &[("MSFT", "CS", Some("7372"))]),
+                partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
+            ],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(bars(&[("AAPL", instant(2022, 2, 10))]), &universe)
@@ -697,11 +771,14 @@ mod tests {
     /// listing's bars would classify one company's history as another's.
     #[test]
     fn test_a_classification_is_not_carried_past_one_silent_observation() {
-        let universe = universe_of(&[
-            partition((2021, 10, 1), &[("ECHO", "CS", Some("4731"))]),
-            partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
-            partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
-        ])
+        let universe = universe_of(
+            &[
+                partition((2021, 10, 1), &[("ECHO", "CS", Some("4731"))]),
+                partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
+                partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
+            ],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(
@@ -727,10 +804,13 @@ mod tests {
     /// than being invisible behind the common-stock filter.
     #[test]
     fn test_a_name_reclassified_out_of_common_stock_is_dropped_from_then_on() {
-        let universe = universe_of(&[
-            partition((2021, 10, 1), &[("XYZ", "CS", Some("6726"))]),
-            partition((2022, 1, 3), &[("XYZ", "ETF", None)]),
-        ])
+        let universe = universe_of(
+            &[
+                partition((2021, 10, 1), &[("XYZ", "CS", Some("6726"))]),
+                partition((2022, 1, 3), &[("XYZ", "ETF", None)]),
+            ],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(
@@ -755,13 +835,16 @@ mod tests {
 
     #[test]
     fn test_a_bar_carries_the_share_count_current_when_it_printed() {
-        let universe = universe_of(&[
-            partition_with_shares(
-                (2021, 10, 1),
-                &[("AAPL", "CS", Some("3571"), Some(16.53e9))],
-            ),
-            partition_with_shares((2022, 1, 3), &[("AAPL", "CS", Some("3571"), Some(14.59e9))]),
-        ])
+        let universe = universe_of(
+            &[
+                partition_with_shares(
+                    (2021, 10, 1),
+                    &[("AAPL", "CS", Some("3571"), Some(16.53e9))],
+                ),
+                partition_with_shares((2022, 1, 3), &[("AAPL", "CS", Some("3571"), Some(14.59e9))]),
+            ],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(
@@ -786,10 +869,13 @@ mod tests {
     /// null here is a dated coverage change rather than a stray row.
     #[test]
     fn test_a_missing_share_count_keeps_the_bar_and_nulls_the_count() {
-        let universe = universe_of(&[partition_with_shares(
-            (2021, 10, 1),
-            &[("AAPL", "CS", Some("3571"), None)],
-        )])
+        let universe = universe_of(
+            &[partition_with_shares(
+                (2021, 10, 1),
+                &[("AAPL", "CS", Some("3571"), None)],
+            )],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 11, 15))]), &universe)
@@ -826,12 +912,15 @@ mod tests {
             ])
             .expect("the stored fixture must build");
 
-            let universe = universe_of(&[(
-                SessionDate::from_date(
-                    chrono::NaiveDate::from_ymd_opt(2021, 10, 1).expect("a valid date"),
-                ),
-                stored,
-            )])
+            let universe = universe_of(
+                &[(
+                    SessionDate::from_date(
+                        chrono::NaiveDate::from_ymd_opt(2021, 10, 1).expect("a valid date"),
+                    ),
+                    stored,
+                )],
+                &table(),
+            )
             .expect("the universe must build");
 
             let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 11, 15))]), &universe)
@@ -868,12 +957,15 @@ mod tests {
         ])
         .expect("the stored fixture must build");
 
-        let universe = universe_of(&[(
-            SessionDate::from_date(
-                chrono::NaiveDate::from_ymd_opt(2021, 10, 1).expect("a valid date"),
-            ),
-            stored,
-        )])
+        let universe = universe_of(
+            &[(
+                SessionDate::from_date(
+                    chrono::NaiveDate::from_ymd_opt(2021, 10, 1).expect("a valid date"),
+                ),
+                stored,
+            )],
+            &table(),
+        )
         .expect("the universe must build");
 
         let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 11, 15))]), &universe)
@@ -894,8 +986,11 @@ mod tests {
     /// rather than reach forward for the first observation that postdates it.
     #[test]
     fn test_a_bar_predating_every_observation_is_dropped() {
-        let universe = universe_of(&[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])])
-            .expect("the universe must build");
+        let universe = universe_of(
+            &[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])],
+            &table(),
+        )
+        .expect("the universe must build");
 
         let joined = join_point_in_time(bars(&[("AAPL", instant(2021, 9, 15))]), &universe)
             .expect("the join must run");
@@ -905,8 +1000,11 @@ mod tests {
 
     #[test]
     fn test_a_bar_for_a_name_outside_the_universe_is_dropped() {
-        let universe = universe_of(&[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])])
-            .expect("the universe must build");
+        let universe = universe_of(
+            &[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])],
+            &table(),
+        )
+        .expect("the universe must build");
 
         let joined = join_point_in_time(
             bars(&[
