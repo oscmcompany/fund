@@ -1455,14 +1455,12 @@ mod tests {
     #[test]
     fn test_the_export_key_is_determined_by_the_session_and_producer_alone() {
         let prefix = producer_prefix(JOURNAL_PREFIX, Producer::Trader);
+
         let key = date_partitioned_key(&prefix, session(2026, 8, 11).date());
+
         assert_eq!(
             key,
             "exports/journal/producer=trader/year=2026/month=08/day=11/data.parquet"
-        );
-        assert_eq!(
-            key,
-            date_partitioned_key(&prefix, session(2026, 8, 11).date())
         );
     }
 

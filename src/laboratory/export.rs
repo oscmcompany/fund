@@ -458,16 +458,36 @@ mod tests {
         );
     }
 
-    /// Both share the prefix, so a reader listing `exports/journal/` sees both and must be able to
-    /// tell them apart from the key alone.
+    /// All three share the prefix, so a reader listing `exports/journal/` sees every producer and
+    /// must be able to tell them apart from the key alone.
     #[test]
-    fn test_both_producers_live_under_one_prefix() {
+    fn test_every_producer_writes_a_distinct_key_under_one_prefix() {
         let date = session(2026, 8, 17).date();
+        // Spelled out rather than derived from `as_str`, which is the thing under test: a producer
+        // whose name came back empty would satisfy any assertion built from it.
+        let expected = [
+            (
+                Producer::Trader,
+                "exports/journal/producer=trader/year=2026/month=08/day=17/data.parquet",
+            ),
+            (
+                Producer::Trainer,
+                "exports/journal/producer=trainer/year=2026/month=08/day=17/data.parquet",
+            ),
+            (
+                Producer::Archiver,
+                "exports/journal/producer=archiver/year=2026/month=08/day=17/data.parquet",
+            ),
+        ];
 
-        for producer in [Producer::Trader, Producer::Trainer, Producer::Archiver] {
-            let key = date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, producer), date);
-            assert!(key.starts_with("exports/journal/producer="), "{key}");
-            assert!(key.contains(producer.as_str()), "{key}");
+        for (producer, key) in expected {
+            assert_eq!(
+                date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, producer), date),
+                key
+            );
         }
+
+        let distinct: BTreeMap<&str, ()> = expected.iter().map(|(_, key)| (*key, ())).collect();
+        assert_eq!(distinct.len(), expected.len());
     }
 }
