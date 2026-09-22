@@ -354,6 +354,12 @@ fn to_polars_error(error: sqlx::Error) -> PolarsError {
     PolarsError::ComputeError(error.to_string().into())
 }
 
+/// The producer every export in this module writes as.
+///
+/// The host, not this module: `trader` is the box that runs the application, and naming it once
+/// here is what keeps the journal and the log from disagreeing about whose records they are.
+const PRODUCER: Producer = Producer::Trader;
+
 /// S3 prefix the sealed sessions are written under.
 pub const JOURNAL_PREFIX: &str = "exports/journal";
 
@@ -446,7 +452,7 @@ pub async fn export_journals(
                     continue;
                 }
                 let key = date_partitioned_key(
-                    &producer_prefix(JOURNAL_PREFIX, Producer::Trader),
+                    &producer_prefix(JOURNAL_PREFIX, PRODUCER),
                     session_date.date(),
                 );
                 match write_frame(s3_client, bucket, &key, &mut frame).await {
@@ -489,11 +495,30 @@ pub async fn export_journals(
     summary
 }
 
-/// S3 prefix the diagnostic logs are written under, partitioned by service.
+/// S3 prefix the diagnostic logs are written under, partitioned by producer and then by service.
+///
+/// `producer` sits above `service` rather than replacing it: a service name only *implies* its
+/// host, so "every archiver log" would otherwise be answerable only by someone who already knows
+/// which binaries run where.
 pub const LOG_PREFIX: &str = "exports/logs";
 
 /// Calendar days of exported logs kept on local disk, matching the journal's window.
 pub const LOG_RETENTION_DAYS: i64 = 7;
+
+/// Where one service's log for one date is written.
+///
+/// Named rather than inlined so a test can assert the layout the exporter actually uses, including
+/// which producer it writes as. A test that rebuilt this expression would only prove it agrees with
+/// itself, and would pass unchanged if [`PRODUCER`] were edited.
+fn log_key(service: &str, date: NaiveDate) -> String {
+    date_partitioned_key(
+        &format!(
+            "{}/service={service}",
+            producer_prefix(LOG_PREFIX, PRODUCER)
+        ),
+        date,
+    )
+}
 
 /// What one log export run accomplished.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -564,7 +589,7 @@ pub async fn export_logs(
             continue;
         }
 
-        let key = date_partitioned_key(&format!("{LOG_PREFIX}/service={service}"), date);
+        let key = log_key(&service, date);
         match write_frame(s3_client, bucket, &key, &mut frame).await {
             Ok(()) => {
                 summary
@@ -1475,5 +1500,34 @@ mod tests {
             date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, Producer::Archiver), date);
 
         assert_ne!(trader, archiver);
+    }
+
+    /// Pins the producer both exports in this module write as. The two key tests each rebuild or
+    /// consume it, so without this a change here would move the journal and the log together and
+    /// look like agreement rather than a rename.
+    #[test]
+    fn test_this_module_exports_as_the_trader() {
+        assert_eq!(PRODUCER.as_str(), "trader");
+    }
+
+    /// `producer` above `service`, so "every archiver log" is one prefix rather than a question
+    /// about which binaries run where.
+    #[test]
+    fn test_the_log_key_carries_the_producer_above_the_service() {
+        let date = session(2026, 8, 11).date();
+
+        assert_eq!(
+            log_key("seed-equity-details-postgres", date),
+            "exports/logs/producer=trader/service=seed-equity-details-postgres/year=2026/month=08/day=11/data.parquet"
+        );
+    }
+
+    /// The finer split survives the new key: two services on one host still write separate objects
+    /// for the same date, which is what stops one from overwriting the other.
+    #[test]
+    fn test_two_services_on_one_producer_write_different_log_keys() {
+        let date = session(2026, 8, 11).date();
+
+        assert_ne!(log_key("seed-archive-nightly", date), log_key("api", date));
     }
 }
