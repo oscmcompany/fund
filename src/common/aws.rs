@@ -39,6 +39,44 @@ pub fn date_partitioned_key(prefix: &str, date: chrono::NaiveDate) -> String {
     )
 }
 
+/// Which instance produced an exported record.
+///
+/// Records are keyed by producer because three of them write the same shapes on the same dates, and
+/// a date alone does not identify an object. The trader is the `application` devenv profile; the two
+/// names diverge until the exe.dev dependency is retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Producer {
+    Trader,
+    Trainer,
+    Archiver,
+}
+
+impl Producer {
+    /// The partition value, which is the whole identity of this type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Producer::Trader => "trader",
+            Producer::Trainer => "trainer",
+            Producer::Archiver => "archiver",
+        }
+    }
+}
+
+impl std::fmt::Display for Producer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The prefix one producer writes under, before any finer partition and before the date.
+///
+/// A prefix rather than a whole key, because the two callers differ in what sits between: the trader
+/// writes one object per session and the trainer one per experiment type. Feeding the result to
+/// [`date_partitioned_key`] is what keeps the date layout in one place.
+pub fn producer_prefix(prefix: &str, producer: Producer) -> String {
+    format!("{prefix}/producer={producer}")
+}
+
 /// Recover the date from a key built by [`date_partitioned_key`], or `None` if the key does not
 /// have that shape.
 ///

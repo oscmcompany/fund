@@ -12,15 +12,17 @@ use polars::prelude::*;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::common::aws::date_partitioned_key;
+use crate::common::aws::{date_partitioned_key, producer_prefix, Producer};
 use crate::common::types::SessionDate;
+use crate::data::export::JOURNAL_PREFIX;
 use crate::laboratory::journal::{file_name, session_from_file_name, Journal};
 
-/// S3 prefix the laboratory writes under.
+/// The producer this export writes as.
 ///
-/// Its own, and not the application's `exports/journal`: both partition by date, so one prefix
-/// would mean two producers overwriting each other's object for the same day.
-pub const EXPERIMENT_PREFIX: &str = "exports/laboratory/experiments";
+/// Shares `exports/journal` with the trader now that `producer=` separates them. A date alone does
+/// not identify an object here — both write one per session — and the key is what makes the shared
+/// prefix safe rather than a collision.
+const PRODUCER: Producer = Producer::Trainer;
 
 /// Age, in days, past which a shipped file is deleted.
 ///
@@ -85,8 +87,13 @@ pub async fn export_journals(
                 day_written = false;
                 continue;
             }
-            let prefix = format!("{EXPERIMENT_PREFIX}/experiment_type={experiment_type}");
-            let key = date_partitioned_key(&prefix, session.date());
+            // `experiment_type` sits beneath `producer`, so one session is many objects here and
+            // exactly one for the trader.
+            let prefix = producer_prefix(JOURNAL_PREFIX, PRODUCER);
+            let key = date_partitioned_key(
+                &format!("{prefix}/experiment_type={experiment_type}"),
+                session.date(),
+            );
             match write_frame(s3_client, bucket, &key, &mut frame).await {
                 Ok(()) => summary
                     .written
@@ -426,21 +433,41 @@ mod tests {
         assert_eq!(frames["dataset_built"].height(), 1);
     }
 
-    /// The whole reason for a separate prefix: the application's journal key for the same date must
-    /// not be the one this produces.
+    /// The separate prefix is gone, so `producer` is now the only thing keeping two writers of the
+    /// same date apart. It is the reason the shared prefix is safe rather than a collision.
     #[test]
-    fn test_the_key_does_not_collide_with_the_application_journal() {
+    fn test_the_key_does_not_collide_with_the_traders_journal() {
         let date = session(2026, 8, 17).date();
-        let laboratory = date_partitioned_key(
-            &format!("{EXPERIMENT_PREFIX}/experiment_type=dataset_built"),
+        let trainer = date_partitioned_key(
+            &format!(
+                "{}/experiment_type=dataset_built",
+                producer_prefix(JOURNAL_PREFIX, PRODUCER)
+            ),
             date,
         );
-        let application = date_partitioned_key(crate::data::export::JOURNAL_PREFIX, date);
+        let trader = date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, Producer::Trader), date);
 
-        assert_ne!(laboratory, application);
+        assert_ne!(trainer, trader);
         assert_eq!(
-            laboratory,
-            "exports/laboratory/experiments/experiment_type=dataset_built/year=2026/month=08/day=17/data.parquet"
+            trainer,
+            "exports/journal/producer=trainer/experiment_type=dataset_built/year=2026/month=08/day=17/data.parquet"
         );
+        assert_eq!(
+            trader,
+            "exports/journal/producer=trader/year=2026/month=08/day=17/data.parquet"
+        );
+    }
+
+    /// Both share the prefix, so a reader listing `exports/journal/` sees both and must be able to
+    /// tell them apart from the key alone.
+    #[test]
+    fn test_both_producers_live_under_one_prefix() {
+        let date = session(2026, 8, 17).date();
+
+        for producer in [Producer::Trader, Producer::Trainer, Producer::Archiver] {
+            let key = date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, producer), date);
+            assert!(key.starts_with("exports/journal/producer="), "{key}");
+            assert!(key.contains(producer.as_str()), "{key}");
+        }
     }
 }
