@@ -33,6 +33,20 @@ This is a collection of guidelines and references.
 - Never rename fixed external identifiers: devenv profile names (`application`, `trainer`), the `awssm`
   secretspec provider, the `tide` model and package name, environment variables and secret keys, library
   import aliases, linter directives, and external library fields and parameters
+- Three hosts do the work and each has one name, used for the instance, its tags, its scripts, and the
+  `producer=` partition its journals and logs are written under: `archiver` collects data, `trader`
+  executes, and `researcher` runs experiments and model training
+- The host name is the anchor and a module name is never a host name — `researcher` runs every
+  `laboratory_*` binary and would run training beside them, so the module appears in the finer key
+  (`service=` for a log, `experiment_type=` for an experiment) rather than in the host's name
+- The devenv profiles still read `application` and `trainer`, which is a recorded mismatch rather than a
+  defect: they are renamed to `trader` and `researcher` when the exe.dev dependency is retired, and until
+  then the line above governs everything except those two profile names
+- `fund-role` and `fund-profile` are different axes and neither absorbs the other: the role is which kind
+  of host (`archiver`), the profile is which environment (`production`), and provisioning filters on both
+  so a second environment cannot adopt the first's box
+- "Profile" already means a role in devenv and an environment in secretspec, so never introduce a third
+  sense of it; a record's host partition is `producer=`
 - Apply the spell-it-out rule to new code and to identifiers you touch; already-shipped schema identifiers
   and stored values are effectively fixed and change only via an explicit migration
 - Always match existing styles and patterns in the codebase for consistency

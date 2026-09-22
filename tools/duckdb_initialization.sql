@@ -237,8 +237,10 @@ SELECT
     year,
     month,
     day
+-- Scoped to one producer: the trainer shares this prefix and its records carry different columns,
+-- so a `**` glob would union two schemas and call the result the trader's journal.
 FROM read_parquet(
-    's3://' || getvariable('records_bucket') || '/exports/journal/**/*.parquet',
+    's3://' || getvariable('records_bucket') || '/exports/journal/producer=trader/**/*.parquet',
     hive_partitioning = true
 );
 

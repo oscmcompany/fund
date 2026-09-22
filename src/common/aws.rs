@@ -39,6 +39,49 @@ pub fn date_partitioned_key(prefix: &str, date: chrono::NaiveDate) -> String {
     )
 }
 
+/// Which host produced an exported record.
+///
+/// Records are keyed by producer because three hosts write the same shapes on the same dates, and a
+/// date alone does not identify an object. These name the host rather than the module that ran:
+/// `researcher` runs every `laboratory_*` binary and would run model training too, so naming it for
+/// either one would be wrong as soon as the other moved. The finer key beneath — `service` for a
+/// log, `experiment_type` for an experiment — is where the module appears.
+///
+/// The devenv profiles still read `application` and `trainer`; see the naming table in `CLAUDE.md`
+/// for the mismatch and when it closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Producer {
+    Trader,
+    Researcher,
+    Archiver,
+}
+
+impl Producer {
+    /// The partition value, which is the whole identity of this type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Producer::Trader => "trader",
+            Producer::Researcher => "researcher",
+            Producer::Archiver => "archiver",
+        }
+    }
+}
+
+impl std::fmt::Display for Producer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The prefix one producer writes under, before any finer partition and before the date.
+///
+/// A prefix rather than a whole key, because the two callers differ in what sits between: the trader
+/// writes one object per session and the trainer one per experiment type. Feeding the result to
+/// [`date_partitioned_key`] is what keeps the date layout in one place.
+pub fn producer_prefix(prefix: &str, producer: Producer) -> String {
+    format!("{prefix}/producer={producer}")
+}
+
 /// Recover the date from a key built by [`date_partitioned_key`], or `None` if the key does not
 /// have that shape.
 ///

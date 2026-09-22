@@ -12,7 +12,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use crate::common::aws::date_partitioned_key;
+use crate::common::aws::{date_partitioned_key, producer_prefix, Producer};
 use crate::common::journal::{file_name, session_from_file_name, Journal};
 use crate::common::types::{Dataset, SessionDate};
 
@@ -445,7 +445,10 @@ pub async fn export_journals(
                     ));
                     continue;
                 }
-                let key = date_partitioned_key(JOURNAL_PREFIX, session_date.date());
+                let key = date_partitioned_key(
+                    &producer_prefix(JOURNAL_PREFIX, Producer::Trader),
+                    session_date.date(),
+                );
                 match write_frame(s3_client, bucket, &key, &mut frame).await {
                     Ok(()) => {
                         summary.exported.push((session_date.date(), frame.height()));
@@ -1447,18 +1450,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The key is a pure function of the session, which is what makes a repeat export an overwrite
-    /// rather than a duplicate — and why there is no cursor to keep in sync.
+    /// The key is a pure function of the session and the producer, which is what makes a repeat
+    /// export an overwrite rather than a duplicate — and why there is no cursor to keep in sync.
     #[test]
-    fn test_the_export_key_is_determined_by_the_session_alone() {
-        let key = date_partitioned_key(JOURNAL_PREFIX, session(2026, 8, 11).date());
+    fn test_the_export_key_is_determined_by_the_session_and_producer_alone() {
+        let prefix = producer_prefix(JOURNAL_PREFIX, Producer::Trader);
+
+        let key = date_partitioned_key(&prefix, session(2026, 8, 11).date());
+
         assert_eq!(
             key,
-            "exports/journal/year=2026/month=08/day=11/data.parquet"
+            "exports/journal/producer=trader/year=2026/month=08/day=11/data.parquet"
         );
-        assert_eq!(
-            key,
-            date_partitioned_key(JOURNAL_PREFIX, session(2026, 8, 11).date())
-        );
+    }
+
+    /// The producer is what stops the trainer's object for a date from being this one, now that the
+    /// two share `exports/journal`.
+    #[test]
+    fn test_another_producer_writes_a_different_key_for_the_same_session() {
+        let date = session(2026, 8, 11).date();
+
+        let trader = date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, Producer::Trader), date);
+        let archiver =
+            date_partitioned_key(&producer_prefix(JOURNAL_PREFIX, Producer::Archiver), date);
+
+        assert_ne!(trader, archiver);
     }
 }
