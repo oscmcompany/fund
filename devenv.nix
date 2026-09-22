@@ -749,13 +749,13 @@ in {
 
   # Profile comes from the environment rather than the script name: it scopes the box's secret
   # grant, so the two must be the same string. Dry-run unless a caller passes --apply.
-  scripts.provision-archive-worker.exec = ''
+  scripts.provision-archiver.exec = ''
     set -euo pipefail
     if [[ -z "''${FUND_PROFILE:-}" ]]; then
       echo "Error: FUND_PROFILE is not set; it names the profile whose keys the box may read." >&2
       exit 1
     fi
-    exec bash "$DEVENV_ROOT/tools/provision-archive-worker" --profile "$FUND_PROFILE" "$@"
+    exec bash "$DEVENV_ROOT/tools/provision-archiver" --profile "$FUND_PROFILE" "$@"
   '';
 
   scripts.start-application.exec = ''

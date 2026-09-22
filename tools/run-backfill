@@ -7,9 +7,9 @@
 #
 #   run-backfill equity-trades archive --start 2021-08-26 --end 2026-08-28 --source vendor-keeping-raw
 #
-# The instance role this runs under is reconciled by `provision-archive-worker` beside this file,
+# The instance role this runs under is reconciled by `provision-archiver` beside this file,
 # which derives the policy from the profile rather than reading a fixed document:
-#   bash tools/provision-archive-worker --profile development/<name> --apply
+#   bash tools/provision-archiver --profile development/<name> --apply
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"

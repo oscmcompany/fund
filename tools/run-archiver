@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# run-archive-worker -- What the worker does when the nightly schedule wakes it.
+# run-archiver -- What the worker does when the nightly schedule wakes it.
 #
 # Sync, fold whatever the recent sessions are missing, stop. The schedule fires every night
 # including weekends, because `seed` asks the calendar and the set difference decides what is owed.
@@ -12,7 +12,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGION="${AWS_REGION:-us-east-1}"
 PROFILE_FILE=/etc/fund-profile
-INHIBIT_FILE=/etc/fund-archive-worker.inhibit
+INHIBIT_FILE=/etc/fund-archiver.inhibit
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
@@ -58,7 +58,7 @@ export FUND_PROFILE
 cd "$REPO_ROOT"
 
 log "Syncing"
-if ! tools/sync-archive-worker; then
+if ! tools/sync-archiver; then
   log "ERROR: sync failed; not folding tonight"
   exit 1
 fi

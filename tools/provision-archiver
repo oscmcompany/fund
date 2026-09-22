@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # --------------------------------------------------------------------------- #
-# provision-archive-worker -- Reconcile the EC2 instance that writes the archive
+# provision-archiver -- Reconcile the EC2 instance that writes the archive
 #
-# Run locally: bash tools/provision-archive-worker --profile <profile> [--apply]
+# Run locally: bash tools/provision-archiver --profile <profile> [--apply]
 #
 # Every resource is named for the profile, so two profiles never share a role or an instance.
 # Mutable settings are corrected on each run; a mismatch in something that cannot be changed in
@@ -54,7 +54,7 @@ APPLY=false
 usage() {
   echo "Usage: $(basename "$0") --profile <profile> [--apply]"
   echo ""
-  echo "Reconcile the archive worker: IAM role, instance profile, security group,"
+  echo "Reconcile the archiver: IAM role, instance profile, security group,"
   echo "instance, stall alarm, and the nightly schedule that starts it."
   echo ""
   echo "Options:"
@@ -83,7 +83,7 @@ if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
 fi
 
 SLUG="${PROFILE//[\/.]/-}"
-NAME="fund-archive-worker-${SLUG}"
+NAME="fund-archiver-${SLUG}"
 
 # IAM caps role names at 64, and the scheduler role is the longest thing derived from this one.
 if [[ ${#NAME} -gt 54 ]]; then
@@ -127,6 +127,76 @@ echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
 echo "Region:   $REGION"
 
 # --------------------------------------------------------------------------- #
+# Predecessor
+#
+# This host was called the archive worker until 2026-09-22, and the rename moved every name at
+# once: the tag value the instance is found by, and the stem the role, instance profile, security
+# group, alarm and schedule are keyed on. Nothing here is renamed in place -- IAM and EventBridge
+# have no rename, and the instance carries the old instance profile and security group, which the
+# instance section refuses to adopt rather than silently accept. So the cutover is a rebuild, and
+# what this block enforces is its order.
+#
+# Only one overlap is dangerous: two armed schedules mean two boxes folding the same session. Any
+# other leftover just bills. So an ENABLED predecessor schedule refuses and everything else is
+# reported, which is what lets the new box be verified before the old one is deleted.
+#
+# Delete this block once no profile has a predecessor.
+# --------------------------------------------------------------------------- #
+
+step "Predecessor"
+
+PREDECESSOR="fund-archive-worker-${SLUG}"
+
+PREDECESSOR_SCHEDULE_STATE="$(aws scheduler get-schedule --region "$REGION" \
+  --name "${PREDECESSOR}-nightly" --query State --output text 2>/dev/null || echo "None")"
+
+if [[ "$PREDECESSOR_SCHEDULE_STATE" == "ENABLED" ]]; then
+  echo "Error: ${PREDECESSOR}-nightly is still ENABLED. Provisioning now would arm a second" >&2
+  echo "  nightly against a second instance, and both would fold the same session." >&2
+  echo "" >&2
+  echo "  Disable it first, then provision, verify a night, and delete the predecessor set:" >&2
+  echo "    aws scheduler update-schedule --region $REGION --name ${PREDECESSOR}-nightly \\" >&2
+  echo "      --state DISABLED --cli-input-json \"\$(aws scheduler get-schedule --region $REGION \\" >&2
+  echo "      --name ${PREDECESSOR}-nightly --output json)\"" >&2
+  exit 1
+fi
+
+LEFTOVERS=0
+leftover() {
+  echo "    LEFTOVER: $1 -- delete once the new archiver has folded a night"
+  LEFTOVERS=$((LEFTOVERS + 1))
+}
+
+[[ "$PREDECESSOR_SCHEDULE_STATE" == "None" ]] \
+  || leftover "schedule ${PREDECESSOR}-nightly ($PREDECESSOR_SCHEDULE_STATE)"
+
+PREDECESSOR_INSTANCE="$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=tag:fund-role,Values=archive-worker" \
+    "Name=tag:fund-profile,Values=$PROFILE" \
+    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "None")"
+[[ "$PREDECESSOR_INSTANCE" == "None" || -z "$PREDECESSOR_INSTANCE" ]] \
+  || leftover "instance $PREDECESSOR_INSTANCE and its root volume"
+
+for role in "$PREDECESSOR" "${PREDECESSOR}-scheduler"; do
+  aws iam get-role --role-name "$role" >/dev/null 2>&1 && leftover "IAM role $role"
+done
+
+aws iam get-instance-profile --instance-profile-name "$PREDECESSOR" >/dev/null 2>&1 \
+  && leftover "instance profile $PREDECESSOR"
+
+aws cloudwatch describe-alarms --region "$REGION" --alarm-names "${PREDECESSOR}-stalled" \
+  --query 'MetricAlarms[0].AlarmName' --output text 2>/dev/null | grep -q "$PREDECESSOR" \
+  && leftover "alarm ${PREDECESSOR}-stalled"
+
+aws ec2 describe-security-groups --region "$REGION" \
+  --filters "Name=group-name,Values=$PREDECESSOR" \
+  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | grep -q '^sg-' \
+  && leftover "security group $PREDECESSOR"
+
+[[ "$LEFTOVERS" -gt 0 ]] || unchanged "no predecessor resources"
+
+# --------------------------------------------------------------------------- #
 # IAM role
 # --------------------------------------------------------------------------- #
 
@@ -136,8 +206,8 @@ TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
 # Carried on the resource as well as in this file, so the console says what the role is for.
-ROLE_DESCRIPTION="Archive worker ($PROFILE): nightly fetch-and-fold of market data into \
-s3://${ARCHIVE_BUCKET}. Managed by tools/provision-archive-worker."
+ROLE_DESCRIPTION="Archiver ($PROFILE): nightly fetch-and-fold of market data into \
+s3://${ARCHIVE_BUCKET}. Managed by tools/provision-archiver."
 
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
   unchanged "role exists"
@@ -220,7 +290,7 @@ else
   if [[ "$APPLY" == true ]]; then
     SECURITY_GROUP_ID="$(aws ec2 create-security-group --region "$REGION" \
       --group-name "$NAME" --vpc-id "$VPC_ID" \
-      --description "Archive worker ($PROFILE): outbound only, reached via SSM" \
+      --description "Archiver ($PROFILE): outbound only, reached via SSM" \
       --query GroupId --output text)"
   fi
 fi
@@ -237,7 +307,7 @@ CREATED_INSTANCE=false
 # adopt the first profile's box and hand it this profile's secrets.
 read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS <<<"$(
   aws ec2 describe-instances --region "$REGION" \
-    --filters "Name=tag:fund-role,Values=archive-worker" \
+    --filters "Name=tag:fund-role,Values=archiver" \
       "Name=tag:fund-profile,Values=$PROFILE" \
       "Name=instance-state-name,Values=pending,running,stopping,stopped" \
     --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,IamInstanceProfile.Arn,MetadataOptions.HttpTokens]' \
@@ -264,7 +334,7 @@ else
     --query 'Parameter.Value' --output text)"
 
   # cloud-init runs this once, as root, on first boot. Without it the box has no checkout, no
-  # toolchain and no binary, and sync-archive-worker has nothing to run from.
+  # toolchain and no binary, and sync-archiver has nothing to run from.
   USER_DATA="$(cat <<CLOUDINIT
 #!/bin/bash
 set -euxo pipefail
@@ -287,10 +357,10 @@ sudo -u ubuntu -H bash -c '
   cargo build --release --bin seed
   git rev-parse HEAD > target/release/.seed-built-from
 '
-install -m 0644 /home/ubuntu/fund/tools/fund-archive-worker.service \
-  /etc/systemd/system/fund-archive-worker.service
+install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service \
+  /etc/systemd/system/fund-archiver.service
 systemctl daemon-reload
-systemctl enable fund-archive-worker.service
+systemctl enable fund-archiver.service
 CLOUDINIT
 )"
 
@@ -312,7 +382,7 @@ CLOUDINIT
         --metadata-options "HttpTokens=required" \
         --user-data "$USER_DATA" \
         --tag-specifications "ResourceType=instance,Tags=[\
-{Key=Name,Value=$NAME},{Key=fund-role,Value=archive-worker},\
+{Key=Name,Value=$NAME},{Key=fund-role,Value=archiver},\
 {Key=fund-profile,Value=$PROFILE},{Key=fund-ami,Value=$AMI_ID}]" \
         --query 'Instances[0].InstanceId' --output text 2>/dev/null)"; then
         break
@@ -345,7 +415,7 @@ step "Boot service on ${INSTANCE_ID}"
 if [[ "$CREATED_INSTANCE" == true ]]; then
   unchanged "cloud-init installs the profile and unit on a new instance"
 elif [[ "$APPLY" != true ]]; then
-  changed "reconcile /etc/fund-profile and fund-archive-worker.service over SSM"
+  changed "reconcile /etc/fund-profile and fund-archiver.service over SSM"
 else
   ORIGINAL_STATE="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
     --query 'Reservations[0].Instances[0].State.Name' --output text)"
@@ -377,16 +447,16 @@ else
   trap 'rm -f "$RECONCILE_COMMANDS"' EXIT
   cat > "$RECONCILE_COMMANDS" <<JSON
 {"commands":[
-"touch /etc/fund-archive-worker.inhibit",
-"systemctl stop fund-archive-worker.service 2>/dev/null || true",
+"touch /etc/fund-archiver.inhibit",
+"systemctl stop fund-archiver.service 2>/dev/null || true",
 "printf '%s' '${PROFILE}' > /etc/fund-profile",
 "mkdir -p /var/log/fund && chown ubuntu:ubuntu /var/log/fund",
 "sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
-"install -m 0644 /home/ubuntu/fund/tools/fund-archive-worker.service /etc/systemd/system/fund-archive-worker.service",
+"install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
 "systemctl daemon-reload",
-"systemctl enable fund-archive-worker.service",
-"systemctl is-enabled fund-archive-worker.service",
-"rm -f /etc/fund-archive-worker.inhibit"
+"systemctl enable fund-archiver.service",
+"systemctl is-enabled fund-archiver.service",
+"rm -f /etc/fund-archiver.inhibit"
 ]}
 JSON
 
@@ -405,7 +475,7 @@ JSON
       --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text >&2
     exit 1
   fi
-  changed "installed the profile and enabled fund-archive-worker.service"
+  changed "installed the profile and enabled fund-archiver.service"
 
   if [[ "$ORIGINAL_STATE" != "running" ]]; then
     echo "    returning $INSTANCE_ID to stopped"
@@ -479,7 +549,7 @@ fi
 #
 # Its only action is the EC2 stop API, so it stops a hung run from billing all day and tells nobody
 # it happened -- a failed nightly is silent. It is the backstop, not how the box normally turns
-# off: `run-archive-worker` ends with its own stop call.
+# off: `run-archiver` ends with its own stop call.
 # --------------------------------------------------------------------------- #
 
 step "Stall alarm $NAME-stalled"
@@ -488,7 +558,7 @@ changed "put alarm ($STALL_EVALUATION_PERIODS x ${STALL_PERIOD_SECONDS}s under $
 if [[ "$APPLY" == true ]]; then
   aws cloudwatch put-metric-alarm --region "$REGION" \
     --alarm-name "$NAME-stalled" \
-    --alarm-description "Stop the archive worker when its fetch has been dead for an hour" \
+    --alarm-description "Stop the archiver when its fetch has been dead for an hour" \
     --namespace AWS/EC2 --metric-name NetworkIn --statistic Sum \
     --dimensions "Name=InstanceId,Value=$INSTANCE_ID" \
     --period "$STALL_PERIOD_SECONDS" --evaluation-periods "$STALL_EVALUATION_PERIODS" \
@@ -511,8 +581,8 @@ SCHEDULER_ROLE="${NAME}-scheduler"
 SCHEDULER_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
-SCHEDULER_DESCRIPTION="Lets EventBridge Scheduler start the $PROFILE archive worker, and nothing \
-else. Managed by tools/provision-archive-worker."
+SCHEDULER_DESCRIPTION="Lets EventBridge Scheduler start the $PROFILE archiver, and nothing \
+else. Managed by tools/provision-archiver."
 
 if aws iam get-role --role-name "$SCHEDULER_ROLE" >/dev/null 2>&1; then
   unchanged "scheduler role exists"
@@ -534,7 +604,7 @@ fi
 
 changed "ensure schedule at $SCHEDULE_EXPRESSION ($SCHEDULE_STATE)"
 if [[ "$APPLY" == true ]]; then
-  aws iam put-role-policy --role-name "$SCHEDULER_ROLE" --policy-name start-archive-worker \
+  aws iam put-role-policy --role-name "$SCHEDULER_ROLE" --policy-name start-archiver \
     --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",
 \"Action\":[\"ec2:StartInstances\"],
 \"Resource\":\"arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/${INSTANCE_ID}\"}]}"
@@ -553,8 +623,8 @@ if [[ "$APPLY" == true ]]; then
   # visible to it immediately.
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if aws scheduler "$VERB" --region "$REGION" --name "$NAME-nightly" --state "$SCHEDULE_STATE" \
-      --description "Start the $PROFILE archive worker to fold the session that just closed. \
-The box stops itself when the run ends. Managed by tools/provision-archive-worker." \
+      --description "Start the $PROFILE archiver to fold the session that just closed. \
+The box stops itself when the run ends. Managed by tools/provision-archiver." \
       --schedule-expression "$SCHEDULE_EXPRESSION" --schedule-expression-timezone UTC \
       --flexible-time-window '{"Mode":"OFF"}' --target "$SCHEDULE_TARGET" >/dev/null 2>&1; then
       break
