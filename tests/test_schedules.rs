@@ -592,14 +592,14 @@ fn test_the_gate_parser_refuses_disjunction() {
     );
 }
 
-/// The archive worker's trigger, which lives in a provisioning script rather than in `schema.sql`.
+/// The archiver's trigger, which lives in a provisioning script rather than in `schema.sql`.
 ///
 /// Compiled in for the same reason as `SCHEMA`: a copy that drifted from the working tree would
 /// otherwise pass.
 const PROVISION_ARCHIVER: &str = include_str!("../tools/provision-archiver");
 
 /// The `SCHEDULE_EXPRESSION` literal the provisioning script assigns.
-fn archive_worker_expression() -> String {
+fn archiver_expression() -> String {
     let line = PROVISION_ARCHIVER
         .lines()
         .find(|line| line.starts_with("SCHEDULE_EXPRESSION="))
@@ -611,10 +611,10 @@ fn archive_worker_expression() -> String {
 
 /// The `(minute, hour)` an EventBridge `cron(M H * * ? *)` expression fires at.
 ///
-/// Only the once-daily form is modelled, because that is the only form the worker uses; anything
+/// Only the once-daily form is modelled, because that is the only form the archiver uses; anything
 /// else panics rather than being read as midnight.
-fn archive_worker_firing() -> (u32, u32) {
-    let expression = archive_worker_expression();
+fn archiver_firing() -> (u32, u32) {
+    let expression = archiver_expression();
     let fields: Vec<&str> = expression
         .strip_prefix("cron(")
         .and_then(|rest| rest.strip_suffix(')'))
@@ -638,14 +638,14 @@ fn test_the_archiver_fires_after_eastern_midnight_all_year() {
     // Pinned to the literal rather than read back from the script, so an edit to the trigger has to
     // be made here too and cannot pass by agreeing with itself.
     assert_eq!(
-        archive_worker_expression(),
+        archiver_expression(),
         "cron(0 7 * * ? *)",
-        "the archive worker's trigger changed; confirm it still clears Eastern midnight"
+        "the archiver's trigger changed; confirm it still clears Eastern midnight"
     );
 
     // The hour comes from the expression, not from a literal here. An earlier draft hardcoded 7 in
     // the loop, so the walk below agreed with any trigger the pin was edited to accept.
-    let (minute, hour) = archive_worker_firing();
+    let (minute, hour) = archiver_firing();
 
     // The job folds "the previous Eastern date". That phrase only names one session if the trigger
     // lands after Eastern midnight on the same calendar date it fires on in UTC -- at 03:00Z the

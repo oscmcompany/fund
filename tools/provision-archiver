@@ -127,6 +127,76 @@ echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
 echo "Region:   $REGION"
 
 # --------------------------------------------------------------------------- #
+# Predecessor
+#
+# This host was called the archive worker until 2026-09-22, and the rename moved every name at
+# once: the tag value the instance is found by, and the stem the role, instance profile, security
+# group, alarm and schedule are keyed on. Nothing here is renamed in place -- IAM and EventBridge
+# have no rename, and the instance carries the old instance profile and security group, which the
+# instance section refuses to adopt rather than silently accept. So the cutover is a rebuild, and
+# what this block enforces is its order.
+#
+# Only one overlap is dangerous: two armed schedules mean two boxes folding the same session. Any
+# other leftover just bills. So an ENABLED predecessor schedule refuses and everything else is
+# reported, which is what lets the new box be verified before the old one is deleted.
+#
+# Delete this block once no profile has a predecessor.
+# --------------------------------------------------------------------------- #
+
+step "Predecessor"
+
+PREDECESSOR="fund-archive-worker-${SLUG}"
+
+PREDECESSOR_SCHEDULE_STATE="$(aws scheduler get-schedule --region "$REGION" \
+  --name "${PREDECESSOR}-nightly" --query State --output text 2>/dev/null || echo "None")"
+
+if [[ "$PREDECESSOR_SCHEDULE_STATE" == "ENABLED" ]]; then
+  echo "Error: ${PREDECESSOR}-nightly is still ENABLED. Provisioning now would arm a second" >&2
+  echo "  nightly against a second instance, and both would fold the same session." >&2
+  echo "" >&2
+  echo "  Disable it first, then provision, verify a night, and delete the predecessor set:" >&2
+  echo "    aws scheduler update-schedule --region $REGION --name ${PREDECESSOR}-nightly \\" >&2
+  echo "      --state DISABLED --cli-input-json \"\$(aws scheduler get-schedule --region $REGION \\" >&2
+  echo "      --name ${PREDECESSOR}-nightly --output json)\"" >&2
+  exit 1
+fi
+
+LEFTOVERS=0
+leftover() {
+  echo "    LEFTOVER: $1 -- delete once the new archiver has folded a night"
+  LEFTOVERS=$((LEFTOVERS + 1))
+}
+
+[[ "$PREDECESSOR_SCHEDULE_STATE" == "None" ]] \
+  || leftover "schedule ${PREDECESSOR}-nightly ($PREDECESSOR_SCHEDULE_STATE)"
+
+PREDECESSOR_INSTANCE="$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=tag:fund-role,Values=archive-worker" \
+    "Name=tag:fund-profile,Values=$PROFILE" \
+    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "None")"
+[[ "$PREDECESSOR_INSTANCE" == "None" || -z "$PREDECESSOR_INSTANCE" ]] \
+  || leftover "instance $PREDECESSOR_INSTANCE and its root volume"
+
+for role in "$PREDECESSOR" "${PREDECESSOR}-scheduler"; do
+  aws iam get-role --role-name "$role" >/dev/null 2>&1 && leftover "IAM role $role"
+done
+
+aws iam get-instance-profile --instance-profile-name "$PREDECESSOR" >/dev/null 2>&1 \
+  && leftover "instance profile $PREDECESSOR"
+
+aws cloudwatch describe-alarms --region "$REGION" --alarm-names "${PREDECESSOR}-stalled" \
+  --query 'MetricAlarms[0].AlarmName' --output text 2>/dev/null | grep -q "$PREDECESSOR" \
+  && leftover "alarm ${PREDECESSOR}-stalled"
+
+aws ec2 describe-security-groups --region "$REGION" \
+  --filters "Name=group-name,Values=$PREDECESSOR" \
+  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | grep -q '^sg-' \
+  && leftover "security group $PREDECESSOR"
+
+[[ "$LEFTOVERS" -gt 0 ]] || unchanged "no predecessor resources"
+
+# --------------------------------------------------------------------------- #
 # IAM role
 # --------------------------------------------------------------------------- #
 
@@ -136,7 +206,7 @@ TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
 "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
 # Carried on the resource as well as in this file, so the console says what the role is for.
-ROLE_DESCRIPTION="Archive worker ($PROFILE): nightly fetch-and-fold of market data into \
+ROLE_DESCRIPTION="Archiver ($PROFILE): nightly fetch-and-fold of market data into \
 s3://${ARCHIVE_BUCKET}. Managed by tools/provision-archiver."
 
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
@@ -220,7 +290,7 @@ else
   if [[ "$APPLY" == true ]]; then
     SECURITY_GROUP_ID="$(aws ec2 create-security-group --region "$REGION" \
       --group-name "$NAME" --vpc-id "$VPC_ID" \
-      --description "Archive worker ($PROFILE): outbound only, reached via SSM" \
+      --description "Archiver ($PROFILE): outbound only, reached via SSM" \
       --query GroupId --output text)"
   fi
 fi
