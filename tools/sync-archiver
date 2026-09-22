@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# sync-archive-worker -- Bring the archive worker's checkout and binary up to origin/master.
+# sync-archiver -- Bring the archiver's checkout and binary up to origin/master.
 #
 # Runs on the worker itself, before each night's fold. Unlike `sync-application` there is no
 # process-compose to signal, so this only has to leave a good binary behind.

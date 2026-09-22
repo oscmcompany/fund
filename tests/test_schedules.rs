@@ -596,14 +596,14 @@ fn test_the_gate_parser_refuses_disjunction() {
 ///
 /// Compiled in for the same reason as `SCHEMA`: a copy that drifted from the working tree would
 /// otherwise pass.
-const PROVISION_ARCHIVE_WORKER: &str = include_str!("../tools/provision-archive-worker");
+const PROVISION_ARCHIVER: &str = include_str!("../tools/provision-archiver");
 
 /// The `SCHEDULE_EXPRESSION` literal the provisioning script assigns.
 fn archive_worker_expression() -> String {
-    let line = PROVISION_ARCHIVE_WORKER
+    let line = PROVISION_ARCHIVER
         .lines()
         .find(|line| line.starts_with("SCHEDULE_EXPRESSION="))
-        .expect("provision-archive-worker must assign SCHEDULE_EXPRESSION");
+        .expect("provision-archiver must assign SCHEDULE_EXPRESSION");
     line.trim_start_matches("SCHEDULE_EXPRESSION=")
         .trim_matches('"')
         .to_string()
@@ -634,7 +634,7 @@ fn archive_worker_firing() -> (u32, u32) {
 }
 
 #[test]
-fn test_the_archive_worker_fires_after_eastern_midnight_all_year() {
+fn test_the_archiver_fires_after_eastern_midnight_all_year() {
     // Pinned to the literal rather than read back from the script, so an edit to the trigger has to
     // be made here too and cannot pass by agreeing with itself.
     assert_eq!(
