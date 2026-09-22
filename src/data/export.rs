@@ -354,10 +354,10 @@ fn to_polars_error(error: sqlx::Error) -> PolarsError {
     PolarsError::ComputeError(error.to_string().into())
 }
 
-/// The producer every export in this module writes as.
+/// The producer the journal and log exports write as.
 ///
-/// The host, not this module: `trader` is the box that runs the application, and naming it once
-/// here is what keeps the journal and the log from disagreeing about whose records they are.
+/// Names the host, not this module. `export_database` does not use it: the datasets are keyed by
+/// [`Dataset::prefix`] alone and carry no producer.
 const PRODUCER: Producer = Producer::Trader;
 
 /// S3 prefix the sealed sessions are written under.
@@ -496,10 +496,6 @@ pub async fn export_journals(
 }
 
 /// S3 prefix the diagnostic logs are written under, partitioned by producer and then by service.
-///
-/// `producer` sits above `service` rather than replacing it: a service name only *implies* its
-/// host, so "every archiver log" would otherwise be answerable only by someone who already knows
-/// which binaries run where.
 pub const LOG_PREFIX: &str = "exports/logs";
 
 /// Calendar days of exported logs kept on local disk, matching the journal's window.
@@ -507,9 +503,7 @@ pub const LOG_RETENTION_DAYS: i64 = 7;
 
 /// Where one service's log for one date is written.
 ///
-/// Named rather than inlined so a test can assert the layout the exporter actually uses, including
-/// which producer it writes as. A test that rebuilt this expression would only prove it agrees with
-/// itself, and would pass unchanged if [`PRODUCER`] were edited.
+/// The only construction of this key, so a test of it is a test of what the exporter writes.
 fn log_key(service: &str, date: NaiveDate) -> String {
     date_partitioned_key(
         &format!(
@@ -1502,9 +1496,8 @@ mod tests {
         assert_ne!(trader, archiver);
     }
 
-    /// Pins the producer both exports in this module write as. The two key tests each rebuild or
-    /// consume it, so without this a change here would move the journal and the log together and
-    /// look like agreement rather than a rename.
+    /// Pins the producer the journal and log exports write as. The journal's key test spells
+    /// `Producer::Trader` itself, so it cannot catch a change here.
     #[test]
     fn test_this_module_exports_as_the_trader() {
         assert_eq!(PRODUCER.as_str(), "trader");
