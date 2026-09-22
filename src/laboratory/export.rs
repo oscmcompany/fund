@@ -19,10 +19,11 @@ use crate::laboratory::journal::{file_name, session_from_file_name, Journal};
 
 /// The producer this export writes as.
 ///
-/// Shares `exports/journal` with the trader now that `producer=` separates them. A date alone does
-/// not identify an object here — both write one per session — and the key is what makes the shared
-/// prefix safe rather than a collision.
-const PRODUCER: Producer = Producer::Trainer;
+/// The host, not this module: `researcher` runs every `laboratory_*` binary and would run model
+/// training beside them, so the key survives either moving. Shares `exports/journal` with the
+/// trader, which is safe only because `producer` distinguishes them — both write one object a
+/// session and a date alone would collide.
+const PRODUCER: Producer = Producer::Researcher;
 
 /// Age, in days, past which a shipped file is deleted.
 ///
@@ -450,7 +451,7 @@ mod tests {
         assert_ne!(trainer, trader);
         assert_eq!(
             trainer,
-            "exports/journal/producer=trainer/experiment_type=dataset_built/year=2026/month=08/day=17/data.parquet"
+            "exports/journal/producer=researcher/experiment_type=dataset_built/year=2026/month=08/day=17/data.parquet"
         );
         assert_eq!(
             trader,
@@ -471,8 +472,8 @@ mod tests {
                 "exports/journal/producer=trader/year=2026/month=08/day=17/data.parquet",
             ),
             (
-                Producer::Trainer,
-                "exports/journal/producer=trainer/year=2026/month=08/day=17/data.parquet",
+                Producer::Researcher,
+                "exports/journal/producer=researcher/year=2026/month=08/day=17/data.parquet",
             ),
             (
                 Producer::Archiver,

@@ -39,15 +39,20 @@ pub fn date_partitioned_key(prefix: &str, date: chrono::NaiveDate) -> String {
     )
 }
 
-/// Which instance produced an exported record.
+/// Which host produced an exported record.
 ///
-/// Records are keyed by producer because three of them write the same shapes on the same dates, and
-/// a date alone does not identify an object. The trader is the `application` devenv profile; the two
-/// names diverge until the exe.dev dependency is retired.
+/// Records are keyed by producer because three hosts write the same shapes on the same dates, and a
+/// date alone does not identify an object. These name the host rather than the module that ran:
+/// `researcher` runs every `laboratory_*` binary and would run model training too, so naming it for
+/// either one would be wrong as soon as the other moved. The finer key beneath — `service` for a
+/// log, `experiment_type` for an experiment — is where the module appears.
+///
+/// The devenv profiles still read `application` and `trainer`; see the naming table in `CLAUDE.md`
+/// for the mismatch and when it closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Producer {
     Trader,
-    Trainer,
+    Researcher,
     Archiver,
 }
 
@@ -56,7 +61,7 @@ impl Producer {
     pub const fn as_str(self) -> &'static str {
         match self {
             Producer::Trader => "trader",
-            Producer::Trainer => "trainer",
+            Producer::Researcher => "researcher",
             Producer::Archiver => "archiver",
         }
     }
