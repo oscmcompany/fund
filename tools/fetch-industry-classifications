@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
-# Regenerates src/data/classification_table.rs from the Fama-French industry definitions.
+# Publishes the Fama-French SIC runs, and regenerates the bucket names they refer to.
 #
-# The table decides which names share a sector, which is what the screen's concentration cap and the
-# laboratory's sector factor are both read off, so it is baked into the binary rather than fetched at
-# read time: a study run today and the book selected tonight must group names identically, and a
-# table that moved under either would make the two incomparable. Re-run this when Dartmouth
-# republishes the definitions, and commit the diff.
+# Two outputs with different homes. The runs go to S3 as an `as_of`-partitioned dataset, so moving
+# one needs no deploy. The bucket names stay in src/data/classification_table.rs, because the code
+# matches on them, and that file is committed.
+#
+# The table decides which names share a sector, which the screen's concentration cap and the
+# laboratory's sector factor are both read off. That grouping is re-derived on every read, so a
+# study run today and the book selected tonight group names identically only if they used the same
+# mapping -- which is why every reader journals `classification_as_of` rather than why the runs are
+# compiled in. They are not, any more.
 #
 #   tools/fetch-industry-classifications
 #   tools/fetch-industry-classifications --check
 #
-# `--check` rewrites nothing and exits non-zero when the definitions have moved, matching
+# `--check` writes nothing and exits non-zero when either output has moved, matching
 # `fetch-trade-conditions`. Deliberately not a test: it needs the network, and a suite that fails
 # when Dartmouth is down stops meaning anything.
+#
+# The order is not optional. A run naming a bucket this repository has not committed is refused,
+# because the vocabulary is compiled in: publishing it first would make every deployed binary refuse
+# the whole mapping. Commit and deploy the vocabulary, then publish.
 #
 # Two granularities from one source. The 12-industry file is the sector -- coarse enough that the
 # screen's per-sector cap can bind at all -- and the 49-industry file is the subgroup beneath it.
@@ -51,13 +59,16 @@ TARGET="${OUTPUT}"
 if [[ "${CHECK_ONLY}" == true ]]; then
   TARGET="${WORK}/generated.rs"
 fi
+RANGES_CSV="${WORK}/ranges.csv"
+RANGES_PARQUET="${WORK}/ranges.parquet"
 
-python3 - "${WORK}" "${TARGET}" <<'PYTHON'
+python3 - "${WORK}" "${TARGET}" "${RANGES_CSV}" <<'PYTHON'
+import csv
 import re
 import sys
 from datetime import date
 
-work, output = sys.argv[1], sys.argv[2]
+work, output, ranges_csv = sys.argv[1], sys.argv[2], sys.argv[3]
 
 # The name each bucket is spelled with, keyed by the source's own short code.
 #
@@ -326,24 +337,20 @@ lines.extend(
         "    pub bucket: Bucket,",
         "}",
         "",
-        "/// Every SIC run the twelve-industry definition assigns, ascending by `low`.",
-        f"pub const SECTOR_RANGES: [SicRange<Sector>; {len(sector_spans)}] = [",
     ]
 )
-for low, high, code in sector_spans:
-    lines.append(
-        f"    SicRange {{ low: {low}, high: {high}, bucket: Sector::{code} }},"
-    )
-lines.append("];")
-lines.append("")
-lines.append("/// Every SIC run the forty-nine-industry definition assigns, ascending by `low`.")
-lines.append(f"pub const INDUSTRY_RANGES: [SicRange<Industry>; {len(industry_spans)}] = [")
-for low, high, code in industry_spans:
-    lines.append(
-        f"    SicRange {{ low: {low}, high: {high}, bucket: Industry::{code} }},"
-    )
-lines.append("];")
-lines.append("")
+
+# The runs themselves are published as a dataset rather than emitted here, so moving one needs no
+# deploy. Only the vocabulary -- the bucket names the runs refer to -- stays compiled in.
+# lineterminator explicitly: csv.writer defaults to CRLF, and the shell reads this file back to
+# check bucket names, where a trailing carriage return makes every name fail to match.
+with open(ranges_csv, "w", newline="") as handle:
+    writer = csv.writer(handle, lineterminator="\n")
+    writer.writerow(["granularity", "low", "high", "bucket"])
+    for low, high, code in sector_spans:
+        writer.writerow(["sector", low, high, code])
+    for low, high, code in industry_spans:
+        writer.writerow(["industry", low, high, code])
 
 rendered = "\n".join(lines)
 
@@ -365,8 +372,8 @@ with open(output, "w") as handle:
     handle.write(rendered)
 
 print(
-    f"Wrote {len(sectors)} sectors over {len(sector_spans)} ranges and "
-    f"{len(industries)} industries over {len(industry_spans)} ranges to {output}"
+    f"Wrote {len(sectors)} sector and {len(industries)} industry names to {output}, "
+    f"and {len(sector_spans)} + {len(industry_spans)} ranges to {ranges_csv}"
 )
 PYTHON
 
@@ -377,20 +384,117 @@ PYTHON
 echo "Formatting"
 rustfmt --edition 2021 "${TARGET}"
 
+# The ranges go to S3 as a dataset. duckdb rather than a Rust helper, because nothing in the binary
+# should be able to write this: the archive reads it, and a writer in the same process is a way for a
+# run to quietly reclassify the universe it is measuring.
+echo "Encoding the ranges"
+duckdb -c "COPY (SELECT granularity, CAST(low AS UINTEGER) AS low, CAST(high AS UINTEGER) AS high, \
+  bucket FROM read_csv('${RANGES_CSV}', header = true)) TO '${RANGES_PARQUET}' (FORMAT parquet);"
+
+# The vocabulary as committed, not as just regenerated: python has already overwritten the working
+# tree, and what deployed binaries know is what is on HEAD. A run naming a bucket absent from it
+# would load as `UnknownBucket` and take down every reader until the new binary ships.
+echo "Checking the runs against the committed vocabulary"
+COMMITTED_VOCABULARY="${WORK}/committed_vocabulary.rs"
+if git show "HEAD:src/data/classification_table.rs" > "${COMMITTED_VOCABULARY}" 2>/dev/null; then
+  UNKNOWN=""
+  while IFS= read -r bucket; do
+    grep -q "=> \"${bucket}\"," "${COMMITTED_VOCABULARY}" || UNKNOWN="${UNKNOWN} ${bucket}"
+  done < <(tail -n +2 "${RANGES_CSV}" | cut -d, -f4 | sort -u)
+  if [[ -n "${UNKNOWN}" ]]; then
+    echo "Error: the published runs name bucket(s) this repository has not committed:${UNKNOWN}" >&2
+    echo "  Deployed binaries would refuse the whole mapping, not just these runs." >&2
+    echo "  Commit src/data/classification_table.rs, deploy it, then re-run to publish." >&2
+    exit 1
+  fi
+  echo "    every bucket is one the committed vocabulary names"
+else
+  echo "    no committed vocabulary to compare against; skipping" >&2
+fi
+
+BUCKET="${AWS_S3_ARCHIVE_BUCKET_NAME:-oscm-fund-archive}"
+PREFIX="data/reference/classification"
+
+# The newest stored partition, so a run that changes nothing writes nothing. Writing every fetch
+# would make `as_of` mean "when we looked" rather than "when the definitions moved", and churn every
+# reader's provenance for no change.
+# Fail closed. A masked error here -- expired credentials, a denied listing -- would read as an
+# empty prefix, and the script would answer "no stored mapping yet" and publish over whatever is
+# actually there. Every key is listed and the maximum taken in the shell rather than by JMESPath,
+# because `--query` with `--output text` is applied per page and a paginated listing would leave
+# several keys in one variable.
+ALL_KEYS="$(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${PREFIX}/" \
+  --query 'Contents[].Key' --output text)"
+NEWEST_KEY="$(printf '%s' "${ALL_KEYS}" | tr '\t' '\n' | grep -v '^None$' | sort | tail -1)"
+[[ -z "${NEWEST_KEY}" ]] && NEWEST_KEY="None"
+
+UNCHANGED=false
+if [[ "${NEWEST_KEY}" != "None" && -n "${NEWEST_KEY}" ]]; then
+  aws s3 cp "s3://${BUCKET}/${NEWEST_KEY}" "${WORK}/stored.parquet" --quiet
+  # Compared as a set of rows, not as bytes: parquet encoding is not reproducible, so a byte diff
+  # would report drift on every run and stop meaning anything.
+  # EXCEPT ALL, not EXCEPT: set semantics would call a stored object holding a duplicated run
+  # identical to a clean one, so the tool would refuse to republish while the loader refuses to read
+  # it as overlapping -- the two disagreeing about whether anything is wrong.
+  DIFFERENCES="$(duckdb -noheader -list -c "SELECT count(*) FROM ( \
+    (SELECT * FROM read_parquet('${RANGES_PARQUET}') EXCEPT ALL SELECT * FROM read_parquet('${WORK}/stored.parquet')) \
+    UNION ALL \
+    (SELECT * FROM read_parquet('${WORK}/stored.parquet') EXCEPT ALL SELECT * FROM read_parquet('${RANGES_PARQUET}')));")"
+  if [[ "${DIFFERENCES}" == "0" ]]; then
+    UNCHANGED=true
+  fi
+  echo "Stored ${NEWEST_KEY}: ${DIFFERENCES} differing row(s)"
+else
+  echo "No stored mapping yet; this run publishes the first"
+fi
+
 if [[ "${CHECK_ONLY}" == true ]]; then
   # Ignoring FETCHED_ON, which moves with the clock and says nothing about the source. It is the
   # only dated line by construction — the generator refuses to emit a second one — so this compares
   # the definitions themselves rather than the day they were read.
   undated() { grep -v '^pub const FETCHED_ON' "$1"; }
-  if diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null; then
-    echo "Up to date: the committed table matches the published definitions"
+  VOCABULARY_MOVED=false
+  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null || VOCABULARY_MOVED=true
+
+  if [[ "${VOCABULARY_MOVED}" == false && "${UNCHANGED}" == true ]]; then
+    echo "Up to date: both the vocabulary and the published ranges match"
     exit 0
   fi
-  echo "DRIFT: the published definitions no longer match the committed table" >&2
-  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
+  if [[ "${VOCABULARY_MOVED}" == true ]]; then
+    echo "DRIFT: the bucket names no longer match the committed vocabulary" >&2
+    diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
+  fi
+  if [[ "${UNCHANGED}" == false ]]; then
+    echo "DRIFT: the published ranges differ from the newest stored partition" >&2
+  fi
   echo >&2
-  echo "Re-run without --check, review the diff, and commit it." >&2
+  echo "Re-run without --check to republish, and commit any vocabulary diff." >&2
   exit 1
 fi
 
-echo "Done. Review the diff and commit it."
+if [[ "${UNCHANGED}" == true ]]; then
+  echo "Ranges unchanged; nothing published. Review any vocabulary diff and commit it."
+  exit 0
+fi
+
+AS_OF="$(date -u +%Y-%m-%d)"
+DESTINATION_KEY="${PREFIX}/as_of=${AS_OF}/data.parquet"
+echo "Publishing s3://${BUCKET}/${DESTINATION_KEY}"
+
+# `--if-none-match "*"` so a second change on one UTC day refuses rather than overwrites. The key is
+# date-only and `classification_as_of` is the whole of a run's mapping provenance, so replacing it
+# would silently change what every earlier run's record refers to. Conditional at S3 rather than a
+# head-then-put, which has a window between the two calls.
+if ! aws s3api put-object --bucket "${BUCKET}" --key "${DESTINATION_KEY}" \
+  --body "${RANGES_PARQUET}" --if-none-match "*" >/dev/null 2>"${WORK}/put_error"; then
+  if grep -q "PreconditionFailed\|At least one of the pre-conditions" "${WORK}/put_error"; then
+    echo "Error: as_of=${AS_OF} already holds a different mapping." >&2
+    echo "  Overwriting it would change what earlier runs' classification_as_of refers to." >&2
+    echo "  Wait for the next UTC day, or delete that partition deliberately if it was never read." >&2
+  else
+    cat "${WORK}/put_error" >&2
+  fi
+  exit 1
+fi
+
+echo "Done. Review any vocabulary diff and commit it."
