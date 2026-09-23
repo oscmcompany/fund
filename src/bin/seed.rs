@@ -1759,6 +1759,17 @@ async fn record_the_fold(report: &NightlyReport) {
         .await;
 }
 
+/// The conditions table a session should be recorded as folded under, if any.
+///
+/// A function rather than an inline test because it is the whole of the field's contract, and the
+/// defect it fixes was recording at the load rather than at the write.
+fn conditions_folded_under(sessions_written: usize, as_of: Option<NaiveDate>) -> Option<NaiveDate> {
+    if sessions_written == 0 {
+        return None;
+    }
+    as_of
+}
+
 /// Every record this box failed to ship, named.
 ///
 /// Pure, and separate from the export it summarises, because the decision it encodes is the one
@@ -2003,11 +2014,9 @@ async fn run_leg(
     // every partition it wrote. A table republished mid-leg would otherwise leave two sessions
     // folded under rules the record names as one.
     let conditions = match leg {
-        Leg::Trades => {
-            let table = Arc::new(archive::read_newest_conditions(&s3_client, &bucket).await?);
-            *conditions_as_of = Some(table.as_of());
-            Some(table)
-        }
+        Leg::Trades => Some(Arc::new(
+            archive::read_newest_conditions(&s3_client, &bucket).await?,
+        )),
         _ => None,
     };
 
@@ -2110,6 +2119,14 @@ async fn run_leg(
                 .await?
             }
         };
+        // Recorded from the write rather than from the load, so the record names a table something
+        // was actually folded under: a night already current loads one and folds nothing.
+        if let Some(as_of) = conditions_folded_under(
+            summary.sessions_written(),
+            conditions.as_ref().map(|table| table.as_of()),
+        ) {
+            *conditions_as_of = Some(as_of);
+        }
         written += summary.sessions_written();
         complete &= summary.is_complete();
     }
@@ -3043,6 +3060,20 @@ async fn trading_calendar(window: &Window) -> Result<TradingCalendar, Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A night that loaded a table and folded nothing records no table.
+    ///
+    /// The field means "what the tape was folded under", so a run whose partitions were already
+    /// current must leave it absent — the load is not the fold, and the journal would otherwise
+    /// attribute rules to a run that applied them to nothing.
+    #[test]
+    fn test_a_leg_that_wrote_nothing_records_no_conditions_table() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 9, 23).expect("a real date");
+        assert_eq!(conditions_folded_under(0, Some(as_of)), None);
+        assert_eq!(conditions_folded_under(1, Some(as_of)), Some(as_of));
+        // And a leg that wrote without a table cannot name one, which is every leg but trades.
+        assert_eq!(conditions_folded_under(3, None), None);
+    }
 
     fn parse(arguments: &[&str]) -> Result<Arguments, clap::Error> {
         Arguments::try_parse_from(std::iter::once("seed").chain(arguments.iter().copied()))

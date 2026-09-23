@@ -58,13 +58,10 @@ struct Anchor {
 
 /// The five rows the archive cannot be wrong about, and what it believes of each.
 ///
-/// Two dependencies, checked the same way. **The house rule** excludes 2 and 10: both are
-/// volume-eligible and belong in VWAP, but an average-price trade reports a session average and a
-/// derivatively priced one is computed off another instrument, so differencing either against the
-/// prevailing quote measures the convention rather than the cost. **The auction prints** are what
-/// the volume rule exists to exclude — measured 2026-08-21, 246 of them carried 14.1% of the
-/// session's dollar volume, so a vendor flipping one to volume-eligible would move every VWAP in the
-/// archive silently. A refused night is healed by the next; a wrongly folded one is not.
+/// The house rule excludes 2 and 10 because an average price and a derivative price measure the
+/// convention rather than the cost, and the three auction prints are what the volume rule exists to
+/// exclude — 246 of them carried 14.1% of a session's dollar volume on 2026-08-21. A refused night
+/// is healed by the next and a wrongly folded one is not, so both are checked on arrival.
 const ANCHORS: [Anchor; 5] = [
     Anchor {
         identifier: 2,
@@ -116,6 +113,13 @@ pub enum ConditionsError {
     },
     #[error("condition {identifier} claims the unspellable byte on {tape}, so a token no table can spell would acquire its eligibility")]
     ClaimsTheSentinel { identifier: u32, tape: &'static str },
+    #[error("condition {other} shares the {tape} spelling '{character}' with house-rule condition {identifier}, whose prints the spread excludes")]
+    HouseRuleCollision {
+        identifier: u32,
+        other: u32,
+        tape: &'static str,
+        character: char,
+    },
 }
 
 /// The provider's sale-condition rows, loaded rather than compiled in.
@@ -177,6 +181,33 @@ impl ConditionsTable {
                     return Err(ConditionsError::ClaimsTheSentinel {
                         identifier: condition.identifier,
                         tape: column,
+                    });
+                }
+            }
+        }
+        // The house rule reads a character and has no ambiguous answer to give, so a second row
+        // spelled the same way would put its prints outside the spread with nothing reporting it.
+        // `volume_eligibility_from_characters` needs no equivalent: it already answers `Ambiguous`.
+        for anchor in ANCHORS.iter().filter(|anchor| anchor.not_a_market_price) {
+            let Some(excluded) = conditions
+                .iter()
+                .find(|condition| condition.identifier == anchor.identifier)
+            else {
+                continue;
+            };
+            for (column, tape) in TAPE_COLUMNS {
+                let Some(character) = excluded.character_on(tape) else {
+                    continue;
+                };
+                if let Some(other) = conditions.iter().find(|condition| {
+                    condition.identifier != anchor.identifier
+                        && condition.character_on(tape) == Some(character)
+                }) {
+                    return Err(ConditionsError::HouseRuleCollision {
+                        identifier: anchor.identifier,
+                        other: other.identifier,
+                        tape: column,
+                        character: char::from(character),
                     });
                 }
             }
@@ -460,8 +491,8 @@ pub fn carries_a_market_price(identifiers: &[u32]) -> bool {
 
 /// The same house rule against Alpaca's characters.
 ///
-/// Both codes are collision-free on every tape, so unlike the high-low rules this needs no ambiguous
-/// arm; the test below is what holds the provider to that.
+/// No ambiguous arm, unlike the volume rule: [`ConditionsTable::new`] refuses a table where anything
+/// else is spelled the way an excluded condition is, so a character reaching here names one rule.
 pub fn carries_a_market_price_from_characters(
     table: &ConditionsTable,
     characters: &[u8],
@@ -683,6 +714,50 @@ mod tests {
                 identifier: 99,
                 tape: "unlisted_trading_privileges",
             })
+        );
+    }
+
+    /// A second row spelled like an excluded condition would put its prints outside the spread.
+    ///
+    /// `carries_a_market_price_from_characters` has no ambiguous answer to give, so the table is
+    /// refused rather than the lookup made vaguer. This replaces the collision test the compiled
+    /// table carried, which a fixture could only have asserted against itself.
+    #[test]
+    fn test_a_row_spelled_like_an_excluded_condition_is_refused() {
+        let mut colliding = rows();
+        colliding.push(row(
+            99,
+            "Impostor",
+            true,
+            &[(Tape::ConsolidatedTapeAssociation, b'B')],
+        ));
+        assert_eq!(
+            ConditionsTable::new(date(), colliding),
+            Err(ConditionsError::HouseRuleCollision {
+                identifier: 2,
+                other: 99,
+                tape: "consolidated_tape_association",
+                character: 'B',
+            })
+        );
+    }
+
+    /// The volume rule keeps its collisions, because it has an ambiguous answer and the spread does
+    /// not.
+    #[test]
+    fn test_a_collision_away_from_the_house_rule_is_still_accepted() {
+        let mut colliding = rows();
+        colliding.push(row(
+            99,
+            "Ordinary",
+            true,
+            &[(Tape::ConsolidatedTapeAssociation, b'F')],
+        ));
+        let table = ConditionsTable::new(date(), colliding)
+            .expect("a collision the volume rule can answer must load");
+        assert_eq!(
+            by_character(&table, b'F', Tape::ConsolidatedTapeAssociation).len(),
+            2
         );
     }
 

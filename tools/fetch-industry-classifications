@@ -425,10 +425,15 @@ PREFIX="data/reference/classification"
 # several keys in one variable.
 ALL_KEYS="$(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${PREFIX}/" \
   --query 'Contents[].Key' --output text)"
+# Only keys of the exact shape the loader reads. `conditions_as_of_dates` keeps a key only when it
+# round-trips to `as_of=<date>/data.parquet`, so a nested `as_of=.../backup/data.parquet` would make
+# this script answer "unchanged" while the loader kept folding under an older partition -- the two
+# disagreeing about whether anything is wrong.
 # `|| NEWEST_KEY=""` because an empty prefix makes `grep` match nothing, and `pipefail` turns that
 # into a fatal error on the one run that most needs to succeed -- the first publish. The fail-closed
 # property is untouched: the listing itself is a separate assignment and still aborts the script.
-NEWEST_KEY="$(printf '%s' "${ALL_KEYS}" | tr '\t' '\n' | grep -v '^None$' | sort | tail -1)" \
+NEWEST_KEY="$(printf '%s' "${ALL_KEYS}" | tr '\t' '\n' \
+  | grep -E "^${PREFIX}/as_of=[0-9]{4}-[0-9]{2}-[0-9]{2}/data\.parquet$" | sort | tail -1)" \
   || NEWEST_KEY=""
 [[ -z "${NEWEST_KEY}" ]] && NEWEST_KEY="None"
 
