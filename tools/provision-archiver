@@ -18,7 +18,7 @@ set -euo pipefail
 #   EBS volume        The instance's root disk, and the only one. Ubuntu, the checkout, the Rust
 #                     toolchain, target/release/seed, and staging room for a session's pull.
 #                     The main thing that bills while the box is off, ~$8/month.
-#   IAM role          Archive data, this box's own records prefix, this profile's secrets, and the
+#   IAM role          Archive data, this box's own two record prefixes, this profile's secrets, and
 #                     StopInstances call the run ends with, plus AmazonSSMManagedInstanceCore so SSM
 #                     can reach the box.
 #   instance profile  The wrapper EC2 needs to hand the role to the instance. No settings.
@@ -40,8 +40,9 @@ ARCHIVE_BUCKET="oscm-fund-archive"
 ARCHIVE_PREFIX="data/*"
 
 # This box's own records bucket, matching what `run-backfill` exports as
-# AWS_S3_RECORDS_BUCKET_NAME. Scoped to exports/ and write-only: the archiver ships its journal and
-# logs there and has no reason to read back what the trader wrote.
+# AWS_S3_RECORDS_BUCKET_NAME. Scoped to the archiver's two producer prefixes, not to `exports/*`:
+# the bucket is shared with the trader, and `producer=` is a convention in code that constrains
+# nothing at IAM. No ListBucket -- both exporters enumerate local directories and only ever put.
 RECORDS_BUCKET_STEM="oscm-fund"
 
 # 03:00 Eastern in summer, 02:00 in winter, folding the session that closed the previous Eastern
@@ -132,7 +133,7 @@ fi
 echo "Profile:  $PROFILE"
 echo "Names:    $NAME"
 echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
-echo "Records:  $RECORDS_BUCKET/exports/*"
+echo "Records:  $RECORDS_BUCKET/exports/{journal,logs}/producer=archiver/*"
 echo "Region:   $REGION"
 
 # --------------------------------------------------------------------------- #
@@ -540,13 +541,10 @@ ROLE_POLICY="$(cat <<JSON
       "Sid": "WriteOwnRecords",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/exports/*"
-    },
-    {
-      "Sid": "ListOwnRecords",
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}"
+      "Resource": [
+        "arn:aws:s3:::${RECORDS_BUCKET}/exports/journal/producer=archiver/*",
+        "arn:aws:s3:::${RECORDS_BUCKET}/exports/logs/producer=archiver/*"
+      ]
     },
     {
       "Sid": "StopSelfWhenDone",
@@ -559,7 +557,7 @@ ROLE_POLICY="$(cat <<JSON
 JSON
 )"
 
-changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX, $RECORDS_BUCKET/exports/* and $INSTANCE_ID"
+changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX, $RECORDS_BUCKET producer=archiver and $INSTANCE_ID"
 if [[ "$APPLY" == true ]]; then
   aws iam put-role-policy --role-name "$NAME" \
     --policy-name archive-and-secrets --policy-document "$ROLE_POLICY"

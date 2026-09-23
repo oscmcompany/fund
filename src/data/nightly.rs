@@ -17,7 +17,7 @@ use crate::data::calendar::TradingCalendar;
 ///
 /// A leg rather than a family because the two quote cadences are separate passes over the tape and
 /// either can be the one a budget runs out on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Leg {
     DailyBars,
     IntradayBars(IntradayCadence),
@@ -378,7 +378,7 @@ pub fn plan_reference(
 ///
 /// The unwritten half carries its cause per grid point: the ordinary reason is that the session's
 /// bar partition is not there yet, which is a different fact from the feed refusing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ReferenceOutcome {
     /// Every owed grid point was attempted.
     Swept {
@@ -411,7 +411,7 @@ impl fmt::Display for ReferenceOutcome {
 ///
 /// Skipped and failed are separate variants rather than one "did not finish", because a night that
 /// ran out of budget is healed by the next one and a night that errored is not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum LegOutcome {
     /// Reached every session it was given. Carries whether the passes considered themselves
     /// complete.

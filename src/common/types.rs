@@ -920,7 +920,7 @@ impl TradeConditions {
 ///
 /// Distinct from [`BarInterval`] so a fold cannot be opened at [`BarInterval::OneDay`], whose bucket
 /// is the session itself: the daily row is the merge of the intraday ones, never a grid of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum IntradayCadence {
     OneMinute,
     FiveMinute,

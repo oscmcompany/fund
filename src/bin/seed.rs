@@ -24,6 +24,7 @@ use fund::common::types::{
 use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
+use fund::data::export;
 use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport, ReferenceOutcome};
 use fund::data::{attribution, bars, details, quotes, trades};
 
@@ -1737,29 +1738,42 @@ async fn record_the_fold(report: &NightlyReport) {
             return;
         }
     };
+    let (window_start, window_end) = report.window();
     let observation = Observation::ArchiveFolded(ArchiveFolded {
-        window_start: report.window().0.to_string(),
-        window_end: report.window().1.to_string(),
-        sessions: report.sessions_planned(),
+        window_start,
+        window_end,
+        sessions_planned: report.sessions_planned(),
         partitions_written: report.written(),
-        legs: report
-            .legs()
-            .iter()
-            .map(|(leg, outcome)| (leg.to_string(), format!("{outcome:?}")))
-            .collect(),
-        reference: report.reference().map(|outcome| outcome.to_string()),
-        failed: report.failed().iter().map(|leg| leg.to_string()).collect(),
-        skipped: report.skipped().iter().map(|leg| leg.to_string()).collect(),
-        incomplete: report
-            .incomplete()
-            .iter()
-            .map(|leg| leg.to_string())
-            .collect(),
-        complete: report.is_complete(),
+        legs: report.legs().to_vec(),
+        reference: report.reference().cloned(),
     });
     journal
         .record(uuid::Uuid::new_v4(), Utc::now(), observation)
         .await;
+}
+
+/// Every record this box failed to ship, named.
+///
+/// Pure, and separate from the export it summarises, because the decision it encodes is the one
+/// worth pinning: a denied upload leaves the record on a machine that is about to power off, so it
+/// must fail the command rather than appear as a count in a line that says "Records exported".
+fn unshipped_records(
+    journal: Option<&export::JournalExportSummary>,
+    logs: &export::LogExportSummary,
+) -> Vec<String> {
+    let mut refusals: Vec<String> = Vec::new();
+    if let Some(sessions) = journal {
+        for (session_date, error) in &sessions.failed {
+            refusals.push(format!("journal {session_date}: {error}"));
+        }
+    }
+    if let Some(error) = &logs.directory_error {
+        refusals.push(format!("log directory: {error}"));
+    }
+    for (date, service, error) in &logs.failed {
+        refusals.push(format!("log {date} {service}: {error}"));
+    }
+    refusals
 }
 
 /// Ships this box's journal and logs to the records bucket.
@@ -1772,27 +1786,29 @@ async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
         .map_err(|_| SeedError::Usage("AWS_S3_RECORDS_BUCKET_NAME must be set".to_string()))?;
     let s3_client = fund::common::aws::s3_client().await;
 
+    // Both exports are attempted before either failure is raised: the logs are most worth having on
+    // the night the journal could not be written, and returning early would drop them.
+    let mut journal_summary: Option<export::JournalExportSummary> = None;
+
     match Journal::from_env() {
         Ok(journal) => {
-            let sessions = fund::data::export::export_journals(
-                &journal,
-                &s3_client,
-                &bucket,
-                today,
-                Producer::Archiver,
-            )
-            .await;
+            let sessions =
+                export::export_journals(&journal, &s3_client, &bucket, today, Producer::Archiver)
+                    .await;
             info!(
                 sessions = sessions.exported.len(),
                 records = sessions.total_records(),
                 failed = sessions.failed.len(),
                 "Journal exported"
             );
+            journal_summary = Some(sessions);
         }
+        // The one deliberate exception: a box with no journal has nothing to ship, which is not the
+        // same as failing to ship it.
         Err(error) => warn!(%error, "No journal on this box; nothing to export"),
     }
 
-    let logs = fund::data::export::export_logs(
+    let logs = export::export_logs(
         &fund::common::log::log_directory(),
         &s3_client,
         &bucket,
@@ -1807,10 +1823,16 @@ async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
         unparsable = logs.unparsable_lines,
         "Logs exported"
     );
-    // Reported rather than swallowed: "the directory could not be listed" and "it was empty" are
-    // different answers and a count of zero cannot tell them apart.
-    if let Some(error) = &logs.directory_error {
-        return Err(SeedError::Failed(error.clone().into()));
+    let refusals = unshipped_records(journal_summary.as_ref(), &logs);
+    if !refusals.is_empty() {
+        return Err(SeedError::Failed(
+            format!(
+                "{} of this box's records did not ship: {}",
+                refusals.len(),
+                refusals.join("; ")
+            )
+            .into(),
+        ));
     }
 
     Ok(Outcome::Complete)
@@ -3892,5 +3914,50 @@ mod tests {
         let window = Window::new(session("2026-01-05"), session("2026-01-05")).expect("a window");
         assert_eq!(window.chunks().len(), 1);
         assert_eq!(window.dates(), vec![session("2026-01-05")]);
+    }
+    /// A denied upload must fail the command, not appear as a count beside "Records exported".
+    ///
+    /// The box powers off when this returns, so a record that did not ship has nowhere left to be.
+    #[test]
+    fn test_a_failed_upload_makes_the_export_a_refusal() {
+        let mut logs = export::LogExportSummary::default();
+        logs.exported
+            .push((date(2026, 9, 22), "seed".to_string(), 10));
+        logs.failed.push((
+            date(2026, 9, 22),
+            "archiver".to_string(),
+            "AccessDenied".to_string(),
+        ));
+
+        let refusals = unshipped_records(None, &logs);
+
+        assert_eq!(refusals.len(), 1, "the failed upload is a refusal");
+        assert!(refusals[0].contains("archiver"), "{:?}", refusals);
+    }
+
+    /// A clean export is not a refusal, so the check can distinguish the two.
+    #[test]
+    fn test_a_clean_export_raises_nothing() {
+        let mut logs = export::LogExportSummary::default();
+        logs.exported
+            .push((date(2026, 9, 22), "seed".to_string(), 10));
+
+        assert!(unshipped_records(None, &logs).is_empty());
+    }
+
+    /// An unlistable directory and an empty one are different answers, and only one is a refusal.
+    #[test]
+    fn test_an_unlistable_log_directory_is_a_refusal() {
+        let mut logs = export::LogExportSummary::default();
+        logs.directory_error = Some("permission denied".to_string());
+
+        let refusals = unshipped_records(None, &logs);
+
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals[0].contains("permission denied"), "{:?}", refusals);
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(year, month, day).expect("a real date")
     }
 }

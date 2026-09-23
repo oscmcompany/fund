@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, QuoteRejection};
 use crate::common::events::Command;
 use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
+use crate::data::nightly::{Leg, LegOutcome, ReferenceOutcome};
 
 /// Version stamped on every record written by this build.
 ///
@@ -863,25 +864,22 @@ pub struct LogsExported {
 ///
 /// The archiver's only record. It powers itself off when the run ends, so a night that is not
 /// written down here leaves nothing behind but a log file on a stopped box.
+///
+/// Carries what the run observed and nothing it computed: whether the night was complete, and which
+/// legs failed, were skipped or fell short, are all functions of `legs` and `reference`, and storing
+/// them beside their own inputs would be a summary free to contradict the data under it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArchiveFolded {
-    pub window_start: String,
-    pub window_end: String,
-    pub sessions: usize,
-    /// Partitions written across every leg.
+    pub window_start: SessionDate,
+    pub window_end: SessionDate,
+    /// Sessions the plan held, which is what separates "nothing owed" from "nothing written".
+    pub sessions_planned: usize,
     pub partitions_written: usize,
-    /// `(leg, outcome)` for every leg the run recorded, in the order it ran them.
-    pub legs: Vec<(String, String)>,
-    /// Absent when the budget was spent before the sweep could start.
-    pub reference: Option<String>,
-    /// Legs that failed, were skipped for budget, or did not reach every session. Named rather than
-    /// counted: which leg fell short is the question a bad night actually asks.
-    pub failed: Vec<String>,
-    pub skipped: Vec<String>,
-    pub incomplete: Vec<String>,
-    /// The predicate the exit code is taken from, stored so a reader need not re-derive it from the
-    /// lists above and reach a different answer.
-    pub complete: bool,
+    /// Every leg the run recorded, in the order it ran them.
+    pub legs: Vec<(Leg, LegOutcome)>,
+    /// `None` only where no sweep outcome was recorded at all. A sweep the budget never reached is
+    /// `Some(ReferenceOutcome::Skipped)`, which is a different night and must stay distinguishable.
+    pub reference: Option<ReferenceOutcome>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.
@@ -1294,6 +1292,24 @@ mod tests {
                 purge_skipped: false,
             }),
             Observation::LogsExported(LogsExported::default()),
+            Observation::ArchiveFolded(ArchiveFolded {
+                window_start: SessionDate::from_date(
+                    chrono::NaiveDate::from_ymd_opt(2026, 9, 15).expect("a real date"),
+                ),
+                window_end: SessionDate::from_date(
+                    chrono::NaiveDate::from_ymd_opt(2026, 9, 21).expect("a real date"),
+                ),
+                sessions_planned: 5,
+                partitions_written: 2,
+                legs: vec![(
+                    crate::data::nightly::Leg::DailyBars,
+                    crate::data::nightly::LegOutcome::Folded {
+                        complete: true,
+                        written: 2,
+                    },
+                )],
+                reference: Some(crate::data::nightly::ReferenceOutcome::Skipped),
+            }),
         ]
     }
 

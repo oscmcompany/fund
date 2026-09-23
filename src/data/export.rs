@@ -1526,13 +1526,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The shape `run-archiver`'s `log()` emits survives the read, and the shape it used to emit
-    /// does not.
+    /// The shape `run-archiver`'s `log()` emits survives the read, and the plain-text shape it
+    /// replaced does not.
     ///
-    /// Narrower than it looks: the bare line is rejected for not being a JSON object at all, before
-    /// the timestamp and level are ever consulted. Those two are covered by
-    /// `test_a_log_line_without_a_timestamp_or_level_is_counted_unparsable`. What this pins is that
-    /// the shell's plain-text format was unexportable, which is why it changed.
+    /// The bare line is rejected for not being a JSON object at all, before the timestamp and level
+    /// are consulted; those two are covered by
+    /// `test_a_log_line_without_a_timestamp_or_level_is_counted_unparsable`.
     #[test]
     fn test_the_shell_json_line_survives_the_read_and_the_bare_line_does_not() {
         let directory = temporary_directory("logs-shell-shape");
@@ -1553,6 +1552,55 @@ mod tests {
 
         assert_eq!(frame.height(), 1, "the JSON line survives");
         assert_eq!(unparsable, 1, "the bare line does not");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The archiver's own `log()`, run for real and read by the exporter that must consume it.
+    ///
+    /// The two tests above pin this reader's contract using handwritten lines, which leaves them
+    /// green if `tools/run-archiver` reverts to plain text. This one runs the shell function out of
+    /// the script itself, so the seam is what is under test rather than a restatement of it.
+    #[test]
+    fn test_the_real_shell_log_function_produces_lines_this_reader_keeps() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/run-archiver");
+        let directory = temporary_directory("logs-shell-seam");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("2026-09-22.archiver.log");
+
+        // `json_line` and `log` lifted from the script and run unchanged. A child's plain output goes
+        // through the same wrapper, which is the case that decides whether the file can age out.
+        let program = format!(
+            r#"set -euo pipefail
+STATUS_FILE="$(mktemp)"
+eval "$(sed -n '/^json_line() {{/,/^}}/p;/^run_wrapped() {{/,/^}}/p' {script})"
+log() {{ json_line INFO run-archiver "$1"; }}
+log 'Syncing'
+log 'a "quoted" value and a back\slash'
+run_wrapped child bash -c 'echo "   Compiling polars v0.51.0"'
+"#,
+            script = script.display()
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&program)
+            .output()
+            .expect("bash must run");
+        assert!(
+            output.status.success(),
+            "the script fragment must run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(&path, &output.stdout).expect("the file must be writable");
+
+        let (frame, unparsable) = read_log_frame(&path).expect("the file must read");
+
+        // Three lines in, three rows out. A single unparsable line would keep the file from ever
+        // ageing out, so it would be re-read and re-uploaded every night.
+        assert_eq!(frame.height(), 3, "every emitted line must be readable");
+        assert_eq!(
+            unparsable, 0,
+            "an unparsable line makes the file undeletable and permanent"
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
