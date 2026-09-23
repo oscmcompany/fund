@@ -11,8 +11,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, DataFeed, MarketDataClient, TradingClient};
+use fund::common::aws::Producer;
 use fund::common::database::connect_pool;
 use fund::common::flatfiles;
+use fund::common::journal::{ArchiveFolded, Journal, Observation};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::{
@@ -110,6 +112,8 @@ enum Command {
     /// Whatever the recent sessions are still missing, cheapest family first, under a wall clock
     /// budget. What the nightly schedule runs.
     ArchiveNightly(NightlyArguments),
+    /// Ship this box's journal and logs to the records bucket, before it powers off.
+    ExportRecords,
 }
 
 /// Which vendor a nightly run takes its quotes and prints from.
@@ -260,6 +264,7 @@ impl Command {
             Command::ArchiveProvenance { .. } => "seed-archive-provenance",
             Command::ArchiveCadence { .. } => "seed-archive-cadence",
             Command::ArchiveNightly(_) => "seed-archive-nightly",
+            Command::ExportRecords => "seed-export-records",
         }
     }
 }
@@ -1149,6 +1154,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         Command::ArchiveProvenance { action } => seed_provenance(action).await,
         Command::ArchiveNightly(arguments) => archive_nightly(arguments, today).await,
         Command::ArchiveCadence { action } => check_cadence(action).await,
+        Command::ExportRecords => export_records(today).await,
     }
 }
 
@@ -1711,7 +1717,103 @@ async fn archive_nightly(
     info!(%reference, "Reference sweep finished");
     report.record_reference(reference);
 
+    // Written before the caller decides the exit code, because the box stops itself once this
+    // returns: a record produced after the run is a record produced on a machine that is gone.
+    record_the_fold(&report).await;
+
     Ok(Outcome::Nightly(report))
+}
+
+/// Writes the night into the archiver's journal, if it has one.
+///
+/// A missing journal is logged and stepped over rather than failing the run. The fold is the work
+/// and the record is the account of it; losing the account is bad, and throwing away a completed
+/// fold because the account could not be filed is worse.
+async fn record_the_fold(report: &NightlyReport) {
+    let journal = match Journal::from_env() {
+        Ok(journal) => journal,
+        Err(error) => {
+            warn!(%error, "No journal on this box; the night is not recorded");
+            return;
+        }
+    };
+    let observation = Observation::ArchiveFolded(ArchiveFolded {
+        window_start: report.window().0.to_string(),
+        window_end: report.window().1.to_string(),
+        sessions: report.sessions_planned(),
+        partitions_written: report.written(),
+        legs: report
+            .legs()
+            .iter()
+            .map(|(leg, outcome)| (leg.to_string(), format!("{outcome:?}")))
+            .collect(),
+        reference: report.reference().map(|outcome| outcome.to_string()),
+        failed: report.failed().iter().map(|leg| leg.to_string()).collect(),
+        skipped: report.skipped().iter().map(|leg| leg.to_string()).collect(),
+        incomplete: report
+            .incomplete()
+            .iter()
+            .map(|leg| leg.to_string())
+            .collect(),
+        complete: report.is_complete(),
+    });
+    journal
+        .record(uuid::Uuid::new_v4(), Utc::now(), observation)
+        .await;
+}
+
+/// Ships this box's journal and logs to the records bucket.
+///
+/// Its own subcommand rather than a step inside the nightly, because a night that failed is the one
+/// whose records are most worth having: chaining the export to a successful fold would lose them
+/// exactly when they matter.
+async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
+    let bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME")
+        .map_err(|_| SeedError::Usage("AWS_S3_RECORDS_BUCKET_NAME must be set".to_string()))?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    match Journal::from_env() {
+        Ok(journal) => {
+            let sessions = fund::data::export::export_journals(
+                &journal,
+                &s3_client,
+                &bucket,
+                today,
+                Producer::Archiver,
+            )
+            .await;
+            info!(
+                sessions = sessions.exported.len(),
+                records = sessions.total_records(),
+                failed = sessions.failed.len(),
+                "Journal exported"
+            );
+        }
+        Err(error) => warn!(%error, "No journal on this box; nothing to export"),
+    }
+
+    let logs = fund::data::export::export_logs(
+        &fund::common::log::log_directory(),
+        &s3_client,
+        &bucket,
+        today,
+        Producer::Archiver,
+    )
+    .await;
+    info!(
+        files = logs.exported.len(),
+        lines = logs.total_lines(),
+        failed = logs.failed.len(),
+        unparsable = logs.unparsable_lines,
+        "Logs exported"
+    );
+    // Reported rather than swallowed: "the directory could not be listed" and "it was empty" are
+    // different answers and a count of zero cannot tell them apart.
+    if let Some(error) = &logs.directory_error {
+        return Err(SeedError::Failed(error.clone().into()));
+    }
+
+    Ok(Outcome::Complete)
 }
 
 /// Fills every quarterly reference observation the archive is missing.

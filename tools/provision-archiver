@@ -18,8 +18,9 @@ set -euo pipefail
 #   EBS volume        The instance's root disk, and the only one. Ubuntu, the checkout, the Rust
 #                     toolchain, target/release/seed, and staging room for a session's pull.
 #                     The main thing that bills while the box is off, ~$8/month.
-#   IAM role          Archive data, this profile's secrets, and the StopInstances call the run
-#                     ends with, plus AmazonSSMManagedInstanceCore so SSM can reach the box.
+#   IAM role          Archive data, this box's own records prefix, this profile's secrets, and the
+#                     StopInstances call the run ends with, plus AmazonSSMManagedInstanceCore so SSM
+#                     can reach the box.
 #   instance profile  The wrapper EC2 needs to hand the role to the instance. No settings.
 #   security group    No ingress. SSM reaches the box outbound, so nothing listens on a port.
 #   stall alarm       A cost backstop, not a notifier -- see the alarm section below. Bills a
@@ -37,6 +38,11 @@ INSTANCE_TYPE="r6i.2xlarge"
 VOLUME_SIZE_GB=100
 ARCHIVE_BUCKET="oscm-fund-archive"
 ARCHIVE_PREFIX="data/*"
+
+# This box's own records bucket, matching what `run-backfill` exports as
+# AWS_S3_RECORDS_BUCKET_NAME. Scoped to exports/ and write-only: the archiver ships its journal and
+# logs there and has no reason to read back what the trader wrote.
+RECORDS_BUCKET_STEM="oscm-fund"
 
 # 03:00 Eastern in summer, 02:00 in winter, folding the session that closed the previous Eastern
 # day. tests/test_schedules.rs pins this literal.
@@ -91,6 +97,8 @@ if [[ ${#NAME} -gt 54 ]]; then
   exit 1
 fi
 
+RECORDS_BUCKET="${RECORDS_BUCKET_STEM}-${SLUG}"
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 DRIFT=0
@@ -124,6 +132,7 @@ fi
 echo "Profile:  $PROFILE"
 echo "Names:    $NAME"
 echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
+echo "Records:  $RECORDS_BUCKET/exports/*"
 echo "Region:   $REGION"
 
 # --------------------------------------------------------------------------- #
@@ -345,8 +354,8 @@ curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awsc
 unzip -q /tmp/awscli.zip -d /tmp
 /tmp/aws/install --update
 printf '%s' "${PROFILE}" > /etc/fund-profile
-mkdir -p /var/log/fund
-chown ubuntu:ubuntu /var/log/fund
+mkdir -p /var/log/fund /var/journal/fund
+chown ubuntu:ubuntu /var/log/fund /var/journal/fund
 sudo -u ubuntu -H bash -c '
   set -euxo pipefail
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -450,7 +459,7 @@ else
 "touch /etc/fund-archiver.inhibit",
 "systemctl stop fund-archiver.service 2>/dev/null || true",
 "printf '%s' '${PROFILE}' > /etc/fund-profile",
-"mkdir -p /var/log/fund && chown ubuntu:ubuntu /var/log/fund",
+"mkdir -p /var/log/fund /var/journal/fund && chown ubuntu:ubuntu /var/log/fund /var/journal/fund",
 "sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
 "install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
 "systemctl daemon-reload",
@@ -528,6 +537,18 @@ ROLE_POLICY="$(cat <<JSON
       "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"
     },
     {
+      "Sid": "WriteOwnRecords",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/exports/*"
+    },
+    {
+      "Sid": "ListOwnRecords",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}"
+    },
+    {
       "Sid": "StopSelfWhenDone",
       "Effect": "Allow",
       "Action": ["ec2:StopInstances"],
@@ -538,7 +559,7 @@ ROLE_POLICY="$(cat <<JSON
 JSON
 )"
 
-changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX and $INSTANCE_ID"
+changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX, $RECORDS_BUCKET/exports/* and $INSTANCE_ID"
 if [[ "$APPLY" == true ]]; then
   aws iam put-role-policy --role-name "$NAME" \
     --policy-name archive-and-secrets --policy-document "$ROLE_POLICY"

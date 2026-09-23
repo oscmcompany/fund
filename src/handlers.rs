@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::common::alpaca::{
     AlpacaCredentials, ClientError, DataFeed, MarketDataClient, TradingClient,
 };
+use crate::common::aws::Producer;
 use crate::common::events::{self, Command, EventError};
 use crate::common::journal::{
     BarsIngested, CommandFinished, CommandOutcome, DatabaseExported, Journal, JournalError,
@@ -822,6 +823,7 @@ async fn handle_database_export(
         &state.s3_client,
         &state.records_bucket,
         today,
+        Producer::Trader,
     )
     .await;
     // After the export, so the seal has released. This record lands in the session the export ran
@@ -865,6 +867,7 @@ async fn handle_database_export(
         &state.s3_client,
         &state.records_bucket,
         today,
+        Producer::Trader,
     )
     .await;
     state

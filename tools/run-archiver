@@ -14,8 +14,12 @@ REGION="${AWS_REGION:-us-east-1}"
 PROFILE_FILE=/etc/fund-profile
 INHIBIT_FILE=/etc/fund-archiver.inhibit
 
+# Emitted as JSON because these lines are exported, and the reader keeps only objects carrying a
+# timestamp and a level -- a bare "TIMESTAMP message" is counted unparsable and dropped, which would
+# lose exactly the lines that explain a bad night.
 log() {
-  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+  printf '{"timestamp":"%s","level":"INFO","target":"run-archiver","fields":{"message":"%s"}}\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "${1//\"/\\\"}"
 }
 
 instance_id() {
@@ -41,6 +45,13 @@ stop_self() {
 
 # An operator debugging the box starts it by hand, and a boot service that folded and then stopped
 # underneath them would make that impossible.
+# Redirected into a dated, service-named file because `split_log_file_name` collects only
+# `<date>.<service>.log`; the unit's own `archiver.log` carries no date and is invisible to the
+# export. The unit still owns that file, which now holds only what systemd writes around this run.
+LOG_DIRECTORY=/var/log/fund
+mkdir -p "$LOG_DIRECTORY"
+exec >> "${LOG_DIRECTORY}/$(date -u +%F).archiver.log" 2>&1
+
 if [[ -e "$INHIBIT_FILE" ]]; then
   log "$INHIBIT_FILE present; not folding and not stopping"
   exit 0
@@ -55,6 +66,12 @@ fi
 FUND_PROFILE="$(cat "$PROFILE_FILE")"
 export FUND_PROFILE
 
+# The archiver's own journal. `seed` writes the night here and `export-records` ships it, which is
+# the only way anything this box learns survives the power-off at the end of this script.
+FUND_JOURNAL_DIRECTORY=/var/journal/fund
+export FUND_JOURNAL_DIRECTORY
+mkdir -p "$FUND_JOURNAL_DIRECTORY"
+
 cd "$REPO_ROOT"
 
 log "Syncing"
@@ -64,5 +81,19 @@ if ! tools/sync-archiver; then
 fi
 
 log "Folding as $FUND_PROFILE"
-tools/run-backfill archive-nightly "$@"
-log "Fold complete"
+# The fold's exit status is kept, but the export runs either way: a night that failed is the one
+# whose records are most worth having, and `set -e` would otherwise stop before shipping them.
+FOLD_STATUS=0
+tools/run-backfill archive-nightly "$@" || FOLD_STATUS=$?
+log "Fold finished with status ${FOLD_STATUS}"
+
+# Before the trap stops the box, which is the whole point: an export that raced the shutdown would
+# collect nothing and leave the night on a machine that is off.
+log "Exporting records"
+if tools/run-backfill export-records; then
+  log "Records exported"
+else
+  log "ERROR: records failed to export; they remain on this box only"
+fi
+
+exit "$FOLD_STATUS"

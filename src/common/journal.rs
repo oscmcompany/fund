@@ -66,6 +66,7 @@ pub enum Observation {
     JournalExported(JournalExported),
     DatabaseExported(DatabaseExported),
     LogsExported(LogsExported),
+    ArchiveFolded(ArchiveFolded),
 }
 
 impl Observation {
@@ -95,6 +96,7 @@ impl Observation {
             Observation::JournalExported(_) => "journal_exported",
             Observation::DatabaseExported(_) => "database_exported",
             Observation::LogsExported(_) => "logs_exported",
+            Observation::ArchiveFolded(_) => "archive_folded",
         }
     }
 }
@@ -857,6 +859,31 @@ pub struct LogsExported {
     pub directory_error: Option<String>,
 }
 
+/// One nightly fold: what the archiver reached, and what it did not.
+///
+/// The archiver's only record. It powers itself off when the run ends, so a night that is not
+/// written down here leaves nothing behind but a log file on a stopped box.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ArchiveFolded {
+    pub window_start: String,
+    pub window_end: String,
+    pub sessions: usize,
+    /// Partitions written across every leg.
+    pub partitions_written: usize,
+    /// `(leg, outcome)` for every leg the run recorded, in the order it ran them.
+    pub legs: Vec<(String, String)>,
+    /// Absent when the budget was spent before the sweep could start.
+    pub reference: Option<String>,
+    /// Legs that failed, were skipped for budget, or did not reach every session. Named rather than
+    /// counted: which leg fell short is the question a bad night actually asks.
+    pub failed: Vec<String>,
+    pub skipped: Vec<String>,
+    pub incomplete: Vec<String>,
+    /// The predicate the exit code is taken from, stored so a reader need not re-derive it from the
+    /// lists above and reach a different answer.
+    pub complete: bool,
+}
+
 /// One run of the nightly database export and the purge chained behind it.
 ///
 /// The purge is gated on the export being clean, so `rows_purged` being absent while datasets
@@ -1109,6 +1136,7 @@ mod tests {
                 Observation::JournalExported(_) => "journal_exported",
                 Observation::DatabaseExported(_) => "database_exported",
                 Observation::LogsExported(_) => "logs_exported",
+                Observation::ArchiveFolded(_) => "archive_folded",
             }
         }
 

@@ -523,6 +523,24 @@ impl NightlyReport {
             && self.incomplete().is_empty()
     }
 
+    /// The window this report covers, and how many sessions were planned inside it.
+    ///
+    /// Exposed so the journal record can carry the plan as well as its result: "nothing written" and
+    /// "nothing owed" are different nights and the count is what separates them.
+    pub fn window(&self) -> (SessionDate, SessionDate) {
+        (self.window_start, self.window_end)
+    }
+
+    /// How many sessions the plan held.
+    pub fn sessions_planned(&self) -> usize {
+        self.sessions
+    }
+
+    /// Every leg recorded, in the order it ran.
+    pub fn legs(&self) -> &[(Leg, LegOutcome)] {
+        &self.legs
+    }
+
     /// Total partitions written across every leg.
     pub fn written(&self) -> usize {
         self.legs
