@@ -1,18 +1,18 @@
 //! Which trades count, and under whose rule.
 //!
 //! Massive spells a condition by identifier and Alpaca by SIP character; both resolve here first.
+//! The rows are published and loaded; the house rule below is ours and stays compiled in.
 
 use crate::common::types::{Tape, TradeConditions};
-use crate::data::conditions_table::SALE_CONDITIONS;
 
 /// One row of the provider's sale-condition reference.
 ///
 /// The three `updates_*` flags are the provider's, copied rather than interpreted. The characters
 /// are the same condition as each SIP spells it, which is what lets an Alpaca trade reach this table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaleCondition {
     pub identifier: u32,
-    pub name: &'static str,
+    pub name: String,
     pub updates_volume: bool,
     pub updates_high_low: bool,
     pub updates_open_close: bool,
@@ -43,16 +43,300 @@ pub enum Eligibility {
     Ambiguous,
 }
 
-/// Conditions whose price is not a market price at the instant they printed.
+/// A vendor row the archive's own numbers depend on, checked when a table is loaded.
 ///
-/// Ours, not the provider's — both are volume-eligible and belong in VWAP. An average-price trade
-/// reports a session average and a derivatively priced one is computed off another instrument, so
-/// differencing either against the prevailing quote measures the convention rather than the cost.
-const NOT_A_MARKET_PRICE: [u32; 2] = [2, 10];
+/// The identifier is the vendor's namespace and these dependencies are ours, so each carries the
+/// name it was written against: a renumbering would otherwise leave the rules pointing at different
+/// conditions without a word.
+struct Anchor {
+    identifier: u32,
+    name: &'static str,
+    updates_volume: bool,
+    /// Whether the house rule excludes this condition's price — ours, not the provider's.
+    not_a_market_price: bool,
+}
+
+/// The five rows the archive cannot be wrong about, and what it believes of each.
+///
+/// Two dependencies, checked the same way. **The house rule** excludes 2 and 10: both are
+/// volume-eligible and belong in VWAP, but an average-price trade reports a session average and a
+/// derivatively priced one is computed off another instrument, so differencing either against the
+/// prevailing quote measures the convention rather than the cost. **The auction prints** are what
+/// the volume rule exists to exclude — measured 2026-08-21, 246 of them carried 14.1% of the
+/// session's dollar volume, so a vendor flipping one to volume-eligible would move every VWAP in the
+/// archive silently. A refused night is healed by the next; a wrongly folded one is not.
+const ANCHORS: [Anchor; 5] = [
+    Anchor {
+        identifier: 2,
+        name: "Average Price Trade",
+        updates_volume: true,
+        not_a_market_price: true,
+    },
+    Anchor {
+        identifier: 10,
+        name: "Derivatively Priced",
+        updates_volume: true,
+        not_a_market_price: true,
+    },
+    Anchor {
+        identifier: 15,
+        name: "Market Center Official Close",
+        updates_volume: false,
+        not_a_market_price: false,
+    },
+    Anchor {
+        identifier: 16,
+        name: "Market Center Official Open",
+        updates_volume: false,
+        not_a_market_price: false,
+    },
+    Anchor {
+        identifier: 38,
+        name: "Corrected Consolidated Close (per listing market)",
+        updates_volume: false,
+        not_a_market_price: false,
+    },
+];
+
+/// Why a published conditions table was refused.
+///
+/// Each variant carries what produced the refusal, because a table is rejected while nobody is
+/// watching and the message is the whole record of what was wrong with it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConditionsError {
+    #[error("the table holds no conditions, which would report every trade as unresolved")]
+    Empty,
+    #[error("identifier {identifier} appears more than once, so a lookup answers with whichever row came first")]
+    Duplicated { identifier: u32 },
+    #[error("the archive expects {identifier} to be \"{expected}\", and the table {found}")]
+    Anchor {
+        identifier: u32,
+        expected: &'static str,
+        found: String,
+    },
+    #[error("condition {identifier} claims the unspellable byte on {tape}, so a token no table can spell would acquire its eligibility")]
+    ClaimsTheSentinel { identifier: u32, tape: &'static str },
+}
+
+/// The provider's sale-condition rows, loaded rather than compiled in.
+///
+/// A value in scope is proof that identifiers are unique — which [`by_identifier`]'s scan needs and
+/// nothing downstream re-checks — and that the house rule still names the conditions it was written
+/// against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionsTable {
+    as_of: chrono::NaiveDate,
+    conditions: Vec<SaleCondition>,
+}
+
+impl ConditionsTable {
+    /// Builds a table from published rows, refusing anything the lookups could answer unsoundly.
+    pub fn new(
+        as_of: chrono::NaiveDate,
+        mut conditions: Vec<SaleCondition>,
+    ) -> Result<Self, ConditionsError> {
+        // Sorted here rather than demanded of the caller: the published order is the provider's, and
+        // the invariant the lookup needs is uniqueness, which sorting cannot fake.
+        conditions.sort_by_key(|condition| condition.identifier);
+        if conditions.is_empty() {
+            return Err(ConditionsError::Empty);
+        }
+        for pair in conditions.windows(2) {
+            if pair[0].identifier == pair[1].identifier {
+                return Err(ConditionsError::Duplicated {
+                    identifier: pair[0].identifier,
+                });
+            }
+        }
+        for anchor in &ANCHORS {
+            let found = match conditions
+                .iter()
+                .find(|condition| condition.identifier == anchor.identifier)
+            {
+                None => "does not carry it".to_string(),
+                Some(condition) if condition.name != anchor.name => {
+                    format!("calls it \"{}\"", condition.name)
+                }
+                Some(condition) if condition.updates_volume != anchor.updates_volume => format!(
+                    "makes it {}volume-eligible",
+                    if condition.updates_volume { "" } else { "in" }
+                ),
+                Some(_) => continue,
+            };
+            return Err(ConditionsError::Anchor {
+                identifier: anchor.identifier,
+                expected: anchor.name,
+                found,
+            });
+        }
+        // A tape claiming the sentinel would resolve a token no table can spell to a real condition,
+        // and a malformed print would quietly acquire that condition's eligibility.
+        for condition in &conditions {
+            for (column, tape) in TAPE_COLUMNS {
+                if condition.character_on(tape) == Some(TradeConditions::UNSPELLABLE) {
+                    return Err(ConditionsError::ClaimsTheSentinel {
+                        identifier: condition.identifier,
+                        tape: column,
+                    });
+                }
+            }
+        }
+        Ok(Self { as_of, conditions })
+    }
+
+    /// The date the provider's reference endpoint was read into the partition this table holds.
+    pub fn as_of(&self) -> chrono::NaiveDate {
+        self.as_of
+    }
+
+    /// The rows this table holds, so a caller can walk them without a second copy to disagree with.
+    pub fn conditions(&self) -> &[SaleCondition] {
+        &self.conditions
+    }
+}
+
+/// Column names of the published table, written once so the writer and the reader cannot disagree.
+const TAPE_COLUMNS: [(&str, Tape); 3] = [
+    (
+        "consolidated_tape_association",
+        Tape::ConsolidatedTapeAssociation,
+    ),
+    (
+        "unlisted_trading_privileges",
+        Tape::UnlistedTradingPrivileges,
+    ),
+    ("trade_data_dissemination", Tape::TradeDataDissemination),
+];
+
+impl ConditionsTable {
+    /// The published rows, in the shape the dataset stores.
+    ///
+    /// A tape character is stored as the one-character string the SIP actually prints rather than as
+    /// its byte, so the published table reads as the provider's own reference rather than as a
+    /// column of numbers nobody can check by eye.
+    pub fn to_dataframe(&self) -> Result<polars::prelude::DataFrame, polars::prelude::PolarsError> {
+        use polars::prelude::*;
+
+        let spelling = |condition: &SaleCondition, tape: Tape| {
+            condition
+                .character_on(tape)
+                .map(|character| String::from_utf8_lossy(&[character]).into_owned())
+        };
+
+        let mut columns = vec![
+            Column::new(
+                "identifier".into(),
+                self.conditions
+                    .iter()
+                    .map(|condition| condition.identifier)
+                    .collect::<Vec<u32>>(),
+            ),
+            Column::new(
+                "name".into(),
+                self.conditions
+                    .iter()
+                    .map(|condition| condition.name.as_str())
+                    .collect::<Vec<&str>>(),
+            ),
+        ];
+        for (name, flag) in [
+            ("updates_volume", 0usize),
+            ("updates_high_low", 1),
+            ("updates_open_close", 2),
+        ] {
+            columns.push(Column::new(
+                name.into(),
+                self.conditions
+                    .iter()
+                    .map(|condition| match flag {
+                        0 => condition.updates_volume,
+                        1 => condition.updates_high_low,
+                        _ => condition.updates_open_close,
+                    })
+                    .collect::<Vec<bool>>(),
+            ));
+        }
+        for (name, tape) in TAPE_COLUMNS {
+            columns.push(Column::new(
+                name.into(),
+                self.conditions
+                    .iter()
+                    .map(|condition| spelling(condition, tape))
+                    .collect::<Vec<Option<String>>>(),
+            ));
+        }
+        DataFrame::new(columns)
+    }
+
+    /// Reads a published frame back, refusing a spelling that is not one character.
+    ///
+    /// A SIP prints exactly one byte per condition, so a longer string is a corrupt row rather than
+    /// a wider spelling, and truncating it would invent a condition the tape never carried.
+    pub fn from_dataframe(
+        as_of: chrono::NaiveDate,
+        frame: &polars::prelude::DataFrame,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use polars::prelude::*;
+
+        let identifiers = frame.column("identifier")?.cast(&DataType::UInt32)?;
+        let identifiers = identifiers.u32()?;
+        let names = frame.column("name")?.str()?;
+        let volume = frame.column("updates_volume")?.bool()?;
+        let high_low = frame.column("updates_high_low")?.bool()?;
+        let open_close = frame.column("updates_open_close")?.bool()?;
+
+        let mut spellings = Vec::with_capacity(TAPE_COLUMNS.len());
+        for (name, _) in TAPE_COLUMNS {
+            spellings.push(frame.column(name)?.str()?.clone());
+        }
+
+        let mut conditions = Vec::with_capacity(frame.height());
+        for index in 0..frame.height() {
+            let (Some(identifier), Some(name), Some(volume), Some(high_low), Some(open_close)) = (
+                identifiers.get(index),
+                names.get(index),
+                volume.get(index),
+                high_low.get(index),
+                open_close.get(index),
+            ) else {
+                return Err(
+                    format!("row {index} of the conditions table has a null column").into(),
+                );
+            };
+            let mut characters = [None, None, None];
+            for (position, spelling) in spellings.iter().enumerate() {
+                characters[position] = match spelling.get(index) {
+                    None => None,
+                    Some(text) if text.len() == 1 => Some(text.as_bytes()[0]),
+                    Some(text) => {
+                        return Err(format!(
+                            "condition {identifier} is spelled \"{text}\" on {}, which is not one character",
+                            TAPE_COLUMNS[position].0
+                        )
+                        .into())
+                    }
+                };
+            }
+            conditions.push(SaleCondition {
+                identifier,
+                name: name.to_string(),
+                updates_volume: volume,
+                updates_high_low: high_low,
+                updates_open_close: open_close,
+                consolidated_tape_association: characters[0],
+                unlisted_trading_privileges: characters[1],
+                trade_data_dissemination: characters[2],
+            });
+        }
+
+        Ok(Self::new(as_of, conditions)?)
+    }
+}
 
 /// The condition with this identifier, as Massive spells it.
-pub fn by_identifier(identifier: u32) -> Option<&'static SaleCondition> {
-    SALE_CONDITIONS
+pub fn by_identifier(table: &ConditionsTable, identifier: u32) -> Option<&SaleCondition> {
+    table
+        .conditions
         .iter()
         .find(|condition| condition.identifier == identifier)
 }
@@ -61,8 +345,9 @@ pub fn by_identifier(identifier: u32) -> Option<&'static SaleCondition> {
 ///
 /// A slice rather than an option because the mapping is not injective: CTA `I` is both an odd lot
 /// and a CAP election, and UTP `V` is both a stock option and a contingent trade.
-pub fn by_character(character: u8, tape: Tape) -> Vec<&'static SaleCondition> {
-    SALE_CONDITIONS
+pub fn by_character(table: &ConditionsTable, character: u8, tape: Tape) -> Vec<&SaleCondition> {
+    table
+        .conditions
         .iter()
         .filter(|condition| condition.character_on(tape) == Some(character))
         .collect()
@@ -72,10 +357,10 @@ pub fn by_character(character: u8, tape: Tape) -> Vec<&'static SaleCondition> {
 ///
 /// Ineligible wins over eligible: one disqualifying condition disqualifies the print, however many
 /// ordinary ones sit beside it.
-pub fn volume_eligibility(identifiers: &[u32]) -> Eligibility {
+pub fn volume_eligibility(table: &ConditionsTable, identifiers: &[u32]) -> Eligibility {
     let mut unresolved = false;
     for identifier in identifiers {
-        match by_identifier(*identifier) {
+        match by_identifier(table, *identifier) {
             Some(condition) if !condition.updates_volume => return Eligibility::Ineligible,
             Some(_) => {}
             // Non-disqualifying by decision: an unknown code is far likelier to be a namespace this
@@ -108,21 +393,21 @@ fn regular_sale_on(tape: Tape) -> u8 {
 ///
 /// The dispatch lives here rather than at the fold, so a caller cannot read Alpaca's characters
 /// against the identifier table by reaching for the wrong function.
-pub fn volume_eligibility_of(conditions: &TradeConditions) -> Eligibility {
+pub fn volume_eligibility_of(table: &ConditionsTable, conditions: &TradeConditions) -> Eligibility {
     match conditions {
-        TradeConditions::Identified(identifiers) => volume_eligibility(identifiers),
+        TradeConditions::Identified(identifiers) => volume_eligibility(table, identifiers),
         TradeConditions::Spelled { characters, tape } => {
-            volume_eligibility_from_characters(characters, *tape)
+            volume_eligibility_from_characters(table, characters, *tape)
         }
     }
 }
 
 /// The market-price question, asked of however the provider spelled the conditions.
-pub fn carries_a_market_price_of(conditions: &TradeConditions) -> bool {
+pub fn carries_a_market_price_of(table: &ConditionsTable, conditions: &TradeConditions) -> bool {
     match conditions {
         TradeConditions::Identified(identifiers) => carries_a_market_price(identifiers),
         TradeConditions::Spelled { characters, tape } => {
-            carries_a_market_price_from_characters(characters, *tape)
+            carries_a_market_price_from_characters(table, characters, *tape)
         }
     }
 }
@@ -132,13 +417,17 @@ pub fn carries_a_market_price_of(conditions: &TradeConditions) -> bool {
 /// Every colliding character pair agrees on `updates_volume` today, so this returns [`Eligibility::
 /// Ambiguous`] for a genuinely new collision rather than for any that exists now — the test below
 /// is what keeps that true.
-pub fn volume_eligibility_from_characters(characters: &[u8], tape: Tape) -> Eligibility {
+pub fn volume_eligibility_from_characters(
+    table: &ConditionsTable,
+    characters: &[u8],
+    tape: Tape,
+) -> Eligibility {
     let mut unresolved = false;
     for character in characters {
         if *character == regular_sale_on(tape) {
             continue;
         }
-        let candidates = by_character(*character, tape);
+        let candidates = by_character(table, *character, tape);
         if candidates.is_empty() {
             unresolved = true;
             continue;
@@ -166,72 +455,263 @@ pub fn volume_eligibility_from_characters(characters: &[u8], tape: Tape) -> Elig
 pub fn carries_a_market_price(identifiers: &[u32]) -> bool {
     !identifiers
         .iter()
-        .any(|identifier| NOT_A_MARKET_PRICE.contains(identifier))
+        .any(|identifier| excluded_by_the_house_rule(*identifier))
 }
 
 /// The same house rule against Alpaca's characters.
 ///
 /// Both codes are collision-free on every tape, so unlike the high-low rules this needs no ambiguous
 /// arm; the test below is what holds the provider to that.
-pub fn carries_a_market_price_from_characters(characters: &[u8], tape: Tape) -> bool {
+pub fn carries_a_market_price_from_characters(
+    table: &ConditionsTable,
+    characters: &[u8],
+    tape: Tape,
+) -> bool {
     !characters.iter().any(|character| {
-        by_character(*character, tape)
+        by_character(table, *character, tape)
             .iter()
-            .any(|condition| NOT_A_MARKET_PRICE.contains(&condition.identifier))
+            .any(|condition| excluded_by_the_house_rule(condition.identifier))
     })
+}
+
+/// Whether the house rule names this identifier, whichever spelling reached it.
+fn excluded_by_the_house_rule(identifier: u32) -> bool {
+    ANCHORS
+        .iter()
+        .any(|anchor| anchor.not_a_market_price && anchor.identifier == identifier)
+}
+
+/// Fixtures for tests that need a loaded table, kept beside the rules they exercise.
+///
+/// Three modules fold trades under test and three private copies of this would drift apart.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    pub(crate) fn date() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("a real date")
+    }
+
+    pub(crate) fn row(
+        identifier: u32,
+        name: &str,
+        updates_volume: bool,
+        spellings: &[(Tape, u8)],
+    ) -> SaleCondition {
+        let character = |wanted: Tape| {
+            spellings
+                .iter()
+                .find(|(tape, _)| *tape == wanted)
+                .map(|(_, character)| *character)
+        };
+        SaleCondition {
+            identifier,
+            name: name.to_string(),
+            updates_volume,
+            updates_high_low: updates_volume,
+            updates_open_close: updates_volume,
+            consolidated_tape_association: character(Tape::ConsolidatedTapeAssociation),
+            unlisted_trading_privileges: character(Tape::UnlistedTradingPrivileges),
+            trade_data_dissemination: character(Tape::TradeDataDissemination),
+        }
+    }
+
+    /// Rows enough to exercise every rule, and the five the constructor insists on.
+    ///
+    /// Deliberately **not** a copy of the provider's table. What Massive actually publishes is
+    /// checked against the published object by `tools/fetch-trade-conditions --check` and, for the
+    /// five rows the archive's numbers depend on, by [`ConditionsTable::new`] on every load. A
+    /// fixture asserting the vendor's content would only prove it agrees with itself.
+    pub(crate) fn rows() -> Vec<SaleCondition> {
+        use Tape::*;
+        vec![
+            row(
+                2,
+                "Average Price Trade",
+                true,
+                &[
+                    (ConsolidatedTapeAssociation, b'B'),
+                    (UnlistedTradingPrivileges, b'W'),
+                    (TradeDataDissemination, b'W'),
+                ],
+            ),
+            row(
+                5,
+                "CAP Election",
+                true,
+                &[(ConsolidatedTapeAssociation, b'I')],
+            ),
+            row(
+                10,
+                "Derivatively Priced",
+                true,
+                &[
+                    (ConsolidatedTapeAssociation, b'4'),
+                    (UnlistedTradingPrivileges, b'4'),
+                ],
+            ),
+            row(
+                14,
+                "Intermarket Sweep",
+                true,
+                &[(ConsolidatedTapeAssociation, b'F')],
+            ),
+            row(
+                15,
+                "Market Center Official Close",
+                false,
+                &[(ConsolidatedTapeAssociation, b'M')],
+            ),
+            row(
+                16,
+                "Market Center Official Open",
+                false,
+                &[(ConsolidatedTapeAssociation, b'Q')],
+            ),
+            row(
+                37,
+                "Odd Lot Trade",
+                true,
+                &[(ConsolidatedTapeAssociation, b'I')],
+            ),
+            row(
+                38,
+                "Corrected Consolidated Close (per listing market)",
+                false,
+                &[],
+            ),
+        ]
+    }
+
+    pub(crate) fn table() -> ConditionsTable {
+        ConditionsTable::new(date(), rows()).expect("the fixture must satisfy every anchor")
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::fixture::*;
     use super::*;
-    use crate::data::conditions_table::FETCHED_ON;
 
-    /// Both spellings of one condition reach the same row.
-    ///
-    /// Pinned to the literal `37`/`b'I'` rather than to a lookup, because a test that resolves the
-    /// character through the same table it is checking would pass against an empty one.
+    /// An empty table answers every print with the fallback, which reads like an unreadable tape.
     #[test]
-    fn test_a_condition_resolves_from_either_provider_spelling() {
-        let odd_lot = by_identifier(37).expect("the table carries the odd lot condition");
-        assert_eq!(odd_lot.name, "Odd Lot Trade");
-        assert!(odd_lot.updates_volume, "an odd lot is real volume");
-        assert!(
-            !odd_lot.updates_high_low,
-            "an odd lot does not set the high"
-        );
-
-        let from_character = by_character(b'I', Tape::ConsolidatedTapeAssociation);
-        assert!(
-            from_character.contains(&odd_lot),
-            "CTA spells the odd lot condition I"
+    fn test_a_table_holding_no_conditions_is_refused() {
+        assert_eq!(
+            ConditionsTable::new(date(), Vec::new()),
+            Err(ConditionsError::Empty)
         );
     }
 
-    /// The auction prints are the whole reason the volume rule exists.
-    ///
-    /// Measured 2026-08-21: 246 trades carrying these codes were 14.1% of the session's dollar
-    /// volume, so treating them as ordinary would move every VWAP in the archive by double digits.
+    /// `by_identifier` scans, so a duplicate answers with whichever row happens to come first.
     #[test]
-    fn test_the_official_open_and_close_are_not_consolidated_volume() {
-        for identifier in [15, 16, 38] {
-            let condition = by_identifier(identifier).expect("a published condition");
-            assert!(
-                !condition.updates_volume,
-                "{} ({}) must stay out of consolidated volume",
-                identifier, condition.name
-            );
-        }
-        assert_eq!(volume_eligibility(&[15]), Eligibility::Ineligible);
-        assert_eq!(volume_eligibility(&[37, 41, 15]), Eligibility::Ineligible);
+    fn test_a_duplicated_identifier_is_refused() {
+        let mut duplicated = rows();
+        duplicated.push(row(37, "Odd Lot Trade", false, &[]));
+        assert_eq!(
+            ConditionsTable::new(date(), duplicated),
+            Err(ConditionsError::Duplicated { identifier: 37 })
+        );
+    }
+
+    /// The house rule names identifiers, and the identifiers are the vendor's to renumber.
+    #[test]
+    fn test_an_anchor_the_provider_renamed_is_refused() {
+        let renamed: Vec<SaleCondition> = rows()
+            .into_iter()
+            .map(|condition| match condition.identifier {
+                10 => row(10, "Something Else Entirely", true, &[]),
+                _ => condition,
+            })
+            .collect();
+        assert_eq!(
+            ConditionsTable::new(date(), renamed),
+            Err(ConditionsError::Anchor {
+                identifier: 10,
+                expected: "Derivatively Priced",
+                found: "calls it \"Something Else Entirely\"".to_string(),
+            })
+        );
+    }
+
+    /// The auction prints are 14.1% of a session's dollar volume, so this cannot change quietly.
+    ///
+    /// Measured 2026-08-21 over 246 prints. A vendor flipping one to volume-eligible would move
+    /// every VWAP in the archive, and the fold cannot be undone — so it is refused on arrival.
+    #[test]
+    fn test_an_auction_print_turned_volume_eligible_is_refused() {
+        let flipped: Vec<SaleCondition> = rows()
+            .into_iter()
+            .map(|condition| match condition.identifier {
+                15 => row(
+                    15,
+                    "Market Center Official Close",
+                    true,
+                    &[(Tape::ConsolidatedTapeAssociation, b'M')],
+                ),
+                _ => condition,
+            })
+            .collect();
+        assert_eq!(
+            ConditionsTable::new(date(), flipped),
+            Err(ConditionsError::Anchor {
+                identifier: 15,
+                expected: "Market Center Official Close",
+                found: "makes it volume-eligible".to_string(),
+            })
+        );
+    }
+
+    /// The transport substitutes the sentinel for a token no table can spell.
+    ///
+    /// A row claiming that byte would resolve a malformed print to a real condition, and the print
+    /// would silently acquire its eligibility.
+    #[test]
+    fn test_a_row_claiming_the_unspellable_byte_is_refused() {
+        let mut claiming = rows();
+        claiming.push(row(
+            99,
+            "Impostor",
+            true,
+            &[(
+                Tape::UnlistedTradingPrivileges,
+                TradeConditions::UNSPELLABLE,
+            )],
+        ));
+        assert_eq!(
+            ConditionsTable::new(date(), claiming),
+            Err(ConditionsError::ClaimsTheSentinel {
+                identifier: 99,
+                tape: "unlisted_trading_privileges",
+            })
+        );
+    }
+
+    /// Both spellings of one condition reach the same row.
+    #[test]
+    fn test_a_condition_resolves_from_either_provider_spelling() {
+        let table = table();
+        let odd_lot = by_identifier(&table, 37).expect("the fixture carries it");
+        assert_eq!(odd_lot.name, "Odd Lot Trade");
+        assert!(
+            by_character(&table, b'I', Tape::ConsolidatedTapeAssociation).contains(&odd_lot),
+            "the character reaches the row the identifier does"
+        );
     }
 
     /// One disqualifying code outweighs any number of ordinary ones beside it.
     #[test]
     fn test_ineligibility_wins_over_the_conditions_it_sits_beside() {
-        assert_eq!(volume_eligibility(&[]), Eligibility::Eligible);
-        assert_eq!(volume_eligibility(&[37]), Eligibility::Eligible);
-        assert_eq!(volume_eligibility(&[14, 12, 37]), Eligibility::Eligible);
-        assert_eq!(volume_eligibility(&[16, 37]), Eligibility::Ineligible);
+        let table = table();
+        assert_eq!(volume_eligibility(&table, &[]), Eligibility::Eligible);
+        assert_eq!(volume_eligibility(&table, &[37]), Eligibility::Eligible);
+        assert_eq!(
+            volume_eligibility(&table, &[14, 2, 37]),
+            Eligibility::Eligible
+        );
+        assert_eq!(
+            volume_eligibility(&table, &[16, 37]),
+            Eligibility::Ineligible
+        );
     }
 
     /// A code this table does not carry is reported, never silently treated as ordinary.
@@ -240,44 +720,75 @@ mod tests {
     /// condition — so an unresolved code is the common case and must stay visible.
     #[test]
     fn test_an_unresolved_code_is_ambiguous_rather_than_eligible() {
-        assert_eq!(volume_eligibility(&[9_999]), Eligibility::Ambiguous);
-        assert_eq!(volume_eligibility(&[37, 9_999]), Eligibility::Ambiguous);
+        let table = table();
+        assert_eq!(volume_eligibility(&table, &[9_999]), Eligibility::Ambiguous);
+        assert_eq!(
+            volume_eligibility(&table, &[37, 9_999]),
+            Eligibility::Ambiguous
+        );
         // Still ineligible: a code we cannot read does not rescue one we can.
-        assert_eq!(volume_eligibility(&[15, 9_999]), Eligibility::Ineligible);
+        assert_eq!(
+            volume_eligibility(&table, &[15, 9_999]),
+            Eligibility::Ineligible
+        );
     }
 
-    /// The unspellable sentinel resolves as unknown on every tape, which is the whole point of it.
-    ///
-    /// The transport substitutes it for a condition token no table can spell. If any tape ever
-    /// claimed that byte it would resolve to a real condition instead, and a malformed print would
-    /// silently acquire that condition's eligibility.
+    /// The sentinel resolves as unknown on every tape, which is the whole point of it.
     #[test]
     fn test_the_unspellable_sentinel_is_ambiguous_on_every_tape() {
-        for tape in [
-            Tape::ConsolidatedTapeAssociation,
-            Tape::UnlistedTradingPrivileges,
-            Tape::TradeDataDissemination,
-        ] {
+        let table = table();
+        for tape in Tape::ALL {
             assert!(
-                by_character(TradeConditions::UNSPELLABLE, tape).is_empty(),
+                by_character(&table, TradeConditions::UNSPELLABLE, tape).is_empty(),
                 "no row may claim the sentinel on {tape:?}"
             );
             assert_eq!(
-                volume_eligibility_from_characters(&[TradeConditions::UNSPELLABLE], tape),
+                volume_eligibility_from_characters(&table, &[TradeConditions::UNSPELLABLE], tape),
                 Eligibility::Ambiguous,
                 "an unspellable token must stay visible on {tape:?}"
             );
         }
-        // A token we cannot read does not rescue one we can. Pinned to `M` — "Market Center Official
-        // Close", identifier 15, `updates_volume: false` — rather than to a lookup, because a test
-        // that resolved the character through the table it is checking would pass against an empty
-        // one.
+        // A token we cannot read does not rescue one we can.
         assert_eq!(
             volume_eligibility_from_characters(
+                &table,
                 &[b'M', TradeConditions::UNSPELLABLE],
                 Tape::ConsolidatedTapeAssociation
             ),
             Eligibility::Ineligible
+        );
+    }
+
+    /// A character naming two conditions is answerable only when they agree.
+    ///
+    /// The fixture's CTA `I` names two rows that agree, so it resolves; a disagreeing pair is what
+    /// `Ambiguous` exists for, and the archive would otherwise pick whichever came first.
+    #[test]
+    fn test_a_colliding_character_resolves_only_when_its_rows_agree() {
+        let table = table();
+        assert_eq!(
+            by_character(&table, b'I', Tape::ConsolidatedTapeAssociation).len(),
+            2,
+            "the fixture's collision must really collide"
+        );
+        assert_eq!(
+            volume_eligibility_from_characters(&table, b"I", Tape::ConsolidatedTapeAssociation),
+            Eligibility::Eligible,
+            "two rows that agree answer"
+        );
+
+        let mut disagreeing = rows();
+        disagreeing.push(row(
+            99,
+            "Contrary",
+            false,
+            &[(Tape::ConsolidatedTapeAssociation, b'I')],
+        ));
+        let table = ConditionsTable::new(date(), disagreeing).expect("anchors are untouched");
+        assert_eq!(
+            volume_eligibility_from_characters(&table, b"I", Tape::ConsolidatedTapeAssociation),
+            Eligibility::Ambiguous,
+            "a collision that disagrees must not be resolved by row order"
         );
     }
 
@@ -295,209 +806,140 @@ mod tests {
             "an average price is not a quote"
         );
         assert!(!carries_a_market_price(&[10, 37, 41]));
-    }
 
-    /// The provider's character mapping collides, and the archive depends on it not mattering.
-    ///
-    /// Three collisions exist — CTA `I`, CTA `K`, UTP `V`. Every one agrees on `updates_volume`,
-    /// which is the only rule read off a character. If the provider ever publishes a collision that
-    /// disagrees, this fails and the resolution has to stop being character-based.
-    #[test]
-    fn test_every_colliding_character_agrees_on_the_volume_rule() {
-        let mut collisions = 0;
-        for tape in Tape::ALL {
-            for character in 0u8..=255 {
-                let candidates = by_character(character, tape);
-                if candidates.len() < 2 {
-                    continue;
-                }
-                collisions += 1;
-                let verdicts: std::collections::BTreeSet<bool> =
-                    candidates.iter().map(|row| row.updates_volume).collect();
-                assert_eq!(
-                    verdicts.len(),
-                    1,
-                    "{tape} {:?} names conditions that disagree on volume: {:?}",
-                    character as char,
-                    candidates
-                );
-            }
-        }
-        assert_eq!(collisions, 3, "CTA I, CTA K and UTP V, and nothing else");
-    }
-
-    /// The house rule is read off characters too, so its codes must name nothing else.
-    ///
-    /// Spelled out rather than iterated over `NOT_A_MARKET_PRICE`: a loop driven by the constant
-    /// under test passes vacuously if the constant is emptied, which is the one edit that would
-    /// silently retire the rule.
-    #[test]
-    fn test_the_house_rule_codes_are_collision_free_on_every_tape() {
-        for (identifier, name, expected) in [
-            (
-                2,
-                "Average Price Trade",
-                vec![
-                    (Tape::ConsolidatedTapeAssociation, b'B'),
-                    (Tape::UnlistedTradingPrivileges, b'W'),
-                    (Tape::TradeDataDissemination, b'W'),
-                ],
-            ),
-            (
-                10,
-                "Derivatively Priced",
-                vec![
-                    (Tape::ConsolidatedTapeAssociation, b'4'),
-                    (Tape::UnlistedTradingPrivileges, b'4'),
-                ],
-            ),
-        ] {
-            assert!(
-                NOT_A_MARKET_PRICE.contains(&identifier),
-                "{identifier} must still be excluded from the effective spread"
-            );
-            let condition = by_identifier(identifier).expect("a published condition");
-            assert_eq!(condition.name, name);
-            for (tape, character) in expected {
-                assert_eq!(
-                    condition.character_on(tape),
-                    Some(character),
-                    "{tape} spells {name} {:?}",
-                    character as char
-                );
-                assert_eq!(
-                    by_character(character, tape).len(),
-                    1,
-                    "{tape} {:?} must name only {name}",
-                    character as char
-                );
-            }
-        }
-        assert_eq!(NOT_A_MARKET_PRICE.len(), 2, "exactly the two above");
-
+        // And through Alpaca's spelling, which has to resolve the character first.
+        let table = table();
         assert!(!carries_a_market_price_from_characters(
+            &table,
             b"B",
             Tape::ConsolidatedTapeAssociation
         ));
-        assert!(!carries_a_market_price_from_characters(
-            b"W",
-            Tape::UnlistedTradingPrivileges
-        ));
         assert!(carries_a_market_price_from_characters(
+            &table,
             b"I",
             Tape::ConsolidatedTapeAssociation
         ));
     }
 
-    /// Both providers reach the same verdict on the same trade, and it is the verdict named here.
-    ///
-    /// The point of the whole module: a bulk fold reading Massive identifiers and a nightly fold
-    /// reading Alpaca characters must not disagree about whether a print is volume. Each pair
-    /// carries its own literal expectation, so both paths regressing to `Eligible` together fails.
+    /// The marker a SIP spells "no condition applies" with is not a condition.
+    #[test]
+    fn test_the_regular_sale_marker_is_read_on_each_tape_that_spells_it() {
+        let table = table();
+        assert_eq!(
+            volume_eligibility_from_characters(&table, b" ", Tape::ConsolidatedTapeAssociation),
+            Eligibility::Eligible,
+            "CTA spells an ordinary print with a space"
+        );
+        assert_eq!(
+            volume_eligibility_from_characters(&table, b"@", Tape::UnlistedTradingPrivileges),
+            Eligibility::Eligible,
+            "UTP spells it with an at-sign"
+        );
+
+        // Beside a real condition it still resolves, which is the common shape on the tape.
+        assert_eq!(
+            volume_eligibility_from_characters(&table, b" F", Tape::ConsolidatedTapeAssociation),
+            volume_eligibility_from_characters(&table, b"F", Tape::ConsolidatedTapeAssociation),
+            "the marker contributes nothing beyond itself"
+        );
+    }
+
+    /// Each provider's spelling is read against its own half of the table.
+    #[test]
+    fn test_each_spelling_is_read_against_its_own_table() {
+        let table = table();
+        let spelled = TradeConditions::Spelled {
+            characters: vec![b'M'],
+            tape: Tape::ConsolidatedTapeAssociation,
+        };
+        assert_eq!(
+            volume_eligibility_of(&table, &spelled),
+            Eligibility::Ineligible
+        );
+
+        // The same byte read as an identifier, which is what reading it against the wrong table
+        // would do. A different answer, which is what makes the assertion above load-bearing.
+        assert_eq!(
+            volume_eligibility(&table, &[u32::from(b'M')]),
+            Eligibility::Ambiguous
+        );
+
+        assert_eq!(
+            volume_eligibility_of(&table, &TradeConditions::Identified(vec![15])),
+            Eligibility::Ineligible,
+            "identifier 15 is the same condition, spelled the other way"
+        );
+    }
+
+    /// The two spellings of the same condition reach the same verdict.
     #[test]
     fn test_the_two_provider_spellings_agree_on_eligibility() {
+        let table = table();
         let tape = Tape::ConsolidatedTapeAssociation;
         for (identifiers, characters, expected) in [
-            // Odd Lot Trade, which is real volume.
             (vec![37u32], b"I".to_vec(), Eligibility::Eligible),
-            // Market Center Official Open and Close, which are the auctions.
             (vec![16], b"Q".to_vec(), Eligibility::Ineligible),
             (vec![15], b"M".to_vec(), Eligibility::Ineligible),
-            // Intermarket Sweep, which is an ordinary print.
             (vec![14], b"F".to_vec(), Eligibility::Eligible),
         ] {
             assert_eq!(
-                volume_eligibility(&identifiers),
+                volume_eligibility(&table, &identifiers),
                 expected,
                 "{identifiers:?} must be {expected:?}"
             );
             assert_eq!(
-                volume_eligibility_from_characters(&characters, tape),
+                volume_eligibility_from_characters(&table, &characters, tape),
                 expected,
                 "{characters:?} must be {expected:?}"
             );
         }
     }
 
-    /// The table is present and stamped, which is what makes the const reproducible.
-    #[test]
-    fn test_the_generated_table_is_populated_and_dated() {
-        assert!(
-            SALE_CONDITIONS.len() >= 40,
-            "the provider published 40 sale conditions when this was written"
-        );
-        assert_eq!(FETCHED_ON.len(), 10, "an ISO date");
-        // Strictly increasing, which is uniqueness and ordering in one pass. `dedup` would not do:
-        // it drops only adjacent repeats, so an unsorted table with duplicates apart reads clean.
-        assert!(
-            SALE_CONDITIONS
-                .windows(2)
-                .all(|pair| pair[0].identifier < pair[1].identifier),
-            "identifiers must ascend without repeating, which `by_identifier` assumes"
-        );
-    }
-
-    /// The regular-sale marker is spelled differently per tape, and reading the wrong one reports
-    /// the whole tape as unreadable.
+    /// Every row survives the shape the dataset stores it in, including an absent spelling.
     ///
-    /// Pinned per tape rather than as one character: fixing only the at-sign left every NYSE-listed
-    /// name at ~100% ambiguous, because CTA writes a space. Both are asserted as *eligible*, which
-    /// is the observable difference — an unrecognized character is merely ambiguous, so a test that
-    /// only checked "not ineligible" would pass with the marker unhandled.
+    /// The property the published table is trusted on: a column silently dropped or a `None` read
+    /// back as a character would change an eligibility verdict with nothing to show for it.
     #[test]
-    fn test_the_regular_sale_marker_is_read_on_each_tape_that_spells_it() {
-        assert_eq!(
-            volume_eligibility_from_characters(b" ", Tape::ConsolidatedTapeAssociation),
-            Eligibility::Eligible,
-            "CTA spells an ordinary print with a space"
-        );
-        assert_eq!(
-            volume_eligibility_from_characters(b"@", Tape::UnlistedTradingPrivileges),
-            Eligibility::Eligible,
-            "UTP spells it with an at-sign"
-        );
+    fn test_a_table_round_trips_through_the_dataset_shape() {
+        let table = table();
+        let frame = table.to_dataframe().expect("the frame must build");
+        assert_eq!(frame.height(), rows().len(), "every row must be written");
+        let read = ConditionsTable::from_dataframe(date(), &frame).expect("it must read back");
+        assert_eq!(read, table, "the round trip must return what it was given");
 
-        // Beside a real condition it still resolves, which is the common shape on the tape: a
-        // regular sale that also updates the last price arrives as two characters, not one.
-        assert_eq!(
-            volume_eligibility_from_characters(b" I", Tape::ConsolidatedTapeAssociation),
-            volume_eligibility_from_characters(b"I", Tape::ConsolidatedTapeAssociation),
-            "the marker contributes nothing beyond itself"
+        // The absent spelling specifically: 38 is on no tape, and a null read as a byte would put
+        // it on one.
+        let corrected = by_identifier(&read, 38).expect("the row survived");
+        assert_eq!(corrected.consolidated_tape_association, None);
+        assert_eq!(corrected.unlisted_trading_privileges, None);
+        assert_eq!(corrected.trade_data_dissemination, None);
+    }
+
+    /// A SIP prints one byte, so a longer spelling is a corrupt row rather than a wider character.
+    #[test]
+    fn test_a_spelling_that_is_not_one_character_is_refused() {
+        use polars::prelude::*;
+
+        let table = table();
+        let mut frame = table.to_dataframe().expect("the frame must build");
+        let mut spellings: Vec<Option<&str>> = vec![None; frame.height()];
+        spellings[0] = Some("BB");
+        frame
+            .with_column(Column::new(
+                "consolidated_tape_association".into(),
+                spellings,
+            ))
+            .expect("the column must replace");
+
+        let error = ConditionsTable::from_dataframe(date(), &frame)
+            .expect_err("a two-character spelling must be refused");
+        assert!(
+            error.to_string().contains("not one character"),
+            "the refusal must say what was wrong: {error}"
         );
     }
 
-    /// The dispatch is the point: Alpaca's characters must not reach the identifier table.
-    ///
-    /// Pinned on `M`, which is the one input where the two tables actually disagree. As a character
-    /// it is Market Center Official Close and volume-ineligible; its byte, 77, names no identifier
-    /// at all and would resolve as merely ambiguous. Comparing against the sibling function instead
-    /// proved nothing -- a mutation swapping the tables passed, because the inputs I first chose
-    /// happened to agree.
-    #[test]
-    fn test_each_spelling_is_read_against_its_own_table() {
-        let spelled = TradeConditions::Spelled {
-            characters: vec![b'M'],
-            tape: Tape::ConsolidatedTapeAssociation,
-        };
-        assert_eq!(volume_eligibility_of(&spelled), Eligibility::Ineligible);
-
-        // The same byte read as an identifier, which is what reading it against the wrong table
-        // would do. A different answer, which is what makes the assertion above load-bearing.
-        assert_eq!(
-            volume_eligibility(&[u32::from(b'M')]),
-            Eligibility::Ambiguous
-        );
-
-        // And the identifier spelling still resolves as an identifier.
-        assert_eq!(
-            volume_eligibility_of(&TradeConditions::Identified(vec![15])),
-            Eligibility::Ineligible,
-            "identifier 15 is the same condition, spelled the other way"
-        );
-    }
-
-    /// The same character names different conditions on different tapes, which is the whole reason
-    /// a character cannot be read without one.
+    /// Alpaca's tape letters and Massive's numeric markers name the same SIPs.
     #[test]
     fn test_alpacas_tape_letters_name_the_same_sips_as_the_numeric_markers() {
         assert_eq!(

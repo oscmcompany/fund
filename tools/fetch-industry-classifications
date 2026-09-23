@@ -425,7 +425,11 @@ PREFIX="data/reference/classification"
 # several keys in one variable.
 ALL_KEYS="$(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${PREFIX}/" \
   --query 'Contents[].Key' --output text)"
-NEWEST_KEY="$(printf '%s' "${ALL_KEYS}" | tr '\t' '\n' | grep -v '^None$' | sort | tail -1)"
+# `|| NEWEST_KEY=""` because an empty prefix makes `grep` match nothing, and `pipefail` turns that
+# into a fatal error on the one run that most needs to succeed -- the first publish. The fail-closed
+# property is untouched: the listing itself is a separate assignment and still aborts the script.
+NEWEST_KEY="$(printf '%s' "${ALL_KEYS}" | tr '\t' '\n' | grep -v '^None$' | sort | tail -1)" \
+  || NEWEST_KEY=""
 [[ -z "${NEWEST_KEY}" ]] && NEWEST_KEY="None"
 
 UNCHANGED=false
