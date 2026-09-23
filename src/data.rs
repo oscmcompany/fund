@@ -13,7 +13,6 @@ pub mod calendar;
 pub mod classification;
 pub mod classification_table;
 pub mod conditions;
-pub mod conditions_table;
 pub mod details;
 pub mod export;
 pub mod nightly;

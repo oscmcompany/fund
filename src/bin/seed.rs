@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
@@ -1693,14 +1694,19 @@ async fn archive_nightly(
             report.record(leg, LegOutcome::Skipped);
             continue;
         }
-        let outcome = match run_leg(leg, &plan, &calendar, arguments, &budget).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                error!(%leg, %error, "Nightly leg failed, continuing to the next");
-                LegOutcome::Failed(error.to_string())
-            }
-        };
+        let mut folded_under = None;
+        let outcome =
+            match run_leg(leg, &plan, &calendar, arguments, &budget, &mut folded_under).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    error!(%leg, %error, "Nightly leg failed, continuing to the next");
+                    LegOutcome::Failed(error.to_string())
+                }
+            };
         info!(%leg, remaining_seconds = budget.remaining().as_secs(), "Leg finished");
+        if let Some(as_of) = folded_under {
+            report.record_conditions(as_of);
+        }
         report.record(leg, outcome);
     }
 
@@ -1746,10 +1752,22 @@ async fn record_the_fold(report: &NightlyReport) {
         partitions_written: report.written(),
         legs: report.legs().to_vec(),
         reference: report.reference().cloned(),
+        conditions_as_of: report.conditions_as_of(),
     });
     journal
         .record(uuid::Uuid::new_v4(), Utc::now(), observation)
         .await;
+}
+
+/// The conditions table a session should be recorded as folded under, if any.
+///
+/// A function rather than an inline test because it is the whole of the field's contract, and the
+/// defect it fixes was recording at the load rather than at the write.
+fn conditions_folded_under(sessions_written: usize, as_of: Option<NaiveDate>) -> Option<NaiveDate> {
+    if sessions_written == 0 {
+        return None;
+    }
+    as_of
 }
 
 /// Every record this box failed to ship, named.
@@ -1929,6 +1947,8 @@ async fn run_leg(
     calendar: &TradingCalendar,
     arguments: &NightlyArguments,
     budget: &nightly::Budget,
+    // Set by the trades leg alone, because it is the only one that folds under published rules.
+    conditions_as_of: &mut Option<chrono::NaiveDate>,
 ) -> Result<LegOutcome, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
@@ -1989,6 +2009,16 @@ async fn run_leg(
             .into());
         }
     }
+
+    // Loaded once for the leg rather than per session, so the `as_of` this run records is true of
+    // every partition it wrote. A table republished mid-leg would otherwise leave two sessions
+    // folded under rules the record names as one.
+    let conditions = match leg {
+        Leg::Trades => Some(Arc::new(
+            archive::read_newest_conditions(&s3_client, &bucket).await?,
+        )),
+        _ => None,
+    };
 
     let mut written = 0;
     let mut complete = true;
@@ -2074,11 +2104,29 @@ async fn run_leg(
                     .into());
                 }
                 archive::archive_trade_sessions(
-                    &s3_client, &source, calendar, &bucket, &one, &scope,
+                    &s3_client,
+                    &source,
+                    calendar,
+                    &bucket,
+                    &one,
+                    &scope,
+                    Arc::clone(
+                        conditions
+                            .as_ref()
+                            .expect("the trades leg loaded its table above"),
+                    ),
                 )
                 .await?
             }
         };
+        // Recorded from the write rather than from the load, so the record names a table something
+        // was actually folded under: a night already current loads one and folds nothing.
+        if let Some(as_of) = conditions_folded_under(
+            summary.sessions_written(),
+            conditions.as_ref().map(|table| table.as_of()),
+        ) {
+            *conditions_as_of = Some(as_of);
+        }
         written += summary.sessions_written();
         complete &= summary.is_complete();
     }
@@ -2432,9 +2480,21 @@ async fn seed_trades(action: &TradeAction) -> Result<Outcome, SeedError> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
     Ok(Outcome::Pass(
-        archive::archive_trade_sessions(&s3_client, &source, &calendar, &bucket, &sampled, &scope)
-            .await
-            .map_err(box_error)?,
+        archive::archive_trade_sessions(
+            &s3_client,
+            &source,
+            &calendar,
+            &bucket,
+            &sampled,
+            &scope,
+            Arc::new(
+                archive::read_newest_conditions(&s3_client, &bucket)
+                    .await
+                    .map_err(|error| SeedError::Failed(Box::new(error)))?,
+            ),
+        )
+        .await
+        .map_err(box_error)?,
     ))
 }
 
@@ -2449,6 +2509,15 @@ async fn measure_trades(symbols: &TradeSymbolArguments) -> Result<Outcome, SeedE
     let sampled = sample(&calendar, &window, symbols.stride);
     report_sample(&window, symbols.stride, &calendar, &sampled);
 
+    // Read against the same published rules the archive folds under, or the counters below would
+    // measure a different policy from the one that produced the partitions they are compared to.
+    let s3_client = fund::common::aws::s3_client().await;
+    let conditions = Arc::new(
+        archive::read_newest_conditions(&s3_client, &bucket_name()?)
+            .await
+            .map_err(|error| SeedError::Failed(Box::new(error)))?,
+    );
+
     // The exclusion counters are printed beside the totals because they are the first thing a
     // disagreement with the flat-file archive would be explained by: the two providers spell
     // conditions differently, so they can admit different prints.
@@ -2462,7 +2531,16 @@ async fn measure_trades(symbols: &TradeSymbolArguments) -> Result<Outcome, SeedE
             continue;
         };
         for ticker in &named {
-            match trades::fold_session(&market_data, ticker, *session, open, close).await {
+            match trades::fold_session(
+                &market_data,
+                ticker,
+                *session,
+                open,
+                close,
+                Arc::clone(&conditions),
+            )
+            .await
+            {
                 Ok((summaries, fetch)) => print_trade_row(ticker, *session, &summaries, fetch),
                 Err(error) => println!(
                     "{:<8}{:<12} failed: {error}",
@@ -2982,6 +3060,20 @@ async fn trading_calendar(window: &Window) -> Result<TradingCalendar, Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A night that loaded a table and folded nothing records no table.
+    ///
+    /// The field means "what the tape was folded under", so a run whose partitions were already
+    /// current must leave it absent — the load is not the fold, and the journal would otherwise
+    /// attribute rules to a run that applied them to nothing.
+    #[test]
+    fn test_a_leg_that_wrote_nothing_records_no_conditions_table() {
+        let as_of = NaiveDate::from_ymd_opt(2026, 9, 23).expect("a real date");
+        assert_eq!(conditions_folded_under(0, Some(as_of)), None);
+        assert_eq!(conditions_folded_under(1, Some(as_of)), Some(as_of));
+        // And a leg that wrote without a table cannot name one, which is every leg but trades.
+        assert_eq!(conditions_folded_under(3, None), None);
+    }
 
     fn parse(arguments: &[&str]) -> Result<Arguments, clap::Error> {
         Arguments::try_parse_from(std::iter::once("seed").chain(arguments.iter().copied()))

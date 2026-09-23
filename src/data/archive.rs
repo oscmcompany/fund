@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -27,6 +28,7 @@ use crate::data::attribution::{Attribution, Declaration};
 use crate::data::cadence::{CadenceCheck, CadenceError, CadenceTotals, SessionOutcome};
 use crate::data::calendar::TradingCalendar;
 use crate::data::classification::ClassificationTable;
+use crate::data::conditions::ConditionsTable;
 use crate::data::{bars, boundaries, quotes, reference, splits, trades};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
@@ -93,6 +95,8 @@ pub enum ArchiveError {
         prefix: String,
         message: String,
     },
+    #[error("the conditions table could not be loaded: {message}")]
+    Conditions { message: String },
     #[error("the classification mapping could not be loaded: {message}")]
     Classification { message: String },
     #[error("failed to read s3://{bucket}/{key}: {message}")]
@@ -2249,6 +2253,68 @@ pub async fn read_newest_classification(
     })
 }
 
+/// Where the provider's sale-condition table is published, one partition per `as_of`.
+pub const CONDITIONS_ARCHIVE_PREFIX: &str = "data/reference/conditions";
+
+/// The key one `as_of` of the conditions table is written to.
+pub fn conditions_key(as_of: chrono::NaiveDate) -> String {
+    format!("{CONDITIONS_ARCHIVE_PREFIX}/as_of={as_of}/data.parquet")
+}
+
+/// Every `as_of` the conditions table holds a partition for, ascending.
+pub async fn conditions_as_of_dates(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<Vec<chrono::NaiveDate>, ArchiveError> {
+    let (partitions, _sidecars) =
+        partitions_and_sidecars(s3_client, bucket, CONDITIONS_ARCHIVE_PREFIX, "data.parquet")
+            .await?;
+
+    // Kept only when the date round-trips to the very key it was read from, for the reason
+    // `classification_as_of_dates` gives: a nested key would send the reader somewhere that is not
+    // there and fail the load while a valid earlier partition sits beside it.
+    let mut dates: Vec<chrono::NaiveDate> = partitions
+        .iter()
+        .filter_map(|key| {
+            let date = key
+                .split('/')
+                .find_map(|segment| segment.strip_prefix("as_of="))
+                .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
+            (conditions_key(date) == *key).then_some(date)
+        })
+        .collect();
+    dates.sort_unstable();
+    dates.dedup();
+    Ok(dates)
+}
+
+/// Loads the newest published conditions table.
+///
+/// Refuses when the dataset is absent rather than folding under no rules: an empty table reports
+/// every print as unresolved, which is indistinguishable from a tape nobody can read.
+pub async fn read_newest_conditions(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<ConditionsTable, ArchiveError> {
+    let newest = conditions_as_of_dates(s3_client, bucket)
+        .await?
+        .pop()
+        .ok_or_else(|| ArchiveError::Conditions {
+            message: format!(
+                "no conditions partition under s3://{bucket}/{CONDITIONS_ARCHIVE_PREFIX}"
+            ),
+        })?;
+    let key = conditions_key(newest);
+    let frame = read_partition(s3_client, bucket, &key)
+        .await?
+        .ok_or_else(|| ArchiveError::Conditions {
+            message: format!("s3://{bucket}/{key} was listed and then could not be read"),
+        })?;
+    ConditionsTable::from_dataframe(newest, &frame).map_err(|error| ArchiveError::Conditions {
+        message: format!("s3://{bucket}/{key} is not a usable conditions table: {error}"),
+    })
+}
+
 /// Every `as_of` the reference dataset holds a partition for, ascending.
 ///
 /// Listed rather than derived from the quarterly grid, because the grid is a policy about what
@@ -3181,6 +3247,7 @@ impl std::fmt::Display for TradeSource<'_> {
 /// `sessions` must already be calendar-filtered on the same terms as the quote pass. A whole-session
 /// fold treats a name absent from the file as absent from the tape, while a per-name fold treats it
 /// as a fetch that can be retried — which is why the two report a failed symbol differently.
+#[allow(clippy::too_many_arguments)]
 pub async fn archive_trade_sessions(
     s3_client: &S3Client,
     source: &TradeSource<'_>,
@@ -3188,6 +3255,7 @@ pub async fn archive_trade_sessions(
     bucket: &str,
     sessions: &[SessionDate],
     scope: &Scope,
+    conditions: Arc<ConditionsTable>,
 ) -> Result<PassSummary, ArchiveError> {
     let (Some(first), Some(last)) = (sessions.first(), sessions.last()) else {
         return Ok(PassProgress::default().into_trade_summary(0));
@@ -3218,6 +3286,11 @@ pub async fn archive_trade_sessions(
         sessions_requested: requested.len(),
         ..Default::default()
     };
+    // Taken rather than loaded here, so the caller that records the night names the very table the
+    // fold ran under. A pass that loaded its own would leave the record asserting a fact about a
+    // read it did not make.
+    info!(conditions_as_of = %conditions.as_of(), "Folding the tape under the published conditions");
+
     let mut trades_folded = 0usize;
     for session in requested {
         trades_folded += archive_trade_session(
@@ -3227,6 +3300,7 @@ pub async fn archive_trade_sessions(
             bucket,
             session,
             scope,
+            Arc::clone(&conditions),
             &mut progress,
         )
         .await?;
@@ -3269,6 +3343,7 @@ async fn archive_trade_session(
     bucket: &str,
     session: SessionDate,
     scope: &Scope,
+    conditions: Arc<ConditionsTable>,
     progress: &mut PassProgress,
 ) -> Result<usize, ArchiveError> {
     let Some((open, close)) = quotes::trading_hours(calendar, session) else {
@@ -3301,10 +3376,20 @@ async fn archive_trade_session(
     // for it here would be read later as though a file had reported it.
     let (summaries, trades_folded) = match source {
         TradeSource::PerName(market_data) => {
-            fold_trade_universe(market_data, session, open, close, &universe, progress).await
+            fold_trade_universe(
+                market_data,
+                session,
+                open,
+                close,
+                &universe,
+                conditions,
+                progress,
+            )
+            .await
         }
         TradeSource::WholeSession(flat_files) => {
-            let Some(fold) = trades::MarketFold::new(session, open, close, universe) else {
+            let Some(fold) = trades::MarketFold::new(session, open, close, universe, conditions)
+            else {
                 // Unreachable while `trading_hours` returns a published session, and cheap to say so
                 // rather than fold nothing and report the whole universe as its cost.
                 warn!(%session, %open, %close, "The session spans no time; leaving it unsummarized");
@@ -3352,12 +3437,14 @@ async fn archive_trade_session(
 ///
 /// A symbol's failure costs that symbol rather than the session, as on the quote path: the other
 /// names are already fetched and discarding them would mean paying for them twice.
+#[allow(clippy::too_many_arguments)]
 async fn fold_trade_universe(
     market_data: &MarketDataClient,
     session: SessionDate,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     universe: &BTreeSet<Ticker>,
+    conditions: Arc<ConditionsTable>,
     progress: &mut PassProgress,
 ) -> (Vec<TradeSummary>, usize) {
     let mut pending: Vec<Ticker> = universe.iter().cloned().collect();
@@ -3369,10 +3456,20 @@ async fn fold_trade_universe(
         while tasks.len() < QUOTE_CONCURRENCY {
             let Some(ticker) = pending.pop() else { break };
             let client = market_data.clone();
+            let conditions = Arc::clone(&conditions);
             tasks.spawn(async move {
                 let mut last_error = None;
                 for attempt in 0..QUOTE_SYMBOL_ATTEMPTS {
-                    match trades::fold_session(&client, &ticker, session, open, close).await {
+                    match trades::fold_session(
+                        &client,
+                        &ticker,
+                        session,
+                        open,
+                        close,
+                        Arc::clone(&conditions),
+                    )
+                    .await
+                    {
                         Ok(folded) => return Ok(folded),
                         Err(error) => {
                             if !error.is_transient() {
@@ -4430,6 +4527,7 @@ mod tests {
             at,
             open,
             close,
+            std::sync::Arc::new(crate::data::conditions::fixture::table()),
         )
         .expect("a positive session must open");
         fold.push(

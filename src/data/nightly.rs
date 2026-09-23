@@ -436,6 +436,8 @@ pub struct NightlyReport {
     sessions: usize,
     legs: Vec<(Leg, LegOutcome)>,
     reference: Option<ReferenceOutcome>,
+    /// Set only by a trades leg that ran, because folding no tape is not folding under no rules.
+    conditions_as_of: Option<chrono::NaiveDate>,
 }
 
 impl NightlyReport {
@@ -447,6 +449,7 @@ impl NightlyReport {
             sessions: plan.sessions().len(),
             legs: Vec::new(),
             reference: None,
+            conditions_as_of: None,
         }
     }
 
@@ -463,6 +466,19 @@ impl NightlyReport {
     /// What the reference sweep did, or `None` if it never ran.
     pub fn reference(&self) -> Option<&ReferenceOutcome> {
         self.reference.as_ref()
+    }
+
+    /// Records which published conditions table the tape was folded under.
+    pub fn record_conditions(&mut self, as_of: chrono::NaiveDate) {
+        self.conditions_as_of = Some(as_of);
+    }
+
+    /// The conditions table the trades leg ran under, or `None` if no tape was folded.
+    ///
+    /// The fold cannot be undone, so this is the only account of which eligibility rules produced
+    /// the partitions this run wrote.
+    pub fn conditions_as_of(&self) -> Option<chrono::NaiveDate> {
+        self.conditions_as_of
     }
 
     /// Legs that errored.

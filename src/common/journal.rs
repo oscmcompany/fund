@@ -880,6 +880,11 @@ pub struct ArchiveFolded {
     /// `None` only where no sweep outcome was recorded at all. A sweep the budget never reached is
     /// `Some(ReferenceOutcome::Skipped)`, which is a different night and must stay distinguishable.
     pub reference: Option<ReferenceOutcome>,
+    /// Which published conditions table the tape was folded under.
+    ///
+    /// `None` when the run wrote no trade partition, which is not the same as folding under no
+    /// rules. The fold cannot be undone, so this is the only record of the rules that produced them.
+    pub conditions_as_of: Option<chrono::NaiveDate>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.
@@ -1309,6 +1314,7 @@ mod tests {
                     },
                 )],
                 reference: Some(crate::data::nightly::ReferenceOutcome::Skipped),
+                conditions_as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 31),
             }),
         ]
     }

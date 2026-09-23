@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# Regenerates src/data/conditions_table.rs from the provider's sale-condition reference.
+# Publishes the provider's sale-condition table to the archive as an `as_of`-partitioned dataset.
 #
-# The table decides which trades enter volume, VWAP and the effective spread, so it is baked into
-# the binary rather than fetched at fold time: a five-year backfill and tonight's nightly must apply
-# the same rules, and a table that moves under a running pass would make two partitions written a day
-# apart incomparable. Re-run this when the provider publishes new codes, and commit the diff.
+# The table decides which trades enter volume, VWAP and the effective spread. It used to be baked
+# into `src/data/conditions_table.rs`, so moving one row meant regenerating Rust, committing it and
+# deploying a binary; it is now data, and `seed` loads the newest partition at the start of a trades
+# leg and journals the `as_of` it ran under.
 #
 #   secretspec run -- tools/fetch-trade-conditions
 #   secretspec run -- tools/fetch-trade-conditions --check
 #
-# `--check` rewrites nothing and exits non-zero when the provider has moved, which is the drift
-# detection a baked table would otherwise lack. Deliberately not a test: it needs the network and a
-# credential, and a suite that fails when the vendor is down stops meaning anything.
+# `--check` publishes nothing and exits non-zero when the provider has moved, which is the drift
+# detection a published table would otherwise lack. Deliberately not a test: it needs the network
+# and a credential, and a suite that fails when the vendor is down stops meaning anything.
+#
+# The fold cannot be undone, so republishing does not change a partition already written -- unlike
+# the classification mapping, which is applied on every read. What a new `as_of` changes is every
+# fold after it, which is why the run that used one records which.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Entered rather than merely resolved: `cargo fmt` below reads the manifest from the working
-# directory, so a run from anywhere but the repository root would format nothing and say so quietly.
 cd "${ROOT}"
-OUTPUT="${ROOT}/src/data/conditions_table.rs"
 
 CHECK_ONLY=false
 if [[ "${1:-}" == "--check" ]]; then
@@ -35,13 +36,16 @@ for variable in MASSIVE_BASE_URL MASSIVE_API_KEY; do
   fi
 done
 
-RESPONSE="$(mktemp)"
-trap 'rm -f "${RESPONSE}"' EXIT
-
 if [[ "${MASSIVE_BASE_URL}" != https://* ]]; then
   echo "Error: MASSIVE_BASE_URL is not https, so the credential would cross the wire in clear" >&2
   exit 1
 fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+RESPONSE="${WORK}/response.json"
+CONDITIONS_CSV="${WORK}/conditions.csv"
+CONDITIONS_PARQUET="${WORK}/conditions.parquet"
 
 echo "Fetching sale conditions from ${MASSIVE_BASE_URL}"
 # The key travels as a bearer header fed over stdin, so it reaches neither the query string nor
@@ -54,17 +58,10 @@ url = "${MASSIVE_BASE_URL}/v3/reference/conditions?asset_class=stocks&limit=1000
 header = "Authorization: Bearer ${MASSIVE_API_KEY}"
 CURL_CONFIGURATION
 
-TARGET="${OUTPUT}"
-if [[ "${CHECK_ONLY}" == true ]]; then
-  TARGET="$(mktemp)"
-  trap 'rm -f "${RESPONSE}" "${TARGET}"' EXIT
-fi
-
-python3 - "${RESPONSE}" "${TARGET}" <<'PYTHON'
+python3 - "${RESPONSE}" "${CONDITIONS_CSV}" <<'PYTHON'
+import csv
 import json
-import re
 import sys
-from datetime import date
 
 response, output = sys.argv[1], sys.argv[2]
 with open(response) as handle:
@@ -87,81 +84,170 @@ for row in conditions:
 def character(row, tape):
     value = row.get("sip_mapping", {}).get(tape)
     if value is None:
-        return "None"
-    if len(value) != 1:
+        return ""
+    # Bytes, not code points: the loader reads the stored string as one byte, so a two-byte
+    # character passes a `len()` check here and is refused at 07:00Z instead of at this desk.
+    if len(value.encode("utf-8")) != 1:
         sys.exit(f"Error: condition {row['id']} maps to {value!r} on {tape}, which is not one byte")
-    return f"Some(b'{value}')" if value != "'" else "Some(b'\\'')"
+    return value
 
 
-lines = [
-    "//! The provider's sale-condition table, generated — see `tools/fetch-trade-conditions`.",
-    "//!",
-    "//! Edit the script, never this file. [`FETCHED_ON`] carries the date it was read.",
-    "",
-    "use crate::data::conditions::SaleCondition;",
-    "",
-    "/// The date the provider's reference endpoint was last read into this file.",
-    "///",
-    "/// The only line in this file that changes with the clock, which is what lets `--check` compare",
-    "/// two generations by ignoring exactly one line.",
-    f'pub const FETCHED_ON: &str = "{date.today().isoformat()}";',
-    "",
-    "/// Every stock sale condition the provider publishes, ordered by identifier.",
-    f"pub const SALE_CONDITIONS: [SaleCondition; {len(conditions)}] = [",
-]
-for row in conditions:
-    rules = row["update_rules"]["consolidated"]
-    lines.append("    SaleCondition {")
-    lines.append(f"        identifier: {row['id']},")
-    lines.append(f"        name: {json.dumps(row['name'])},")
-    lines.append(f"        updates_volume: {str(rules['updates_volume']).lower()},")
-    lines.append(f"        updates_high_low: {str(rules['updates_high_low']).lower()},")
-    lines.append(f"        updates_open_close: {str(rules['updates_open_close']).lower()},")
-    lines.append(f"        consolidated_tape_association: {character(row, 'CTA')},")
-    lines.append(f"        unlisted_trading_privileges: {character(row, 'UTP')},")
-    lines.append(f"        trade_data_dissemination: {character(row, 'FINRA_TDDS')},")
-    lines.append("    },")
-lines.append("];")
-lines.append("")
-
-rendered = "\n".join(lines)
-
-# `--check` compares two generations by ignoring the one dated line, so a second one would make an
-# unchanged table read as drift a day later. That is exactly the bug this guard exists to prevent,
-# and it is asserted here rather than trusted because the failure only appears the next morning.
-dated = [
-    line
-    for line in rendered.splitlines()
-    if re.search(r"\d{4}-\d{2}-\d{2}", line) and not line.startswith("pub const FETCHED_ON")
-]
-if dated:
-    sys.exit(
-        "Error: the generated file carries a date outside FETCHED_ON, which would make --check "
-        f"report drift every day: {dated}"
+# `lineterminator` because csv.writer defaults to CRLF, and the trailing carriage return reaches
+# every downstream comparison as part of the value.
+with open(output, "w", newline="") as handle:
+    writer = csv.writer(handle, lineterminator="\n")
+    writer.writerow(
+        [
+            "identifier",
+            "name",
+            "updates_volume",
+            "updates_high_low",
+            "updates_open_close",
+            "consolidated_tape_association",
+            "unlisted_trading_privileges",
+            "trade_data_dissemination",
+        ]
     )
+    for row in conditions:
+        rules = row["update_rules"]["consolidated"]
+        writer.writerow(
+            [
+                row["id"],
+                row["name"],
+                str(rules["updates_volume"]).lower(),
+                str(rules["updates_high_low"]).lower(),
+                str(rules["updates_open_close"]).lower(),
+                character(row, "CTA"),
+                character(row, "UTP"),
+                character(row, "FINRA_TDDS"),
+            ]
+        )
 
-with open(output, "w") as handle:
-    handle.write(rendered)
-
-print(f"Wrote {len(conditions)} sale conditions to {output}")
+print(f"Read {len(conditions)} sale conditions")
 PYTHON
 
+# duckdb rather than a Rust helper, because nothing in the binary should be able to write this: the
+# archive reads it, and a writer in the same process is a way for a run to quietly re-decide which
+# prints it was measuring.
+echo "Encoding the conditions"
+duckdb -c "COPY (SELECT CAST(identifier AS UINTEGER) AS identifier, name, \
+  CAST(updates_volume AS BOOLEAN) AS updates_volume, \
+  CAST(updates_high_low AS BOOLEAN) AS updates_high_low, \
+  CAST(updates_open_close AS BOOLEAN) AS updates_open_close, \
+  consolidated_tape_association, unlisted_trading_privileges, trade_data_dissemination \
+  FROM read_csv('${CONDITIONS_CSV}', header = true, all_varchar = true)) \
+  TO '${CONDITIONS_PARQUET}' (FORMAT parquet);"
+
+# The five rows the archive's own numbers depend on, checked here as well as at load time. A loader
+# refusing them takes the fold down tonight; this says so while someone is watching, and names the
+# row rather than leaving the operator to read a stack trace at 07:00Z.
+echo "Checking the rows the archive cannot be wrong about"
+ANCHORS_FAILED=false
+check_anchor() {
+  local identifier="$1" name="$2" volume="$3"
+  local found
+  found="$(duckdb -noheader -list -c "SELECT name || '|' || updates_volume FROM \
+    read_parquet('${CONDITIONS_PARQUET}') WHERE identifier = ${identifier};")"
+  if [[ -z "${found}" ]]; then
+    echo "    ${identifier}: MISSING, expected \"${name}\"" >&2
+    ANCHORS_FAILED=true
+  elif [[ "${found}" != "${name}|${volume}" ]]; then
+    echo "    ${identifier}: \"${found}\", expected \"${name}|${volume}\"" >&2
+    ANCHORS_FAILED=true
+  fi
+}
+# The house rule's two, which are ours, and the three auction prints the volume rule exists to
+# exclude -- 14.1% of a session's dollar volume, measured 2026-08-21.
+check_anchor 2 "Average Price Trade" true
+check_anchor 10 "Derivatively Priced" true
+check_anchor 15 "Market Center Official Close" false
+check_anchor 16 "Market Center Official Open" false
+check_anchor 38 "Corrected Consolidated Close (per listing market)" false
+if [[ "${ANCHORS_FAILED}" == true ]]; then
+  echo "Error: the provider has moved a row the archive's rules are written against." >&2
+  echo "  Publishing it would make every loader refuse the table. Update ANCHORS in" >&2
+  echo "  src/data/conditions.rs deliberately, deploy it, then re-run to publish." >&2
+  exit 1
+fi
+echo "    all five still say what the archive believes"
+
+BUCKET="${AWS_S3_ARCHIVE_BUCKET_NAME:-oscm-fund-archive}"
+PREFIX="data/reference/conditions"
+
+# Fail closed. A masked error here -- expired credentials, a denied listing -- would read as an empty
+# prefix, and the script would answer "nothing stored yet" and publish over whatever is actually
+# there. Every key is listed and the maximum taken in the shell rather than by JMESPath, because
+# `--query` with `--output text` is applied per page and a paginated listing would leave several keys
+# in one variable.
+ALL_KEYS="$(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${PREFIX}/" \
+  --query 'Contents[].Key' --output text)"
+# Only keys of the exact shape the loader reads. `conditions_as_of_dates` keeps a key only when it
+# round-trips to `as_of=<date>/data.parquet`, so a nested `as_of=.../backup/data.parquet` would make
+# this script answer "unchanged" while the loader kept folding under an older partition -- the two
+# disagreeing about whether anything is wrong.
+# `|| NEWEST_KEY=""` because an empty prefix makes `grep` match nothing, and `pipefail` turns that
+# into a fatal error on the one run that most needs to succeed -- the first publish. The fail-closed
+# property is untouched: the listing itself is a separate assignment and still aborts the script.
+NEWEST_KEY="$(printf '%s' "${ALL_KEYS}" | tr '\t' '\n' \
+  | grep -E "^${PREFIX}/as_of=[0-9]{4}-[0-9]{2}-[0-9]{2}/data\.parquet$" | sort | tail -1)" \
+  || NEWEST_KEY=""
+[[ -z "${NEWEST_KEY}" ]] && NEWEST_KEY="None"
+
+UNCHANGED=false
+if [[ "${NEWEST_KEY}" != "None" ]]; then
+  aws s3 cp "s3://${BUCKET}/${NEWEST_KEY}" "${WORK}/stored.parquet" --quiet
+  # Compared as a set of rows, not as bytes: parquet encoding is not reproducible, so a byte diff
+  # would report drift on every run and stop meaning anything.
+  # EXCEPT ALL, not EXCEPT: set semantics would call a stored object holding a duplicated identifier
+  # identical to a clean one, so this would refuse to republish while the loader refuses to read it
+  # as duplicated -- the two disagreeing about whether anything is wrong.
+  DIFFERENCES="$(duckdb -noheader -list -c "SELECT count(*) FROM ( \
+    (SELECT * FROM read_parquet('${CONDITIONS_PARQUET}') EXCEPT ALL SELECT * FROM read_parquet('${WORK}/stored.parquet')) \
+    UNION ALL \
+    (SELECT * FROM read_parquet('${WORK}/stored.parquet') EXCEPT ALL SELECT * FROM read_parquet('${CONDITIONS_PARQUET}')));")"
+  if [[ "${DIFFERENCES}" == "0" ]]; then
+    UNCHANGED=true
+  fi
+  echo "Stored ${NEWEST_KEY}: ${DIFFERENCES} differing row(s)"
+else
+  echo "No stored conditions yet; this run publishes the first"
+fi
+
 if [[ "${CHECK_ONLY}" == true ]]; then
-  # Ignoring FETCHED_ON, which moves with the clock and says nothing about the provider. It is the
-  # only dated line by construction — the generator refuses to emit a second one — so this compares
-  # the table itself rather than the day it was read.
-  undated() { grep -v '^pub const FETCHED_ON' "$1"; }
-  if diff <(undated "${OUTPUT}") <(undated "${TARGET}") >/dev/null; then
-    echo "Up to date: the committed table matches the provider"
+  if [[ "${UNCHANGED}" == true ]]; then
+    echo "Up to date: the published conditions match the provider"
     exit 0
   fi
-  echo "DRIFT: the provider's table no longer matches the committed one" >&2
-  diff <(undated "${OUTPUT}") <(undated "${TARGET}") >&2 || true
+  echo "DRIFT: the provider's conditions differ from the newest stored partition" >&2
   echo >&2
-  echo "Re-run without --check, review the diff, and commit it." >&2
+  echo "Re-run without --check to publish a new as_of." >&2
   exit 1
 fi
 
-echo "Formatting"
-cargo fmt -- "${OUTPUT}" 2>/dev/null || cargo fmt
-echo "Done. Review the diff and commit it."
+if [[ "${UNCHANGED}" == true ]]; then
+  echo "Conditions unchanged; nothing published."
+  exit 0
+fi
+
+AS_OF="$(date -u +%Y-%m-%d)"
+DESTINATION_KEY="${PREFIX}/as_of=${AS_OF}/data.parquet"
+echo "Publishing s3://${BUCKET}/${DESTINATION_KEY}"
+
+# `--if-none-match "*"` so a second change on one UTC day refuses rather than overwrites. The key is
+# date-only and `conditions_as_of` is the whole of a fold's rule provenance, so replacing it would
+# silently change what every earlier run's record refers to -- and unlike the classification
+# mapping, those runs cannot be re-read under the corrected table, because their fold is final.
+if ! aws s3api put-object --bucket "${BUCKET}" --key "${DESTINATION_KEY}" \
+  --body "${CONDITIONS_PARQUET}" --if-none-match "*" >/dev/null 2>"${WORK}/put_error"; then
+  if grep -q "PreconditionFailed\|At least one of the pre-conditions" "${WORK}/put_error"; then
+    echo "Error: as_of=${AS_OF} already holds a different table." >&2
+    echo "  Overwriting it would change what earlier runs' conditions_as_of refers to, and those" >&2
+    echo "  folds cannot be redone from the record." >&2
+    echo "  Wait for the next UTC day, or delete that partition deliberately if nothing read it." >&2
+  else
+    cat "${WORK}/put_error" >&2
+  fi
+  exit 1
+fi
+
+echo "Done."

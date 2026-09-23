@@ -3,6 +3,7 @@
 //! Eligibility is decided here, by [`crate::data::conditions`], because the fold cannot be undone.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -14,7 +15,9 @@ use crate::common::flatfiles::TradeSink;
 use crate::common::types::{
     BarInterval, IntradayCadence, SessionDate, Ticker, TradeExclusions, TradeSummary,
 };
-use crate::data::conditions::{carries_a_market_price_of, volume_eligibility_of, Eligibility};
+use crate::data::conditions::{
+    carries_a_market_price_of, volume_eligibility_of, ConditionsTable, Eligibility,
+};
 
 /// The upper quantile every summary reports beside its median.
 const UPPER_QUANTILE: f64 = 0.9;
@@ -149,6 +152,9 @@ pub struct SessionFold {
     /// The last stamp accepted, which is what an inverted print is judged against.
     previous_timestamp: Option<DateTime<Utc>>,
     out_of_order: usize,
+    /// The published eligibility rules this fold was run under. Shared rather than copied because a
+    /// session rotates through thousands of these folds and every one asks the same table.
+    conditions: Arc<ConditionsTable>,
 }
 
 impl SessionFold {
@@ -158,6 +164,7 @@ impl SessionFold {
         session: SessionDate,
         open: DateTime<Utc>,
         close: DateTime<Utc>,
+        conditions: Arc<ConditionsTable>,
     ) -> Option<Self> {
         let span = (close - open).num_milliseconds();
         if span <= 0 {
@@ -175,6 +182,7 @@ impl SessionFold {
             previous_direction: 1.0,
             previous_timestamp: None,
             out_of_order: 0,
+            conditions,
         })
     }
 
@@ -207,7 +215,7 @@ impl SessionFold {
             bucket.exclusions.record_correction(tick.notional());
             return;
         }
-        match volume_eligibility_of(tick.conditions()) {
+        match volume_eligibility_of(&self.conditions, tick.conditions()) {
             Eligibility::Ineligible => {
                 bucket.exclusions.record_volume_ineligible(tick.notional());
                 return;
@@ -217,7 +225,7 @@ impl SessionFold {
             Eligibility::Ambiguous => bucket.exclusions.record_unresolved_condition(),
             Eligibility::Eligible => {}
         }
-        if !carries_a_market_price_of(tick.conditions()) {
+        if !carries_a_market_price_of(&self.conditions, tick.conditions()) {
             bucket.exclusions.record_non_market_price(tick.notional());
         }
         bucket.add(&tick, direction);
@@ -352,6 +360,7 @@ pub struct MarketFold {
     resumed: BTreeSet<Ticker>,
     universe: BTreeSet<Ticker>,
     folded: usize,
+    conditions: Arc<ConditionsTable>,
 }
 
 impl MarketFold {
@@ -365,6 +374,7 @@ impl MarketFold {
         open: DateTime<Utc>,
         close: DateTime<Utc>,
         universe: BTreeSet<Ticker>,
+        conditions: Arc<ConditionsTable>,
     ) -> Option<Self> {
         if (close - open).num_milliseconds() <= 0 {
             return None;
@@ -378,6 +388,7 @@ impl MarketFold {
             resumed: BTreeSet::new(),
             universe,
             folded: 0,
+            conditions,
         })
     }
 
@@ -411,7 +422,13 @@ impl MarketFold {
                 self.resumed.insert(ticker.clone());
                 Some(fold)
             }
-            None => SessionFold::new(ticker.clone(), self.session, self.open, self.close),
+            None => SessionFold::new(
+                ticker.clone(),
+                self.session,
+                self.open,
+                self.close,
+                Arc::clone(&self.conditions),
+            ),
         };
         self.current = fold.map(|fold| (ticker, fold));
     }
@@ -471,8 +488,9 @@ pub async fn fold_session(
     session: SessionDate,
     open: DateTime<Utc>,
     close: DateTime<Utc>,
+    conditions: Arc<ConditionsTable>,
 ) -> Result<(Vec<TradeSummary>, TradeFetch), ClientError> {
-    let Some(mut fold) = SessionFold::new(ticker.clone(), session, open, close) else {
+    let Some(mut fold) = SessionFold::new(ticker.clone(), session, open, close, conditions) else {
         return Err(ClientError::Parse(format!(
             "{session} spans no time between {open} and {close}"
         )));
@@ -605,6 +623,11 @@ pub fn summaries_to_dataframe(summaries: &[TradeSummary]) -> Result<DataFrame, P
 mod tests {
     use super::*;
 
+    /// The published rules these folds run under, from the fixture beside the rules themselves.
+    fn conditions() -> Arc<ConditionsTable> {
+        Arc::new(crate::data::conditions::fixture::table())
+    }
+
     use crate::common::types::TradeConditions;
     use chrono::NaiveDate;
 
@@ -654,7 +677,7 @@ mod tests {
     }
 
     fn fold_of(ticks: Vec<TradeTick>) -> Vec<TradeSummary> {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0))
+        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0), conditions())
             .expect("a positive session");
         for tick in ticks {
             fold.push(tick);
@@ -807,7 +830,7 @@ mod tests {
     /// A print outside regular hours is not folded at all.
     #[test]
     fn test_a_print_outside_the_session_is_not_folded() {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0))
+        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(40, 0), conditions())
             .expect("a positive session");
         fold.push(trade(29, 100.0, 100.0));
         fold.push(trade(45, 100.0, 100.0));
@@ -915,7 +938,7 @@ mod tests {
     /// this module misses, because a ten-minute window divides evenly.
     #[test]
     fn test_a_window_that_does_not_divide_evenly_keeps_its_short_last_bar() {
-        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(37, 0))
+        let mut fold = SessionFold::new(ticker(), session(), at(30, 0), at(37, 0), conditions())
             .expect("a positive session");
         fold.push(trade(30, 100.0, 100.0));
         fold.push(trade(36, 100.0, 200.0));
@@ -960,8 +983,8 @@ mod tests {
             .iter()
             .map(|name| Ticker::new(name).expect("a valid ticker"))
             .collect();
-        let mut fold =
-            MarketFold::new(session(), at(30, 0), at(40, 0), universe).expect("a positive session");
+        let mut fold = MarketFold::new(session(), at(30, 0), at(40, 0), universe, conditions())
+            .expect("a positive session");
         let named = |name: &str| Ticker::new(name).expect("a valid ticker");
 
         fold.push(named("AAPL"), trade(30, 100.0, 100.0));
@@ -990,8 +1013,8 @@ mod tests {
     #[test]
     fn test_a_name_outside_the_universe_is_not_folded() {
         let universe: BTreeSet<Ticker> = std::iter::once(ticker()).collect();
-        let mut fold =
-            MarketFold::new(session(), at(30, 0), at(40, 0), universe).expect("a positive session");
+        let mut fold = MarketFold::new(session(), at(30, 0), at(40, 0), universe, conditions())
+            .expect("a positive session");
         fold.push(
             Ticker::new("CBOE").expect("a valid ticker"),
             trade(30, 200.0, 50.0),
@@ -1007,14 +1030,25 @@ mod tests {
     #[test]
     fn test_a_market_fold_refuses_a_session_with_no_span() {
         let universe: BTreeSet<Ticker> = std::iter::once(ticker()).collect();
-        assert!(MarketFold::new(session(), at(40, 0), at(40, 0), universe.clone()).is_none());
-        assert!(MarketFold::new(session(), at(40, 0), at(30, 0), universe).is_none());
+        assert!(MarketFold::new(
+            session(),
+            at(40, 0),
+            at(40, 0),
+            universe.clone(),
+            conditions()
+        )
+        .is_none());
+        assert!(MarketFold::new(session(), at(40, 0), at(30, 0), universe, conditions()).is_none());
     }
 
     /// A session with no span is refused rather than folded into zero buckets.
     #[test]
     fn test_a_session_with_no_span_is_refused() {
-        assert!(SessionFold::new(ticker(), session(), at(40, 0), at(40, 0)).is_none());
-        assert!(SessionFold::new(ticker(), session(), at(40, 0), at(30, 0)).is_none());
+        assert!(
+            SessionFold::new(ticker(), session(), at(40, 0), at(40, 0), conditions()).is_none()
+        );
+        assert!(
+            SessionFold::new(ticker(), session(), at(40, 0), at(30, 0), conditions()).is_none()
+        );
     }
 }
