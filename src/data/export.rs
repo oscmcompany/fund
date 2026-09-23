@@ -354,12 +354,6 @@ fn to_polars_error(error: sqlx::Error) -> PolarsError {
     PolarsError::ComputeError(error.to_string().into())
 }
 
-/// The producer the journal and log exports write as.
-///
-/// Names the host, not this module. `export_database` does not use it: the datasets are keyed by
-/// [`Dataset::prefix`] alone and carry no producer.
-const PRODUCER: Producer = Producer::Trader;
-
 /// S3 prefix the sealed sessions are written under.
 pub const JOURNAL_PREFIX: &str = "exports/journal";
 
@@ -404,6 +398,7 @@ pub async fn export_journals(
     s3_client: &S3Client,
     bucket: &str,
     today: SessionDate,
+    producer: Producer,
 ) -> JournalExportSummary {
     let mut summary = JournalExportSummary::default();
 
@@ -452,7 +447,7 @@ pub async fn export_journals(
                     continue;
                 }
                 let key = date_partitioned_key(
-                    &producer_prefix(JOURNAL_PREFIX, PRODUCER),
+                    &producer_prefix(JOURNAL_PREFIX, producer),
                     session_date.date(),
                 );
                 match write_frame(s3_client, bucket, &key, &mut frame).await {
@@ -504,11 +499,11 @@ pub const LOG_RETENTION_DAYS: i64 = 7;
 /// Where one service's log for one date is written.
 ///
 /// The only construction of this key, so a test of it is a test of what the exporter writes.
-fn log_key(service: &str, date: NaiveDate) -> String {
+fn log_key(producer: Producer, service: &str, date: NaiveDate) -> String {
     date_partitioned_key(
         &format!(
             "{}/service={service}",
-            producer_prefix(LOG_PREFIX, PRODUCER)
+            producer_prefix(LOG_PREFIX, producer)
         ),
         date,
     )
@@ -548,6 +543,7 @@ pub async fn export_logs(
     s3_client: &S3Client,
     bucket: &str,
     today: SessionDate,
+    producer: Producer,
 ) -> LogExportSummary {
     let mut summary = LogExportSummary::default();
 
@@ -583,7 +579,7 @@ pub async fn export_logs(
             continue;
         }
 
-        let key = log_key(&service, date);
+        let key = log_key(producer, &service, date);
         match write_frame(s3_client, bucket, &key, &mut frame).await {
             Ok(()) => {
                 summary
@@ -1038,6 +1034,7 @@ mod tests {
             &s3_client,
             "unused-bucket",
             session(2026, 8, 17),
+            Producer::Trader,
         )
         .await;
 
@@ -1496,11 +1493,131 @@ mod tests {
         assert_ne!(trader, archiver);
     }
 
-    /// Pins the producer the journal and log exports write as. The journal's key test spells
-    /// `Producer::Trader` itself, so it cannot catch a change here.
+    /// The archiver's two log shapes, and the one that was silently dropped.
+    ///
+    /// The systemd unit writes `archiver.log`, which carries no date and so is not collected at all
+    /// — an export over that directory reported a clean run and left behind exactly the lines that
+    /// explain a bad night. Dating the file is what makes it visible, and this pins that so the
+    /// naming cannot quietly regress.
     #[test]
-    fn test_this_module_exports_as_the_trader() {
-        assert_eq!(PRODUCER.as_str(), "trader");
+    fn test_an_undated_log_is_not_collected_and_a_dated_one_is() {
+        let directory = temporary_directory("logs-archiver");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        for name in [
+            "archiver.log",
+            "2026-09-22.archiver.log",
+            "2026-09-22.seed.log",
+        ] {
+            std::fs::write(directory.join(name), "{}\n").expect("the file must be writable");
+        }
+
+        let mut collected: Vec<String> = rolled_log_files(&directory)
+            .expect("the directory must read")
+            .into_iter()
+            .map(|(date, service, _)| format!("{date}.{service}"))
+            .collect();
+        collected.sort();
+
+        assert_eq!(
+            collected,
+            vec!["2026-09-22.archiver", "2026-09-22.seed"],
+            "the undated unit log is invisible to the exporter; both dated files must be collected"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The shape `run-archiver`'s `log()` emits survives the read, and the plain-text shape it
+    /// replaced does not.
+    ///
+    /// The bare line is rejected for not being a JSON object at all, before the timestamp and level
+    /// are consulted; those two are covered by
+    /// `test_a_log_line_without_a_timestamp_or_level_is_counted_unparsable`.
+    #[test]
+    fn test_the_shell_json_line_survives_the_read_and_the_bare_line_does_not() {
+        let directory = temporary_directory("logs-shell-shape");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("2026-09-22.archiver.log");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-09-22T16:46:38Z","level":"INFO","target":"run-archiver","#,
+                r#""fields":{"message":"Syncing"}}"#,
+                "\n",
+                "2026-09-22T16:46:38Z Syncing\n",
+            ),
+        )
+        .expect("the file must be writable");
+
+        let (frame, unparsable) = read_log_frame(&path).expect("the file must read");
+
+        assert_eq!(frame.height(), 1, "the JSON line survives");
+        assert_eq!(unparsable, 1, "the bare line does not");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The archiver's own `log()`, run for real and read by the exporter that must consume it.
+    ///
+    /// The two tests above pin this reader's contract using handwritten lines, which leaves them
+    /// green if `tools/run-archiver` reverts to plain text. This one runs the shell function out of
+    /// the script itself, so the seam is what is under test rather than a restatement of it.
+    #[test]
+    fn test_the_real_shell_log_function_produces_lines_this_reader_keeps() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/run-archiver");
+        let directory = temporary_directory("logs-shell-seam");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("2026-09-22.archiver.log");
+
+        // `json_line` and `log` lifted from the script and run unchanged. A child's plain output goes
+        // through the same wrapper, which is the case that decides whether the file can age out.
+        let program = format!(
+            r#"set -euo pipefail
+STATUS_FILE="$(mktemp)"
+eval "$(sed -n '/^json_line() {{/,/^}}/p;/^run_wrapped() {{/,/^}}/p' {script})"
+log() {{ json_line INFO run-archiver "$1"; }}
+log 'Syncing'
+log 'a "quoted" value and a back\slash'
+run_wrapped child bash -c 'echo "   Compiling polars v0.51.0"'
+"#,
+            script = script.display()
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&program)
+            .output()
+            .expect("bash must run");
+        assert!(
+            output.status.success(),
+            "the script fragment must run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(&path, &output.stdout).expect("the file must be writable");
+
+        let (frame, unparsable) = read_log_frame(&path).expect("the file must read");
+
+        // Three lines in, three rows out. A single unparsable line would keep the file from ever
+        // ageing out, so it would be re-read and re-uploaded every night.
+        assert_eq!(frame.height(), 3, "every emitted line must be readable");
+        assert_eq!(
+            unparsable, 0,
+            "an unparsable line makes the file undeletable and permanent"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Two hosts now share these exporters, so the producer is a parameter rather than a constant.
+    /// The property that matters is that they cannot land on each other's key.
+    #[test]
+    fn test_two_producers_never_share_a_log_key() {
+        let date = session(2026, 8, 11).date();
+
+        assert_eq!(
+            log_key(Producer::Archiver, "seed", date),
+            "exports/logs/producer=archiver/service=seed/year=2026/month=08/day=11/data.parquet"
+        );
+        assert_ne!(
+            log_key(Producer::Trader, "seed", date),
+            log_key(Producer::Archiver, "seed", date)
+        );
     }
 
     /// `producer` above `service`, so "every archiver log" is one prefix rather than a question
@@ -1510,7 +1627,7 @@ mod tests {
         let date = session(2026, 8, 11).date();
 
         assert_eq!(
-            log_key("seed-equity-details-postgres", date),
+            log_key(Producer::Trader, "seed-equity-details-postgres", date),
             "exports/logs/producer=trader/service=seed-equity-details-postgres/year=2026/month=08/day=11/data.parquet"
         );
     }
@@ -1521,6 +1638,9 @@ mod tests {
     fn test_two_services_on_one_producer_write_different_log_keys() {
         let date = session(2026, 8, 11).date();
 
-        assert_ne!(log_key("seed-archive-nightly", date), log_key("api", date));
+        assert_ne!(
+            log_key(Producer::Trader, "seed-archive-nightly", date),
+            log_key(Producer::Trader, "api", date)
+        );
     }
 }

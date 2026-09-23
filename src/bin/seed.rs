@@ -11,8 +11,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, DataFeed, MarketDataClient, TradingClient};
+use fund::common::aws::Producer;
 use fund::common::database::connect_pool;
 use fund::common::flatfiles;
+use fund::common::journal::{ArchiveFolded, Journal, Observation};
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
 use fund::common::types::{
@@ -22,6 +24,7 @@ use fund::common::types::{
 use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
+use fund::data::export;
 use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport, ReferenceOutcome};
 use fund::data::{attribution, bars, details, quotes, trades};
 
@@ -110,6 +113,8 @@ enum Command {
     /// Whatever the recent sessions are still missing, cheapest family first, under a wall clock
     /// budget. What the nightly schedule runs.
     ArchiveNightly(NightlyArguments),
+    /// Ship this box's journal and logs to the records bucket, before it powers off.
+    ExportRecords,
 }
 
 /// Which vendor a nightly run takes its quotes and prints from.
@@ -260,6 +265,7 @@ impl Command {
             Command::ArchiveProvenance { .. } => "seed-archive-provenance",
             Command::ArchiveCadence { .. } => "seed-archive-cadence",
             Command::ArchiveNightly(_) => "seed-archive-nightly",
+            Command::ExportRecords => "seed-export-records",
         }
     }
 }
@@ -1149,6 +1155,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         Command::ArchiveProvenance { action } => seed_provenance(action).await,
         Command::ArchiveNightly(arguments) => archive_nightly(arguments, today).await,
         Command::ArchiveCadence { action } => check_cadence(action).await,
+        Command::ExportRecords => export_records(today).await,
     }
 }
 
@@ -1711,7 +1718,124 @@ async fn archive_nightly(
     info!(%reference, "Reference sweep finished");
     report.record_reference(reference);
 
+    // Written before the caller decides the exit code, because the box stops itself once this
+    // returns: a record produced after the run is a record produced on a machine that is gone.
+    record_the_fold(&report).await;
+
     Ok(Outcome::Nightly(report))
+}
+
+/// Writes the night into the archiver's journal, if it has one.
+///
+/// A missing journal is logged and stepped over rather than failing the run. The fold is the work
+/// and the record is the account of it; losing the account is bad, and throwing away a completed
+/// fold because the account could not be filed is worse.
+async fn record_the_fold(report: &NightlyReport) {
+    let journal = match Journal::from_env() {
+        Ok(journal) => journal,
+        Err(error) => {
+            warn!(%error, "No journal on this box; the night is not recorded");
+            return;
+        }
+    };
+    let (window_start, window_end) = report.window();
+    let observation = Observation::ArchiveFolded(ArchiveFolded {
+        window_start,
+        window_end,
+        sessions_planned: report.sessions_planned(),
+        partitions_written: report.written(),
+        legs: report.legs().to_vec(),
+        reference: report.reference().cloned(),
+    });
+    journal
+        .record(uuid::Uuid::new_v4(), Utc::now(), observation)
+        .await;
+}
+
+/// Every record this box failed to ship, named.
+///
+/// Pure, and separate from the export it summarises, because the decision it encodes is the one
+/// worth pinning: a denied upload leaves the record on a machine that is about to power off, so it
+/// must fail the command rather than appear as a count in a line that says "Records exported".
+fn unshipped_records(
+    journal: Option<&export::JournalExportSummary>,
+    logs: &export::LogExportSummary,
+) -> Vec<String> {
+    let mut refusals: Vec<String> = Vec::new();
+    if let Some(sessions) = journal {
+        for (session_date, error) in &sessions.failed {
+            refusals.push(format!("journal {session_date}: {error}"));
+        }
+    }
+    if let Some(error) = &logs.directory_error {
+        refusals.push(format!("log directory: {error}"));
+    }
+    for (date, service, error) in &logs.failed {
+        refusals.push(format!("log {date} {service}: {error}"));
+    }
+    refusals
+}
+
+/// Ships this box's journal and logs to the records bucket.
+///
+/// Its own subcommand rather than a step inside the nightly, because a night that failed is the one
+/// whose records are most worth having: chaining the export to a successful fold would lose them
+/// exactly when they matter.
+async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
+    let bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME")
+        .map_err(|_| SeedError::Usage("AWS_S3_RECORDS_BUCKET_NAME must be set".to_string()))?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    // Both exports are attempted before either failure is raised: the logs are most worth having on
+    // the night the journal could not be written, and returning early would drop them.
+    let mut journal_summary: Option<export::JournalExportSummary> = None;
+
+    match Journal::from_env() {
+        Ok(journal) => {
+            let sessions =
+                export::export_journals(&journal, &s3_client, &bucket, today, Producer::Archiver)
+                    .await;
+            info!(
+                sessions = sessions.exported.len(),
+                records = sessions.total_records(),
+                failed = sessions.failed.len(),
+                "Journal exported"
+            );
+            journal_summary = Some(sessions);
+        }
+        // The one deliberate exception: a box with no journal has nothing to ship, which is not the
+        // same as failing to ship it.
+        Err(error) => warn!(%error, "No journal on this box; nothing to export"),
+    }
+
+    let logs = export::export_logs(
+        &fund::common::log::log_directory(),
+        &s3_client,
+        &bucket,
+        today,
+        Producer::Archiver,
+    )
+    .await;
+    info!(
+        files = logs.exported.len(),
+        lines = logs.total_lines(),
+        failed = logs.failed.len(),
+        unparsable = logs.unparsable_lines,
+        "Logs exported"
+    );
+    let refusals = unshipped_records(journal_summary.as_ref(), &logs);
+    if !refusals.is_empty() {
+        return Err(SeedError::Failed(
+            format!(
+                "{} of this box's records did not ship: {}",
+                refusals.len(),
+                refusals.join("; ")
+            )
+            .into(),
+        ));
+    }
+
+    Ok(Outcome::Complete)
 }
 
 /// Fills every quarterly reference observation the archive is missing.
@@ -3790,5 +3914,50 @@ mod tests {
         let window = Window::new(session("2026-01-05"), session("2026-01-05")).expect("a window");
         assert_eq!(window.chunks().len(), 1);
         assert_eq!(window.dates(), vec![session("2026-01-05")]);
+    }
+    /// A denied upload must fail the command, not appear as a count beside "Records exported".
+    ///
+    /// The box powers off when this returns, so a record that did not ship has nowhere left to be.
+    #[test]
+    fn test_a_failed_upload_makes_the_export_a_refusal() {
+        let mut logs = export::LogExportSummary::default();
+        logs.exported
+            .push((date(2026, 9, 22), "seed".to_string(), 10));
+        logs.failed.push((
+            date(2026, 9, 22),
+            "archiver".to_string(),
+            "AccessDenied".to_string(),
+        ));
+
+        let refusals = unshipped_records(None, &logs);
+
+        assert_eq!(refusals.len(), 1, "the failed upload is a refusal");
+        assert!(refusals[0].contains("archiver"), "{:?}", refusals);
+    }
+
+    /// A clean export is not a refusal, so the check can distinguish the two.
+    #[test]
+    fn test_a_clean_export_raises_nothing() {
+        let mut logs = export::LogExportSummary::default();
+        logs.exported
+            .push((date(2026, 9, 22), "seed".to_string(), 10));
+
+        assert!(unshipped_records(None, &logs).is_empty());
+    }
+
+    /// An unlistable directory and an empty one are different answers, and only one is a refusal.
+    #[test]
+    fn test_an_unlistable_log_directory_is_a_refusal() {
+        let mut logs = export::LogExportSummary::default();
+        logs.directory_error = Some("permission denied".to_string());
+
+        let refusals = unshipped_records(None, &logs);
+
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals[0].contains("permission denied"), "{:?}", refusals);
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(year, month, day).expect("a real date")
     }
 }

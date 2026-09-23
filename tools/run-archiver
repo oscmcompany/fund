@@ -14,8 +14,47 @@ REGION="${AWS_REGION:-us-east-1}"
 PROFILE_FILE=/etc/fund-profile
 INHIBIT_FILE=/etc/fund-archiver.inhibit
 
+# Emitted as JSON because these lines are exported, and the reader keeps only objects carrying a
+# timestamp and a level -- a bare "TIMESTAMP message" is counted unparsable and dropped, which would
+# lose exactly the lines that explain a bad night.
+json_line() {
+  local level="$1" target="$2" message="$3"
+  # Backslash first, then quote: escaping the quote first would re-escape the backslash it inserts.
+  # Control characters are stripped rather than encoded -- a raw byte makes the whole line invalid
+  # JSON, and the exporter drops an invalid line silently.
+  message="${message//\\/\\\\}"
+  message="${message//\"/\\\"}"
+  message="$(printf '%s' "$message" | tr -d '\000-\037')"
+  printf '{"timestamp":"%s","level":"%s","target":"%s","fields":{"message":"%s"}}\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$level" "$target" "$message"
+}
+
 log() {
-  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+  json_line INFO run-archiver "$1"
+}
+
+# Every line a child writes, wrapped so the dated log stays JSON-only.
+#
+# `export_logs` deletes a file only when it parsed every line, so one plain-text line from cargo or
+# from seed's report would keep the file undeletable -- re-read and re-uploaded every night, forever.
+run_wrapped() {
+  local target="$1"; shift
+  local status=0
+  # The pipeline's first element decides the status; `pipefail` alone would let the wrapper's zero
+  # exit mask a failed child.
+  {
+    "$@" 2>&1 || echo "__EXIT__$?"
+  } | while IFS= read -r line; do
+    case "$line" in
+      __EXIT__*) status="${line#__EXIT__}"; printf '%s' "$status" > "$STATUS_FILE" ;;
+      *) json_line INFO "$target" "$line" ;;
+    esac
+  done
+  if [[ -s "$STATUS_FILE" ]]; then
+    status="$(cat "$STATUS_FILE")"
+    : > "$STATUS_FILE"
+  fi
+  return "$status"
 }
 
 instance_id() {
@@ -41,6 +80,15 @@ stop_self() {
 
 # An operator debugging the box starts it by hand, and a boot service that folded and then stopped
 # underneath them would make that impossible.
+# Redirected into a dated, service-named file because `split_log_file_name` collects only
+# `<date>.<service>.log`; the unit's own `archiver.log` carries no date and is invisible to the
+# export. The unit still owns that file, which now holds only what systemd writes around this run.
+LOG_DIRECTORY=/var/log/fund
+mkdir -p "$LOG_DIRECTORY"
+STATUS_FILE="$(mktemp)"
+trap 'rm -f "$STATUS_FILE"' EXIT
+exec >> "${LOG_DIRECTORY}/$(date -u +%F).archiver.log" 2>&1
+
 if [[ -e "$INHIBIT_FILE" ]]; then
   log "$INHIBIT_FILE present; not folding and not stopping"
   exit 0
@@ -55,14 +103,42 @@ fi
 FUND_PROFILE="$(cat "$PROFILE_FILE")"
 export FUND_PROFILE
 
+# The archiver's own journal. `seed` writes the night here and `export-records` ships it, which is
+# the only way anything this box learns survives the power-off at the end of this script.
+FUND_JOURNAL_DIRECTORY=/var/journal/fund
+export FUND_JOURNAL_DIRECTORY
+mkdir -p "$FUND_JOURNAL_DIRECTORY"
+
 cd "$REPO_ROOT"
 
 log "Syncing"
-if ! tools/sync-archiver; then
+SYNCED=true
+if ! run_wrapped sync-archiver tools/sync-archiver; then
   log "ERROR: sync failed; not folding tonight"
-  exit 1
+  SYNCED=false
 fi
 
-log "Folding as $FUND_PROFILE"
-tools/run-backfill archive-nightly "$@"
-log "Fold complete"
+# The fold's exit status is kept, but the export runs either way: a night that failed is the one
+# whose records are most worth having, and `set -e` would otherwise stop before shipping them.
+FOLD_STATUS=0
+if [[ "$SYNCED" == true ]]; then
+  log "Folding as $FUND_PROFILE"
+  run_wrapped seed tools/run-backfill archive-nightly "$@" || FOLD_STATUS=$?
+  log "Fold finished with status ${FOLD_STATUS}"
+else
+  # The fold is skipped and the run still reaches the export below, because the night that failed to
+  # sync is the one whose diagnostics are worth shipping.
+  FOLD_STATUS=1
+  log "Skipping the fold; the checkout did not sync"
+fi
+
+# Before the trap stops the box, which is the whole point: an export that raced the shutdown would
+# collect nothing and leave the night on a machine that is off.
+log "Exporting records"
+if run_wrapped seed-export tools/run-backfill export-records; then
+  log "Records exported"
+else
+  log "ERROR: records failed to export; they remain on this box only"
+fi
+
+exit "$FOLD_STATUS"
