@@ -127,6 +127,33 @@ drift() {
   DRIFT=$((DRIFT + 1))
 }
 
+# An unreachable API reads as InProgress rather than as a status, so one failed call does not decide
+# the wait below.
+command_status() {
+  aws ssm get-command-invocation --region "$REGION" --command-id "$1" --instance-id "$2" \
+    --query Status --output text 2>/dev/null || echo InProgress
+}
+
+# The terminal status of an SSM command, polled rather than left to `aws ssm wait command-executed`,
+# whose window is 100 seconds -- shorter than a git fetch on a cold box, and it leaves InProgress
+# behind, which reads as a failure. `Delayed` keeps polling because SSM retries it: it means the
+# target was unreachable, which is exactly what a box that has just booted looks like.
+wait_for_the_command() {
+  local command_id="$1" instance_id="$2" attempts="${3:-60}" pause="${4:-10}"
+  local status
+  for _ in $(seq 1 "$attempts"); do
+    status="$(command_status "$command_id" "$instance_id")"
+    case "$status" in
+      Pending | InProgress | Delayed) ;;
+      *) printf '%s' "$status"; return ;;
+    esac
+    sleep "$pause"
+  done
+  # Read once more: the budget expires during a pause, so the last polled value is a sample from
+  # before it and a command that finished inside it would be reported by its stale status.
+  command_status "$command_id" "$instance_id"
+}
+
 if [[ "$APPLY" != true ]]; then
   echo "DRY RUN -- pass --apply to make changes"
 fi
@@ -355,8 +382,8 @@ curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awsc
 unzip -q /tmp/awscli.zip -d /tmp
 /tmp/aws/install --update
 printf '%s' "${PROFILE}" > /etc/fund-profile
-mkdir -p /var/log/fund /var/journal/fund
-chown ubuntu:ubuntu /var/log/fund /var/journal/fund
+mkdir -p /var/log/fund /var/journal/fund /var/lib/fund
+chown ubuntu:ubuntu /var/log/fund /var/journal/fund /var/lib/fund
 sudo -u ubuntu -H bash -c '
   set -euxo pipefail
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -413,86 +440,6 @@ CLOUDINIT
   fi
 fi
 
-# --------------------------------------------------------------------------- #
-# Boot service
-#
-# cloud-init installs these on a new instance. An existing one predates them, or predates a change
-# to them, and the schedule would otherwise start a box with nothing to run and nothing to stop it.
-# --------------------------------------------------------------------------- #
-
-step "Boot service on ${INSTANCE_ID}"
-
-if [[ "$CREATED_INSTANCE" == true ]]; then
-  unchanged "cloud-init installs the profile and unit on a new instance"
-elif [[ "$APPLY" != true ]]; then
-  changed "reconcile /etc/fund-profile and fund-archiver.service over SSM"
-else
-  ORIGINAL_STATE="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
-    --query 'Reservations[0].Instances[0].State.Name' --output text)"
-  if [[ "$ORIGINAL_STATE" != "running" ]]; then
-    echo "    starting $INSTANCE_ID to reach it over SSM (it was $ORIGINAL_STATE)"
-    # A maintenance start is indistinguishable from a scheduled one to the box, so the boot service
-    # may already be folding; the first commands below stop it rather than race a self-stop.
-    aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
-    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
-  fi
-
-  echo "    waiting for the SSM agent"
-  SSM_READY=false
-  for _ in $(seq 1 30); do
-    if [[ "$(aws ssm describe-instance-information --region "$REGION" \
-      --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-      --query 'length(InstanceInformationList)' --output text 2>/dev/null)" == "1" ]]; then
-      SSM_READY=true
-      break
-    fi
-    sleep 10
-  done
-  if [[ "$SSM_READY" != true ]]; then
-    echo "Error: $INSTANCE_ID never registered with SSM; cannot install the boot service." >&2
-    exit 1
-  fi
-
-  RECONCILE_COMMANDS="$(mktemp)"
-  trap 'rm -f "$RECONCILE_COMMANDS"' EXIT
-  cat > "$RECONCILE_COMMANDS" <<JSON
-{"commands":[
-"touch /etc/fund-archiver.inhibit",
-"systemctl stop fund-archiver.service 2>/dev/null || true",
-"printf '%s' '${PROFILE}' > /etc/fund-profile",
-"mkdir -p /var/log/fund /var/journal/fund && chown ubuntu:ubuntu /var/log/fund /var/journal/fund",
-"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
-"install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
-"systemctl daemon-reload",
-"systemctl enable fund-archiver.service",
-"systemctl is-enabled fund-archiver.service",
-"rm -f /etc/fund-archiver.inhibit"
-]}
-JSON
-
-  RECONCILE_ID="$(aws ssm send-command --region "$REGION" --instance-ids "$INSTANCE_ID" \
-    --document-name AWS-RunShellScript --parameters "file://$RECONCILE_COMMANDS" \
-    --query 'Command.CommandId' --output text)"
-  aws ssm wait command-executed --region "$REGION" \
-    --command-id "$RECONCILE_ID" --instance-id "$INSTANCE_ID" 2>/dev/null || true
-  RECONCILE_STATUS="$(aws ssm get-command-invocation --region "$REGION" \
-    --command-id "$RECONCILE_ID" --instance-id "$INSTANCE_ID" --query Status --output text)"
-  rm -f "$RECONCILE_COMMANDS"
-
-  if [[ "$RECONCILE_STATUS" != "Success" ]]; then
-    echo "Error: installing the boot service failed ($RECONCILE_STATUS)." >&2
-    aws ssm get-command-invocation --region "$REGION" --command-id "$RECONCILE_ID" \
-      --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text >&2
-    exit 1
-  fi
-  changed "installed the profile and enabled fund-archiver.service"
-
-  if [[ "$ORIGINAL_STATE" != "running" ]]; then
-    echo "    returning $INSTANCE_ID to stopped"
-    aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
-  fi
-fi
-
 if [[ "$DRIFT" -gt 0 ]]; then
   echo "" >&2
   echo "Error: $DRIFT drifted field(s) above. Fix or replace the instance; this script will not" >&2
@@ -513,8 +460,9 @@ if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; 
   exit 1
 fi
 
-# `seed` resolves only AWS_S3_ARCHIVE_BUCKET_NAME and writes every key under data/**. The records
-# bucket belongs to the application and the trainer, and the worker has no reason to reach it.
+# `seed` writes every archive key under data/**, and since #1165 it also exports its own records to
+# the shared bucket the trader writes -- hence two prefix-scoped statements rather than one on
+# `exports/*`, which would let this box overwrite the trader's journal.
 ROLE_POLICY="$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -655,6 +603,110 @@ The box stops itself when the run ends. Managed by tools/provision-archiver." \
     echo "    scheduler cannot assume $SCHEDULER_ROLE yet; retry $attempt of 10"
     sleep 10
   done
+fi
+
+# --------------------------------------------------------------------------- #
+# Boot service
+#
+# cloud-init installs these on a new instance. An existing one predates them, or predates a change
+# to them, and the schedule would otherwise start a box with nothing to run and nothing to stop it.
+#
+# Last, because it is the only step that needs the box *running* and therefore the only one that can
+# fail for reasons outside this account. Run earlier, its failure left the role, alarm and schedule
+# unwritten -- a half-configured account is worse than a box whose unit is one run behind.
+#
+# A run already in flight is ended with SIGKILL rather than `systemctl stop`, because `run-archiver`
+# arms an EXIT trap that powers the instance off: SIGTERM would run it and shut the box down
+# underneath this very command. SIGKILL runs no trap. The one-shot inhibit is written first, for a
+# run that has not reached its own check yet, and `run-archiver` consumes it on the next boot -- so a
+# reconcile that dies partway costs one fold rather than leaving a box that neither folds nor stops.
+# --------------------------------------------------------------------------- #
+
+step "Boot service on ${INSTANCE_ID}"
+
+if [[ "$CREATED_INSTANCE" == true ]]; then
+  unchanged "cloud-init installs the profile and unit on a new instance"
+elif [[ "$APPLY" != true ]]; then
+  changed "reconcile /etc/fund-profile and fund-archiver.service over SSM"
+else
+  ORIGINAL_STATE="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text)"
+  if [[ "$ORIGINAL_STATE" != "running" ]]; then
+    echo "    starting $INSTANCE_ID to reach it over SSM (it was $ORIGINAL_STATE)"
+    # A maintenance start is indistinguishable from a scheduled one to the box, so the boot service
+    # may already be folding by the time SSM can be reached; the first commands below end that run.
+    aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+  fi
+
+  echo "    waiting for the SSM agent"
+  SSM_READY=false
+  for _ in $(seq 1 30); do
+    if [[ "$(aws ssm describe-instance-information --region "$REGION" \
+      --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+      --query 'length(InstanceInformationList)' --output text 2>/dev/null)" == "1" ]]; then
+      SSM_READY=true
+      break
+    fi
+    sleep 10
+  done
+  if [[ "$SSM_READY" != true ]]; then
+    echo "Error: $INSTANCE_ID never registered with SSM; cannot install the boot service." >&2
+    exit 1
+  fi
+
+  # `set -e` first, or a failed mkdir or git reset in the middle is masked by the last command's
+  # success and the whole reconcile reports Success.
+  RECONCILE_COMMANDS="$(mktemp)"
+  trap 'rm -f "$RECONCILE_COMMANDS"' EXIT
+  cat > "$RECONCILE_COMMANDS" <<JSON
+{"commands":[
+"set -e",
+"mkdir -p /var/lib/fund && chown ubuntu:ubuntu /var/lib/fund",
+"touch /var/lib/fund/inhibit-once && chown ubuntu:ubuntu /var/lib/fund/inhibit-once",
+"systemctl kill -s KILL fund-archiver.service 2>/dev/null || true",
+"sleep 2",
+"! systemctl is-active --quiet fund-archiver.service",
+"printf '%s' '${PROFILE}' > /etc/fund-profile",
+"mkdir -p /var/log/fund /var/journal/fund && chown ubuntu:ubuntu /var/log/fund /var/journal/fund",
+"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
+"install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
+"systemctl daemon-reload",
+"systemctl enable fund-archiver.service",
+"systemctl is-enabled fund-archiver.service",
+"rm -f /var/lib/fund/inhibit-once"
+]}
+JSON
+
+  RECONCILE_ID="$(aws ssm send-command --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --document-name AWS-RunShellScript --parameters "file://$RECONCILE_COMMANDS" \
+    --query 'Command.CommandId' --output text)"
+  RECONCILE_STATUS="$(wait_for_the_command "$RECONCILE_ID" "$INSTANCE_ID")"
+  rm -f "$RECONCILE_COMMANDS"
+
+  if [[ "$RECONCILE_STATUS" != "Success" ]]; then
+    echo "Error: installing the boot service failed ($RECONCILE_STATUS)." >&2
+    BOX_STDERR="$(aws ssm get-command-invocation --region "$REGION" --command-id "$RECONCILE_ID" \
+      --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text 2>/dev/null || true)"
+    if [[ -n "$BOX_STDERR" && "$BOX_STDERR" != "None" ]]; then
+      echo "    $BOX_STDERR" >&2
+    fi
+    # Reported because the box shutting down is the failure this has actually had: the reconcile is
+    # `InProgress` forever and the instance is `stopped`, which no SSM field says.
+    echo "    instance is now $(aws ec2 describe-instances --region "$REGION" \
+      --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' \
+      --output text)" >&2
+    # Nothing is cleaned up from here: a cleanup command cannot reach a box that has gone away,
+    # which is the failure this path exists for. The next boot consumes the one-shot inhibit itself.
+    echo "    /var/lib/fund/inhibit-once may remain; the next start skips one fold and stops" >&2
+    exit 1
+  fi
+  changed "installed the profile and enabled fund-archiver.service"
+
+  if [[ "$ORIGINAL_STATE" != "running" ]]; then
+    echo "    returning $INSTANCE_ID to stopped"
+    aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
+  fi
 fi
 
 step "Done"

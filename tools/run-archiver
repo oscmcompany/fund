@@ -14,6 +14,11 @@ REGION="${AWS_REGION:-us-east-1}"
 PROFILE_FILE=/etc/fund-profile
 INHIBIT_FILE=/etc/fund-archiver.inhibit
 
+# The provisioner's inhibit, left behind only by a reconcile that did not finish. Under /var/lib
+# rather than beside the operator's file because this script runs as `ubuntu`, and removing a file
+# from /etc needs write permission on /etc.
+ONE_SHOT_INHIBIT_FILE=/var/lib/fund/inhibit-once
+
 # Emitted as JSON because these lines are exported, and the reader keeps only objects carrying a
 # timestamp and a level -- a bare "TIMESTAMP message" is counted unparsable and dropped, which would
 # lose exactly the lines that explain a bad night.
@@ -57,6 +62,12 @@ run_wrapped() {
   return "$status"
 }
 
+# True when the one-shot inhibit was there, and the file is gone either way.
+consume_a_one_shot_inhibit() {
+  [[ -e "$1" ]] || return 1
+  rm -f "$1"
+}
+
 instance_id() {
   local token
   token="$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
@@ -95,6 +106,13 @@ if [[ -e "$INHIBIT_FILE" ]]; then
 fi
 
 trap stop_self EXIT
+
+# Honoured once and then gone, and the box still stops -- a scheduled start that neither folded nor
+# stopped would burn until the stall alarm, which is why this is not the operator's file.
+if consume_a_one_shot_inhibit "$ONE_SHOT_INHIBIT_FILE"; then
+  log "$ONE_SHOT_INHIBIT_FILE was present; an unfinished reconcile left it, so skipping the fold"
+  exit 0
+fi
 
 if [[ ! -r "$PROFILE_FILE" ]]; then
   log "ERROR: $PROFILE_FILE is missing; it names the profile whose keys this box may read"
