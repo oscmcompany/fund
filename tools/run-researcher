@@ -1,21 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# run-researcher -- What the researcher box does when its schedule wakes it.
+# run-researcher -- What the researcher box does when its schedule wakes it: train, then ship.
 #
-# Train, then ship what the box learned. Two legs on `run-archiver`'s shape, and the export is the
-# last of them for that script's reason: a record left on a box that spends most of its time off is
-# a record nobody can read.
-#
-# It neither syncs nor stops the box, which is where it differs from the archiver. `sync-trainer`
-# fast-forwards the checkout every minute, and the researcher is an exe.dev VM an operator starts
-# and stops by hand. Both change when it moves to AWS -- see task 28 of the laboratory expansion
-# plan -- and this is the script that grows those legs when they do.
-#
-# The ad-hoc half of the box's work needs no separate trigger: `laboratory_*` binaries write into
-# the same journal, and this ships every session up to and including today.
-#
-# Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
+# The export is the last leg, so nothing the run produced is left on a box that spends most of its
+# time off. It neither syncs nor stops the box; both change when it moves to AWS (laboratory plan,
+# task 28). Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -30,6 +20,32 @@ trap 'rm -f "$STATUS_FILE"' EXIT
 
 log "Starting at $(git rev-parse --short HEAD)"
 
+# One-time migration, deletable once no box has the directory. The laboratory used to write to a
+# subdirectory of its own, and the export now reads only the parent -- so without this move those
+# files are the records nobody collects, which is the state this script exists to end. The names
+# cannot collide: the application's are `session-`, the laboratory's `laboratory-session-`.
+JOURNAL_DIRECTORY="${FUND_JOURNAL_DIRECTORY:-/var/journal/fund}"
+LEGACY_JOURNAL_DIRECTORY="${JOURNAL_DIRECTORY}/laboratory"
+if [[ -d "$LEGACY_JOURNAL_DIRECTORY" ]]; then
+  moved=0
+  failed=0
+  for file in "$LEGACY_JOURNAL_DIRECTORY"/laboratory-session-*.jsonl; do
+    [[ -e "$file" ]] || continue
+    if mv -n "$file" "${JOURNAL_DIRECTORY}/"; then
+      moved=$((moved + 1))
+    else
+      failed=$((failed + 1))
+      log "ERROR: could not move $file; its records stay unshipped"
+    fi
+  done
+  log "Moved ${moved} file(s) out of ${LEGACY_JOURNAL_DIRECTORY}, ${failed} failed"
+  if [[ "$failed" -eq 0 ]] && rmdir "$LEGACY_JOURNAL_DIRECTORY" 2>/dev/null; then
+    log "Removed ${LEGACY_JOURNAL_DIRECTORY}"
+  else
+    log "Kept ${LEGACY_JOURNAL_DIRECTORY}; it still holds something this does not move"
+  fi
+fi
+
 # `train-tide-model` holds the lock `sync-trainer` checks, so the checkout cannot be reset out from
 # under the build this starts.
 TRAIN_STATUS=0
@@ -39,11 +55,15 @@ log "Training finished with status ${TRAIN_STATUS}"
 
 # Runs whatever the training did. The run that failed is the one whose records are most worth
 # having, and `set -e` would otherwise stop before shipping them.
+EXPORT_STATUS=0
 log "Exporting records"
-if run_wrapped laboratory-export devenv tasks run records:export; then
+run_wrapped laboratory-export devenv tasks run records:export || EXPORT_STATUS=$?
+if [[ "$EXPORT_STATUS" -eq 0 ]]; then
   log "Records exported"
 else
-  log "ERROR: records failed to export; they remain on this box only"
+  log "ERROR: records failed to export with status ${EXPORT_STATUS}; they remain on this box only"
 fi
 
-exit "${TRAIN_STATUS}"
+# Either leg. A failed export that exited zero would report a clean night over records that never
+# left the box, which is the whole failure this script exists to prevent.
+exit "$(first_failure "${TRAIN_STATUS}" "${EXPORT_STATUS}")"

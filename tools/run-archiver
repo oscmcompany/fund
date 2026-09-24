@@ -112,11 +112,15 @@ fi
 
 # Before the trap stops the box, which is the whole point: an export that raced the shutdown would
 # collect nothing and leave the night on a machine that is off.
+EXPORT_STATUS=0
 log "Exporting records"
-if run_wrapped seed-export tools/run-backfill export-records; then
+run_wrapped seed-export tools/run-backfill export-records || EXPORT_STATUS=$?
+if [[ "$EXPORT_STATUS" -eq 0 ]]; then
   log "Records exported"
 else
-  log "ERROR: records failed to export; they remain on this box only"
+  log "ERROR: records failed to export with status ${EXPORT_STATUS}; they remain on this box only"
 fi
 
-exit "$FOLD_STATUS"
+# Either leg. This used to exit the fold's status alone, so a night whose records never left the box
+# -- the one failure a box that powers itself off cannot recover from -- reported success.
+exit "$(first_failure "$FOLD_STATUS" "$EXPORT_STATUS")"

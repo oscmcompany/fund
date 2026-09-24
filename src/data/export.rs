@@ -373,8 +373,9 @@ pub struct JournalExportSummary {
     pub deleted: Vec<NaiveDate>,
     /// Lines skipped as unreadable, across every session.
     ///
-    /// A torn final line per crashed session is expected; more than that means something else is
-    /// wrong.
+    /// A torn final line follows a crash, but it is not something to tolerate: its file is kept
+    /// rather than deleted, so it is re-read and re-uploaded on every run until someone removes the
+    /// line. `seed export-records` reports a non-zero count rather than exiting clean over it.
     pub unparsable_lines: usize,
 }
 

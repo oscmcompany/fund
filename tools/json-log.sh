@@ -1,16 +1,8 @@
 # Sourced, not executed. JSON-only logging for the scripts whose output is exported.
 #
-# `export_logs` deletes a file only when it parsed every line, so one plain-text line from cargo or
-# from a leg's own report would keep the file undeletable -- re-read and re-uploaded every night,
-# forever. The reader keeps only objects carrying a timestamp and a level, so a bare
-# "TIMESTAMP message" is counted unparsable and dropped, which would lose exactly the lines that
-# explain a bad run.
-#
-# A caller sets JSON_LOG_TARGET to its own name, calls `open_the_json_log <service>` to redirect
-# into the dated file the export collects, and wraps each leg in `run_wrapped <target> <command>`.
-#
-# One copy rather than one per script: the archiver and the researcher both export their logs, and
-# two hand-maintained escapers would agree only by coincidence.
+# A caller sets JSON_LOG_TARGET, calls `open_the_json_log <service>`, and wraps each leg in
+# `run_wrapped <target> <command>`. `export_logs` keeps a file whose every line did not parse, so a
+# single plain-text line makes it permanent.
 
 json_line() {
   local level="$1" target="$2" message="$3"
@@ -39,22 +31,38 @@ open_the_json_log() {
 }
 
 # Every line a child writes, wrapped so the dated log stays JSON-only.
+#
+# The status travels through a file rather than a sentinel line, because a child printing one would
+# be believed; and `read` returns false on a final line with no newline, so that line is logged by
+# the second half of the condition rather than dropped.
 run_wrapped() {
   local target="$1"; shift
-  local status=0
-  # The pipeline's first element decides the status; `pipefail` alone would let the wrapper's zero
-  # exit mask a failed child.
+  : > "$STATUS_FILE"
   {
-    "$@" 2>&1 || echo "__EXIT__$?"
-  } | while IFS= read -r line; do
-    case "$line" in
-      __EXIT__*) status="${line#__EXIT__}"; printf '%s' "$status" > "$STATUS_FILE" ;;
-      *) json_line INFO "$target" "$line" ;;
-    esac
+    "$@" 2>&1
+    printf '%s' "$?" > "$STATUS_FILE"
+  } | while IFS= read -r line || [[ -n "$line" ]]; do
+    json_line INFO "$target" "$line"
   done
-  if [[ -s "$STATUS_FILE" ]]; then
-    status="$(cat "$STATUS_FILE")"
-    : > "$STATUS_FILE"
-  fi
+  # The pipeline's own status is the `while` loop's, which is always zero, so the child's is read
+  # back here. An empty file means the child died without reaching the line that writes it.
+  local status
+  status="$(cat "$STATUS_FILE")"
+  [[ -n "$status" ]] || status=1
   return "$status"
+}
+
+# The status a run reports: the first leg that failed, or zero.
+#
+# One place rather than one per script, because both run scripts have several legs and the rule --
+# a failed export is a failed run, even after a clean fold -- has to be the same in both.
+first_failure() {
+  local status
+  for status in "$@"; do
+    if [[ "$status" -ne 0 ]]; then
+      printf '%s' "$status"
+      return
+    fi
+  done
+  printf '0'
 }

@@ -41,6 +41,7 @@ fn only_log_file(directory: &Path) -> (String, String) {
     let mut entries: Vec<_> = std::fs::read_dir(directory)
         .expect("the log directory must be readable")
         .map(|entry| entry.expect("the entry must be readable").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
         .collect();
     assert_eq!(entries.len(), 1, "exactly one log file: {entries:?}");
     let path = entries.remove(0);
@@ -111,11 +112,11 @@ fn test_a_failed_leg_keeps_its_status_through_the_wrapper() {
         &directory,
         "open_the_json_log researcher\n\
          run_wrapped leg bash -c 'echo working; exit 3'\n\
-         printf 'STATUS=%s' \"$?\" > \"$FUND_LOG_DIRECTORY/../status\"\n",
+         printf 'STATUS=%s' \"$?\" > \"$FUND_LOG_DIRECTORY/status\"\n",
     );
 
     assert!(output.status.success(), "the script itself must not crash");
-    let status = std::fs::read_to_string(directory.with_file_name("status")).unwrap_or_default();
+    let status = std::fs::read_to_string(directory.join("status")).unwrap_or_default();
     assert_eq!(status, "STATUS=3", "the leg's own status, not the pipe's");
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -131,10 +132,79 @@ fn test_a_clean_leg_after_a_failed_one_reports_clean() {
         "open_the_json_log researcher\n\
          run_wrapped first bash -c 'exit 3' || true\n\
          run_wrapped second bash -c 'exit 0'\n\
-         printf 'STATUS=%s' \"$?\" > \"$FUND_LOG_DIRECTORY/../status\"\n",
+         printf 'STATUS=%s' \"$?\" > \"$FUND_LOG_DIRECTORY/status\"\n",
     );
 
-    let status = std::fs::read_to_string(directory.with_file_name("status")).unwrap_or_default();
+    let status = std::fs::read_to_string(directory.join("status")).unwrap_or_default();
     assert_eq!(status, "STATUS=0");
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A child's own output must not be able to impersonate the wrapper's bookkeeping. The status once
+/// travelled as a `__EXIT__` line through the same stream the child writes on.
+#[test]
+fn test_a_child_cannot_fake_its_own_exit_status() {
+    let directory = temporary_directory("impersonation");
+
+    run_under_the_helper(
+        &directory,
+        "open_the_json_log researcher\n\
+         run_wrapped leg bash -c 'echo __EXIT__5'\n\
+         printf 'STATUS=%s' \"$?\" > \"$FUND_LOG_DIRECTORY/status\"\n",
+    );
+
+    let status = std::fs::read_to_string(directory.join("status")).unwrap_or_default();
+    assert_eq!(
+        status, "STATUS=0",
+        "the child succeeded; only its output said otherwise"
+    );
+    let (_, contents) = only_log_file(&directory);
+    assert!(
+        contents.contains("__EXIT__5"),
+        "and the line itself must still be logged: {contents}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// `read` returns false on a final line with no newline, so without the second half of the loop
+/// condition the last thing a crashing child said is the one line that never reaches the log.
+#[test]
+fn test_a_final_line_without_a_newline_is_still_logged() {
+    let directory = temporary_directory("unterminated");
+
+    run_under_the_helper(
+        &directory,
+        "open_the_json_log researcher\n\
+         run_wrapped leg bash -c \"printf 'last diagnostic'\"\n",
+    );
+
+    let (_, contents) = only_log_file(&directory);
+    assert!(
+        contents.contains("last diagnostic"),
+        "the unterminated line must be logged: {contents}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A failed export after a clean fold is still a failed run: the records never left a box that is
+/// about to power off, which is the one failure nothing later recovers from. Both run scripts end
+/// on this, which is why it lives in the helper rather than twice in shell.
+#[test]
+fn test_the_reported_status_is_the_first_leg_that_failed() {
+    let directory = temporary_directory("first-failure");
+
+    run_under_the_helper(
+        &directory,
+        "for pair in '0 0' '0 3' '2 0' '2 3'; do \
+           printf '%s=%s\\n' \"$pair\" \"$(first_failure $pair)\"; \
+         done > \"$FUND_LOG_DIRECTORY/answers\"",
+    );
+
+    let answers = std::fs::read_to_string(directory.join("answers")).expect("the file must exist");
+    assert_eq!(
+        answers.lines().collect::<Vec<_>>(),
+        vec!["0 0=0", "0 3=3", "2 0=2", "2 3=2"],
+        "a clean run reports zero, either failing leg reports itself, and the first one wins"
+    );
     let _ = std::fs::remove_dir_all(&directory);
 }
