@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publishes the provider's sale-condition table to the archive as an `as_of`-partitioned dataset.
+# Publishes the provider's trade condition table to the archive as an `as_of`-partitioned dataset.
 #
 # The table decides which trades enter volume, VWAP and the effective spread. It used to be baked
 # into `src/data/conditions_table.rs`, so moving one row meant regenerating Rust, committing it and
@@ -62,7 +62,7 @@ RESPONSE="${WORK}/response.json"
 CONDITIONS_CSV="${WORK}/conditions.csv"
 CONDITIONS_PARQUET="${WORK}/conditions.parquet"
 
-echo "Fetching sale conditions from ${MASSIVE_BASE_URL}"
+echo "Fetching trade conditions from ${MASSIVE_BASE_URL}"
 # The key travels as a bearer header fed over stdin, so it reaches neither the query string nor
 # `argv`. The header half matches `massive.rs:311` and the reason recorded there — reqwest prints the
 # full URL when a decode fails, so a key in the URL reaches every log line reporting one. The stdin
@@ -82,12 +82,18 @@ response, output = sys.argv[1], sys.argv[2]
 with open(response) as handle:
     payload = json.load(handle)
 
+# Sale conditions, plus the one flag Massive puts on trades as an identifier: 41, Trade Thru Exempt,
+# on 29.4% of the prints in the 2026-09-18 flat file and the only code there outside the sale
+# conditions. Without its row every such print resolved to nothing and was counted unresolved.
+# Named types rather than every row applying to trades, which would also admit fourteen short-sale
+# and financial-status flags that carry no update rules and never appear on a print.
+TRADE_TYPES = ("sale_condition", "trade_thru_exempt")
 conditions = sorted(
-    (row for row in payload.get("results", []) if row.get("type") == "sale_condition"),
+    (row for row in payload.get("results", []) if row.get("type") in TRADE_TYPES),
     key=lambda row: row["id"],
 )
 if not conditions:
-    sys.exit("Error: the response carried no sale conditions")
+    sys.exit("Error: the response carried no trade conditions")
 
 for row in conditions:
     rules = row.get("update_rules", {}).get("consolidated", {})
@@ -138,7 +144,7 @@ with open(output, "w", newline="") as handle:
             ]
         )
 
-print(f"Read {len(conditions)} sale conditions")
+print(f"Read {len(conditions)} trade conditions")
 PYTHON
 
 # duckdb rather than a Rust helper, because nothing in the binary should be able to write this: the

@@ -136,9 +136,11 @@ FROM read_parquet(
 -- prints are not. A rising share means the provider is using a code the table does not publish.
 --
 -- Read it per provider, which `providers` names from each partition's own provenance sidecar.
--- Sessions folded from Massive flat files carry ~30% by construction: they spell conditions as
--- identifiers, and the table publishes sale conditions only, so a print carrying a non-sale flag
--- resolves to nothing and is counted. Alpaca spells SIP characters and reads 0%.
+-- Sessions folded from Massive flat files before 2026-09-24 carry ~30% by construction: Massive
+-- flags trade-through-exempt prints with identifier 41, which the table did not then publish --
+-- 29.4% of prints in the 2026-09-18 file, and the only code there it lacked. The fold is final, so
+-- those counts stay; volume and VWAP were unaffected, because 41 counts toward volume. Alpaca
+-- spells SIP characters and reads 0%.
 .print 'Loading unresolved_condition_rate...'
 DROP VIEW IF EXISTS unresolved_condition_rate;
 CREATE OR REPLACE VIEW unresolved_condition_rate AS

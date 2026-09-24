@@ -624,6 +624,51 @@ mod tests {
     use super::fixture::*;
     use super::*;
 
+    /// Massive flags trade-through-exempt prints with identifier 41, which the published table
+    /// lacked until 2026-09-24, so every such print read as unresolved. Spelled here as the provider
+    /// publishes it, beside the row whose UTP character it shares.
+    #[test]
+    fn test_the_trade_through_exempt_flag_resolves_on_both_spellings() {
+        use Tape::*;
+        let cross_trade = row(9, "Cross Trade", true, &[(UnlistedTradingPrivileges, b'X')]);
+        let trade_through_exempt = row(
+            41,
+            "Trade Thru Exempt",
+            true,
+            &[
+                (ConsolidatedTapeAssociation, b'1'),
+                (UnlistedTradingPrivileges, b'X'),
+            ],
+        );
+        let without = ConditionsTable::new(date(), [rows(), vec![cross_trade.clone()]].concat())
+            .expect("the table without the flag must load");
+        let with = ConditionsTable::new(
+            date(),
+            [rows(), vec![cross_trade, trade_through_exempt]].concat(),
+        )
+        .expect("the flag must not trip the house-rule collision check");
+
+        assert_eq!(
+            volume_eligibility(&without, &[14, 41]),
+            Eligibility::Ambiguous
+        );
+        assert_eq!(volume_eligibility(&with, &[14, 41]), Eligibility::Eligible);
+        assert_eq!(
+            volume_eligibility_from_characters(&with, b"X", UnlistedTradingPrivileges),
+            Eligibility::Eligible,
+            "two rows sharing X agree on volume, so the collision resolves"
+        );
+        assert_eq!(
+            volume_eligibility_from_characters(&with, b"1", ConsolidatedTapeAssociation),
+            Eligibility::Eligible
+        );
+        assert!(carries_a_market_price_from_characters(
+            &with,
+            b"X",
+            UnlistedTradingPrivileges
+        ));
+    }
+
     /// An empty table answers every print with the fallback, which reads like an unreadable tape.
     #[test]
     fn test_a_table_holding_no_conditions_is_refused() {
