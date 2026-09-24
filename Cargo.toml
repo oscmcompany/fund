@@ -5,7 +5,8 @@ edition = "2021"
 resolver = "2"
 
 # No features, and every binary auto-discovered from `src/bin/`: the service `fund`, the `dashboard`,
-# `tide_model_trainer`, `backfill_account_snapshots`, the `seed` seeder and the `laboratory_*` studies.
+# `tide_model_trainer`, `backfill_account_snapshots`, the `seed` seeder, the `laboratory_*` studies,
+# and `laboratory_export`, which ships what those studies wrote.
 #
 # There is deliberately no `train` feature -- it existed so an inference-only build could skip the
 # training modules, but burn's `autodiff` is always compiled in anyway (it costs the NdArray

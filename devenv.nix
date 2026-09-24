@@ -846,11 +846,22 @@ in {
       echo "Pinned cron timezone to UTC (host is $(date +%Z), offset $(date +%z))"
     fi
 
-    if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
-      echo "Training cron entry already installed"
+    # `run-researcher` rather than `train-tide-model` directly: training is one leg and the record
+    # export is the last, so the box cannot finish a night without shipping what it produced.
+    #
+    # A box provisioned before that wrapper existed carries the bare training entry, and leaving it
+    # would run training twice on the same evening. Removed rather than checked, so this is a
+    # migration and not a second entry.
+    if crontab -l 2>/dev/null | grep -qF 'tools/train-tide-model'; then
+      crontab -l 2>/dev/null | grep -vF 'tools/train-tide-model' | crontab - || true
+      echo "Removed the bare training cron entry; run-researcher runs it as a leg"
+    fi
+
+    if crontab -l 2>/dev/null | grep -qF 'run-researcher'; then
+      echo "Researcher cron entry already installed"
     else
-      (crontab -l 2>/dev/null || true; echo '0 23 * * 1-5 bash ~/fund-cron.sh tools/train-tide-model >> /var/log/fund/train-tide-model.log 2>&1') | crontab -
-      echo "Installed training cron entry (weekdays 23:00 UTC, post-close Eastern)"
+      (crontab -l 2>/dev/null || true; echo '0 23 * * 1-5 bash ~/fund-cron.sh tools/run-researcher >> /var/log/fund/run-researcher.log 2>&1') | crontab -
+      echo "Installed researcher cron entry (weekdays 23:00 UTC, post-close Eastern)"
     fi
 
     if crontab -l 2>/dev/null | grep -qF 'sync-trainer'; then
@@ -864,12 +875,14 @@ in {
   scripts.stop-trainer.exec = ''
     set -euo pipefail
 
-    if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
-      crontab -l 2>/dev/null | grep -vF 'train-tide-model' | crontab - || true
-      echo "Removed training cron entry"
-    else
-      echo "No training cron entry to remove"
-    fi
+    # Both spellings: a box provisioned before `run-researcher` existed carries the bare training
+    # entry, and a stop that left it behind would keep training on a box meant to be idle.
+    for entry in run-researcher tools/train-tide-model; do
+      if crontab -l 2>/dev/null | grep -qF "$entry"; then
+        crontab -l 2>/dev/null | grep -vF "$entry" | crontab - || true
+        echo "Removed the $entry cron entry"
+      fi
+    done
 
     if crontab -l 2>/dev/null | grep -qF 'sync-trainer'; then
       crontab -l 2>/dev/null | grep -vF 'sync-trainer' | crontab - || true
@@ -1045,6 +1058,15 @@ in {
       echo "Repairing the bar archive and running the tide training pipeline (Rust + burn)"
       ${runtimeEnv}
       secretspec run -- cargo run --release --bin tide_model_trainer
+    '';
+
+    # The researcher's half of the record export, which `tools/run-researcher` runs as its last leg.
+    # The trader ships its journal from inside the service and the archiver from `seed`; this box
+    # runs neither, so its journal and logs had no way off it at all.
+    "records:export".exec = ''
+      set -euo pipefail
+      ${runtimeEnv}
+      secretspec run -- cargo run --release --bin laboratory_export
     '';
 
     # The same pipeline, run to rehearse it rather than to publish a model. It differs from

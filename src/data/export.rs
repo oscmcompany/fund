@@ -1555,30 +1555,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The archiver's own `log()`, run for real and read by the exporter that must consume it.
+    /// The run scripts' own `log()`, run for real and read by the exporter that must consume it.
     ///
     /// The two tests above pin this reader's contract using handwritten lines, which leaves them
-    /// green if `tools/run-archiver` reverts to plain text. This one runs the shell function out of
-    /// the script itself, so the seam is what is under test rather than a restatement of it.
+    /// green if `tools/json-log.sh` reverts to plain text. This one sources the helper the archiver
+    /// and the researcher both run, so the seam is what is under test rather than a restatement.
     #[test]
     fn test_the_real_shell_log_function_produces_lines_this_reader_keeps() {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/run-archiver");
+        let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/json-log.sh");
         let directory = temporary_directory("logs-shell-seam");
         std::fs::create_dir_all(&directory).expect("the directory must be creatable");
         let path = directory.join("2026-09-22.archiver.log");
 
-        // `json_line` and `log` lifted from the script and run unchanged. A child's plain output goes
-        // through the same wrapper, which is the case that decides whether the file can age out.
+        // A child's plain output goes through the same wrapper, which is the case that decides
+        // whether the file can age out.
         let program = format!(
             r#"set -euo pipefail
 STATUS_FILE="$(mktemp)"
-eval "$(sed -n '/^json_line() {{/,/^}}/p;/^run_wrapped() {{/,/^}}/p' {script})"
-log() {{ json_line INFO run-archiver "$1"; }}
+JSON_LOG_TARGET=run-archiver
+source {helper}
 log 'Syncing'
 log 'a "quoted" value and a back\slash'
 run_wrapped child bash -c 'echo "   Compiling polars v0.51.0"'
 "#,
-            script = script.display()
+            helper = helper.display()
         );
         let output = std::process::Command::new("bash")
             .arg("-c")

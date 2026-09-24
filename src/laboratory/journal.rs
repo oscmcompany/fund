@@ -32,9 +32,6 @@ use crate::laboratory::stability::{Association, SignAgreement};
 /// reader will ever see one without the other.
 pub const SCHEMA_VERSION: u32 = 5;
 
-/// Where the laboratory writes when `FUND_LABORATORY_JOURNAL_DIRECTORY` says nothing.
-const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund/laboratory";
-
 /// Errors writing the laboratory journal.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -262,7 +259,23 @@ pub struct FeatureTriaged {
 pub struct DatasetBuilt {
     pub fingerprint: DatasetFingerprint,
     /// The commit this ran from, so a number can be traced to the code that produced it.
-    pub revision: Option<String>,
+    ///
+    /// Private because it is not a caller's choice. It was read from `FUND_REVISION` at eight sites
+    /// and set by none of them, so every record ever written carried null.
+    revision: Option<String>,
+}
+
+impl DatasetBuilt {
+    /// Records a prepared dataset, stamping the commit this binary was built from.
+    ///
+    /// `None` when the build had no git to ask, which is the honest answer; `build.rs` appends
+    /// `-dirty` rather than naming a commit that is not what ran.
+    pub fn new(fingerprint: DatasetFingerprint) -> Self {
+        Self {
+            fingerprint,
+            revision: option_env!("FUND_REVISION").map(str::to_string),
+        }
+    }
 }
 
 /// What one forecast was worth over one dataset.
@@ -346,11 +359,12 @@ impl Journal {
         })
     }
 
-    /// Opens a journal at `FUND_LABORATORY_JOURNAL_DIRECTORY`, or the default beneath it.
+    /// Opens a journal in the same directory the application's uses, from the same variable.
+    ///
+    /// The two never share a host, and `laboratory-session-` against `session-` already tells the
+    /// files apart, so a second variable bought nothing and was declared in no script.
     pub fn from_env() -> Result<Self, JournalError> {
-        let directory = std::env::var("FUND_LABORATORY_JOURNAL_DIRECTORY")
-            .unwrap_or_else(|_| DEFAULT_JOURNAL_DIRECTORY.to_string());
-        Self::new(directory)
+        Self::new(crate::common::journal::journal_directory_from_env())
     }
 
     pub fn directory(&self) -> &Path {
@@ -860,5 +874,33 @@ mod tests {
             "the evening pair belongs to one session"
         );
         assert_eq!(lines(eighteenth).lines().count(), 1);
+    }
+
+    /// One variable configures a box and the file names keep the two records apart, so a script
+    /// that provisions `/var/journal/fund` provisions both.
+    #[test]
+    fn test_both_journals_open_the_same_directory() {
+        let laboratory = Journal::from_env().expect("the laboratory journal must resolve");
+        let application = crate::common::journal::Journal::from_env()
+            .expect("the application journal must resolve");
+
+        assert_eq!(laboratory.directory(), application.directory());
+    }
+
+    /// Without this the `revision` on every record is null, which is the state this field was in
+    /// from the day it was added until the build began stamping it.
+    #[test]
+    fn test_the_build_stamps_a_revision() {
+        let stamp = DatasetBuilt::new(fingerprint()).revision;
+
+        let stamp = stamp.expect("the build must stamp a revision; this tree is a git checkout");
+        let commit = stamp.strip_suffix("-dirty").unwrap_or(&stamp);
+        assert_eq!(commit.len(), 40, "a full sha, not an abbreviation: {stamp}");
+        assert!(
+            commit
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+            "a sha and nothing else: {stamp}"
+        );
     }
 }

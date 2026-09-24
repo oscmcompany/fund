@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# run-researcher -- What the researcher box does when its schedule wakes it.
+#
+# Train, then ship what the box learned. Two legs on `run-archiver`'s shape, and the export is the
+# last of them for that script's reason: a record left on a box that spends most of its time off is
+# a record nobody can read.
+#
+# It neither syncs nor stops the box, which is where it differs from the archiver. `sync-trainer`
+# fast-forwards the checkout every minute, and the researcher is an exe.dev VM an operator starts
+# and stops by hand. Both change when it moves to AWS -- see task 28 of the laboratory expansion
+# plan -- and this is the script that grows those legs when they do.
+#
+# The ad-hoc half of the box's work needs no separate trigger: `laboratory_*` binaries write into
+# the same journal, and this ships every session up to and including today.
+#
+# Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+JSON_LOG_TARGET=run-researcher
+# shellcheck source=tools/json-log.sh
+source "${REPO_ROOT}/tools/json-log.sh"
+
+cd "${REPO_ROOT}"
+
+open_the_json_log researcher
+trap 'rm -f "$STATUS_FILE"' EXIT
+
+log "Starting at $(git rev-parse --short HEAD)"
+
+# `train-tide-model` holds the lock `sync-trainer` checks, so the checkout cannot be reset out from
+# under the build this starts.
+TRAIN_STATUS=0
+log "Training"
+run_wrapped train-tide-model tools/train-tide-model || TRAIN_STATUS=$?
+log "Training finished with status ${TRAIN_STATUS}"
+
+# Runs whatever the training did. The run that failed is the one whose records are most worth
+# having, and `set -e` would otherwise stop before shipping them.
+log "Exporting records"
+if run_wrapped laboratory-export devenv tasks run records:export; then
+  log "Records exported"
+else
+  log "ERROR: records failed to export; they remain on this box only"
+fi
+
+exit "${TRAIN_STATUS}"

@@ -242,10 +242,9 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
             .record(
                 run_id,
                 Utc::now(),
-                laboratory::Observation::DatasetBuilt(laboratory::DatasetBuilt {
-                    fingerprint: dataset.fingerprint.clone(),
-                    revision: std::env::var("FUND_REVISION").ok(),
-                }),
+                laboratory::Observation::DatasetBuilt(laboratory::DatasetBuilt::new(
+                    dataset.fingerprint.clone(),
+                )),
             )
             .await;
     }
