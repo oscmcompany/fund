@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, QuoteRejection};
 use crate::common::events::Command;
 use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
-use crate::data::nightly::{Leg, LegOutcome, ReferenceOutcome};
+use crate::data::nightly::{Leg, LegOutcome, ReferenceCheck, ReferenceOutcome};
 
 /// Version stamped on every record written by this build.
 ///
@@ -885,6 +885,12 @@ pub struct ArchiveFolded {
     /// `None` when the run wrote no trade partition, which is not the same as folding under no
     /// rules. The fold cannot be undone, so this is the only record of the rules that produced them.
     pub conditions_as_of: Option<chrono::NaiveDate>,
+    /// Whether the provider's sale-condition table still matches the newest published one.
+    ///
+    /// `None` when the run was not given a check, which a hand-run fold is not.
+    pub conditions_check: Option<ReferenceCheck>,
+    /// Whether the published SIC mapping and its committed vocabulary still match the source.
+    pub classification_check: Option<ReferenceCheck>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.
@@ -1323,6 +1329,10 @@ mod tests {
                 )],
                 reference: Some(crate::data::nightly::ReferenceOutcome::Skipped),
                 conditions_as_of: chrono::NaiveDate::from_ymd_opt(2026, 8, 31),
+                conditions_check: Some(crate::data::nightly::ReferenceCheck::Matches),
+                classification_check: Some(crate::data::nightly::ReferenceCheck::Failed {
+                    exit_status: 1,
+                }),
             }),
         ]
     }

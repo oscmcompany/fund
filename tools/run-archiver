@@ -96,12 +96,29 @@ if ! run_wrapped sync-archiver tools/sync-archiver; then
   SYNCED=false
 fi
 
+# Before the fold, so both verdicts reach the night's record. Recorded rather than acted on: drift
+# is a fact about the provider, and the loader already refuses a table the archive cannot be wrong
+# about. Neither status is a leg for `first_failure`.
+CONDITIONS_CHECK_STATUS=0
+CLASSIFICATION_CHECK_STATUS=0
+if [[ "$SYNCED" == true ]]; then
+  log "Checking the reference tables against their sources"
+  run_wrapped conditions-check tools/run-backfill check-reference fetch-trade-conditions \
+    || CONDITIONS_CHECK_STATUS=$?
+  run_wrapped classification-check tools/run-backfill check-reference fetch-industry-classifications \
+    || CLASSIFICATION_CHECK_STATUS=$?
+  log "Reference checks: conditions ${CONDITIONS_CHECK_STATUS}, classification ${CLASSIFICATION_CHECK_STATUS}"
+fi
+
 # The fold's exit status is kept, but the export runs either way: a night that failed is the one
 # whose records are most worth having, and `set -e` would otherwise stop before shipping them.
 FOLD_STATUS=0
 if [[ "$SYNCED" == true ]]; then
   log "Folding as $FUND_PROFILE"
-  run_wrapped seed tools/run-backfill archive-nightly "$@" || FOLD_STATUS=$?
+  run_wrapped seed tools/run-backfill archive-nightly \
+    --conditions-check-status "$CONDITIONS_CHECK_STATUS" \
+    --classification-check-status "$CLASSIFICATION_CHECK_STATUS" \
+    "$@" || FOLD_STATUS=$?
   log "Fold finished with status ${FOLD_STATUS}"
 else
   # The fold is skipped and the run still reaches the export below, because the night that failed to

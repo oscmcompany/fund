@@ -14,9 +14,9 @@
 #   tools/fetch-industry-classifications
 #   tools/fetch-industry-classifications --check
 #
-# `--check` writes nothing and exits non-zero when either output has moved, matching
-# `fetch-trade-conditions`. Deliberately not a test: it needs the network, and a suite that fails
-# when Dartmouth is down stops meaning anything.
+# `--check` writes nothing and exits 3 when either output has moved, matching
+# `fetch-trade-conditions`; any other non-zero status means the check could not be made. Not a
+# test: it needs the network, and a suite that fails when Dartmouth is down stops meaning anything.
 #
 # The order is not optional. A run naming a bucket this repository has not committed is refused,
 # because the vocabulary is compiled in: publishing it first would make every deployed binary refuse
@@ -37,6 +37,9 @@ OUTPUT="${ROOT}/src/data/classification_table.rs"
 
 BASE_URL="https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp"
 
+# Distinct from 1, which every refusal below uses, so a caller can tell drift from a failed check.
+DRIFT_STATUS=3
+
 CHECK_ONLY=false
 if [[ "${1:-}" == "--check" ]]; then
   CHECK_ONLY=true
@@ -46,7 +49,18 @@ elif [[ -n "${1:-}" ]]; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+# A command that fails under `set -e` exits with its own status, and curl's include 3, so a failed
+# check would read as drift. Only the line that decides drift may leave with that status.
+DRIFT_DECLARED=false
+leave() {
+  local status=$?
+  rm -rf "${WORK}"
+  if [[ "${status}" -eq "${DRIFT_STATUS}" && "${DRIFT_DECLARED}" != true ]]; then
+    exit 1
+  fi
+  exit "${status}"
+}
+trap leave EXIT
 
 for granularity in 12 49; do
   echo "Fetching Siccodes${granularity} from ${BASE_URL}"
@@ -478,7 +492,8 @@ if [[ "${CHECK_ONLY}" == true ]]; then
   fi
   echo >&2
   echo "Re-run without --check to republish, and commit any vocabulary diff." >&2
-  exit 1
+  DRIFT_DECLARED=true
+  exit "${DRIFT_STATUS}"
 fi
 
 if [[ "${UNCHANGED}" == true ]]; then

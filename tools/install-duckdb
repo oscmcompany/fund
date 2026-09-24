@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# install-duckdb -- Installs the pinned DuckDB CLI on the archiver, which the reference checks use.
+#
+# Idempotent and verified: a matching version already on the box is left alone, and a download
+# whose checksum differs is refused. Called by cloud-init on a new box and by the reconcile on one
+# that predates it. Run as root.
+
+VERSION="1.5.2"
+SHA256="fc9145affabca627431e73ddaf6b8117e5c192692480c13886f227be202d5d15"
+DESTINATION=/usr/local/bin/duckdb
+
+if [[ -x "$DESTINATION" ]] && "$DESTINATION" --version 2>/dev/null | grep -q "^v${VERSION} "; then
+  echo "duckdb ${VERSION} already installed"
+  exit 0
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+curl -fsSL -o "$WORK/duckdb.zip" \
+  "https://github.com/duckdb/duckdb/releases/download/v${VERSION}/duckdb_cli-linux-amd64.zip"
+echo "${SHA256}  $WORK/duckdb.zip" | sha256sum -c --quiet -
+unzip -q -o "$WORK/duckdb.zip" -d "$WORK"
+install -m 0755 "$WORK/duckdb" "$DESTINATION"
+"$DESTINATION" --version

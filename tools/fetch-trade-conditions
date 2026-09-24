@@ -9,9 +9,10 @@
 #   secretspec run -- tools/fetch-trade-conditions
 #   secretspec run -- tools/fetch-trade-conditions --check
 #
-# `--check` publishes nothing and exits non-zero when the provider has moved, which is the drift
-# detection a published table would otherwise lack. Deliberately not a test: it needs the network
-# and a credential, and a suite that fails when the vendor is down stops meaning anything.
+# `--check` publishes nothing and exits 3 when the provider has moved, which the archiver's nightly
+# records on `ArchiveFolded`; any other non-zero status means the check could not be made. Not a
+# test: it needs the network and a credential, and a suite that fails when the vendor is down stops
+# meaning anything.
 #
 # The fold cannot be undone, so republishing does not change a partition already written -- unlike
 # the classification mapping, which is applied on every read. What a new `as_of` changes is every
@@ -20,6 +21,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
+
+# Distinct from 1, which every refusal above uses, so a caller can tell drift from a failed check.
+DRIFT_STATUS=3
 
 CHECK_ONLY=false
 if [[ "${1:-}" == "--check" ]]; then
@@ -42,7 +46,18 @@ if [[ "${MASSIVE_BASE_URL}" != https://* ]]; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+# A command that fails under `set -e` exits with its own status, and curl's include 3, so a failed
+# check would read as drift. Only the line that decides drift may leave with that status.
+DRIFT_DECLARED=false
+leave() {
+  local status=$?
+  rm -rf "${WORK}"
+  if [[ "${status}" -eq "${DRIFT_STATUS}" && "${DRIFT_DECLARED}" != true ]]; then
+    exit 1
+  fi
+  exit "${status}"
+}
+trap leave EXIT
 RESPONSE="${WORK}/response.json"
 CONDITIONS_CSV="${WORK}/conditions.csv"
 CONDITIONS_PARQUET="${WORK}/conditions.parquet"
@@ -221,7 +236,8 @@ if [[ "${CHECK_ONLY}" == true ]]; then
   echo "DRIFT: the provider's conditions differ from the newest stored partition" >&2
   echo >&2
   echo "Re-run without --check to publish a new as_of." >&2
-  exit 1
+  DRIFT_DECLARED=true
+  exit "${DRIFT_STATUS}"
 fi
 
 if [[ "${UNCHANGED}" == true ]]; then
