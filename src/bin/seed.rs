@@ -1784,12 +1784,26 @@ fn unshipped_records(
         for (session_date, error) in &sessions.failed {
             refusals.push(format!("journal {session_date}: {error}"));
         }
+        // A line the Parquet does not hold keeps its file rather than deleting it, so those records
+        // did not ship. Counting only explicit failures let an incomplete export exit clean.
+        if sessions.unparsable_lines > 0 {
+            refusals.push(format!(
+                "{} journal line(s) the Parquet does not hold",
+                sessions.unparsable_lines
+            ));
+        }
     }
     if let Some(error) = &logs.directory_error {
         refusals.push(format!("log directory: {error}"));
     }
     for (date, service, error) in &logs.failed {
         refusals.push(format!("log {date} {service}: {error}"));
+    }
+    if logs.unparsable_lines > 0 {
+        refusals.push(format!(
+            "{} log line(s) the Parquet does not hold",
+            logs.unparsable_lines
+        ));
     }
     refusals
 }
@@ -4047,6 +4061,28 @@ mod tests {
 
         assert_eq!(refusals.len(), 1);
         assert!(refusals[0].contains("permission denied"), "{:?}", refusals);
+    }
+
+    /// A file holding an unparsable line is kept rather than deleted, so those records did not ship
+    /// and the file is re-uploaded on every run from then on. Counting only explicit failures let
+    /// that exit clean forever.
+    #[test]
+    fn test_a_line_the_parquet_does_not_hold_is_a_refusal() {
+        let mut journal = export::JournalExportSummary::default();
+        journal.exported.push((date(2026, 9, 22), 40));
+        journal.unparsable_lines = 1;
+        let mut logs = export::LogExportSummary::default();
+        logs.unparsable_lines = 2;
+
+        let refusals = unshipped_records(Some(&journal), &logs);
+
+        assert_eq!(
+            refusals,
+            vec![
+                "1 journal line(s) the Parquet does not hold",
+                "2 log line(s) the Parquet does not hold"
+            ]
+        );
     }
 
     fn date(year: i32, month: u32, day: u32) -> chrono::NaiveDate {

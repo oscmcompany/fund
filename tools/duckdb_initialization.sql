@@ -244,6 +244,35 @@ FROM read_parquet(
     hive_partitioning = true
 );
 
+-- The research log: what the laboratory ran, one row per observation.
+--
+-- Scoped to the researcher for the reason the trader's view is scoped: the two share
+-- exports/journal and carry different columns. `experiment_type` is a partition key rather than a
+-- stored column, which is what makes a query for one kind of observation read only its files.
+--
+-- The payload is JSON and its shape is the observation's, so read it with `payload->>'$.field'`.
+-- `revision` inside a dataset_built payload is NULL for every record written before the build began
+-- stamping it, which is not the same as a run from an unknown commit.
+.print 'Loading experiments...'
+DROP VIEW IF EXISTS experiments;
+CREATE OR REPLACE VIEW experiments AS
+SELECT
+    schema_version,
+    event_id,
+    run_id,
+    experiment_type,
+    -- Epoch milliseconds in the Parquet, for the reason the journal view gives above.
+    to_timestamp(timestamp / 1000.0) AS timestamp,
+    payload,
+    -- From the key layout rather than the file contents, so a filter on them skips whole files.
+    year,
+    month,
+    day
+FROM read_parquet(
+    's3://' || getvariable('records_bucket') || '/exports/journal/producer=researcher/**/*.parquet',
+    hive_partitioning = true
+);
+
 .print ''
 .print 'DuckDB initialized. Views with errors above were skipped (no data in S3).'
 .print 'Run .help for DuckDB commands, SHOW TABLES to list loaded views.'

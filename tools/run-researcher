@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# run-researcher -- What the researcher box does when its schedule wakes it: train, then ship.
+#
+# The export is the last leg, so nothing the run produced is left on a box that spends most of its
+# time off. It neither syncs nor stops the box; both change when it moves to AWS (laboratory plan,
+# task 28). Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+JSON_LOG_TARGET=run-researcher
+# shellcheck source=tools/json-log.sh
+source "${REPO_ROOT}/tools/json-log.sh"
+
+cd "${REPO_ROOT}"
+
+open_the_json_log researcher
+trap 'rm -f "$STATUS_FILE"' EXIT
+
+log "Starting at $(git rev-parse --short HEAD)"
+
+# One-time migration, deletable once no box has the directory. The laboratory used to write to a
+# subdirectory of its own, and the export now reads only the parent -- so without this move those
+# files are the records nobody collects, which is the state this script exists to end. The names
+# cannot collide: the application's are `session-`, the laboratory's `laboratory-session-`.
+JOURNAL_DIRECTORY="${FUND_JOURNAL_DIRECTORY:-/var/journal/fund}"
+LEGACY_JOURNAL_DIRECTORY="${JOURNAL_DIRECTORY}/laboratory"
+if [[ -d "$LEGACY_JOURNAL_DIRECTORY" ]]; then
+  moved=0
+  failed=0
+  for file in "$LEGACY_JOURNAL_DIRECTORY"/laboratory-session-*.jsonl; do
+    [[ -e "$file" ]] || continue
+    if mv -n "$file" "${JOURNAL_DIRECTORY}/"; then
+      moved=$((moved + 1))
+    else
+      failed=$((failed + 1))
+      log "ERROR: could not move $file; its records stay unshipped"
+    fi
+  done
+  log "Moved ${moved} file(s) out of ${LEGACY_JOURNAL_DIRECTORY}, ${failed} failed"
+  if [[ "$failed" -eq 0 ]] && rmdir "$LEGACY_JOURNAL_DIRECTORY" 2>/dev/null; then
+    log "Removed ${LEGACY_JOURNAL_DIRECTORY}"
+  else
+    log "Kept ${LEGACY_JOURNAL_DIRECTORY}; it still holds something this does not move"
+  fi
+fi
+
+# `train-tide-model` holds the lock `sync-trainer` checks, so the checkout cannot be reset out from
+# under the build this starts.
+TRAIN_STATUS=0
+log "Training"
+run_wrapped train-tide-model tools/train-tide-model || TRAIN_STATUS=$?
+log "Training finished with status ${TRAIN_STATUS}"
+
+# Runs whatever the training did. The run that failed is the one whose records are most worth
+# having, and `set -e` would otherwise stop before shipping them.
+EXPORT_STATUS=0
+log "Exporting records"
+run_wrapped laboratory-export devenv tasks run records:export || EXPORT_STATUS=$?
+if [[ "$EXPORT_STATUS" -eq 0 ]]; then
+  log "Records exported"
+else
+  log "ERROR: records failed to export with status ${EXPORT_STATUS}; they remain on this box only"
+fi
+
+# Either leg. A failed export that exited zero would report a clean night over records that never
+# left the box, which is the whole failure this script exists to prevent.
+exit "$(first_failure "${TRAIN_STATUS}" "${EXPORT_STATUS}")"

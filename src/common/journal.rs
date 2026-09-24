@@ -965,9 +965,7 @@ impl Journal {
 
     /// Opens a journal at `FUND_JOURNAL_DIRECTORY`, or `/var/journal/fund`.
     pub fn from_env() -> Result<Self, JournalError> {
-        let directory = std::env::var("FUND_JOURNAL_DIRECTORY")
-            .unwrap_or_else(|_| DEFAULT_JOURNAL_DIRECTORY.to_string());
-        Self::new(directory)
+        Self::new(journal_directory_from_env())
     }
 
     pub fn directory(&self) -> &Path {
@@ -1053,6 +1051,16 @@ pub struct JournalGuard<'a> {
 /// permissions, and backup a log directory gets are the wrong ones for the only original the
 /// application owns.
 pub const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
+
+/// The directory both journals open, from `FUND_JOURNAL_DIRECTORY` or the default above.
+///
+/// One variable and one tree for the application's journal and the laboratory's, because the two
+/// never share a host and their file names already say which is which. A second variable was
+/// declared in no script, so the laboratory wrote wherever the box defaulted to.
+pub fn journal_directory_from_env() -> String {
+    std::env::var("FUND_JOURNAL_DIRECTORY")
+        .unwrap_or_else(|_| DEFAULT_JOURNAL_DIRECTORY.to_string())
+}
 
 /// The file one session's records live in.
 pub(crate) fn file_name(session_date: SessionDate) -> String {

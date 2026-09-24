@@ -148,10 +148,7 @@ async fn run(
             .record(
                 run_id,
                 Utc::now(),
-                laboratory::Observation::DatasetBuilt(laboratory::DatasetBuilt {
-                    fingerprint,
-                    revision: std::env::var("FUND_REVISION").ok(),
-                }),
+                laboratory::Observation::DatasetBuilt(laboratory::DatasetBuilt::new(fingerprint)),
             )
             .await;
     }

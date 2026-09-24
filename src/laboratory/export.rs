@@ -1,6 +1,6 @@
-//! Ships sealed laboratory journal days to S3, one object per experiment type per session.
+//! Ships laboratory journal days to S3, one object per experiment type per session.
 //!
-//! Triggered explicitly: the laboratory has no scheduled pass to hang this off.
+//! Called by `laboratory_export`, which `tools/run-researcher` runs as its last leg.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,10 +41,11 @@ pub struct ExportSummary {
     pub unparsable_lines: usize,
 }
 
-/// Writes every sealed day to S3, then deletes the local files that have aged out.
+/// Writes every day up to and including `today` to S3, then deletes the local files that have aged
+/// out.
 ///
-/// A session is sealed once `today` has moved past it. The key is derived from the record, so a
-/// repeat run overwrites byte-identically and a failed run repairs itself.
+/// The key is derived from the session, so a repeat run overwrites what it wrote before and a failed
+/// run repairs itself. Today's file is still open, which is why the seal is taken around each read.
 pub async fn export_journals(
     journal: &Journal,
     s3_client: &S3Client,
@@ -116,7 +117,12 @@ pub async fn export_journals(
     summary
 }
 
-/// Every session in the directory that `today` has moved past.
+/// Every session in the directory up to and including `today`.
+///
+/// Today is included, matching `data::export::sealed_sessions`: the seal below covers the read, the
+/// key is derived from the session, and a later run overwrites it with the same rows plus whatever
+/// arrived after. Excluding today meant a study could not ship on the day it ran, which on a box
+/// that is usually off left a day's work waiting on the next boot.
 fn sealed_sessions(
     directory: &Path,
     today: SessionDate,
@@ -129,7 +135,8 @@ fn sealed_sessions(
         let Some(session) = session_from_file_name(&name) else {
             continue;
         };
-        if session >= today {
+        // A file dated ahead of today is a clock that disagrees with this one, not a sealed day.
+        if session > today {
             continue;
         }
         sessions.push(session);
@@ -271,32 +278,33 @@ mod tests {
     use crate::common::types::SessionDate;
     use crate::laboratory::dataset::DatasetFingerprint;
     use crate::laboratory::journal::{DatasetBuilt, Observation, Record};
+    use aws_sdk_s3::Client as S3Client;
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    use aws_smithy_types::body::SdkBody;
+    use percent_encoding::percent_decode_str;
     use uuid::Uuid;
 
     fn record(run_id: Uuid, milliseconds: i64) -> Record {
         Record::new(
             run_id,
             DateTime::from_timestamp_millis(milliseconds).unwrap(),
-            Observation::DatasetBuilt(DatasetBuilt {
-                fingerprint: DatasetFingerprint {
-                    session: session(2026, 8, 17),
-                    lookback_days: 365,
-                    liquidity_floor: None,
-                    screen_window: None,
-                    rows: 10,
-                    tickers: 2,
-                    first_timestamp: DateTime::from_timestamp_millis(0),
-                    last_timestamp: DateTime::from_timestamp_millis(86_400_000),
-                    splits_digest: 0xAB,
-                    boundaries_digest: 0xCD,
-                    reference_digest: Some(0xEF),
-                    factor_specification: None,
-                    microstructure: crate::laboratory::dataset::Microstructure::Omitted,
-                    quote_summary_digest: None,
-                    trade_summary_digest: None,
-                },
-                revision: None,
-            }),
+            Observation::DatasetBuilt(DatasetBuilt::new(DatasetFingerprint {
+                session: session(2026, 8, 17),
+                lookback_days: 365,
+                liquidity_floor: None,
+                screen_window: None,
+                rows: 10,
+                tickers: 2,
+                first_timestamp: DateTime::from_timestamp_millis(0),
+                last_timestamp: DateTime::from_timestamp_millis(86_400_000),
+                splits_digest: 0xAB,
+                boundaries_digest: 0xCD,
+                reference_digest: Some(0xEF),
+                factor_specification: None,
+                microstructure: crate::laboratory::dataset::Microstructure::Omitted,
+                quote_summary_digest: None,
+                trade_summary_digest: None,
+            })),
         )
     }
 
@@ -308,12 +316,15 @@ mod tests {
         std::fs::write(directory.join(file_name(session)), lines.join("\n") + "\n").unwrap();
     }
 
+    /// The property the whole trigger rests on: a study run today ships tonight rather than on the
+    /// next boot of a box that is usually off.
     #[test]
-    fn test_today_is_not_yet_sealed() {
+    fn test_today_ships_and_a_day_dated_ahead_does_not() {
         let directory = tempfile::tempdir().unwrap();
+        let tomorrow = session(2026, 8, 19);
         let today = session(2026, 8, 18);
         let yesterday = session(2026, 8, 17);
-        for date in [today, yesterday] {
+        for date in [tomorrow, today, yesterday] {
             write_day(directory.path(), date, &[]);
         }
 
@@ -321,8 +332,8 @@ mod tests {
 
         assert_eq!(
             sealed,
-            vec![yesterday],
-            "a day still being written to is not sealed"
+            vec![yesterday, today],
+            "today is shipped and a file dated ahead of it is not"
         );
     }
 
@@ -490,5 +501,115 @@ mod tests {
 
         let distinct: BTreeMap<&str, ()> = expected.iter().map(|(_, key)| (*key, ())).collect();
         assert_eq!(distinct.len(), expected.len());
+    }
+
+    /// An S3 client that answers every request from memory and keeps what it was handed.
+    ///
+    /// The key is decoded because S3 percent-encodes the `=` in every hive segment, so a key built
+    /// by `date_partitioned_key` never matches the wire form.
+    fn capturing_s3_client(
+        captured: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+    ) -> S3Client {
+        let http_client = infallible_client_fn(move |request| {
+            let key = percent_decode_str(request.uri().path())
+                .decode_utf8_lossy()
+                .trim_start_matches('/')
+                .trim_start_matches("test-bucket/")
+                .to_string();
+            let body = request.body().bytes().unwrap_or_default().to_vec();
+            captured
+                .lock()
+                .expect("the recorder must not be poisoned")
+                .push((key, body));
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::empty())
+                .expect("a canned response must build")
+        });
+        S3Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test-key",
+                    "test-secret",
+                    None,
+                    None,
+                    "test",
+                ))
+                .http_client(http_client)
+                .build(),
+        )
+    }
+
+    /// The whole leg, end to end: records appended through the real journal, exported, and the
+    /// bytes read back as Parquet.
+    ///
+    /// The three unit tests above each cover one step. This is the seam between them, which is
+    /// where the export spent its whole life broken — every piece worked and nothing called them.
+    #[tokio::test]
+    async fn test_a_study_run_today_reaches_s3_as_parquet() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::new(directory.path()).expect("the journal must open");
+        let today = session(2026, 8, 18);
+        let run_id = Uuid::new_v4();
+        // Appended through the writer rather than handwritten, so the file under test is the one a
+        // study would actually leave behind.
+        let stamp = |date: SessionDate, hour: u32| {
+            date.date()
+                .and_hms_opt(hour, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        };
+        for (date, hour) in [(session(2026, 8, 17), 20), (today, 20)] {
+            journal
+                .append(&record(run_id, stamp(date, hour)))
+                .await
+                .expect("the record must append");
+        }
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let summary = export_journals(
+            &journal,
+            &capturing_s3_client(captured.clone()),
+            "test-bucket",
+            today,
+        )
+        .await;
+
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        let written = captured.lock().expect("the recorder must not be poisoned");
+        let keys: Vec<&str> = written.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "exports/journal/producer=researcher/experiment_type=dataset_built/year=2026/month=08/day=17/data.parquet",
+                "exports/journal/producer=researcher/experiment_type=dataset_built/year=2026/month=08/day=18/data.parquet",
+            ],
+            "yesterday and today, each under its own partition"
+        );
+
+        let (_, bytes) = written.last().expect("today's object must have been put");
+        let frame = ParquetReader::new(std::io::Cursor::new(bytes.clone()))
+            .finish()
+            .expect("the body must be Parquet");
+        assert_eq!(frame.height(), 1, "the one record appended for today");
+        let columns: Vec<String> = frame
+            .get_column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                "schema_version",
+                "event_id",
+                "run_id",
+                "timestamp",
+                "payload"
+            ],
+            "the envelope the DuckDB view selects"
+        );
     }
 }
