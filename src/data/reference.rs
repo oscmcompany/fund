@@ -6,10 +6,11 @@ use std::collections::BTreeMap;
 
 use polars::prelude::*;
 
-use crate::common::types::{EquityReference, SecurityType, SessionDate, SicCode};
+use crate::common::types::{Cik, EquityReference, SecurityType, SessionDate, SicCode};
 use crate::data::classification::{self, ClassificationTable};
 use crate::data::classification_table::{Industry, Sector};
 use crate::data::details::{industry_code, sector_code};
+use crate::data::industry_codes::IndustryCodesTable;
 
 /// The column carrying which `as_of` observation a row was classified by.
 ///
@@ -30,6 +31,7 @@ pub fn reference_to_dataframe(references: &[EquityReference]) -> Result<DataFram
     let mut shares: Vec<Option<f64>> = Vec::with_capacity(references.len());
     let mut capitalizations: Vec<Option<f64>> = Vec::with_capacity(references.len());
     let mut exchanges: Vec<Option<String>> = Vec::with_capacity(references.len());
+    let mut ciks: Vec<Option<String>> = Vec::with_capacity(references.len());
 
     for reference in references {
         tickers.push(reference.ticker().as_str().to_string());
@@ -46,6 +48,7 @@ pub fn reference_to_dataframe(references: &[EquityReference]) -> Result<DataFram
         shares.push(reference.shares_outstanding());
         capitalizations.push(reference.reported_market_capitalization());
         exchanges.push(reference.primary_exchange().map(str::to_string));
+        ciks.push(reference.cik().map(|cik| cik.as_str().to_string()));
     }
 
     DataFrame::new(vec![
@@ -57,6 +60,7 @@ pub fn reference_to_dataframe(references: &[EquityReference]) -> Result<DataFram
         Column::new("shares_outstanding".into(), shares),
         Column::new("reported_market_capitalization".into(), capitalizations),
         Column::new("primary_exchange".into(), exchanges),
+        Column::new("cik".into(), ciks),
     ])
 }
 
@@ -87,6 +91,9 @@ struct Observation {
     shares_outstanding: Option<f64>,
     /// Observations since the feed last answered for this symbol. Zero on a fresh answer.
     carried: u32,
+    /// Whether the code came from the SEC because Massive reported none, which a reader should be
+    /// able to count: SEC codes are today's, not the observation's.
+    coded_by_sec: bool,
 }
 
 /// The tradeable universe, and the grid of observations it was built from.
@@ -97,12 +104,18 @@ struct Observation {
 pub struct Universe {
     rows: DataFrame,
     observations: Vec<i64>,
+    coded_by_sec: usize,
 }
 
 impl Universe {
     /// One row per (ticker, `as_of`) that was common stock then.
     pub fn rows(&self) -> &DataFrame {
         &self.rows
+    }
+
+    /// Rows whose sector came from the SEC's current code because Massive reported none.
+    pub fn coded_by_sec(&self) -> usize {
+        self.coded_by_sec
     }
 }
 
@@ -114,6 +127,7 @@ impl Universe {
 pub fn universe_of(
     partitions: &[(SessionDate, DataFrame)],
     table: &ClassificationTable,
+    industry_codes: Option<&IndustryCodesTable>,
 ) -> Result<Universe, PolarsError> {
     // Ascending here rather than trusting the caller: the carry-forward is only correct in order,
     // and a caller that listed the prefix differently would silently invert it.
@@ -127,6 +141,7 @@ pub fn universe_of(
     let mut sectors: Vec<String> = Vec::new();
     let mut industries: Vec<String> = Vec::new();
     let mut shares: Vec<Option<f64>> = Vec::new();
+    let mut coded_by_sec = 0usize;
 
     for (as_of, frame) in ordered {
         // Aged first, so a symbol this observation answers for is reset to zero below and only the
@@ -135,7 +150,7 @@ pub fn universe_of(
             observation.carried += 1;
             observation.carried <= CARRY_FORWARD_OBSERVATIONS
         });
-        for (ticker, observation) in observations_of(frame, table)? {
+        for (ticker, observation) in observations_of(frame, table, industry_codes)? {
             // A newer observation supersedes an older one, which is what makes a reclassification
             // out of common stock take effect rather than being carried past.
             current.insert(ticker, observation);
@@ -152,6 +167,7 @@ pub fn universe_of(
             sectors.push(sector_code(observation.sector));
             industries.push(industry_code(observation.industry));
             shares.push(observation.shares_outstanding);
+            coded_by_sec += usize::from(observation.coded_by_sec);
         }
     }
 
@@ -164,6 +180,7 @@ pub fn universe_of(
             Column::new("shares_outstanding".into(), shares),
         ])?,
         observations,
+        coded_by_sec,
     })
 }
 
@@ -171,18 +188,35 @@ pub fn universe_of(
 fn observations_of(
     frame: &DataFrame,
     table: &ClassificationTable,
+    industry_codes: Option<&IndustryCodesTable>,
 ) -> Result<Vec<(String, Observation)>, PolarsError> {
     let tickers = frame.column("ticker")?.str()?;
     let security_types = frame.column("security_type")?.str()?;
     let sic_codes = frame.column("sic_code")?.str()?;
     let shares = frame.column("shares_outstanding")?.f64()?;
+    // Absent from partitions swept before the CIK was recorded, which then fall back to nothing.
+    let ciks = frame
+        .column("cik")
+        .ok()
+        .map(|column| column.str().cloned())
+        .transpose()?;
 
     let mut observations = Vec::with_capacity(frame.height());
     for index in 0..frame.height() {
         let Some(ticker) = tickers.get(index) else {
             continue;
         };
-        let sic_code = sic_codes.get(index);
+        // Massive's point-in-time code wins; the SEC's current one only fills what it left empty.
+        let reported = sic_codes.get(index).and_then(SicCode::new);
+        let filled = match (&reported, industry_codes, &ciks) {
+            (None, Some(industry_codes), Some(ciks)) => ciks
+                .get(index)
+                .and_then(Cik::new)
+                .and_then(|cik| industry_codes.code_of(&cik).cloned()),
+            _ => None,
+        };
+        let coded_by_sec = filled.is_some();
+        let sic_code = reported.or(filled);
         observations.push((
             ticker.to_string(),
             Observation {
@@ -194,13 +228,14 @@ fn observations_of(
                     .get(index)
                     .filter(|count| count.is_finite() && *count > 0.0),
                 // Both lookups are total over four-digit codes, so `None` here carries exactly
-                // one meaning: the feed reported no usable code.
+                // one meaning: neither Massive nor the SEC reported a usable code.
                 sector: sic_code
-                    .and_then(SicCode::new)
-                    .map(|code| classification::sector_of(table, &code)),
+                    .as_ref()
+                    .map(|code| classification::sector_of(table, code)),
                 industry: sic_code
-                    .and_then(SicCode::new)
-                    .map(|code| classification::industry_of(table, &code)),
+                    .as_ref()
+                    .map(|code| classification::industry_of(table, code)),
+                coded_by_sec,
             },
         ));
     }
@@ -542,6 +577,112 @@ mod tests {
         )
     }
 
+    /// A partition whose rows name the filer, which every sweep since the CIK was recorded writes.
+    fn partition_with_ciks(
+        as_of: (i32, u32, u32),
+        rows: &[(&str, Option<&str>, Option<&str>)],
+    ) -> (SessionDate, DataFrame) {
+        let date = SessionDate::from_date(
+            chrono::NaiveDate::from_ymd_opt(as_of.0, as_of.1, as_of.2).expect("a valid date"),
+        );
+        let references: Vec<EquityReference> = rows
+            .iter()
+            .map(|(ticker, sic, cik)| {
+                EquityReference::new(
+                    Ticker::new(ticker).expect("a valid test symbol"),
+                    date,
+                    Some(SecurityType::CommonStock),
+                    sic.and_then(SicCode::new),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("the fixture must be constructible")
+                .with_cik(cik.and_then(Cik::new))
+            })
+            .collect();
+        (
+            date,
+            reference_to_dataframe(&references).expect("the frame must build"),
+        )
+    }
+
+    fn sectors(universe: &Universe) -> Vec<(String, String)> {
+        let tickers = universe.rows().column("ticker").unwrap().str().unwrap();
+        let sectors = universe.rows().column("sector").unwrap().str().unwrap();
+        (0..universe.rows().height())
+            .map(|row| {
+                (
+                    tickers.get(row).unwrap().to_string(),
+                    sectors.get(row).unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The gap this exists for: Massive gives AZN, RY and SPOT no code but does name the filer, and
+    /// EDGAR's code for that filer places it. Massive's own code, where it has one, still wins --
+    /// it is the observation's, and the SEC's is only today's.
+    #[test]
+    fn test_the_sec_code_fills_only_what_massive_left_empty() {
+        let observation = partition_with_ciks(
+            (2026, 7, 1),
+            &[
+                ("AGRI", Some("0100"), Some("1")),
+                ("AZN", None, Some("901832")),
+                ("NOCK", None, None),
+            ],
+        );
+        let industry_codes = crate::data::industry_codes::fixture::table(vec![
+            crate::data::industry_codes::fixture::code("1", "3571"),
+            crate::data::industry_codes::fixture::code("901832", "3571"),
+        ]);
+
+        let without = universe_of(&[observation.clone()], &table(), None).unwrap();
+        let with = universe_of(&[observation], &table(), Some(&industry_codes)).unwrap();
+
+        let expected_without = vec![
+            ("AGRI".to_string(), "ConsumerNondurables".to_string()),
+            ("AZN".to_string(), "NOT AVAILABLE".to_string()),
+            ("NOCK".to_string(), "NOT AVAILABLE".to_string()),
+        ];
+        assert_eq!(sectors(&without), expected_without);
+        assert_eq!(
+            sectors(&with),
+            vec![
+                ("AGRI".to_string(), "ConsumerNondurables".to_string()),
+                ("AZN".to_string(), "BusinessEquipment".to_string()),
+                ("NOCK".to_string(), "NOT AVAILABLE".to_string()),
+            ],
+            "AGRI keeps Massive's code over the SEC's, AZN is filled, and a name with no filer stays empty"
+        );
+        assert_eq!(without.coded_by_sec(), 0);
+        assert_eq!(
+            with.coded_by_sec(),
+            1,
+            "only AZN's sector came from the SEC"
+        );
+    }
+
+    /// Partitions swept before the CIK was recorded have no `cik` column, and must read as they
+    /// always did rather than failing the universe.
+    #[test]
+    fn test_a_partition_without_a_cik_column_reads_as_before() {
+        let (as_of, frame) = partition_with_ciks((2021, 10, 1), &[("AZN", None, Some("901832"))]);
+        let frame = frame.drop("cik").expect("the column must drop");
+        let industry_codes = crate::data::industry_codes::fixture::table(vec![
+            crate::data::industry_codes::fixture::code("901832", "3571"),
+        ]);
+
+        let universe = universe_of(&[(as_of, frame)], &table(), Some(&industry_codes)).unwrap();
+
+        assert_eq!(
+            sectors(&universe),
+            vec![("AZN".to_string(), "NOT AVAILABLE".to_string())]
+        );
+    }
+
     fn bars(rows: &[(&str, i64)]) -> DataFrame {
         DataFrame::new(vec![
             Column::new(
@@ -587,6 +728,7 @@ mod tests {
                 ],
             )],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -618,6 +760,7 @@ mod tests {
                 ],
             )],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -643,6 +786,7 @@ mod tests {
         let universe = universe_of(
             &[partition((2021, 10, 1), &[("ZZZZ", "CS", None)])],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -661,10 +805,11 @@ mod tests {
 
     #[test]
     fn test_an_empty_archive_yields_an_empty_universe_with_the_same_schema() {
-        let empty = universe_of(&[], &table()).expect("an empty universe must build");
+        let empty = universe_of(&[], &table(), None).expect("an empty universe must build");
         let populated = universe_of(
             &[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -682,6 +827,7 @@ mod tests {
                 partition((2022, 1, 3), &[("AAPL", "CS", Some("7372"))]),
             ],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -716,6 +862,7 @@ mod tests {
                 partition((2022, 1, 3), &[("AAPL", "CS", Some("3571"))]),
             ],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -752,6 +899,7 @@ mod tests {
                 partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
             ],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -778,6 +926,7 @@ mod tests {
                 partition((2022, 4, 1), &[("AAPL", "CS", Some("3571"))]),
             ],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -810,6 +959,7 @@ mod tests {
                 partition((2022, 1, 3), &[("XYZ", "ETF", None)]),
             ],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -844,6 +994,7 @@ mod tests {
                 partition_with_shares((2022, 1, 3), &[("AAPL", "CS", Some("3571"), Some(14.59e9))]),
             ],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -875,6 +1026,7 @@ mod tests {
                 &[("AAPL", "CS", Some("3571"), None)],
             )],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -920,6 +1072,7 @@ mod tests {
                     stored,
                 )],
                 &table(),
+                None,
             )
             .expect("the universe must build");
 
@@ -965,6 +1118,7 @@ mod tests {
                 stored,
             )],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -989,6 +1143,7 @@ mod tests {
         let universe = universe_of(
             &[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])],
             &table(),
+            None,
         )
         .expect("the universe must build");
 
@@ -1003,6 +1158,7 @@ mod tests {
         let universe = universe_of(
             &[partition((2021, 10, 1), &[("AAPL", "CS", Some("3571"))])],
             &table(),
+            None,
         )
         .expect("the universe must build");
 

@@ -294,6 +294,9 @@ enum ReferenceAction {
         #[arg(long, value_name = "YYYY-MM-DD")]
         as_of: Option<NaiveDate>,
     },
+    /// Ask EDGAR for every filer the archive holds no Massive code for, and publish the SEC's codes
+    /// when they changed. What the nightly runs after a sweep writes a new observation.
+    IndustryCodes,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1729,6 +1732,15 @@ async fn archive_nightly(
         ReferenceOutcome::Skipped
     };
     info!(%reference, "Reference sweep finished");
+    // Only after a new observation: that is the only thing that can add a filer lacking a code, and
+    // asking EDGAR about a thousand filers every night would spend two minutes to learn nothing.
+    let observed =
+        matches!(&reference, ReferenceOutcome::Swept { written, .. } if !written.is_empty());
+    if observed && budget.may_start_another() {
+        if let Err(error) = refresh_industry_codes(today).await {
+            error!(%error, "SEC industry codes were not refreshed; the stored table stands");
+        }
+    }
     report.record_reference(reference);
 
     // Written before the caller decides the exit code, because the box stops itself once this
@@ -1898,6 +1910,40 @@ async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
 /// bar archive: the grid point for a new quarter is a session whose bars this same run has just
 /// written. Deferral is cheap here in a way it is not for a leg -- the work is defined by a set
 /// difference over quarters, so a night that skips it loses a day and never the quarter.
+/// Refreshes the SEC's industry codes for every filer the archive lacks a Massive code for.
+///
+/// Logged rather than journalled: a change is recorded as a new `as_of` partition, which is dated,
+/// durable and readable without this box, and a second record of the same fact would be two things
+/// that must agree. A refresh that could not ask every filer is a failure, because it publishes
+/// nothing.
+async fn refresh_industry_codes(today: SessionDate) -> Result<Outcome, SeedError> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+    let edgar_client = fund::common::edgar::EdgarClient::from_env().map_err(box_error)?;
+    let outcome = archive::refresh_industry_codes(&s3_client, &edgar_client, &bucket, today)
+        .await
+        .map_err(box_error)?;
+    match outcome {
+        archive::IndustryCodesOutcome::NothingToLookUp => {
+            info!("Every common stock the archive holds carries a Massive code")
+        }
+        archive::IndustryCodesOutcome::Unchanged { filers, coded } => {
+            info!(filers, coded, "SEC industry codes unchanged")
+        }
+        archive::IndustryCodesOutcome::Published {
+            as_of,
+            filers,
+            coded,
+        } => info!(%as_of, filers, coded, "SEC industry codes published"),
+        archive::IndustryCodesOutcome::Incomplete { filers, failed } => {
+            return Err(SeedError::Failed(
+                format!("{failed} of {filers} EDGAR lookups failed; nothing was published").into(),
+            ));
+        }
+    }
+    Ok(Outcome::Complete)
+}
+
 async fn run_reference(
     today: SessionDate,
     budget: &nightly::Budget,
@@ -2206,6 +2252,9 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
         ReferenceAction::Archive(arguments) => (arguments, true),
         ReferenceAction::Probe(arguments) => (arguments, false),
         ReferenceAction::Grid { as_of } => return report_reference_grid(*as_of).await,
+        ReferenceAction::IndustryCodes => {
+            return refresh_industry_codes(SessionDate::at(Utc::now())).await;
+        }
     };
     let window = arguments.window.window()?;
     let bucket = bucket_name()?;
@@ -3955,6 +4004,18 @@ mod tests {
             panic!("expected a reference command");
         };
         assert!(matches!(action, ReferenceAction::Archive(_)));
+    }
+
+    /// Named in the plan and the runbook, so a rename would strand the one-off backfill that runs
+    /// it by hand.
+    #[test]
+    fn test_the_industry_codes_refresh_parses_with_no_arguments() {
+        let parsed = Arguments::try_parse_from(["seed", "equity-reference", "industry-codes"])
+            .expect("industry-codes must parse on its own");
+        let Command::EquityReference { action } = parsed.command else {
+            panic!("expected a reference command");
+        };
+        assert!(matches!(action, ReferenceAction::IndustryCodes));
     }
 
     #[test]

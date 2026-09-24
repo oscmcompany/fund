@@ -1820,6 +1820,27 @@ impl SicCode {
     }
 }
 
+/// The SEC's Central Index Key: which company filed, independent of the ticker it trades under.
+///
+/// Stored zero-padded to ten digits, the width EDGAR's own paths use, so two spellings of one company
+/// compare equal. A ticker can be reused by a different company; a CIK cannot.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Cik(String);
+
+impl Cik {
+    /// `None` unless the key is one to ten ASCII digits and not all zeros.
+    pub fn new(key: &str) -> Option<Self> {
+        let usable = (1..=10).contains(&key.len())
+            && key.chars().all(|digit| digit.is_ascii_digit())
+            && key.chars().any(|digit| digit != '0');
+        usable.then(|| Self(format!("{key:0>10}")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// What kind of instrument a symbol is, as the reference feed classifies it.
 ///
 /// The variant that matters is [`SecurityType::CommonStock`]: a bar exists for every instrument that
@@ -1917,6 +1938,8 @@ pub struct EquityReference {
     /// The feed's own capitalization, carried only as a cross-check against `shares x close`.
     reported_market_capitalization: Option<f64>,
     primary_exchange: Option<String>,
+    /// The filer behind the ticker on `as_of`, which is what an SEC lookup is keyed by.
+    cik: Option<Cik>,
 }
 
 impl EquityReference {
@@ -1959,7 +1982,17 @@ impl EquityReference {
             shares_outstanding,
             reported_market_capitalization,
             primary_exchange,
+            cik: None,
         })
+    }
+
+    /// Attaches the filer the feed named, which only the Massive route reports.
+    pub fn with_cik(self, cik: Option<Cik>) -> Self {
+        Self { cik, ..self }
+    }
+
+    pub fn cik(&self) -> Option<&Cik> {
+        self.cik.as_ref()
     }
 
     pub fn ticker(&self) -> &Ticker {

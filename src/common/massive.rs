@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::common::types::{
-    BarInterval, EquityBar, EquityReference, EquitySplit, SecurityType, SessionDate, SicCode,
+    BarInterval, Cik, EquityBar, EquityReference, EquitySplit, SecurityType, SessionDate, SicCode,
     Ticker,
 };
 
@@ -195,6 +195,7 @@ struct ReferenceRow {
     share_class_shares_outstanding: Option<f64>,
     market_cap: Option<f64>,
     primary_exchange: Option<String>,
+    cik: Option<String>,
 }
 
 /// The per-ticker reference envelope, which carries one result rather than a page of them.
@@ -598,6 +599,9 @@ impl MassiveClient {
             row.market_cap,
             row.primary_exchange,
         )
+        // Point-in-time like every other field here, which is what makes a later SEC lookup by it
+        // safe against a ticker the feed has since given to a different company.
+        .map(|reference| reference.with_cik(row.cik.as_deref().and_then(Cik::new)))
         .map(Some)
         .map_err(|error| MassiveError::Parse(format!("{ticker} on {as_of}: {error}")))
     }
@@ -1223,6 +1227,21 @@ mod tests {
         );
         assert_eq!(reference.primary_exchange(), Some("XNAS"));
         assert!(reference.is_tradeable_equity());
+    }
+
+    /// Shaped on the live answer for AZN on 2026-07-01: no SIC code, but the filer named, which is
+    /// what lets EDGAR supply the code Massive does not.
+    #[tokio::test]
+    async fn test_a_foreign_issuer_carries_its_filer_without_a_code() {
+        let azn = r#"{"status":"OK","results":{"ticker":"AZN","type":"CS","cik":"0000901832","sic_code":null,"primary_exchange":"XNAS"}}"#;
+
+        let reference = reference_for(azn, "AZN")
+            .await
+            .expect("a record without a code is not an error")
+            .expect("the feed had a record");
+
+        assert_eq!(reference.sic_code(), None);
+        assert_eq!(reference.cik().map(Cik::as_str), Some("0000901832"));
     }
 
     #[tokio::test]
