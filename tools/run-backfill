@@ -44,10 +44,14 @@ case "${1:-}" in
     REQUIRED_KEYS=""
     OPTIONAL_KEYS=""
     ;;
-  # The drift checks come through here for this environment alone: the conditions tool needs the
-  # Massive credential, and neither needs Alpaca.
+  # The drift checks come through here for this environment alone. Keys per tool: the
+  # classification check reads a public feed, and loading Massive's credential for it would let a
+  # missing Massive secret record a failed check the tool never needed that secret for.
   check-reference)
-    REQUIRED_KEYS="MASSIVE_BASE_URL MASSIVE_API_KEY"
+    case "${2:-}" in
+      fetch-trade-conditions) REQUIRED_KEYS="MASSIVE_BASE_URL MASSIVE_API_KEY" ;;
+      *) REQUIRED_KEYS="" ;;
+    esac
     OPTIONAL_KEYS=""
     ;;
 esac

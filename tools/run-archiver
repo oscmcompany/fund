@@ -103,9 +103,11 @@ CONDITIONS_CHECK_STATUS=0
 CLASSIFICATION_CHECK_STATUS=0
 if [[ "$SYNCED" == true ]]; then
   log "Checking the reference tables against their sources"
-  run_wrapped conditions-check tools/run-backfill check-reference fetch-trade-conditions \
+  # Bounded, because a request that hangs would hold the fold and the export behind it. A check
+  # cut off by the deadline exits 124 and is recorded as failed.
+  run_wrapped conditions-check timeout 300 tools/run-backfill check-reference fetch-trade-conditions \
     || CONDITIONS_CHECK_STATUS=$?
-  run_wrapped classification-check tools/run-backfill check-reference fetch-industry-classifications \
+  run_wrapped classification-check timeout 300 tools/run-backfill check-reference fetch-industry-classifications \
     || CLASSIFICATION_CHECK_STATUS=$?
   log "Reference checks: conditions ${CONDITIONS_CHECK_STATUS}, classification ${CLASSIFICATION_CHECK_STATUS}"
 fi

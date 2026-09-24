@@ -21,14 +21,17 @@ fn exit_through_leave(tool_name: &str, declared: bool, status: i32) -> i32 {
          WORK=\"$(mktemp -d)\"\n\
          DRIFT_STATUS=3\n\
          DRIFT_DECLARED={declared}\n\
-         eval \"$(sed -n '/^leave() {{/,/^}}/p' {script})\"\n\
+         eval \"$(sed -n '/^leave() {{/,/^}}/p' \"$1\")\"\n\
          trap leave EXIT\n\
          exit {status}\n",
-        script = tool(tool_name).display(),
     );
+    // The path travels as `$1` rather than inside the program, so a checkout under a directory
+    // with a space in its name still reaches `sed` as one argument.
     Command::new("bash")
         .arg("-c")
         .arg(program)
+        .arg("bash")
+        .arg(tool(tool_name))
         .status()
         .expect("bash must run")
         .code()
