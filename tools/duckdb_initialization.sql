@@ -135,24 +135,40 @@ FROM read_parquet(
 -- and non-market-price prints, because both are still folded, while ineligible and corrected
 -- prints are not. A rising share means the provider is using a code the table does not publish.
 --
--- Read it per provider. Sessions folded from Massive flat files carry ~30% by construction: they
--- spell conditions as identifiers, and the table publishes sale conditions only, so a print flagged
--- with a non-sale identifier such as 41 (Trade Thru Exempt) resolves to nothing and is counted.
--- Sessions folded from Alpaca spell SIP characters and read 0% -- 2026-09-21 onward is the clean
--- baseline this view detects drift against. The provider is in each partition's sidecar.
+-- Read it per provider, which `providers` names from each partition's own provenance sidecar.
+-- Sessions folded from Massive flat files carry ~30% by construction: they spell conditions as
+-- identifiers, and the table publishes sale conditions only, so a print carrying a non-sale flag
+-- resolves to nothing and is counted. Alpaca spells SIP characters and reads 0%.
 .print 'Loading unresolved_condition_rate...'
 DROP VIEW IF EXISTS unresolved_condition_rate;
 CREATE OR REPLACE VIEW unresolved_condition_rate AS
+WITH rate AS (
+    SELECT
+        make_date(CAST(year AS INTEGER), CAST(month AS INTEGER), CAST(day AS INTEGER)) AS session_date,
+        count(*) AS names,
+        sum(trade_count + volume_ineligible_trades + corrected_trades) AS prints_classified,
+        sum(unresolved_condition_trades) AS unresolved_prints
+    FROM trade_summaries
+    GROUP BY ALL
+),
+provenance AS (
+    SELECT
+        CAST(session AS DATE) AS session_date,
+        list_sort(list_distinct(list_transform(routes, route -> route.provider))) AS providers
+    FROM read_json(
+        's3://' || getvariable('archive_bucket') || '/data/derived/equity/trades/interval=one_day/**/*.provenance.json'
+    )
+)
 SELECT
-    make_date(CAST(year AS INTEGER), CAST(month AS INTEGER), CAST(day AS INTEGER)) AS session_date,
-    count(*) AS names,
-    sum(trade_count + volume_ineligible_trades + corrected_trades) AS prints_classified,
-    sum(unresolved_condition_trades) AS unresolved_prints,
-    sum(unresolved_condition_trades)
-        / nullif(sum(trade_count + volume_ineligible_trades + corrected_trades), 0) AS unresolved_share
-FROM trade_summaries
-GROUP BY ALL
-ORDER BY session_date;
+    rate.session_date,
+    provenance.providers,
+    rate.names,
+    rate.prints_classified,
+    rate.unresolved_prints,
+    rate.unresolved_prints / nullif(rate.prints_classified, 0) AS unresolved_share
+FROM rate
+LEFT JOIN provenance USING (session_date)
+ORDER BY rate.session_date;
 
 -- Share of each quarterly observation's common stock the classification cannot place.
 --
