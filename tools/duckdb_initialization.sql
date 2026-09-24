@@ -117,6 +117,111 @@ FROM read_parquet(
     's3://' || getvariable('archive_bucket') || '/data/derived/equity/corporate_actions/boundaries.parquet'
 );
 
+-- One row per name per session, daily cadence only, for the reason training_bars gives. Every row
+-- carries what the fold excluded beside what it kept, so a rate is a query over the partitions
+-- rather than a number a run has to remember.
+.print 'Loading trade_summaries...'
+DROP VIEW IF EXISTS trade_summaries;
+CREATE OR REPLACE VIEW trade_summaries AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('archive_bucket') || '/data/derived/equity/trades/interval=one_day/**/*.parquet',
+    hive_partitioning = true
+);
+
+-- Share of each session's prints whose conditions the published table could not resolve.
+--
+-- The denominator is every print the fold classified: `trade_count` already holds the unresolved
+-- and non-market-price prints, because both are still folded, while ineligible and corrected
+-- prints are not. A rising share means the provider is using a code the table does not publish.
+--
+-- Read it per provider, which `providers` names from each partition's own provenance sidecar.
+-- Sessions folded from Massive flat files before 2026-09-24 carry ~30% by construction: Massive
+-- flags trade-through-exempt prints with identifier 41, which the table did not then publish --
+-- 29.4% of prints in the 2026-09-18 file, and the only code there it lacked. The fold is final, so
+-- those counts stay; volume and VWAP were unaffected, because 41 counts toward volume. Alpaca
+-- spells SIP characters and reads 0%.
+.print 'Loading unresolved_condition_rate...'
+DROP VIEW IF EXISTS unresolved_condition_rate;
+CREATE OR REPLACE VIEW unresolved_condition_rate AS
+WITH rate AS (
+    SELECT
+        make_date(CAST(year AS INTEGER), CAST(month AS INTEGER), CAST(day AS INTEGER)) AS session_date,
+        count(*) AS names,
+        sum(trade_count + volume_ineligible_trades + corrected_trades) AS prints_classified,
+        sum(unresolved_condition_trades) AS unresolved_prints
+    FROM trade_summaries
+    GROUP BY ALL
+),
+provenance AS (
+    SELECT
+        CAST(session AS DATE) AS session_date,
+        list_sort(list_distinct(list_transform(routes, route -> route.provider))) AS providers
+    FROM read_json(
+        's3://' || getvariable('archive_bucket') || '/data/derived/equity/trades/interval=one_day/**/*.provenance.json'
+    )
+)
+SELECT
+    rate.session_date,
+    provenance.providers,
+    rate.names,
+    rate.prints_classified,
+    rate.unresolved_prints,
+    rate.unresolved_prints / nullif(rate.prints_classified, 0) AS unresolved_share
+FROM rate
+LEFT JOIN provenance USING (session_date)
+ORDER BY rate.session_date;
+
+-- Share of each quarterly observation's common stock the classification cannot place.
+--
+-- Only `no_sic_code` is unclassified: the feed declined to give a code, so the name has no sector.
+-- `fallback_bucket` counts codes no published range covers, which land in Other by construction --
+-- the 12-sector definition lists eleven sectors and makes Other the remainder, so a large count at
+-- that granularity is the design rather than a gap. Measured against the newest published mapping,
+-- which is what every read applies.
+.print 'Loading unclassified_share...'
+DROP VIEW IF EXISTS unclassified_share;
+CREATE OR REPLACE VIEW unclassified_share AS
+-- A window rather than `WHERE as_of = (SELECT max(as_of) ...)`: DuckDB 1.5.2 fails an internal
+-- assertion on that scalar subquery over a hive-partitioned read.
+WITH mapping AS (
+    SELECT granularity, low, high
+    FROM read_parquet(
+        's3://' || getvariable('archive_bucket') || '/data/reference/classification/*/data.parquet',
+        hive_partitioning = true
+    )
+    QUALIFY as_of = max(as_of) OVER ()
+),
+common_stock AS (
+    SELECT as_of, ticker, TRY_CAST(sic_code AS INTEGER) AS sic_digits
+    FROM training_reference
+    WHERE security_type = 'CS'
+),
+-- One row per name per granularity, with whether any published range covers its code.
+placed AS (
+    SELECT
+        stock.as_of,
+        granularity.name AS granularity,
+        stock.sic_digits,
+        bool_or(mapping.low IS NOT NULL) AS covered
+    FROM common_stock AS stock
+    CROSS JOIN (VALUES ('sector'), ('industry')) AS granularity(name)
+    LEFT JOIN mapping
+        ON mapping.granularity = granularity.name
+       AND stock.sic_digits BETWEEN mapping.low AND mapping.high
+    GROUP BY stock.as_of, granularity.name, stock.ticker, stock.sic_digits
+)
+SELECT
+    as_of,
+    granularity,
+    count(*) AS common_stocks,
+    count(*) FILTER (WHERE sic_digits IS NULL) AS no_sic_code,
+    count(*) FILTER (WHERE sic_digits IS NULL) / count(*) AS unclassified_share,
+    count(*) FILTER (WHERE sic_digits IS NOT NULL AND NOT covered) AS fallback_bucket
+FROM placed
+GROUP BY as_of, granularity
+ORDER BY as_of, granularity;
+
 -- ---------------------------------------------------------------------------
 -- Nightly exports (exports/) -- one view per exported table
 -- ---------------------------------------------------------------------------

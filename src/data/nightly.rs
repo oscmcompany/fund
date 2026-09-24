@@ -407,6 +407,29 @@ impl fmt::Display for ReferenceOutcome {
     }
 }
 
+/// What a reference table's `--check` reported when the nightly ran it.
+///
+/// Drift is a fact about the provider rather than a failure of the run, so it is recorded and the
+/// run's exit status is left alone. `Failed` is kept apart from `Drifted` because a check that could
+/// not reach the provider says nothing about whether the provider moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ReferenceCheck {
+    Matches,
+    Drifted,
+    Failed { exit_status: i32 },
+}
+
+impl ReferenceCheck {
+    /// Reads the tools' contract: 0 matches, 3 drifted, and anything else is a check not made.
+    pub fn from_exit_status(exit_status: i32) -> Self {
+        match exit_status {
+            0 => ReferenceCheck::Matches,
+            3 => ReferenceCheck::Drifted,
+            exit_status => ReferenceCheck::Failed { exit_status },
+        }
+    }
+}
+
 /// What became of one leg.
 ///
 /// Skipped and failed are separate variants rather than one "did not finish", because a night that
@@ -1161,5 +1184,22 @@ mod report_tests {
         }
         report.record_reference(ReferenceOutcome::Failed("no credentials".to_string()));
         assert!(!report.is_complete());
+    }
+
+    /// The contract both `--check` tools state in their headers, pinned to literals so a change on
+    /// either side fails here rather than recording drift as a failed check or the reverse.
+    #[test]
+    fn test_a_check_status_reads_as_the_tools_define_it() {
+        assert_eq!(ReferenceCheck::from_exit_status(0), ReferenceCheck::Matches);
+        assert_eq!(ReferenceCheck::from_exit_status(3), ReferenceCheck::Drifted);
+        assert_eq!(
+            ReferenceCheck::from_exit_status(1),
+            ReferenceCheck::Failed { exit_status: 1 }
+        );
+        assert_eq!(
+            ReferenceCheck::from_exit_status(127),
+            ReferenceCheck::Failed { exit_status: 127 },
+            "a tool that was never found is a check not made, not a provider that moved"
+        );
     }
 }

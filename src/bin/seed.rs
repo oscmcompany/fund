@@ -26,7 +26,7 @@ use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSe
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
 use fund::data::export;
-use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport, ReferenceOutcome};
+use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome};
 use fund::data::{attribution, bars, details, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
@@ -146,6 +146,13 @@ struct NightlyArguments {
     /// cap of N sessions would take forty nights to heal a two-hundred-session hole.
     #[arg(long, default_value_t = 240)]
     budget_minutes: u64,
+    /// Exit status of `fetch-trade-conditions --check`, which `run-archiver` runs before the fold.
+    /// Recorded rather than acted on; absent on a hand-run fold, which checked nothing.
+    #[arg(long, value_name = "STATUS")]
+    conditions_check_status: Option<i32>,
+    /// Exit status of `fetch-industry-classifications --check`, recorded the same way.
+    #[arg(long, value_name = "STATUS")]
+    classification_check_status: Option<i32>,
     #[command(flatten)]
     files: FlatFileArguments,
 }
@@ -1726,7 +1733,16 @@ async fn archive_nightly(
 
     // Written before the caller decides the exit code, because the box stops itself once this
     // returns: a record produced after the run is a record produced on a machine that is gone.
-    record_the_fold(&report).await;
+    record_the_fold(
+        &report,
+        arguments
+            .conditions_check_status
+            .map(ReferenceCheck::from_exit_status),
+        arguments
+            .classification_check_status
+            .map(ReferenceCheck::from_exit_status),
+    )
+    .await;
 
     Ok(Outcome::Nightly(report))
 }
@@ -1736,7 +1752,11 @@ async fn archive_nightly(
 /// A missing journal is logged and stepped over rather than failing the run. The fold is the work
 /// and the record is the account of it; losing the account is bad, and throwing away a completed
 /// fold because the account could not be filed is worse.
-async fn record_the_fold(report: &NightlyReport) {
+async fn record_the_fold(
+    report: &NightlyReport,
+    conditions_check: Option<ReferenceCheck>,
+    classification_check: Option<ReferenceCheck>,
+) {
     let journal = match Journal::from_env() {
         Ok(journal) => journal,
         Err(error) => {
@@ -1753,6 +1773,8 @@ async fn record_the_fold(report: &NightlyReport) {
         legs: report.legs().to_vec(),
         reference: report.reference().cloned(),
         conditions_as_of: report.conditions_as_of(),
+        conditions_check,
+        classification_check,
     });
     journal
         .record(uuid::Uuid::new_v4(), Utc::now(), observation)
@@ -3087,6 +3109,26 @@ mod tests {
         assert_eq!(conditions_folded_under(1, Some(as_of)), Some(as_of));
         // And a leg that wrote without a table cannot name one, which is every leg but trades.
         assert_eq!(conditions_folded_under(3, None), None);
+    }
+
+    /// `run-archiver` passes both statuses by these names, so a rename here would fail every
+    /// scheduled run at argument parsing -- before the fold, not just the record.
+    #[test]
+    fn test_the_nightly_takes_both_check_statuses_by_the_names_the_wrapper_uses() {
+        let arguments = nightly(&[
+            "--conditions-check-status",
+            "3",
+            "--classification-check-status",
+            "0",
+        ]);
+
+        assert_eq!(arguments.conditions_check_status, Some(3));
+        assert_eq!(arguments.classification_check_status, Some(0));
+        let unchecked = nightly(&[]);
+        assert_eq!(
+            unchecked.conditions_check_status, None,
+            "a hand-run fold checked nothing"
+        );
     }
 
     fn parse(arguments: &[&str]) -> Result<Arguments, clap::Error> {

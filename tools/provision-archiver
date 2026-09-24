@@ -394,6 +394,10 @@ sudo -u ubuntu -H bash -c '
   cargo build --release --bin seed
   git rev-parse HEAD > target/release/.seed-built-from
 '
+# The reference checks compare tables with it, and it is the one tool here apt does not carry. Not
+# fatal: without it the checks record Failed and the fold still runs, while a stopped provision
+# would leave the box without its service.
+bash /home/ubuntu/fund/tools/install-duckdb || echo "duckdb was not installed; the reference checks will record Failed"
 install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service \
   /etc/systemd/system/fund-archiver.service
 systemctl daemon-reload
@@ -670,6 +674,7 @@ else
 "printf '%s' '${PROFILE}' > /etc/fund-profile",
 "mkdir -p /var/log/fund /var/journal/fund && chown ubuntu:ubuntu /var/log/fund /var/journal/fund",
 "sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
+"bash /home/ubuntu/fund/tools/install-duckdb || echo 'duckdb was not installed; the reference checks will record Failed'",
 "install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
 "systemctl daemon-reload",
 "systemctl enable fund-archiver.service",

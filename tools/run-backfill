@@ -44,6 +44,16 @@ case "${1:-}" in
     REQUIRED_KEYS=""
     OPTIONAL_KEYS=""
     ;;
+  # The drift checks come through here for this environment alone. Keys per tool: the
+  # classification check reads a public feed, and loading Massive's credential for it would let a
+  # missing Massive secret record a failed check the tool never needed that secret for.
+  check-reference)
+    case "${2:-}" in
+      fetch-trade-conditions) REQUIRED_KEYS="MASSIVE_BASE_URL MASSIVE_API_KEY" ;;
+      *) REQUIRED_KEYS="" ;;
+    esac
+    OPTIONAL_KEYS=""
+    ;;
 esac
 
 STDERR_FILE="$(mktemp)"
@@ -85,4 +95,23 @@ fi
 
 cd "$ROOT"
 rm -f "$STDERR_FILE"
+
+# Named tools only, so this cannot become a way to run anything in the checkout with the box's
+# credentials. The exit status is the tool's own, which `run-archiver` hands to the nightly.
+if [[ "${1:-}" == "check-reference" ]]; then
+  case "${2:-}" in
+    fetch-trade-conditions | fetch-industry-classifications) ;;
+    *)
+      echo "Error: check-reference takes fetch-trade-conditions or fetch-industry-classifications." >&2
+      exit 2
+      ;;
+  esac
+  # The classification check formats with rustfmt, which rustup installs where a service's PATH
+  # does not look.
+  if [[ -d "${HOME:-}/.cargo/bin" ]]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  exec "tools/$2" --check
+fi
+
 exec ./target/release/seed "$@"
