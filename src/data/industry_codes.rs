@@ -23,11 +23,15 @@ pub enum IndustryCodesError {
     UnusableCode { cik: String, code: Option<String> },
 }
 
-/// One filer's code, as EDGAR reported it when the table was published.
+/// One filer's answer, as EDGAR gave it when the table was published.
+///
+/// `sic_code` is `None` where EDGAR holds no code for the filer. The row is kept anyway, because the
+/// table records who was asked as well as what they said: that is how the nightly tells a filer
+/// EDGAR cannot code from one nobody has asked yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndustryCode {
     pub cik: Cik,
-    pub sic_code: SicCode,
+    pub sic_code: Option<SicCode>,
     pub sic_description: Option<String>,
 }
 
@@ -75,9 +79,22 @@ impl IndustryCodesTable {
         self.codes.is_empty()
     }
 
-    /// The code EDGAR reports for `cik`, or `None` when the table does not hold it.
+    /// The code EDGAR reports for `cik`, or `None` when it has none or was not asked.
     pub fn code_of(&self, cik: &Cik) -> Option<&SicCode> {
-        self.codes.get(cik).map(|row| &row.sic_code)
+        self.codes.get(cik).and_then(|row| row.sic_code.as_ref())
+    }
+
+    /// Whether `cik` was asked, whatever EDGAR answered.
+    pub fn asked(&self, cik: &Cik) -> bool {
+        self.codes.contains_key(cik)
+    }
+
+    /// Filers the table holds a code for, as opposed to filers it asked.
+    pub fn coded(&self) -> usize {
+        self.codes
+            .values()
+            .filter(|row| row.sic_code.is_some())
+            .count()
     }
 
     /// Whether `other` holds exactly these rows, which is what decides a new `as_of` is owed.
@@ -101,7 +118,7 @@ impl IndustryCodesTable {
             Column::new(
                 "sic_code".into(),
                 rows.iter()
-                    .map(|row| row.sic_code.as_str().to_string())
+                    .map(|row| row.sic_code.as_ref().map(|code| code.as_str().to_string()))
                     .collect::<Vec<_>>(),
             ),
             Column::new(
@@ -130,12 +147,17 @@ impl IndustryCodesTable {
                     cik: ciks.get(row).map(str::to_string),
                 }
             })?;
-            let sic_code = codes.get(row).and_then(SicCode::new).ok_or_else(|| {
-                IndustryCodesError::UnusableCode {
-                    cik: cik.as_str().to_string(),
-                    code: codes.get(row).map(str::to_string),
-                }
-            })?;
+            // Null is an answer -- EDGAR has no code -- and a present but malformed one is refused.
+            let sic_code =
+                match codes.get(row) {
+                    None => None,
+                    Some(stored) => Some(SicCode::new(stored).ok_or_else(|| {
+                        IndustryCodesError::UnusableCode {
+                            cik: cik.as_str().to_string(),
+                            code: Some(stored.to_string()),
+                        }
+                    })?),
+                };
             rows.push(IndustryCode {
                 cik,
                 sic_code,
@@ -153,7 +175,16 @@ pub(crate) mod fixture {
     pub(crate) fn code(cik: &str, sic: &str) -> IndustryCode {
         IndustryCode {
             cik: Cik::new(cik).expect("a usable CIK"),
-            sic_code: SicCode::new(sic).expect("a usable SIC code"),
+            sic_code: Some(SicCode::new(sic).expect("a usable SIC code")),
+            sic_description: None,
+        }
+    }
+
+    /// A filer EDGAR was asked about and holds no code for.
+    pub(crate) fn uncoded(cik: &str) -> IndustryCode {
+        IndustryCode {
+            cik: Cik::new(cik).expect("a usable CIK"),
+            sic_code: None,
             sic_description: None,
         }
     }
@@ -174,12 +205,23 @@ mod tests {
 
     #[test]
     fn test_a_table_round_trips_through_its_published_shape() {
-        let original = table(vec![code("901832", "2834"), code("1000275", "6029")]);
+        let original = table(vec![
+            code("901832", "2834"),
+            code("1000275", "6029"),
+            uncoded("1234"),
+        ]);
 
         let frame = original.to_dataframe().unwrap();
         let read = IndustryCodesTable::from_dataframe(original.as_of(), &frame).unwrap();
 
         assert_eq!(read, original);
+        let uncoded_filer = Cik::new("1234").unwrap();
+        assert!(
+            read.asked(&uncoded_filer),
+            "a filer with no code is still one that was asked"
+        );
+        assert_eq!(read.code_of(&uncoded_filer), None);
+        assert_eq!(read.coded(), 2);
         assert_eq!(
             read.code_of(&Cik::new("0000901832").unwrap())
                 .map(SicCode::as_str),

@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, QuoteRejection};
 use crate::common::events::Command;
 use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
+use crate::data::archive::IndustryCodesOutcome;
 use crate::data::nightly::{Leg, LegOutcome, ReferenceCheck, ReferenceOutcome};
 
 /// Version stamped on every record written by this build.
@@ -891,6 +892,10 @@ pub struct ArchiveFolded {
     pub conditions_check: Option<ReferenceCheck>,
     /// Whether the published SIC mapping and its committed vocabulary still match the source.
     pub classification_check: Option<ReferenceCheck>,
+    /// What the SEC industry-code refresh did, including when it was not owed or could not run.
+    ///
+    /// `None` only when the budget ran out before it was reached.
+    pub industry_codes: Option<IndustryCodesOutcome>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.
@@ -1332,6 +1337,10 @@ mod tests {
                 conditions_check: Some(crate::data::nightly::ReferenceCheck::Matches),
                 classification_check: Some(crate::data::nightly::ReferenceCheck::Failed {
                     exit_status: 1,
+                }),
+                industry_codes: Some(crate::data::archive::IndustryCodesOutcome::NotOwed {
+                    filers: 1365,
+                    rows_without_a_filer: 223,
                 }),
             }),
         ]

@@ -15,6 +15,10 @@ const SUBMISSIONS_BASE_URL: &str = "https://data.sec.gov/submissions";
 /// the margin is deliberate: a burst that crosses it costs far more than the time it saved.
 pub const REQUESTS_PER_SECOND: u32 = 8;
 
+/// Attempts per lookup. A run asks about a thousand filers and one dropped connection would
+/// otherwise refuse the whole table, which is what the first run against the live archive did.
+const ATTEMPTS: u32 = 3;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EdgarError {
     /// The SEC refuses requests whose User-Agent carries no contact, so there is no anonymous
@@ -41,9 +45,13 @@ struct Submissions {
     sic_description: Option<String>,
 }
 
+/// Cheap to clone, and every clone shares one pace: the SEC's limit is on the address, so concurrent
+/// lookups and their retries all draw from the same eight requests a second.
 #[derive(Clone)]
 pub struct EdgarClient {
     http_client: reqwest::Client,
+    base_url: String,
+    pace: std::sync::Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 }
 
 impl EdgarClient {
@@ -61,15 +69,59 @@ impl EdgarClient {
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http_client })
+        Ok(Self::with(http_client, SUBMISSIONS_BASE_URL))
+    }
+
+    fn with(http_client: reqwest::Client, base_url: &str) -> Self {
+        let mut pace = tokio::time::interval(std::time::Duration::from_millis(
+            1000 / u64::from(REQUESTS_PER_SECOND),
+        ));
+        // Delay rather than burst after a stall: catching up on missed ticks is exactly the burst
+        // the SEC answers by blocking the address.
+        pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            http_client,
+            base_url: base_url.to_string(),
+            pace: std::sync::Arc::new(tokio::sync::Mutex::new(pace)),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(base_url: &str) -> Self {
+        Self::with(reqwest::Client::new(), base_url)
     }
 
     /// The code `cik` is registered under, or `None` when EDGAR has no filer or no code for it.
     ///
     /// Both absences are answers: a filer with no SIC code on record is common among funds and
     /// shells, and a `404` is a CIK EDGAR does not know.
+    ///
+    /// A dropped connection or a server error is retried; a `403` or `429` is not, because both are
+    /// the SEC saying to stop and a retry would extend the block.
     pub async fn registration(&self, cik: &Cik) -> Result<Option<Registration>, EdgarError> {
-        let response = self.http_client.get(submissions_url(cik)).send().await?;
+        let mut attempt = 1;
+        loop {
+            self.pace.lock().await.tick().await;
+            let outcome = self.attempt(cik).await;
+            let retryable = match &outcome {
+                Err(EdgarError::Request(_)) => true,
+                Err(EdgarError::Status { status, .. }) => *status >= 500,
+                Err(EdgarError::MissingContact) | Ok(_) => false,
+            };
+            if !retryable || attempt == ATTEMPTS {
+                return outcome;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt) * 2)).await;
+            attempt += 1;
+        }
+    }
+
+    async fn attempt(&self, cik: &Cik) -> Result<Option<Registration>, EdgarError> {
+        let response = self
+            .http_client
+            .get(submissions_url(&self.base_url, cik))
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -83,8 +135,8 @@ impl EdgarClient {
     }
 }
 
-fn submissions_url(cik: &Cik) -> String {
-    format!("{SUBMISSIONS_BASE_URL}/CIK{}.json", cik.as_str())
+fn submissions_url(base_url: &str, cik: &Cik) -> String {
+    format!("{base_url}/CIK{}.json", cik.as_str())
 }
 
 /// A code EDGAR sends in a shape `SicCode` will not admit is no code, for the reason the Massive
@@ -107,7 +159,7 @@ mod tests {
     #[test]
     fn test_the_url_pads_the_cik_to_ten_digits() {
         assert_eq!(
-            submissions_url(&Cik::new("901832").unwrap()),
+            submissions_url(SUBMISSIONS_BASE_URL, &Cik::new("901832").unwrap()),
             "https://data.sec.gov/submissions/CIK0000901832.json"
         );
     }
@@ -130,5 +182,58 @@ mod tests {
             })
         );
         assert_eq!(registration_of(shell), None);
+    }
+
+    /// A server error is transient and a dropped connection costs a whole table, so both retry.
+    #[tokio::test]
+    async fn test_a_server_error_is_retried_and_the_answer_kept() {
+        let mut server = mockito::Server::new_async().await;
+        let failing = server
+            .mock("GET", "/CIK0000901832.json")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let answering = server
+            .mock("GET", "/CIK0000901832.json")
+            .with_status(200)
+            .with_body(r#"{"sic":"2834","sicDescription":"Pharmaceutical Preparations"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let registration = EdgarClient::for_tests(&server.url())
+            .registration(&Cik::new("901832").unwrap())
+            .await
+            .expect("the retry must succeed");
+
+        failing.assert_async().await;
+        answering.assert_async().await;
+        assert_eq!(
+            registration.map(|found| found.sic_code.as_str().to_string()),
+            Some("2834".to_string())
+        );
+    }
+
+    /// A 403 is the SEC blocking the address. Retrying would extend the block, so it is asked once.
+    #[tokio::test]
+    async fn test_a_refusal_is_not_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let refused = server
+            .mock("GET", "/CIK0000901832.json")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let outcome = EdgarClient::for_tests(&server.url())
+            .registration(&Cik::new("901832").unwrap())
+            .await;
+
+        refused.assert_async().await;
+        assert!(
+            matches!(outcome, Err(EdgarError::Status { status: 403, .. })),
+            "{outcome:?}"
+        );
     }
 }
