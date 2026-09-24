@@ -586,13 +586,16 @@ pub async fn unscreened_window(
     )
     .await?;
     let classification = archive::read_newest_classification(s3_client, bucket).await?;
-    // Journalled beside the digest: the mapping is applied on every read, so a study repeated after
-    // Dartmouth republishes groups the same names differently, and the `as_of` is what says so.
+    let industry_codes = archive::read_newest_industry_codes(s3_client, bucket).await?;
+    let universe = reference::universe_of(&partitions, &classification, industry_codes.as_ref())?;
+    // Journalled beside the digest: the mapping and the SEC codes are applied on every read, so a
+    // study repeated after either republishes groups the same names differently.
     tracing::info!(
         classification_as_of = %classification.as_of(),
-        "Classifying the study universe"
+        industry_codes_as_of = ?industry_codes.as_ref().map(|codes| codes.as_of()),
+        coded_by_sec = universe.coded_by_sec(),
+        "Classified the study universe"
     );
-    let universe = reference::universe_of(&partitions, &classification)?;
     let reference_digest = digest_of(universe.rows())?;
     let consolidated =
         reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;

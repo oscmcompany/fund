@@ -15,20 +15,22 @@ use tracing::{info, warn};
 
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
+use crate::common::edgar;
 use crate::common::flatfiles::{FlatFileClient, FlatFileError, RawDataset};
 use crate::common::massive::MassiveClient;
 use crate::common::provenance::{
     AlpacaPlan, MassivePlan, MassiveTransport, PartitionProvenance, Provenance,
 };
 use crate::common::types::{
-    BarInterval, EquityBar, EquityReference, IntradayCadence, LiquidityFloor, QuoteSummary,
-    SessionDate, Ticker, TradeSummary,
+    BarInterval, Cik, EquityBar, EquityReference, IntradayCadence, LiquidityFloor, QuoteSummary,
+    SecurityType, SessionDate, SicCode, Ticker, TradeSummary,
 };
 use crate::data::attribution::{Attribution, Declaration};
 use crate::data::cadence::{CadenceCheck, CadenceError, CadenceTotals, SessionOutcome};
 use crate::data::calendar::TradingCalendar;
 use crate::data::classification::ClassificationTable;
 use crate::data::conditions::ConditionsTable;
+use crate::data::industry_codes::{IndustryCode, IndustryCodesTable};
 use crate::data::{bars, boundaries, quotes, reference, splits, trades};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
@@ -99,6 +101,8 @@ pub enum ArchiveError {
     Conditions { message: String },
     #[error("the classification mapping could not be loaded: {message}")]
     Classification { message: String },
+    #[error("the SEC industry codes could not be loaded or published: {message}")]
+    IndustryCodes { message: String },
     #[error("failed to read s3://{bucket}/{key}: {message}")]
     Read {
         bucket: String,
@@ -2197,13 +2201,24 @@ pub async fn classification_as_of_dates(
     s3_client: &S3Client,
     bucket: &str,
 ) -> Result<Vec<chrono::NaiveDate>, ArchiveError> {
-    let (partitions, _sidecars) = partitions_and_sidecars(
-        s3_client,
-        bucket,
-        CLASSIFICATION_ARCHIVE_PREFIX,
-        "data.parquet",
-    )
-    .await?;
+    as_of_partition_dates(s3_client, bucket, CLASSIFICATION_ARCHIVE_PREFIX).await
+}
+
+/// The key one `as_of` of a reference dataset under `prefix` is written to.
+fn as_of_key(prefix: &str, as_of: chrono::NaiveDate) -> String {
+    format!("{prefix}/as_of={as_of}/data.parquet")
+}
+
+/// Every `as_of` a reference dataset under `prefix` holds a partition for, ascending.
+///
+/// One listing for every such dataset, so they cannot come to disagree about which keys count.
+async fn as_of_partition_dates(
+    s3_client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<chrono::NaiveDate>, ArchiveError> {
+    let (partitions, _sidecars) =
+        partitions_and_sidecars(s3_client, bucket, prefix, "data.parquet").await?;
 
     // Kept only when the date round-trips to the very key it was read from. Finding `as_of=` in any
     // segment would accept `as_of=2099-01-01/backup/data.parquet` and then send the reader to a
@@ -2215,7 +2230,7 @@ pub async fn classification_as_of_dates(
                 .split('/')
                 .find_map(|segment| segment.strip_prefix("as_of="))
                 .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
-            (classification_key(date) == *key).then_some(date)
+            (as_of_key(prefix, date) == *key).then_some(date)
         })
         .collect();
     dates.sort_unstable();
@@ -2266,26 +2281,7 @@ pub async fn conditions_as_of_dates(
     s3_client: &S3Client,
     bucket: &str,
 ) -> Result<Vec<chrono::NaiveDate>, ArchiveError> {
-    let (partitions, _sidecars) =
-        partitions_and_sidecars(s3_client, bucket, CONDITIONS_ARCHIVE_PREFIX, "data.parquet")
-            .await?;
-
-    // Kept only when the date round-trips to the very key it was read from, for the reason
-    // `classification_as_of_dates` gives: a nested key would send the reader somewhere that is not
-    // there and fail the load while a valid earlier partition sits beside it.
-    let mut dates: Vec<chrono::NaiveDate> = partitions
-        .iter()
-        .filter_map(|key| {
-            let date = key
-                .split('/')
-                .find_map(|segment| segment.strip_prefix("as_of="))
-                .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
-            (conditions_key(date) == *key).then_some(date)
-        })
-        .collect();
-    dates.sort_unstable();
-    dates.dedup();
-    Ok(dates)
+    as_of_partition_dates(s3_client, bucket, CONDITIONS_ARCHIVE_PREFIX).await
 }
 
 /// Loads the newest published conditions table.
@@ -2313,6 +2309,253 @@ pub async fn read_newest_conditions(
     ConditionsTable::from_dataframe(newest, &frame).map_err(|error| ArchiveError::Conditions {
         message: format!("s3://{bucket}/{key} is not a usable conditions table: {error}"),
     })
+}
+
+/// Where the SEC's industry codes are published, one partition per `as_of`.
+pub const INDUSTRY_CODES_ARCHIVE_PREFIX: &str = "data/reference/sec_industry_codes";
+
+/// The key one `as_of` of the SEC industry codes is written to.
+pub fn industry_codes_key(as_of: chrono::NaiveDate) -> String {
+    as_of_key(INDUSTRY_CODES_ARCHIVE_PREFIX, as_of)
+}
+
+/// Loads the newest published SEC industry codes, or `None` when none has been published.
+///
+/// Absence is an answer here, unlike for conditions: without the table every name keeps whatever code
+/// Massive gave it, which is exactly the state before this dataset existed.
+pub async fn read_newest_industry_codes(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<Option<IndustryCodesTable>, ArchiveError> {
+    let Some(newest) = as_of_partition_dates(s3_client, bucket, INDUSTRY_CODES_ARCHIVE_PREFIX)
+        .await?
+        .pop()
+    else {
+        return Ok(None);
+    };
+    let key = industry_codes_key(newest);
+    let frame = read_partition(s3_client, bucket, &key)
+        .await?
+        .ok_or_else(|| ArchiveError::IndustryCodes {
+            message: format!("s3://{bucket}/{key} was listed and then could not be read"),
+        })?;
+    IndustryCodesTable::from_dataframe(newest, &frame)
+        .map(Some)
+        .map_err(|error| ArchiveError::IndustryCodes {
+            message: format!("s3://{bucket}/{key} is not a usable table: {error}"),
+        })
+}
+
+/// What a scan of the reference archive found about filers of common stock with no Massive code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilerScan {
+    /// Every filer behind such a row, across every observation.
+    pub filers: BTreeSet<Cik>,
+    /// Rows with no Massive code and no usable CIK, which no lookup can reach and which stay
+    /// unclassified. Counted so the gap is reported rather than hidden inside a coverage figure.
+    pub rows_without_a_filer: usize,
+    /// Partitions swept before the CIK was recorded, which contribute no filers at all.
+    pub partitions_without_ciks: usize,
+}
+
+/// Scans every reference partition for filers of common stock the feed gave no code.
+///
+/// All partitions rather than the newest, because a name that delisted in 2023 still classifies the
+/// 2023 bars it printed.
+pub async fn filers_without_a_code(
+    s3_client: &S3Client,
+    bucket: &str,
+) -> Result<FilerScan, ArchiveError> {
+    let mut scan = FilerScan::default();
+    for as_of in reference_partition_dates(s3_client, bucket).await? {
+        let frame = read_reference_partition(s3_client, bucket, as_of).await?;
+        let Ok(ciks) = frame.column("cik").and_then(|column| column.str().cloned()) else {
+            scan.partitions_without_ciks += 1;
+            continue;
+        };
+        let security_types = frame.column("security_type")?.str()?;
+        let sic_codes = frame.column("sic_code")?.str()?;
+        for row in 0..frame.height() {
+            let common_stock = security_types.get(row) == Some(SecurityType::CommonStock.as_code());
+            if !common_stock || sic_codes.get(row).and_then(SicCode::new).is_some() {
+                continue;
+            }
+            match ciks.get(row).and_then(Cik::new) {
+                Some(cik) => {
+                    scan.filers.insert(cik);
+                }
+                None => scan.rows_without_a_filer += 1,
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Whether EDGAR must be asked: some filer lacking a Massive code has no answer in the stored table.
+///
+/// By set difference rather than by schedule, so a refresh that failed or was never reached is owed
+/// again the next night without anything remembering that it failed.
+pub fn industry_codes_owed(filers: &BTreeSet<Cik>, stored: Option<&IndustryCodesTable>) -> bool {
+    match stored {
+        None => !filers.is_empty(),
+        Some(table) => filers.iter().any(|cik| !table.asked(cik)),
+    }
+}
+
+/// What one refresh of the SEC industry codes did, as the nightly records it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum IndustryCodesOutcome {
+    /// Every filer lacking a Massive code already has an answer in the stored table.
+    NotOwed {
+        filers: usize,
+        rows_without_a_filer: usize,
+    },
+    /// Every filer was asked and the answers match the stored table.
+    Unchanged {
+        filers: usize,
+        coded: usize,
+        rows_without_a_filer: usize,
+    },
+    /// Every filer was asked and the answers were written as `as_of`.
+    Published {
+        as_of: chrono::NaiveDate,
+        filers: usize,
+        coded: usize,
+        rows_without_a_filer: usize,
+    },
+    /// Some filers could not be asked, so nothing was published: a partial table would silently
+    /// drop answers the stored one holds.
+    Incomplete { filers: usize, failed: usize },
+    /// The refresh could not run at all, which a missing contact secret is.
+    Failed(String),
+}
+
+/// EDGAR lookups awaiting an answer at once; the rate itself is the client's.
+const INDUSTRY_CODE_LOOKUPS_IN_FLIGHT: usize = 16;
+
+/// Asks EDGAR about every filer the archive lacks a code for when that is owed, or when `force`d.
+///
+/// Paced at [`edgar::REQUESTS_PER_SECOND`], so about 1,400 filers take three minutes. The SEC answers
+/// a burst by blocking the address rather than slowing it, which is why the pace is not a tuning knob.
+pub async fn refresh_industry_codes(
+    s3_client: &S3Client,
+    edgar_client: &edgar::EdgarClient,
+    bucket: &str,
+    today: SessionDate,
+    force: bool,
+) -> Result<IndustryCodesOutcome, ArchiveError> {
+    let scan = filers_without_a_code(s3_client, bucket).await?;
+    if scan.partitions_without_ciks > 0 {
+        warn!(
+            partitions = scan.partitions_without_ciks,
+            "Reference partitions carry no CIK; their filers cannot be looked up until re-swept"
+        );
+    }
+    let stored = read_newest_industry_codes(s3_client, bucket).await?;
+    if !force && !industry_codes_owed(&scan.filers, stored.as_ref()) {
+        return Ok(IndustryCodesOutcome::NotOwed {
+            filers: scan.filers.len(),
+            rows_without_a_filer: scan.rows_without_a_filer,
+        });
+    }
+
+    // Concurrent because each answer carries a filer's whole filing history and takes up to a
+    // second, so one at a time never reaches the rate. The client's pace is the limit, not this.
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut queued = scan.filers.iter();
+    let mut rows: Vec<IndustryCode> = Vec::new();
+    let mut failed = 0usize;
+    loop {
+        while in_flight.len() < INDUSTRY_CODE_LOOKUPS_IN_FLIGHT {
+            let Some(cik) = queued.next() else { break };
+            let (client, cik) = (edgar_client.clone(), cik.clone());
+            in_flight.spawn(async move {
+                let outcome = client.registration(&cik).await;
+                (cik, outcome)
+            });
+        }
+        let Some(joined) = in_flight.join_next().await else {
+            break;
+        };
+        let (cik, outcome) = joined.map_err(|error| ArchiveError::IndustryCodes {
+            message: format!("an EDGAR lookup task did not complete: {error}"),
+        })?;
+        match outcome {
+            Ok(Some(registration)) => rows.push(IndustryCode {
+                cik,
+                sic_code: Some(registration.sic_code),
+                sic_description: registration.sic_description,
+            }),
+            Ok(None) => rows.push(IndustryCode {
+                cik,
+                sic_code: None,
+                sic_description: None,
+            }),
+            Err(error) => {
+                warn!(cik = cik.as_str(), %error, "EDGAR lookup failed");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        return Ok(IndustryCodesOutcome::Incomplete {
+            filers: scan.filers.len(),
+            failed,
+        });
+    }
+
+    let fetched = IndustryCodesTable::new(today.date(), rows).map_err(|error| {
+        ArchiveError::IndustryCodes {
+            message: format!(
+                "EDGAR answered for none of {} filers: {error}",
+                scan.filers.len()
+            ),
+        }
+    })?;
+    let coded = fetched.coded();
+    if stored
+        .as_ref()
+        .is_some_and(|stored| stored.same_rows_as(&fetched))
+    {
+        return Ok(IndustryCodesOutcome::Unchanged {
+            filers: scan.filers.len(),
+            coded,
+            rows_without_a_filer: scan.rows_without_a_filer,
+        });
+    }
+
+    let key = industry_codes_key(today.date());
+    let mut frame = fetched.to_dataframe()?;
+    let mut buffer: Vec<u8> = Vec::new();
+    ParquetWriter::new(&mut buffer).finish(&mut frame)?;
+    // Replaced when today's key already exists, unlike the conditions table: these codes are applied
+    // on every read and never folded into anything, so a same-day correction changes no stored
+    // result. The ETag still refuses a write racing another.
+    let precondition = match read_partition_with_etag(s3_client, bucket, &key).await? {
+        Some((_frame, etag)) => Precondition::Match(etag),
+        None => Precondition::Absent,
+    };
+    match put_object_with_precondition(
+        s3_client,
+        bucket,
+        &key,
+        buffer,
+        "application/vnd.apache.parquet",
+        &precondition,
+    )
+    .await
+    {
+        WriteOutcome::Written => Ok(IndustryCodesOutcome::Published {
+            as_of: today.date(),
+            filers: scan.filers.len(),
+            coded,
+            rows_without_a_filer: scan.rows_without_a_filer,
+        }),
+        WriteOutcome::Contended => Err(ArchiveError::IndustryCodes {
+            message: format!("s3://{bucket}/{key} changed while this run was writing it"),
+        }),
+        WriteOutcome::Failed(message) => Err(ArchiveError::IndustryCodes { message }),
+    }
 }
 
 /// Every `as_of` the reference dataset holds a partition for, ascending.
@@ -2361,14 +2604,18 @@ pub async fn current_universe(
     // the newest key vanished between the two listings its nearest-prior rule returns an older one.
     let frame = read_reference_partition(s3_client, bucket, newest).await?;
     let table = read_newest_classification(s3_client, bucket).await?;
+    let industry_codes = read_newest_industry_codes(s3_client, bucket).await?;
+    let universe = reference::universe_of(&[(newest, frame)], &table, industry_codes.as_ref())?;
     // Journalled because the grouping is re-derived on every read: two runs agree about which names
-    // share a sector only if they used the same mapping, and this is what says which one that was.
+    // share a sector only if they used the same mapping and the same SEC codes beneath it.
     tracing::info!(
         classification_as_of = %table.as_of(),
+        industry_codes_as_of = ?industry_codes.as_ref().map(IndustryCodesTable::as_of),
+        coded_by_sec = universe.coded_by_sec(),
         reference_as_of = %newest,
-        "Building the current universe"
+        "Built the current universe"
     );
-    Ok(reference::universe_of(&[(newest, frame)], &table)?)
+    Ok(universe)
 }
 
 /// Which of the `available` observations answer for the sessions in `[start, end]`.
@@ -4260,6 +4507,38 @@ mod tests {
     use aws_smithy_types::body::SdkBody;
     use chrono::NaiveDate;
     use percent_encoding::percent_decode_str;
+
+    /// The rule that makes a failed refresh retry itself: owed exactly while some filer lacking a
+    /// Massive code has no answer stored. A filer EDGAR cannot code counts as answered, or the
+    /// nightly would ask about it forever.
+    #[test]
+    fn test_industry_codes_are_owed_until_every_filer_has_an_answer() {
+        use crate::data::industry_codes::fixture::{code, table, uncoded};
+        let filers: BTreeSet<Cik> = ["901832", "1234"]
+            .iter()
+            .map(|cik| Cik::new(cik).unwrap())
+            .collect();
+
+        assert!(
+            !industry_codes_owed(&BTreeSet::new(), None),
+            "nothing lacks a code"
+        );
+        assert!(
+            industry_codes_owed(&filers, None),
+            "nothing has been published yet"
+        );
+        assert!(
+            industry_codes_owed(&filers, Some(&table(vec![code("901832", "2834")]))),
+            "1234 was never asked"
+        );
+        assert!(
+            !industry_codes_owed(
+                &filers,
+                Some(&table(vec![code("901832", "2834"), uncoded("1234")]))
+            ),
+            "both were asked, and EDGAR having no code for 1234 is an answer"
+        );
+    }
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(

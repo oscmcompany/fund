@@ -15,6 +15,7 @@ pub mod classification_table;
 pub mod conditions;
 pub mod details;
 pub mod export;
+pub mod industry_codes;
 pub mod nightly;
 pub mod purge;
 pub mod quotes;

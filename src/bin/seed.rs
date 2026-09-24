@@ -294,6 +294,9 @@ enum ReferenceAction {
         #[arg(long, value_name = "YYYY-MM-DD")]
         as_of: Option<NaiveDate>,
     },
+    /// Ask EDGAR for every filer the archive holds no Massive code for, and publish the SEC's codes
+    /// when they changed. What the nightly runs after a sweep writes a new observation.
+    IndustryCodes,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1730,6 +1733,13 @@ async fn archive_nightly(
     };
     info!(%reference, "Reference sweep finished");
     report.record_reference(reference);
+    // Every night the budget allows, and it asks EDGAR only when some filer lacking a Massive code
+    // has no answer stored -- so a failed refresh is owed again tomorrow without being remembered.
+    let industry_codes = if budget.may_start_another() {
+        Some(industry_codes_outcome(today, false).await)
+    } else {
+        None
+    };
 
     // Written before the caller decides the exit code, because the box stops itself once this
     // returns: a record produced after the run is a record produced on a machine that is gone.
@@ -1741,6 +1751,7 @@ async fn archive_nightly(
         arguments
             .classification_check_status
             .map(ReferenceCheck::from_exit_status),
+        industry_codes,
     )
     .await;
 
@@ -1756,6 +1767,7 @@ async fn record_the_fold(
     report: &NightlyReport,
     conditions_check: Option<ReferenceCheck>,
     classification_check: Option<ReferenceCheck>,
+    industry_codes: Option<archive::IndustryCodesOutcome>,
 ) {
     let journal = match Journal::from_env() {
         Ok(journal) => journal,
@@ -1775,6 +1787,7 @@ async fn record_the_fold(
         conditions_as_of: report.conditions_as_of(),
         conditions_check,
         classification_check,
+        industry_codes,
     });
     journal
         .record(uuid::Uuid::new_v4(), Utc::now(), observation)
@@ -1890,6 +1903,49 @@ async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
     }
 
     Ok(Outcome::Complete)
+}
+
+/// Refreshes the SEC's industry codes when owed, or unconditionally when `force`d, and reports it.
+///
+/// A missing contact secret or a failed lookup is an outcome rather than an error, so the nightly
+/// records it on the night's record instead of only in a log.
+async fn industry_codes_outcome(today: SessionDate, force: bool) -> archive::IndustryCodesOutcome {
+    let refreshed = async {
+        let bucket = bucket_name()?;
+        let s3_client = fund::common::aws::s3_client().await;
+        let edgar_client = fund::common::edgar::EdgarClient::from_env().map_err(box_error)?;
+        archive::refresh_industry_codes(&s3_client, &edgar_client, &bucket, today, force)
+            .await
+            .map_err(box_error)
+    };
+    let outcome = match refreshed.await {
+        Ok(outcome) => outcome,
+        Err(error) => archive::IndustryCodesOutcome::Failed(error.to_string()),
+    };
+    match &outcome {
+        archive::IndustryCodesOutcome::Failed(cause) => {
+            error!(%cause, "SEC industry codes were not refreshed; the stored table stands")
+        }
+        archive::IndustryCodesOutcome::Incomplete { filers, failed } => warn!(
+            filers,
+            failed, "EDGAR lookups failed, so nothing was published; owed again next night"
+        ),
+        outcome => info!(?outcome, "SEC industry codes refreshed"),
+    }
+    outcome
+}
+
+/// The operator's run, which always asks EDGAR, and fails unless every filer was answered.
+async fn refresh_industry_codes(today: SessionDate) -> Result<Outcome, SeedError> {
+    match industry_codes_outcome(today, true).await {
+        archive::IndustryCodesOutcome::Failed(cause) => Err(SeedError::Failed(cause.into())),
+        archive::IndustryCodesOutcome::Incomplete { filers, failed } => Err(SeedError::Failed(
+            format!("{failed} of {filers} EDGAR lookups failed; nothing was published").into(),
+        )),
+        archive::IndustryCodesOutcome::NotOwed { .. }
+        | archive::IndustryCodesOutcome::Unchanged { .. }
+        | archive::IndustryCodesOutcome::Published { .. } => Ok(Outcome::Complete),
+    }
 }
 
 /// Fills every quarterly reference observation the archive is missing.
@@ -2206,6 +2262,9 @@ async fn seed_reference(action: &ReferenceAction) -> Result<Outcome, SeedError> 
         ReferenceAction::Archive(arguments) => (arguments, true),
         ReferenceAction::Probe(arguments) => (arguments, false),
         ReferenceAction::Grid { as_of } => return report_reference_grid(*as_of).await,
+        ReferenceAction::IndustryCodes => {
+            return refresh_industry_codes(SessionDate::at(Utc::now())).await;
+        }
     };
     let window = arguments.window.window()?;
     let bucket = bucket_name()?;
@@ -3955,6 +4014,18 @@ mod tests {
             panic!("expected a reference command");
         };
         assert!(matches!(action, ReferenceAction::Archive(_)));
+    }
+
+    /// Named in the plan and the runbook, so a rename would strand the one-off backfill that runs
+    /// it by hand.
+    #[test]
+    fn test_the_industry_codes_refresh_parses_with_no_arguments() {
+        let parsed = Arguments::try_parse_from(["seed", "equity-reference", "industry-codes"])
+            .expect("industry-codes must parse on its own");
+        let Command::EquityReference { action } = parsed.command else {
+            panic!("expected a reference command");
+        };
+        assert!(matches!(action, ReferenceAction::IndustryCodes));
     }
 
     #[test]
