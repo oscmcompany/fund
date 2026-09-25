@@ -504,7 +504,7 @@ async fn present_sessions(
 }
 
 /// Sessions that have a partition under `prefix` within `[start, end]`.
-async fn present_partitions(
+pub(crate) async fn present_partitions(
     s3_client: &S3Client,
     bucket: &str,
     prefix: &str,
