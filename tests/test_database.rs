@@ -6,7 +6,7 @@ mod common;
 
 use chrono::{NaiveDate, Utc};
 use fund::common::alpaca::{ActivityType, OrderSide};
-use fund::common::events::{self, Command, EventType, Outcome};
+use fund::common::events::{self, Command, EventType, Outcome, Terminal};
 use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
@@ -751,13 +751,9 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
 async fn test_a_request_with_no_terminal_outcome_is_recovered() {
     let pool = fresh_pool().await;
 
-    events::emit(
-        &pool,
-        EventType::new(Command::AccountSync, Outcome::Requested),
-        serde_json::json!({}),
-    )
-    .await
-    .unwrap();
+    events::request(&pool, Command::AccountSync, serde_json::json!({}))
+        .await
+        .unwrap();
 
     let recovered = events::recover_missed_commands(&pool).await.unwrap();
     assert_eq!(recovered, vec![Command::AccountSync]);
@@ -777,13 +773,9 @@ async fn test_a_request_with_no_terminal_outcome_is_recovered() {
 #[serial]
 async fn test_an_errored_command_is_not_recovered() {
     let pool = fresh_pool().await;
-    events::emit(
-        &pool,
-        EventType::new(Command::MarketDataSync, Outcome::Requested),
-        serde_json::json!({}),
-    )
-    .await
-    .unwrap();
+    events::request(&pool, Command::MarketDataSync, serde_json::json!({}))
+        .await
+        .unwrap();
     events::emit_errored(&pool, Command::MarketDataSync, "Alpaca returned 500")
         .await
         .unwrap();
@@ -801,13 +793,9 @@ async fn test_an_errored_command_is_not_recovered() {
 async fn test_an_unfinished_evaluation_is_skipped_but_a_liquidation_is_not() {
     let pool = fresh_pool().await;
     for command in [Command::PortfolioEvaluation, Command::PortfolioLiquidation] {
-        events::emit(
-            &pool,
-            EventType::new(command, Outcome::Requested),
-            serde_json::json!({}),
-        )
-        .await
-        .unwrap();
+        events::request(&pool, command, serde_json::json!({}))
+            .await
+            .unwrap();
     }
 
     let recovered = events::recover_missed_commands(&pool).await.unwrap();
@@ -827,9 +815,10 @@ async fn test_an_oversized_payload_still_inserts_and_arrives_truncated() {
     listener.listen("events").await.expect("must subscribe");
 
     let oversized = serde_json::json!({ "filler": "x".repeat(9_000) });
-    events::emit(
+    events::record(
         &pool,
-        EventType::new(Command::DatabaseExport, Outcome::Completed),
+        Command::DatabaseExport,
+        Terminal::Completed,
         oversized.clone(),
     )
     .await
@@ -865,9 +854,10 @@ async fn test_a_small_payload_arrives_whole() {
     listener.listen("events").await.unwrap();
 
     let payload = serde_json::json!({ "pairs_opened": ["AAAA-BBBB"] });
-    events::emit(
+    events::record(
         &pool,
-        EventType::new(Command::PortfolioEvaluation, Outcome::Completed),
+        Command::PortfolioEvaluation,
+        Terminal::Completed,
         payload.clone(),
     )
     .await
@@ -898,9 +888,16 @@ async fn test_every_event_type_round_trips_through_the_trigger() {
     for command in Command::ALL {
         for outcome in [Outcome::Requested, Outcome::Completed, Outcome::Errored] {
             let event_type = EventType::new(command, outcome);
-            events::emit(&pool, event_type, serde_json::json!({}))
-                .await
-                .unwrap();
+            match outcome {
+                Outcome::Requested => events::request(&pool, command, serde_json::json!({})).await,
+                Outcome::Completed => {
+                    events::record(&pool, command, Terminal::Completed, serde_json::json!({})).await
+                }
+                Outcome::Errored => {
+                    events::record(&pool, command, Terminal::Errored, serde_json::json!({})).await
+                }
+            }
+            .unwrap();
 
             let received = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
                 .await

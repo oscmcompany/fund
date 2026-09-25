@@ -204,8 +204,26 @@ pub enum EventError {
     Database(#[from] sqlx::Error),
 }
 
+/// The end a handler reached: what survives the work, and never what wakes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminal {
+    Completed,
+    Errored,
+}
+
+impl From<Terminal> for Outcome {
+    fn from(terminal: Terminal) -> Self {
+        match terminal {
+            Terminal::Completed => Outcome::Completed,
+            Terminal::Errored => Outcome::Errored,
+        }
+    }
+}
+
 /// Writes an event row. The insert trigger fires `pg_notify`, so no separate publish is needed.
-pub async fn emit(pool: &PgPool, event_type: EventType, payload: Value) -> Result<(), EventError> {
+///
+/// Private so every caller says which half it means: [`request`] wakes a handler, [`record`] does not.
+async fn emit(pool: &PgPool, event_type: EventType, payload: Value) -> Result<(), EventError> {
     sqlx::query!(
         "INSERT INTO events (event_type, payload) VALUES ($1, $2)",
         event_type.as_str(),
@@ -215,6 +233,21 @@ pub async fn emit(pool: &PgPool, event_type: EventType, payload: Value) -> Resul
     .await?;
     debug!(event_type = event_type.as_str(), "Event emitted");
     Ok(())
+}
+
+/// Asks for a command to run: the only write that wakes a handler.
+pub async fn request(pool: &PgPool, command: Command, payload: Value) -> Result<(), EventError> {
+    emit(pool, EventType::new(command, Outcome::Requested), payload).await
+}
+
+/// Records where a command ended. The listener sees the row and never dispatches it.
+pub async fn record(
+    pool: &PgPool,
+    command: Command,
+    terminal: Terminal,
+    payload: Value,
+) -> Result<(), EventError> {
+    emit(pool, EventType::new(command, terminal.into()), payload).await
 }
 
 /// Records a command as completed, with a payload summarizing what it did.
@@ -227,14 +260,15 @@ pub async fn emit_completed(
     command: Command,
     summary: Value,
 ) -> Result<(), EventError> {
-    emit(pool, EventType::new(command, Outcome::Completed), summary).await
+    record(pool, command, Terminal::Completed, summary).await
 }
 
 /// Records a command as failed, with the error rendered into the payload.
 pub async fn emit_errored(pool: &PgPool, command: Command, error: &str) -> Result<(), EventError> {
-    emit(
+    record(
         pool,
-        EventType::new(command, Outcome::Errored),
+        command,
+        Terminal::Errored,
         serde_json::json!({ "error": error }),
     )
     .await
@@ -335,6 +369,28 @@ impl Notification {
             payload,
             payload_truncated,
         })
+    }
+}
+
+/// A notification that asks for work, which is the only thing a handler is dispatched from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Request {
+    pub event_id: i64,
+    pub command: Command,
+    pub payload_truncated: bool,
+}
+
+impl Request {
+    /// The request a notification carries, or `None` for a record of work already done.
+    pub fn from_notification(notification: &Notification) -> Option<Self> {
+        match notification.event_type.outcome() {
+            Outcome::Requested => Some(Self {
+                event_id: notification.event_id,
+                command: notification.event_type.command(),
+                payload_truncated: notification.payload_truncated,
+            }),
+            Outcome::Completed | Outcome::Errored => None,
+        }
     }
 }
 
@@ -456,6 +512,40 @@ mod tests {
         assert!(notification.payload_truncated);
         assert_eq!(notification.payload, Value::Object(serde_json::Map::new()));
         assert_eq!(notification.event_id, 7);
+    }
+
+    /// A terminal record must never become a request, or the service would re-run the work its own
+    /// completion announced; a request must carry its command through unchanged.
+    #[test]
+    fn test_only_a_requested_notification_is_a_request() {
+        for command in Command::ALL {
+            for (outcome, expected) in [
+                (Outcome::Requested, true),
+                (Outcome::Completed, false),
+                (Outcome::Errored, false),
+            ] {
+                let notification = Notification {
+                    event_id: 3,
+                    event_type: EventType::new(command, outcome),
+                    payload: Value::Null,
+                    payload_truncated: false,
+                };
+                let request = Request::from_notification(&notification);
+                assert_eq!(request.is_some(), expected, "{command:?} {outcome:?}");
+                if let Some(request) = request {
+                    assert_eq!(request.command, command);
+                    assert_eq!(request.event_id, 3);
+                }
+            }
+        }
+    }
+
+    /// Every terminal a handler can record is a terminal outcome on the wire.
+    #[test]
+    fn test_a_record_can_only_write_a_terminal_outcome() {
+        for terminal in [Terminal::Completed, Terminal::Errored] {
+            assert!(Outcome::from(terminal).is_terminal(), "{terminal:?}");
+        }
     }
 
     /// A malformed or unknown notification must not be an error the listener dies on.
