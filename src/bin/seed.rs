@@ -2384,10 +2384,9 @@ async fn run_leg(
         complete &= summary.is_complete();
     }
 
-    // A partition written while a name's fetch failed reads as present to the fill above, so the
-    // names are asked for separately. What the repair cannot fetch is recorded rather than failing
-    // the leg: a name the vendor never answers for would otherwise fail every night.
-    let scan = archive::scan_session_symbols(
+    // A present partition can be short names the fill never revisits, so they are asked for here.
+    // A name still absent afterwards is recorded; only a repair that errors marks the leg incomplete.
+    let scan = match archive::scan_session_symbols(
         &s3_client,
         &bucket,
         family,
@@ -2396,7 +2395,17 @@ async fn run_leg(
         plan.window_start(),
         plan.window_end(),
     )
-    .await?;
+    .await
+    {
+        Ok(scan) => scan,
+        Err(error) => {
+            warn!(%leg, %error, "Symbol scan failed; the fill stands and no names were repaired");
+            return Ok(LegOutcome::Folded {
+                complete: false,
+                written,
+            });
+        }
+    };
     for (session, coverage) in scan.coverage() {
         let archive::SessionCoverage::Partial(missing) = coverage else {
             continue;
@@ -2406,32 +2415,76 @@ async fn run_leg(
         }
         if !budget.may_start_another() {
             warn!(%leg, %session, "Budget spent before a name repair; the next run will reach it");
+            complete = false;
             break;
         }
         let named = Scope::new(
             NameSelection::Named(missing.clone()),
             SessionSelection::Present,
         )?;
-        let summary = fold.session(*session, &named).await?;
-        record_conditions(&summary);
+        let still_missing = match fold.session(*session, &named).await {
+            Ok(summary) => {
+                record_conditions(&summary);
+                written += summary.sessions_written();
+                names_still_missing(&s3_client, &bucket, family, leg.interval(), *session).await
+            }
+            Err(error) => {
+                // A partition another provider built refuses this write, among other causes.
+                warn!(%leg, %session, %error, "Name repair failed");
+                None
+            }
+        };
+        if still_missing.is_none() {
+            complete = false;
+        }
+        let still_missing = still_missing.unwrap_or(missing.len());
         repairs.push(Repair {
             leg,
             session: *session,
             defect: Defect::NamesMissing {
                 missing: missing.len(),
-                still_missing: summary.symbols_failed(),
+                still_missing,
             },
         });
         info!(
             %leg,
             %session,
             missing = missing.len(),
-            still_missing = summary.symbols_failed(),
+            still_missing,
             "Repaired names missing from a present partition"
         );
     }
 
     Ok(LegOutcome::Folded { complete, written })
+}
+
+/// How many names one session's partition is still short, read back rather than inferred.
+///
+/// A fetch that answered empty writes no row and counts as no failure, so only a re-scan can say
+/// the name is still absent. `None` when the partition could not be read at all.
+async fn names_still_missing(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    family: archive::SessionFamily,
+    interval: BarInterval,
+    session: SessionDate,
+) -> Option<usize> {
+    let rescan = archive::scan_session_symbols(
+        s3_client,
+        bucket,
+        family,
+        interval,
+        LiquidityFloor::CURRENT,
+        session,
+        session,
+    )
+    .await
+    .ok()?;
+    match rescan.coverage().get(&session)? {
+        archive::SessionCoverage::Partial(missing) => Some(missing.len()),
+        archive::SessionCoverage::Complete => Some(0),
+        archive::SessionCoverage::Absent | archive::SessionCoverage::Undescribed => None,
+    }
 }
 
 /// Whether a session the fill wrote was one an earlier night already owed.
