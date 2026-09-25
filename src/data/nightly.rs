@@ -452,6 +452,55 @@ impl ViewCheck {
     }
 }
 
+/// A count and the population it was taken over, so a rate carries its denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Share {
+    pub count: u64,
+    pub population: u64,
+}
+
+impl Share {
+    /// `None` over an empty population, which measured nothing rather than zero.
+    pub fn rate(self) -> Option<f64> {
+        (self.population > 0).then(|| self.count as f64 / self.population as f64)
+    }
+}
+
+impl std::ops::Add for Share {
+    type Output = Share;
+
+    fn add(self, other: Share) -> Share {
+        Share {
+            count: self.count + other.count,
+            population: self.population + other.population,
+        }
+    }
+}
+
+/// What was wrong with a partition a nightly run rewrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Defect {
+    /// No partition for a session older than the newest one, so an earlier night owed it and missed.
+    SessionMissed,
+    /// A partition was present and short `missing` names, `still_missing` of which the repair could
+    /// not fetch either.
+    NamesMissing {
+        missing: usize,
+        still_missing: usize,
+    },
+}
+
+/// One partition a run rewrote, named by its site and the defect it had.
+///
+/// The site is the leg and the session, so the same site across nights is a recurring defect rather
+/// than routine upkeep. Daily bars never appear: that leg re-fetches its correction window by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Repair {
+    pub leg: Leg,
+    pub session: SessionDate,
+    pub defect: Defect,
+}
+
 /// What became of one leg.
 ///
 /// Skipped and failed are separate variants rather than one "did not finish", because a night that
@@ -483,6 +532,7 @@ pub struct NightlyReport {
     reference: Option<ReferenceOutcome>,
     /// Set only by a trades leg that ran, because folding no tape is not folding under no rules.
     conditions_as_of: Option<chrono::NaiveDate>,
+    repairs: Vec<Repair>,
 }
 
 impl NightlyReport {
@@ -495,7 +545,18 @@ impl NightlyReport {
             legs: Vec::new(),
             reference: None,
             conditions_as_of: None,
+            repairs: Vec::new(),
         }
+    }
+
+    /// Records one partition the run rewrote and what was wrong with it.
+    pub fn record_repair(&mut self, repair: Repair) {
+        self.repairs.push(repair);
+    }
+
+    /// Every repair, in the order the run made them.
+    pub fn repairs(&self) -> &[Repair] {
+        &self.repairs
     }
 
     /// Records what became of one leg.
@@ -706,6 +767,56 @@ mod tests {
 
     fn session(text: &str) -> SessionDate {
         SessionDate::from_date(chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("a date"))
+    }
+
+    #[test]
+    fn test_a_share_over_nothing_measured_nothing() {
+        assert_eq!(
+            Share {
+                count: 0,
+                population: 0
+            }
+            .rate(),
+            None
+        );
+        let summed = Share {
+            count: 3,
+            population: 100,
+        } + Share {
+            count: 1,
+            population: 300,
+        };
+        assert_eq!(
+            summed,
+            Share {
+                count: 4,
+                population: 400
+            }
+        );
+        assert_eq!(summed.rate(), Some(0.01));
+    }
+
+    #[test]
+    fn test_a_report_keeps_its_repairs_in_order() {
+        let calendar = calendar_over("2026-09-01", "2026-09-30", &[]);
+        let plan = plan(session("2026-09-23"), 2, &calendar).expect("a plan");
+        let mut report = NightlyReport::over(&plan);
+        let first = Repair {
+            leg: Leg::Trades,
+            session: session("2026-09-21"),
+            defect: Defect::SessionMissed,
+        };
+        let second = Repair {
+            leg: Leg::Quotes(IntradayCadence::OneMinute),
+            session: session("2026-09-22"),
+            defect: Defect::NamesMissing {
+                missing: 2,
+                still_missing: 1,
+            },
+        };
+        report.record_repair(first);
+        report.record_repair(second);
+        assert_eq!(report.repairs(), &[first, second]);
     }
 
     #[test]

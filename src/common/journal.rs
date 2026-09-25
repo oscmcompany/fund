@@ -15,7 +15,9 @@ use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, 
 use crate::common::events::Command;
 use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
 use crate::data::archive::IndustryCodesOutcome;
-use crate::data::nightly::{Leg, LegOutcome, ReferenceCheck, ReferenceOutcome, ViewCheck};
+use crate::data::nightly::{
+    Leg, LegOutcome, ReferenceCheck, ReferenceOutcome, Repair, Share, ViewCheck,
+};
 
 /// Version stamped on every record written by this build.
 ///
@@ -898,6 +900,13 @@ pub struct ArchiveFolded {
     ///
     /// `None` only when the budget ran out before it was reached.
     pub industry_codes: Option<IndustryCodesOutcome>,
+    /// Every partition the run rewrote because something was wrong with it, and what was.
+    pub repairs: Vec<Repair>,
+    /// Prints folded under a condition the published table could not resolve, over the planned
+    /// window's daily trade partitions. `None` when no partition could be read.
+    pub unresolved_conditions: Option<Share>,
+    /// Common-stock names in the newest reference partition that no sector resolves for.
+    pub unclassified: Option<Share>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.
@@ -1345,6 +1354,21 @@ mod tests {
                     filers: 1365,
                     rows_without_a_filer: 223,
                 }),
+                repairs: vec![crate::data::nightly::Repair {
+                    leg: crate::data::nightly::Leg::Trades,
+                    session: SessionDate::from_date(
+                        chrono::NaiveDate::from_ymd_opt(2026, 9, 18).expect("a real date"),
+                    ),
+                    defect: crate::data::nightly::Defect::NamesMissing {
+                        missing: 3,
+                        still_missing: 1,
+                    },
+                }],
+                unresolved_conditions: Some(Share {
+                    count: 41,
+                    population: 12_000,
+                }),
+                unclassified: None,
             }),
         ]
     }

@@ -25,9 +25,11 @@ use fund::common::types::{
 use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSelection};
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
+use fund::data::conditions::ConditionsTable;
 use fund::data::export;
 use fund::data::nightly::{
-    self, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome, ViewCheck,
+    self, Defect, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome, Repair, Share,
+    ViewCheck,
 };
 use fund::data::{attribution, bars, deletion, details, quotes, trades};
 
@@ -1748,17 +1750,31 @@ async fn archive_nightly(
             continue;
         }
         let mut folded_under = None;
-        let outcome =
-            match run_leg(leg, &plan, &calendar, arguments, &budget, &mut folded_under).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    error!(%leg, %error, "Nightly leg failed, continuing to the next");
-                    LegOutcome::Failed(error.to_string())
-                }
-            };
+        let mut repairs = Vec::new();
+        let outcome = match run_leg(
+            leg,
+            &plan,
+            &calendar,
+            arguments,
+            &budget,
+            &mut folded_under,
+            &mut repairs,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                error!(%leg, %error, "Nightly leg failed, continuing to the next");
+                LegOutcome::Failed(error.to_string())
+            }
+        };
         info!(%leg, remaining_seconds = budget.remaining().as_secs(), "Leg finished");
         if let Some(as_of) = folded_under {
             report.record_conditions(as_of);
+        }
+        // Kept from a leg that later failed: the partitions it repaired before the error are real.
+        for repair in repairs {
+            report.record_repair(repair);
         }
         report.record(leg, outcome);
     }
@@ -1784,10 +1800,14 @@ async fn archive_nightly(
         None
     };
 
+    let (unresolved_conditions, unclassified) = measure_the_night(&plan).await;
+
     // Written before the caller decides the exit code, because the box stops itself once this
     // returns: a record produced after the run is a record produced on a machine that is gone.
     record_the_fold(
         &report,
+        unresolved_conditions,
+        unclassified,
         arguments
             .conditions_check_status
             .map(ReferenceCheck::from_exit_status),
@@ -1804,6 +1824,45 @@ async fn archive_nightly(
     Ok(Outcome::Nightly(report))
 }
 
+/// The two rates the night is judged on: prints no published condition resolves, over the planned
+/// window's trade partitions, and common stock no sector resolves for, in the newest reference.
+///
+/// Each is `None` when it could not be measured, logged rather than failing a finished fold.
+async fn measure_the_night(plan: &nightly::NightlyPlan) -> (Option<Share>, Option<Share>) {
+    let bucket = match bucket_name() {
+        Ok(bucket) => bucket,
+        Err(error) => {
+            warn!(%error, "No archive bucket; the night's rates are not measured");
+            return (None, None);
+        }
+    };
+    let s3_client = fund::common::aws::s3_client().await;
+    let unresolved_conditions =
+        match archive::unresolved_condition_share(&s3_client, &bucket, plan.sessions()).await {
+            Ok(share) => share,
+            Err(error) => {
+                warn!(%error, "Unresolved-condition share not measured");
+                None
+            }
+        };
+    let unclassified = match archive::current_universe(&s3_client, &bucket).await {
+        Ok(universe) => Some(Share {
+            count: universe.unclassified() as u64,
+            population: universe.rows().height() as u64,
+        }),
+        Err(error) => {
+            warn!(%error, "Unclassified share not measured");
+            None
+        }
+    };
+    info!(
+        unresolved_conditions = ?unresolved_conditions.and_then(Share::rate),
+        unclassified = ?unclassified.and_then(Share::rate),
+        "Measured the night"
+    );
+    (unresolved_conditions, unclassified)
+}
+
 /// Writes the night into the archiver's journal, if it has one.
 ///
 /// A missing journal is logged and stepped over rather than failing the run. The fold is the work
@@ -1811,6 +1870,8 @@ async fn archive_nightly(
 /// fold because the account could not be filed is worse.
 async fn record_the_fold(
     report: &NightlyReport,
+    unresolved_conditions: Option<Share>,
+    unclassified: Option<Share>,
     conditions_check: Option<ReferenceCheck>,
     classification_check: Option<ReferenceCheck>,
     views_check: Option<ViewCheck>,
@@ -1836,6 +1897,9 @@ async fn record_the_fold(
         classification_check,
         views_check,
         industry_codes,
+        repairs: report.repairs().to_vec(),
+        unresolved_conditions,
+        unclassified,
     });
     journal
         .record(uuid::Uuid::new_v4(), Utc::now(), observation)
@@ -2193,26 +2257,32 @@ async fn run_leg(
     budget: &nightly::Budget,
     // Set by the trades leg alone, because it is the only one that folds under published rules.
     conditions_as_of: &mut Option<chrono::NaiveDate>,
+    repairs: &mut Vec<Repair>,
 ) -> Result<LegOutcome, Box<dyn std::error::Error>> {
     let bucket = bucket_name()?;
     let s3_client = fund::common::aws::s3_client().await;
-    let scope = Scope::new(NameSelection::WholeMarket, SessionSelection::Absent)?;
+    let fill = Scope::new(NameSelection::WholeMarket, SessionSelection::Absent)?;
 
-    if let Leg::DailyBars = leg {
-        let summary = archive::archive_missing_sessions(
-            &s3_client,
-            &MassiveClient::from_env()?,
-            &bucket,
-            plan.window_start(),
-            plan.window_end(),
-            Some(calendar),
-        )
-        .await?;
-        return Ok(LegOutcome::Folded {
-            complete: summary.is_complete(),
-            written: summary.sessions_written(),
-        });
-    }
+    let family = match leg {
+        Leg::DailyBars => {
+            let summary = archive::archive_missing_sessions(
+                &s3_client,
+                &MassiveClient::from_env()?,
+                &bucket,
+                plan.window_start(),
+                plan.window_end(),
+                Some(calendar),
+            )
+            .await?;
+            return Ok(LegOutcome::Folded {
+                complete: summary.is_complete(),
+                written: summary.sessions_written(),
+            });
+        }
+        Leg::IntradayBars(_) => archive::SessionFamily::Bars,
+        Leg::Quotes(_) => archive::SessionFamily::Quotes,
+        Leg::Trades => archive::SessionFamily::Trades,
+    };
 
     let sessions = plan.sessions();
 
@@ -2263,9 +2333,27 @@ async fn run_leg(
         )),
         _ => None,
     };
+    let fold = SessionFold {
+        leg,
+        s3_client: &s3_client,
+        bucket: &bucket,
+        calendar,
+        trade_source: trade_source.as_ref(),
+        conditions: conditions.as_ref(),
+    };
 
     let mut written = 0;
     let mut complete = true;
+    let mut record_conditions = |summary: &archive::PassSummary| {
+        // Recorded from the write rather than from the load, so the record names a table something
+        // was actually folded under: a night already current loads one and folds nothing.
+        if let Some(as_of) = conditions_folded_under(
+            summary.sessions_written(),
+            conditions.as_ref().map(|table| table.as_of()),
+        ) {
+            *conditions_as_of = Some(as_of);
+        }
+    };
 
     for (index, session) in sessions.iter().enumerate() {
         // Asked between sessions and never inside one, so a fold cannot be cut off having written
@@ -2281,25 +2369,173 @@ async fn run_leg(
                 unreached: sessions.len() - index,
             });
         }
+        let summary = fold.session(*session, &fill).await?;
+        record_conditions(&summary);
+        if let Some(defect) =
+            missed_session(summary.sessions_written(), *session, plan.window_end())
+        {
+            repairs.push(Repair {
+                leg,
+                session: *session,
+                defect,
+            });
+        }
+        written += summary.sessions_written();
+        complete &= summary.is_complete();
+    }
 
-        let one = [*session];
-        let summary = match leg {
-            Leg::DailyBars => unreachable!("handled above, before the per-session loop"),
+    // A present partition can be short names the fill never revisits, so they are asked for here.
+    // A name still absent afterwards is recorded; only a repair that errors marks the leg incomplete.
+    let scan = match archive::scan_session_symbols(
+        &s3_client,
+        &bucket,
+        family,
+        leg.interval(),
+        LiquidityFloor::CURRENT,
+        plan.window_start(),
+        plan.window_end(),
+    )
+    .await
+    {
+        Ok(scan) => scan,
+        Err(error) => {
+            warn!(%leg, %error, "Symbol scan failed; the fill stands and no names were repaired");
+            return Ok(LegOutcome::Folded {
+                complete: false,
+                written,
+            });
+        }
+    };
+    for (session, coverage) in scan.coverage() {
+        let archive::SessionCoverage::Partial(missing) = coverage else {
+            continue;
+        };
+        if !sessions.contains(session) {
+            continue;
+        }
+        if !budget.may_start_another() {
+            warn!(%leg, %session, "Budget spent before a name repair; the next run will reach it");
+            complete = false;
+            break;
+        }
+        let named = Scope::new(
+            NameSelection::Named(missing.clone()),
+            SessionSelection::Present,
+        )?;
+        let still_missing = match fold.session(*session, &named).await {
+            Ok(summary) => {
+                record_conditions(&summary);
+                written += summary.sessions_written();
+                names_still_missing(&s3_client, &bucket, family, leg.interval(), *session).await
+            }
+            Err(error) => {
+                // A partition another provider built refuses this write, among other causes.
+                warn!(%leg, %session, %error, "Name repair failed");
+                None
+            }
+        };
+        if still_missing.is_none() {
+            complete = false;
+        }
+        let still_missing = still_missing.unwrap_or(missing.len());
+        repairs.push(Repair {
+            leg,
+            session: *session,
+            defect: Defect::NamesMissing {
+                missing: missing.len(),
+                still_missing,
+            },
+        });
+        info!(
+            %leg,
+            %session,
+            missing = missing.len(),
+            still_missing,
+            "Repaired names missing from a present partition"
+        );
+    }
+
+    Ok(LegOutcome::Folded { complete, written })
+}
+
+/// How many names one session's partition is still short, read back rather than inferred.
+///
+/// A fetch that answered empty writes no row and counts as no failure, so only a re-scan can say
+/// the name is still absent. `None` when the partition could not be read at all.
+async fn names_still_missing(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    family: archive::SessionFamily,
+    interval: BarInterval,
+    session: SessionDate,
+) -> Option<usize> {
+    let rescan = archive::scan_session_symbols(
+        s3_client,
+        bucket,
+        family,
+        interval,
+        LiquidityFloor::CURRENT,
+        session,
+        session,
+    )
+    .await
+    .ok()?;
+    match rescan.coverage().get(&session)? {
+        archive::SessionCoverage::Partial(missing) => Some(missing.len()),
+        archive::SessionCoverage::Complete => Some(0),
+        archive::SessionCoverage::Absent | archive::SessionCoverage::Undescribed => None,
+    }
+}
+
+/// Whether a session the fill wrote was one an earlier night already owed.
+///
+/// Every session before the newest had its own night, so writing one here means that night missed
+/// it. The newest is the one this night exists for and is not a repair.
+fn missed_session(
+    sessions_written: usize,
+    session: SessionDate,
+    newest: SessionDate,
+) -> Option<Defect> {
+    (sessions_written > 0 && session < newest).then_some(Defect::SessionMissed)
+}
+
+/// What folding one session of one leg needs, bound once per leg.
+struct SessionFold<'a> {
+    leg: Leg,
+    s3_client: &'a aws_sdk_s3::Client,
+    bucket: &'a str,
+    calendar: &'a TradingCalendar,
+    trade_source: Option<&'a archive::TradeSource<'a>>,
+    conditions: Option<&'a Arc<ConditionsTable>>,
+}
+
+impl SessionFold<'_> {
+    /// Folds one session under `scope`, which is the fill or a named repair.
+    async fn session(
+        &self,
+        session: SessionDate,
+        scope: &Scope,
+    ) -> Result<archive::PassSummary, Box<dyn std::error::Error>> {
+        let one = [session];
+        let summary = match self.leg {
+            Leg::DailyBars => {
+                unreachable!("daily bars run as one windowed call, never per session")
+            }
             Leg::IntradayBars(_) => {
                 archive::archive_intraday_sessions(
-                    &s3_client,
+                    self.s3_client,
                     &MassiveClient::from_env()?,
-                    &bucket,
-                    leg.interval(),
-                    *session,
-                    *session,
-                    &scope,
-                    Some(calendar),
+                    self.bucket,
+                    self.leg.interval(),
+                    session,
+                    session,
+                    scope,
+                    Some(self.calendar),
                 )
                 .await?
             }
             Leg::Quotes(cadence) => {
-                let Some(source) = &trade_source else {
+                let Some(source) = self.trade_source else {
                     unreachable!("only intraday bars skip the source, and this is not that arm")
                 };
                 let quote_source = match source {
@@ -2309,73 +2545,38 @@ async fn run_leg(
                     }
                 };
                 archive::archive_quote_sessions(
-                    &s3_client,
+                    self.s3_client,
                     &quote_source,
-                    calendar,
-                    &bucket,
+                    self.calendar,
+                    self.bucket,
                     &one,
-                    &scope,
+                    scope,
                     cadence,
                     ForeignProvider::Refuse,
                 )
                 .await?
             }
             Leg::Trades => {
-                let flat_files;
-                let market_data;
-                let source = match arguments.provider {
-                    NightlyProvider::AlpacaRest => {
-                        market_data = market_data_client().await?;
-                        archive::TradeSource::PerName(&market_data)
-                    }
-                    NightlyProvider::MassiveFlatFile => {
-                        flat_files = flat_file_client(&arguments.files).await?;
-                        archive::TradeSource::WholeSession(&flat_files)
-                    }
+                let Some(source) = self.trade_source else {
+                    unreachable!("only intraday bars skip the source, and this is not that arm")
                 };
-                // Refused before a print is fetched: past the floor Alpaca folds an opening auction
-                // print the archive excludes, adding 0.3-2.2% of session volume.
-                let unfaithful = source.unfaithful_sessions(&one);
-                if let Some(earliest) = unfaithful.first() {
-                    return Err(format!(
-                        "{source} trades are not faithful before {}: {earliest} is earlier. \
-                         Writing it would add volume the archive correctly excludes; re-fold \
-                         from the raw tee instead.",
-                        source
-                            .faithful_from()
-                            .expect("a route that refuses a session has a floor"),
-                    )
-                    .into());
-                }
                 archive::archive_trade_sessions(
-                    &s3_client,
-                    &source,
-                    calendar,
-                    &bucket,
+                    self.s3_client,
+                    source,
+                    self.calendar,
+                    self.bucket,
                     &one,
-                    &scope,
+                    scope,
                     Arc::clone(
-                        conditions
-                            .as_ref()
-                            .expect("the trades leg loaded its table above"),
+                        self.conditions
+                            .expect("the trades leg loaded its table before folding"),
                     ),
                 )
                 .await?
             }
         };
-        // Recorded from the write rather than from the load, so the record names a table something
-        // was actually folded under: a night already current loads one and folds nothing.
-        if let Some(as_of) = conditions_folded_under(
-            summary.sessions_written(),
-            conditions.as_ref().map(|table| table.as_of()),
-        ) {
-            *conditions_as_of = Some(as_of);
-        }
-        written += summary.sessions_written();
-        complete &= summary.is_complete();
+        Ok(summary)
     }
-
-    Ok(LegOutcome::Folded { complete, written })
 }
 
 /// The flat-file client the pass's source names.
@@ -3320,6 +3521,26 @@ mod tests {
         assert_eq!(conditions_folded_under(1, Some(as_of)), Some(as_of));
         // And a leg that wrote without a table cannot name one, which is every leg but trades.
         assert_eq!(conditions_folded_under(3, None), None);
+    }
+
+    #[test]
+    fn test_only_a_session_an_earlier_night_owed_is_a_missed_session() {
+        let newest = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 24).unwrap());
+        let older = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 22).unwrap());
+        assert_eq!(
+            missed_session(1, older, newest),
+            Some(Defect::SessionMissed)
+        );
+        assert_eq!(
+            missed_session(1, newest, newest),
+            None,
+            "the newest session is the one this night exists for"
+        );
+        assert_eq!(
+            missed_session(0, older, newest),
+            None,
+            "a session already present was not rewritten"
+        );
     }
 
     /// `run-archiver` passes every status by these names, so a rename here would fail every

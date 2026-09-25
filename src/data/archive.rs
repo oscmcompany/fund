@@ -31,6 +31,7 @@ use crate::data::calendar::TradingCalendar;
 use crate::data::classification::ClassificationTable;
 use crate::data::conditions::ConditionsTable;
 use crate::data::industry_codes::{IndustryCode, IndustryCodesTable};
+use crate::data::nightly::Share;
 use crate::data::{bars, boundaries, quotes, reference, splits, trades};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
@@ -1192,10 +1193,11 @@ fn sessions_for(
 /// alarm rather than a real name silently excused.
 ///
 /// Sorted, because the lookup binary-searches it.
-const EXCHANGE_TEST_SYMBOLS: [&str; 28] = [
-    "CBOA", "CBOJ", "CBOL", "CBOO", "CBOT", "CBOX", "CBOY", "CBXA", "CBXJ", "CBXL", "CBXO", "CBXY",
-    "IBOT", "MTEST", "MTEST.A", "NTEST", "NTEST.H", "NTEST.I", "ZBZX", "ZEXIT", "ZIEXT", "ZJZZT",
-    "ZTEST", "ZTST", "ZVZZT", "ZWZZT", "ZXIET", "ZXZZT",
+const EXCHANGE_TEST_SYMBOLS: [&str; 34] = [
+    "ATEST", "CBOA", "CBOJ", "CBOL", "CBOO", "CBOT", "CBOX", "CBOY", "CBXA", "CBXJ", "CBXL",
+    "CBXO", "CBXY", "IBOT", "MTEST", "MTEST.A", "NTEST", "NTEST.H", "NTEST.I", "ZBZX", "ZEXIT",
+    "ZIEXT", "ZJZZT", "ZTEST", "ZTST", "ZVZZT", "ZWZZT", "ZXIET", "ZXZZT", "ZZZTA", "ZZZTE",
+    "ZZZTS", "ZZZTT", "ZZZTX",
 ];
 
 /// Whether this name is an exchange test symbol rather than a security.
@@ -2182,6 +2184,43 @@ pub const REFERENCE_ARCHIVE_PREFIX: &str = "data/derived/equity/reference";
 /// The archive prefix for one trade cadence, hive-partitioned like the quotes.
 pub fn trade_archive_prefix(interval: BarInterval) -> String {
     format!("{TRADE_ARCHIVE_PREFIX}/interval={interval}")
+}
+
+/// Prints folded under a condition the table could not resolve, over these sessions' daily trade
+/// partitions, against every print the fold counted.
+///
+/// A session with no partition contributes nothing and is not an error: the night may not have
+/// reached it. `None` when not one partition could be read, which measured nothing.
+pub async fn unresolved_condition_share(
+    s3_client: &S3Client,
+    bucket: &str,
+    sessions: &[SessionDate],
+) -> Result<Option<Share>, ArchiveError> {
+    let prefix = trade_archive_prefix(BarInterval::OneDay);
+    let mut total: Option<Share> = None;
+    for session in sessions {
+        let key = date_partitioned_key(&prefix, session.date());
+        let Some(frame) = read_partition(s3_client, bucket, &key).await? else {
+            continue;
+        };
+        let share = condition_share_of(&frame)?;
+        total = Some(total.map_or(share, |sum| sum + share));
+    }
+    Ok(total)
+}
+
+/// The unresolved prints and the prints counted in one daily trade partition.
+///
+/// Ambiguous prints are folded into `trade_count` as well as counted apart, so it is the population.
+fn condition_share_of(frame: &DataFrame) -> Result<Share, ArchiveError> {
+    let sum = |column: &str| -> Result<u64, ArchiveError> {
+        let total = frame.column(column)?.i64()?.sum().unwrap_or(0);
+        Ok(u64::try_from(total).unwrap_or(0))
+    };
+    Ok(Share {
+        count: sum("unresolved_condition_trades")?,
+        population: sum("trade_count")?,
+    })
 }
 
 /// Where the published SIC-to-bucket mapping lives, one partition per `as_of`.
@@ -4704,6 +4743,22 @@ mod tests {
         assert!(source
             .unfaithful_sessions(&[session(2021, 8, 26), session(2022, 1, 4)])
             .is_empty());
+    }
+
+    #[test]
+    fn test_the_condition_share_counts_unresolved_prints_against_every_print_counted() {
+        let frame = DataFrame::new(vec![
+            Column::new("trade_count".into(), [1_000_i64, 3_000]),
+            Column::new("unresolved_condition_trades".into(), [10_i64, 20]),
+        ])
+        .expect("a frame");
+        assert_eq!(
+            condition_share_of(&frame).expect("both columns are present"),
+            Share {
+                count: 30,
+                population: 4_000
+            }
+        );
     }
 
     /// An S3 client answering from `respond` instead of the network, given the method and the key.
