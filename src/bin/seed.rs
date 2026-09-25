@@ -29,7 +29,7 @@ use fund::data::export;
 use fund::data::nightly::{
     self, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome, ViewCheck,
 };
-use fund::data::{attribution, bars, details, quotes, trades};
+use fund::data::{attribution, bars, deletion, details, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
 ///
@@ -118,6 +118,42 @@ enum Command {
     ArchiveNightly(NightlyArguments),
     /// Ship this box's journal and logs to the records bucket, before it powers off.
     ExportRecords,
+    /// Delete session partitions, each only if a named route could rebuild it. Reports without
+    /// `--apply`.
+    ArchiveDelete(DeleteArguments),
+}
+
+/// Which partitions to delete.
+#[derive(Debug, Args)]
+struct DeleteArguments {
+    #[arg(long, value_enum)]
+    family: Family,
+    #[arg(long, value_enum)]
+    interval: Interval,
+    /// A session to delete; repeat for several. Every one is checked before any is deleted.
+    #[arg(long = "session", value_parser = session_date, required = true)]
+    sessions: Vec<SessionDate>,
+    /// Delete. Without it the run names each partition's route and removes nothing.
+    #[arg(long)]
+    apply: bool,
+}
+
+/// A family stored one partition per session, spelled as its archive prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Family {
+    Bars,
+    Quotes,
+    Trades,
+}
+
+impl Family {
+    fn session_family(self) -> archive::SessionFamily {
+        match self {
+            Family::Bars => archive::SessionFamily::Bars,
+            Family::Quotes => archive::SessionFamily::Quotes,
+            Family::Trades => archive::SessionFamily::Trades,
+        }
+    }
 }
 
 /// Which vendor a nightly run takes its quotes and prints from.
@@ -279,6 +315,7 @@ impl Command {
             Command::ArchiveCadence { .. } => "seed-archive-cadence",
             Command::ArchiveNightly(_) => "seed-archive-nightly",
             Command::ExportRecords => "seed-export-records",
+            Command::ArchiveDelete(_) => "seed-archive-delete",
         }
     }
 }
@@ -1172,6 +1209,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         Command::ArchiveNightly(arguments) => archive_nightly(arguments, today).await,
         Command::ArchiveCadence { action } => check_cadence(action).await,
         Command::ExportRecords => export_records(today).await,
+        Command::ArchiveDelete(arguments) => delete_partitions(arguments, today).await,
     }
 }
 
@@ -1851,6 +1889,110 @@ fn unshipped_records(
         ));
     }
     refusals
+}
+
+/// Deletes the named partitions once every one has a route that would rebuild it.
+///
+/// All or nothing: a run that deleted the rebuildable half of a list and refused the rest would
+/// leave the operator reconciling two outcomes from one command.
+async fn delete_partitions(
+    arguments: &DeleteArguments,
+    today: SessionDate,
+) -> Result<Outcome, SeedError> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    let mut rederivable = Vec::with_capacity(arguments.sessions.len());
+    let mut orphans = Vec::new();
+    let mut refusals = Vec::new();
+    for &session in &arguments.sessions {
+        let address = deletion::PartitionAddress::new(
+            arguments.family.session_family(),
+            arguments.interval.bar_interval(),
+            session,
+        );
+        let stored = match deletion::inspect(&s3_client, &bucket, address)
+            .await
+            .map_err(box_error)?
+        {
+            deletion::Inspection::Stored(stored) => stored,
+            deletion::Inspection::NotStored { orphaned_sidecar } => {
+                match orphaned_sidecar {
+                    Some(etag) => {
+                        println!("{address}: not stored; its provenance record is orphaned");
+                        orphans.push((address, etag));
+                    }
+                    None => println!("{address}: not stored"),
+                }
+                continue;
+            }
+        };
+        let raw_object_present = match address.raw_key() {
+            Some(key) => deletion::object_etag(&s3_client, &bucket, &key)
+                .await
+                .map_err(box_error)?
+                .is_some(),
+            None => false,
+        };
+        match deletion::rederivation_route(address, today, &stored, raw_object_present) {
+            Ok(found) => {
+                println!("{address}: rebuildable from {}", found.route());
+                rederivable.push(found);
+            }
+            Err(refusal) => {
+                println!("{refusal}");
+                refusals.push(refusal);
+            }
+        }
+    }
+    if !refusals.is_empty() {
+        return Err(SeedError::Failed(
+            format!(
+                "{} of {} partitions have no route that would rebuild them; nothing was deleted",
+                refusals.len(),
+                arguments.sessions.len()
+            )
+            .into(),
+        ));
+    }
+    if !arguments.apply {
+        println!(
+            "{} partitions rebuildable, {} orphaned records; pass --apply to delete them",
+            rederivable.len(),
+            orphans.len()
+        );
+        return Ok(Outcome::Complete);
+    }
+
+    // Each delete is its own request, so a failure partway leaves the earlier ones done; naming
+    // them is what tells the operator which sessions now need their rebuild.
+    let mut deleted: Vec<deletion::PartitionAddress> = Vec::new();
+    let report_partial = |deleted: &[deletion::PartitionAddress]| {
+        for address in deleted {
+            println!("{address}: deleted before the failure");
+        }
+    };
+    for partition in &rederivable {
+        if let Err(error) = deletion::delete_partition(&s3_client, &bucket, partition).await {
+            report_partial(&deleted);
+            return Err(box_error(error));
+        }
+        deleted.push(partition.address());
+    }
+    for (address, etag) in &orphans {
+        if let Err(error) =
+            deletion::delete_orphaned_sidecar(&s3_client, &bucket, *address, etag).await
+        {
+            report_partial(&deleted);
+            return Err(box_error(error));
+        }
+    }
+    println!(
+        "{} partitions deleted, {} orphaned records removed",
+        deleted.len(),
+        orphans.len()
+    );
+    Ok(Outcome::Complete)
 }
 
 /// Ships this box's journal and logs to the records bucket.

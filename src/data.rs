@@ -13,6 +13,7 @@ pub mod calendar;
 pub mod classification;
 pub mod classification_table;
 pub mod conditions;
+pub mod deletion;
 pub mod details;
 pub mod export;
 pub mod industry_codes;
