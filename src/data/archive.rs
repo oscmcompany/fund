@@ -175,7 +175,7 @@ pub enum ArchiveError {
 /// `Option<String>` so the two cases cannot be confused at the call site: "the object I read" and
 /// "no object at all" map to different S3 headers, and sending the wrong one turns the check off
 /// without failing.
-enum Precondition {
+pub(crate) enum Precondition {
     /// The object carried this ETag when it was read.
     Match(String),
     /// There was no object at the key.
@@ -186,7 +186,7 @@ enum Precondition {
 ///
 /// Contention is an expected outcome on a shared bucket, not a fault, so it is separated from a
 /// genuine write failure — the caller retries one and propagates the other.
-enum WriteOutcome {
+pub(crate) enum WriteOutcome {
     Written,
     Contended,
     Failed(String),
@@ -4426,7 +4426,7 @@ async fn put_partition(
 ///
 /// Shared with the provenance sidecar, whose contention window is the same one partitions have: two
 /// routes touching a session at once must merge rather than overwrite.
-async fn put_object_with_precondition(
+pub(crate) async fn put_object_with_precondition(
     s3_client: &S3Client,
     bucket: &str,
     key: &str,

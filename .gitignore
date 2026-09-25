@@ -36,3 +36,6 @@ data/*
 
 # LLVM coverage raw files
 *.profraw
+
+# The Register is private research state. Its record is the records bucket; this is a scratch copy.
+/register/
