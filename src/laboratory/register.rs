@@ -74,6 +74,15 @@ pub enum Bid {
     Unrecorded,
 }
 
+/// How many sessions the verdict was measured over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sessions {
+    Counted(usize),
+    /// A seed result whose count was never written down. Never reconstructed.
+    Unrecorded,
+}
+
 /// Everything committed when an accession opens, before the study binary runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opening {
@@ -105,7 +114,7 @@ pub struct Closing {
     pub verdict: Verdict,
     /// The number the verdict rests on, in the bid's units.
     pub statistic: String,
-    pub sessions: usize,
+    pub sessions: Sessions,
     pub commits: Vec<String>,
     pub closed: SessionDate,
     /// For an inconclusive verdict, the one change its successor makes.
@@ -367,7 +376,7 @@ mod tests {
         Closing {
             verdict,
             statistic: "+5.2pp".to_string(),
-            sessions: 250,
+            sessions: Sessions::Counted(250),
             commits: vec!["abc1234".to_string()],
             closed: session(),
             notes: None,

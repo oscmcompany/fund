@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use fund::common::types::SessionDate;
 use fund::laboratory::register::{
-    self, Accession, AccessionNumber, Bid, Closing, Opening, Status, StudyCost, Verdict,
+    self, Accession, AccessionNumber, Bid, Closing, Opening, Sessions, Status, StudyCost, Verdict,
 };
 
 #[derive(Debug, Parser)]
@@ -73,8 +73,11 @@ struct CloseArguments {
     verdict: VerdictArgument,
     #[arg(long)]
     statistic: String,
-    #[arg(long)]
-    sessions: usize,
+    #[arg(long, required_unless_present = "unrecorded_sessions")]
+    sessions: Option<usize>,
+    /// Only for the seed: results whose session count was never written down.
+    #[arg(long, conflicts_with = "sessions")]
+    unrecorded_sessions: bool,
     #[arg(long = "commit")]
     commits: Vec<String>,
     /// For an inconclusive verdict, the one change its successor makes.
@@ -152,7 +155,10 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
                     VerdictArgument::Inconclusive => Verdict::Inconclusive,
                 },
                 statistic: close.statistic,
-                sessions: close.sessions,
+                sessions: match close.sessions {
+                    Some(count) => Sessions::Counted(count),
+                    None => Sessions::Unrecorded,
+                },
                 commits: close.commits,
                 closed: today,
                 notes: close.notes,
@@ -255,6 +261,28 @@ mod tests {
             "--bid",
             "+4bp",
             "--unrecorded-bid"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn test_a_closing_needs_exactly_one_of_a_session_count_or_its_absence() {
+        let base = [
+            "register",
+            "close",
+            "3",
+            "--verdict",
+            "refute",
+            "--statistic",
+            "t=0.4",
+        ];
+        assert!(Arguments::try_parse_from(base).is_err());
+        assert!(Arguments::try_parse_from(base.iter().chain(&["--sessions", "499"])).is_ok());
+        assert!(Arguments::try_parse_from(base.iter().chain(&["--unrecorded-sessions"])).is_ok());
+        assert!(Arguments::try_parse_from(base.iter().chain(&[
+            "--sessions",
+            "499",
+            "--unrecorded-sessions"
         ]))
         .is_err());
     }
