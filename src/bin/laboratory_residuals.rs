@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use tracing::{error, info, warn};
 
 use fund::common::types::{Screen, ScreenWindow, SessionDate};
-use fund::data::details::UNKNOWN;
+use fund::data::reference::UNKNOWN;
 use fund::laboratory::dataset;
 use fund::laboratory::dataset::DatasetFingerprint;
 use fund::laboratory::harness::{

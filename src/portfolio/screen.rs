@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::debug;
 
-use crate::common::journal::ExclusionReason;
 use crate::common::types::{PairID, Ticker};
 use crate::data::classification_table::Sector;
 
@@ -107,14 +106,6 @@ impl ScreenRejection {
         match self {
             ScreenRejection::UnusableInput => "unusable_input",
             ScreenRejection::StructuralBreak { .. } => "structural_break",
-        }
-    }
-
-    /// Which funnel exit this rejection is, for the journal.
-    pub fn exclusion_reason(&self) -> ExclusionReason {
-        match self {
-            ScreenRejection::UnusableInput => ExclusionReason::UnusableInput,
-            ScreenRejection::StructuralBreak { .. } => ExclusionReason::StructuralBreak,
         }
     }
 

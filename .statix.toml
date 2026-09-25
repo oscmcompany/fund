@@ -1,2 +1,2 @@
 disabled = ["repeated_keys"]
-ignore = [".devenv", "target", ".venv", "models/tide/.devenv"]
+ignore = [".devenv", "target", ".venv"]

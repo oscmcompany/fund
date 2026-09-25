@@ -541,9 +541,9 @@ mod tests {
         }
     }
 
-    /// The round trip survives the case `clean_data` writes.
+    /// The round trip survives the case `clean_frame` writes.
     ///
-    /// `models::tide::data::clean_data` uppercases the sector and industry columns, and the
+    /// `laboratory::frame::clean_frame` uppercases the sector and industry columns, and the
     /// laboratory reads them back on the far side of it, so an exact-match decoder would refuse
     /// every classified row and measure nothing.
     #[test]

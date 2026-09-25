@@ -57,7 +57,6 @@ fn time(text: &str) -> NaiveTime {
 fn expected_eastern_firings(job_name: &str) -> Option<Vec<NaiveTime>> {
     let single = |value: &str| Some(vec![time(value)]);
     match job_name {
-        "predictions-requested" => single("09:00"),
         "portfolio-liquidation-requested" => single("15:45"),
         "account-sync-requested" => single("16:15"),
         "market-data-sync-requested" => single("16:30"),
@@ -341,10 +340,10 @@ fn expected_eastern_dates(expression: &CronExpression) -> Vec<NaiveDate> {
 #[test]
 fn test_every_gated_schedule_keeps_the_same_eastern_clock_all_year() {
     let jobs = parse_jobs(SCHEMA);
-    assert!(
-        jobs.len() >= 6,
-        "expected the schema's scheduled jobs to be found, got {}",
-        jobs.len()
+    assert_eq!(
+        jobs.len(),
+        5,
+        "four trading jobs and the cron cleanup must all be found"
     );
 
     let mut checked = 0;
@@ -455,7 +454,6 @@ fn test_gated_schedules_never_fire_on_a_weekend() {
 #[test]
 fn test_a_once_daily_job_fires_exactly_once_per_session() {
     let once_daily = [
-        "predictions-requested",
         "portfolio-liquidation-requested",
         "account-sync-requested",
         "market-data-sync-requested",

@@ -20,14 +20,11 @@ const _: () = assert!(RETENTION_DAYS >= 3);
 
 /// Tables the purge owns, in the order it visits them.
 ///
-/// Both are append-only and fully represented in the nightly export. The other datasets are absent
+/// Append-only and fully represented in the nightly export. The other datasets are absent
 /// because a row can change after the day it was written, and `equity_bars` because TimescaleDB's
 /// retention policy owns it — two mechanisms deleting from one table is how a rolling window
 /// becomes an empty one.
-const PURGED_TABLES: &[(Dataset, &str)] = &[
-    (Dataset::Events, "created_at"),
-    (Dataset::EquityPredictions, "timestamp"),
-];
+const PURGED_TABLES: &[(Dataset, &str)] = &[(Dataset::Events, "created_at")];
 
 /// What one purge accomplished.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -128,13 +125,13 @@ mod tests {
             .iter()
             .map(|(dataset, _)| dataset.as_str())
             .collect();
-        assert_eq!(tables, vec!["events", "equity_predictions"]);
+        assert_eq!(tables, vec!["events"]);
     }
 
     #[test]
     fn test_summary_totals_only_successful_tables() {
         let summary = PurgeSummary {
-            purged: vec![(Dataset::Events, 100), (Dataset::EquityPredictions, 50)],
+            purged: vec![(Dataset::Events, 100), (Dataset::AccountSnapshots, 50)],
             failed: vec![(Dataset::EquityPairs, "boom".into())],
         };
         assert_eq!(summary.total_rows(), 150);

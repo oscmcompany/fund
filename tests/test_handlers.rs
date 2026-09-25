@@ -201,452 +201,6 @@ fn universe_of(tickers: &[&str]) -> Universe {
     )
 }
 
-/// The whole entry half, end to end: history from the database, prices and orders from Alpaca, the
-/// pair recorded on the way out. This is the test that would catch a mis-wiring between the screen,
-/// the sizing, the gate, and execution — each of which passes its own unit tests in isolation.
-#[tokio::test]
-#[serial]
-async fn test_a_pass_opens_a_pair_and_records_it() {
-    let pool = fresh_pool().await;
-    let mut server = mockito::Server::new_async().await;
-
-    common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    common::seed_details(
-        &pool,
-        &[("AAAA", "BusinessEquipment"), ("BBBB", "Utilities")],
-    )
-    .await;
-    // The long leg is forecast to out-return the short, so the model agrees with the spread.
-    common::seed_predictions(
-        &pool,
-        "run-1",
-        &[("AAAA", 0.04), ("BBBB", -0.03)],
-        Utc::now(),
-    )
-    .await;
-
-    let close_history = bars::load_aligned_closes(
-        &pool,
-        BarInterval::OneDay,
-        60,
-        &SplitTable::default(),
-        &BoundaryTable::default(),
-        SessionDate::at(Utc::now()),
-    )
-    .await
-    .expect("history must load");
-    assert_eq!(close_history.len(), 2, "both legs need aligned history");
-
-    // Prices that push the spread past the entry threshold but not past the cap. Which leg is
-    // stretched decides which becomes the short, so both orderings are quoted and the screen picks.
-    // 1.2% rather than 50%: the seeded series is near-deterministic, so a 50% dislocation scores a
-    // z in the hundreds, which the screen now refuses as a data-quality artifact.
-    // `AAAA` is quoted as well as traded so the accepted-midpoint path is exercised and the
-    // assertion on the recorded book is not vacuous. The book straddles the trade, so prices hold.
-    let long_price = last_close(&close_history, "AAAA");
-    let snapshot_body = serde_json::json!({
-        "AAAA": {
-            "latestTrade": { "t": session_instant().to_rfc3339(), "p": long_price },
-            "latestQuote": {
-                "t": session_instant().to_rfc3339(),
-                "bp": long_price * 0.9995,
-                "ap": long_price * 1.0005,
-                "bs": 10,
-                "as": 12,
-            },
-        },
-        "BBBB": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "BBBB") * 1.012 } },
-    });
-
-    let _snapshots = server
-        .mock(
-            "GET",
-            mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
-        )
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(snapshot_body.to_string())
-        .create_async()
-        .await;
-    let _account = server
-        .mock("GET", "/v2/account")
-        .with_status(200)
-        .with_body(account_body(100_000))
-        .create_async()
-        .await;
-    // Both legs, and exactly both. Without the count this test would pass if only one order were
-    // ever submitted, which is precisely the mis-wiring it exists to catch.
-    let submit = server
-        .mock("POST", "/v2/orders")
-        .with_status(200)
-        .with_body(r#"{"id":"order-1","status":"accepted"}"#)
-        .expect(2)
-        .create_async()
-        .await;
-    let _confirm = server
-        .mock("GET", "/v2/orders/order-1")
-        .with_status(200)
-        .with_body(
-            r#"{"id":"order-1","status":"filled","filled_qty":"33","filled_avg_price":"150.00"}"#,
-        )
-        .create_async()
-        .await;
-
-    let trading = TradingClient::with_base_url(credentials(), server.url());
-    let market_data = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Iex);
-    let calendar = calendar_for_today();
-    let universe = universe_of(&["AAAA", "BBBB"]);
-
-    let running = CancellationToken::new();
-    let journal = journal("test-a-pass-opens-a-pair-and-records-it");
-    let dispatched_correlation_id = uuid::Uuid::new_v4();
-    let context = EvaluationContext {
-        prices_adjustable: true,
-        pool: &pool,
-        trading: &trading,
-        market_data: &market_data,
-        calendar: &calendar,
-        universe: &universe,
-        close_history: &close_history,
-        sizing: SizingParameters::default(),
-        execution: settings(),
-        journal: &journal,
-        correlation_id: dispatched_correlation_id,
-        shutdown: &running,
-        now: session_instant(),
-    };
-
-    let summary = evaluate::run_pass(&context)
-        .await
-        .expect("the pass must run");
-
-    assert_eq!(
-        summary.entries_blocked, None,
-        "nothing should have stopped the entry half"
-    );
-    assert_eq!(
-        summary.candidates_screened, 1,
-        "the fixture must screen one pair"
-    );
-    assert_eq!(summary.pairs_opened, vec!["AAAA-BBBB".to_string()]);
-    assert_eq!(summary.model_run_id.as_deref(), Some("run-1"));
-
-    let open = pairs::load_open_pairs(&pool).await.unwrap();
-    assert_eq!(open.len(), 1);
-    assert!(
-        open[0].entry_z_score() > 0.0,
-        "the stored entry score must be positive by the orientation invariant"
-    );
-
-    // The pass is only useful to a replay if the observation reached the disk. One evaluation
-    // record, and one submission and one resolution per leg, all threaded by the pass's identifier.
-    let records = recorded(&journal);
-    let passes = of_type(&records, "pass_evaluated");
-    assert_eq!(passes.len(), 1, "one record per pass");
-    let pass = &passes[0];
-    let correlation_id = pass["correlation_id"]
-        .as_str()
-        .expect("a pass is correlated");
-    assert_eq!(
-        correlation_id,
-        dispatched_correlation_id.to_string(),
-        "the pass records the identifier the dispatcher supplied, not one of its own"
-    );
-    assert!(
-        pass["payload"]["error"].is_null(),
-        "a pass that completed records no error"
-    );
-
-    assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
-    let candidate = &pass["payload"]["candidates"][0];
-    assert_eq!(candidate["decision"], "opened");
-    // Sizing is recorded on the candidate, not only on the orders that went out, so a pair the risk
-    // gate refuses is still answerable in the dimension that caused the refusal.
-    assert!(
-        candidate["long_notional"].is_number()
-            && candidate["short_quantity"].is_number()
-            && candidate["gross_exposure"].is_number(),
-        "a candidate that reached the sizer carries what it was sized to"
-    );
-
-    // Prices are their own records, one per fetch, sharing the pass's identifier.
-    let priced = of_type(&records, "prices_observed");
-    assert!(!priced.is_empty(), "the prices the pass decided on");
-    let readings: Vec<&serde_json::Value> = priced
-        .iter()
-        .flat_map(|record| record["payload"]["readings"].as_array().unwrap())
-        .collect();
-    assert!(!readings.is_empty());
-    assert!(
-        readings
-            .iter()
-            .all(|reading| reading["price"].is_number() && reading["price_source"].is_string()),
-        "a price without its source cannot be compared across passes"
-    );
-    // Asserted before the check below, which is otherwise vacuously true the moment the fixture
-    // stops quoting anything.
-    assert!(
-        readings
-            .iter()
-            .any(|reading| reading["price_source"] == "quote_midpoint"),
-        "the fixture must exercise the guard's accepting path"
-    );
-    assert!(
-        readings.iter().all(|reading| {
-            reading["price_source"] != "quote_midpoint"
-                || (reading["bid_price"].is_number()
-                    && reading["ask_price"].is_number()
-                    && reading["quote_timestamp"].is_string())
-        }),
-        "a midpoint must carry the book it was taken from, or the guard cannot be tuned"
-    );
-    // Nothing refuses a trade for being old, so the record is the only place to notice a stale one.
-    assert!(
-        readings
-            .iter()
-            .any(|reading| reading["price_source"] == "last_trade"),
-        "the fixture must exercise the fallback path"
-    );
-    assert!(
-        readings.iter().all(|reading| {
-            reading["price_source"] != "last_trade" || reading["trade_timestamp"].is_string()
-        }),
-        "a fallback price must carry when it printed, or its staleness cannot be judged"
-    );
-    assert!(
-        priced
-            .iter()
-            .all(|record| record["payload"]["purpose"].is_string()),
-        "each fetch names what it was for"
-    );
-
-    // What the model offered the screen, as rows rather than a count. `expected_return` and
-    // `confidence` are derived from the stored quantiles, so `equity_predictions` alone cannot
-    // reconstruct what the screen actually consumed.
-    let screened = of_type(&records, "universe_screened");
-    assert_eq!(screened.len(), 1, "one funnel per pass");
-    let screen_inputs = screened[0]["payload"]["inputs"]
-        .as_array()
-        .expect("screen inputs are recorded");
-    assert_eq!(
-        screen_inputs.len(),
-        2,
-        "both predictions reached the screen"
-    );
-    assert!(screen_inputs
-        .iter()
-        .all(|input| input["expected_return"].is_number()
-            && input["confidence"].is_number()
-            && input["is_shortable"].is_boolean()));
-    assert!(
-        screened[0]["payload"]["excluded"]
-            .as_array()
-            .expect("the funnel is recorded")
-            .is_empty(),
-        "nothing was filtered out in this fixture"
-    );
-
-    let submitted = of_type(&records, "order_submitted");
-    let resolved = of_type(&records, "order_resolved");
-    assert_eq!(submitted.len(), 2, "one submission per leg");
-    assert_eq!(resolved.len(), 2, "every submission is resolved");
-    for record in submitted.iter().chain(resolved.iter()) {
-        assert_eq!(
-            record["correlation_id"], correlation_id,
-            "orders thread back to the pass that decided them"
-        );
-    }
-    // The submission is keyed by an identifier chosen before the request was sent, which is what
-    // makes an order recoverable if the process dies between the write and Alpaca's response.
-    assert_eq!(
-        submitted[0]["payload"]["client_order_id"],
-        resolved[0]["payload"]["client_order_id"]
-    );
-    assert_eq!(resolved[0]["payload"]["outcome"], "filled");
-
-    // The pair itself, with the rationale nothing outside this application knows: which long was
-    // paired with which short, on what hedge ratio, at what entry score.
-    let opened = of_type(&records, "pair_opened");
-    assert_eq!(opened.len(), 1, "the pair that opened is recorded");
-    assert_eq!(opened[0]["payload"]["pair_id"], "AAAA-BBBB");
-    assert_eq!(opened[0]["payload"]["model_run_id"], "run-1");
-    assert!(
-        opened[0]["payload"]["hedge_ratio"].is_number()
-            && opened[0]["payload"]["entry_z_score"].is_number()
-            && opened[0]["payload"]["signal_strength"].is_number()
-    );
-    // The identifier the close and the attribution will join on.
-    assert_eq!(
-        opened[0]["payload"]["equity_pair_id"],
-        open[0].id().to_string(),
-        "the record names the row it wrote"
-    );
-
-    // The plan reaches the disk before the orders it calls for, which is why it is its own record.
-    // These assert the *order* of the writes, not merely that both happened.
-    let entry_plan: Vec<&serde_json::Value> = of_type(&records, "plan_decided")
-        .into_iter()
-        .filter(|record| record["payload"]["phase"] == "entries")
-        .collect();
-    assert_eq!(entry_plan.len(), 1, "one plan per round");
-    // The exits round plans unconditionally, including on a pass with an empty book. Without this
-    // a regression that dropped that call would leave the rest of these assertions green.
-    let exit_plan: Vec<&serde_json::Value> = of_type(&records, "plan_decided")
-        .into_iter()
-        .filter(|record| record["payload"]["phase"] == "exits")
-        .collect();
-    assert_eq!(exit_plan.len(), 1, "the exits round plans every pass");
-    assert_eq!(
-        entry_plan[0]["payload"]["actions"][0]["pair_id"],
-        "AAAA-BBBB"
-    );
-    assert_eq!(entry_plan[0]["payload"]["actions"][0]["action"], "open");
-    assert!(
-        entry_plan[0]["payload"]["actions"][0]["long_notional"].is_number(),
-        "an entry is sized before it is sent, so the plan can say what it would have risked"
-    );
-
-    // The *entries* plan specifically: locating it by event type alone finds the exits plan, which
-    // precedes the orders under any ordering and would make these assertions vacuous.
-    let position = |predicate: &dyn Fn(&serde_json::Value) -> bool, what: &str| {
-        records
-            .iter()
-            .position(|record| predicate(record))
-            .unwrap_or_else(|| panic!("{what} must be recorded"))
-    };
-    let entry_plan_at = position(
-        &|record| record["event_type"] == "plan_decided" && record["payload"]["phase"] == "entries",
-        "the entries plan",
-    );
-    assert!(
-        entry_plan_at
-            < position(
-                &|record| record["event_type"] == "order_submitted",
-                "an order"
-            ),
-        "the entries plan is written before the first order leaves the process"
-    );
-    assert!(
-        entry_plan_at < position(&|record| record["event_type"] == "pair_opened", "a pair"),
-        "and before the pair it opens"
-    );
-
-    submit.assert_async().await;
-}
-
-/// The same fixture as above, with shutdown already requested: the pass must open nothing and say
-/// so, rather than submitting orders it may not survive to record.
-///
-/// This is what makes the drain's timeout in `bin/fund.rs` a real bound: opening a pair is two
-/// broker legs at `FILL_TIMEOUT` each, so bounding the *start* of new pairs is what caps the worst
-/// case at the one pair already in flight. `.expect(0)` on the order mock is the assertion that
-/// matters, since without it the test passes on a summary reporting zero opens while orders go out.
-#[tokio::test]
-#[serial]
-async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
-    let pool = fresh_pool().await;
-    let mut server = mockito::Server::new_async().await;
-
-    common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    common::seed_details(
-        &pool,
-        &[("AAAA", "BusinessEquipment"), ("BBBB", "Utilities")],
-    )
-    .await;
-    common::seed_predictions(
-        &pool,
-        "run-1",
-        &[("AAAA", 0.04), ("BBBB", -0.03)],
-        Utc::now(),
-    )
-    .await;
-
-    let close_history = bars::load_aligned_closes(
-        &pool,
-        BarInterval::OneDay,
-        60,
-        &SplitTable::default(),
-        &BoundaryTable::default(),
-        SessionDate::at(Utc::now()),
-    )
-    .await
-    .expect("history must load");
-
-    let snapshot_body = serde_json::json!({
-        "AAAA": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "AAAA") } },
-        "BBBB": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "BBBB") * 1.012 } },
-    });
-    let _snapshots = server
-        .mock(
-            "GET",
-            mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
-        )
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(snapshot_body.to_string())
-        .create_async()
-        .await;
-    let _account = server
-        .mock("GET", "/v2/account")
-        .with_status(200)
-        .with_body(account_body(100_000))
-        .create_async()
-        .await;
-    let submit = server
-        .mock("POST", "/v2/orders")
-        .with_status(200)
-        .with_body(r#"{"id":"order-1","status":"accepted"}"#)
-        .expect(0)
-        .create_async()
-        .await;
-
-    let trading = TradingClient::with_base_url(credentials(), server.url());
-    let market_data = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Iex);
-    let calendar = calendar_for_today();
-    let universe = universe_of(&["AAAA", "BBBB"]);
-
-    let running = CancellationToken::new();
-    running.cancel();
-
-    let journal = journal("test-a-pass-opens-nothing-once-shutdown-is-requested");
-    let context = EvaluationContext {
-        prices_adjustable: true,
-        pool: &pool,
-        trading: &trading,
-        market_data: &market_data,
-        calendar: &calendar,
-        universe: &universe,
-        close_history: &close_history,
-        sizing: SizingParameters::default(),
-        execution: settings(),
-        journal: &journal,
-        correlation_id: uuid::Uuid::new_v4(),
-        shutdown: &running,
-        now: session_instant(),
-    };
-
-    let summary = evaluate::run_pass(&context)
-        .await
-        .expect("the pass must still complete cleanly");
-
-    // The pair cleared every check — it was approved and then not reached. That is the distinction
-    // `entries_abandoned` exists to record, and it is why this is not `entries_refused`.
-    assert_eq!(
-        summary.candidates_screened, 1,
-        "the screen still ran; only the opening stopped"
-    );
-    assert_eq!(summary.entries_blocked, None, "the gate did not block");
-    assert!(summary.entries_refused.is_empty(), "nothing was refused");
-    assert_eq!(summary.entries_abandoned, 1);
-    assert!(summary.pairs_opened.is_empty());
-
-    assert!(
-        pairs::load_open_pairs(&pool).await.unwrap().is_empty(),
-        "no pair may be recorded"
-    );
-    submit.assert_async().await;
-}
-
 /// Exits run before anything else and are never gated. A pass on a full book still has to close
 /// what should close, which is the property that makes every early return in the entry half safe.
 #[tokio::test]
@@ -674,7 +228,6 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         hedge_ratio_for(&close_history),
         2.5,
         0.03,
-        None,
     )
     .unwrap();
     pairs::record_open(&pool, &entry, Utc::now() - Duration::hours(1))
@@ -686,7 +239,6 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
             1.0,
             2.5,
             0.01,
-            None,
         )
         .unwrap();
         pairs::record_open(&pool, &filler, Utc::now())
@@ -768,7 +320,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
 
     // Pin *why* nothing opened rather than only that nothing did. Closing the converged pair frees
     // a slot, so the entry half is not capacity-blocked by the time it runs — it runs and finds
-    // nothing, because this test seeds no details and no predictions. Asserting both fields
+    // nothing, because nothing feeds the screen until a signal is accepted. Asserting both fields
     // distinguishes that from a gate refusal, which an empty `pairs_opened` alone cannot.
     assert_eq!(summary.entries_blocked, None);
     assert_eq!(summary.candidates_screened, 0);
@@ -835,7 +387,6 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
         1.0,
         2.5,
         0.03,
-        None,
     )
     .unwrap();
     pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
@@ -906,10 +457,6 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
         1,
         "the book reading was written before the failure and is unaffected by it"
     );
-    assert!(
-        of_type(&records, "universe_screened").is_empty(),
-        "the pass never reached the screen"
-    );
 }
 
 /// A pair with no price this pass is held, not closed and not crashed. The pre-close liquidation
@@ -937,7 +484,6 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         1.0,
         2.5,
         0.03,
-        None,
     )
     .unwrap();
     pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
@@ -1016,7 +562,6 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         1.0,
         2.5,
         0.03,
-        None,
     )
     .unwrap();
     pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
@@ -1116,7 +661,6 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
             1.0,
             2.5,
             0.01,
-            None,
         )
         .unwrap();
         pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
@@ -1219,7 +763,6 @@ async fn test_a_refused_leg_leaves_its_pair_open() {
             1.0,
             2.5,
             0.01,
-            None,
         )
         .unwrap();
         pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
@@ -1293,7 +836,6 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         1.0,
         2.5,
         0.03,
-        None,
     )
     .unwrap();
     let id = pairs::record_open(&pool, &entry, opened).await.unwrap();

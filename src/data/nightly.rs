@@ -452,6 +452,25 @@ impl ViewCheck {
     }
 }
 
+/// What refreshing one whole-table dataset did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum TableRefresh {
+    Refreshed {
+        rows: usize,
+    },
+    /// The table was left as it was; the error is the vendor's or the bucket's.
+    Failed(String),
+}
+
+impl TableRefresh {
+    pub fn of<E: std::fmt::Display>(result: Result<usize, E>) -> Self {
+        match result {
+            Ok(rows) => TableRefresh::Refreshed { rows },
+            Err(error) => TableRefresh::Failed(error.to_string()),
+        }
+    }
+}
+
 /// A count and the population it was taken over, so a rate carries its denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Share {
@@ -767,6 +786,18 @@ mod tests {
 
     fn session(text: &str) -> SessionDate {
         SessionDate::from_date(chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("a date"))
+    }
+
+    #[test]
+    fn test_a_table_refresh_keeps_the_row_count_or_the_error() {
+        assert_eq!(
+            TableRefresh::of::<String>(Ok(12)),
+            TableRefresh::Refreshed { rows: 12 }
+        );
+        assert_eq!(
+            TableRefresh::of(Err("throttled")),
+            TableRefresh::Failed("throttled".to_string())
+        );
     }
 
     #[test]

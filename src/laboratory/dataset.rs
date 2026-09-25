@@ -11,11 +11,8 @@ use tracing::warn;
 use crate::common::aws::date_partitioned_key;
 use crate::common::types::{BarInterval, LiquidityFloor, Screen, ScreenWindow, SessionDate};
 use crate::data::{adjust, archive, bars, reference, truncate};
+use crate::laboratory::frame::{self, FrameError};
 use crate::laboratory::residual::{residual_returns, FactorSpecification, ResidualPanel};
-use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
-use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
-use crate::models::tide::predict;
-use crate::models::tide::TideError;
 
 /// Errors building a dataset.
 #[derive(Debug, thiserror::Error)]
@@ -24,12 +21,8 @@ pub enum DatasetError {
     Archive(#[from] archive::ArchiveError),
     #[error("dataframe operation failed: {0}")]
     Frame(#[from] PolarsError),
-    #[error("preprocessing failed: {0}")]
-    Tide(#[from] TideError),
-    #[error("failed to read the reference universe: {0}")]
-    Details(#[from] crate::data::details::DetailsError),
-    #[error("failed to consolidate bars with their classification: {0}")]
-    Consolidation(#[from] crate::models::tide::predict::PredictionError),
+    #[error("failed to shape the study frame: {0}")]
+    Shape(#[from] FrameError),
     #[error("failed to residualize returns: {0}")]
     Residual(#[from] crate::laboratory::residual::ResidualError),
     /// A window that cannot produce a dataset, named rather than returned empty.
@@ -156,45 +149,11 @@ fn digest_of(frame: &DataFrame) -> Result<u64, DatasetError> {
     Ok(digest)
 }
 
-/// A prepared dataset and the identity of what it was prepared from.
-pub struct PreparedDataset {
-    pub fit: FitResult,
-    pub fingerprint: DatasetFingerprint,
-}
-
 /// One session's returns per name, and the identity of the window they came from.
 pub struct ReturnsDataset {
     /// Every engineered feature alongside `ticker` and `timestamp`, cleaned and unscaled.
     pub returns: DataFrame,
     pub fingerprint: DatasetFingerprint,
-}
-
-/// Reads the archive for `lookback_days` back from `session` and prepares it for windowing.
-///
-/// The splits table is fatal where the boundary table is not: stored prices are raw, so training
-/// without splits fits a two-for-one as a genuine fifty percent fall, while an absent boundary
-/// table costs a guard on a handful of names.
-pub async fn build(
-    s3_client: &S3Client,
-    bucket: &str,
-    lookback_days: i64,
-    session: SessionDate,
-    screen: Screen,
-    training_fraction: TrainingFraction,
-    target: Target,
-) -> Result<PreparedDataset, DatasetError> {
-    let (filtered, fingerprint) = read_window(
-        s3_client,
-        bucket,
-        lookback_days,
-        session,
-        screen,
-        Microstructure::Omitted,
-    )
-    .await?;
-    let fit = fit(filtered, training_fraction, target)?;
-
-    Ok(PreparedDataset { fit, fingerprint })
 }
 
 /// One intraday window, folded for splits and otherwise raw.
@@ -363,7 +322,7 @@ pub async fn returns(
     // The model's own two steps, not just the first: `clean_data` drops any row holding a null or
     // non-finite value in any continuous column, so skipping it would measure names the model never
     // sees — a missing vendor VWAP costs a row there and none here.
-    let cleaned = clean_data(engineer_features(filtered)?)?;
+    let cleaned = frame::clean_frame(frame::add_daily_returns(filtered)?)?;
 
     Ok(ReturnsDataset {
         returns: cleaned,
@@ -675,8 +634,7 @@ pub async fn unscreened_window(
         "Classified the study universe"
     );
     let reference_digest = digest_of(universe.rows())?;
-    let consolidated =
-        reference::join_point_in_time(predict::prepare_bars(equity_bars)?, &universe)?;
+    let consolidated = reference::join_point_in_time(frame::prepare_bars(equity_bars)?, &universe)?;
     // The prices arrived restated onto this session's share basis and the counts did not, so their
     // product is out by the split factor until this runs.
     let bars = adjust::adjust_share_counts(consolidated, &adjustments.splits, session)?;
@@ -762,7 +720,7 @@ async fn read_window(
     // An empty window has no last session to anchor on; `session` screens it to the same nothing
     // and reaches the fingerprint below, which is where an empty window is named.
     let anchor = window.last_session.unwrap_or(session);
-    let filtered = filter_training_bars(window.bars, screen, anchor)?;
+    let filtered = frame::filter_study_bars(window.bars, screen, anchor)?;
 
     let fingerprint = fingerprint_of(
         &filtered,

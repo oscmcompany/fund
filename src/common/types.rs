@@ -8,7 +8,6 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use uuid::Uuid;
 
 /// Which bound of a [`LiquidityFloor`] a name failed, and the reading that failed it.
 ///
@@ -253,7 +252,6 @@ pub mod decimal_number_option {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dataset {
     Events,
-    EquityPredictions,
     EquityPairs,
     AccountSnapshots,
     AccountActivities,
@@ -264,7 +262,6 @@ impl Dataset {
     pub fn as_str(self) -> &'static str {
         match self {
             Dataset::Events => "events",
-            Dataset::EquityPredictions => "equity_predictions",
             Dataset::EquityPairs => "equity_pairs",
             Dataset::AccountSnapshots => "account_snapshots",
             Dataset::AccountActivities => "account_activities",
@@ -275,7 +272,6 @@ impl Dataset {
     pub fn prefix(self) -> &'static str {
         match self {
             Dataset::Events => "exports/events",
-            Dataset::EquityPredictions => "exports/equity/predictions",
             Dataset::EquityPairs => "exports/equity/pairs",
             Dataset::AccountSnapshots => "exports/account/snapshots",
             Dataset::AccountActivities => "exports/account/activities",
@@ -2231,148 +2227,6 @@ impl SeriesBoundary {
     }
 }
 
-/// Ticker metadata used to constrain pair selection to cross-sector matches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EquityDetail {
-    ticker: Ticker,
-    sector: String,
-    industry: String,
-}
-
-impl EquityDetail {
-    /// Constructs an `EquityDetail` from validated field values.
-    pub fn new(ticker: Ticker, sector: String, industry: String) -> Self {
-        Self {
-            ticker,
-            sector,
-            industry,
-        }
-    }
-
-    pub fn ticker(&self) -> &Ticker {
-        &self.ticker
-    }
-
-    pub fn sector(&self) -> &str {
-        &self.sector
-    }
-
-    pub fn industry(&self) -> &str {
-        &self.industry
-    }
-}
-
-/// One ticker's quantile prediction from a single batch.
-///
-/// The three quantiles are ordered by construction: [`EquityPrediction::new`] rejects a set where
-/// `quantile_10 > quantile_50` or `quantile_50 > quantile_90`. A crossed quantile set is a model or
-/// deserialization bug, and every downstream use — the confidence measure, the directional signal —
-/// silently produces nonsense from one rather than failing.
-#[derive(Debug, Clone, Serialize)]
-pub struct EquityPrediction {
-    correlation_id: Uuid,
-    model_run_id: String,
-    ticker: Ticker,
-    timestamp: DateTime<Utc>,
-    quantile_10: f64,
-    quantile_50: f64,
-    quantile_90: f64,
-}
-
-/// Error returned when constructing an [`EquityPrediction`] whose quantiles are not ordered.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CrossedQuantilesError {
-    pub quantile_10: f64,
-    pub quantile_50: f64,
-    pub quantile_90: f64,
-}
-
-impl std::fmt::Display for CrossedQuantilesError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Quantiles must be non-decreasing, got [{}, {}, {}].",
-            self.quantile_10, self.quantile_50, self.quantile_90
-        )
-    }
-}
-
-impl std::error::Error for CrossedQuantilesError {}
-
-impl EquityPrediction {
-    /// Constructs an `EquityPrediction`, rejecting crossed or non-finite quantiles.
-    pub fn new(
-        correlation_id: Uuid,
-        model_run_id: String,
-        ticker: Ticker,
-        timestamp: DateTime<Utc>,
-        quantile_10: f64,
-        quantile_50: f64,
-        quantile_90: f64,
-    ) -> Result<Self, CrossedQuantilesError> {
-        let ordered = quantile_10 <= quantile_50 && quantile_50 <= quantile_90;
-        let finite = quantile_10.is_finite() && quantile_50.is_finite() && quantile_90.is_finite();
-        if !ordered || !finite {
-            return Err(CrossedQuantilesError {
-                quantile_10,
-                quantile_50,
-                quantile_90,
-            });
-        }
-        Ok(Self {
-            correlation_id,
-            model_run_id,
-            ticker,
-            timestamp,
-            quantile_10,
-            quantile_50,
-            quantile_90,
-        })
-    }
-
-    pub fn correlation_id(&self) -> Uuid {
-        self.correlation_id
-    }
-
-    pub fn model_run_id(&self) -> &str {
-        &self.model_run_id
-    }
-
-    pub fn ticker(&self) -> &Ticker {
-        &self.ticker
-    }
-
-    pub fn timestamp(&self) -> DateTime<Utc> {
-        self.timestamp
-    }
-
-    pub fn quantile_10(&self) -> f64 {
-        self.quantile_10
-    }
-
-    pub fn quantile_50(&self) -> f64 {
-        self.quantile_50
-    }
-
-    pub fn quantile_90(&self) -> f64 {
-        self.quantile_90
-    }
-
-    /// The median prediction, which is the expected forward return the strategy trades on.
-    pub fn expected_return(&self) -> f64 {
-        self.quantile_50
-    }
-
-    /// Confidence derived from the width of the prediction interval, in `(0.0, 1.0]`.
-    ///
-    /// A tight interval means the model is sure; a wide one means it is not. The reciprocal form
-    /// maps a zero-width interval to 1.0 and decays monotonically, and is finite for any
-    /// non-negative width, which the ordering invariant guarantees.
-    pub fn confidence(&self) -> f64 {
-        1.0 / (1.0 + (self.quantile_90 - self.quantile_10))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3045,54 +2899,6 @@ mod tests {
     fn test_split_accepts_a_fractional_ratio() {
         let reallocation = split("E1", 1.0, 1.0056).expect("a fractional ratio must construct");
         assert_eq!(reallocation.split_to(), 1.0056);
-    }
-
-    fn prediction(
-        low: f64,
-        mid: f64,
-        high: f64,
-    ) -> Result<EquityPrediction, CrossedQuantilesError> {
-        EquityPrediction::new(
-            Uuid::nil(),
-            "run-1".to_string(),
-            ticker("AAPL"),
-            Utc::now(),
-            low,
-            mid,
-            high,
-        )
-    }
-
-    #[test]
-    fn test_prediction_accepts_ordered_quantiles() {
-        let prediction = prediction(-0.01, 0.0, 0.01).expect("ordered quantiles must construct");
-        assert_eq!(prediction.expected_return(), 0.0);
-    }
-
-    #[test]
-    fn test_prediction_rejects_crossed_quantiles() {
-        assert!(prediction(0.02, 0.0, 0.01).is_err());
-        assert!(prediction(-0.01, 0.05, 0.01).is_err());
-    }
-
-    #[test]
-    fn test_prediction_rejects_non_finite_quantiles() {
-        assert!(prediction(f64::NAN, 0.0, 0.01).is_err());
-        assert!(prediction(-0.01, 0.0, f64::INFINITY).is_err());
-    }
-
-    /// Confidence must fall as the interval widens, and stay inside `(0.0, 1.0]`. A zero-width
-    /// interval is maximal confidence.
-    #[test]
-    fn test_prediction_confidence_decreases_with_interval_width() {
-        let tight = prediction(0.0, 0.0, 0.0).unwrap();
-        let medium = prediction(-0.01, 0.0, 0.01).unwrap();
-        let wide = prediction(-0.5, 0.0, 0.5).unwrap();
-
-        assert_eq!(tight.confidence(), 1.0);
-        assert!(medium.confidence() < tight.confidence());
-        assert!(wide.confidence() < medium.confidence());
-        assert!(wide.confidence() > 0.0);
     }
 
     fn reference(security_type: Option<SecurityType>, sic: Option<&str>) -> EquityReference {

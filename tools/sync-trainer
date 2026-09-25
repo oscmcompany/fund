@@ -15,14 +15,11 @@ set -euo pipefail
 # checked out. What it needs instead is a guard against syncing *during* a run, because resetting
 # the working tree under a training job would swap the source out from beneath it.
 #
-# This replaces the fetch-and-reset that used to live at the top of `train-tide-model`, rather than
-# adding a second one alongside it.
-#
 # Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCK_FILE="/tmp/sync-trainer.pid"
-TRAINING_LOCK_FILE="/tmp/train-tide-model.pid"
+TRAINING_LOCK_FILE="/tmp/run-researcher.pid"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
@@ -41,20 +38,16 @@ trap 'rm -f "$LOCK_FILE"' EXIT
 
 cd "$REPO_ROOT"
 
-# Never sync mid-run. A training run takes far longer than the one-minute cron interval, so this is
-# the common case on a training evening rather than a rare race. Skipping costs one cycle; the next
-# firing after the run finishes picks the new revision up.
-#
-# The lock `train-tide-model` holds, not a `pgrep` for `tide_model_trainer`. The binary does not
-# exist as a process during the release build that precedes it, which can run for minutes -- and
-# that is precisely the window in which resetting the tree does the most damage.
+# Never sync mid-run. Skipping costs one cycle; the next firing after the run picks the new revision
+# up. The lock `run-researcher` holds rather than a `pgrep`, because no binary exists as a process
+# during the release build that precedes it -- the window in which a reset does the most damage.
 if [[ -f "$TRAINING_LOCK_FILE" ]]; then
   training_pid="$(cat "$TRAINING_LOCK_FILE")"
   if kill -0 "$training_pid" 2>/dev/null; then
-    log "Training in progress (pid $training_pid), skipping sync"
+    log "A researcher run is in progress (pid $training_pid), skipping sync"
     exit 0
   fi
-  log "Ignoring a stale training lock from pid $training_pid"
+  log "Ignoring a stale researcher lock from pid $training_pid"
 fi
 
 if ! git fetch origin master 2>&1; then

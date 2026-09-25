@@ -4,18 +4,16 @@
 
 mod common;
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use fund::common::alpaca::{ActivityType, OrderSide};
 use fund::common::events::{self, Command, EventType, Outcome};
-use fund::common::types::{BarInterval, EquityDetail, PairID, SessionDate, Ticker};
+use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
-use fund::data::classification_table::Sector;
 use fund::data::truncate::BoundaryTable;
 use fund::data::universe;
 
 use fund::common::types::CloseReason;
-use fund::models::tide::predict;
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, PairEntry};
 use rust_decimal::Decimal;
@@ -32,94 +30,13 @@ fn pair(long: &str, short: &str) -> PairID {
 }
 
 fn entry(long: &str, short: &str) -> PairEntry {
-    PairEntry::new(
-        pair(long, short),
-        1.05,
-        2.4,
-        0.03,
-        Some("run-1".to_string()),
-    )
-    .expect("test entry must be valid")
+    PairEntry::new(pair(long, short), 1.05, 2.4, 0.03).expect("test entry must be valid")
 }
 
 async fn fresh_pool() -> PgPool {
     let pool = common::test_pool("database").await;
     common::reset_tables(&pool).await;
     pool
-}
-
-/// The universe shrinks. A name that delists or reclassifies out of common stock leaves the
-/// snapshot, and an upsert would keep it in `equity_details` — where the screen's inner join would
-/// go on admitting it forever.
-#[tokio::test]
-#[serial]
-async fn test_storing_details_replaces_the_table_rather_than_merging_into_it() {
-    let pool = fresh_pool().await;
-    let detail = |symbol: &str, sector: Sector| {
-        EquityDetail::new(
-            ticker(symbol),
-            sector.as_str().to_string(),
-            "Computers".to_string(),
-        )
-    };
-
-    fund::data::details::store_details(
-        &pool,
-        &[
-            detail("AAPL", Sector::BusinessEquipment),
-            detail("TWTR", Sector::Other),
-        ],
-    )
-    .await
-    .expect("the first snapshot must store");
-
-    // TWTR is gone from the second snapshot, and AAPL's sector has been restated.
-    let written =
-        fund::data::details::store_details(&pool, &[detail("AAPL", Sector::Manufacturing)])
-            .await
-            .expect("the second snapshot must store");
-
-    assert_eq!(written, 1);
-    let stored = fund::data::details::load_sectors(&pool)
-        .await
-        .expect("the sectors must load");
-    assert_eq!(stored.len(), 1, "the departed name must not survive");
-    assert_eq!(
-        stored.get(&ticker("AAPL")),
-        Some(&Some(Sector::Manufacturing))
-    );
-    assert!(stored.get(&ticker("TWTR")).is_none());
-}
-
-/// A snapshot that answered for nothing is a failed read, not an empty market, so it must leave the
-/// stored universe alone rather than emptying the table the screen depends on.
-#[tokio::test]
-#[serial]
-async fn test_an_empty_snapshot_leaves_the_stored_universe_alone() {
-    let pool = fresh_pool().await;
-    fund::data::details::store_details(
-        &pool,
-        &[EquityDetail::new(
-            ticker("AAPL"),
-            "35".to_string(),
-            "3571".to_string(),
-        )],
-    )
-    .await
-    .expect("the snapshot must store");
-
-    let written = fund::data::details::store_details(&pool, &[])
-        .await
-        .expect("an empty snapshot must not fail");
-
-    assert_eq!(written, 0);
-    assert_eq!(
-        fund::data::details::load_sectors(&pool)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -212,7 +129,7 @@ async fn test_every_close_reason_is_accepted_by_the_constraint() {
     assert_eq!(legs.len(), CloseReason::ALL.len());
 
     for (reason, (long, short)) in CloseReason::ALL.into_iter().zip(legs) {
-        let entry = PairEntry::new(pair(long, short), 1.0, 2.0, 0.01, None).unwrap();
+        let entry = PairEntry::new(pair(long, short), 1.0, 2.0, 0.01).unwrap();
         let id = pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
         assert!(
             pairs::record_close(&pool, id, reason, Utc::now())
@@ -594,8 +511,8 @@ async fn test_the_two_liquidity_screens_agree_on_the_window_and_the_anchor() {
 /// The two screens read different prices through a split, and this pins how far apart that puts them.
 ///
 /// A characterization test, not an approval: `load_liquidity` aggregates raw `equity_bars` while the
-/// live predict path screens the split-adjusted, boundary-stitched output of `load_bars_dataframe`.
-/// An adjusted minimum close is weakly lower than the raw one, so through a split the predicted set
+/// frame side screens the split-adjusted, boundary-stitched output of `load_bars_dataframe`, which is
+/// what a study reads. An adjusted minimum close is weakly lower than the raw one, so through a split the frame
 /// applies the harder price floor and refuses a name the traded universe admits. Sharing the anchor
 /// does not close this, and a docstring saying so is a sentence where this is a number — when the
 /// two bases are unified, this test fails and says where.
@@ -829,61 +746,6 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
     assert_eq!(closes[&ticker("AAAA")], vec![100.0]);
 }
 
-/// The pass reads only the current session's predictions. Reading yesterday's when this morning's
-/// inference failed would present a stale prediction as current, and nothing downstream carries the
-/// timestamp far enough to notice.
-#[tokio::test]
-#[serial]
-async fn test_predictions_are_bounded_to_the_session_window() {
-    let pool = fresh_pool().await;
-    let now = Utc::now();
-    let (start, end) = SessionDate::at(now).bounds();
-
-    common::seed_predictions(&pool, "run-today", &[("AAAA", 0.03)], now).await;
-    common::seed_predictions(
-        &pool,
-        "run-yesterday",
-        &[("BBBB", 0.04)],
-        start - Duration::hours(2),
-    )
-    .await;
-
-    let loaded = predict::load_predictions_between(&pool, start, end)
-        .await
-        .unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].ticker().as_str(), "AAAA");
-    assert_eq!(loaded[0].model_run_id(), "run-today");
-}
-
-/// One row per ticker, the newest. A re-run leaves two predictions for the same symbol, and feeding
-/// both into the screen would let one ticker appear on both legs of the same pair.
-///
-/// Both rows are placed relative to the session's own start rather than to the clock. Offsets back
-/// from `now` land in the *previous* session whenever the suite runs within that many hours of
-/// Eastern midnight, and the window query then returns nothing.
-#[tokio::test]
-#[serial]
-async fn test_predictions_return_the_newest_row_per_ticker() {
-    let pool = fresh_pool().await;
-    let (start, end) = SessionDate::at(Utc::now()).bounds();
-
-    common::seed_predictions(&pool, "run-early", &[("AAAA", 0.01)], start).await;
-    common::seed_predictions(
-        &pool,
-        "run-late",
-        &[("AAAA", 0.05)],
-        start + Duration::hours(1),
-    )
-    .await;
-
-    let loaded = predict::load_predictions_between(&pool, start, end)
-        .await
-        .unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].model_run_id(), "run-late");
-}
-
 #[tokio::test]
 #[serial]
 async fn test_a_request_with_no_terminal_outcome_is_recovered() {
@@ -1051,38 +913,6 @@ async fn test_every_event_type_round_trips_through_the_trigger() {
     }
 }
 
-#[tokio::test]
-#[serial]
-async fn test_sectors_load_as_a_lookup_map() {
-    let pool = fresh_pool().await;
-    common::seed_details(
-        &pool,
-        &[
-            ("AAAA", "BusinessEquipment"),
-            ("BBBB", "Utilities"),
-            ("CCCC", "NOT AVAILABLE"),
-            // A two-digit major group, which is what rows written before this change carry.
-            ("DDDD", "35"),
-            // The source's own short code, which is not the stored spelling.
-            ("EEEE", "BusEq"),
-        ],
-    )
-    .await;
-
-    let sectors = fund::data::details::load_sectors(&pool).await.unwrap();
-    assert_eq!(sectors.len(), 5);
-    assert_eq!(sectors[&ticker("AAAA")], Some(Sector::BusinessEquipment));
-    assert_eq!(sectors[&ticker("BBBB")], Some(Sector::Utilities));
-    // Present with no sector, which is the feed declining to classify the name. Distinct from a
-    // ticker absent from the map, which is one outside the universe.
-    assert_eq!(sectors[&ticker("CCCC")], None);
-    // Stale rows read as unclassified rather than as some sector, which is what keeps the window
-    // between deploy and the first post-close refresh conservative instead of wrong.
-    assert_eq!(sectors[&ticker("DDDD")], None);
-    assert_eq!(sectors[&ticker("EEEE")], None);
-    assert!(!sectors.contains_key(&ticker("FFFF")));
-}
-
 /// A pair identifier is stored as text and parsed back on read. A leg whose symbol contains a dot
 /// must survive the round trip, because splitting on every dash would turn `BRK.B-MSFT` into three
 /// fragments and drop the pair on load.
@@ -1090,7 +920,7 @@ async fn test_sectors_load_as_a_lookup_map() {
 #[serial]
 async fn test_a_dotted_ticker_survives_the_pair_round_trip() {
     let pool = fresh_pool().await;
-    let entry = PairEntry::new(pair("BRK.B", "MSFT"), 1.0, 2.5, 0.01, None).unwrap();
+    let entry = PairEntry::new(pair("BRK.B", "MSFT"), 1.0, 2.5, 0.01).unwrap();
     let id = pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
 
     let open = pairs::load_open_pairs(&pool).await.unwrap();

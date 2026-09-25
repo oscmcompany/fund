@@ -6,7 +6,7 @@ pub mod convergence;
 pub mod cost;
 pub mod dataset;
 pub mod export;
-pub mod forecast;
+pub mod frame;
 pub mod harness;
 pub mod information;
 pub mod intraday;

@@ -279,7 +279,6 @@ if [[ ! -f "$DOTENV" ]]; then
   sed "s|development/your.name|$PROFILE|g" "$REPO_ROOT/.env.example" > "$DOTENV"
 
   cat >> "$DOTENV" << 'EOF'
-AWS_S3_MODEL_ARTIFACT_PATH=models/tide/
 MASSIVE_BASE_URL=https://api.massive.com
 EOF
 

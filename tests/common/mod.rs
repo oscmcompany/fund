@@ -7,7 +7,6 @@
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use sqlx::PgPool;
-use uuid::Uuid;
 
 const SCHEMA_SQL: &str = include_str!("../../schema.sql");
 
@@ -173,10 +172,8 @@ pub async fn test_pool(suffix: &str) -> PgPool {
 pub async fn reset_tables(pool: &PgPool) {
     sqlx::raw_sql(
         "DELETE FROM events; \
-         DELETE FROM equity_predictions; \
          DELETE FROM equity_pairs; \
          DELETE FROM equity_bars; \
-         DELETE FROM equity_details; \
          DELETE FROM account_activities; \
          DELETE FROM account_snapshots;",
     )
@@ -279,55 +276,4 @@ pub async fn seed_bar_with_volume(
     .expect("Failed to seed an equity bar");
 }
 
-/// Inserts ticker metadata.
-pub async fn seed_details(pool: &PgPool, ticker_sectors: &[(&str, &str)]) {
-    for (ticker, sector) in ticker_sectors {
-        sqlx::query(
-            "INSERT INTO equity_details (ticker, sector, industry) VALUES ($1, $2, $2) \
-             ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector",
-        )
-        .bind(*ticker)
-        .bind(*sector)
-        .execute(pool)
-        .await
-        .expect("Failed to seed an equity detail");
-    }
-}
-
-/// Inserts one prediction per ticker at `timestamp`, all sharing one `correlation_id`.
-///
-/// One identifier for the whole batch, not one per row. `insert_predictions` takes a single
-/// `correlation_id` and applies it to every prediction in the call, which is what makes the column
-/// identify a batch at all — a fixture giving each ticker its own would produce a table state the
-/// writer cannot produce, and any query grouping by batch would see one row per group.
-pub async fn seed_predictions(
-    pool: &PgPool,
-    model_run_id: &str,
-    tickers_and_medians: &[(&str, f64)],
-    timestamp: DateTime<Utc>,
-) {
-    let correlation_id = Uuid::new_v4();
-    for (ticker, median) in tickers_and_medians {
-        sqlx::query(
-            "INSERT INTO equity_predictions \
-             (correlation_id, model_run_id, ticker, timestamp, quantile_10, quantile_50, quantile_90) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (ticker, timestamp) DO UPDATE SET \
-                 quantile_10 = EXCLUDED.quantile_10, \
-                 quantile_50 = EXCLUDED.quantile_50, \
-                 quantile_90 = EXCLUDED.quantile_90",
-        )
-        .bind(correlation_id)
-        .bind(model_run_id)
-        .bind(*ticker)
-        .bind(timestamp)
-        // A narrow interval, so `confidence` clears the screen's floor comfortably.
-        .bind(median - 0.02)
-        .bind(*median)
-        .bind(median + 0.02)
-        .execute(pool)
-        .await
-        .expect("Failed to seed a prediction");
-    }
-}
 use fund::common::types::SessionDate;

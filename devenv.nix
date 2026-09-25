@@ -3,10 +3,7 @@
 
   # Compute bucket name and secretspec profile at shell/process start time from
   # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
-  # evaluation time because dotenv runs after Nix evaluates devenv.nix. Model
-  # artifacts live in the same per-profile bucket under models/tide/: the Rust
-  # tide trainer (tide_model_trainer) writes there and the inference service
-  # reads there, so training and serving agree in both dev and production.
+  # evaluation time because dotenv runs after Nix evaluates devenv.nix.
   #
   # Two buckets, split by whether the bytes are a provider-derived fact or a
   # record of what one instance did. The archive holds data/** and is shared:
@@ -19,7 +16,6 @@
     export AWS_S3_RECORDS_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
     export AWS_S3_ARCHIVE_BUCKET_NAME="${archiveBucket}"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
-    export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
     if [[ ! -w "''${FUND_LOG_DIRECTORY:-/var/log/fund}" ]]; then
       export FUND_LOG_DIRECTORY="$HOME/.local/state/fund/log"
     else
@@ -50,17 +46,6 @@
       --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
     echo "Dashboard reader role applied"
   '';
-
-  # Training lookback window. Read from the environment so it can be overridden
-  # per run (e.g. FUND_LOOKBACK_DAYS=1200 devenv --profile trainer ...); a hardcoded
-  # empty default would both shadow the override and break int parsing in the
-  # tide trainer, which only falls back to its own default when the var is
-  # unset, not when it is the empty string.
-  rawLookbackDays = builtins.getEnv "FUND_LOOKBACK_DAYS";
-  lookbackDays =
-    if rawLookbackDays == ""
-    then "365"
-    else rawLookbackDays;
 
   # PostgreSQL role. DATABASE_URL below names no user; psql falls back to the OS
   # user but sqlx does not, failing with `role "anonymous" does not exist`.
@@ -465,16 +450,10 @@ in {
     # tests/common/mod.rs before the schema is applied, so the trading schedules
     # have no other executable cover at all.
     #
-    # test_model_artifact is the second such exception, and needs no network
-    # either: it packages what the trainer's publish stage writes and loads it
-    # back through the service's own loader. The two sides are built from the
-    # same constants but by different code, and nothing else executes the join
-    # between them.
-    #
     # The last three run the shell scripts the archiver and the researcher depend on, extracting
     # their functions or sourcing their helpers. They need bash and nothing else, and were missing
     # from this list for as long as they existed, so none of them had ever run in CI.
-    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules --test test_model_artifact --test test_archiver_boot --test test_json_logging --test test_reference_checks --test test_view_check"
+    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules --test test_archiver_boot --test test_json_logging --test test_reference_checks --test test_view_check"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)
@@ -850,15 +829,12 @@ in {
       echo "Pinned cron timezone to UTC (host is $(date +%Z), offset $(date +%z))"
     fi
 
-    # `run-researcher` rather than `train-tide-model` directly: training is one leg and the record
-    # export is the last, so the box cannot finish a night without shipping what it produced.
-    #
-    # A box provisioned before that wrapper existed carries the bare training entry, and leaving it
-    # would run training twice on the same evening. Removed rather than checked, so this is a
-    # migration and not a second entry.
+    # `run-researcher` is the box's one scheduled job, and its last leg is the record export, so the
+    # box cannot finish a night without shipping what it produced. A box provisioned before the
+    # wrapper carries a bare training entry whose script no longer exists; it is removed here.
     if crontab -l 2>/dev/null | grep -qF 'tools/train-tide-model'; then
       crontab -l 2>/dev/null | grep -vF 'tools/train-tide-model' | crontab - || true
-      echo "Removed the bare training cron entry; run-researcher runs it as a leg"
+      echo "Removed the retired training cron entry"
     fi
 
     if crontab -l 2>/dev/null | grep -qF 'run-researcher'; then
@@ -929,14 +905,6 @@ in {
     ${runtimeEnv}
     secretspec run -- cargo run --release --bin seed -- \
       equity-bars daily postgres --start "$SEED_START_DATE" $END_FLAG
-  '';
-
-  scripts.seed-equity-details-postgres.exec = ''
-    set -euo pipefail
-
-    echo "Seeding equity details into PostgreSQL from the newest reference partition"
-    ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed -- equity-details postgres
   '';
 
   # Repairs account_snapshots from Alpaca's portfolio history. Not a seed: it fills only the
@@ -1042,28 +1010,6 @@ in {
     "checks:sql".exec = "check-sql";
     "checks:nix".exec = "check-nix";
 
-    # --- Model training ---
-
-    # Rust-native TiDE training (burn). Repairs its own S3 bar archive over the training window --
-    # every weekday in it with no partition is fetched from Massive, so a missed night and a week of
-    # downtime cost the same nothing -- then trains against that window and uploads a model.tar.gz
-    # the service loads directly. A gap older than the window is `data:seed:s3`, which floors at two
-    # years.
-    # The bars themselves need no Alpaca credentials: the grouped endpoint answers by date, so there
-    # is no symbol list to build and therefore no broker to ask for one. The trading calendar does,
-    # and without it the scan requests holidays, which answer empty forever and cannot be told apart
-    # from a session Massive is missing. Both the calendar and the series-boundary table warn and
-    # skip when the credentials are absent rather than failing the run -- a repair that requests a
-    # few holidays is a better trade than no repair at all. The seed binaries, which are run
-    # deliberately rather than nightly, require the calendar instead of degrading.
-    # The former Python/tinygrad workflow and its Prefect block registration are retired.
-    "models:tide:train".exec = ''
-      set -euo pipefail
-      echo "Repairing the bar archive and running the tide training pipeline (Rust + burn)"
-      ${runtimeEnv}
-      secretspec run -- cargo run --release --bin tide_model_trainer
-    '';
-
     # The researcher's half of the record export, which `tools/run-researcher` runs as its last leg.
     # The trader ships its journal from inside the service and the archiver from `seed`; this box
     # runs neither, so its journal and logs had no way off it at all.
@@ -1071,59 +1017,6 @@ in {
       set -euo pipefail
       ${runtimeEnv}
       secretspec run -- cargo run --release --bin laboratory_export
-    '';
-
-    # The same pipeline, run to rehearse it rather than to publish a model. It differs from
-    # `models:tide:train` in exactly two ways, and both are deliberate.
-    #
-    # The artifact prefix is `models/tide-smoke/`. `resolve_artifact_key` serves the
-    # lexicographically greatest folder under whatever prefix it is given, and a rehearsal artifact
-    # is always the newest one -- so publishing it beside the real runs would hand the service a
-    # one-epoch model, silently and until the next nightly run.
-    #
-    # `FUND_EPOCHS` defaults to 1, because what is under test is that the four stages connect, not
-    # that the model converges. Everything else is left alone: the lookback stays the trainer's own
-    # default, so the rehearsal reads the same window the nightly run does.
-    #
-    # `FUND_LOOKBACK_DAYS` has a floor near 250 -- the split reserves the last fifth of the window
-    # for validation and windowing needs 36 sessions of it -- and the trainer now says so before it
-    # touches the network rather than after it has loaded a year of bars.
-    "models:tide:train:smoke".exec = ''
-      set -euo pipefail
-      ${runtimeEnv}
-      export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
-      export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
-      echo "Rehearsing the tide training pipeline ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
-      echo "  Publishing to s3://$AWS_S3_RECORDS_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
-      secretspec run -- cargo run --release --bin tide_model_trainer
-    '';
-
-    # The rehearsal above, pointed at the production archive. It exists because the two buckets do
-    # not hold the same history: the development archive was seeded in one pass from a clean
-    # upstream, so a loader bug that only appears across a schema or provider change is reproducible
-    # in production and nowhere else.
-    #
-    # The one place in this file that overrides FUND_PROFILE, and it is set *before* runtimeEnv
-    # because both the bucket name and the secretspec profile are derived from it. Setting it after
-    # would read production credentials against the development bucket.
-    #
-    # Publishes to `models/tide-smoke/`, exactly as the task above does. Nothing resolves artifacts
-    # from that prefix, so a one-epoch rehearsal cannot become the model the production service
-    # loads -- which is why this is a separate task rather than a flag on `models:tide:train`.
-    #
-    # Not read-only, and that is worth knowing before running it: stage one repairs the production
-    # bar archive over the lookback window, the same write the nightly job makes. That is a gap
-    # being filled rather than a side effect, but it is a write to production data.
-    "models:tide:train:smoke:production".exec = ''
-      set -euo pipefail
-      export FUND_PROFILE="production"
-      ${runtimeEnv}
-      export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
-      export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
-      echo "Rehearsing against PRODUCTION ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
-      echo "  Reading and repairing s3://$AWS_S3_ARCHIVE_BUCKET_NAME/data/derived/equity/bars/interval=one_day/"
-      echo "  Publishing to s3://$AWS_S3_RECORDS_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
-      secretspec run -- cargo run --release --bin tide_model_trainer
     '';
 
     # --- Data tasks ---
@@ -1134,8 +1027,7 @@ in {
     # silent skip would be the wrong answer there -- a seed that quietly did half its work is how a
     # deployment ends up with an archive and no trading data, or the reverse.
 
-    # Bootstrap for an empty database. Details first, because they are fast and carry no date range,
-    # and because the pair screen's sector rule silently admits nothing without them.
+    # Bootstrap for an empty database: the daily bars the screen and the close history read.
     "data:seed:postgres" = {
       exec = ''
         set -euo pipefail
@@ -1148,31 +1040,15 @@ in {
           exit 1
         fi
 
-        # The ticker metadata now comes from the archive's reference dataset rather than a CSV
-        # compiled into the binary, so this half needs AWS and a populated reference prefix.
-        if [ -z "''${AWS_S3_ARCHIVE_BUCKET_NAME:-}" ]; then
-          echo "AWS_S3_ARCHIVE_BUCKET_NAME is not set."
-          echo "  Ticker metadata is read from the archive's point-in-time reference dataset, so"
-          echo "  this half needs the bucket even though it writes to PostgreSQL."
-          exit 1
-        fi
-
         if [ -z "''${SEED_START_DATE:-}" ]; then
           echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed:postgres"
           echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
           echo ""
-          echo "  Seeds ticker metadata and daily bars into PostgreSQL. The screen needs 60"
-          echo "  sessions of aligned closes and the model 40, so allow at least six months."
+          echo "  Seeds daily bars into PostgreSQL. The screen needs 60 sessions of aligned"
+          echo "  closes, so allow at least three months."
           exit 1
         fi
 
-        echo "=== Seeding equity details into PostgreSQL from the reference archive ==="
-        echo "  If this fails with 'the reference dataset holds no partitions', run"
-        echo "  'devenv tasks run data:reference:seed' first -- it is not part of data:seed:s3"
-        echo "  because its grid is quarterly rather than a repair span."
-        seed-equity-details-postgres
-
-        echo ""
         echo "=== Seeding equity bars into PostgreSQL ==="
         seed-equity-bars-postgres
       '';
@@ -1305,10 +1181,6 @@ in {
     env = {
       DISABLE_DISK_CACHE = "1";
       DATABASE_URL = "postgresql://localhost:5432/fund";
-      # The inference service reads Burn-native artifacts; track the most
-      # recent training run rather than pinning (the old pin protected the
-      # retired tinygrad loader from Burn artifacts).
-      MODEL_VERSION = "latest";
     };
 
     # Shared setup: wait for PostgreSQL and apply schema before any module starts.
@@ -1370,7 +1242,6 @@ in {
 
   profiles.trainer.module = {
     env = {
-      FUND_LOOKBACK_DAYS = lookbackDays;
       MLFLOW_TRACKING_URI = "";
       PREFECT_API_URL = "";
     };
@@ -1460,14 +1331,11 @@ in {
       echo "    database:backup             Dump database and upload to S3"
       echo "    data:seed                   Both targets below (needs a"
       echo "                                database and AWS)"
-      echo "    data:seed:postgres          Bars and details into PostgreSQL"
+      echo "    data:seed:postgres          Daily bars into PostgreSQL"
       echo "                                (run without arguments for usage)"
       echo "    data:seed:s3                Bars and details into the S3 archive"
       echo "                                the trainer reads; repairs whatever"
       echo "                                is missing, two years by default"
-      echo "    models:tide:train           Repair the S3 bar archive over the"
-      echo "                                training window, train TiDE, and"
-      echo "                                upload artifacts"
     } >&2
   '';
 

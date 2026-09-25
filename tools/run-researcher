@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# run-researcher -- What the researcher box does when its schedule wakes it: train, then ship.
+# run-researcher -- What the researcher box does when its schedule wakes it: ship its records.
 #
-# The export is the last leg, so nothing the run produced is left on a box that spends most of its
-# time off. It neither syncs nor stops the box; both change when it moves to AWS (laboratory plan,
+# The export is the one leg since TiDE was deleted, and the wrapper stays so a future scheduled study
+# runs before it and nothing the run produced is left on a box that spends most of its time off. It neither syncs nor stops the box; both change when it moves to AWS (laboratory plan,
 # task 28). Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +16,16 @@ source "${REPO_ROOT}/tools/json-log.sh"
 cd "${REPO_ROOT}"
 
 open_the_json_log researcher
-trap 'rm -f "$STATUS_FILE"' EXIT
+
+# Held for the whole run: the export leg builds before it runs, and `sync-trainer` must not reset the
+# checkout out from under that build.
+LOCK_FILE="/tmp/run-researcher.pid"
+if [[ -f "$LOCK_FILE" ]] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
+  log "Already running (pid $(cat "$LOCK_FILE")), skipping"
+  exit 0
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$STATUS_FILE" "$LOCK_FILE"' EXIT
 
 log "Starting at $(git rev-parse --short HEAD)"
 
@@ -46,15 +55,6 @@ if [[ -d "$LEGACY_JOURNAL_DIRECTORY" ]]; then
   fi
 fi
 
-# `train-tide-model` holds the lock `sync-trainer` checks, so the checkout cannot be reset out from
-# under the build this starts.
-TRAIN_STATUS=0
-log "Training"
-run_wrapped train-tide-model tools/train-tide-model || TRAIN_STATUS=$?
-log "Training finished with status ${TRAIN_STATUS}"
-
-# Runs whatever the training did. The run that failed is the one whose records are most worth
-# having, and `set -e` would otherwise stop before shipping them.
 EXPORT_STATUS=0
 log "Exporting records"
 run_wrapped laboratory-export devenv tasks run records:export || EXPORT_STATUS=$?
@@ -64,6 +64,6 @@ else
   log "ERROR: records failed to export with status ${EXPORT_STATUS}; they remain on this box only"
 fi
 
-# Either leg. A failed export that exited zero would report a clean night over records that never
-# left the box, which is the whole failure this script exists to prevent.
-exit "$(first_failure "${TRAIN_STATUS}" "${EXPORT_STATUS}")"
+# A failed export that exited zero would report a clean night over records that never left the box,
+# which is the whole failure this script exists to prevent.
+exit "${EXPORT_STATUS}"

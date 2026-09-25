@@ -11,7 +11,7 @@ use crate::common::alpaca::ActivityType;
 use crate::common::events::EventType;
 use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
 use crate::dashboard::cache::{
-    AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
+    AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns,
 };
 
 /// The stored spellings of every transfer type, for an `activity_type = ANY(...)` bind.
@@ -27,8 +27,6 @@ const ACCOUNT_HISTORY_DAYS: i64 = 365;
 
 const CLOSED_PAIRS_LIMIT: i64 = 200;
 
-const PREDICTIONS_LIMIT: i64 = 50;
-
 const RECENT_EVENTS_LIMIT: i64 = 100;
 
 /// One poll cycle's worth of data.
@@ -38,9 +36,6 @@ pub struct DashboardData {
     pub open_pairs: Vec<OpenPair>,
     pub closed_pairs: Vec<ClosedPair>,
     pub closed_summary: ClosedSummary,
-    pub predictions: Vec<Prediction>,
-    pub prediction_model_run_id: Option<String>,
-    pub prediction_timestamp: Option<DateTime<Utc>>,
     pub recent_events: Vec<EventEntry>,
     pub latest_bars_inserted_at: Option<DateTime<Utc>>,
 }
@@ -63,8 +58,6 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
     let open_pairs = fetch_open_pairs(pool).await?;
     let closed_pairs = fetch_closed_pairs(pool).await?;
     let closed_summary = compute_closed_summary(&closed_pairs);
-    let (predictions, prediction_model_run_id, prediction_timestamp) =
-        fetch_latest_predictions(pool).await?;
     let recent_events = fetch_recent_events(pool).await?;
     let latest_bars_inserted_at = fetch_latest_bars_inserted_at(pool).await?;
 
@@ -74,9 +67,6 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
         open_pairs,
         closed_pairs,
         closed_summary,
-        predictions,
-        prediction_model_run_id,
-        prediction_timestamp,
         recent_events,
         latest_bars_inserted_at,
     })
@@ -246,56 +236,6 @@ async fn fetch_closed_pairs(pool: &PgPool) -> Result<Vec<ClosedPair>, sqlx::Erro
         });
     }
     Ok(pairs)
-}
-
-/// Fetches the most recent prediction batch, ranked by median prediction.
-///
-/// A batch is identified by its shared `correlation_id`, not by timestamp: selecting on the maximum
-/// timestamp alone would mix rows from two runs if one ever wrote a ticker the other did not.
-async fn fetch_latest_predictions(
-    pool: &PgPool,
-) -> Result<(Vec<Prediction>, Option<String>, Option<DateTime<Utc>>), sqlx::Error> {
-    let rows = sqlx::query(
-        "WITH latest_batch AS (
-             SELECT correlation_id
-             FROM equity_predictions
-             ORDER BY timestamp DESC
-             LIMIT 1
-         )
-         SELECT p.ticker, p.quantile_10, p.quantile_50, p.quantile_90,
-                p.model_run_id, p.timestamp
-         FROM equity_predictions p
-         JOIN latest_batch b ON p.correlation_id = b.correlation_id
-         ORDER BY p.quantile_50 DESC
-         LIMIT $1",
-    )
-    .bind(PREDICTIONS_LIMIT)
-    .fetch_all(pool)
-    .await?;
-
-    let mut model_run_id = None;
-    let mut timestamp = None;
-    let mut predictions = Vec::with_capacity(rows.len());
-
-    for row in rows {
-        let raw_ticker: String = row.try_get("ticker")?;
-        let Some(ticker) = Ticker::new(&raw_ticker) else {
-            warn!(ticker = %raw_ticker, "Prediction has an unparseable ticker, skipping");
-            continue;
-        };
-        if model_run_id.is_none() {
-            model_run_id = Some(row.try_get::<String, _>("model_run_id")?);
-            timestamp = Some(row.try_get::<DateTime<Utc>, _>("timestamp")?);
-        }
-        predictions.push(Prediction {
-            ticker,
-            quantile_10: row.try_get("quantile_10")?,
-            quantile_50: row.try_get("quantile_50")?,
-            quantile_90: row.try_get("quantile_90")?,
-        });
-    }
-
-    Ok((predictions, model_run_id, timestamp))
 }
 
 /// Seeds the event ring buffer from the table, newest first.

@@ -16,14 +16,14 @@ use crate::common::events::Command;
 use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
 use crate::data::archive::IndustryCodesOutcome;
 use crate::data::nightly::{
-    Leg, LegOutcome, ReferenceCheck, ReferenceOutcome, Repair, Share, ViewCheck,
+    Leg, LegOutcome, ReferenceCheck, ReferenceOutcome, Repair, Share, TableRefresh, ViewCheck,
 };
 
 /// Version stamped on every record written by this build.
 ///
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. What
 /// each version held is documented beside the DuckDB view in `tools/duckdb_initialization.sql`.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Anything that stops a record reaching the disk.
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +50,6 @@ pub enum Observation {
     CommandFinished(CommandFinished),
     PassEvaluated(Box<PassEvaluated>),
     PricesObserved(PricesObserved),
-    UniverseScreened(UniverseScreened),
     OpenPairsObserved(OpenPairsObserved),
     PlanDecided(PlanDecided),
     PairOpened(PairOpened),
@@ -60,7 +59,6 @@ pub enum Observation {
     OrderResolved(OrderResolved),
     PositionCloseRequested(PositionCloseRequested),
     LiquidationAttempted(LiquidationAttempted),
-    PredictionsGenerated(Box<PredictionsGenerated>),
     ActivityObserved(ActivityObserved),
     AccountObserved(AccountObserved),
     PositionsObserved(PositionsObserved),
@@ -80,7 +78,6 @@ impl Observation {
             Observation::CommandFinished(_) => "command_finished",
             Observation::PassEvaluated(_) => "pass_evaluated",
             Observation::PricesObserved(_) => "prices_observed",
-            Observation::UniverseScreened(_) => "universe_screened",
             Observation::OpenPairsObserved(_) => "open_pairs_observed",
             Observation::PlanDecided(_) => "plan_decided",
             Observation::PairOpened(_) => "pair_opened",
@@ -90,7 +87,6 @@ impl Observation {
             Observation::OrderResolved(_) => "order_resolved",
             Observation::PositionCloseRequested(_) => "position_close_requested",
             Observation::LiquidationAttempted(_) => "liquidation_attempted",
-            Observation::PredictionsGenerated(_) => "predictions_generated",
             Observation::ActivityObserved(_) => "activity_observed",
             Observation::AccountObserved(_) => "account_observed",
             Observation::PositionsObserved(_) => "positions_observed",
@@ -193,10 +189,7 @@ pub struct PassEvaluated {
     pub open_pairs_at_start: usize,
     pub vacant_slots: Option<usize>,
     pub universe_size: usize,
-    pub predictions_available: usize,
-    pub eligible_tickers: usize,
     pub candidates_screened: usize,
-    pub model_run_id: Option<String>,
     /// The risk gate's rendered reason for not running the entry half at all.
     pub session_block: Option<String>,
     /// The error that ended the pass early, if one did.
@@ -255,15 +248,6 @@ pub struct UnavailablePrice {
     pub ask_price: Option<f64>,
     pub quote_timestamp: Option<DateTime<Utc>>,
     pub quote_rejection: Option<QuoteRejection>,
-}
-
-/// The eligibility funnel for one pass.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
-pub struct UniverseScreened {
-    /// Every prediction that reached the screen, as the screen received it.
-    pub inputs: Vec<ScreenInputReading>,
-    /// Every prediction that did not, and the first test it failed.
-    pub excluded: Vec<ExcludedTickerReading>,
 }
 
 /// Every open pair as one pass measured it.
@@ -335,46 +319,6 @@ pub struct PlannedAction {
     pub long_notional: Option<Decimal>,
     #[serde(with = "crate::common::types::decimal_number_option")]
     pub short_quantity: Option<Decimal>,
-}
-
-/// One prediction as the screen consumed it.
-///
-/// Derived from the stored quantiles and the session's universe, so not recoverable from
-/// `equity_predictions` alone.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ScreenInputReading {
-    pub ticker: Ticker,
-    pub expected_return: f64,
-    pub confidence: f64,
-    pub is_shortable: bool,
-}
-
-/// Which eligibility test a prediction failed first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExclusionReason {
-    AlreadyHeld,
-    NoSector,
-    NoCloseHistory,
-    OutsideUniverse,
-    Unpriced,
-    UnusableInput,
-    StructuralBreak,
-}
-
-/// One prediction the eligibility filter removed, and why.
-///
-/// Written every pass, because `already_held` changes within a session even though the other tests
-/// do not.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ExcludedTickerReading {
-    pub ticker: Ticker,
-    pub reason: ExclusionReason,
-    /// The reading the reason ruled on, where the name alone does not say how far outside it fell.
-    ///
-    /// Set for `structural_break` and absent for the set-membership tests, which have no number to
-    /// report. A limit can only be moved from the readings it refused.
-    pub detail: Option<String>,
 }
 
 /// One symbol's reference price, and which snapshot field it came from.
@@ -514,7 +458,6 @@ pub struct PairOpened {
     pub hedge_ratio: f64,
     pub entry_z_score: f64,
     pub signal_strength: f64,
-    pub model_run_id: Option<String>,
     pub opened_at: DateTime<Utc>,
     /// The prices `entry_z_score` was computed from.
     ///
@@ -666,34 +609,6 @@ pub struct LiquidationAttempted {
     /// The error that ended the run early, if one did. Its absence is the claim that the run
     /// finished, not that the book is flat — `pairs_still_open` answers that.
     pub error: Option<String>,
-}
-
-/// The pre-open inference run and everything it produced.
-///
-/// The quantiles are here rather than left to `equity_predictions` and the nightly export, because
-/// those are the model's actual output and the journal is meant to hold the originals. They arrive
-/// at one moment from one place, so unlike the pass readings there is nothing to gain by splitting
-/// them out.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PredictionsGenerated {
-    pub model_run_id: String,
-    pub artifact_key: String,
-    pub artifact_staleness_sessions: Option<i64>,
-    /// Rows the database accepted, which is not the prediction count when an upsert collapses a
-    /// re-run.
-    pub rows_written: u64,
-    pub universe_size: usize,
-    pub predictions: Vec<PredictionReading>,
-}
-
-/// One ticker's prediction, as the model produced it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PredictionReading {
-    pub ticker: Ticker,
-    pub timestamp: DateTime<Utc>,
-    pub quantile_10: f64,
-    pub quantile_50: f64,
-    pub quantile_90: f64,
 }
 
 /// One activity as Alpaca reported it.
@@ -907,6 +822,10 @@ pub struct ArchiveFolded {
     pub unresolved_conditions: Option<Share>,
     /// Common-stock names in the newest reference partition that no sector resolves for.
     pub unclassified: Option<Share>,
+    /// The splits table, refreshed whole from Massive. `None` when the budget ran out first.
+    pub splits: Option<TableRefresh>,
+    /// The series-boundary table, refreshed from Alpaca over the last year.
+    pub boundaries: Option<TableRefresh>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.
@@ -1149,7 +1068,6 @@ mod tests {
                 Observation::CommandFinished(_) => "command_finished",
                 Observation::PassEvaluated(_) => "pass_evaluated",
                 Observation::PricesObserved(_) => "prices_observed",
-                Observation::UniverseScreened(_) => "universe_screened",
                 Observation::OpenPairsObserved(_) => "open_pairs_observed",
                 Observation::PlanDecided(_) => "plan_decided",
                 Observation::PairOpened(_) => "pair_opened",
@@ -1159,7 +1077,6 @@ mod tests {
                 Observation::OrderResolved(_) => "order_resolved",
                 Observation::PositionCloseRequested(_) => "position_close_requested",
                 Observation::LiquidationAttempted(_) => "liquidation_attempted",
-                Observation::PredictionsGenerated(_) => "predictions_generated",
                 Observation::ActivityObserved(_) => "activity_observed",
                 Observation::AccountObserved(_) => "account_observed",
                 Observation::PositionsObserved(_) => "positions_observed",
@@ -1207,7 +1124,6 @@ mod tests {
                 readings: Vec::new(),
                 unavailable: Vec::new(),
             }),
-            Observation::UniverseScreened(UniverseScreened::default()),
             Observation::OpenPairsObserved(OpenPairsObserved::default()),
             Observation::PlanDecided(PlanDecided {
                 phase: PlanPhase::Entries,
@@ -1230,7 +1146,6 @@ mod tests {
                 hedge_ratio: 1.0,
                 entry_z_score: 2.5,
                 signal_strength: 0.03,
-                model_run_id: None,
                 opened_at: instant("2026-08-11T14:35:00Z"),
                 long_decision_price: 100.0,
                 short_decision_price: 50.0,
@@ -1278,14 +1193,6 @@ mod tests {
                 error: None,
             }),
             Observation::LiquidationAttempted(LiquidationAttempted::default()),
-            Observation::PredictionsGenerated(Box::new(PredictionsGenerated {
-                model_run_id: "run-1".to_string(),
-                artifact_key: "models/tide/run-1".to_string(),
-                artifact_staleness_sessions: None,
-                rows_written: 0,
-                universe_size: 0,
-                predictions: Vec::new(),
-            })),
             Observation::ActivityObserved(ActivityObserved {
                 activity_id: "a1".to_string(),
                 activity_type: ActivityType::Fill,
@@ -1369,6 +1276,8 @@ mod tests {
                     population: 12_000,
                 }),
                 unclassified: None,
+                splits: Some(TableRefresh::Refreshed { rows: 3_120 }),
+                boundaries: Some(TableRefresh::Failed("throttled".to_string())),
             }),
         ]
     }
@@ -1436,7 +1345,7 @@ mod tests {
         );
         let value: Value = serde_json::to_value(&record).expect("record must serialize");
 
-        assert_eq!(value["schema_version"], Value::Number(6.into()));
+        assert_eq!(value["schema_version"], Value::Number(7.into()));
         assert_eq!(value["event_type"], "account_observed");
         assert_eq!(value["session_date"], "2026-08-11");
         assert_eq!(value["timestamp"], "2026-08-11T20:15:00Z");

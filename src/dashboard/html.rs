@@ -17,8 +17,6 @@ const EVENTS_DISPLAY_LIMIT: usize = 12;
 /// Closed pairs shown on the page. The summary underneath covers all of them.
 const CLOSED_PAIRS_DISPLAY_LIMIT: usize = 20;
 
-const PREDICTIONS_DISPLAY_LIMIT: usize = 15;
-
 /// How old daily bars may be before the freshness line turns amber, then red.
 const BARS_WARNING_AGE: Duration = Duration::hours(24);
 const BARS_STALE_AGE: Duration = Duration::hours(48);
@@ -56,7 +54,6 @@ fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
     let freshness = render_freshness_line(state, now);
     let account = render_account_section(state);
     let open_pairs = render_open_pairs_section(state, now);
-    let predictions = render_predictions_section(state);
     let closed_pairs = render_closed_pairs_section(state);
     let events = render_events_section(state);
     // The meta refresh and the footer below both read this rather than a number of their own.
@@ -82,7 +79,6 @@ fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
 <div class="freshness">{freshness}</div>
 {account}
 {open_pairs}
-{predictions}
 {closed_pairs}
 {events}
 <footer class="sys-footer">
@@ -113,8 +109,8 @@ fn render_updated_line(state: &DashboardState, now: DateTime<Utc>) -> String {
 
 /// Reports how old the most recent daily bar is.
 ///
-/// The one number that says whether anything upstream is still running: predictions, the screen,
-/// and every exit decision read from `equity_bars`, so a stale table silently freezes the strategy
+/// The one number that says whether anything upstream is still running: the screen and every exit
+/// decision read from `equity_bars`, so a stale table silently freezes the strategy
 /// rather than stopping it.
 fn render_freshness_line(state: &DashboardState, now: DateTime<Utc>) -> String {
     match state.latest_bars_inserted_at {
@@ -205,50 +201,6 @@ fn render_open_pairs_section(state: &DashboardState, now: DateTime<Utc>) -> Stri
         state.open_pairs.len()
     );
     section("Open pairs", body)
-}
-
-fn render_predictions_section(state: &DashboardState) -> String {
-    if state.predictions.is_empty() {
-        return section(
-            "Predictions",
-            r#"<p class="dim">No predictions yet.</p>"#.to_string(),
-        );
-    }
-
-    let rows: String = state
-        .predictions
-        .iter()
-        .take(PREDICTIONS_DISPLAY_LIMIT)
-        .map(|prediction| {
-            format!(
-                "<tr><td>{}</td><td>{:.4}</td><td>{:.4}</td><td>{:.4}</td></tr>",
-                html_escape(prediction.ticker.as_str()),
-                prediction.quantile_10,
-                prediction.quantile_50,
-                prediction.quantile_90,
-            )
-        })
-        .collect();
-
-    let run = match (&state.prediction_model_run_id, state.prediction_timestamp) {
-        (Some(run_id), Some(timestamp)) => format!(
-            "Run {} at {}",
-            html_escape(run_id),
-            eastern_stamp(timestamp, "%Y-%m-%d %H:%M")
-        ),
-        (Some(run_id), None) => format!("Run {}", html_escape(run_id)),
-        _ => "Run unknown".to_string(),
-    };
-
-    let body = format!(
-        r#"<table>
-<tr><th>Ticker</th><th>Q10</th><th>Q50</th><th>Q90</th></tr>
-{rows}
-</table>
-<p class="summary">{run} — {} tickers, ranked by median prediction</p>"#,
-        state.predictions.len()
-    );
-    section("Predictions", body)
 }
 
 fn render_closed_pairs_section(state: &DashboardState) -> String {
@@ -552,7 +504,7 @@ mod tests {
     use crate::common::types::CloseReason;
     use crate::common::types::{PairID, Ticker};
     use crate::dashboard::cache::{
-        AccountSnapshot, ClosedPair, EventEntry, OpenPair, PeriodReturns, Prediction,
+        AccountSnapshot, ClosedPair, EventEntry, OpenPair, PeriodReturns,
     };
     use crate::dashboard::database::compute_closed_summary;
     use chrono::{NaiveDate, TimeZone};
@@ -609,14 +561,6 @@ mod tests {
             }],
             closed_summary: compute_closed_summary(&closed_pairs),
             closed_pairs,
-            predictions: vec![Prediction {
-                ticker: Ticker::new("EEE").expect("a valid ticker"),
-                quantile_10: -0.01,
-                quantile_50: 0.005,
-                quantile_90: 0.02,
-            }],
-            prediction_model_run_id: Some("run-2026-07-31".to_string()),
-            prediction_timestamp: Some(now() - Duration::hours(12)),
             events: vec![EventEntry {
                 event_type: EventType::new(Command::PortfolioEvaluation, Outcome::Completed),
                 created_at: now() - Duration::minutes(5),
@@ -635,13 +579,7 @@ mod tests {
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("OSCM"));
         assert!(html.ends_with("</html>"));
-        for title in [
-            "Account",
-            "Open pairs",
-            "Predictions",
-            "Closed pairs",
-            "Events",
-        ] {
+        for title in ["Account", "Open pairs", "Closed pairs", "Events"] {
             assert!(html.contains(title), "missing the {title} section");
         }
         assert!(html.contains("Awaiting first refresh"));
@@ -653,7 +591,6 @@ mod tests {
         assert!(html.contains("$1,234,567.89"));
         assert!(html.contains("CCC-DDD"));
         assert!(html.contains("AAA-BBB"));
-        assert!(html.contains("run-2026-07-31"));
         assert!(html.contains("portfolio_evaluation_completed"));
         assert!(html.contains("convergence=1"));
     }
