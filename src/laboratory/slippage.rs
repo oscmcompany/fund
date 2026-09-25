@@ -1,6 +1,6 @@
-//! Implementation shortfall on the trader's own entries: each leg's fill against its decision price.
+//! Implementation shortfall on the trader's completed-pair entries: each leg's fill against its decision price.
 //!
-//! Read off `pair_opened` records, which have carried both prices since the journal began.
+//! Read off `pair_opened`; a leg unwound because its partner failed journals no decision price, so it is absent.
 
 use std::collections::BTreeMap;
 
@@ -90,12 +90,12 @@ pub struct SlippageSummary {
     /// Each session's mean cost and how many legs it rests on.
     pub by_session: BTreeMap<SessionDate, (f64, usize)>,
     /// Each name's mean cost and how many legs it rests on.
-    pub by_ticker: BTreeMap<String, (f64, usize)>,
+    pub by_ticker: BTreeMap<Ticker, (f64, usize)>,
 }
 
 pub fn summarize_legs(legs: &[LegSlippage]) -> SlippageSummary {
     let mut by_session: BTreeMap<SessionDate, Vec<f64>> = BTreeMap::new();
-    let mut by_ticker: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut by_ticker: BTreeMap<Ticker, Vec<f64>> = BTreeMap::new();
     let mut undefined = 0;
     for leg in legs {
         let Some(cost) = leg.cost_basis_points else {
@@ -103,10 +103,7 @@ pub fn summarize_legs(legs: &[LegSlippage]) -> SlippageSummary {
             continue;
         };
         by_session.entry(leg.session).or_default().push(cost);
-        by_ticker
-            .entry(leg.ticker.as_str().to_string())
-            .or_default()
-            .push(cost);
+        by_ticker.entry(leg.ticker.clone()).or_default().push(cost);
     }
     let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
     SlippageSummary {
@@ -182,7 +179,7 @@ mod tests {
         let per_session = summary.per_session.expect("two sessions summarize");
         assert_eq!(per_session.mean, 6.0);
         assert_eq!(per_session.sessions, 2);
-        assert_eq!(summary.by_ticker["AAAA"], (6.0, 2));
+        assert_eq!(summary.by_ticker[&Ticker::new("AAAA").unwrap()], (6.0, 2));
         assert_eq!(
             summary
                 .by_session

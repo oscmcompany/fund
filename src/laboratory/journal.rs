@@ -28,9 +28,8 @@ use crate::laboratory::stability::{Association, SignAgreement};
 /// `factor_specification`, naming the factor set a residual panel was fitted against. v5 adds the
 /// `study_measured` observation — the first record carrying a declaration alongside a reading — and
 /// `screen_window` beside the fingerprint's floor, because a screen is a floor *and* the stretch of
-/// history it was applied over. Both land in v5 rather than v5 and v6: v5 has not shipped, so no
-/// reader will ever see one without the other.
-pub const SCHEMA_VERSION: u32 = 5;
+/// history it was applied over. v6 adds `slippage_measured`.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Errors writing the laboratory journal.
 #[derive(Debug, thiserror::Error)]
@@ -229,7 +228,7 @@ pub struct StabilityMeasured {
     pub sign_agreements: Vec<SignAgreement>,
 }
 
-/// What the trader's own entries paid against the prices they were decided at.
+/// What the trader's completed-pair entries paid against the prices they were decided at.
 ///
 /// A measurement of the record rather than a test of a hypothesis, so it carries no family: read
 /// from `pair_opened`, whose fill and decision prices have sat side by side and never subtracted.
@@ -840,7 +839,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["schema_version"], serde_json::json!(5));
+        assert_eq!(value["schema_version"], serde_json::json!(6));
         assert_eq!(value["run_id"], serde_json::json!(run_id.to_string()));
         assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
         assert_eq!(

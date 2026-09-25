@@ -45,9 +45,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let legs = legs(&records);
     let summary = summarize_legs(&legs);
 
-    // The population first, so an estimate over three legs cannot read like one over three thousand.
     println!(
-        "{} journal records read from s3://{bucket} ({unreadable} unreadable), {} legs, {} undefined, {} sessions",
+        "{} journal records read from s3://{bucket} ({unreadable} unreadable), {} completed-pair entry legs, {} undefined, {} sessions",
         records.len(),
         summary.legs,
         summary.undefined,
@@ -55,8 +54,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     match &summary.per_session {
         Some(cost) => println!(
-            "cost {:+.2}bp per leg, {:.2} standard error across {} sessions",
-            cost.mean, cost.standard_error, cost.sessions
+            "cost {:+.2}bp, the mean of {} session means, {:.2} standard error",
+            cost.mean, cost.sessions, cost.standard_error
         ),
         None => println!("cost unmeasurable: fewer than two sessions carry a defined leg"),
     }
