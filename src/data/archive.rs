@@ -2442,7 +2442,7 @@ pub fn industry_codes_owed(filers: &BTreeSet<Cik>, stored: Option<&IndustryCodes
 }
 
 /// What one refresh of the SEC industry codes did, as the nightly records it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IndustryCodesOutcome {
     /// Every filer lacking a Massive code already has an answer in the stored table.
     NotOwed {

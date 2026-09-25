@@ -60,6 +60,21 @@ pub struct LiquidityFloor {
     minimum_dollar_volume: f64,
 }
 
+impl<'de> Deserialize<'de> for LiquidityFloor {
+    /// Through [`LiquidityFloor::new`], so a stored floor that could not have been constructed is
+    /// refused rather than read back into a value that claims to be valid.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            minimum_close_price: f64,
+            minimum_dollar_volume: f64,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        LiquidityFloor::new(stored.minimum_close_price, stored.minimum_dollar_volume)
+            .ok_or_else(|| de::Error::custom("a liquidity floor bound is negative or not finite"))
+    }
+}
+
 impl LiquidityFloor {
     /// The floor every path uses until a caller declares its own.
     ///
@@ -127,7 +142,7 @@ impl std::fmt::Display for LiquidityFloor {
 /// Beside the floor rather than with the screens, because the pair is one decision: the same bounds
 /// over a trailing month and over two years admit different sets, and the tree currently holds both
 /// and calls each "the universe".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum ScreenWindow {
     /// The trailing calendar days the traded universe screens over.
     ///
@@ -259,6 +274,14 @@ pub enum Dataset {
 }
 
 impl Dataset {
+    /// Every dataset, which is what a stored name is read back against.
+    pub const ALL: [Dataset; 4] = [
+        Dataset::Events,
+        Dataset::EquityPairs,
+        Dataset::AccountSnapshots,
+        Dataset::AccountActivities,
+    ];
+
     /// The PostgreSQL table name, which is also how the dataset is reported.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -289,6 +312,44 @@ impl std::fmt::Display for Dataset {
 impl serde::Serialize for Dataset {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Reads a closed vocabulary back from the name it was written under, refusing any other name.
+///
+/// One function rather than one per type, so every recorded enum refuses an unknown spelling the
+/// same way instead of each defaulting it differently.
+pub fn deserialize_named<'de, D, T>(
+    deserializer: D,
+    kind: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    parse(&raw).ok_or_else(|| de::Error::custom(format!("unknown {kind}: {raw:?}")))
+}
+
+impl<'de> Deserialize<'de> for Dataset {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_named(deserializer, "dataset", |raw| {
+            Dataset::ALL
+                .into_iter()
+                .find(|dataset| dataset.as_str() == raw)
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CloseReason {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_named(deserializer, "close reason", CloseReason::parse)
+    }
+}
+
+impl<'de> Deserialize<'de> for PairID {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_named(deserializer, "pair identifier", PairID::parse)
     }
 }
 
@@ -455,7 +516,7 @@ impl<'de> Deserialize<'de> for Notional {
 /// [`SessionDate::from_date`] takes a date already expressed in Eastern terms. What it guarantees
 /// is the timezone, not tradability — only
 /// [`crate::data::calendar::TradingCalendar::is_trading_day`] can answer whether a date trades.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionDate(NaiveDate);
 
@@ -1018,7 +1079,7 @@ impl TradeConditions {
 ///
 /// Distinct from [`BarInterval`] so a fold cannot be opened at [`BarInterval::OneDay`], whose bucket
 /// is the session itself: the daily row is the merge of the intraday ones, never a grid of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IntradayCadence {
     OneMinute,
     FiveMinute,
@@ -3202,5 +3263,19 @@ mod tests {
         let text = ClientOrderId::for_pair(&pair, PairLeg::Short).to_string();
         assert_eq!(text.len(), 67);
         assert!(text.len() <= CLIENT_ORDER_ID_MAXIMUM_LENGTH);
+    }
+
+    /// A stored floor goes back through the constructor, so one the constructor would refuse is
+    /// refused on read rather than read back as a floor that screens nothing.
+    #[test]
+    fn test_a_stored_floor_the_constructor_would_refuse_is_refused() {
+        let read: LiquidityFloor =
+            serde_json::from_str(r#"{"minimum_close_price":10.0,"minimum_dollar_volume":5e7}"#)
+                .expect("a valid floor reads");
+        assert_eq!(read, LiquidityFloor::CURRENT);
+        assert!(serde_json::from_str::<LiquidityFloor>(
+            r#"{"minimum_close_price":-1.0,"minimum_dollar_volume":5e7}"#
+        )
+        .is_err());
     }
 }

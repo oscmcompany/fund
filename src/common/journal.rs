@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -44,7 +44,7 @@ pub enum JournalError {
 ///
 /// Observations only — no slippage, profit and loss, or exposure totals, each of which is a query
 /// over these rows. Variants are additive and past files are never rewritten.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
 pub enum Observation {
     CommandFinished(CommandFinished),
@@ -104,7 +104,7 @@ impl Observation {
 /// Why a scheduled command did no work.
 ///
 /// The calendar is the only thing that stops a pass today; nothing in the tree detects a halt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
     NotATradingDay,
@@ -148,6 +148,20 @@ impl CommandOutcome {
     }
 }
 
+impl<'de> Deserialize<'de> for CommandOutcome {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::common::types::deserialize_named(deserializer, "command outcome", |raw| match raw {
+            "completed" => Some(CommandOutcome::Completed),
+            "errored" => Some(CommandOutcome::Errored),
+            "dropped_in_flight" => Some(CommandOutcome::DroppedInFlight),
+            other => other
+                .strip_prefix("skipped_")
+                .and_then(SkipReason::parse)
+                .map(CommandOutcome::Skipped),
+        })
+    }
+}
+
 impl Serialize for CommandOutcome {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.as_string())
@@ -159,7 +173,7 @@ impl Serialize for CommandOutcome {
 /// Written for every firing, including the ones that do no work: a holiday, a dropped duplicate,
 /// and a crashed process are otherwise the same absence. `correlation_id` is shared with everything
 /// the command did, which is what makes the duration attributable.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandFinished {
     pub command: Command,
     pub outcome: CommandOutcome,
@@ -174,7 +188,7 @@ pub struct CommandFinished {
 /// The readings it acted on are their own records sharing this pass's `correlation_id` — prices,
 /// the screen funnel, the open book. `candidates` stays here because a candidate's decision is not
 /// known until the pass ends.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PassEvaluated {
     #[serde(with = "crate::common::types::decimal_number_option")]
     pub account_equity: Option<Decimal>,
@@ -201,7 +215,7 @@ pub struct PassEvaluated {
 }
 
 /// Which of a pass's two price fetches a reading came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PricePurpose {
     /// The exit half, pricing the book it already holds.
@@ -214,7 +228,7 @@ pub enum PricePurpose {
 ///
 /// Written per fetch rather than per pass: the exit half prices the open book and the entry half
 /// asks only for what it is missing, and those are two separate readings of the market.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PricesObserved {
     pub purpose: PricePurpose,
     pub readings: Vec<PriceReading>,
@@ -222,7 +236,7 @@ pub struct PricesObserved {
 }
 
 /// Why a symbol the fetch asked for came back without a usable price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableCause {
     /// Alpaca returned the symbol with neither a quote nor a trade.
@@ -239,7 +253,7 @@ pub enum UnavailableCause {
 /// a symbol nobody asked about. A `quote_rejected` row carries the book it was refused on, because
 /// that is the reading the limits most need to be judged against — the guard cost the pass this
 /// symbol entirely, and "how far outside" is not answerable from the cause alone.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnavailablePrice {
     pub ticker: Ticker,
     pub cause: UnavailableCause,
@@ -251,13 +265,13 @@ pub struct UnavailablePrice {
 }
 
 /// Every open pair as one pass measured it.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct OpenPairsObserved {
     pub readings: Vec<OpenPairReading>,
 }
 
 /// Which round of a pass a plan belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPhase {
     Exits,
@@ -265,7 +279,7 @@ pub enum PlanPhase {
 }
 
 /// What a planned action would do to a pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannedActionKind {
     Close,
@@ -283,6 +297,17 @@ pub enum PlannedReason {
     Rank(u32),
 }
 
+impl<'de> Deserialize<'de> for PlannedReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::common::types::deserialize_named(deserializer, "planned reason", |raw| {
+            match raw.strip_prefix("rank_") {
+                Some(rank) => rank.parse().ok().map(PlannedReason::Rank),
+                None => CloseReason::parse(raw).map(PlannedReason::Close),
+            }
+        })
+    }
+}
+
 impl Serialize for PlannedReason {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -297,7 +322,7 @@ impl Serialize for PlannedReason {
 /// Its own record rather than a field on [`PassEvaluated`], which is written when the pass ends: a
 /// plan on that row would reach disk only after acting, so a process that died mid-execution would
 /// leave what it intended unrecorded.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanDecided {
     pub phase: PlanPhase,
     pub actions: Vec<PlannedAction>,
@@ -307,7 +332,7 @@ pub struct PlanDecided {
 }
 
 /// One thing a plan calls for, carrying enough to reconstruct the attempt if it never completes.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlannedAction {
     pub pair_id: PairID,
     pub action: PlannedActionKind,
@@ -327,7 +352,7 @@ pub struct PlannedAction {
 /// that fell back to the last trade still carries the quote that was refused and the reason, because
 /// a log holding only the quotes that passed cannot say whether the limits are set anywhere near
 /// right.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PriceReading {
     pub ticker: Ticker,
     pub price: f64,
@@ -347,7 +372,7 @@ pub struct PriceReading {
 }
 
 /// What a pass resolved to do about one open pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairDecision {
     /// Kept, because nothing said otherwise.
@@ -382,7 +407,7 @@ impl From<CloseReason> for PairDecision {
 /// Carries every input to the z-score, which on its own cannot distinguish a price move from a
 /// refit. The stop is not among them: it is [`crate::portfolio::screen::stop_at`] of
 /// `entry_z_score`, so storing it beside its own input is a second thing that can be wrong.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenPairReading {
     pub pair_id: PairID,
     pub long_ticker: Ticker,
@@ -401,7 +426,7 @@ pub struct OpenPairReading {
 }
 
 /// What became of a scored candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateDecision {
     Opened,
@@ -419,7 +444,7 @@ pub enum CandidateDecision {
 /// A scored candidate and what became of it.
 ///
 /// The sizing fields are set for every candidate that reached the sizer, refused ones included.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateReading {
     pub pair_id: PairID,
     pub long_ticker: Ticker,
@@ -448,7 +473,7 @@ pub struct CandidateReading {
 /// `equity_pairs` is mutated in place three times over a pair's life, so the journal needs three
 /// records where the table has one row. This is the only one carrying the entry rationale: nothing
 /// external knows which long was paired with which short, or on what.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairOpened {
     /// The `equity_pairs` primary key, which the two later records join on.
     pub equity_pair_id: Uuid,
@@ -475,7 +500,7 @@ pub struct PairOpened {
 }
 
 /// A pair as it was marked closed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairClosed {
     pub equity_pair_id: Uuid,
     pub reason: CloseReason,
@@ -492,7 +517,7 @@ pub struct PairClosed {
 /// A record of a write, not of a conclusion — the same kind of thing as [`OrderSubmitted`]. The
 /// amount is derivable from [`PairOpened`], [`PairClosed`], and the session's [`ActivityObserved`]
 /// rows; what is not derivable is that this process put that number on that row and that it landed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairAttributed {
     pub equity_pair_id: Uuid,
     #[serde(with = "crate::common::types::decimal_number_option")]
@@ -505,7 +530,7 @@ pub struct PairAttributed {
 ///
 /// Keyed by `client_order_id` because this is written before the request leaves the process, when
 /// the broker's identifier does not exist yet.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderSubmitted {
     pub client_order_id: Uuid,
     pub ticker: Ticker,
@@ -523,7 +548,7 @@ pub struct OrderSubmitted {
 /// `TimedOut` is our word and not the broker's: it is the case `broker_status` exists to explain,
 /// since an order Alpaca still held at `pending_new` never reached the market while one at
 /// `accepted` reached it and found no contra side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderOutcome {
     Filled,
@@ -541,7 +566,7 @@ pub enum OrderOutcome {
 ///
 /// One follows every [`OrderSubmitted`], so an unresolved submission means the process died between
 /// the two. Slippage is absent: it is this row joined to the pass that produced the order.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderResolved {
     pub client_order_id: Uuid,
     /// Absent when the order never reached the broker.
@@ -560,7 +585,7 @@ pub struct OrderResolved {
 }
 
 /// Why a position was asked to close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseRequestReason {
     /// One leg of a pair the exit half decided to close.
@@ -575,7 +600,7 @@ pub enum CloseRequestReason {
 ///
 /// Unlike an entry, an exit is not polled to a terminal state, so there is no fill price here —
 /// `alpaca_order_id` is the join to the fill once the post-close activity sync lands it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PositionCloseRequested {
     pub ticker: Ticker,
     /// The pair this leg belonged to, absent when the account is flattened without consulting them.
@@ -601,7 +626,7 @@ pub struct PositionCloseRequested {
 /// Written whether or not the flattening succeeded. This is the last fail-safe before positions
 /// carry overnight, and a run that failed at the broker would otherwise leave no trace of having
 /// been attempted.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LiquidationAttempted {
     pub pairs_closed: usize,
     pub positions_refused: usize,
@@ -617,7 +642,7 @@ pub struct LiquidationAttempted {
 /// question can be asked. `net_amount` is the reason this matters most: it is the only field
 /// saying how much a deposit or withdrawal moved, and it reaches no other store the application
 /// owns.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivityObserved {
     /// Alpaca's activity identifier, which is what makes the sync idempotent.
     pub activity_id: String,
@@ -640,7 +665,7 @@ pub struct ActivityObserved {
 ///
 /// Recorded in full because Alpaca backfills only equity for a past date, never the rest. The
 /// balances are `Decimal`, so nothing between Alpaca's response and this record rounds.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountObserved {
     /// The session these balances describe, which is not always the one the record was written in:
     /// a post-close sync re-run after Eastern midnight observes yesterday from today.
@@ -662,7 +687,7 @@ pub struct AccountObserved {
 /// The companion to [`AccountObserved`], and recorded for the same reason: Alpaca answers what is
 /// held now and never what was held on a past date, so a session whose book went unrecorded cannot
 /// have it reconstructed from anything but these rows.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PositionsObserved {
     pub readings: Vec<PositionReading>,
     /// Rows Alpaca reported that could not be read, so an empty book and an unreadable one are
@@ -671,7 +696,7 @@ pub struct PositionsObserved {
 }
 
 /// One held position, as Alpaca reported it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PositionReading {
     pub ticker: Ticker,
     pub side: PositionSide,
@@ -688,7 +713,7 @@ pub struct PositionReading {
 ///
 /// The bar path is the most consequential thing the application does that the broker cannot be
 /// re-asked about: Massive serves a date once and the archive partition is frozen afterwards.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarsIngested {
     /// The session the sync ran for, which is not the only session it covers: the window reaches
     /// back far enough to close a gap left by a missed run.
@@ -704,7 +729,7 @@ pub struct BarsIngested {
 }
 
 /// One universe refresh: what became eligible to trade, and what fell out.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct UniverseRefreshed {
     /// Symbols Alpaca reports as tradable, before the liquidity screen.
     pub alpaca_tradable: usize,
@@ -724,7 +749,7 @@ pub struct UniverseRefreshed {
 /// Every command consults this before doing anything, and the early closes are the part no local
 /// table can hold: a half-day's real 13:00 close is knowable only from this fetch, and the entry
 /// gate sizes its remaining-minutes check against it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalendarObserved {
     pub horizon_start: SessionDate,
     pub horizon_end: SessionDate,
@@ -735,7 +760,7 @@ pub struct CalendarObserved {
 }
 
 /// One published session that ends before the usual bell.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EarlyClose {
     pub session_date: SessionDate,
     /// The Eastern wall-clock close, as Alpaca publishes it.
@@ -746,7 +771,7 @@ pub struct EarlyClose {
 ///
 /// Written after the seal releases, so it lands in the session the export ran in rather than one
 /// it just shipped, and reaches S3 only on the next run.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct JournalExported {
     pub sessions_exported: usize,
     pub records_exported: usize,
@@ -763,7 +788,7 @@ pub struct JournalExported {
 ///
 /// Unlike [`JournalExported`], today's files are still open: what ships is a snapshot the next run
 /// replaces, so a count here rising for the same date is ordinary rather than a duplicate.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LogsExported {
     pub files_exported: usize,
     pub lines_exported: usize,
@@ -786,7 +811,7 @@ pub struct LogsExported {
 /// Carries what the run observed and nothing it computed: whether the night was complete, and which
 /// legs failed, were skipped or fell short, are all functions of `legs` and `reference`, and storing
 /// them beside their own inputs would be a summary free to contradict the data under it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArchiveFolded {
     pub window_start: SessionDate,
     pub window_end: SessionDate,
@@ -816,6 +841,9 @@ pub struct ArchiveFolded {
     /// `None` only when the budget ran out before it was reached.
     pub industry_codes: Option<IndustryCodesOutcome>,
     /// Every partition the run rewrote because something was wrong with it, and what was.
+    ///
+    /// Defaulted, because records before it was added carry no field rather than an empty list.
+    #[serde(default)]
     pub repairs: Vec<Repair>,
     /// Prints folded under a condition the published table could not resolve, over the planned
     /// window's daily trade partitions. `None` when no partition could be read.
@@ -832,7 +860,7 @@ pub struct ArchiveFolded {
 ///
 /// The purge is gated on the export being clean, so `rows_purged` being absent while datasets
 /// exported is the skip rather than a failure — `purge_skipped` is what tells the two apart.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseExported {
     pub session_date: SessionDate,
     /// `(dataset, rows)` for each table written to S3.
@@ -849,7 +877,7 @@ pub struct DatabaseExported {
 ///
 /// `session_date` is derived from `timestamp`, so a record cannot be filed under a session it did
 /// not happen in.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub schema_version: u32,
     pub event_id: Uuid,
@@ -1003,6 +1031,66 @@ pub fn journal_directory_from_env() -> String {
         .unwrap_or_else(|_| DEFAULT_JOURNAL_DIRECTORY.to_string())
 }
 
+/// One line of a journal file, read back.
+///
+/// A line that does not parse is kept with its version and type rather than dropped, because an
+/// older record whose field changed shape is still a record, and a reader that skipped it would
+/// report a shorter session than the one that happened.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadLine<R> {
+    Read(Box<R>),
+    Unreadable {
+        line: usize,
+        schema_version: Option<u32>,
+        kind: Option<String>,
+        reason: String,
+    },
+}
+
+/// A line of this journal, read back.
+pub type ReadRecord = ReadLine<Record>;
+
+/// Parses one journal line into the record it was written from.
+pub fn parse_record(line: &str) -> Result<Record, serde_json::Error> {
+    serde_json::from_str(line)
+}
+
+/// Reads every line of one session's journal file, in the order it was written.
+pub fn read_records(contents: &str) -> Vec<ReadRecord> {
+    read_lines(contents, "event_type")
+}
+
+/// Reads every line of a JSONL journal as `R`, naming a line that does not parse by `kind_field`.
+///
+/// The version is read off each line rather than assumed, so a file spanning a schema change reads
+/// its old lines as old; one this build cannot type says which version and kind it was.
+pub fn read_lines<R: serde::de::DeserializeOwned>(
+    contents: &str,
+    kind_field: &str,
+) -> Vec<ReadLine<R>> {
+    contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| match serde_json::from_str::<R>(line) {
+            Ok(record) => ReadLine::Read(Box::new(record)),
+            Err(error) => {
+                let envelope: Option<serde_json::Value> = serde_json::from_str(line).ok();
+                let field =
+                    |name: &str| envelope.as_ref().and_then(|value| value.get(name).cloned());
+                ReadLine::Unreadable {
+                    line: index + 1,
+                    schema_version: field("schema_version")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok()),
+                    kind: field(kind_field).and_then(|value| value.as_str().map(str::to_string)),
+                    reason: error.to_string(),
+                }
+            }
+        })
+        .collect()
+}
+
 /// The file one session's records live in.
 pub(crate) fn file_name(session_date: SessionDate) -> String {
     format!("session-{}.jsonl", session_date.date())
@@ -1109,6 +1197,75 @@ mod tests {
     }
 
     /// One value per variant, so the compiler forces this list to grow with the enum.
+    /// Every observation reads back as exactly what was written, so a field renamed on one side
+    /// only fails here rather than on the first replay that needs it.
+    #[test]
+    fn test_every_observation_reads_back_as_written() {
+        let observations = every_observation();
+        assert_eq!(
+            observations.len(),
+            22,
+            "one fixture per observation variant"
+        );
+        for observation in observations {
+            let record = Record::new(Uuid::nil(), instant("2026-08-11T20:15:00Z"), observation);
+            let line = serde_json::to_string(&record).expect("a record serializes");
+            let read = parse_record(&line).unwrap_or_else(|error| panic!("{line}: {error}"));
+            assert_eq!(read, record, "{line}");
+        }
+    }
+
+    #[test]
+    fn test_a_line_this_build_cannot_type_keeps_its_version_and_type() {
+        let written = serde_json::to_string(&Record::new(
+            Uuid::nil(),
+            instant("2026-08-11T20:15:00Z"),
+            account_observation(),
+        ))
+        .unwrap();
+        // v4 wrote a quote rejection as a bare string, which the current shape does not read.
+        let old = r#"{"schema_version":4,"event_id":"00000000-0000-0000-0000-000000000000","correlation_id":"00000000-0000-0000-0000-000000000000","session_date":"2026-08-11","timestamp":"2026-08-11T20:15:00Z","event_type":"prices_observed","payload":{"purpose":"open_pairs","readings":[],"unavailable":[{"ticker":"AAAA","cause":"quote_rejected","quote_rejection":"stale_quote"}]}}"#;
+        let read = read_records(&format!("{written}\n\n{old}\n"));
+        assert_eq!(read.len(), 2);
+        assert!(
+            matches!(&read[0], ReadLine::Read(record) if record.schema_version == SCHEMA_VERSION)
+        );
+        match &read[1] {
+            ReadLine::Unreadable {
+                line,
+                schema_version,
+                kind,
+                ..
+            } => {
+                assert_eq!(*line, 3);
+                assert_eq!(*schema_version, Some(4));
+                assert_eq!(kind.as_deref(), Some("prices_observed"));
+            }
+            ReadLine::Read(record) => panic!("a v4 rejection read as {record:?}"),
+        }
+    }
+
+    /// A real v6 archiver record, written before `repairs` existed, still reads: a field added
+    /// later defaults rather than refusing every earlier night.
+    #[test]
+    fn test_an_archiver_record_from_before_repairs_existed_reads() {
+        let line = r#"{"schema_version":6,"event_id":"3a6e6ec6-7f6b-446f-8a81-61ee0a6a3529","correlation_id":"a2dc0c46-c7f1-4109-8551-b45b460d40a8","session_date":"2026-09-23","timestamp":"2026-09-23T07:29:36.044000Z","event_type":"archive_folded","payload":{"legs":[["DailyBars",{"Folded":{"complete":true,"written":2}}],[{"IntradayBars":"FiveMinute"},{"Folded":{"complete":true,"written":1}}],[{"IntradayBars":"OneMinute"},{"Folded":{"complete":true,"written":1}}],["Trades",{"Folded":{"complete":true,"written":1}}],[{"Quotes":"FiveMinute"},{"Folded":{"complete":true,"written":1}}],[{"Quotes":"OneMinute"},{"Folded":{"complete":true,"written":1}}]],"partitions_written":7,"reference":{"Swept":{"unwritten":[],"written":[]}},"sessions_planned":5,"window_end":"2026-09-22","window_start":"2026-09-16"}}"#;
+        let record = parse_record(line).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(record.schema_version, 6);
+        match record.observation {
+            Observation::ArchiveFolded(folded) => {
+                assert!(folded.repairs.is_empty());
+                assert_eq!(
+                    folded.window_start,
+                    SessionDate::from_date(
+                        chrono::NaiveDate::from_ymd_opt(2026, 9, 16).expect("a real date"),
+                    )
+                );
+            }
+            other => panic!("read as {other:?}"),
+        }
+    }
+
     fn every_observation() -> Vec<Observation> {
         vec![
             Observation::CommandFinished(CommandFinished {

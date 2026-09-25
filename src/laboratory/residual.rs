@@ -36,6 +36,23 @@ pub struct FactorSpecification {
     minimum_residual_variance_share: f64,
 }
 
+impl<'de> serde::Deserialize<'de> for FactorSpecification {
+    /// Through [`FactorSpecification::new`], so an impossible specification is refused on read.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Stored {
+            volatility_sessions: usize,
+            minimum_residual_variance_share: f64,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        FactorSpecification::new(
+            stored.volatility_sessions,
+            stored.minimum_residual_variance_share,
+        )
+        .ok_or_else(|| serde::de::Error::custom("a factor specification out of its bounds"))
+    }
+}
+
 impl FactorSpecification {
     /// The specification every study uses until one declares its own.
     ///

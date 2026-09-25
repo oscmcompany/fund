@@ -43,7 +43,7 @@ pub const RESEARCH_SCREEN: Screen = Screen::new(LiquidityFloor::CURRENT, ScreenW
 ///
 /// Counts and spans catch a different window; the two digests catch the case they cannot, where the
 /// archive holds the same raw bars and a table revised in place restates them at read time.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct DatasetFingerprint {
     pub session: SessionDate,
     pub lookback_days: i64,
@@ -373,7 +373,7 @@ pub async fn residuals(
 /// A parameter rather than a default because a panel with these columns is a different measurement
 /// from one without, and every study written before they existed must keep reading the frame it was
 /// written against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Microstructure {
     /// Quote and trade summaries left-joined on `(ticker, session)`.

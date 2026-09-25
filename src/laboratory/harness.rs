@@ -92,7 +92,7 @@ impl Haircut {
 ///
 /// Two variants because the archive holds two clocks, and a horizon of "5" means a week in one and
 /// twenty-five minutes in the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum Horizon {
     Sessions(NonZeroUsize),
     Bars {
@@ -115,7 +115,7 @@ impl std::fmt::Display for Horizon {
 /// `Unscreened` is a variant rather than an absent floor because it is a real and common answer —
 /// the intraday datasets apply no screen at all — and a study over the whole market must not be
 /// readable as a study over the traded book.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub enum DeclaredUniverse {
     Screened {
         name: String,
@@ -156,7 +156,25 @@ impl std::fmt::Display for DeclaredUniverse {
 ///
 /// The cost model travels inside the priced variant so that netting a spread off a variance share
 /// or a count of bits is unrepresentable rather than merely discouraged.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+/// What a reading that is not a return is measured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Units {
+    #[serde(rename = "share")]
+    Share,
+    #[serde(rename = "variance share")]
+    VarianceShare,
+}
+
+impl std::fmt::Display for Units {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Units::Share => "share",
+            Units::VarianceShare => "variance share",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 pub enum Quantity {
     /// Basis points of return per round trip, signed, costable through the declared model.
     ReturnPerRoundTrip {
@@ -166,14 +184,14 @@ pub enum Quantity {
         quoted_spread: BasisPoints,
     },
     /// A reading with no round trip behind it: a correlation, a share, a rate, a count of bits.
-    Unpriced { units: &'static str },
+    Unpriced { units: Units },
 }
 
 /// How the two arms relate, which is what decides how their errors combine.
 ///
 /// Matched is the better arm whenever it is available — differencing session by session removes the
 /// variation both arms share — and it is the only one of the two that requires aligned readings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum Pairing {
     /// Both arms read the same sessions, so the difference is taken per session.
     Matched,
@@ -518,7 +536,7 @@ fn disjoint_difference(
 ///
 /// Four outcomes rather than a number and a flag, because "no round trip to charge for" and "a
 /// round trip nobody can price" are different answers and only one of them is about the data.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum NetOfCost {
     Net {
@@ -527,7 +545,7 @@ pub enum NetOfCost {
         net_basis_points: f64,
     },
     /// The readings are not a return, so no spread is owed on them.
-    NotAReturn { units: &'static str },
+    NotAReturn { units: Units },
     /// A return the declared fill style cannot be costed from.
     Refused(CostRefusal),
     /// No difference was measurable, so there is nothing to charge against.
@@ -976,7 +994,9 @@ mod tests {
     }
 
     fn unpriced() -> Quantity {
-        Quantity::Unpriced { units: "share" }
+        Quantity::Unpriced {
+            units: Units::Share,
+        }
     }
 
     /// One session a day, so every fixture arm reads the same sessions in the same order.
@@ -1631,7 +1651,9 @@ mod tests {
         assert_eq!(result.clears_haircut(), None);
         assert_eq!(
             result.net_of_cost(),
-            NetOfCost::NotAReturn { units: "share" }
+            NetOfCost::NotAReturn {
+                units: Units::Share
+            }
         );
     }
 
@@ -1764,7 +1786,9 @@ mod tests {
 
         assert_eq!(
             result.net_of_cost(),
-            NetOfCost::NotAReturn { units: "share" }
+            NetOfCost::NotAReturn {
+                units: Units::Share
+            }
         );
     }
 

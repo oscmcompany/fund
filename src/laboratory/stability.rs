@@ -13,7 +13,7 @@ pub const DEFAULT_LAGS: usize = 10;
 ///
 /// The error is taken under the null that the two are unrelated, which is the hypothesis being
 /// tested — so a correlation inside twice its error is nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 pub struct Association {
     pub lag: usize,
     pub correlation: f64,
@@ -25,7 +25,7 @@ pub struct Association {
 ///
 /// The error is that of a coin rather than of the observed rate, for the same reason: one half is
 /// the claim being tested.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 pub struct SignAgreement {
     pub lag: usize,
     pub rate: f64,

@@ -12,7 +12,7 @@ use crate::common::types::BasisPoints;
 /// The variants differ in what they can be costed from and not only in what they pay: a crossing
 /// order's cost is readable off a quoted spread, and the other two turn on a fill rate the archive
 /// does not hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FillStyle {
     /// Crosses the book, paying half the quoted spread on each crossing.
@@ -27,7 +27,7 @@ pub enum FillStyle {
 ///
 /// Counted in names rather than crossings so that a half-finished round trip cannot be expressed:
 /// a count of crossings admits odd numbers, and three crossings would price one and a half spreads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RoundTrip(u32);
 
 impl RoundTrip {
@@ -52,7 +52,7 @@ impl RoundTrip {
 /// A refusal rather than a zero, because the styles that pay no spread are not free: they pay in
 /// unfilled orders and in adverse selection, and both are measured against data the archive does
 /// not yet hold. Returning zero would make the cheapest assumption look like the best one.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum CostRefusal {
     /// The style's cost turns on a fill rate, which no stored field measures.
@@ -99,7 +99,7 @@ impl std::fmt::Display for CostRefusal {
 ///
 /// Constructed rather than assembled from literals at each call site, so two studies quoting a net
 /// figure are quoting it on the same terms or visibly not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct CostModel {
     fill_style: FillStyle,
     round_trip: RoundTrip,

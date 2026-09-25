@@ -260,7 +260,7 @@ pub fn state_at(resolution: Resolution, observed: Observed, horizon: usize) -> O
 /// pairs drawn from one universe sharing legs, so an error over entries would divide by far more
 /// than the information present. `entries` counts only the entries followed this far, so one the
 /// archive ran out under leaves the denominator rather than counting as still open.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct Curve {
     pub horizon: usize,
     pub converged: f64,
