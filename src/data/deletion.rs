@@ -210,8 +210,9 @@ pub async fn inspect(
     address: PartitionAddress,
 ) -> Result<Inspection, ArchiveError> {
     let key = address.key();
-    // The record is read first: a fold writes the parquet before its record, so reading in the same
-    // order could pair a new parquet with the record it is about to replace.
+    // The parquet is read first and again last: a fold writes the parquet before its record, so a
+    // fold landing anywhere between the reads changes the parquet's ETag and the pair is refused.
+    let before = object_etag(s3_client, bucket, &key).await?;
     let (sidecar, orphaned_sidecar) =
         match read_sidecar(s3_client, bucket, &PartitionProvenance::sidecar_key(&key)).await? {
             SidecarRead::Found(record, etag) => (
@@ -220,7 +221,11 @@ pub async fn inspect(
             ),
             SidecarRead::Unreadable | SidecarRead::Absent => (None, None),
         };
-    match object_etag(s3_client, bucket, &key).await? {
+    let after = object_etag(s3_client, bucket, &key).await?;
+    if before != after {
+        return Err(ArchiveError::Contended { key, attempts: 1 });
+    }
+    match after {
         Some(parquet_etag) => Ok(Inspection::Stored(StoredPartition::new(
             parquet_etag,
             sidecar,
@@ -773,6 +778,63 @@ mod tests {
 
     const PARTITION: &str =
         "/data/derived/equity/quotes/interval=one_day/year=2026/month=09/day=18/data.parquet";
+
+    fn sidecar_body() -> http::Response<SdkBody> {
+        let record = PartitionProvenance::new("equity_quotes", Some("2026-09-18"), alpaca());
+        http::Response::builder()
+            .status(200)
+            .header("etag", "\"sidecar\"")
+            .body(SdkBody::from(serde_json::to_vec(&record).unwrap()))
+            .expect("a canned response must build")
+    }
+
+    fn head_with(etag: &str) -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .header("etag", etag)
+            .body(SdkBody::empty())
+            .expect("a canned response must build")
+    }
+
+    #[tokio::test]
+    async fn test_a_fold_landing_between_the_reads_is_refused() {
+        let heads = Arc::new(Mutex::new(0_usize));
+        let counted = Arc::clone(&heads);
+        let client = scripted_s3_client(Arc::default(), move |method, _| match *method {
+            http::Method::HEAD => {
+                let mut count = counted.lock().expect("unpoisoned");
+                *count += 1;
+                head_with(if *count == 1 { "\"old\"" } else { "\"new\"" })
+            }
+            _ => sidecar_body(),
+        });
+        let target = address(
+            SessionFamily::Quotes,
+            BarInterval::OneDay,
+            session(2026, 9, 18),
+        );
+        assert!(matches!(
+            inspect(&client, "archive", target).await,
+            Err(ArchiveError::Contended { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_an_undisturbed_inspection_pairs_the_parquet_with_its_record() {
+        let client = scripted_s3_client(Arc::default(), |method, _| match *method {
+            http::Method::HEAD => head_with("\"parquet\""),
+            _ => sidecar_body(),
+        });
+        let target = address(
+            SessionFamily::Quotes,
+            BarInterval::OneDay,
+            session(2026, 9, 18),
+        );
+        assert_eq!(
+            inspect(&client, "archive", target).await.unwrap(),
+            Inspection::Stored(built_by(&[alpaca()]))
+        );
+    }
 
     #[tokio::test]
     async fn test_a_delete_removes_each_object_only_as_it_was_inspected() {
