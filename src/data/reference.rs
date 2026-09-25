@@ -105,6 +105,7 @@ pub struct Universe {
     rows: DataFrame,
     observations: Vec<i64>,
     coded_by_sec: usize,
+    unclassified: usize,
 }
 
 impl Universe {
@@ -116,6 +117,11 @@ impl Universe {
     /// Rows whose sector came from the SEC's current code because Massive reported none.
     pub fn coded_by_sec(&self) -> usize {
         self.coded_by_sec
+    }
+
+    /// Rows no sector resolves for, even after the SEC fill.
+    pub fn unclassified(&self) -> usize {
+        self.unclassified
     }
 }
 
@@ -142,6 +148,7 @@ pub fn universe_of(
     let mut industries: Vec<String> = Vec::new();
     let mut shares: Vec<Option<f64>> = Vec::new();
     let mut coded_by_sec = 0usize;
+    let mut unclassified = 0usize;
 
     for (as_of, frame) in ordered {
         // Aged first, so a symbol this observation answers for is reset to zero below and only the
@@ -168,6 +175,7 @@ pub fn universe_of(
             industries.push(industry_code(observation.industry));
             shares.push(observation.shares_outstanding);
             coded_by_sec += usize::from(observation.coded_by_sec);
+            unclassified += usize::from(observation.sector.is_none());
         }
     }
 
@@ -181,6 +189,7 @@ pub fn universe_of(
         ])?,
         observations,
         coded_by_sec,
+        unclassified,
     })
 }
 
@@ -663,6 +672,8 @@ mod tests {
             1,
             "only AZN's sector came from the SEC"
         );
+        assert_eq!(without.unclassified(), 2, "AZN and NOCK before the fill");
+        assert_eq!(with.unclassified(), 1, "only NOCK after it");
     }
 
     /// Partitions swept before the CIK was recorded have no `cik` column, and must read as they
