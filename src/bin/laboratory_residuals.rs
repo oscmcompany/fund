@@ -334,7 +334,7 @@ fn measure(
                 Horizon::Sessions(NonZeroUsize::new(1).expect("a positive count")),
                 declared_universe(screen),
                 Quantity::Unpriced {
-                    units: "variance share",
+                    units: fund::laboratory::harness::Units::VarianceShare,
                 },
             ),
             Pairing::Matched,

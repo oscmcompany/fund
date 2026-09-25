@@ -17,7 +17,7 @@ use crate::data::calendar::TradingCalendar;
 ///
 /// A leg rather than a family because the two quote cadences are separate passes over the tape and
 /// either can be the one a budget runs out on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Leg {
     DailyBars,
     IntradayBars(IntradayCadence),
@@ -378,7 +378,7 @@ pub fn plan_reference(
 ///
 /// The unwritten half carries its cause per grid point: the ordinary reason is that the session's
 /// bar partition is not there yet, which is a different fact from the feed refusing.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReferenceOutcome {
     /// Every owed grid point was attempted.
     Swept {
@@ -412,7 +412,7 @@ impl fmt::Display for ReferenceOutcome {
 /// Drift is a fact about the provider rather than a failure of the run, so it is recorded and the
 /// run's exit status is left alone. `Failed` is kept apart from `Drifted` because a check that could
 /// not reach the provider says nothing about whether the provider moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReferenceCheck {
     Matches,
     Drifted,
@@ -434,7 +434,7 @@ impl ReferenceCheck {
 ///
 /// Its own enum rather than a [`ReferenceCheck`], because a view that reads nothing is our defect
 /// and not the provider moving. `Failed` is a check that could not reach S3 and so saw nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ViewCheck {
     AllRead,
     SomeReadNothing,
@@ -453,7 +453,7 @@ impl ViewCheck {
 }
 
 /// What refreshing one whole-table dataset did.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TableRefresh {
     Refreshed {
         rows: usize,
@@ -472,7 +472,7 @@ impl TableRefresh {
 }
 
 /// A count and the population it was taken over, so a rate carries its denominator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Share {
     pub count: u64,
     pub population: u64,
@@ -497,7 +497,7 @@ impl std::ops::Add for Share {
 }
 
 /// What was wrong with a partition a nightly run rewrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Defect {
     /// No partition for a session older than the newest one, so an earlier night owed it and missed.
     SessionMissed,
@@ -513,7 +513,7 @@ pub enum Defect {
 ///
 /// The site is the leg and the session, so the same site across nights is a recurring defect rather
 /// than routine upkeep. Daily bars never appear: that leg re-fetches its correction window by design.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Repair {
     pub leg: Leg,
     pub session: SessionDate,
@@ -524,7 +524,7 @@ pub struct Repair {
 ///
 /// Skipped and failed are separate variants rather than one "did not finish", because a night that
 /// ran out of budget is healed by the next one and a night that errored is not.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LegOutcome {
     /// Reached every session it was given. Carries whether the passes considered themselves
     /// complete.

@@ -431,6 +431,12 @@ impl std::fmt::Display for OrderSide {
     }
 }
 
+impl<'de> Deserialize<'de> for OrderSide {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::common::types::deserialize_named(deserializer, "order side", OrderSide::parse)
+    }
+}
+
 impl Serialize for OrderSide {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
@@ -590,6 +596,12 @@ impl PositionSide {
 impl std::fmt::Display for PositionSide {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PositionSide {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::common::types::deserialize_named(deserializer, "position side", PositionSide::parse)
     }
 }
 
@@ -859,6 +871,13 @@ impl ActivityType {
 impl std::fmt::Display for ActivityType {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityType {
+    /// Total, like [`ActivityType::parse`]: a type this build does not classify is kept as `Other`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(ActivityType::parse(&String::deserialize(deserializer)?))
     }
 }
 
@@ -1878,14 +1897,17 @@ impl Default for QuoteLimits {
 ///
 /// Each variant carries the reading that produced it, so the journal can say how far outside
 /// the bound the book was rather than only that it was.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reason")]
 pub enum QuoteRejection {
     /// The quote is older than the market it is supposed to describe.
+    #[serde(rename = "stale_quote")]
     Stale {
         age_seconds: i64,
         limit_seconds: i64,
     },
     /// The book is too wide for its midpoint to be a price anyone would transact at.
+    #[serde(rename = "wide_quote")]
     Wide { relative_spread: f64, limit: f64 },
 }
 
@@ -1896,32 +1918,6 @@ impl QuoteRejection {
             QuoteRejection::Stale { .. } => "stale_quote",
             QuoteRejection::Wide { .. } => "wide_quote",
         }
-    }
-}
-
-impl Serialize for QuoteRejection {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
-        let mut record = serializer.serialize_struct("QuoteRejection", 3)?;
-        record.serialize_field("reason", self.as_str())?;
-        match self {
-            QuoteRejection::Stale {
-                age_seconds,
-                limit_seconds,
-            } => {
-                record.serialize_field("age_seconds", age_seconds)?;
-                record.serialize_field("limit_seconds", limit_seconds)?;
-            }
-            QuoteRejection::Wide {
-                relative_spread,
-                limit,
-            } => {
-                record.serialize_field("relative_spread", relative_spread)?;
-                record.serialize_field("limit", limit)?;
-            }
-        }
-        record.end()
     }
 }
 
@@ -1993,12 +1989,26 @@ pub enum PriceSource {
 }
 
 impl PriceSource {
+    pub const ALL: [PriceSource; 2] = [PriceSource::QuoteMidpoint, PriceSource::LastTrade];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        PriceSource::ALL
+            .into_iter()
+            .find(|source| source.as_str() == raw)
+    }
+
     /// A stable short name for the journal and the structured logs.
     pub fn as_str(self) -> &'static str {
         match self {
             PriceSource::QuoteMidpoint => "quote_midpoint",
             PriceSource::LastTrade => "last_trade",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for PriceSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::common::types::deserialize_named(deserializer, "price source", PriceSource::parse)
     }
 }
 

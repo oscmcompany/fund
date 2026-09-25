@@ -22,7 +22,7 @@ pub struct SessionMetrics {
 ///
 /// Reported together because an information coefficient without its standard error cannot be told
 /// apart from noise: across a few hundred sessions, 0.01 and zero are the same claim.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 pub struct Distribution {
     pub mean: f64,
     pub standard_error: f64,

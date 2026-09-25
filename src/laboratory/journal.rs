@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -49,7 +49,7 @@ pub enum JournalError {
 /// One thing the laboratory did.
 ///
 /// Named `<subject>_<past participle>`, the convention the application journal already uses.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "experiment_type",
     content = "payload",
@@ -85,7 +85,7 @@ impl Observation {
 /// The declaration travels with the reading rather than being recoverable from the binary that
 /// produced it, because a threshold is only a threshold relative to the family it was spent
 /// against: a record carrying the statistic without `family_tests` is a number nobody can judge.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StudyMeasured {
     pub question: String,
     pub family: String,
@@ -140,7 +140,7 @@ impl From<&StudyResult> for StudyMeasured {
 ///
 /// `selection` carries the control and `segment` the replication, so an arm that only converges over
 /// one half of the window says so in the record rather than in a follow-up nobody runs.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConvergenceMeasured {
     /// How the pair was admitted: the screen's correlation band, or the population without it.
     pub selection: String,
@@ -162,7 +162,7 @@ pub struct ConvergenceMeasured {
 /// `lag` separates the two answers this can give: at zero the state describes the session being
 /// read, which explains without anticipating, and only a positive lag is something a book could act
 /// on before the session it speaks about.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegimeMeasured {
     pub predictor: String,
     /// Which per-session statistic was explained.
@@ -184,7 +184,7 @@ pub struct RegimeMeasured {
 ///
 /// The split-sample check is this number against its error, not two figures that happen to point
 /// the same way.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalfDifference {
     pub lag: usize,
     /// The second half's association minus the first's.
@@ -217,7 +217,7 @@ impl HalfDifference {
 ///
 /// Both statistics are recorded because they answer the same question at different bluntness: a
 /// series can co-move in magnitude while its sign is a coin, and only the sign is tradeable.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StabilityMeasured {
     pub predictor: String,
     /// Which per-session statistic was followed through time.
@@ -232,7 +232,7 @@ pub struct StabilityMeasured {
 /// `excess_share` is the answer and the rest are why it should be believed: the raw estimate is
 /// biased upward at this sample size, `null_bits` is that bias measured on the same rows, and
 /// `target_entropy_bits` is the ceiling that makes two targets comparable at all.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeatureTriaged {
     pub feature: String,
     pub sessions: usize,
@@ -255,7 +255,7 @@ pub struct FeatureTriaged {
 ///
 /// The fingerprint is what makes a later result comparable, so it is recorded once here and
 /// referenced by `run_id` rather than repeated on every result the run goes on to produce.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatasetBuilt {
     pub fingerprint: DatasetFingerprint,
     /// The commit this ran from, so a number can be traced to the code that produced it.
@@ -282,7 +282,7 @@ impl DatasetBuilt {
 ///
 /// Summarized rather than per session: `sessions` is what the panel held and each distribution
 /// counts what it could measure, so a forecast that never ranked reads as absent and not as zero.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForecastScored {
     pub predictor: String,
     pub sessions: usize,
@@ -307,7 +307,7 @@ impl From<&Evaluation> for ForecastScored {
 ///
 /// `run_id` sits where the application's record carries `session_date`, and threads every record
 /// one run emits. An experiment spans hundreds of sessions and belongs to none of them.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub schema_version: u32,
     pub event_id: Uuid,
@@ -427,6 +427,14 @@ impl Journal {
 /// Proof that no append can run while it is alive.
 pub struct JournalGuard<'a> {
     _appends_blocked: tokio::sync::MutexGuard<'a, Option<OpenSession>>,
+}
+
+/// A line of the laboratory journal, read back.
+pub type ReadRecord = crate::common::journal::ReadLine<Record>;
+
+/// Reads every line of one laboratory session's file, naming an unreadable line by its experiment.
+pub fn read_records(contents: &str) -> Vec<ReadRecord> {
+    crate::common::journal::read_lines(contents, "experiment_type")
 }
 
 /// Prefix naming files whose date is an Eastern session.
@@ -659,6 +667,18 @@ mod tests {
         );
     }
 
+    /// A dataset record reads back as written, fingerprint and floor included.
+    #[test]
+    fn test_a_dataset_record_reads_back_as_written() {
+        let timestamp = DateTime::from_timestamp_millis(1_755_000_000_000).unwrap();
+        let record = Record::new(Uuid::nil(), timestamp, observation());
+        let line = serde_json::to_string(&record).unwrap();
+        match read_records(&line).as_slice() {
+            [crate::common::journal::ReadLine::Read(read)] => assert_eq!(**read, record),
+            other => panic!("{line} read as {other:?}"),
+        }
+    }
+
     /// The denominator has to reach the file, not only the terminal.
     ///
     /// A record carrying the statistic without the family it was spent against is a number nobody
@@ -691,7 +711,9 @@ mod tests {
                 ),
                 Horizon::Sessions(one),
                 DeclaredUniverse::Unscreened,
-                Quantity::Unpriced { units: "share" },
+                Quantity::Unpriced {
+                    units: crate::laboratory::harness::Units::Share,
+                },
             ),
             Pairing::Matched,
             arm("real sectors", [0.30, 0.25, 0.28, 0.26]),
@@ -703,6 +725,13 @@ mod tests {
 
         let observation = Observation::StudyMeasured(StudyMeasured::from(&result));
         assert_eq!(observation.experiment_type(), "study_measured");
+        let timestamp = DateTime::from_timestamp_millis(1_755_000_000_000).unwrap();
+        let record = Record::new(Uuid::nil(), timestamp, observation.clone());
+        let line = serde_json::to_string(&record).unwrap();
+        match read_records(&line).as_slice() {
+            [crate::common::journal::ReadLine::Read(read)] => assert_eq!(**read, record),
+            other => panic!("{line} read as {other:?}"),
+        }
 
         let value: serde_json::Value = serde_json::to_value(&observation).unwrap();
         assert_eq!(
@@ -879,6 +908,7 @@ mod tests {
     /// One variable configures a box and the file names keep the two records apart, so a script
     /// that provisions `/var/journal/fund` provisions both.
     #[test]
+    #[serial_test::serial]
     fn test_both_journals_open_the_same_directory() {
         let laboratory = Journal::from_env().expect("the laboratory journal must resolve");
         let application = crate::common::journal::Journal::from_env()

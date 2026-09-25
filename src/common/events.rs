@@ -28,6 +28,16 @@ pub enum Command {
     DatabaseExport,
 }
 
+impl<'de> serde::Deserialize<'de> for Command {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::common::types::deserialize_named(deserializer, "command", |raw| {
+            Command::ALL
+                .into_iter()
+                .find(|command| command.as_str() == raw)
+        })
+    }
+}
+
 impl serde::Serialize for Command {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())

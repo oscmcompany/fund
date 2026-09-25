@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use polars::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::data::classification_table::Sector;
 use crate::data::reference::sector_of_stored;
@@ -34,6 +34,23 @@ pub enum ResidualError {
 pub struct FactorSpecification {
     volatility_sessions: usize,
     minimum_residual_variance_share: f64,
+}
+
+impl<'de> Deserialize<'de> for FactorSpecification {
+    /// Through [`FactorSpecification::new`], so an impossible specification is refused on read.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            volatility_sessions: usize,
+            minimum_residual_variance_share: f64,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        FactorSpecification::new(
+            stored.volatility_sessions,
+            stored.minimum_residual_variance_share,
+        )
+        .ok_or_else(|| serde::de::Error::custom("a factor specification out of its bounds"))
+    }
 }
 
 impl FactorSpecification {
