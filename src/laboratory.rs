@@ -15,6 +15,7 @@ pub mod journal;
 pub mod metrics;
 pub mod predictor;
 pub mod regime;
+pub mod register;
 pub mod residual;
 pub mod slippage;
 pub mod stability;
