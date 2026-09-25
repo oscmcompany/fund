@@ -16,7 +16,7 @@ use fund::common::log::init_tracing;
 use fund::common::types::SessionDate;
 use fund::laboratory::harness::distribution;
 use fund::laboratory::journal as laboratory;
-use fund::laboratory::metrics::{self, Distribution};
+use fund::laboratory::metrics;
 use fund::laboratory::predictor::{
     evaluate, CrossSectionalMean, Evaluation, Momentum, Panel, Persistence, Predictor,
     RandomRanking,
@@ -722,6 +722,7 @@ fn render(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fund::laboratory::metrics::Distribution;
 
     const DAY: i64 = 86_400_000;
 

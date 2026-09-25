@@ -26,7 +26,9 @@ use fund::data::archive::{self, ForeignProvider, NameSelection, Scope, SessionSe
 use fund::data::cadence::CadenceTotals;
 use fund::data::calendar::TradingCalendar;
 use fund::data::export;
-use fund::data::nightly::{self, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome};
+use fund::data::nightly::{
+    self, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome, ViewCheck,
+};
 use fund::data::{attribution, bars, details, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
@@ -153,6 +155,9 @@ struct NightlyArguments {
     /// Exit status of `fetch-industry-classifications --check`, recorded the same way.
     #[arg(long, value_name = "STATUS")]
     classification_check_status: Option<i32>,
+    /// Exit status of `tools/check-views`, recorded the same way.
+    #[arg(long, value_name = "STATUS")]
+    views_check_status: Option<i32>,
     #[command(flatten)]
     files: FlatFileArguments,
 }
@@ -1751,6 +1756,9 @@ async fn archive_nightly(
         arguments
             .classification_check_status
             .map(ReferenceCheck::from_exit_status),
+        arguments
+            .views_check_status
+            .map(ViewCheck::from_exit_status),
         industry_codes,
     )
     .await;
@@ -1767,6 +1775,7 @@ async fn record_the_fold(
     report: &NightlyReport,
     conditions_check: Option<ReferenceCheck>,
     classification_check: Option<ReferenceCheck>,
+    views_check: Option<ViewCheck>,
     industry_codes: Option<archive::IndustryCodesOutcome>,
 ) {
     let journal = match Journal::from_env() {
@@ -1787,6 +1796,7 @@ async fn record_the_fold(
         conditions_as_of: report.conditions_as_of(),
         conditions_check,
         classification_check,
+        views_check,
         industry_codes,
     });
     journal
@@ -3170,19 +3180,22 @@ mod tests {
         assert_eq!(conditions_folded_under(3, None), None);
     }
 
-    /// `run-archiver` passes both statuses by these names, so a rename here would fail every
+    /// `run-archiver` passes every status by these names, so a rename here would fail every
     /// scheduled run at argument parsing -- before the fold, not just the record.
     #[test]
-    fn test_the_nightly_takes_both_check_statuses_by_the_names_the_wrapper_uses() {
+    fn test_the_nightly_takes_every_check_status_by_the_names_the_wrapper_uses() {
         let arguments = nightly(&[
             "--conditions-check-status",
             "3",
             "--classification-check-status",
             "0",
+            "--views-check-status",
+            "1",
         ]);
 
         assert_eq!(arguments.conditions_check_status, Some(3));
         assert_eq!(arguments.classification_check_status, Some(0));
+        assert_eq!(arguments.views_check_status, Some(1));
         let unchecked = nightly(&[]);
         assert_eq!(
             unchecked.conditions_check_status, None,

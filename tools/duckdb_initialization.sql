@@ -349,6 +349,29 @@ FROM read_parquet(
     hive_partitioning = true
 );
 
+-- The archiver's nights: one archive_folded row per run, which is the only record the box leaves.
+--
+-- Scoped to the archiver for the reason the other two journal views are scoped. Read the night with
+-- `payload->>'$.conditions_check'` and its siblings; a field added after a night reads as NULL there.
+.print 'Loading archive_runs...'
+DROP VIEW IF EXISTS archive_runs;
+CREATE OR REPLACE VIEW archive_runs AS
+SELECT
+    schema_version,
+    event_id,
+    event_type,
+    session_date,
+    -- Epoch milliseconds in the Parquet, for the reason the journal view gives above.
+    to_timestamp(timestamp / 1000.0) AS timestamp,
+    payload,
+    year,
+    month,
+    day
+FROM read_parquet(
+    's3://' || getvariable('records_bucket') || '/exports/journal/producer=archiver/**/*.parquet',
+    hive_partitioning = true
+);
+
 -- The research log: what the laboratory ran, one row per observation.
 --
 -- Scoped to the researcher for the reason the trader's view is scoped: the two share

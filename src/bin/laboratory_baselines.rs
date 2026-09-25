@@ -16,7 +16,6 @@ use fund::laboratory::harness::{
     StudyResult,
 };
 use fund::laboratory::journal as laboratory;
-use fund::laboratory::metrics::Distribution;
 use fund::laboratory::predictor::{
     evaluate, CrossSectionalMean, Evaluation, Momentum, Panel, Persistence, Predictor,
     RandomRanking,
@@ -416,6 +415,7 @@ fn render(scored: &[laboratory::ForecastScored]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fund::laboratory::metrics::Distribution;
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

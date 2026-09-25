@@ -40,7 +40,7 @@ OPTIONAL_KEYS="MASSIVE_S3_ENDPOINT MASSIVE_S3_ACCESS_KEY_ID MASSIVE_S3_SECRET_AC
 # or Alpaca outage stop the very command that ships the diagnostics explaining it -- the export runs
 # after a failed night, which is exactly when a credential problem is likely to be the cause.
 case "${1:-}" in
-  export-records)
+  export-records | check-views)
     REQUIRED_KEYS=""
     OPTIONAL_KEYS=""
     ;;
@@ -112,6 +112,10 @@ if [[ "${1:-}" == "check-reference" ]]; then
     export PATH="$HOME/.cargo/bin:$PATH"
   fi
   exec "tools/$2" --check
+fi
+
+if [[ "${1:-}" == "check-views" ]]; then
+  exec tools/check-views
 fi
 
 exec ./target/release/seed "$@"

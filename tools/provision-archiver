@@ -40,9 +40,9 @@ ARCHIVE_BUCKET="oscm-fund-archive"
 ARCHIVE_PREFIX="data/*"
 
 # This box's own records bucket, matching what `run-backfill` exports as
-# AWS_S3_RECORDS_BUCKET_NAME. Scoped to the archiver's two producer prefixes, not to `exports/*`:
-# the bucket is shared with the trader, and `producer=` is a convention in code that constrains
-# nothing at IAM. No ListBucket -- both exporters enumerate local directories and only ever put.
+# AWS_S3_RECORDS_BUCKET_NAME. Writes are scoped to the archiver's two producer prefixes, not to
+# `exports/*`: the bucket is shared with the trader, and `producer=` is a convention in code that
+# constrains nothing at IAM. Reads span `exports/*`, because `check-views` reads every view.
 RECORDS_BUCKET_STEM="oscm-fund"
 
 # 03:00 Eastern in summer, 02:00 in winter, folding the session that closed the previous Eastern
@@ -160,7 +160,7 @@ fi
 echo "Profile:  $PROFILE"
 echo "Names:    $NAME"
 echo "Archive:  $ARCHIVE_BUCKET/$ARCHIVE_PREFIX"
-echo "Records:  $RECORDS_BUCKET/exports/{journal,logs}/producer=archiver/*"
+echo "Records:  $RECORDS_BUCKET/exports/{journal,logs}/producer=archiver/* (read: exports/*)"
 echo "Region:   $REGION"
 
 # --------------------------------------------------------------------------- #
@@ -465,8 +465,9 @@ if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; 
 fi
 
 # `seed` writes every archive key under data/**, and since #1165 it also exports its own records to
-# the shared bucket the trader writes -- hence two prefix-scoped statements rather than one on
-# `exports/*`, which would let this box overwrite the trader's journal.
+# the shared bucket the trader writes -- hence two prefix-scoped writes rather than one on
+# `exports/*`, which would let this box overwrite the trader's journal. Reading that prefix is
+# granted separately and read-only, for the nightly view check.
 ROLE_POLICY="$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -499,6 +500,19 @@ ROLE_POLICY="$(cat <<JSON
       ]
     },
     {
+      "Sid": "ReadRecordsForTheViewCheck",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/exports/*"
+    },
+    {
+      "Sid": "ListRecordsForTheViewCheck",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}",
+      "Condition": {"StringLike": {"s3:prefix": "exports/*"}}
+    },
+    {
       "Sid": "StopSelfWhenDone",
       "Effect": "Allow",
       "Action": ["ec2:StopInstances"],
@@ -509,7 +523,7 @@ ROLE_POLICY="$(cat <<JSON
 JSON
 )"
 
-changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX, $RECORDS_BUCKET producer=archiver and $INSTANCE_ID"
+changed "put inline policy scoped to $ARCHIVE_BUCKET/$ARCHIVE_PREFIX, $RECORDS_BUCKET producer=archiver (read: exports/*) and $INSTANCE_ID"
 if [[ "$APPLY" == true ]]; then
   aws iam put-role-policy --role-name "$NAME" \
     --policy-name archive-and-secrets --policy-document "$ROLE_POLICY"
