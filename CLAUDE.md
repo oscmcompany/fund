@@ -142,6 +142,8 @@ This is a collection of guidelines and references.
   refutation closes doors that are still open and under-claiming reopens ones that are shut
 - Correcting an instance does not generalise the lesson; run the check deliberately against each new
   measurement rather than remembering it as a past mistake
+- A tooling trap that a check could detect is owed a check, not a memory — a memory is read after the trap
+  fires; only a hazard of a typed command that no check can observe stays a note
 - Standard errors assume independent observations, which financial data never is — aggregate to the level
   that actually varies and report effective sample size rather than row count
 - Always report the undefined share alongside an estimate; an estimator silently defined on 60% of its
