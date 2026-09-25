@@ -744,8 +744,7 @@ fn render_group(results: &[&StudyResult]) -> String {
 
 /// A statistic with its standard error and the sessions behind it, or why there is none.
 ///
-/// The one rendering of "mean ± error (n)" in the tree; three binaries previously carried
-/// byte-identical private copies of it and three more open-coded it at different precisions.
+/// The one rendering of "mean ± error (n)" shared by the laboratory binaries.
 pub fn distribution(value: Option<Distribution>) -> String {
     value.map_or_else(
         || "unmeasurable".to_string(),

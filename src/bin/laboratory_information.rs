@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
 use fund::common::types::SessionDate;
+use fund::laboratory::harness::distribution;
 use fund::laboratory::information::{self, Feature, Outcome, DEFAULT_BINS};
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::metrics::{self, Distribution};
@@ -384,18 +385,6 @@ fn render(triaged: &[laboratory::FeatureTriaged], panel_rows: usize) -> String {
         ));
     }
     rendered
-}
-
-fn distribution(value: Option<Distribution>) -> String {
-    value.map_or_else(
-        || "unmeasurable".to_string(),
-        |distribution| {
-            format!(
-                "{:+.6} ± {:.6} ({})",
-                distribution.mean, distribution.standard_error, distribution.sessions
-            )
-        },
-    )
 }
 
 #[cfg(test)]
