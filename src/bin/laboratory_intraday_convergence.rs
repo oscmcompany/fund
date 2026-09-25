@@ -152,6 +152,7 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
         BarInterval::FiveMinute,
         parameters.lookback_days,
         parameters.session,
+        dataset::RESEARCH_SCREEN,
     )
     .await?;
     let hours = session_hours(parameters).await?;
