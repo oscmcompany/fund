@@ -9,7 +9,7 @@ use polars::prelude::*;
 use serde::Serialize;
 
 use crate::data::classification_table::Sector;
-use crate::data::details::sector_of_stored;
+use crate::data::reference::sector_of_stored;
 
 /// The column this module adds, null wherever the residual was refused.
 pub const RESIDUAL_COLUMN: &str = "residual_return";
@@ -503,8 +503,8 @@ impl Demeaned {
 mod tests {
     use super::*;
     use crate::data::classification_table::Industry;
-    use crate::data::details::UNKNOWN;
-    use crate::models::tide::data::clean_data;
+    use crate::data::reference::UNKNOWN;
+    use crate::laboratory::frame::clean_frame;
 
     /// A lookback of two keeps the fixtures readable; the shape under test is the same at sixty.
     ///
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn test_the_panel_measures_names_after_the_frame_crosses_clean_data() {
         let rows = panel(&[Sector::Manufacturing, Sector::BusinessEquipment], 8);
-        let cleaned = clean_data(with_model_columns(&rows)).expect("clean_data must accept it");
+        let cleaned = clean_frame(with_model_columns(&rows)).expect("clean_data must accept it");
 
         // The premise: if this stops holding, the test below passes for the wrong reason.
         let sectors = cleaned.column("sector").unwrap().str().unwrap();

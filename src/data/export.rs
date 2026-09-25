@@ -72,10 +72,6 @@ pub async fn export_database(
     let (start, end) = date.bounds();
 
     export!(Dataset::Events, events_frame(pool, start, end));
-    export!(
-        Dataset::EquityPredictions,
-        predictions_frame(pool, start, end)
-    );
     export!(Dataset::EquityPairs, pairs_frame(pool));
     export!(Dataset::AccountSnapshots, account_snapshots_frame(pool));
     export!(
@@ -157,46 +153,6 @@ async fn events_frame(
     ])
 }
 
-async fn predictions_frame(
-    pool: &PgPool,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Result<DataFrame, PolarsError> {
-    let rows = sqlx::query!(
-        r#"SELECT correlation_id AS "correlation_id!", model_run_id AS "model_run_id!",
-                  ticker AS "ticker!", timestamp AS "timestamp!",
-                  quantile_10 AS "quantile_10!", quantile_50 AS "quantile_50!",
-                  quantile_90 AS "quantile_90!"
-           FROM equity_predictions
-           WHERE timestamp >= $1 AND timestamp < $2
-           ORDER BY ticker"#,
-        start,
-        end
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(to_polars_error)?;
-
-    DataFrame::new(vec![
-        Column::new(
-            "correlation_id".into(),
-            collect(&rows, |row| row.correlation_id.to_string()),
-        ),
-        Column::new(
-            "model_run_id".into(),
-            collect(&rows, |row| row.model_run_id.clone()),
-        ),
-        Column::new("ticker".into(), collect(&rows, |row| row.ticker.clone())),
-        Column::new(
-            "timestamp".into(),
-            collect(&rows, |row| row.timestamp.timestamp_millis()),
-        ),
-        Column::new("quantile_10".into(), collect(&rows, |row| row.quantile_10)),
-        Column::new("quantile_50".into(), collect(&rows, |row| row.quantile_50)),
-        Column::new("quantile_90".into(), collect(&rows, |row| row.quantile_90)),
-    ])
-}
-
 async fn pairs_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
         r#"SELECT id AS "id!", pair_id AS "pair_id!", long_ticker AS "long_ticker!",
@@ -204,7 +160,7 @@ async fn pairs_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
                   hedge_ratio::double precision AS "hedge_ratio!",
                   entry_z_score::double precision AS "entry_z_score!",
                   signal_strength::double precision AS "signal_strength!",
-                  model_run_id, status AS "status!", opened_at AS "opened_at!", closed_at,
+                  status AS "status!", opened_at AS "opened_at!", closed_at,
                   close_reason,
                   realized_profit_and_loss::double precision AS realized_profit_and_loss
            FROM equity_pairs
@@ -233,10 +189,6 @@ async fn pairs_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
         Column::new(
             "signal_strength".into(),
             collect(&rows, |row| row.signal_strength),
-        ),
-        Column::new(
-            "model_run_id".into(),
-            collect(&rows, |row| row.model_run_id.clone()),
         ),
         Column::new("status".into(), collect(&rows, |row| row.status.clone())),
         Column::new(

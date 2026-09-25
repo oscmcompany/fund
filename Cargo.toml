@@ -5,13 +5,10 @@ edition = "2021"
 resolver = "2"
 
 # No features, and every binary auto-discovered from `src/bin/`: the service `fund`, the `dashboard`,
-# `tide_model_trainer`, `backfill_account_snapshots`, the `seed` seeder, the `laboratory_*` studies,
-# and `laboratory_export`, which ships what those studies wrote.
+# `backfill_account_snapshots`, the `seed` seeder, the `laboratory_*` studies, and
+# `laboratory_export`, which ships what those studies wrote.
 #
-# There is deliberately no `train` feature -- it existed so an inference-only build could skip the
-# training modules, but burn's `autodiff` is always compiled in anyway (it costs the NdArray
-# inference path nothing), so all the flag excluded was `rand`. There is deliberately no `dashboard`
-# feature either, for a sharper reason: features are crate-wide, so building the service and then
+# There is deliberately no `dashboard` feature: features are crate-wide, so building the service and then
 # the dashboard with different feature sets recompiles the entire dependency graph twice on every
 # `devenv up`. Axum is cheaper than that. One build configuration is worth more than one unlinked
 # web framework.
@@ -74,16 +71,11 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 # system is expressed in America/New_York, so this is unconditional rather than feature-gated.
 chrono-tz = "0.10"
 
-# Model. `autodiff` brings the Autodiff backend used by Rust-native training; it adds no runtime
-# cost to the NdArray inference path, so it is always compiled in rather than gated behind `train`.
-# flate2/tar/tempfile unpack the `model.tar.gz` artifact that both training and inference handle.
-burn = { version = "0.16", features = ["ndarray", "autodiff"] }
-ndarray = "0.16"
+# flate2 decompresses the vendor's gzipped flat files; tempfile stages the raw tee and the exports.
 flate2 = "1.0"
-tar = "0.4"
 tempfile = "3.27"
 
-# Epoch shuffling during training.
+# Seeded permutations for the studies' null controls.
 rand = "0.10"
 
 # The dashboard's HTTP server. Unconditional rather than behind a feature -- see the note above.

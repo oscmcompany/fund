@@ -29,9 +29,9 @@ use fund::data::conditions::ConditionsTable;
 use fund::data::export;
 use fund::data::nightly::{
     self, Defect, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome, Repair, Share,
-    ViewCheck,
+    TableRefresh, ViewCheck,
 };
-use fund::data::{attribution, bars, deletion, details, quotes, trades};
+use fund::data::{attribution, bars, deletion, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
 ///
@@ -82,11 +82,6 @@ enum Command {
     EquityBars {
         #[command(subcommand)]
         route: BarRoute,
-    },
-    /// Ticker metadata, from the CSV compiled into this binary.
-    EquityDetails {
-        #[command(subcommand)]
-        target: DetailsTarget,
     },
     /// Quoted spreads from Alpaca, into the S3 archive. Every session is written at both cadences,
     /// so there is no interval to choose.
@@ -309,7 +304,6 @@ impl Command {
                 BarRoute::Intraday { .. } => "seed-equity-bars-intraday",
                 BarRoute::FlatFile { .. } => "seed-equity-bars-flat-file",
             },
-            Command::EquityDetails { .. } => "seed-equity-details",
             Command::EquityQuotes { .. } => "seed-equity-quotes",
             Command::EquityTrades { .. } => "seed-equity-trades",
             Command::EquityReference { .. } => "seed-equity-reference",
@@ -417,12 +411,6 @@ enum DailyTarget {
     /// Into `data/derived/equity/bars/interval=one_day/`, which the trainer trains from. Needs AWS, Massive
     /// and Alpaca.
     S3(ArchiveBarsArguments),
-}
-
-#[derive(Debug, Subcommand)]
-enum DetailsTarget {
-    /// Into `equity_details`, which the pair screen's per-sector cap reads.
-    Postgres,
 }
 
 #[derive(Debug, Args)]
@@ -1198,12 +1186,6 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
             BarRoute::Intraday { action } => seed_intraday_bars(action).await,
             BarRoute::FlatFile { action } => seed_flat_file_bars(action).await,
         },
-        Command::EquityDetails { target } => {
-            match target {
-                DetailsTarget::Postgres => seed_database_details().await?,
-            }
-            Ok(Outcome::Complete)
-        }
         Command::EquityQuotes { action } => seed_quotes(action).await,
         Command::EquityTrades { action } => seed_trades(action).await,
         Command::EquityReference { action } => seed_reference(action).await,
@@ -1327,29 +1309,6 @@ async fn seed_archive_bars(
         Some(&calendar),
     )
     .await?)
-}
-
-// --- Details --------------------------------------------------------------------------------
-
-/// Seeds ticker metadata into the database from the archive's newest reference partition.
-///
-/// The newest rather than a point-in-time read, because the screen that consumes `equity_details`
-/// only ever runs against the current session.
-async fn seed_database_details() -> Result<(), Box<dyn std::error::Error>> {
-    let bucket = bucket_name()?;
-    let s3_client = fund::common::aws::s3_client().await;
-    let universe = archive::current_universe(&s3_client, &bucket).await?;
-    let details = details::details_from_universe(universe.rows())?;
-    info!(tickers = details.len(), "Read the reference universe");
-
-    let pool = connect_pool().await?;
-    let stored = details::store_details(&pool, &details).await?;
-    info!(
-        destination = "postgres",
-        rows = stored,
-        "Equity details seeded"
-    );
-    Ok(())
 }
 
 // --- Intraday bars --------------------------------------------------------------------------
@@ -1779,6 +1738,13 @@ async fn archive_nightly(
         report.record(leg, outcome);
     }
 
+    // Whole-table refreshes the trainer used to run as a side effect of training. Both are single
+    // requests and rows outside the boundary window survive the merge, so this costs seconds.
+    if budget.may_start_another() {
+        let (splits, boundaries) = refresh_corporate_actions(today).await;
+        report.record_corporate_actions(splits, boundaries);
+    }
+
     let reference = if budget.may_start_another() {
         match run_reference(today, &budget).await {
             Ok(outcome) => outcome,
@@ -1801,13 +1767,19 @@ async fn archive_nightly(
     };
 
     let (unresolved_conditions, unclassified) = measure_the_night(&plan).await;
+    let (splits, boundaries) = report.corporate_actions().cloned().unzip();
+    let readings = NightReadings {
+        unresolved_conditions,
+        unclassified,
+        splits,
+        boundaries,
+    };
 
     // Written before the caller decides the exit code, because the box stops itself once this
     // returns: a record produced after the run is a record produced on a machine that is gone.
     record_the_fold(
         &report,
-        unresolved_conditions,
-        unclassified,
+        readings,
         arguments
             .conditions_check_status
             .map(ReferenceCheck::from_exit_status),
@@ -1863,6 +1835,61 @@ async fn measure_the_night(plan: &nightly::NightlyPlan) -> (Option<Share>, Optio
     (unresolved_conditions, unclassified)
 }
 
+/// What the night measured and refreshed beside its legs, for the record.
+struct NightReadings {
+    unresolved_conditions: Option<Share>,
+    unclassified: Option<Share>,
+    splits: Option<TableRefresh>,
+    boundaries: Option<TableRefresh>,
+}
+
+/// How far back the boundary refresh asks Alpaca, which is the window the trainer refreshed.
+const BOUNDARY_REFRESH_DAYS: i64 = 365;
+
+/// Refreshes the splits table from Massive and the series boundaries from Alpaca.
+///
+/// Each is recorded rather than failing the night: a stale table is a night old, and a fold thrown
+/// away because a reference request failed is worse.
+async fn refresh_corporate_actions(today: SessionDate) -> (TableRefresh, TableRefresh) {
+    let bucket = match bucket_name() {
+        Ok(bucket) => bucket,
+        Err(error) => {
+            let failed = TableRefresh::Failed(error.to_string());
+            return (failed.clone(), failed);
+        }
+    };
+    let s3_client = fund::common::aws::s3_client().await;
+    let now = Utc::now();
+    // `archive_splits` answers `Ok(0)` when Massive returned nothing and the stored table was kept,
+    // which is a table left stale rather than a refresh.
+    let splits = TableRefresh::of(match MassiveClient::from_env() {
+        Ok(massive) => match archive::archive_splits(&s3_client, &massive, &bucket, now).await {
+            Ok(0) => Err("Massive returned no splits; the stored table was kept".to_string()),
+            other => other.map_err(|error| error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    });
+    let boundaries = TableRefresh::of(match market_data_client().await {
+        Ok(market_data) => archive::archive_boundaries(
+            &s3_client,
+            &market_data,
+            &bucket,
+            today.plus_calendar_days(-BOUNDARY_REFRESH_DAYS),
+            today,
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    });
+    info!(
+        ?splits,
+        ?boundaries,
+        "Refreshed the corporate-action tables"
+    );
+    (splits, boundaries)
+}
+
 /// Writes the night into the archiver's journal, if it has one.
 ///
 /// A missing journal is logged and stepped over rather than failing the run. The fold is the work
@@ -1870,8 +1897,7 @@ async fn measure_the_night(plan: &nightly::NightlyPlan) -> (Option<Share>, Optio
 /// fold because the account could not be filed is worse.
 async fn record_the_fold(
     report: &NightlyReport,
-    unresolved_conditions: Option<Share>,
-    unclassified: Option<Share>,
+    readings: NightReadings,
     conditions_check: Option<ReferenceCheck>,
     classification_check: Option<ReferenceCheck>,
     views_check: Option<ViewCheck>,
@@ -1898,8 +1924,10 @@ async fn record_the_fold(
         views_check,
         industry_codes,
         repairs: report.repairs().to_vec(),
-        unresolved_conditions,
-        unclassified,
+        unresolved_conditions: readings.unresolved_conditions,
+        unclassified: readings.unclassified,
+        splits: readings.splits,
+        boundaries: readings.boundaries,
     });
     journal
         .record(uuid::Uuid::new_v4(), Utc::now(), observation)

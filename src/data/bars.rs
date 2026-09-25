@@ -28,9 +28,9 @@ const INSERT_CHUNK_ROWS: usize = 1_000;
 /// 70 sessions, so this is deliberately wider than either needs.
 pub const HISTORY_LOOKBACK_DAYS: i64 = 120;
 
-/// The bar frame both loaders produce and [`crate::models::tide::predict::consolidate_data`] reads.
+/// The bar frame both loaders produce and [`crate::laboratory::frame::prepare_bars`] reads.
 ///
-/// Stated here rather than in the trainer, where the PostgreSQL loader satisfying it could not see
+/// Stated here rather than beside a reader, where the PostgreSQL loader satisfying it could not see
 /// it, so the two readers are held to one shape.
 pub const BAR_FRAME_COLUMNS: [(&str, DataType); 8] = [
     ("ticker", DataType::String),
@@ -192,9 +192,8 @@ pub async fn store_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, BarsEr
 
 /// Builds the canonical bar frame.
 ///
-/// This column set and order is the contract between the trainer's S3 dataset and the application's
-/// inference input. `timestamp` is Unix milliseconds because that is what the feature engineering
-/// in [`crate::models::tide::data`] expects.
+/// This column set and order is the contract between the S3 archive and the application's frame.
+/// `timestamp` is Unix milliseconds because that is what [`crate::laboratory::frame`] expects.
 pub fn bars_to_dataframe(bars: &[EquityBar]) -> Result<DataFrame, PolarsError> {
     let mut tickers: Vec<String> = Vec::with_capacity(bars.len());
     let mut intervals: Vec<String> = Vec::with_capacity(bars.len());

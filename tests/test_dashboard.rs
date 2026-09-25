@@ -28,14 +28,8 @@ fn decimal(value: &str) -> Decimal {
 }
 
 fn entry(long: &str, short: &str) -> PairEntry {
-    PairEntry::new(
-        PairID::new(ticker(long), ticker(short)),
-        1.05,
-        2.4,
-        0.03,
-        Some("run-dashboard".to_string()),
-    )
-    .expect("test entry must be valid")
+    PairEntry::new(PairID::new(ticker(long), ticker(short)), 1.05, 2.4, 0.03)
+        .expect("test entry must be valid")
 }
 
 async fn fresh_pool() -> PgPool {
@@ -80,9 +74,7 @@ async fn test_every_query_runs_against_an_empty_database() {
     assert!(data.account_snapshot_history.is_empty());
     assert!(data.open_pairs.is_empty());
     assert!(data.closed_pairs.is_empty());
-    assert!(data.predictions.is_empty());
     assert!(data.recent_events.is_empty());
-    assert_eq!(data.prediction_model_run_id, None);
     // `MAX(...)` over no rows is a single NULL row, not an empty result. A query written to expect
     // no rows would fail here rather than on the empty page it was tested on.
     assert_eq!(data.latest_bars_inserted_at, None);
@@ -121,13 +113,6 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
     store_equity(&pool, SessionDate::at(now), "1010000").await;
 
     common::seed_bar(&pool, "AAPL", SessionDate::at(now), 190.0).await;
-    common::seed_predictions(
-        &pool,
-        "run-dashboard",
-        &[("AAPL", 0.01), ("MSFT", -0.004)],
-        now,
-    )
-    .await;
 
     events::emit(
         &pool,
@@ -165,14 +150,6 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
     assert_eq!(data.account_snapshot_history[1].equity, decimal("1010000"));
     assert_eq!(data.period_returns.one_day, Some(1.0));
 
-    assert_eq!(data.predictions.len(), 2);
-    // Ranked by median prediction, so the positive one leads.
-    assert_eq!(data.predictions[0].ticker.as_str(), "AAPL");
-    assert_eq!(
-        data.prediction_model_run_id.as_deref(),
-        Some("run-dashboard")
-    );
-
     assert!(data.latest_bars_inserted_at.is_some());
     assert_eq!(data.recent_events.len(), 1);
     assert_eq!(
@@ -180,31 +157,6 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
         EventType::new(Command::PortfolioEvaluation, Outcome::Completed)
     );
     assert_eq!(data.recent_events[0].payload["pairs_opened"], json!(1));
-}
-
-/// The prediction query selects one batch by its shared `correlation_id`, so a second run must
-/// replace the first on the page rather than interleave with it.
-#[tokio::test]
-#[serial]
-async fn test_only_the_most_recent_prediction_batch_is_shown() {
-    let pool = fresh_pool().await;
-    let now = Utc::now();
-
-    common::seed_predictions(
-        &pool,
-        "run-yesterday",
-        &[("AAPL", 0.02), ("MSFT", 0.01), ("GOOG", 0.005)],
-        now - Duration::days(1),
-    )
-    .await;
-    common::seed_predictions(&pool, "run-today", &[("AAPL", 0.03), ("MSFT", 0.02)], now).await;
-
-    let data = fetch_dashboard_data(&pool)
-        .await
-        .expect("the prediction query must run");
-
-    assert_eq!(data.predictions.len(), 2, "expected only today's batch");
-    assert_eq!(data.prediction_model_run_id.as_deref(), Some("run-today"));
 }
 
 /// A closed pair with no attributed profit and loss is still a close. The query filters on

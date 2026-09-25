@@ -11,7 +11,7 @@
 --            the long-term record of equity bars and ticker metadata; it
 --            accumulates for as long as the bucket keeps it.
 --   exports/ the application's nightly export of the tables only it knows
---            about -- events, predictions, pairs, account state -- plus the
+--            about -- events, pairs, account state -- plus the
 --            journal, which is the original those tables are derived from.
 --            This is what the retention window would otherwise discard.
 --
@@ -230,22 +230,15 @@ ORDER BY as_of, granularity;
 -- under data/, from the same Massive endpoint, and the trainer's archive is now their single
 -- owner -- query `training_bars` and `training_reference` above for them.
 
-.print 'Loading equity_predictions...'
-DROP VIEW IF EXISTS equity_predictions;
-CREATE OR REPLACE VIEW equity_predictions AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('records_bucket') || '/exports/equity/predictions/**/*.parquet',
-    hive_partitioning = true
-);
-
 .print 'Loading equity_pairs...'
 DROP VIEW IF EXISTS equity_pairs;
 CREATE OR REPLACE VIEW equity_pairs AS
 SELECT *
 FROM read_parquet(
     's3://' || getvariable('records_bucket') || '/exports/equity/pairs/**/*.parquet',
-    hive_partitioning = true
+    hive_partitioning = true,
+    -- Exports before the TiDE deletion carry model_run_id and later ones do not.
+    union_by_name = true
 );
 
 .print 'Loading account_snapshots...'
@@ -295,7 +288,9 @@ FROM read_parquet(
 -- prices it read, the orders it sent, the fills they produced. Joining on it is how a duration
 -- becomes an answer about where the time went.
 --
--- schema_version is 3 through 6; v1 and v2 were development and their objects are gone. Four
+-- schema_version is 3 through 7; v1 and v2 were development and their objects are gone. v7 removed
+-- predictions_generated and universe_screened with TiDE, and pass_evaluated.predictions_available,
+-- eligible_tickers and model_run_id and pair_opened.model_run_id with them; nothing replaced them. Four
 -- payload fields have changed shape, so a query reaching into any of them must branch on the
 -- version:
 --

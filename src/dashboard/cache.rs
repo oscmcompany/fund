@@ -87,15 +87,6 @@ impl ClosedPair {
     }
 }
 
-/// One ticker's quantile prediction from the most recent batch.
-#[derive(Debug, Clone)]
-pub struct Prediction {
-    pub ticker: Ticker,
-    pub quantile_10: f64,
-    pub quantile_50: f64,
-    pub quantile_90: f64,
-}
-
 /// A row from the event log, or a live arrival from the NOTIFY channel.
 ///
 /// `created_at` is the row's own column when seeded from the table, and the moment the listener
@@ -148,9 +139,6 @@ pub struct DashboardState {
     pub open_pairs: Vec<OpenPair>,
     pub closed_pairs: Vec<ClosedPair>,
     pub closed_summary: ClosedSummary,
-    pub predictions: Vec<Prediction>,
-    pub prediction_model_run_id: Option<String>,
-    pub prediction_timestamp: Option<DateTime<Utc>>,
     pub events: VecDeque<EventEntry>,
     pub latest_bars_inserted_at: Option<DateTime<Utc>>,
     pub last_updated: Option<DateTime<Utc>>,
@@ -171,9 +159,6 @@ pub async fn apply_poll(state: &SharedState, data: crate::dashboard::database::D
     guard.open_pairs = data.open_pairs;
     guard.closed_pairs = data.closed_pairs;
     guard.closed_summary = data.closed_summary;
-    guard.predictions = data.predictions;
-    guard.prediction_model_run_id = data.prediction_model_run_id;
-    guard.prediction_timestamp = data.prediction_timestamp;
     guard.latest_bars_inserted_at = data.latest_bars_inserted_at;
     guard.last_updated = Some(Utc::now());
     guard.last_error = None;
@@ -338,7 +323,7 @@ mod tests {
             append_event(
                 &state,
                 EventEntry {
-                    event_type: EventType::new(Command::Predictions, Outcome::Completed),
+                    event_type: EventType::new(Command::AccountSync, Outcome::Completed),
                     created_at: Utc::now(),
                     payload: serde_json::json!({ "index": index }),
                 },

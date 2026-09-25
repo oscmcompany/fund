@@ -9,7 +9,7 @@ use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::Serialize;
 
 use crate::common::types::CloseReason;
-use crate::models::tide::TideError;
+use crate::laboratory::frame::FrameError;
 use crate::portfolio::evaluate::exit_reason;
 use crate::portfolio::screen::{
     admits_correlation, admits_entry_z_score, logarithmic_returns, pearson_correlation,
@@ -29,13 +29,13 @@ pub struct Closes {
 
 impl Closes {
     /// Reads `ticker`, `timestamp` and `close_price` into one series per name.
-    pub fn from_frame(frame: &DataFrame) -> Result<Self, TideError> {
+    pub fn from_frame(frame: &DataFrame) -> Result<Self, FrameError> {
         let tickers = frame.column("ticker")?.str()?;
         let timestamps = frame.column("timestamp")?.i64()?;
         let closes = frame.column("close_price")?.cast(&DataType::Float64)?;
         let closes = closes.f64()?;
         if tickers.null_count() > 0 || timestamps.null_count() > 0 {
-            return Err(TideError::Data(
+            return Err(FrameError::Data(
                 "closes need every row to name its ticker and its session".to_string(),
             ));
         }

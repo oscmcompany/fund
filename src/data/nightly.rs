@@ -452,6 +452,25 @@ impl ViewCheck {
     }
 }
 
+/// What refreshing one whole-table dataset did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum TableRefresh {
+    Refreshed {
+        rows: usize,
+    },
+    /// The table was left as it was; the error is the vendor's or the bucket's.
+    Failed(String),
+}
+
+impl TableRefresh {
+    pub fn of<E: std::fmt::Display>(result: Result<usize, E>) -> Self {
+        match result {
+            Ok(rows) => TableRefresh::Refreshed { rows },
+            Err(error) => TableRefresh::Failed(error.to_string()),
+        }
+    }
+}
+
 /// A count and the population it was taken over, so a rate carries its denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Share {
@@ -533,6 +552,8 @@ pub struct NightlyReport {
     /// Set only by a trades leg that ran, because folding no tape is not folding under no rules.
     conditions_as_of: Option<chrono::NaiveDate>,
     repairs: Vec<Repair>,
+    /// The splits and boundary refreshes, or `None` where the budget ran out before them.
+    corporate_actions: Option<(TableRefresh, TableRefresh)>,
 }
 
 impl NightlyReport {
@@ -546,7 +567,18 @@ impl NightlyReport {
             reference: None,
             conditions_as_of: None,
             repairs: Vec::new(),
+            corporate_actions: None,
         }
+    }
+
+    /// Records what the splits and boundary refreshes did.
+    pub fn record_corporate_actions(&mut self, splits: TableRefresh, boundaries: TableRefresh) {
+        self.corporate_actions = Some((splits, boundaries));
+    }
+
+    /// The splits and boundary refreshes, or `None` if they never ran.
+    pub fn corporate_actions(&self) -> Option<&(TableRefresh, TableRefresh)> {
+        self.corporate_actions.as_ref()
     }
 
     /// Records one partition the run rewrote and what was wrong with it.
@@ -638,8 +670,17 @@ impl NightlyReport {
             self.reference,
             Some(ReferenceOutcome::Swept { ref unwritten, .. }) if unwritten.is_empty()
         );
+        // A stale table fails the night the way a failed leg does, or it goes unnoticed for weeks.
+        let refreshed = matches!(
+            self.corporate_actions,
+            Some((
+                TableRefresh::Refreshed { .. },
+                TableRefresh::Refreshed { .. }
+            ))
+        );
         Leg::ALL.iter().all(|leg| recorded.contains(leg))
             && swept
+            && refreshed
             && self.failed().is_empty()
             && self.skipped().is_empty()
             && self.incomplete().is_empty()
@@ -767,6 +808,18 @@ mod tests {
 
     fn session(text: &str) -> SessionDate {
         SessionDate::from_date(chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("a date"))
+    }
+
+    #[test]
+    fn test_a_table_refresh_keeps_the_row_count_or_the_error() {
+        assert_eq!(
+            TableRefresh::of::<String>(Ok(12)),
+            TableRefresh::Refreshed { rows: 12 }
+        );
+        assert_eq!(
+            TableRefresh::of(Err("throttled")),
+            TableRefresh::Failed("throttled".to_string())
+        );
     }
 
     #[test]
@@ -1244,6 +1297,19 @@ mod report_tests {
             );
         }
         report.record_reference(swept());
+        assert!(
+            !report.is_complete(),
+            "a night that never refreshed its tables is not complete"
+        );
+        report.record_corporate_actions(
+            TableRefresh::Refreshed { rows: 3_120 },
+            TableRefresh::Failed("throttled".to_string()),
+        );
+        assert!(!report.is_complete(), "a failed refresh fails the night");
+        report.record_corporate_actions(
+            TableRefresh::Refreshed { rows: 3_120 },
+            TableRefresh::Refreshed { rows: 41 },
+        );
         assert!(report.is_complete());
         assert_eq!(report.written(), 0);
         assert_eq!(

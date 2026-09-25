@@ -8,14 +8,11 @@ use tracing::{debug, warn};
 
 /// A unit of work the service can be asked to perform.
 ///
-/// Five arrive from pg_cron on a schedule; [`Command::DatabaseExport`] is chained by the service
+/// Four arrive from pg_cron on a schedule; [`Command::DatabaseExport`] is chained by the service
 /// itself when the market data sync completes, so the export can never run against a half-synced
 /// database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
-    /// Pre-open: resolve the newest model artifact, run inference, write predictions, warm the
-    /// calendar and universe caches.
-    Predictions,
     /// Every five minutes through the session: price the book, close what should close, open into
     /// vacant slots if conditions allow.
     PortfolioEvaluation,
@@ -59,8 +56,7 @@ pub enum Recovery {
 
 impl Command {
     /// Every variant, for exhaustive iteration in tests and in the recovery scan.
-    pub const ALL: [Command; 6] = [
-        Command::Predictions,
+    pub const ALL: [Command; 5] = [
         Command::PortfolioEvaluation,
         Command::PortfolioLiquidation,
         Command::AccountSync,
@@ -71,7 +67,6 @@ impl Command {
     /// The command's stable name, used as the prefix of every event type it appears in.
     pub fn as_str(self) -> &'static str {
         match self {
-            Command::Predictions => "predictions",
             Command::PortfolioEvaluation => "portfolio_evaluation",
             Command::PortfolioLiquidation => "portfolio_liquidation",
             Command::AccountSync => "account_sync",
@@ -90,8 +85,7 @@ impl Command {
     pub fn recovery(self) -> Recovery {
         match self {
             Command::PortfolioEvaluation => Recovery::Skip,
-            Command::Predictions
-            | Command::PortfolioLiquidation
+            Command::PortfolioLiquidation
             | Command::AccountSync
             | Command::MarketDataSync
             | Command::DatabaseExport => Recovery::Replay,
@@ -148,9 +142,6 @@ impl EventType {
     /// in the schema is greppable in this file.
     pub fn as_str(self) -> &'static str {
         match (self.command, self.outcome) {
-            (Command::Predictions, Outcome::Requested) => "predictions_requested",
-            (Command::Predictions, Outcome::Completed) => "predictions_completed",
-            (Command::Predictions, Outcome::Errored) => "predictions_errored",
             (Command::PortfolioEvaluation, Outcome::Requested) => "portfolio_evaluation_requested",
             (Command::PortfolioEvaluation, Outcome::Completed) => "portfolio_evaluation_completed",
             (Command::PortfolioEvaluation, Outcome::Errored) => "portfolio_evaluation_errored",
@@ -382,7 +373,7 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "wire names must be unique");
-        assert_eq!(names.len(), 18, "six commands times three outcomes");
+        assert_eq!(names.len(), 15, "five commands times three outcomes");
     }
 
     /// The wire name must be exactly the command prefix and outcome suffix joined by an underscore.
@@ -406,7 +397,7 @@ mod tests {
     #[test]
     fn test_parse_rejects_unknown_names() {
         assert!(EventType::parse("trading_session_started").is_none());
-        assert!(EventType::parse("predictions_started").is_none());
+        assert!(EventType::parse("predictions_requested").is_none());
         assert!(EventType::parse("").is_none());
     }
 
@@ -427,14 +418,14 @@ mod tests {
 
     #[test]
     fn test_notification_parses_trigger_payload() {
-        let raw = r#"{"event_id":42,"event_type":"predictions_requested","payload":{"reason":"pre_open"}}"#;
+        let raw = r#"{"event_id":42,"event_type":"account_sync_requested","payload":{"reason":"post_close"}}"#;
         let notification = Notification::parse(raw).expect("well-formed payload must parse");
         assert_eq!(notification.event_id, 42);
         assert_eq!(
             notification.event_type,
-            EventType::new(Command::Predictions, Outcome::Requested)
+            EventType::new(Command::AccountSync, Outcome::Requested)
         );
-        assert_eq!(notification.payload["reason"], "pre_open");
+        assert_eq!(notification.payload["reason"], "post_close");
     }
 
     #[test]
@@ -462,7 +453,7 @@ mod tests {
     fn test_notification_rejects_malformed_input() {
         assert!(Notification::parse("not json").is_none());
         assert!(Notification::parse(r#"{"event_id":1}"#).is_none());
-        assert!(Notification::parse(r#"{"event_type":"predictions_requested"}"#).is_none());
+        assert!(Notification::parse(r#"{"event_type":"account_sync_requested"}"#).is_none());
         assert!(
             Notification::parse(r#"{"event_id":1,"event_type":"legacy_thing_requested"}"#)
                 .is_none()

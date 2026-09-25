@@ -44,42 +44,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_interval_timestamp -- noqa: PG01
     ON equity_bars (bar_interval, timestamp DESC);
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
--- equity_details: ticker metadata used to constrain pair selection to cross-sector matches.
---
--- Seeded from the archive's reference dataset via seed_equity_details; refreshed by the post-close
--- market data sync.
---
--- Both columns hold a Fama-French bucket short name -- sector one of twelve, industry one of
--- forty-nine -- looked up from the whole four-digit SIC code, never sliced from it. The default
--- spells the absence of a SIC code rather than naming a group, and 'Other' is a real bucket that
--- must not be confused with it; src/data/classification.rs is the only thing that reads either back.
-CREATE TABLE IF NOT EXISTS equity_details (
-    ticker    TEXT NOT NULL PRIMARY KEY,
-    sector    TEXT NOT NULL DEFAULT 'NOT AVAILABLE',
-    industry  TEXT NOT NULL DEFAULT 'NOT AVAILABLE'
-);
-
--- equity_predictions: TiDE quantile output, one row per ticker per prediction batch.
---
--- Written by the pre-open predictions handler and read by the entry screen for the rest of the
--- session. Identity is (ticker, timestamp); a batch is identified by its shared correlation_id.
-CREATE TABLE IF NOT EXISTS equity_predictions (
-    correlation_id  UUID             NOT NULL,
-    model_run_id    TEXT             NOT NULL,
-    ticker          TEXT             NOT NULL,
-    timestamp       TIMESTAMPTZ      NOT NULL,
-    quantile_10     DOUBLE PRECISION NOT NULL,
-    quantile_50     DOUBLE PRECISION NOT NULL,
-    quantile_90     DOUBLE PRECISION NOT NULL,
-    created_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    PRIMARY KEY (ticker, timestamp)
-);
-
-SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
--- Retention is the nightly purge handler's job, not TimescaleDB's: rows must reach S3 via the
--- export before they are dropped, and only the handler knows whether that happened.
-SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
-
 -- equity_pairs: the long/short leg mapping, plus the signal that justified the entry.
 --
 -- This is the application's own record and deliberately not a position ledger -- Alpaca holds the
@@ -102,7 +66,6 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     hedge_ratio               DOUBLE PRECISION NOT NULL,
     entry_z_score             DOUBLE PRECISION NOT NULL,
     signal_strength           DOUBLE PRECISION NOT NULL,
-    model_run_id              TEXT,
     status                    TEXT        NOT NULL CHECK (status IN ('open', 'closed')),
     opened_at                 TIMESTAMPTZ NOT NULL,
     closed_at                 TIMESTAMPTZ,
@@ -176,7 +139,7 @@ CREATE INDEX IF NOT EXISTS idx_account_activities_ticker_time -- noqa: PG01
 -- events: append-only record of every command issued and every outcome reached.
 --
 -- Completed payloads carry the summary of what happened -- pairs opened and closed with their exit
--- reasons, rows synced, the artifact the predictions ran against and its age. That is what makes
+-- reasons, rows synced. That is what makes
 -- the nightly parquet export of this table worth reading afterwards.
 --
 -- This table is also the restart recovery mechanism. On startup the service scans for today's
@@ -192,7 +155,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 SELECT create_hypertable('events', by_range('created_at'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_events_type_id ON events (event_type, id); -- noqa: PG01
--- As with predictions: the purge handler drops these once the export has written them to S3.
+-- The purge handler drops these once the export has written them to S3.
 SELECT remove_retention_policy('events', if_exists => TRUE);
 
 -- notify_event: fires pg_notify on the 'events' channel after each insert.
@@ -263,21 +226,13 @@ $$ LANGUAGE plpgsql;
 -- still lands inside it. The only hard bound is that a gate must not also match the firing an hour
 -- later, so anything under 60 minutes is safe.
 --
--- Pre-open predictions: weekdays at 09:00 Eastern, 30 minutes ahead of a regular open so
--- predictions are ready for the first evaluation pass. The handler resolves the newest model
--- artifact, runs inference, writes equity_predictions, and warms the calendar and universe caches.
+-- The pre-open predictions job ran TiDE inference, which is deleted. Unscheduled here so a database
+-- that still carries the job stops emitting an event nothing handles.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'predictions-requested') THEN
         PERFORM cron.unschedule('predictions-requested');
     END IF;
-    PERFORM cron.schedule(
-        'predictions-requested',
-        '0 13,14 * * 1-5',
-        $$SELECT emit_event('predictions_requested', '{"reason": "pre_open"}'::jsonb)
-          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:00'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:20'$$
-    );
 END;
 $do$;
 

@@ -16,21 +16,16 @@ use crate::common::alpaca::{
     TradingClient,
 };
 use crate::common::journal::{
-    CandidateDecision, CandidateReading, CloseRequestReason, ExcludedTickerReading,
-    ExclusionReason, Journal, LiquidationAttempted, Observation, OpenPairReading,
-    OpenPairsObserved, PairClosed, PairDecision, PairOpened, PassEvaluated, PlanDecided, PlanPhase,
-    PlannedAction, PlannedActionKind, PlannedReason, PositionCloseRequested, PricePurpose,
-    PriceReading, PricesObserved, ScreenInputReading, UnavailableCause, UnavailablePrice,
-    UniverseScreened,
+    CandidateDecision, CandidateReading, CloseRequestReason, Journal, LiquidationAttempted,
+    Observation, OpenPairReading, OpenPairsObserved, PairClosed, PairDecision, PairOpened,
+    PassEvaluated, PlanDecided, PlanPhase, PlannedAction, PlannedActionKind, PlannedReason,
+    PositionCloseRequested, PricePurpose, PriceReading, PricesObserved, UnavailableCause,
+    UnavailablePrice,
 };
-use crate::common::types::{
-    CloseReason, EquityPrediction, EquityQuote, PairID, SessionDate, Ticker,
-};
+use crate::common::types::{CloseReason, EquityQuote, PairID, SessionDate, Ticker};
 use crate::data::calendar::TradingCalendar;
 use crate::data::classification_table::Sector;
-use crate::data::details::{self, DetailsError};
 use crate::data::universe::Universe;
-use crate::models::tide::predict;
 use crate::portfolio::account::{self, AccountError};
 use crate::portfolio::execute::{
     self, ExecutionContext, ExecutionError, ExecutionSettings, OpenOutcome,
@@ -39,7 +34,6 @@ use crate::portfolio::pairs::{self, OpenPair, PairsError};
 use crate::portfolio::risk::{RiskBlock, RiskGate};
 use crate::portfolio::screen::{
     self, ExitModelFailure, ScreenInput, SpreadModel, CONVERGENCE_Z_SCORE,
-    CORRELATION_WINDOW_SESSIONS,
 };
 use crate::portfolio::size::{self, SizedPair, SizingParameters};
 
@@ -59,10 +53,6 @@ pub enum EvaluationError {
     Account(#[from] AccountError),
     #[error("order execution failed: {0}")]
     Execution(#[from] ExecutionError),
-    #[error("sector metadata is unreadable: {0}")]
-    Details(#[from] DetailsError),
-    #[error("prediction access failed: {0}")]
-    Predictions(#[from] sqlx::Error),
 }
 
 /// Everything a pass needs that it does not compute itself.
@@ -151,7 +141,6 @@ pub struct AccountReading {
     pub previous_equity: Option<Decimal>,
     pub minutes_until_close: Option<i64>,
     pub remaining_open: usize,
-    pub model_run_id: Option<String>,
 }
 
 /// Whether the entry round runs at all.
@@ -174,7 +163,6 @@ pub struct CandidatesReading {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedOpen {
     pub pair: SizedPair,
-    pub model_run_id: Option<String>,
 }
 
 /// What the entry round resolved to do, and every candidate it weighed to get there.
@@ -229,12 +217,6 @@ pub struct EvaluationSummary {
     pub entries_blocked: Option<String>,
     /// Why individual candidates were refused, if any were.
     pub entries_refused: Vec<String>,
-    /// The model run the session's predictions came from.
-    ///
-    /// Recorded on the pass rather than only on the pair, so a session that opened nothing still
-    /// says which model it was deciding with. That is the difference between "the model saw no
-    /// opportunity" and "the model was yesterday's".
-    pub model_run_id: Option<String>,
     /// Approved pairs the pass declined to open because shutdown was requested mid-entry.
     ///
     /// Distinct from `entries_refused`, which is the risk gate turning a pair down on its merits.
@@ -369,7 +351,6 @@ async fn evaluate_pass(
     }
 
     let open_pairs = exit_reading.open_pairs;
-    let mut prices = exit_reading.prices;
     let held: HashSet<Ticker> = open_pairs
         .iter()
         .filter(|pair| !exits.closed.contains(&pair.id()))
@@ -388,8 +369,6 @@ async fn evaluate_pass(
     observation.drawdown = gate.drawdown();
     observation.minutes_until_close = account_reading.minutes_until_close;
     observation.vacant_slots = Some(gate.vacant_slots());
-    summary.model_run_id = account_reading.model_run_id.clone();
-    observation.model_run_id = summary.model_run_id.clone();
 
     match admission {
         Admission::Blocked(block) => {
@@ -402,9 +381,7 @@ async fn evaluate_pass(
         Admission::Open => {}
     }
 
-    let candidates_reading = observe_candidates(context, correlation_id, held, &mut prices).await?;
-    observation.predictions_available = candidates_reading.screened.predictions_available;
-    observation.eligible_tickers = candidates_reading.screened.eligible;
+    let candidates_reading = observe_candidates(held);
 
     let entry_plan = decide_entries(
         &account_reading,
@@ -679,12 +656,6 @@ async fn fetch_prices(
 }
 
 /// Reads the account, its drawdown baseline, and the clock the gate judges against.
-///
-/// The model run identifier is read here, before the gate, not after. A pass blocked by drawdown,
-/// capacity, or the hold window is the most common way a session opens nothing, and those are
-/// exactly the rows where "which model was deciding" matters — the difference between the model
-/// seeing no opportunity and the model being three days old. One row rather than seven thousand, so
-/// a blocked pass still does not pay for the screen.
 async fn observe_account(
     context: &EvaluationContext<'_>,
     remaining_open: usize,
@@ -694,7 +665,6 @@ async fn observe_account(
         previous_equity: previous_session_equity(context).await?,
         minutes_until_close: context.calendar.minutes_until_close(context.now),
         remaining_open,
-        model_run_id: current_model_run_id(context).await?,
     })
 }
 
@@ -723,14 +693,14 @@ pub fn decide_admission(
 }
 
 /// Builds the screen's inputs, priced and filtered, applying no judgment about which to take.
-async fn observe_candidates(
-    context: &EvaluationContext<'_>,
-    correlation_id: uuid::Uuid,
-    held: HashSet<Ticker>,
-    prices: &mut HashMap<Ticker, CheckedPrice>,
-) -> Result<CandidatesReading, EvaluationError> {
-    let screened = build_screen_inputs(context, correlation_id, &held, prices).await?;
-    Ok(CandidatesReading { screened, held })
+fn observe_candidates(held: HashSet<Ticker>) -> CandidatesReading {
+    // TiDE was the only source of an expected return and it measured no signal, so nothing feeds
+    // the screen until an accepted claim does; the scoring, selection and sizing below stand ready.
+    info!("No accepted signal; no entries will be screened");
+    CandidatesReading {
+        screened: ScreenedUniverse::default(),
+        held,
+    }
 }
 
 /// Scores, selects, sizes, and admits. Pure, and the round's whole decision.
@@ -815,10 +785,7 @@ pub fn decide_entries(
 
     plan.opens = approved
         .into_iter()
-        .map(|pair| PlannedOpen {
-            pair,
-            model_run_id: reading.screened.model_run_id.clone(),
-        })
+        .map(|pair| PlannedOpen { pair })
         .collect();
     // Approved, not yet attempted. Without this an approved pair still reads `not_selected` on the
     // path where applying fails, contradicting the plan record written moments earlier.
@@ -870,7 +837,7 @@ async fn apply_entries(
             break;
         }
 
-        let opened = match execute::open_pair(execution, pair, planned.model_run_id.clone()).await {
+        let opened = match execute::open_pair(execution, pair).await {
             Ok(opened) => opened,
             Err(error) => return (outcome, Some(error.into())),
         };
@@ -917,7 +884,6 @@ async fn apply_entries(
                             hedge_ratio: entry.hedge_ratio(),
                             entry_z_score: entry.entry_z_score(),
                             signal_strength: entry.signal_strength(),
-                            model_run_id: entry.model_run_id().map(str::to_string),
                             opened_at: context.now,
                             long_decision_price: pair.candidate().long_price(),
                             short_decision_price: pair.candidate().short_price(),
@@ -1258,28 +1224,6 @@ async fn apply_exits(
     (outcome, None)
 }
 
-/// The model run behind the current session's predictions, without loading them.
-///
-/// One row rather than seven thousand, so this is cheap enough to run before the risk gate on every
-/// pass. See the call site for why it belongs there.
-async fn current_model_run_id(
-    context: &EvaluationContext<'_>,
-) -> Result<Option<String>, EvaluationError> {
-    let (start, end) = SessionDate::at(context.now).bounds();
-    let row = sqlx::query!(
-        r#"SELECT model_run_id AS "model_run_id!"
-           FROM equity_predictions
-           WHERE timestamp >= $1 AND timestamp < $2
-           ORDER BY timestamp DESC
-           LIMIT 1"#,
-        start,
-        end,
-    )
-    .fetch_optional(context.pool)
-    .await?;
-    Ok(row.map(|row| row.model_run_id))
-}
-
 /// The equity recorded for the previous trading day, if any.
 async fn previous_session_equity(
     context: &EvaluationContext<'_>,
@@ -1291,182 +1235,19 @@ async fn previous_session_equity(
     Ok(account::load_equity_for(context.pool, previous).await?)
 }
 
-/// The screen's inputs, and the model run they came from.
+/// The screen's inputs.
+#[derive(Default)]
 pub struct ScreenedUniverse {
     pub inputs: Vec<ScreenInput>,
-    /// Predictions that passed the eligibility filter, before pricing removed any.
-    pub eligible: usize,
-    pub model_run_id: Option<String>,
-    /// Predictions the session had before any eligibility test, for the journal. The gap
-    /// between this and `inputs.len()` is how much the filters removed.
-    pub predictions_available: usize,
     /// Every ticker's sector, not just the screened ones. `select_disjoint` needs the held legs
     /// too, and those are filtered out of `inputs` before it ever sees them.
-    ///
-    /// A present `None` is a name the feed gave no SIC code, which is still in the universe and
-    /// still tradeable; only an absent key is outside it, and that is what `NoSector` reports.
     pub sectors: HashMap<Ticker, Option<Sector>>,
-}
-
-/// Assembles the screen's inputs, fetching only the prices the exit half did not already have.
-///
-/// Records the funnel — what reached the screen and what each removed ticker failed on — before
-/// returning, so the reading exists whether or not the rest of the pass completes.
-async fn build_screen_inputs(
-    context: &EvaluationContext<'_>,
-    correlation_id: uuid::Uuid,
-    held: &HashSet<Ticker>,
-    prices: &mut HashMap<Ticker, CheckedPrice>,
-) -> Result<ScreenedUniverse, EvaluationError> {
-    let (start, end) = SessionDate::at(context.now).bounds();
-    let predictions = predict::load_predictions_between(context.pool, start, end).await?;
-    if predictions.is_empty() {
-        info!("No predictions for the current session; no entries will be screened");
-        return Ok(ScreenedUniverse {
-            inputs: Vec::new(),
-            eligible: 0,
-            model_run_id: None,
-            predictions_available: 0,
-            sectors: HashMap::new(),
-        });
-    }
-
-    // The newest prediction's run, not the first row's. A re-run leaves a mixed batch, and "whichever
-    // ticker sorted first" is not an answer worth recording.
-    let model_run_id = predictions
-        .iter()
-        .max_by_key(|prediction| prediction.timestamp())
-        .map(|prediction| prediction.model_run_id().to_string());
-
-    let sectors = details::load_sectors(context.pool).await?;
-
-    // Only predictions that can produce a candidate: in the universe, with a sector, with enough
-    // history, and not already on the book. Every test here is a set lookup, because this runs once
-    // per prediction on a pass that runs every five minutes.
-    //
-    // The sector test survives the removal of the different-sector rule, for a new reason. A ticker
-    // whose sector is unknown cannot be counted against `MAXIMUM_LEGS_PER_SECTOR`, so admitting one
-    // would let missing metadata quietly become unbounded concentration. Refusing to *open* what
-    // cannot be measured is the conservative side of that trade; `select_disjoint` still tolerates
-    // an unknown sector on a *held* leg, because a position already on the book cannot be
-    // retroactively declined.
-    // Partitioned rather than filtered, so the tickers that fall out are as recorded as the ones
-    // that stay. The first failing test is the one reported: the order below is the order the
-    // filter applies them in, and a ticker failing two is not two facts.
-    let mut eligible: Vec<&EquityPrediction> = Vec::new();
-    let mut excluded: Vec<ExcludedTickerReading> = Vec::new();
-    for prediction in &predictions {
-        let ticker = prediction.ticker();
-        let reason = if held.contains(ticker) {
-            Some(ExclusionReason::AlreadyHeld)
-        } else if !sectors.contains_key(ticker) {
-            Some(ExclusionReason::NoSector)
-        } else if !context.close_history.contains_key(ticker) {
-            Some(ExclusionReason::NoCloseHistory)
-        } else if !context.universe.contains(ticker) {
-            Some(ExclusionReason::OutsideUniverse)
-        } else {
-            None
-        };
-        match reason {
-            Some(reason) => excluded.push(ExcludedTickerReading {
-                ticker: ticker.clone(),
-                reason,
-                detail: None,
-            }),
-            None => eligible.push(prediction),
-        }
-    }
-
-    let missing: Vec<Ticker> = eligible
-        .iter()
-        .filter(|prediction| !prices.contains_key(prediction.ticker()))
-        .map(|prediction| prediction.ticker().clone())
-        .collect();
-    prices.extend(
-        fetch_prices(
-            context,
-            correlation_id,
-            PricePurpose::ScreenCandidates,
-            &missing,
-        )
-        .await?,
-    );
-
-    let mut inputs: Vec<ScreenInput> = Vec::with_capacity(eligible.len());
-    let mut readings: Vec<ScreenInputReading> = Vec::with_capacity(eligible.len());
-    for prediction in &eligible {
-        let ticker = prediction.ticker();
-        // Eligible and still unpriceable: Alpaca returned no usable quote or trade for it this
-        // pass. That is a fifth way out of the funnel and it belongs with the other four.
-        let (Some(window), Some(reference)) =
-            (context.close_history.get(ticker), prices.get(ticker))
-        else {
-            excluded.push(ExcludedTickerReading {
-                ticker: ticker.clone(),
-                reason: ExclusionReason::Unpriced,
-                detail: None,
-            });
-            continue;
-        };
-        let input = match ScreenInput::new(
-            ticker.clone(),
-            window.clone(),
-            reference.price(),
-            prediction.expected_return(),
-            prediction.confidence(),
-            context.universe.is_shortable(ticker),
-        ) {
-            Ok(input) => input,
-            Err(rejection) => {
-                excluded.push(ExcludedTickerReading {
-                    ticker: ticker.clone(),
-                    reason: rejection.exclusion_reason(),
-                    detail: rejection.detail(),
-                });
-                continue;
-            }
-        };
-        readings.push(ScreenInputReading {
-            ticker: ticker.clone(),
-            expected_return: prediction.expected_return(),
-            confidence: prediction.confidence(),
-            is_shortable: context.universe.is_shortable(ticker),
-        });
-        inputs.push(input);
-    }
-
-    info!(
-        predictions = predictions.len(),
-        eligible = eligible.len(),
-        inputs = inputs.len(),
-        window = CORRELATION_WINDOW_SESSIONS,
-        "Screen inputs assembled"
-    );
-    context
-        .journal
-        .record(
-            correlation_id,
-            context.now,
-            Observation::UniverseScreened(UniverseScreened {
-                inputs: readings,
-                excluded,
-            }),
-        )
-        .await;
-    Ok(ScreenedUniverse {
-        inputs,
-        eligible: eligible.len(),
-        model_run_id,
-        predictions_available: predictions.len(),
-        sectors,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::portfolio::screen::ENTRY_Z_SCORE;
+    use crate::portfolio::screen::{CORRELATION_WINDOW_SESSIONS, ENTRY_Z_SCORE};
 
     /// The live long-leg price the exit fixture reads.
     const FIXTURE_LONG_PRICE: f64 = 100.0;

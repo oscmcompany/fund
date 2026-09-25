@@ -86,11 +86,11 @@ echo ""
 echo "Next steps:"
 echo "  ssh $VM_NAME.exe.xyz"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  start-trainer                         # install training and sync cron jobs"
-  echo "  tail -f /var/log/fund/train-tide-model.log  # follow training log"
+  echo "  start-trainer                         # install the researcher and sync cron jobs"
+  echo "  tail -f /var/log/fund/run-researcher.log    # follow the nightly run"
 else
   echo "  cd ~/fund"
-  echo "  devenv tasks run models:tide:train    # run training manually"
+  echo "  tools/run-researcher                  # run the nightly legs by hand"
 fi
 echo "-----------------"
 echo ""

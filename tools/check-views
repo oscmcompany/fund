@@ -40,7 +40,7 @@ DORMANT=()
 case "${FUND_PROFILE:-}" in
   production)
     # No trader has run in production since 2026-07-14, and no researcher ever has.
-    DORMANT=(equity_predictions equity_pairs account_snapshots account_activities events journal experiments)
+    DORMANT=(equity_pairs account_snapshots account_activities events journal experiments)
     ;;
 esac
 

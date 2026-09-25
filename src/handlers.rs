@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
@@ -18,21 +18,17 @@ use crate::common::aws::Producer;
 use crate::common::events::{self, Command, EventError};
 use crate::common::journal::{
     BarsIngested, CommandFinished, CommandOutcome, DatabaseExported, Journal, JournalError,
-    JournalExported, LogsExported, Observation, PredictionReading, PredictionsGenerated,
-    SkipReason,
+    JournalExported, LogsExported, Observation, SkipReason,
 };
 use crate::common::massive::MassiveClient;
 use crate::common::types::{BarInterval, SessionDate};
 use crate::data::adjust::{SplitTable, SplitTableCache};
-use crate::data::archive;
-use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
-use crate::data::calendar::{CalendarCache, TradingCalendar};
-use crate::data::details;
+use crate::data::bars::{self, CloseHistoryCache};
+use crate::data::calendar::CalendarCache;
 use crate::data::export;
 use crate::data::purge;
 use crate::data::truncate::{BoundaryTable, BoundaryTableCache};
 use crate::data::universe::{UniverseCache, UniverseError, LIVE_SCREEN};
-use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
 use crate::portfolio::evaluate::{self, EvaluationContext};
 use crate::portfolio::execute::ExecutionSettings;
@@ -62,19 +58,10 @@ pub enum HandlerError {
     Account(#[from] account::AccountError),
     #[error("bar sync failed: {0}")]
     Bars(#[from] bars::BarsError),
-    #[error("detail sync failed: {0}")]
-    Details(#[from] details::DetailsError),
-    #[error("model artifact could not be resolved or loaded: {0}")]
-    Artifact(#[from] artifact::ArtifactError),
     #[error("tradable universe could not be built: {0}")]
     Universe(#[from] UniverseError),
     #[error("the corporate-actions archive could not be read: {0}")]
     Archive(#[from] crate::data::archive::ArchiveError),
-    #[error("prediction pipeline failed at {stage}: {message}")]
-    Prediction {
-        stage: &'static str,
-        message: String,
-    },
     #[error("journal is unusable: {0}")]
     Journal(#[from] JournalError),
     #[error("configuration is missing or unusable: {0}")]
@@ -95,10 +82,6 @@ pub struct ServiceState {
     massive: MassiveClient,
     s3_client: aws_sdk_s3::Client,
     records_bucket: String,
-    /// The shared `data/**` archive, which the nightly detail refresh reads its universe from.
-    archive_bucket: String,
-    artifact_prefix: String,
-    model_version: String,
     calendar_cache: CalendarCache,
     universe_cache: UniverseCache,
     close_history_cache: CloseHistoryCache,
@@ -132,11 +115,6 @@ impl ServiceState {
         let records_bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME").map_err(|_| {
             HandlerError::Configuration("AWS_S3_RECORDS_BUCKET_NAME is not set".to_string())
         })?;
-        let archive_bucket = crate::common::aws::archive_bucket()
-            .map_err(|error| HandlerError::Configuration(error.to_string()))?;
-        let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
-            .unwrap_or_else(|_| "models/tide/".to_string());
-        let model_version = std::env::var("MODEL_VERSION").unwrap_or_else(|_| "latest".to_string());
 
         Ok(Self {
             pool,
@@ -147,9 +125,6 @@ impl ServiceState {
             massive,
             s3_client: crate::common::aws::s3_client().await,
             records_bucket,
-            archive_bucket,
-            artifact_prefix,
-            model_version,
             calendar_cache: CalendarCache::new(),
             universe_cache: UniverseCache::new(LIVE_SCREEN),
             close_history_cache: CloseHistoryCache::new(),
@@ -335,223 +310,20 @@ async fn record_command(
 /// Routes a command to its handler.
 ///
 /// Every arm returns a JSON summary that becomes the `_completed` payload, which is what makes the
-/// nightly export of `events` worth reading: one row carrying the pairs opened and closed, the rows
-/// synced, and the model run used is the record of the trading day.
+/// nightly export of `events` worth reading: one row carrying the pairs opened and closed and the
+/// rows synced is the record of the trading day.
 async fn dispatch(
     state: &ServiceState,
     command: Command,
     correlation_id: Uuid,
 ) -> Result<Value, HandlerError> {
     match command {
-        Command::Predictions => handle_predictions(state, correlation_id).await,
         Command::PortfolioEvaluation => handle_portfolio_evaluation(state, correlation_id).await,
         Command::PortfolioLiquidation => handle_portfolio_liquidation(state, correlation_id).await,
         Command::AccountSync => handle_account_sync(state, correlation_id).await,
         Command::MarketDataSync => handle_market_data_sync(state, correlation_id).await,
         Command::DatabaseExport => handle_database_export(state, correlation_id).await,
     }
-}
-
-/// Pre-open: warm the caches, resolve the newest artifact, run inference, write predictions.
-///
-/// The previous session's post-close commands are checked here, and the artifact resolved here,
-/// rather than on schedules of their own — both only matter immediately before a session.
-async fn handle_predictions(
-    state: &ServiceState,
-    correlation_id: Uuid,
-) -> Result<Value, HandlerError> {
-    let now = Utc::now();
-    let today = SessionDate::at(now);
-
-    let calendar = state
-        .calendar_cache
-        .get(&state.trading, &state.journal, correlation_id, now)
-        .await?;
-    if !calendar.is_trading_day(today) {
-        info!(%today, "Not a trading day; predictions skipped");
-        return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
-    }
-
-    let universe = state
-        .universe_cache
-        .get(
-            &state.trading,
-            &state.pool,
-            &state.journal,
-            correlation_id,
-            now,
-        )
-        .await?;
-    // An absent table blocks the entry half through the risk gate rather than being papered over
-    // here; the exit half runs on what it has, because closing reduces exposure and the end-of-day
-    // liquidation consults no spread model.
-    let splits = state
-        .split_table_cache
-        .get(&state.s3_client, &state.records_bucket, now)
-        .await?;
-    let unadjustable = SplitTable::default();
-    // Absent boundaries do not block the way absent splits do: the guard they provide is worth far
-    // less than the trading refusing to run without it would cost.
-    let boundaries = state
-        .boundary_table_cache
-        .get(&state.s3_client, &state.records_bucket, now)
-        .await?;
-    let unbounded = BoundaryTable::default();
-    let close_history = state
-        .close_history_cache
-        .get(
-            &state.pool,
-            BarInterval::OneDay,
-            CORRELATION_WINDOW_SESSIONS,
-            splits.as_deref().unwrap_or(&unadjustable),
-            boundaries.as_deref().unwrap_or(&unbounded),
-            now,
-        )
-        .await?;
-
-    let unfinished = previous_session_gaps(state, &calendar, today).await?;
-    if !unfinished.is_empty() {
-        warn!(
-            commands = ?unfinished,
-            "Previous session left post-close commands unfinished"
-        );
-    }
-
-    let artifact_key = artifact::resolve_artifact_key(
-        &state.s3_client,
-        &state.records_bucket,
-        &state.artifact_prefix,
-        &state.model_version,
-        None,
-    )
-    .await?;
-    let model_state = artifact::download_and_load_model(
-        &state.s3_client,
-        &state.records_bucket,
-        &artifact_key,
-        None,
-    )
-    .await?;
-
-    let artifact_staleness_sessions =
-        artifact_staleness_sessions(model_state.run_id(), &calendar, today);
-    if artifact_staleness_sessions.is_some_and(|sessions| sessions >= 1) {
-        // Not an error and not an event of its own. Running on an older model is a normal outcome
-        // of two machines that share no database, and the staleness is recorded here so a session
-        // that was decided by one says so in its own completion row.
-        warn!(
-            run_id = model_state.run_id(),
-            artifact_staleness_sessions,
-            "Predictions are running on a model that missed at least one session"
-        );
-    }
-
-    let (rows, predictions) = run_inference(state, &model_state, correlation_id, now).await?;
-
-    state
-        .journal
-        .record(
-            correlation_id,
-            now,
-            Observation::PredictionsGenerated(Box::new(PredictionsGenerated {
-                model_run_id: model_state.run_id().to_string(),
-                artifact_key: artifact_key.clone(),
-                artifact_staleness_sessions,
-                rows_written: rows,
-                universe_size: universe.len(),
-                predictions: predictions
-                    .iter()
-                    .map(|prediction| PredictionReading {
-                        ticker: prediction.ticker().clone(),
-                        timestamp: prediction.timestamp(),
-                        quantile_10: prediction.quantile_10(),
-                        quantile_50: prediction.quantile_50(),
-                        quantile_90: prediction.quantile_90(),
-                    })
-                    .collect(),
-            })),
-        )
-        .await;
-
-    Ok(json!({
-        "session_date": today,
-        "correlation_id": correlation_id,
-        "model_run_id": model_state.run_id(),
-        "artifact_key": artifact_key,
-        "artifact_staleness_sessions": artifact_staleness_sessions,
-        "predictions": predictions.len(),
-        "rows_written": rows,
-        "universe": universe.len(),
-        "close_history_tickers": close_history.len(),
-        "previous_session_unfinished": unfinished,
-    }))
-}
-
-/// Runs the inference pipeline and persists the result.
-async fn run_inference(
-    state: &ServiceState,
-    model_state: &artifact::ModelState,
-    correlation_id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<(u64, Vec<crate::common::types::EquityPrediction>), HandlerError> {
-    fn at(stage: &'static str) -> impl Fn(String) -> HandlerError {
-        move |message| HandlerError::Prediction { stage, message }
-    }
-
-    // Fatal here, unlike the evaluation pass: a prediction is a commitment to a price, and the
-    // model would read a two-for-one as a genuine fifty percent fall.
-    let splits = state
-        .split_table_cache
-        .get(&state.s3_client, &state.records_bucket, now)
-        .await
-        .map_err(|error| at("load_splits")(error.to_string()))?
-        .ok_or_else(|| at("load_splits")("no splits table in the archive".to_string()))?;
-    let boundaries = state
-        .boundary_table_cache
-        .get(&state.s3_client, &state.records_bucket, now)
-        .await
-        .map_err(|error| at("load_boundaries")(error.to_string()))?;
-    let unbounded = BoundaryTable::default();
-    let equity_bars = bars::load_bars_dataframe(
-        &state.pool,
-        BarInterval::OneDay,
-        HISTORY_LOOKBACK_DAYS,
-        &splits,
-        boundaries.as_deref().unwrap_or(&unbounded),
-        SessionDate::at(now),
-    )
-    .await
-    .map_err(|error| at("load_bars")(error.to_string()))?;
-    let equity_details = details::load_details_dataframe(&state.pool)
-        .await
-        .map_err(|error| at("load_details")(error.to_string()))?;
-
-    let consolidated = predict::consolidate_data(equity_bars, equity_details)
-        .map_err(|error| at("consolidate")(error.to_string()))?;
-    // Read off the cache rather than declared again here: the predicted set and the traded set are
-    // then one value, where two declarations would be two that happen to agree today. The anchor is
-    // the session the cache itself keys on, so the two windows cover the same days and not merely
-    // the same number of them.
-    let filtered = predict::filter_equity_bars(
-        consolidated,
-        state.universe_cache.screen(),
-        SessionDate::at(now),
-    )
-    .map_err(|error| at("filter_bars")(error.to_string()))?;
-    let trained = predict::filter_to_trained_tickers(filtered, model_state)
-        .map_err(|error| at("filter_tickers")(error.to_string()))?;
-
-    // Typed on the way out of the forward pass, so a malformed value fails here as a `generate`
-    // failure rather than reaching the writer as an untyped map and failing as an `insert` one.
-    let predictions = predict::generate_predictions(trained, model_state, correlation_id)
-        .map_err(|error| at("generate")(error.to_string()))?;
-    predict::validate_predictions(&predictions).map_err(at("validate"))?;
-
-    let rows = predict::insert_predictions(&state.pool, &predictions)
-        .await
-        .map_err(HandlerError::Database)?;
-
-    Ok((rows, predictions))
 }
 
 /// Every five minutes: price the book, close what should close, open into vacant slots.
@@ -748,22 +520,6 @@ async fn handle_market_data_sync(
         )
         .await;
 
-    // Today's classification, not a point-in-time join: the screen's sector cap is a question about
-    // what a name is now, and the application only ever trades the current session.
-    //
-    // Warns rather than propagating, unlike the bars above. The bars are the half no provider can be
-    // re-asked about and they are already committed; a metadata refresh that is one night stale is a
-    // far better trade than a sync that returns here, leaving the close history cached stale and the
-    // export never requested.
-    let refreshed = refresh_equity_details(state).await;
-    let (detail_rows, detail_error) = match &refreshed {
-        Ok(rows) => (Some(*rows), None),
-        Err(error) => {
-            warn!(%error, "Equity detail refresh failed; the database keeps the previous universe");
-            (None, Some(error.to_string()))
-        }
-    };
-
     // The cached history now predates the rows just written, so it is dropped rather than
     // overwritten with an empty map -- an empty map keyed to today would pin "no history" for the
     // rest of the Eastern date.
@@ -785,25 +541,8 @@ async fn handle_market_data_sync(
         "sessions_failed": fetched.dates_failed,
         "bars_fetched": fetched.bars.len(),
         "bar_rows_written": bar_rows,
-        "detail_rows_written": detail_rows,
-        // The cause travels with the absence: a null row count and no reason would read exactly like
-        // a refresh that found nothing to write.
-        "detail_refresh_error": detail_error,
         "export_chained": true,
     }))
-}
-
-/// Replaces the stored ticker metadata from the archive's newest reference partition.
-///
-/// Lifted out of the sync so its failure is a value the caller decides about rather than a `?` that
-/// returns past the cache invalidation and the export.
-async fn refresh_equity_details(state: &ServiceState) -> Result<u64, HandlerError> {
-    let universe = archive::current_universe(&state.s3_client, &state.archive_bucket).await?;
-    Ok(details::store_details(
-        &state.pool,
-        &details::details_from_universe(universe.rows())?,
-    )
-    .await?)
 }
 
 /// Chained from a completed market data sync: seal the journal, export to S3, then purge.
@@ -942,79 +681,6 @@ async fn handle_database_export(
     }))
 }
 
-/// Post-close commands from the previous trading day that never reached a terminal outcome.
-///
-/// This is what replaced the `scheduler_health_check` cron job. It answers the only question that
-/// job existed to answer — did last night's work finish — at the one moment the answer changes what
-/// happens next.
-async fn previous_session_gaps(
-    state: &ServiceState,
-    calendar: &TradingCalendar,
-    today: SessionDate,
-) -> Result<Vec<String>, HandlerError> {
-    let Some(previous) = calendar.previous_trading_day(today) else {
-        return Ok(Vec::new());
-    };
-    let (start, end) = previous.bounds();
-
-    let rows = sqlx::query!(
-        r#"
-        SELECT request.event_type AS "event_type!"
-        FROM events AS request
-        WHERE request.created_at >= $1
-          AND request.created_at < $2
-          AND request.event_type LIKE '%\_requested'
-          AND NOT EXISTS (
-              SELECT 1 FROM events AS terminal
-              WHERE terminal.created_at >= $1
-                AND terminal.id > request.id
-                AND terminal.event_type IN (
-                    replace(request.event_type, '_requested', '_completed'),
-                    replace(request.event_type, '_requested', '_errored')
-                )
-          )
-        "#,
-        start,
-        end,
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    Ok(rows.into_iter().map(|row| row.event_type).collect())
-}
-
-/// How many trading sessions the artifact skipped, when its run identifier can be read as a date.
-///
-/// Sessions strictly between the artifact's date and today, not calendar days: the trainer
-/// publishes after one close for the *next* session, so a healthy artifact is always dated at least
-/// one calendar day back and zero is the healthy answer. Bounded by [`HORIZON_DAYS_BACKWARD`], so
-/// an older artifact undercounts a number already past the threshold; `None` if not date-prefixed.
-///
-/// [`HORIZON_DAYS_BACKWARD`]: crate::data::calendar
-fn artifact_staleness_sessions(
-    run_id: &str,
-    calendar: &TradingCalendar,
-    today: SessionDate,
-) -> Option<i64> {
-    // The run identifier's date prefix is an Eastern session, written by the trainer through
-    // `eastern_datetime`, so wrapping it is `from_date`'s case rather than a derivation.
-    let artifact_date =
-        SessionDate::from_date(NaiveDate::parse_from_str(run_id.get(..10)?, "%Y-%m-%d").ok()?);
-    // Half-open on both ends: the artifact's own session is not a session it missed, and today's
-    // has not happened yet. `trading_days_in_range` takes an inclusive range and panics on an
-    // inverted one, so the empty case is answered here rather than passed down.
-    let first_missed = artifact_date.plus_calendar_days(1);
-    let last_missed = today.plus_calendar_days(-1);
-    if first_missed > last_missed {
-        return Some(0);
-    }
-    Some(
-        calendar
-            .trading_days_in_range(first_missed, last_missed)
-            .len() as i64,
-    )
-}
-
 /// Re-runs commands that were requested today and never finished.
 ///
 /// Called once at startup. This is what replaces a consumer offset table: a `_requested` row with
@@ -1049,6 +715,7 @@ pub fn session_date(now: DateTime<Utc>) -> SessionDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
 
     fn date(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(
@@ -1075,95 +742,6 @@ mod tests {
             completion_outcome(&json!({ "skipped": "no_such_reason" })),
             CommandOutcome::Completed
         );
-    }
-
-    /// Weekday sessions spanning 2026-07-27 to 2026-08-07. 2026-08-01 is a Saturday and
-    /// 2026-08-02 a Sunday, so the weekend is absent.
-    fn weekday_calendar() -> TradingCalendar {
-        use crate::common::alpaca::CalendarDay;
-        let open = chrono::NaiveTime::from_hms_opt(9, 30, 0).expect("valid time");
-        let close = chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("valid time");
-        let days = (0..12)
-            .map(|offset| date(2026, 7, 27).plus_calendar_days(offset))
-            .filter(|day| !day.is_weekend())
-            .map(|day| {
-                CalendarDay::new(day.date(), open, close).expect("test session must be valid")
-            })
-            .collect();
-        TradingCalendar::from_days(days)
-    }
-
-    /// The trainer names runs `YYYY-MM-DD-...`, which is what makes staleness readable at all.
-    #[test]
-    fn test_artifact_staleness_reads_the_date_prefix() {
-        let calendar = weekday_calendar();
-        // 2026-07-30 is a Thursday, 2026-07-31 the Friday after it.
-        assert_eq!(
-            artifact_staleness_sessions("2026-07-30-19-21-25-195", &calendar, date(2026, 7, 31)),
-            Some(0)
-        );
-        // 2026-07-29 is the Wednesday, so Thursday's session was skipped.
-        assert_eq!(
-            artifact_staleness_sessions("2026-07-29-19-21-25-195", &calendar, date(2026, 7, 31)),
-            Some(1)
-        );
-    }
-
-    /// The case a calendar-day count gets wrong, and the reason this is measured in sessions.
-    ///
-    /// The trainer publishes after one session's close for the next session, so Friday evening's
-    /// artifact is what Monday is *supposed* to run on. Three calendar days separate them and zero
-    /// trading sessions do. Counting days warned on every healthy Monday.
-    #[test]
-    fn test_an_artifact_from_friday_is_not_stale_on_monday() {
-        let calendar = weekday_calendar();
-        let friday = date(2026, 7, 31);
-        let monday = date(2026, 8, 3);
-        assert_eq!(
-            (monday.date() - friday.date()).num_days(),
-            3,
-            "three calendar days apart"
-        );
-        assert_eq!(
-            artifact_staleness_sessions("2026-07-31-19-21-25-195", &calendar, monday),
-            Some(0),
-            "the weekend holds no session to have missed"
-        );
-        // And a real skip is still caught across the same weekend.
-        assert_eq!(
-            artifact_staleness_sessions("2026-07-30-19-21-25-195", &calendar, monday),
-            Some(1),
-            "Friday's session was missed"
-        );
-    }
-
-    /// An artifact dated today or later has missed nothing, and must not index an inverted range.
-    #[test]
-    fn test_an_artifact_from_today_has_missed_no_sessions() {
-        let calendar = weekday_calendar();
-        assert_eq!(
-            artifact_staleness_sessions("2026-07-31-19-21-25-195", &calendar, date(2026, 7, 31)),
-            Some(0)
-        );
-        assert_eq!(
-            artifact_staleness_sessions("2026-08-03-19-21-25-195", &calendar, date(2026, 7, 31)),
-            Some(0)
-        );
-    }
-
-    /// A run identifier that is not date-prefixed yields no staleness. Reporting a number derived
-    /// from an unparsed prefix would put a fabricated value into the completion payload, which is
-    /// worse than reporting that it is unknown.
-    #[test]
-    fn test_an_undatable_run_identifier_has_no_staleness() {
-        let calendar = weekday_calendar();
-        let today = date(2026, 7, 31);
-        assert_eq!(
-            artifact_staleness_sessions("manual-upload", &calendar, today),
-            None
-        );
-        assert_eq!(artifact_staleness_sessions("short", &calendar, today), None);
-        assert_eq!(artifact_staleness_sessions("", &calendar, today), None);
     }
 
     #[test]

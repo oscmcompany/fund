@@ -7,8 +7,7 @@ use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
 
-use crate::models::tide::data::{session_ranks, TARGET_COLUMN};
-use crate::models::tide::TideError;
+use crate::laboratory::frame::{session_ranks, FrameError, TARGET_COLUMN};
 
 /// Bins each side is cut into. Ten matches the decile language the rest of the laboratory uses.
 pub const DEFAULT_BINS: usize = 10;
@@ -280,8 +279,8 @@ pub fn pair_with_next_session(
     calendar: &DataFrame,
     feature: &str,
     outcome: Outcome,
-    read: impl Fn(&DataFrame) -> Result<Feature, TideError>,
-) -> Result<Paired, TideError> {
+    read: impl Fn(&DataFrame) -> Result<Feature, FrameError>,
+) -> Result<Paired, FrameError> {
     let sorted = frame.sort(
         ["ticker", "timestamp"],
         SortMultipleOptions::default().with_maintain_order(true),
@@ -292,7 +291,7 @@ pub fn pair_with_next_session(
     for name in ["ticker", "timestamp", TARGET_COLUMN, feature] {
         let nulls = sorted.column(name)?.null_count();
         if nulls > 0 {
-            return Err(TideError::Data(format!(
+            return Err(FrameError::Data(format!(
                 "column `{name}` holds {nulls} nulls the pairing cannot align"
             )));
         }
@@ -329,7 +328,7 @@ pub fn pair_with_next_session(
         .collect();
 
     if features.len() != sorted.height() {
-        return Err(TideError::Data(format!(
+        return Err(FrameError::Data(format!(
             "column `{feature}` read {} values for {} rows",
             features.len(),
             sorted.height()
@@ -659,7 +658,7 @@ mod tests {
         .unwrap()
     }
 
-    fn continuous(column: &'static str) -> impl Fn(&DataFrame) -> Result<Feature, TideError> {
+    fn continuous(column: &'static str) -> impl Fn(&DataFrame) -> Result<Feature, FrameError> {
         move |frame: &DataFrame| {
             Ok(Feature::Continuous(
                 frame

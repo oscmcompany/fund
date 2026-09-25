@@ -25,7 +25,7 @@ const DEFAULT_LOOKBACK_DAYS: i64 = 730;
 /// Seeds the shuffle behind every null. Fixed so a ranking can be got back.
 const DEFAULT_SEED: i64 = 0x4E11;
 
-/// Every feature the model reads that varies across a session's names.
+/// Every feature the study frame carries that varies across a session's names.
 ///
 /// The calendar columns are absent deliberately: `day_of_week`, `month` and the rest hold one value
 /// for every name in a session, so their cross-sectional information is zero by construction rather

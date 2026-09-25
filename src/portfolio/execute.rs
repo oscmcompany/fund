@@ -162,7 +162,6 @@ impl CloseOutcome {
 pub async fn open_pair(
     context: &ExecutionContext<'_>,
     pair: &SizedPair,
-    model_run_id: Option<String>,
 ) -> Result<OpenOutcome, ExecutionError> {
     let candidate = pair.candidate();
     let short_ticker = candidate.short_ticker().clone();
@@ -246,7 +245,6 @@ pub async fn open_pair(
         candidate.hedge_ratio(),
         candidate.entry_z_score(),
         candidate.signal_strength(),
-        model_run_id,
     )?;
 
     info!(
@@ -694,17 +692,16 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = journal("fills-both-legs");
-        let outcome = open_pair(&context(&client, &log), &pair(), Some("run-1".to_string()))
+        let outcome = open_pair(&context(&client, &log), &pair())
             .await
             .expect("the open must succeed");
 
         match outcome {
             OpenOutcome::Opened {
-                entry,
                 long_fill,
                 short_fill,
+                ..
             } => {
-                assert_eq!(entry.model_run_id(), Some("run-1"));
                 assert_eq!(long_fill.ticker().as_str(), "AAAA");
                 assert_eq!(short_fill.ticker().as_str(), "BBBB");
                 assert_eq!(short_fill.average_price(), Decimal::new(100, 0));
@@ -736,7 +733,7 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = journal("rejected-short");
-        let outcome = open_pair(&context(&client, &log), &pair(), None)
+        let outcome = open_pair(&context(&client, &log), &pair())
             .await
             .expect("an unfilled leg is not an error");
 
@@ -793,7 +790,7 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = journal("failed-long");
-        let outcome = open_pair(&context(&client, &log), &pair(), None)
+        let outcome = open_pair(&context(&client, &log), &pair())
             .await
             .expect("the unwind must succeed");
 
@@ -841,7 +838,7 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = journal("timed-out");
-        let outcome = open_pair(&context(&client, &log), &pair(), None)
+        let outcome = open_pair(&context(&client, &log), &pair())
             .await
             .expect("a timeout is not an error");
 
@@ -902,7 +899,7 @@ mod tests {
             correlation_id: Uuid::nil(),
         };
 
-        open_pair(&context, &pair(), None)
+        open_pair(&context, &pair())
             .await
             .expect("a timeout is not an error");
 
@@ -952,7 +949,7 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = journal("partial-fill");
-        let outcome = open_pair(&context(&client, &log), &pair(), None)
+        let outcome = open_pair(&context(&client, &log), &pair())
             .await
             .expect("a partial fill is not an error");
 
@@ -1061,7 +1058,7 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = journal("rejected-submission");
-        let result = open_pair(&context(&client, &log), &pair(), None).await;
+        let result = open_pair(&context(&client, &log), &pair()).await;
 
         assert!(result.is_err(), "the broker failure must still be reported");
         let records = recorded(&log);

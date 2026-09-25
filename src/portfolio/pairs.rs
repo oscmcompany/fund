@@ -47,7 +47,6 @@ pub struct PairEntry {
     hedge_ratio: f64,
     entry_z_score: f64,
     signal_strength: f64,
-    model_run_id: Option<String>,
 }
 
 impl PairEntry {
@@ -62,7 +61,6 @@ impl PairEntry {
         hedge_ratio: f64,
         entry_z_score: f64,
         signal_strength: f64,
-        model_run_id: Option<String>,
     ) -> Result<Self, InvalidEntryError> {
         if !hedge_ratio.is_finite() {
             return Err(InvalidEntryError {
@@ -90,7 +88,6 @@ impl PairEntry {
             hedge_ratio,
             entry_z_score,
             signal_strength,
-            model_run_id,
         })
     }
 
@@ -116,10 +113,6 @@ impl PairEntry {
 
     pub fn signal_strength(&self) -> f64 {
         self.signal_strength
-    }
-
-    pub fn model_run_id(&self) -> Option<&str> {
-        self.model_run_id.as_deref()
     }
 }
 
@@ -299,9 +292,9 @@ pub async fn record_open(
     sqlx::query!(
         r#"INSERT INTO equity_pairs (
                id, pair_id, long_ticker, short_ticker, hedge_ratio, entry_z_score,
-               signal_strength, model_run_id, status, opened_at
+               signal_strength, status, opened_at
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9)"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8)"#,
         id,
         entry.pair_id().as_str(),
         entry.long_ticker().as_str(),
@@ -309,7 +302,6 @@ pub async fn record_open(
         entry.hedge_ratio(),
         entry.entry_z_score(),
         entry.signal_strength(),
-        entry.model_run_id(),
         opened_at,
     )
     .execute(pool)
@@ -451,7 +443,7 @@ mod tests {
     #[test]
     fn test_entry_rejects_a_non_finite_hedge_ratio() {
         assert!(matches!(
-            PairEntry::new(pair(), f64::NAN, 2.5, 0.1, None),
+            PairEntry::new(pair(), f64::NAN, 2.5, 0.1),
             Err(InvalidEntryError {
                 field: "hedge_ratio",
                 ..
@@ -466,14 +458,14 @@ mod tests {
     fn test_entry_rejects_a_non_positive_z_score() {
         for value in [-2.5, 0.0] {
             assert!(matches!(
-                PairEntry::new(pair(), 1.0, value, 0.1, None),
+                PairEntry::new(pair(), 1.0, value, 0.1),
                 Err(InvalidEntryError {
                     field: "entry_z_score",
                     ..
                 })
             ));
         }
-        assert!(PairEntry::new(pair(), 1.0, 2.5, 0.1, None).is_ok());
+        assert!(PairEntry::new(pair(), 1.0, 2.5, 0.1).is_ok());
     }
 
     /// Zero is rejected as well as negative. A neutral prediction is not a reason to hold a pair, and
@@ -483,19 +475,19 @@ mod tests {
     fn test_entry_rejects_a_non_positive_signal_strength() {
         for value in [-0.1, 0.0] {
             assert!(matches!(
-                PairEntry::new(pair(), 1.0, 2.5, value, None),
+                PairEntry::new(pair(), 1.0, 2.5, value),
                 Err(InvalidEntryError {
                     field: "signal_strength",
                     ..
                 })
             ));
         }
-        assert!(PairEntry::new(pair(), 1.0, 2.5, 0.01, None).is_ok());
+        assert!(PairEntry::new(pair(), 1.0, 2.5, 0.01).is_ok());
     }
 
     #[test]
     fn test_entry_exposes_the_legs_from_the_identifier() {
-        let entry = PairEntry::new(pair(), 1.0, 2.5, 0.1, None).unwrap();
+        let entry = PairEntry::new(pair(), 1.0, 2.5, 0.1).unwrap();
         assert_eq!(entry.long_ticker().as_str(), "AAPL");
         assert_eq!(entry.short_ticker().as_str(), "MSFT");
     }

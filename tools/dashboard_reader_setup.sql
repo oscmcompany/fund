@@ -19,7 +19,7 @@ $$;
 GRANT CONNECT ON DATABASE fund TO dashboard_reader;
 GRANT USAGE ON SCHEMA public TO dashboard_reader;
 
--- equity_bars, equity_predictions, and events are TimescaleDB hypertables; granting on the
+-- equity_bars and events are TimescaleDB hypertables; granting on the
 -- hypertable covers its existing chunks and the ones created later, so there is nothing to re-run
 -- when a chunk rolls over.
 --
@@ -30,6 +30,5 @@ GRANT USAGE ON SCHEMA public TO dashboard_reader;
 GRANT SELECT ON account_snapshots   TO dashboard_reader;
 GRANT SELECT ON account_activities  TO dashboard_reader;
 GRANT SELECT ON equity_pairs        TO dashboard_reader;
-GRANT SELECT ON equity_predictions  TO dashboard_reader;
 GRANT SELECT ON equity_bars         TO dashboard_reader;
 GRANT SELECT ON events              TO dashboard_reader;

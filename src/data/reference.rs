@@ -9,8 +9,33 @@ use polars::prelude::*;
 use crate::common::types::{Cik, EquityReference, SecurityType, SessionDate, SicCode};
 use crate::data::classification::{self, ClassificationTable};
 use crate::data::classification_table::{Industry, Sector};
-use crate::data::details::{industry_code, sector_code};
 use crate::data::industry_codes::IndustryCodesTable;
+
+/// Value stored when the source has no SIC code, and so no sector or industry, for a ticker.
+///
+/// Spelled rather than left null so a study's frame keeps the name. Distinct from `Sector::Other`,
+/// which is a real group the definitions assign names to.
+pub const UNKNOWN: &str = "NOT AVAILABLE";
+
+/// The stored spelling of a sector, which round-trips through [`sector_of_stored`].
+pub fn sector_code(sector: Option<Sector>) -> String {
+    sector.map_or(UNKNOWN, |sector| sector.as_str()).to_string()
+}
+
+/// The stored spelling of an industry.
+pub fn industry_code(industry: Option<Industry>) -> String {
+    industry
+        .map_or(UNKNOWN, |industry| industry.as_str())
+        .to_string()
+}
+
+/// Reads a stored sector back into the domain type.
+///
+/// Unrecognised text reads as absent rather than as a bucket, because a value this cannot place
+/// names no group and inventing one would put a name into a factor it has no claim to.
+pub fn sector_of_stored(stored: &str) -> Option<Sector> {
+    classification::sector_from_code(stored)
+}
 
 /// The column carrying which `as_of` observation a row was classified by.
 ///

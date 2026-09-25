@@ -354,9 +354,7 @@ pub struct Universe {
 impl Universe {
     /// Composes the three filters, all of which are necessary.
     ///
-    /// Alpaca must permit it, we must hold bars for it, and it must clear `floor` — which has to be
-    /// the floor the model was fitted against, because a universe wider than the training
-    /// population means predicting on names the scaler never saw.
+    /// Alpaca must permit it, we must hold bars for it, and it must clear `floor`.
     pub fn build(
         assets: &TradableAssets,
         liquidity: &[LiquidityRow],

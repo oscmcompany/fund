@@ -78,7 +78,7 @@ fn make_executable(path: &Path) {
 #[test]
 fn test_the_views_are_read_off_the_initialization_script() {
     let found = views();
-    assert!(found.len() >= 15, "found {found:?}");
+    assert_eq!(found.len(), 14, "found {found:?}");
     for expected in ["training_bars", "journal", "archive_runs", "experiments"] {
         assert!(found.iter().any(|view| view == expected), "{expected}");
     }
@@ -121,7 +121,6 @@ fn test_an_empty_view_and_a_missing_one_both_fail_the_check() {
 fn test_a_dormant_view_may_be_empty_and_may_not_read_rows() {
     let names = views();
     let dormant = [
-        "equity_predictions",
         "equity_pairs",
         "account_snapshots",
         "account_activities",
@@ -153,7 +152,6 @@ fn test_a_dormant_view_may_be_empty_and_may_not_read_rows() {
 fn test_a_dormant_view_failing_for_another_reason_is_broken() {
     let names = views();
     let dormant = [
-        "equity_predictions",
         "equity_pairs",
         "account_snapshots",
         "account_activities",

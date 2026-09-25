@@ -26,7 +26,7 @@ pub fn archive_bucket() -> Result<String, MissingArchiveBucket> {
 /// Build the Hive-partitioned S3 key for one day of parquet data, e.g.
 /// `data/derived/equity/bars/interval=one_day/year=2026/month=06/day=10/data.parquet`. The single
 /// source of truth for the date-partition layout: the data manager's daily
-/// writers and exports, the historical backfill, and the tide trainer's
+/// writers and exports, the historical backfill, and the laboratory's
 /// reader all derive their keys here so they can never diverge.
 pub fn date_partitioned_key(prefix: &str, date: chrono::NaiveDate) -> String {
     use chrono::Datelike;

@@ -236,7 +236,7 @@ mod tests {
     }
 
     /// The signature of a forecast that cannot rank, and the reason every field is optional: this
-    /// is what a cross-sectional-mean baseline produces, and what TiDE produces if it has learned
+    /// is what a cross-sectional-mean baseline produces, and what a model produces if it has learned
     /// only the drift.
     #[test]
     fn test_a_cross_section_of_equal_scores_has_no_coefficient() {

@@ -1,6 +1,6 @@
 //! Forecasts to measure a model against, and the panel they read.
 //!
-//! Every baseline here is something TiDE must beat to have earned its place.
+//! Every baseline here is something a forecast must beat to have earned its place.
 
 use std::collections::BTreeSet;
 
