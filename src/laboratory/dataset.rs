@@ -76,7 +76,7 @@ pub struct DatasetFingerprint {
     /// Content of the boundary table the series were stitched and bounded against.
     pub boundaries_digest: u64,
     /// Content of the point-in-time universe the bars were classified against, or `None` where none
-    /// was joined.
+    /// was joined. On the intraday path it is the universe the screen was judged against.
     ///
     /// The universe *is* part of the result: two runs over the same window and the same splits, one
     /// before the reference backfill extended and one after, measure different sets of names and
@@ -237,6 +237,12 @@ pub async fn intraday(
     )
     .await?;
     let adjustments = read_adjustments(s3_client, bucket).await?;
+    let digests = Digests {
+        splits: adjustments.splits_digest,
+        boundaries: adjustments.boundaries_digest,
+        reference: daily_fingerprint.reference_digest,
+    };
+    refuse_moved_tables(&daily_fingerprint, &digests)?;
 
     let unscreened = load_archived_bars(
         s3_client,
@@ -254,17 +260,31 @@ pub async fn intraday(
         session,
         lookback_days,
         Some(screen),
-        Digests {
-            splits: adjustments.splits_digest,
-            boundaries: adjustments.boundaries_digest,
-            reference: daily_fingerprint.reference_digest,
-        },
+        digests,
         None,
         Microstructure::Omitted,
         None,
     )?;
 
     Ok(IntradayDataset { bars, fingerprint })
+}
+
+/// Refuses a fold whose split or boundary table is not the one the screen was judged under.
+///
+/// The intraday path reads the tables twice, so a rewrite between the reads would otherwise screen
+/// under one and fold under the other while the fingerprint reported only the second.
+fn refuse_moved_tables(
+    screened: &DatasetFingerprint,
+    folding: &Digests,
+) -> Result<(), DatasetError> {
+    if screened.splits_digest == folding.splits && screened.boundaries_digest == folding.boundaries
+    {
+        return Ok(());
+    }
+    Err(DatasetError::Window(
+        "the split or boundary table changed between the daily screen and the intraday read"
+            .to_string(),
+    ))
 }
 
 /// Keeps each intraday bar whose `(ticker, session)` appears among the screened daily bars.
@@ -1385,6 +1405,32 @@ mod tests {
         assert_ne!(one, another, "two universes must not share a fingerprint");
         assert_ne!(unjoined, one, "a joined universe and none must differ");
         assert_eq!(unjoined.reference_digest, None);
+    }
+
+    /// Either table moving between the screen's read and the fold's is refused; neither moving is not.
+    #[test]
+    fn test_a_table_that_moved_between_the_reads_is_refused() {
+        let screened = fingerprint_of(
+            &frame(vec!["AAA"], vec![0]),
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()),
+            90,
+            None,
+            digests(0xAB, 0xCD),
+            None,
+            Microstructure::Omitted,
+            None,
+        )
+        .unwrap();
+
+        assert!(refuse_moved_tables(&screened, &digests(0xAB, 0xCD)).is_ok());
+        assert!(matches!(
+            refuse_moved_tables(&screened, &digests(0xAA, 0xCD)),
+            Err(DatasetError::Window(_))
+        ));
+        assert!(matches!(
+            refuse_moved_tables(&screened, &digests(0xAB, 0xCE)),
+            Err(DatasetError::Window(_))
+        ));
     }
 
     #[test]
