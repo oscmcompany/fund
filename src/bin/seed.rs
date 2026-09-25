@@ -1891,11 +1891,6 @@ fn unshipped_records(
     refusals
 }
 
-/// Ships this box's journal and logs to the records bucket.
-///
-/// Its own subcommand rather than a step inside the nightly, because a night that failed is the one
-/// whose records are most worth having: chaining the export to a successful fold would lose them
-/// exactly when they matter.
 /// Deletes the named partitions once every one has a route that would rebuild it.
 ///
 /// All or nothing: a run that deleted the rebuildable half of a list and refused the rest would
@@ -1908,6 +1903,7 @@ async fn delete_partitions(
     let s3_client = fund::common::aws::s3_client().await;
 
     let mut rederivable = Vec::with_capacity(arguments.sessions.len());
+    let mut orphans = Vec::new();
     let mut refusals = Vec::new();
     for &session in &arguments.sessions {
         let address = deletion::PartitionAddress::new(
@@ -1915,13 +1911,30 @@ async fn delete_partitions(
             arguments.interval.bar_interval(),
             session,
         );
+        let stored = match deletion::inspect(&s3_client, &bucket, address)
+            .await
+            .map_err(box_error)?
+        {
+            deletion::Inspection::Stored(stored) => stored,
+            deletion::Inspection::NotStored { orphaned_sidecar } => {
+                match orphaned_sidecar {
+                    Some(etag) => {
+                        println!("{address}: not stored; its provenance record is orphaned");
+                        orphans.push((address, etag));
+                    }
+                    None => println!("{address}: not stored"),
+                }
+                continue;
+            }
+        };
         let raw_object_present = match address.raw_key() {
-            Some(key) => deletion::object_exists(&s3_client, &bucket, &key)
+            Some(key) => deletion::object_etag(&s3_client, &bucket, &key)
                 .await
-                .map_err(box_error)?,
+                .map_err(box_error)?
+                .is_some(),
             None => false,
         };
-        match deletion::rederivation_route(address, today, raw_object_present) {
+        match deletion::rederivation_route(address, today, &stored, raw_object_present) {
             Ok(found) => {
                 println!("{address}: rebuildable from {}", found.route());
                 rederivable.push(found);
@@ -1944,28 +1957,49 @@ async fn delete_partitions(
     }
     if !arguments.apply {
         println!(
-            "{} partitions rebuildable; pass --apply to delete them",
-            rederivable.len()
+            "{} partitions rebuildable, {} orphaned records; pass --apply to delete them",
+            rederivable.len(),
+            orphans.len()
         );
         return Ok(Outcome::Complete);
     }
-    let mut absent = 0;
+
+    // Each delete is its own request, so a failure partway leaves the earlier ones done; naming
+    // them is what tells the operator which sessions now need their rebuild.
+    let mut deleted: Vec<deletion::PartitionAddress> = Vec::new();
+    let report_partial = |deleted: &[deletion::PartitionAddress]| {
+        for address in deleted {
+            println!("{address}: deleted before the failure");
+        }
+    };
     for partition in &rederivable {
-        match deletion::delete_partition(&s3_client, &bucket, partition)
-            .await
-            .map_err(box_error)?
+        if let Err(error) = deletion::delete_partition(&s3_client, &bucket, partition).await {
+            report_partial(&deleted);
+            return Err(box_error(error));
+        }
+        deleted.push(partition.address());
+    }
+    for (address, etag) in &orphans {
+        if let Err(error) =
+            deletion::delete_orphaned_sidecar(&s3_client, &bucket, *address, etag).await
         {
-            deletion::Deleted::Partition => {}
-            deletion::Deleted::Absent => absent += 1,
+            report_partial(&deleted);
+            return Err(box_error(error));
         }
     }
     println!(
-        "{} partitions deleted, {absent} were not stored",
-        rederivable.len() - absent
+        "{} partitions deleted, {} orphaned records removed",
+        deleted.len(),
+        orphans.len()
     );
     Ok(Outcome::Complete)
 }
 
+/// Ships this box's journal and logs to the records bucket.
+///
+/// Its own subcommand rather than a step inside the nightly, because a night that failed is the one
+/// whose records are most worth having: chaining the export to a successful fold would lose them
+/// exactly when they matter.
 async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
     let bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME")
         .map_err(|_| SeedError::Usage("AWS_S3_RECORDS_BUCKET_NAME must be set".to_string()))?;

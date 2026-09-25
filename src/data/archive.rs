@@ -4247,7 +4247,7 @@ async fn read_partition_with_etag(
 /// Three-way rather than an `Option` because absent and unreadable pull the two callers opposite
 /// ways: the guard must refuse a record it cannot interpret, and the writer must not spend its
 /// retries on one.
-enum SidecarRead {
+pub(crate) enum SidecarRead {
     /// The record parsed, and carried this ETag when it was read.
     Found(PartitionProvenance, String),
     /// No object at the key.
@@ -4260,7 +4260,7 @@ enum SidecarRead {
 ///
 /// A failed request is neither absent nor unreadable and is propagated: treating a throttle as "no
 /// record" is what lets a single-route write replace a multi-route one.
-async fn read_sidecar(
+pub(crate) async fn read_sidecar(
     s3_client: &S3Client,
     bucket: &str,
     key: &str,

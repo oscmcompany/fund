@@ -12,7 +12,9 @@ use crate::common::provenance::{
     AlpacaPlan, MassivePlan, MassiveTransport, PartitionProvenance, Provenance,
 };
 use crate::common::types::{BarInterval, SessionDate};
-use crate::data::archive::{alpaca_trades_faithful_from, ArchiveError, SessionFamily};
+use crate::data::archive::{
+    alpaca_trades_faithful_from, read_sidecar, ArchiveError, SessionFamily, SidecarRead,
+};
 
 /// The last day Massive Stocks Advanced answers, which closes the flat-file route for quotes and trades.
 ///
@@ -115,6 +117,12 @@ pub enum RouteClosed {
     OutsideStarterWindow { earliest: SessionDate },
     /// Alpaca's history differs from the archive's before this session, so its fold is a downgrade.
     AlpacaUnfaithful { faithful_from: SessionDate },
+    /// The route is open but rebuilds from a different source than the one that built the partition.
+    NotTheSource { route: Provenance },
+    /// The partition names more than one source, so no single route rebuilds all of its rows.
+    MixedSources { routes: Vec<Provenance> },
+    /// The partition has no readable provenance record, so which route built it is unknown.
+    Unattributed,
 }
 
 impl std::fmt::Display for RouteClosed {
@@ -130,7 +138,94 @@ impl std::fmt::Display for RouteClosed {
             RouteClosed::AlpacaUnfaithful { faithful_from } => {
                 write!(formatter, "Alpaca is faithful from {faithful_from}")
             }
+            RouteClosed::NotTheSource { route } => write!(
+                formatter,
+                "{} under {} did not build it",
+                route.provider_name(),
+                route.subscription_name()
+            ),
+            RouteClosed::MixedSources { routes } => {
+                let names: Vec<String> = routes
+                    .iter()
+                    .map(|route| {
+                        format!(
+                            "{} under {}",
+                            route.provider_name(),
+                            route.subscription_name()
+                        )
+                    })
+                    .collect();
+                write!(formatter, "built by {}", names.join(" and "))
+            }
+            RouteClosed::Unattributed => write!(formatter, "no readable provenance record"),
         }
+    }
+}
+
+/// A partition's provenance record, as read, with the version a delete must still find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSidecar {
+    routes: Vec<Provenance>,
+    etag: String,
+}
+
+impl StoredSidecar {
+    pub fn new(routes: Vec<Provenance>, etag: String) -> Self {
+        Self { routes, etag }
+    }
+}
+
+/// What the archive held at an address when it was inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPartition {
+    parquet_etag: String,
+    /// `None` where the record was absent or did not parse, either of which leaves the source unknown.
+    sidecar: Option<StoredSidecar>,
+}
+
+impl StoredPartition {
+    pub fn new(parquet_etag: String, sidecar: Option<StoredSidecar>) -> Self {
+        Self {
+            parquet_etag,
+            sidecar,
+        }
+    }
+}
+
+/// What is stored at an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inspection {
+    Stored(StoredPartition),
+    /// No parquet. `orphaned_sidecar` is a record an earlier delete removed the parquet from and
+    /// then failed to follow, carrying the version to delete.
+    NotStored {
+        orphaned_sidecar: Option<String>,
+    },
+}
+
+/// Reads the parquet's version and the provenance record at `address`.
+pub async fn inspect(
+    s3_client: &S3Client,
+    bucket: &str,
+    address: PartitionAddress,
+) -> Result<Inspection, ArchiveError> {
+    let key = address.key();
+    // The record is read first: a fold writes the parquet before its record, so reading in the same
+    // order could pair a new parquet with the record it is about to replace.
+    let (sidecar, orphaned_sidecar) =
+        match read_sidecar(s3_client, bucket, &PartitionProvenance::sidecar_key(&key)).await? {
+            SidecarRead::Found(record, etag) => (
+                Some(StoredSidecar::new(record.routes, etag.clone())),
+                Some(etag),
+            ),
+            SidecarRead::Unreadable | SidecarRead::Absent => (None, None),
+        };
+    match object_etag(s3_client, bucket, &key).await? {
+        Some(parquet_etag) => Ok(Inspection::Stored(StoredPartition::new(
+            parquet_etag,
+            sidecar,
+        ))),
+        None => Ok(Inspection::NotStored { orphaned_sidecar }),
     }
 }
 
@@ -142,6 +237,8 @@ impl std::fmt::Display for RouteClosed {
 pub struct Rederivable {
     address: PartitionAddress,
     route: RederivationRoute,
+    parquet_etag: String,
+    sidecar_etag: String,
 }
 
 impl Rederivable {
@@ -172,72 +269,100 @@ fn format_closed(closed: &[RouteClosed]) -> String {
 
 /// The first route that would rebuild `address` if it were deleted on `today`, or every reason none would.
 ///
-/// `raw_object_present` is the caller's `HEAD` of [`PartitionAddress::raw_key`]. Tried in cost order:
-/// the kept bytes first because they need no subscription, then Massive, then Alpaca.
+/// A route counts only if it is the one source the partition's record names: any other writes
+/// different rows, and a mixed partition's second source has no route back at all.
+/// `raw_object_present` is the caller's `HEAD` of [`PartitionAddress::raw_key`]. Candidates are tried
+/// in cost order: the kept bytes first because they need no subscription, then Massive, then Alpaca.
 pub fn rederivation_route(
     address: PartitionAddress,
     today: SessionDate,
+    stored: &StoredPartition,
     raw_object_present: bool,
 ) -> Result<Rederivable, NoRederivationRoute> {
-    let mut closed = Vec::new();
-    let found = |route| Ok(Rederivable { address, route });
-
-    if let Some(key) = address.raw_key() {
-        match raw_object_present {
-            true => return found(RederivationRoute::RawObject { key }),
-            false => closed.push(RouteClosed::RawObjectAbsent { key }),
+    let refuse = |closed| Err(NoRederivationRoute { address, closed });
+    let Some(sidecar) = &stored.sidecar else {
+        return refuse(vec![RouteClosed::Unattributed]);
+    };
+    let source = match sidecar.routes.as_slice() {
+        [source] => *source,
+        [] => return refuse(vec![RouteClosed::Unattributed]),
+        routes => {
+            return refuse(vec![RouteClosed::MixedSources {
+                routes: routes.to_vec(),
+            }])
         }
+    };
+
+    let mut closed = Vec::new();
+    for (route, provenance, shut) in candidates(address, today, raw_object_present) {
+        match shut {
+            Some(reason) => closed.push(reason),
+            None if provenance != source => {
+                closed.push(RouteClosed::NotTheSource { route: provenance })
+            }
+            None => {
+                return Ok(Rederivable {
+                    address,
+                    route,
+                    parquet_etag: stored.parquet_etag.clone(),
+                    sidecar_etag: sidecar.etag.clone(),
+                })
+            }
+        }
+    }
+    refuse(closed)
+}
+
+/// Every route that could rebuild `address`, in cost order, each with its source and what closes it.
+fn candidates(
+    address: PartitionAddress,
+    today: SessionDate,
+    raw_object_present: bool,
+) -> Vec<(RederivationRoute, Provenance, Option<RouteClosed>)> {
+    let mut candidates = Vec::new();
+    if let Some(dataset) = address.raw_dataset() {
+        let key = raw_key(dataset, address.session.date());
+        let shut = (!raw_object_present).then(|| RouteClosed::RawObjectAbsent { key: key.clone() });
+        candidates.push((
+            RederivationRoute::RawObject { key },
+            dataset.provenance(),
+            shut,
+        ));
     }
 
     let rebuilt_by = today.plus_calendar_days(REBUILD_MARGIN_DAYS);
+    let provider = |provenance: Provenance, shut: Option<RouteClosed>| {
+        (RederivationRoute::Provider(provenance), provenance, shut)
+    };
     match address.family {
         SessionFamily::Bars => {
             let earliest = starter_earliest(rebuilt_by);
-            match address.session >= earliest {
-                true => {
-                    return found(RederivationRoute::Provider(Provenance::massive(
-                        MassivePlan::StocksStarter,
-                        MassiveTransport::Rest,
-                    )))
-                }
-                false => closed.push(RouteClosed::OutsideStarterWindow { earliest }),
-            }
+            candidates.push(provider(
+                Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest),
+                (address.session < earliest)
+                    .then_some(RouteClosed::OutsideStarterWindow { earliest }),
+            ));
         }
         SessionFamily::Quotes | SessionFamily::Trades => {
             let lapses_on = advanced_lapses_on();
-            match rebuilt_by.date() < lapses_on {
-                true => {
-                    return found(RederivationRoute::Provider(Provenance::massive(
-                        MassivePlan::StocksAdvanced,
-                        MassiveTransport::FlatFile,
-                    )))
-                }
-                false => closed.push(RouteClosed::AdvancedLapses { on: lapses_on }),
-            }
+            candidates.push(provider(
+                Provenance::massive(MassivePlan::StocksAdvanced, MassiveTransport::FlatFile),
+                (rebuilt_by.date() >= lapses_on)
+                    .then_some(RouteClosed::AdvancedLapses { on: lapses_on }),
+            ));
+            let faithful_from = match address.family {
+                SessionFamily::Trades => Some(alpaca_trades_faithful_from()),
+                SessionFamily::Bars | SessionFamily::Quotes => None,
+            };
+            candidates.push(provider(
+                Provenance::alpaca(AlpacaPlan::AlgoTraderPlus),
+                faithful_from
+                    .filter(|&floor| address.session < floor)
+                    .map(|faithful_from| RouteClosed::AlpacaUnfaithful { faithful_from }),
+            ));
         }
     }
-
-    match address.family {
-        SessionFamily::Bars => {}
-        SessionFamily::Quotes => {
-            return found(RederivationRoute::Provider(Provenance::alpaca(
-                AlpacaPlan::AlgoTraderPlus,
-            )))
-        }
-        SessionFamily::Trades => {
-            let faithful_from = alpaca_trades_faithful_from();
-            match address.session >= faithful_from {
-                true => {
-                    return found(RederivationRoute::Provider(Provenance::alpaca(
-                        AlpacaPlan::AlgoTraderPlus,
-                    )))
-                }
-                false => closed.push(RouteClosed::AlpacaUnfaithful { faithful_from }),
-            }
-        }
-    }
-
-    Err(NoRederivationRoute { address, closed })
+    candidates
 }
 
 fn advanced_lapses_on() -> NaiveDate {
@@ -254,20 +379,20 @@ fn starter_earliest(date: SessionDate) -> SessionDate {
     )
 }
 
-/// Whether an object exists, answered by `HEAD` so a Deep Archive object needs no restore.
-pub async fn object_exists(
+/// An object's ETag, or `None` where there is none, answered by `HEAD` so Deep Archive needs no restore.
+pub async fn object_etag(
     s3_client: &S3Client,
     bucket: &str,
     key: &str,
-) -> Result<bool, ArchiveError> {
+) -> Result<Option<String>, ArchiveError> {
     match s3_client.head_object().bucket(bucket).key(key).send().await {
-        Ok(_) => Ok(true),
+        Ok(head) => Ok(Some(head.e_tag().unwrap_or_default().to_string())),
         Err(error)
             if error
                 .as_service_error()
                 .is_some_and(|inner| inner.is_not_found()) =>
         {
-            Ok(false)
+            Ok(None)
         }
         Err(error) => Err(ArchiveError::Read {
             bucket: bucket.to_string(),
@@ -277,48 +402,78 @@ pub async fn object_exists(
     }
 }
 
-/// What a delete removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Deleted {
-    /// The partition and its provenance sidecar.
-    Partition,
-    /// Nothing was stored at the address, so nothing was removed.
-    Absent,
+/// Deletes one object only if it still carries `etag`.
+///
+/// Conditional because the archive's writers are: a fold landing after the inspection replaces the
+/// object, and an unconditional delete would remove the new bytes the route check never saw.
+async fn delete_if_unchanged(
+    s3_client: &S3Client,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> Result<(), ArchiveError> {
+    s3_client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .if_match(etag)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| ArchiveError::Write {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            message: match error
+                .raw_response()
+                .map(|response| response.status().as_u16())
+            {
+                Some(412) => "changed since it was inspected; inspect it again".to_string(),
+                _ => error.to_string(),
+            },
+        })
 }
 
-/// Deletes a partition and its sidecar, logging the route that would rebuild it.
+/// Deletes a partition and then its sidecar, each only as it was inspected.
 ///
-/// The parquet goes first: a sidecar left behind by a failed second call describes nothing, while
-/// a partition left without its sidecar is one the provenance sweep would report as unattributed.
+/// Parquet first: a sidecar a failed second call leaves behind describes nothing, and the next
+/// inspection finds it as [`Inspection::NotStored`] for [`delete_orphaned_sidecar`].
 pub async fn delete_partition(
     s3_client: &S3Client,
     bucket: &str,
     rederivable: &Rederivable,
-) -> Result<Deleted, ArchiveError> {
+) -> Result<(), ArchiveError> {
     let key = rederivable.address.key();
-    if !object_exists(s3_client, bucket, &key).await? {
-        return Ok(Deleted::Absent);
-    }
-    for object in [key.clone(), PartitionProvenance::sidecar_key(&key)] {
-        s3_client
-            .delete_object()
-            .bucket(bucket)
-            .key(&object)
-            .send()
-            .await
-            .map_err(|error| ArchiveError::Write {
-                bucket: bucket.to_string(),
-                key: object.clone(),
-                message: error.to_string(),
-            })?;
-    }
+    delete_if_unchanged(s3_client, bucket, &key, &rederivable.parquet_etag).await?;
+    delete_if_unchanged(
+        s3_client,
+        bucket,
+        &PartitionProvenance::sidecar_key(&key),
+        &rederivable.sidecar_etag,
+    )
+    .await?;
     info!(
         partition = %rederivable.address,
         key = %key,
         route = %rederivable.route,
         "Deleted archive partition"
     );
-    Ok(Deleted::Partition)
+    Ok(())
+}
+
+/// Deletes a provenance record whose parquet is already gone, as it was inspected.
+///
+/// Needs no route: it describes rows that no longer exist, and left in place it would be read as the
+/// record of whatever partition is written at the key next.
+pub async fn delete_orphaned_sidecar(
+    s3_client: &S3Client,
+    bucket: &str,
+    address: PartitionAddress,
+    etag: &str,
+) -> Result<(), ArchiveError> {
+    let sidecar = PartitionProvenance::sidecar_key(&address.key());
+    delete_if_unchanged(s3_client, bucket, &sidecar, etag).await?;
+    info!(partition = %address, key = %sidecar, "Deleted orphaned provenance record");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -339,8 +494,26 @@ mod tests {
         PartitionAddress::new(family, interval, on)
     }
 
-    fn alpaca() -> RederivationRoute {
-        RederivationRoute::Provider(Provenance::alpaca(AlpacaPlan::AlgoTraderPlus))
+    fn alpaca() -> Provenance {
+        Provenance::alpaca(AlpacaPlan::AlgoTraderPlus)
+    }
+
+    fn flat_file() -> Provenance {
+        Provenance::massive(MassivePlan::StocksAdvanced, MassiveTransport::FlatFile)
+    }
+
+    fn starter() -> Provenance {
+        Provenance::massive(MassivePlan::StocksStarter, MassiveTransport::Rest)
+    }
+
+    fn built_by(routes: &[Provenance]) -> StoredPartition {
+        StoredPartition::new(
+            "\"parquet\"".to_string(),
+            Some(StoredSidecar::new(
+                routes.to_vec(),
+                "\"sidecar\"".to_string(),
+            )),
+        )
     }
 
     #[test]
@@ -350,8 +523,9 @@ mod tests {
             BarInterval::OneDay,
             session(2021, 9, 1),
         );
-        let found = rederivation_route(target, session(2027, 1, 4), true)
-            .expect("the kept bytes rebuild any session");
+        let found =
+            rederivation_route(target, session(2027, 1, 4), &built_by(&[flat_file()]), true)
+                .expect("the kept bytes rebuild any session they built");
         assert_eq!(
             found.route(),
             &RederivationRoute::RawObject {
@@ -369,8 +543,13 @@ mod tests {
             BarInterval::OneMinute,
             session(2022, 6, 14),
         );
-        let refusal = rederivation_route(target, session(2026, 10, 12), false)
-            .expect_err("Alpaca's early trades are a downgrade and the flat files are gone");
+        let refusal = rederivation_route(
+            target,
+            session(2026, 10, 12),
+            &built_by(&[flat_file()]),
+            false,
+        )
+        .expect_err("Alpaca's early trades are a downgrade and the flat files are gone");
         assert_eq!(
             refusal.closed,
             vec![
@@ -395,65 +574,94 @@ mod tests {
             BarInterval::OneDay,
             session(2022, 6, 14),
         );
-        let open = rederivation_route(target, session(2026, 10, 3), false)
+        let stored = built_by(&[flat_file()]);
+        let open = rederivation_route(target, session(2026, 10, 3), &stored, false)
             .expect("ten days out the flat files still answer");
-        assert_eq!(
-            open.route(),
-            &RederivationRoute::Provider(Provenance::massive(
-                MassivePlan::StocksAdvanced,
-                MassiveTransport::FlatFile
-            ))
-        );
-        assert!(rederivation_route(target, session(2026, 10, 4), false).is_err());
+        assert_eq!(open.route(), &RederivationRoute::Provider(flat_file()));
+        assert!(rederivation_route(target, session(2026, 10, 4), &stored, false).is_err());
     }
 
     #[test]
-    fn test_a_trade_session_alpaca_reproduces_falls_back_to_alpaca() {
+    fn test_a_trade_session_alpaca_built_is_rebuilt_from_alpaca_from_its_floor() {
+        let stored = built_by(&[alpaca()]);
         let faithful = address(
             SessionFamily::Trades,
             BarInterval::OneDay,
             session(2023, 7, 5),
         );
-        let found = rederivation_route(faithful, session(2026, 12, 1), false)
+        let found = rederivation_route(faithful, session(2026, 12, 1), &stored, false)
             .expect("from 2023-07-05 Alpaca rebuilds trades faithfully");
-        assert_eq!(found.route(), &alpaca());
+        assert_eq!(found.route(), &RederivationRoute::Provider(alpaca()));
 
         let one_before = address(
             SessionFamily::Trades,
             BarInterval::OneDay,
             session(2023, 7, 3),
         );
-        assert!(rederivation_route(one_before, session(2026, 12, 1), false).is_err());
+        assert!(rederivation_route(one_before, session(2026, 12, 1), &stored, false).is_err());
     }
 
     #[test]
-    fn test_quotes_always_have_alpaca() {
+    fn test_a_partition_alpaca_built_is_not_rebuilt_from_massives_file() {
         let target = address(
             SessionFamily::Quotes,
             BarInterval::OneMinute,
-            session(2021, 8, 23),
+            session(2026, 9, 22),
         );
-        let found = rederivation_route(target, session(2027, 1, 4), false)
-            .expect("Alpaca serves quotes back to 2016");
-        assert_eq!(found.route(), &alpaca());
+        let found = rederivation_route(target, session(2026, 9, 25), &built_by(&[alpaca()]), true)
+            .expect("Alpaca rebuilds what Alpaca built");
+        assert_eq!(found.route(), &RederivationRoute::Provider(alpaca()));
+    }
+
+    #[test]
+    fn test_a_partition_with_two_sources_is_refused_even_with_its_raw_file() {
+        let target = address(
+            SessionFamily::Quotes,
+            BarInterval::OneMinute,
+            session(2024, 1, 25),
+        );
+        let refusal = rederivation_route(
+            target,
+            session(2026, 9, 25),
+            &built_by(&[flat_file(), alpaca()]),
+            true,
+        )
+        .expect_err("the file cannot restore the repair's rows");
+        assert_eq!(
+            refusal.closed,
+            vec![RouteClosed::MixedSources {
+                routes: vec![flat_file(), alpaca()]
+            }]
+        );
+    }
+
+    #[test]
+    fn test_a_partition_with_no_readable_record_is_refused() {
+        let target = address(
+            SessionFamily::Quotes,
+            BarInterval::OneDay,
+            session(2026, 9, 18),
+        );
+        let stored = StoredPartition::new("\"parquet\"".to_string(), None);
+        let refusal = rederivation_route(target, session(2026, 9, 25), &stored, true)
+            .expect_err("an unknown source has no known route back");
+        assert_eq!(refusal.closed, vec![RouteClosed::Unattributed]);
     }
 
     #[test]
     fn test_daily_bars_are_refused_once_they_leave_starters_window() {
         let today = session(2026, 9, 25);
+        let stored = built_by(&[starter()]);
         let inside = address(
             SessionFamily::Bars,
             BarInterval::OneDay,
             session(2021, 10, 2),
         );
         assert_eq!(
-            rederivation_route(inside, today, false)
+            rederivation_route(inside, today, &stored, false)
                 .expect("inside the window with a week to spare")
                 .route(),
-            &RederivationRoute::Provider(Provenance::massive(
-                MassivePlan::StocksStarter,
-                MassiveTransport::Rest
-            ))
+            &RederivationRoute::Provider(starter())
         );
 
         let edge = address(
@@ -461,7 +669,7 @@ mod tests {
             BarInterval::OneDay,
             session(2021, 9, 30),
         );
-        let refusal = rederivation_route(edge, today, false)
+        let refusal = rederivation_route(edge, today, &stored, false)
             .expect_err("inside the window today, outside it by the time a rebuild runs");
         assert_eq!(
             refusal.closed,
@@ -479,9 +687,9 @@ mod tests {
             session(2024, 1, 25),
         );
         assert_eq!(target.raw_key(), None);
-        let found = rederivation_route(target, session(2026, 9, 25), true)
+        let found = rederivation_route(target, session(2026, 9, 25), &built_by(&[starter()]), true)
             .expect("REST rebuilds a recent five-minute session");
-        assert!(matches!(found.route(), RederivationRoute::Provider(_)));
+        assert_eq!(found.route(), &RederivationRoute::Provider(starter()));
     }
 
     #[test]
@@ -492,23 +700,38 @@ mod tests {
                 BarInterval::OneDay,
                 session(2021, 8, 23),
             ),
-            closed: vec![RouteClosed::OutsideStarterWindow {
-                earliest: session(2021, 10, 2),
-            }],
+            closed: vec![
+                RouteClosed::OutsideStarterWindow {
+                    earliest: session(2021, 10, 2),
+                },
+                RouteClosed::NotTheSource { route: alpaca() },
+            ],
         };
         assert_eq!(
             refusal.to_string(),
             "refusing to delete bars one_day 2021-08-23: nothing could rebuild it (Starter answers \
-             from 2021-10-02)"
+             from 2021-10-02; alpaca under algo_trader_plus did not build it)"
         );
     }
 
+    /// Every request's method, decoded key and `If-Match`, answered by `respond`.
     fn scripted_s3_client(
+        seen: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
         respond: impl Fn(&http::Method, &str) -> http::Response<SdkBody> + Send + Sync + 'static,
     ) -> S3Client {
         let http_client = infallible_client_fn(move |request| {
             let method = request.method().clone();
-            let key = percent_decode_str(request.uri().path()).decode_utf8_lossy();
+            let key = percent_decode_str(request.uri().path())
+                .decode_utf8_lossy()
+                .to_string();
+            let if_match = request
+                .headers()
+                .get("if-match")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            seen.lock()
+                .expect("unpoisoned")
+                .push((method.to_string(), key.clone(), if_match));
             respond(&method, &key)
         });
         S3Client::from_conf(
@@ -542,57 +765,55 @@ mod tests {
                 session(2026, 9, 18),
             ),
             session(2026, 9, 25),
+            &built_by(&[alpaca()]),
             false,
         )
         .expect("recent quotes are rebuildable")
     }
 
-    #[tokio::test]
-    async fn test_a_delete_removes_the_partition_and_then_its_sidecar() {
-        let deleted: Arc<Mutex<Vec<String>>> = Arc::default();
-        let seen = Arc::clone(&deleted);
-        let client = scripted_s3_client(move |method, key| match *method {
-            http::Method::HEAD => status(200),
-            http::Method::DELETE => {
-                seen.lock().expect("unpoisoned").push(key.to_string());
-                status(204)
-            }
-            _ => status(500),
-        });
+    const PARTITION: &str =
+        "/data/derived/equity/quotes/interval=one_day/year=2026/month=09/day=18/data.parquet";
 
-        let outcome = delete_partition(&client, "archive", &recent_quotes())
+    #[tokio::test]
+    async fn test_a_delete_removes_each_object_only_as_it_was_inspected() {
+        let seen: Arc<Mutex<Vec<(String, String, Option<String>)>>> = Arc::default();
+        let client = scripted_s3_client(Arc::clone(&seen), |_, _| status(204));
+
+        delete_partition(&client, "archive", &recent_quotes())
             .await
             .expect("the delete succeeds");
 
-        assert_eq!(outcome, Deleted::Partition);
-        let partition =
-            "/data/derived/equity/quotes/interval=one_day/year=2026/month=09/day=18/data.parquet";
         assert_eq!(
-            *deleted.lock().expect("unpoisoned"),
+            *seen.lock().expect("unpoisoned"),
             vec![
-                partition.to_string(),
-                format!("{partition}.provenance.json")
+                (
+                    "DELETE".to_string(),
+                    PARTITION.to_string(),
+                    Some("\"parquet\"".to_string())
+                ),
+                (
+                    "DELETE".to_string(),
+                    format!("{PARTITION}.provenance.json"),
+                    Some("\"sidecar\"".to_string())
+                ),
             ]
         );
     }
 
     #[tokio::test]
-    async fn test_a_partition_that_is_not_stored_deletes_nothing() {
-        let deletes: Arc<Mutex<usize>> = Arc::default();
-        let seen = Arc::clone(&deletes);
-        let client = scripted_s3_client(move |method, _| match *method {
-            http::Method::HEAD => status(404),
-            _ => {
-                *seen.lock().expect("unpoisoned") += 1;
-                status(204)
-            }
-        });
+    async fn test_a_partition_rewritten_since_inspection_is_left_with_its_record() {
+        let seen: Arc<Mutex<Vec<(String, String, Option<String>)>>> = Arc::default();
+        let client = scripted_s3_client(Arc::clone(&seen), |_, _| status(412));
 
-        let outcome = delete_partition(&client, "archive", &recent_quotes())
+        let error = delete_partition(&client, "archive", &recent_quotes())
             .await
-            .expect("an absent partition is not an error");
+            .expect_err("a fold replaced the parquet after it was inspected");
 
-        assert_eq!(outcome, Deleted::Absent);
-        assert_eq!(*deletes.lock().expect("unpoisoned"), 0);
+        assert!(error.to_string().contains("changed since it was inspected"));
+        assert_eq!(
+            seen.lock().expect("unpoisoned").len(),
+            1,
+            "the sidecar is not touched once the parquet refuses"
+        );
     }
 }
