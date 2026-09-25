@@ -15,7 +15,7 @@ use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, 
 use crate::common::events::Command;
 use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
 use crate::data::archive::IndustryCodesOutcome;
-use crate::data::nightly::{Leg, LegOutcome, ReferenceCheck, ReferenceOutcome};
+use crate::data::nightly::{Leg, LegOutcome, ReferenceCheck, ReferenceOutcome, ViewCheck};
 
 /// Version stamped on every record written by this build.
 ///
@@ -892,6 +892,8 @@ pub struct ArchiveFolded {
     pub conditions_check: Option<ReferenceCheck>,
     /// Whether the published SIC mapping and its committed vocabulary still match the source.
     pub classification_check: Option<ReferenceCheck>,
+    /// Whether every DuckDB view over the buckets reads rows, bar those whose producer is dormant.
+    pub views_check: Option<ViewCheck>,
     /// What the SEC industry-code refresh did, including when it was not owed or could not run.
     ///
     /// `None` only when the budget ran out before it was reached.
@@ -1338,6 +1340,7 @@ mod tests {
                 classification_check: Some(crate::data::nightly::ReferenceCheck::Failed {
                     exit_status: 1,
                 }),
+                views_check: Some(crate::data::nightly::ViewCheck::SomeReadNothing),
                 industry_codes: Some(crate::data::archive::IndustryCodesOutcome::NotOwed {
                     filers: 1365,
                     rows_without_a_filer: 223,

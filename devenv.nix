@@ -474,7 +474,7 @@ in {
     # The last three run the shell scripts the archiver and the researcher depend on, extracting
     # their functions or sourcing their helpers. They need bash and nothing else, and were missing
     # from this list for as long as they existed, so none of them had ever run in CI.
-    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules --test test_model_artifact --test test_archiver_boot --test test_json_logging --test test_reference_checks"
+    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules --test test_model_artifact --test test_archiver_boot --test test_json_logging --test test_reference_checks --test test_view_check"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)

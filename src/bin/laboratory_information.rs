@@ -10,7 +10,7 @@ use fund::common::types::SessionDate;
 use fund::laboratory::harness::distribution;
 use fund::laboratory::information::{self, Feature, Outcome, DEFAULT_BINS};
 use fund::laboratory::journal as laboratory;
-use fund::laboratory::metrics::{self, Distribution};
+use fund::laboratory::metrics;
 use fund::laboratory::{dataset, information::Paired};
 
 use polars::prelude::*;
@@ -390,6 +390,7 @@ fn render(triaged: &[laboratory::FeatureTriaged], panel_rows: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fund::laboratory::metrics::Distribution;
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

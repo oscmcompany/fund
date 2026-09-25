@@ -430,6 +430,28 @@ impl ReferenceCheck {
     }
 }
 
+/// What `tools/check-views` reported: whether every view over the buckets answers something.
+///
+/// Its own enum rather than a [`ReferenceCheck`], because a view that reads nothing is our defect
+/// and not the provider moving. `Failed` is a check that could not reach S3 and so saw nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ViewCheck {
+    AllRead,
+    SomeReadNothing,
+    Failed { exit_status: i32 },
+}
+
+impl ViewCheck {
+    /// Reads the tool's contract: 0 every view read rows, 3 some did not, anything else no check.
+    pub fn from_exit_status(exit_status: i32) -> Self {
+        match exit_status {
+            0 => ViewCheck::AllRead,
+            3 => ViewCheck::SomeReadNothing,
+            exit_status => ViewCheck::Failed { exit_status },
+        }
+    }
+}
+
 /// What became of one leg.
 ///
 /// Skipped and failed are separate variants rather than one "did not finish", because a night that
@@ -1187,6 +1209,17 @@ mod report_tests {
     }
 
     /// The contract both `--check` tools state in their headers, pinned to literals so a change on
+    /// `tools/check-views` exits 3 for a view that reads nothing, and 124 when `timeout` cut it off.
+    #[test]
+    fn test_a_view_check_status_reads_as_the_tool_defines_it() {
+        assert_eq!(ViewCheck::from_exit_status(0), ViewCheck::AllRead);
+        assert_eq!(ViewCheck::from_exit_status(3), ViewCheck::SomeReadNothing);
+        assert_eq!(
+            ViewCheck::from_exit_status(124),
+            ViewCheck::Failed { exit_status: 124 }
+        );
+    }
+
     /// either side fails here rather than recording drift as a failed check or the reverse.
     #[test]
     fn test_a_check_status_reads_as_the_tools_define_it() {
