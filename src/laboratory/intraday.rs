@@ -260,37 +260,42 @@ pub fn session_vwaps(
 /// Only pairs whose members are both present contribute, so a hole removes the pairs that would
 /// have spanned it rather than closing over them — which is what makes the lag a real bar distance.
 pub fn autocorrelation(series: &[Option<f64>], lag: usize) -> Option<f64> {
-    if lag == 0 || series.len() <= lag + 1 {
+    if lag == 0 || series.len() <= lag + 1 || series.iter().flatten().count() <= lag + 1 {
         return None;
     }
-    let present: Vec<f64> = series.iter().flatten().copied().collect();
-    if present.len() <= lag + 1 {
-        return None;
-    }
-    let mean = present.iter().sum::<f64>() / present.len() as f64;
-    let variance: f64 = present
-        .iter()
-        .map(|value| (value - mean).powi(2))
-        .sum::<f64>()
-        / present.len() as f64;
+    let variance = autocovariance(series, 0)?;
     if variance <= 0.0 || !variance.is_finite() {
         return None;
     }
+    let correlation = autocovariance(series, lag)? / variance;
+    correlation.is_finite().then_some(correlation)
+}
 
-    let mut covariance = 0.0;
-    let mut pairs = 0_usize;
-    for index in lag..series.len() {
-        let (Some(later), Some(earlier)) = (series[index], series[index - lag]) else {
-            continue;
-        };
-        covariance += (later - mean) * (earlier - mean);
-        pairs += 1;
-    }
-    if pairs == 0 {
+/// Sample autocovariance at `lag` about the whole series' mean, averaged over the pairs present.
+///
+/// The time-series estimator rather than `stability`'s Pearson over pairs: one mean for the session
+/// is what Roll's spread assumes, so the bounce coefficient and the spread read the same quantity.
+/// Over a series with holes the ratio to the lag-zero value can leave ±1, which on 2026-08-20's
+/// window was 215 of 396,392 name-sessions at lag one.
+fn autocovariance(series: &[Option<f64>], lag: usize) -> Option<f64> {
+    let (total, present) = series
+        .iter()
+        .flatten()
+        .fold((0.0, 0_usize), |(total, count), value| {
+            (total + value, count + 1)
+        });
+    if present == 0 {
         return None;
     }
-    let correlation = (covariance / pairs as f64) / variance;
-    correlation.is_finite().then_some(correlation)
+    let mean = total / present as f64;
+    let (covariance, pairs) = series
+        .iter()
+        .zip(series.iter().skip(lag))
+        .filter_map(|(earlier, later)| earlier.zip(*later))
+        .fold((0.0, 0_usize), |(sum, count), (earlier, later)| {
+            (sum + (later - mean) * (earlier - mean), count + 1)
+        });
+    (pairs > 0).then(|| covariance / pairs as f64)
 }
 
 /// What the bounce check found, pooled across names and sessions.
@@ -394,25 +399,10 @@ pub fn bounce(sessions: &[SessionReturns]) -> Option<BounceReading> {
 /// measurement *of* bounce rather than one contaminated by it; a non-negative covariance means the
 /// estimator has nothing to say and `None` says so.
 pub fn roll_spread(returns: &[Option<f64>]) -> Option<f64> {
-    let present: Vec<f64> = returns.iter().flatten().copied().collect();
-    if present.len() < 3 {
+    if returns.iter().flatten().count() < 3 {
         return None;
     }
-    let mean = present.iter().sum::<f64>() / present.len() as f64;
-
-    let mut covariance = 0.0;
-    let mut pairs = 0_usize;
-    for index in 1..returns.len() {
-        let (Some(later), Some(earlier)) = (returns[index], returns[index - 1]) else {
-            continue;
-        };
-        covariance += (later - mean) * (earlier - mean);
-        pairs += 1;
-    }
-    if pairs == 0 {
-        return None;
-    }
-    let covariance = covariance / pairs as f64;
+    let covariance = autocovariance(returns, 1)?;
     (covariance < 0.0).then(|| 2.0 * (-covariance).sqrt())
 }
 
@@ -833,6 +823,29 @@ mod tests {
         assert!(
             first < -0.9,
             "the alternation still reads as bounce, got {first}"
+        );
+    }
+
+    /// The bounce coefficient and Roll's spread must read one autocovariance, about one mean, across
+    /// a hole. Hand-computed: mean 0.2, variance 0.96, and three surviving pairs each at -0.96.
+    #[test]
+    fn test_the_coefficient_and_the_spread_read_one_autocovariance() {
+        let series = [
+            Some(1.0),
+            Some(-1.0),
+            None,
+            Some(1.0),
+            Some(-1.0),
+            Some(1.0),
+        ];
+
+        let first = autocorrelation(&series, 1).unwrap();
+        let spread = roll_spread(&series).unwrap();
+
+        assert!((first - -1.0).abs() < 1e-12, "got {first}");
+        assert!(
+            (spread - 1.959_591_794_226_542_4).abs() < 1e-12,
+            "got {spread}"
         );
     }
 

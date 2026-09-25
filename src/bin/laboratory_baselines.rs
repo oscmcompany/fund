@@ -12,7 +12,8 @@ use fund::common::types::{BasisPoints, Screen, SessionDate};
 use fund::laboratory::cost::{CostModel, FillStyle, RoundTrip};
 use fund::laboratory::dataset::{self, DatasetFingerprint};
 use fund::laboratory::harness::{
-    Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study, StudyResult,
+    distribution, Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study,
+    StudyResult,
 };
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::metrics::Distribution;
@@ -410,22 +411,6 @@ fn render(scored: &[laboratory::ForecastScored]) -> String {
         ));
     }
     rendered
-}
-
-/// A statistic with its standard error, or why there is none.
-///
-/// Rendered together because the mean alone invites reading 0.01 over a few hundred sessions as a
-/// signal, and an absent distribution is a measurement that could not be made rather than a zero.
-fn distribution(value: Option<Distribution>) -> String {
-    value.map_or_else(
-        || "unmeasurable".to_string(),
-        |distribution| {
-            format!(
-                "{:+.6} ± {:.6} ({})",
-                distribution.mean, distribution.standard_error, distribution.sessions
-            )
-        },
-    )
 }
 
 #[cfg(test)]
