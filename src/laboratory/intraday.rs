@@ -278,21 +278,24 @@ pub fn autocorrelation(series: &[Option<f64>], lag: usize) -> Option<f64> {
 /// Over a series with holes the ratio to the lag-zero value can leave ±1, which on 2026-08-20's
 /// window was 215 of 396,392 name-sessions at lag one.
 fn autocovariance(series: &[Option<f64>], lag: usize) -> Option<f64> {
-    let present: Vec<f64> = series.iter().flatten().copied().collect();
-    if present.is_empty() {
+    let (total, present) = series
+        .iter()
+        .flatten()
+        .fold((0.0, 0_usize), |(total, count), value| {
+            (total + value, count + 1)
+        });
+    if present == 0 {
         return None;
     }
-    let mean = present.iter().sum::<f64>() / present.len() as f64;
-    let deviations: Vec<f64> = series
+    let mean = total / present as f64;
+    let (covariance, pairs) = series
         .iter()
         .zip(series.iter().skip(lag))
         .filter_map(|(earlier, later)| earlier.zip(*later))
-        .map(|(earlier, later)| (later - mean) * (earlier - mean))
-        .collect();
-    if deviations.is_empty() {
-        return None;
-    }
-    Some(deviations.iter().sum::<f64>() / deviations.len() as f64)
+        .fold((0.0, 0_usize), |(sum, count), (earlier, later)| {
+            (sum + (later - mean) * (earlier - mean), count + 1)
+        });
+    (pairs > 0).then(|| covariance / pairs as f64)
 }
 
 /// What the bounce check found, pooled across names and sessions.
