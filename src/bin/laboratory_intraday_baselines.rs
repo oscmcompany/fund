@@ -121,6 +121,7 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
         BarInterval::FiveMinute,
         parameters.lookback_days,
         parameters.session,
+        dataset::RESEARCH_SCREEN,
     )
     .await?;
 
@@ -132,10 +133,14 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
     let names: usize = sessions.iter().map(SessionReturns::names).sum();
     let observations: usize = sessions.iter().map(SessionReturns::observations).sum();
     println!(
-        "window: {} sessions, {} name-sessions, {} five-minute returns",
+        "window: {} sessions, {} name-sessions, {} five-minute returns, screened {}",
         sessions.len(),
         names,
-        observations
+        observations,
+        dataset
+            .fingerprint
+            .screen()
+            .map_or_else(|| "by nothing".to_string(), |screen| screen.to_string())
     );
 
     report_bounce(&sessions);

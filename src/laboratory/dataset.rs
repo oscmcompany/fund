@@ -204,18 +204,18 @@ pub struct IntradayDataset {
     pub fingerprint: DatasetFingerprint,
 }
 
-/// Reads the intraday partitions in the window and folds splits into them.
+/// Reads the intraday partitions in the window, folds splits into them, and keeps the screened names.
 ///
-/// **Deliberately stops short of the daily path's universe screen.** The intraday universe was
-/// already decided at ingestion from each session's *daily* bar, and re-applying a daily volume
-/// floor to a five-minute bar — whose volume is a fraction of the session's — would empty the
-/// window rather than screen it.
+/// The screen is judged on the window's *daily* bars, as the daily path judges it, and a five-minute
+/// bar is kept only where its name cleared on that session: a daily floor applied to one bar's
+/// volume would empty the window, and an unscreened read measures whatever the archive happens to hold.
 pub async fn intraday(
     s3_client: &S3Client,
     bucket: &str,
     interval: BarInterval,
     lookback_days: i64,
     session: SessionDate,
+    screen: Screen,
 ) -> Result<IntradayDataset, DatasetError> {
     match interval {
         BarInterval::OneMinute | BarInterval::FiveMinute => {}
@@ -227,9 +227,18 @@ pub async fn intraday(
         }
     }
 
+    let (daily, daily_fingerprint) = read_window(
+        s3_client,
+        bucket,
+        lookback_days,
+        session,
+        screen,
+        Microstructure::Omitted,
+    )
+    .await?;
     let adjustments = read_adjustments(s3_client, bucket).await?;
 
-    let bars = load_archived_bars(
+    let unscreened = load_archived_bars(
         s3_client,
         bucket,
         interval,
@@ -239,18 +248,16 @@ pub async fn intraday(
         &adjustments.boundaries,
     )
     .await?;
-    // `None`: these bars are the whole archive for the window, unscreened.
+    let bars = keep_admitted_sessions(unscreened, &daily)?;
     let fingerprint = fingerprint_of(
         &bars,
         session,
         lookback_days,
-        // `None`: these bars are the whole archive for the window, unscreened — no floor and so no
-        // window for one to have been applied over.
-        None,
+        Some(screen),
         Digests {
             splits: adjustments.splits_digest,
             boundaries: adjustments.boundaries_digest,
-            reference: None,
+            reference: daily_fingerprint.reference_digest,
         },
         None,
         Microstructure::Omitted,
@@ -258,6 +265,57 @@ pub async fn intraday(
     )?;
 
     Ok(IntradayDataset { bars, fingerprint })
+}
+
+/// Keeps each intraday bar whose `(ticker, session)` appears among the screened daily bars.
+///
+/// Per session rather than per name, so a per-session screen admits a name only on the sessions it
+/// cleared; a whole-frame screen keeps every session of the names it admits, which is the same rows.
+fn keep_admitted_sessions(
+    intraday: DataFrame,
+    screened_daily: &DataFrame,
+) -> Result<DataFrame, DatasetError> {
+    let mut sessions_by_stamp: std::collections::HashMap<i64, SessionDate> =
+        std::collections::HashMap::new();
+    let mut session_of = |stamp: i64| -> Result<SessionDate, DatasetError> {
+        if let Some(found) = sessions_by_stamp.get(&stamp) {
+            return Ok(*found);
+        }
+        let instant = DateTime::from_timestamp_millis(stamp).ok_or_else(|| {
+            DatasetError::Window(format!("bar timestamp {stamp} is not an instant"))
+        })?;
+        let found = SessionDate::at(instant);
+        sessions_by_stamp.insert(stamp, found);
+        Ok(found)
+    };
+
+    let mut admitted: std::collections::HashMap<String, std::collections::HashSet<SessionDate>> =
+        std::collections::HashMap::new();
+    let daily_tickers = screened_daily.column("ticker")?.str()?;
+    let daily_stamps = screened_daily.column("timestamp")?.i64()?;
+    for (ticker, stamp) in daily_tickers.into_iter().zip(daily_stamps) {
+        if let (Some(ticker), Some(stamp)) = (ticker, stamp) {
+            admitted
+                .entry(ticker.to_string())
+                .or_default()
+                .insert(session_of(stamp)?);
+        }
+    }
+
+    let tickers = intraday.column("ticker")?.str()?;
+    let stamps = intraday.column("timestamp")?.i64()?;
+    let mask = tickers
+        .into_iter()
+        .zip(stamps)
+        .map(|(ticker, stamp)| match (ticker, stamp) {
+            (Some(ticker), Some(stamp)) => match admitted.get(ticker) {
+                Some(sessions) => Ok(sessions.contains(&session_of(stamp)?)),
+                None => Ok(false),
+            },
+            (None, _) | (_, None) => Ok(false),
+        })
+        .collect::<Result<BooleanChunked, DatasetError>>()?;
+    Ok(intraday.filter(&mask)?)
 }
 
 /// Reads the same window as [`build`] and engineers returns from it, fitting nothing.
@@ -890,6 +948,53 @@ async fn load_archived_bars(
 mod tests {
     use super::*;
 
+    /// A bar survives only where its name cleared the screen on that session. The 20:30 Eastern bar
+    /// is already the next UTC day, so a UTC date join would drop it.
+    #[test]
+    fn test_an_intraday_bar_is_kept_only_on_a_session_its_name_cleared() {
+        let first = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 29).unwrap());
+        let second = first.plus_calendar_days(1);
+        let at = |session: SessionDate, hours: i64| {
+            (session.midnight() + chrono::Duration::hours(hours)).timestamp_millis()
+        };
+        let screened_daily = df![
+            "ticker" => ["AAA", "AAA", "BBB"],
+            "timestamp" => [at(first, 16), at(second, 16), at(first, 16)],
+        ]
+        .unwrap();
+        let intraday = df![
+            "ticker" => ["AAA", "AAA", "BBB", "BBB", "CCC"],
+            "timestamp" => [at(first, 10), at(second, 20) + 30 * 60_000, at(first, 10), at(second, 10), at(first, 10)],
+        ]
+        .unwrap();
+
+        let kept = keep_admitted_sessions(intraday, &screened_daily).unwrap();
+
+        let rows: Vec<(String, i64)> = kept
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .zip(
+                kept.column("timestamp")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .into_no_null_iter(),
+            )
+            .map(|(ticker, stamp)| (ticker.to_string(), stamp))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("AAA".to_string(), at(first, 10)),
+                ("AAA".to_string(), at(second, 20) + 30 * 60_000),
+                ("BBB".to_string(), at(first, 10)),
+            ]
+        );
+    }
+
     /// A renamed security's summaries follow its bars onto the successor symbol.
     ///
     /// `load_archived_bars` stitches a bar onto the company's current ticker while these partitions
@@ -1041,7 +1146,7 @@ mod tests {
     #[test]
     fn test_the_intraday_reader_refuses_a_daily_cadence() {
         // No network: the guard runs before anything is read, which is the point of it being a
-        // guard. `returns` is the daily path and applies a screen this one deliberately does not.
+        // guard, so it refuses before the screen's daily read as well.
         let refused = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1056,6 +1161,7 @@ mod tests {
                     SessionDate::from_date(
                         chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("a valid test date"),
                     ),
+                    RESEARCH_SCREEN,
                 )
                 .await
             });
