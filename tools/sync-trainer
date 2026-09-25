@@ -19,7 +19,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCK_FILE="/tmp/sync-trainer.pid"
-TRAINING_LOCK_FILE="/tmp/run-researcher.pid"
+RESEARCHER_LOCK_FILE="/tmp/fund-researcher.lock"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
@@ -38,16 +38,12 @@ trap 'rm -f "$LOCK_FILE"' EXIT
 
 cd "$REPO_ROOT"
 
-# Never sync mid-run. Skipping costs one cycle; the next firing after the run picks the new revision
-# up. The lock `run-researcher` holds rather than a `pgrep`, because no binary exists as a process
-# during the release build that precedes it -- the window in which a reset does the most damage.
-if [[ -f "$TRAINING_LOCK_FILE" ]]; then
-  training_pid="$(cat "$TRAINING_LOCK_FILE")"
-  if kill -0 "$training_pid" 2>/dev/null; then
-    log "A researcher run is in progress (pid $training_pid), skipping sync"
-    exit 0
-  fi
-  log "Ignoring a stale researcher lock from pid $training_pid"
+# Never sync mid-run. The same `flock` `run-researcher` holds for its whole run, held here across the
+# reset, so neither can start inside the other; a PID file left a window between check and reset.
+exec 9>"$RESEARCHER_LOCK_FILE"
+if ! flock -n 9; then
+  log "A researcher run is in progress, skipping sync"
+  exit 0
 fi
 
 if ! git fetch origin master 2>&1; then

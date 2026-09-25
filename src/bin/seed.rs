@@ -1740,11 +1740,10 @@ async fn archive_nightly(
 
     // Whole-table refreshes the trainer used to run as a side effect of training. Both are single
     // requests and rows outside the boundary window survive the merge, so this costs seconds.
-    let corporate_actions = if budget.may_start_another() {
-        Some(refresh_corporate_actions(today).await)
-    } else {
-        None
-    };
+    if budget.may_start_another() {
+        let (splits, boundaries) = refresh_corporate_actions(today).await;
+        report.record_corporate_actions(splits, boundaries);
+    }
 
     let reference = if budget.may_start_another() {
         match run_reference(today, &budget).await {
@@ -1768,7 +1767,7 @@ async fn archive_nightly(
     };
 
     let (unresolved_conditions, unclassified) = measure_the_night(&plan).await;
-    let (splits, boundaries) = corporate_actions.unzip();
+    let (splits, boundaries) = report.corporate_actions().cloned().unzip();
     let readings = NightReadings {
         unresolved_conditions,
         unclassified,
@@ -1861,10 +1860,13 @@ async fn refresh_corporate_actions(today: SessionDate) -> (TableRefresh, TableRe
     };
     let s3_client = fund::common::aws::s3_client().await;
     let now = Utc::now();
+    // `archive_splits` answers `Ok(0)` when Massive returned nothing and the stored table was kept,
+    // which is a table left stale rather than a refresh.
     let splits = TableRefresh::of(match MassiveClient::from_env() {
-        Ok(massive) => archive::archive_splits(&s3_client, &massive, &bucket, now)
-            .await
-            .map_err(|error| error.to_string()),
+        Ok(massive) => match archive::archive_splits(&s3_client, &massive, &bucket, now).await {
+            Ok(0) => Err("Massive returned no splits; the stored table was kept".to_string()),
+            other => other.map_err(|error| error.to_string()),
+        },
         Err(error) => Err(error.to_string()),
     });
     let boundaries = TableRefresh::of(match market_data_client().await {

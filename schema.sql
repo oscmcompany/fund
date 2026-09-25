@@ -44,11 +44,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_interval_timestamp -- noqa: PG01
     ON equity_bars (bar_interval, timestamp DESC);
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
--- equity_details and equity_predictions went with TiDE: the table the model wrote and the table only
--- its prediction path read. Dropped here so a database that predates the deletion loses them too.
-DROP TABLE IF EXISTS equity_predictions;
-DROP TABLE IF EXISTS equity_details;
-
 -- equity_pairs: the long/short leg mapping, plus the signal that justified the entry.
 --
 -- This is the application's own record and deliberately not a position ledger -- Alpaca holds the
@@ -87,9 +82,6 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
         OR (status = 'closed' AND closed_at IS NOT NULL AND close_reason IS NOT NULL)
     )
 );
-
--- Written by the TiDE prediction path, which is deleted; dropped from a database that predates it.
-ALTER TABLE equity_pairs DROP COLUMN IF EXISTS model_run_id;
 
 -- The evaluation pass asks for open pairs every five minutes and for nothing else on this table
 -- during a session, so the partial index is the one that matters.

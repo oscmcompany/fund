@@ -17,15 +17,14 @@ cd "${REPO_ROOT}"
 
 open_the_json_log researcher
 
-# Held for the whole run: the export leg builds before it runs, and `sync-trainer` must not reset the
-# checkout out from under that build.
-LOCK_FILE="/tmp/run-researcher.pid"
-if [[ -f "$LOCK_FILE" ]] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
-  log "Already running (pid $(cat "$LOCK_FILE")), skipping"
+# Held for the whole run: the export leg builds before it runs, and `sync-trainer` takes the same lock
+# across its reset, so the checkout cannot change under that build.
+exec 9>/tmp/fund-researcher.lock
+if ! flock -n 9; then
+  log "Already running, skipping"
   exit 0
 fi
-echo $$ > "$LOCK_FILE"
-trap 'rm -f "$STATUS_FILE" "$LOCK_FILE"' EXIT
+trap 'rm -f "$STATUS_FILE"' EXIT
 
 log "Starting at $(git rev-parse --short HEAD)"
 

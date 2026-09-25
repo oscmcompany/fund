@@ -11,7 +11,7 @@
 --            the long-term record of equity bars and ticker metadata; it
 --            accumulates for as long as the bucket keeps it.
 --   exports/ the application's nightly export of the tables only it knows
---            about -- events, predictions, pairs, account state -- plus the
+--            about -- events, pairs, account state -- plus the
 --            journal, which is the original those tables are derived from.
 --            This is what the retention window would otherwise discard.
 --
@@ -230,22 +230,15 @@ ORDER BY as_of, granularity;
 -- under data/, from the same Massive endpoint, and the trainer's archive is now their single
 -- owner -- query `training_bars` and `training_reference` above for them.
 
-.print 'Loading equity_predictions...'
-DROP VIEW IF EXISTS equity_predictions;
-CREATE OR REPLACE VIEW equity_predictions AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('records_bucket') || '/exports/equity/predictions/**/*.parquet',
-    hive_partitioning = true
-);
-
 .print 'Loading equity_pairs...'
 DROP VIEW IF EXISTS equity_pairs;
 CREATE OR REPLACE VIEW equity_pairs AS
 SELECT *
 FROM read_parquet(
     's3://' || getvariable('records_bucket') || '/exports/equity/pairs/**/*.parquet',
-    hive_partitioning = true
+    hive_partitioning = true,
+    -- Exports before the TiDE deletion carry model_run_id and later ones do not.
+    union_by_name = true
 );
 
 .print 'Loading account_snapshots...'

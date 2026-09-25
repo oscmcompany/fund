@@ -43,14 +43,13 @@ ssh exe.dev share add oscm-fund-production-application team
 ssh exe.dev share access allow oscm-fund-production-application
 ssh exe.dev publish oscm-fund-production-application 8084:8084
 
-# Provision the trainer VM from your local machine then SSH in and install
-# the training cron job.
+# Provision the researcher VM (still the `trainer` profile) from your local
+# machine, then SSH in and install its nightly cron job.
 provision-production-trainer-vm
 ssh oscm-fund-production-trainer.exe.dev
 start-trainer
 
-# Seed the S3 bar archive the trainer trains from. Needed once on a fresh
-# bucket.
+# Seed the S3 bar archive the laboratory reads. Needed once on a fresh bucket.
 devenv tasks run data:seed:s3
 
 # Launch DuckDB for a local query interface against S3 with all data lake views
@@ -71,8 +70,8 @@ start-duckdb oscm-fund-archive
 - Dashboard is available at `http://<vm-name>.vm.exe.dev:8084`
 - Git sync checks for updates every minute on both VMs; view logs at
   `/var/log/fund/sync-application.log` and `/var/log/fund/sync-trainer.log`
-- Training runs weekdays at 23:00 UTC — post-close Eastern year-round, so the artifact is ready the
-  evening before the session that uses it; view logs at `/var/log/fund/train-tide-model.log`
+- `run-researcher` runs weekdays at 23:00 UTC and ships the researcher's journal and logs to the
+  records bucket; view logs at `/var/log/fund/run-researcher.log`
 - The local `~/lab.duckdb` file is scratch space. It can be deleted and rebuilt from S3 at any time.
 
 ### Principles
