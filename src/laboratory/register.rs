@@ -24,8 +24,9 @@ impl AccessionNumber {
         (number > 0).then_some(Self(number))
     }
 
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
+    /// The number after this one, or `None` once `u32` is spent.
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
     }
 
     /// The object this accession is stored at.
@@ -135,7 +136,6 @@ pub struct Accession {
     pub number: AccessionNumber,
     pub opening: Opening,
     pub status: Status,
-    pub superseded_by: Option<AccessionNumber>,
 }
 
 /// Why a change to the Register was refused.
@@ -155,13 +155,19 @@ pub enum RegisterRefusal {
     InconclusiveWithoutNotes,
 }
 
+/// Text that says something: `None` for an absent or blank value, so neither can stand in for one.
+fn stated(text: &Option<String>) -> Option<&str> {
+    text.as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
 impl Accession {
     pub fn open(number: AccessionNumber, opening: Opening) -> Self {
         Self {
             number,
             opening,
             status: Status::Open,
-            superseded_by: None,
         }
     }
 
@@ -171,7 +177,7 @@ impl Accession {
 
     /// Records the verdict. An accession closes once; a second reading is a new accession.
     pub fn close(mut self, closing: Closing) -> Result<Self, RegisterRefusal> {
-        match (&self.status, closing.verdict, &closing.notes) {
+        match (&self.status, closing.verdict, stated(&closing.notes)) {
             (Status::Closed(_), _, _) => Err(RegisterRefusal::AlreadyClosed(self.number)),
             (Status::Open, Verdict::Inconclusive, None) => {
                 Err(RegisterRefusal::InconclusiveWithoutNotes)
@@ -183,27 +189,38 @@ impl Accession {
         }
     }
 
-    /// Points this closed accession at the successor that re-measures it.
+    /// Refuses `opening` as a successor unless this accession has a verdict and no successor yet.
     ///
-    /// An accepted accession is frozen: its successor is refused unless the successor names what
-    /// changed underneath it, because a new window over the same substrate is a new free choice.
-    pub fn superseded_by(mut self, successor: &Accession) -> Result<Self, RegisterRefusal> {
-        if let Some(existing) = self.superseded_by {
+    /// An accepted accession is frozen: its successor must name what changed underneath it, because
+    /// a new window over the same substrate is a new free choice.
+    pub fn admit_successor(
+        &self,
+        existing_successor: Option<AccessionNumber>,
+        opening: &Opening,
+    ) -> Result<(), RegisterRefusal> {
+        if let Some(existing) = existing_successor {
             return Err(RegisterRefusal::AlreadySuperseded(self.number, existing));
         }
         match &self.status {
-            Status::Open => return Err(RegisterRefusal::StillOpen(self.number)),
-            Status::Closed(closing) => {
-                if closing.verdict == Verdict::Accept
-                    && successor.opening.substrate_change.is_none()
-                {
-                    return Err(RegisterRefusal::AcceptedIsFrozen(self.number));
-                }
-            }
+            Status::Open => Err(RegisterRefusal::StillOpen(self.number)),
+            Status::Closed(closing) => match (closing.verdict, stated(&opening.substrate_change)) {
+                (Verdict::Accept, None) => Err(RegisterRefusal::AcceptedIsFrozen(self.number)),
+                (Verdict::Accept, Some(_)) | (Verdict::Refute | Verdict::Inconclusive, _) => Ok(()),
+            },
         }
-        self.superseded_by = Some(successor.number);
-        Ok(self)
     }
+}
+
+/// The accession that names `predecessor` in its `supersedes`, derived rather than stored so the
+/// two directions of the link cannot disagree.
+pub fn successor_of(
+    accessions: &[Accession],
+    predecessor: AccessionNumber,
+) -> Option<AccessionNumber> {
+    accessions
+        .iter()
+        .find(|accession| accession.opening.supersedes == Some(predecessor))
+        .map(|accession| accession.number)
 }
 
 /// Errors reading or writing the Register.
@@ -226,6 +243,8 @@ pub enum RegisterError {
     Contended(AccessionNumber),
     #[error("{0}")]
     Refused(#[from] RegisterRefusal),
+    #[error("every accession number is taken")]
+    Exhausted,
 }
 
 /// Every accession number stored, in order.
@@ -327,24 +346,79 @@ pub async fn write(
     }
 }
 
-/// Opens an accession under the next unused number.
+/// Every accession stored, in order.
+pub async fn read_all(s3_client: &S3Client, bucket: &str) -> Result<Vec<Accession>, RegisterError> {
+    let mut accessions = Vec::new();
+    for number in numbers(s3_client, bucket).await? {
+        accessions.push(read(s3_client, bucket, number).await?.0);
+    }
+    Ok(accessions)
+}
+
+/// Opens an accession under the next unused number, after its predecessor, if any, admits it.
 ///
-/// The number is taken from what the bucket holds, never a local count, and the create is
-/// conditional: a second writer taking the same number makes this one retry with the next.
+/// Two successors opened at once can both pass the admission; the derived link then shows both
+/// rather than leaving either dangling.
 pub async fn open(
     s3_client: &S3Client,
     bucket: &str,
     opening: Opening,
 ) -> Result<Accession, RegisterError> {
-    let mut number = numbers(s3_client, bucket)
-        .await?
-        .last()
-        .map_or(AccessionNumber::FIRST, |last| last.next());
+    if let Some(predecessor) = opening.supersedes {
+        let accessions = read_all(s3_client, bucket).await?;
+        let stored = accessions
+            .iter()
+            .find(|accession| accession.number == predecessor)
+            .ok_or(RegisterError::Missing(predecessor))?;
+        stored.admit_successor(successor_of(&accessions, predecessor), &opening)?;
+    }
+    create(s3_client, bucket, |number| {
+        Ok(Accession::open(number, opening.clone()))
+    })
+    .await
+}
+
+/// Records a test run before the Register existed, opened and closed in one write.
+///
+/// Its bid is unrecorded by construction, so this path cannot stand in for a pre-registered open.
+pub async fn seed(
+    s3_client: &S3Client,
+    bucket: &str,
+    opening: Opening,
+    closing: Closing,
+) -> Result<Accession, RegisterError> {
+    let opening = Opening {
+        bid: Bid::Unrecorded,
+        supersedes: None,
+        substrate_change: None,
+        ..opening
+    };
+    create(s3_client, bucket, |number| {
+        Ok(Accession::open(number, opening.clone()).close(closing.clone())?)
+    })
+    .await
+}
+
+/// Writes the accession `build` makes under the next unused number.
+///
+/// The number is taken from what the bucket holds, never a local count, and the create is
+/// conditional: a second writer taking the same number makes this one retry with the next.
+async fn create(
+    s3_client: &S3Client,
+    bucket: &str,
+    build: impl Fn(AccessionNumber) -> Result<Accession, RegisterError>,
+) -> Result<Accession, RegisterError> {
+    let mut number = match numbers(s3_client, bucket).await?.last() {
+        Some(last) => last.next().ok_or(RegisterError::Exhausted)?,
+        None => AccessionNumber::FIRST,
+    };
     for _ in 0..8 {
-        let accession = Accession::open(number, opening.clone());
+        let accession = build(number)?;
         match write(s3_client, bucket, &accession, None).await {
             Ok(()) => return Ok(accession),
-            Err(RegisterError::Contended(_)) => number = number.next(),
+            Err(RegisterError::Contended(_)) => {
+                number = number.next().ok_or(RegisterError::Exhausted)?
+            }
             Err(other) => return Err(other),
         }
     }
@@ -426,42 +500,73 @@ mod tests {
             open.clone().close(closing(Verdict::Inconclusive)),
             Err(RegisterRefusal::InconclusiveWithoutNotes)
         );
+        let mut blank = closing(Verdict::Inconclusive);
+        blank.notes = Some(" ".to_string());
+        assert_eq!(
+            open.clone().close(blank),
+            Err(RegisterRefusal::InconclusiveWithoutNotes)
+        );
         let mut with_notes = closing(Verdict::Inconclusive);
         with_notes.notes = Some("widen to two years".to_string());
         assert!(open.close(with_notes).is_ok());
     }
 
     #[test]
-    fn test_an_accepted_accession_is_superseded_only_over_a_substrate_change() {
+    fn test_an_accepted_accession_is_superseded_only_over_a_stated_substrate_change() {
         let accepted = Accession::open(number(1), opening())
             .close(closing(Verdict::Accept))
             .unwrap();
-        let retune = Accession::open(number(2), opening());
         assert_eq!(
-            accepted.clone().superseded_by(&retune),
+            accepted.admit_successor(None, &opening()),
+            Err(RegisterRefusal::AcceptedIsFrozen(number(1)))
+        );
+        let mut blank = opening();
+        blank.substrate_change = Some("  ".to_string());
+        assert_eq!(
+            accepted.admit_successor(None, &blank),
             Err(RegisterRefusal::AcceptedIsFrozen(number(1)))
         );
         let mut changed = opening();
         changed.substrate_change = Some("point-in-time universe (#1144)".to_string());
-        let successor = Accession::open(number(3), changed);
-        let superseded = accepted
-            .superseded_by(&successor)
-            .expect("a substrate change");
-        assert_eq!(superseded.superseded_by, Some(number(3)));
+        assert_eq!(accepted.admit_successor(None, &changed), Ok(()));
         assert_eq!(
-            superseded.superseded_by(&successor),
+            accepted.admit_successor(Some(number(3)), &changed),
             Err(RegisterRefusal::AlreadySuperseded(number(1), number(3)))
         );
     }
 
     #[test]
+    fn test_a_refuted_accession_admits_a_successor_without_a_substrate_change() {
+        let refuted = Accession::open(number(1), opening())
+            .close(closing(Verdict::Refute))
+            .unwrap();
+        assert_eq!(refuted.admit_successor(None, &opening()), Ok(()));
+    }
+
+    #[test]
     fn test_an_open_accession_has_nothing_to_supersede() {
         let open = Accession::open(number(1), opening());
-        let successor = Accession::open(number(2), opening());
         assert_eq!(
-            open.superseded_by(&successor),
+            open.admit_successor(None, &opening()),
             Err(RegisterRefusal::StillOpen(number(1)))
         );
+    }
+
+    #[test]
+    fn test_the_successor_link_is_derived_from_the_successor() {
+        let first = Accession::open(number(1), opening());
+        let mut pointing = opening();
+        pointing.supersedes = Some(number(1));
+        let second = Accession::open(number(2), pointing);
+        let accessions = [first, second];
+        assert_eq!(successor_of(&accessions, number(1)), Some(number(2)));
+        assert_eq!(successor_of(&accessions, number(2)), None);
+    }
+
+    #[test]
+    fn test_the_last_number_has_no_next() {
+        assert_eq!(number(1).next(), Some(number(2)));
+        assert_eq!(number(u32::MAX).next(), None);
     }
 
     #[test]

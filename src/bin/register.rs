@@ -26,6 +26,8 @@ enum Command {
     Open(OpenArguments),
     /// Close an open accession with its verdict.
     Close(CloseArguments),
+    /// Record a test run before the Register existed, opened and closed at once with no bid.
+    Seed(SeedArguments),
     /// Print every accession, one line each.
     List,
     /// Print one accession in full.
@@ -46,11 +48,8 @@ struct OpenArguments {
     #[arg(long)]
     hypothesis: String,
     /// The expected effect and interval in the verdict's units, e.g. "+4bp net, 80% [0, +9]".
-    #[arg(long, required_unless_present = "unrecorded_bid")]
-    bid: Option<String>,
-    /// Only for the seed: tests run before bids existed, which are never reconstructed.
-    #[arg(long, conflicts_with = "bid")]
-    unrecorded_bid: bool,
+    #[arg(long)]
+    bid: String,
     /// The closed accession this one re-measures.
     #[arg(long)]
     supersedes: Option<u32>,
@@ -73,11 +72,8 @@ struct CloseArguments {
     verdict: VerdictArgument,
     #[arg(long)]
     statistic: String,
-    #[arg(long, required_unless_present = "unrecorded_sessions")]
-    sessions: Option<usize>,
-    /// Only for the seed: results whose session count was never written down.
-    #[arg(long, conflicts_with = "sessions")]
-    unrecorded_sessions: bool,
+    #[arg(long)]
+    sessions: usize,
     #[arg(long = "commit")]
     commits: Vec<String>,
     /// For an inconclusive verdict, the one change its successor makes.
@@ -89,6 +85,39 @@ struct CloseArguments {
     bytes_read: Option<u64>,
     #[arg(long)]
     dollars: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+struct SeedArguments {
+    #[arg(long)]
+    family: String,
+    #[arg(long)]
+    universe: String,
+    #[arg(long)]
+    horizon: String,
+    #[arg(long)]
+    hypothesis: String,
+    #[arg(long, value_enum)]
+    verdict: VerdictArgument,
+    #[arg(long)]
+    statistic: String,
+    /// Absent where the original study never wrote its count down.
+    #[arg(long)]
+    sessions: Option<usize>,
+    #[arg(long = "commit")]
+    commits: Vec<String>,
+    #[arg(long)]
+    notes: Option<String>,
+}
+
+impl From<VerdictArgument> for Verdict {
+    fn from(verdict: VerdictArgument) -> Self {
+        match verdict {
+            VerdictArgument::Accept => Verdict::Accept,
+            VerdictArgument::Refute => Verdict::Refute,
+            VerdictArgument::Inconclusive => Verdict::Inconclusive,
+        }
+    }
 }
 
 #[tokio::main]
@@ -126,39 +155,22 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
                     universe: open.universe,
                     horizon: open.horizon,
                     hypothesis: open.hypothesis,
-                    bid: match open.bid {
-                        Some(bid) => Bid::Recorded(bid),
-                        None => Bid::Unrecorded,
-                    },
+                    bid: Bid::Recorded(open.bid),
                     opened: today,
                     supersedes,
                     substrate_change: open.substrate_change,
                 },
             )
             .await?;
-            // The predecessor is pointed at its successor after the successor exists, so a failure
-            // here leaves an open accession naming what it supersedes rather than a dangling link.
-            if let Some(predecessor) = supersedes {
-                let (previous, etag) = register::read(&s3_client, &bucket, predecessor).await?;
-                let pointed = previous.superseded_by(&opened)?;
-                register::write(&s3_client, &bucket, &pointed, Some(&etag)).await?;
-            }
             println!("opened {}", opened.number);
         }
         Command::Close(close) => {
             let (accession, etag) =
                 register::read(&s3_client, &bucket, number(close.number)?).await?;
             let closed = accession.close(Closing {
-                verdict: match close.verdict {
-                    VerdictArgument::Accept => Verdict::Accept,
-                    VerdictArgument::Refute => Verdict::Refute,
-                    VerdictArgument::Inconclusive => Verdict::Inconclusive,
-                },
+                verdict: close.verdict.into(),
                 statistic: close.statistic,
-                sessions: match close.sessions {
-                    Some(count) => Sessions::Counted(count),
-                    None => Sessions::Unrecorded,
-                },
+                sessions: Sessions::Counted(close.sessions),
                 commits: close.commits,
                 closed: today,
                 notes: close.notes,
@@ -171,10 +183,41 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             register::write(&s3_client, &bucket, &closed, Some(&etag)).await?;
             println!("closed {}", closed.number);
         }
+        Command::Seed(seed) => {
+            let seeded = register::seed(
+                &s3_client,
+                &bucket,
+                Opening {
+                    family: seed.family,
+                    universe: seed.universe,
+                    horizon: seed.horizon,
+                    hypothesis: seed.hypothesis,
+                    bid: Bid::Unrecorded,
+                    opened: today,
+                    supersedes: None,
+                    substrate_change: None,
+                },
+                Closing {
+                    verdict: seed.verdict.into(),
+                    statistic: seed.statistic,
+                    sessions: match seed.sessions {
+                        Some(count) => Sessions::Counted(count),
+                        None => Sessions::Unrecorded,
+                    },
+                    commits: seed.commits,
+                    closed: today,
+                    notes: seed.notes,
+                    cost: StudyCost::default(),
+                },
+            )
+            .await?;
+            println!("seeded {}", seeded.number);
+        }
         Command::List => {
-            for number in register::numbers(&s3_client, &bucket).await? {
-                let (accession, _) = register::read(&s3_client, &bucket, number).await?;
-                println!("{}", line(&accession));
+            let accessions = register::read_all(&s3_client, &bucket).await?;
+            for accession in &accessions {
+                let successor = register::successor_of(&accessions, accession.number);
+                println!("{}", line(accession, successor));
             }
         }
         Command::Show { number: value } => {
@@ -198,14 +241,13 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// One accession on one line: number, state, family, and the hypothesis.
-fn line(accession: &Accession) -> String {
+/// One accession on one line: number, state, family, the hypothesis, and any successor.
+fn line(accession: &Accession, successor: Option<AccessionNumber>) -> String {
     let state = match &accession.status {
         Status::Open => "open".to_string(),
         Status::Closed(closing) => format!("{:?}", closing.verdict).to_lowercase(),
     };
-    let superseded = accession
-        .superseded_by
+    let superseded = successor
         .map(|successor| format!(" -> {successor}"))
         .unwrap_or_default();
     format!(
@@ -231,18 +273,17 @@ mod tests {
             supersedes: None,
             substrate_change: None,
         };
-        let mut accession = Accession::open(AccessionNumber::new(5).unwrap(), opening);
+        let accession = Accession::open(AccessionNumber::new(5).unwrap(), opening);
         assert_eq!(
-            line(&accession),
+            line(&accession, None),
             "0005  open         overnight            overnight returns survive costs"
         );
-        accession.superseded_by = AccessionNumber::new(21);
-        assert!(line(&accession).ends_with("-> 0021"));
+        assert!(line(&accession, AccessionNumber::new(21)).ends_with("-> 0021"));
     }
 
     #[test]
-    fn test_an_opening_needs_exactly_one_of_a_bid_or_its_absence() {
-        let base = [
+    fn test_only_a_seed_may_omit_the_bid_or_the_session_count() {
+        let open = [
             "register",
             "open",
             "--family",
@@ -254,20 +295,9 @@ mod tests {
             "--hypothesis",
             "x",
         ];
-        assert!(Arguments::try_parse_from(base).is_err());
-        assert!(Arguments::try_parse_from(base.iter().chain(&["--bid", "+4bp"])).is_ok());
-        assert!(Arguments::try_parse_from(base.iter().chain(&["--unrecorded-bid"])).is_ok());
-        assert!(Arguments::try_parse_from(base.iter().chain(&[
-            "--bid",
-            "+4bp",
-            "--unrecorded-bid"
-        ]))
-        .is_err());
-    }
-
-    #[test]
-    fn test_a_closing_needs_exactly_one_of_a_session_count_or_its_absence() {
-        let base = [
+        assert!(Arguments::try_parse_from(open).is_err());
+        assert!(Arguments::try_parse_from(open.iter().chain(&["--bid", "+4bp"])).is_ok());
+        let close = [
             "register",
             "close",
             "3",
@@ -276,15 +306,26 @@ mod tests {
             "--statistic",
             "t=0.4",
         ];
-        assert!(Arguments::try_parse_from(base).is_err());
-        assert!(Arguments::try_parse_from(base.iter().chain(&["--sessions", "499"])).is_ok());
-        assert!(Arguments::try_parse_from(base.iter().chain(&["--unrecorded-sessions"])).is_ok());
-        assert!(Arguments::try_parse_from(base.iter().chain(&[
-            "--sessions",
-            "499",
-            "--unrecorded-sessions"
-        ]))
-        .is_err());
+        assert!(Arguments::try_parse_from(close).is_err());
+        assert!(Arguments::try_parse_from(close.iter().chain(&["--sessions", "499"])).is_ok());
+        let seed = [
+            "register",
+            "seed",
+            "--family",
+            "f",
+            "--universe",
+            "u",
+            "--horizon",
+            "h",
+            "--hypothesis",
+            "x",
+            "--verdict",
+            "refute",
+            "--statistic",
+            "t=0.4",
+        ];
+        assert!(Arguments::try_parse_from(seed).is_ok());
+        assert!(Arguments::try_parse_from(seed.iter().chain(&["--bid", "+4bp"])).is_err());
     }
 
     #[test]
