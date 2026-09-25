@@ -63,6 +63,7 @@ pub enum Observation {
     RegimeMeasured(RegimeMeasured),
     ConvergenceMeasured(ConvergenceMeasured),
     StudyMeasured(StudyMeasured),
+    SlippageMeasured(SlippageMeasured),
 }
 
 impl Observation {
@@ -76,6 +77,7 @@ impl Observation {
             Observation::RegimeMeasured(_) => "regime_measured",
             Observation::ConvergenceMeasured(_) => "convergence_measured",
             Observation::StudyMeasured(_) => "study_measured",
+            Observation::SlippageMeasured(_) => "slippage_measured",
         }
     }
 }
@@ -225,6 +227,22 @@ pub struct StabilityMeasured {
     pub sessions: usize,
     pub autocorrelations: Vec<Association>,
     pub sign_agreements: Vec<SignAgreement>,
+}
+
+/// What the trader's own entries paid against the prices they were decided at.
+///
+/// A measurement of the record rather than a test of a hypothesis, so it carries no family: read
+/// from `pair_opened`, whose fill and decision prices have sat side by side and never subtracted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlippageMeasured {
+    pub legs: usize,
+    /// Legs whose decision price could not be divided by.
+    pub undefined: usize,
+    /// The mean of each session's mean leg cost in basis points, with its error across sessions.
+    pub cost_basis_points: Option<Distribution>,
+    /// The first and last session the legs came from.
+    pub first_session: Option<SessionDate>,
+    pub last_session: Option<SessionDate>,
 }
 
 /// How much one feature says about the session it precedes.

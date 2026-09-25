@@ -825,6 +825,85 @@ fn read_journal_frame(path: &Path) -> Result<(DataFrame, usize), String> {
     Ok((frame, unparsable))
 }
 
+/// Rebuilds each row of an exported journal frame into the line it was read from.
+///
+/// The inverse of [`read_journal_frame`]: the envelope comes back from its columns and the payload
+/// from the JSON text it was stored as, so a line exported and imported reads as the original. The
+/// timestamp returns at millisecond precision, which is what the export kept.
+pub fn journal_lines_from_frame(frame: &DataFrame) -> Result<String, PolarsError> {
+    let schema_versions = frame.column("schema_version")?.i64()?;
+    let text = |name: &str| -> Result<Vec<Option<String>>, PolarsError> {
+        Ok(frame
+            .column(name)?
+            .str()?
+            .into_iter()
+            .map(|value| value.map(str::to_string))
+            .collect())
+    };
+    let event_ids = text("event_id")?;
+    let correlation_ids = text("correlation_id")?;
+    let event_types = text("event_type")?;
+    let session_dates = text("session_date")?;
+    let payloads = text("payload")?;
+    let timestamps = frame.column("timestamp")?.i64()?;
+
+    let mut lines = String::new();
+    for row in 0..frame.height() {
+        let timestamp = timestamps
+            .get(row)
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let payload: Value = payloads[row]
+            .as_deref()
+            .and_then(|payload| serde_json::from_str(payload).ok())
+            .unwrap_or(Value::Null);
+        let line = serde_json::json!({
+            "schema_version": schema_versions.get(row),
+            "event_id": event_ids[row],
+            "correlation_id": correlation_ids[row],
+            "session_date": session_dates[row],
+            "timestamp": timestamp,
+            "event_type": event_types[row],
+            "payload": payload,
+        });
+        lines.push_str(&line.to_string());
+        lines.push('\n');
+    }
+    Ok(lines)
+}
+
+/// Every record one producer has exported, read back in session order.
+///
+/// Reads the shipped copy rather than a box's local files, so a study sees what the archive holds
+/// whether or not the host that wrote it is running.
+pub async fn read_exported_journal(
+    s3_client: &S3Client,
+    bucket: &str,
+    producer: Producer,
+) -> Result<Vec<crate::common::journal::ReadRecord>, crate::data::archive::ArchiveError> {
+    let prefix = producer_prefix(JOURNAL_PREFIX, producer);
+    let sessions = crate::data::archive::present_partitions(
+        s3_client,
+        bucket,
+        &prefix,
+        SessionDate::from_date(NaiveDate::MIN),
+        SessionDate::from_date(NaiveDate::MAX),
+    )
+    .await?;
+    let mut records = Vec::new();
+    for session in sessions {
+        let key = date_partitioned_key(&prefix, session.date());
+        let Some(frame) = crate::data::archive::read_partition(s3_client, bucket, &key).await?
+        else {
+            continue;
+        };
+        records.extend(crate::common::journal::read_records(
+            &journal_lines_from_frame(&frame)?,
+        ));
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1595,5 +1674,45 @@ run_wrapped child bash -c 'echo "   Compiling polars v0.51.0"'
             log_key(Producer::Trader, "seed-archive-nightly", date),
             log_key(Producer::Trader, "api", date)
         );
+    }
+
+    /// A line exported and imported reads as the record that was written, which is what lets a
+    /// study read the shipped copy instead of the box that wrote it.
+    #[test]
+    fn test_an_exported_journal_imports_as_the_records_it_came_from() {
+        use crate::common::journal::{Observation, PassEvaluated, ReadLine, Record};
+        let directory =
+            std::env::temp_dir().join(format!("fund-journal-import-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session-2026-08-11.jsonl");
+        let timestamp = DateTime::parse_from_rfc3339("2026-08-11T20:15:00.123Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let record = Record::new(
+            uuid::Uuid::nil(),
+            timestamp,
+            Observation::PassEvaluated(Box::new(PassEvaluated {
+                open_pairs_at_start: 2,
+                drawdown: Some(0.0125),
+                ..PassEvaluated::default()
+            })),
+        );
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let (frame, skipped) = read_journal_frame(&path).expect("the file frames");
+        assert_eq!(skipped, 0);
+        let read = crate::common::journal::read_records(
+            &journal_lines_from_frame(&frame).expect("the frame rebuilds"),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+
+        match read.as_slice() {
+            [ReadLine::Read(imported)] => assert_eq!(**imported, record),
+            other => panic!("imported as {other:?}"),
+        }
     }
 }
