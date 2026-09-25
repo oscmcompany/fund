@@ -7,8 +7,9 @@
 #
 #   AWS_S3_ARCHIVE_BUCKET_NAME=... AWS_S3_RECORDS_BUCKET_NAME=... FUND_PROFILE=production tools/check-views
 #
-# Exits 0 when every view reads rows, 3 when any does not, and anything else when the check could not
-# be made. The archiver's nightly records which on `ArchiveFolded`. `DUCKDB` overrides the binary.
+# Exits 0 when every live view reads rows and every dormant one is empty, 3 when any is not, and
+# anything else when the check could not be made. The archiver's nightly records which on
+# `ArchiveFolded`. `DUCKDB` overrides the binary.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +44,28 @@ case "${FUND_PROFILE:-}" in
     ;;
 esac
 
+# A view's own block of the script, from its `Loading` line to the next one, run alone after the
+# connection preamble so an error it raises can only be its own. No count follows: the creation is
+# what is being asked about, and a count of a view that failed to create adds an error of its own.
+view_alone() {
+  local view="$1"
+  sed -n '1,/^\.bail off$/p' "${INITIALIZATION}"
+  awk -v start=".print 'Loading ${view}...'" '
+    $0 == start { inside = 1; print; next }
+    inside && /^\.print / { exit }
+    inside { print }
+  ' "${INITIALIZATION}"
+}
+
+# Whether a dormant view that produced no count failed only because its producer has written nothing.
+# Any other error -- a schema mismatch, a denied read -- is the view breaking, dormant or not.
+empty_because_unwritten() {
+  local errors
+  errors="$(view_alone "$1" | "${DUCKDB}" -csv -noheader 2>&1 >/dev/null)" || true
+  grep -q 'No files found that match the pattern' <<<"${errors}" \
+    && ! grep -v 'No files found that match the pattern' <<<"${errors}" | grep -q 'Error'
+}
+
 is_dormant() {
   local view="$1" candidate
   for candidate in "${DORMANT[@]}"; do
@@ -65,15 +88,20 @@ done < <(grep -E '^[a-z_]+,[0-9]+$' <<<"${OUTPUT}" || true)
 
 broken=0
 live=0
+dormant=0
 unread=0
 for view in "${VIEWS[@]}"; do
   rows="${ROWS[${view}]:-}"
   if is_dormant "${view}"; then
+    dormant=$((dormant + 1))
     if [[ -n "${rows}" && "${rows}" -gt 0 ]]; then
       echo "${view}: dormant but reads ${rows} rows; remove it from the dormant list"
       broken=$((broken + 1))
-    else
+    elif [[ -n "${rows}" ]] || empty_because_unwritten "${view}"; then
       echo "${view}: dormant"
+    else
+      echo "${view}: dormant, and failed for a reason other than its producer writing nothing"
+      broken=$((broken + 1))
     fi
     continue
   fi
@@ -96,7 +124,7 @@ if [[ "${live}" -gt 0 && "${unread}" -eq "${live}" ]]; then
   exit 1
 fi
 if [[ "${broken}" -gt 0 ]]; then
-  echo "${broken} of ${#VIEWS[@]} views answer nothing"
+  echo "${broken} of ${#VIEWS[@]} views are not in the state this profile expects"
   exit "${BROKEN_STATUS}"
 fi
-echo "All ${#VIEWS[@]} views read rows"
+echo "All ${live} live views read rows; ${dormant} dormant views are empty"
