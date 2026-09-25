@@ -76,7 +76,7 @@ pub struct DatasetFingerprint {
     /// Content of the boundary table the series were stitched and bounded against.
     pub boundaries_digest: u64,
     /// Content of the point-in-time universe the bars were classified against, or `None` where none
-    /// was joined.
+    /// was joined. On the intraday path it is the universe the screen was judged against.
     ///
     /// The universe *is* part of the result: two runs over the same window and the same splits, one
     /// before the reference backfill extended and one after, measure different sets of names and
@@ -248,6 +248,18 @@ pub async fn intraday(
         &adjustments.boundaries,
     )
     .await?;
+    // Two reads of the tables, so a rewrite between them would screen and fold under different ones.
+    if (adjustments.splits_digest, adjustments.boundaries_digest)
+        != (
+            daily_fingerprint.splits_digest,
+            daily_fingerprint.boundaries_digest,
+        )
+    {
+        return Err(DatasetError::Window(
+            "the split or boundary table changed between the daily screen and the intraday read"
+                .to_string(),
+        ));
+    }
     let bars = keep_admitted_sessions(unscreened, &daily)?;
     let fingerprint = fingerprint_of(
         &bars,
