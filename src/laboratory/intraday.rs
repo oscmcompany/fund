@@ -449,23 +449,19 @@ pub fn panel_frame(session: &SessionReturns) -> Result<DataFrame, IntradayError>
 /// *adjacent* closes landing on opposite sides of one spread, so it mostly dies at `skip = 2` while
 /// genuine convergence, which takes longer than five minutes, does not.
 pub struct SkippedPersistence {
-    pub skip: usize,
-    name: String,
+    skip: usize,
 }
 
 impl SkippedPersistence {
     /// Refuses `skip` below two, which is plain persistence and skips nothing.
     pub fn new(skip: usize) -> Option<Self> {
-        (skip >= 2).then(|| Self {
-            skip,
-            name: format!("persistence_skip_{skip}"),
-        })
+        (skip >= 2).then_some(Self { skip })
     }
 }
 
 impl crate::laboratory::predictor::Predictor for SkippedPersistence {
-    fn name(&self) -> &str {
-        &self.name
+    fn name(&self) -> String {
+        format!("persistence_skip_{}", self.skip)
     }
 
     fn score(&self, history: &crate::laboratory::predictor::History) -> Vec<Option<f64>> {

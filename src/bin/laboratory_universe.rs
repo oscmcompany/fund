@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
+use clap::Parser;
 use polars::prelude::*;
 use tracing::{error, info};
 
@@ -13,8 +14,6 @@ use fund::common::log::init_tracing;
 use fund::common::types::{Screen, ScreenWindow, SessionDate};
 use fund::data::universe::filter_liquid_bars;
 use fund::laboratory::dataset;
-
-const USAGE: &str = "Usage: laboratory_universe [LOOKBACK_DAYS] [TRAILING_DAYS]";
 
 /// Calendar days of archive to read, matching the other laboratory runners.
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
@@ -25,41 +24,22 @@ const DEFAULT_LOOKBACK_DAYS: i64 = 730;
 /// research population and the traded population differ by.
 const DEFAULT_TRAILING_DAYS: u32 = fund::data::universe::LIQUIDITY_LOOKBACK_DAYS;
 
-struct Parameters {
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_universe",
+    about = "Counts the names each declared screen admits over one window"
+)]
+struct Arguments {
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
     lookback_days: i64,
+    #[arg(
+        default_value_t = DEFAULT_TRAILING_DAYS,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
     trailing_days: u32,
-}
-
-impl Parameters {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (lookback_days, trailing_days) = match arguments {
-            [] => (DEFAULT_LOOKBACK_DAYS, DEFAULT_TRAILING_DAYS),
-            [lookback] => (positive(lookback, "LOOKBACK_DAYS")?, DEFAULT_TRAILING_DAYS),
-            [lookback, trailing] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                u32::try_from(positive(trailing, "TRAILING_DAYS")?)
-                    .map_err(|_| format!("TRAILING_DAYS is too large a window\n{USAGE}"))?,
-            ),
-            _ => return Err(format!("Too many arguments\n{USAGE}")),
-        };
-        Ok(Self {
-            lookback_days,
-            trailing_days,
-        })
-    }
-}
-
-fn positive(raw: &str, name: &str) -> Result<i64, String> {
-    let value: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name} must be a positive integer, got {raw:?}\n{USAGE}"))?;
-    if value <= 0 {
-        return Err(format!(
-            "{name} must be greater than zero, got {value}\n{USAGE}"
-        ));
-    }
-    Ok(value)
 }
 
 /// One screen, the anchor it was applied at, and what it admitted.
@@ -185,22 +165,13 @@ const ANCHOR_SHIFT_DAYS: [i64; 3] = [1, 2, 3];
 
 #[tokio::main]
 async fn main() {
+    let parameters = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
         "laboratory-universe.log",
         Some("info"),
         "laboratory-universe",
     );
-
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
-        Ok(parameters) => parameters,
-        Err(message) => {
-            eprintln!("{message}");
-            drop(tracing_guard);
-            std::process::exit(2);
-        }
-    };
 
     let code = match run(&parameters).await {
         Ok(report) => {
@@ -218,7 +189,7 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Error>> {
+async fn run(parameters: &Arguments) -> Result<String, Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
     let session = SessionDate::at(Utc::now());
@@ -467,12 +438,9 @@ fn render(
 mod tests {
     use super::*;
 
-    fn parse(arguments: &[&str]) -> Result<Parameters, String> {
-        Parameters::parse(
-            &arguments
-                .iter()
-                .map(|argument| (*argument).to_string())
-                .collect::<Vec<_>>(),
+    fn parse(values: &[&str]) -> Result<Arguments, clap::Error> {
+        Arguments::try_parse_from(
+            std::iter::once("laboratory_universe").chain(values.iter().copied()),
         )
     }
 

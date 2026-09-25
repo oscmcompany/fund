@@ -19,10 +19,8 @@ use fund::laboratory::{dataset, intraday_convergence as measure};
 use std::collections::BTreeMap;
 
 use chrono::Timelike;
-
-const USAGE: &str =
-    "Usage: laboratory_intraday_convergence END_SESSION [LOOKBACK_DAYS] [UNIVERSE]\n\
-                     END_SESSION is an Eastern calendar date: YYYY-MM-DD.";
+use clap::builder::RangedU64ValueParser;
+use clap::Parser;
 
 /// Calendar days of archive to measure over by default.
 const DEFAULT_LOOKBACK_DAYS: i64 = 90;
@@ -47,69 +45,44 @@ const PLACEHOLDER_QUOTED_SPREAD_BASIS_POINTS: f64 = 10.0;
 /// What this study assumes about reaching the book: both legs crossed, in and out.
 const COST_MODEL: CostModel = CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR);
 
-struct Parameters {
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_intraday_convergence",
+    about = "Asks whether a dislocated pair converges inside the session"
+)]
+struct Arguments {
+    /// An Eastern calendar date: YYYY-MM-DD.
+    #[arg(value_name = "END_SESSION", value_parser = session_date)]
     session: SessionDate,
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
     lookback_days: i64,
+    /// At least two, because one ticker makes no pairs.
+    #[arg(
+        default_value_t = DEFAULT_UNIVERSE,
+        value_parser = RangedU64ValueParser::<usize>::new().range(2..),
+    )]
     universe: usize,
 }
 
-impl Parameters {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (session, lookback, universe) = match arguments {
-            [session] => (session, DEFAULT_LOOKBACK_DAYS, DEFAULT_UNIVERSE),
-            [session, lookback] => (
-                session,
-                positive(lookback, "LOOKBACK_DAYS")?,
-                DEFAULT_UNIVERSE,
-            ),
-            [session, lookback, universe] => (
-                session,
-                positive(lookback, "LOOKBACK_DAYS")?,
-                usize::try_from(positive(universe, "UNIVERSE")?).map_err(|_| {
-                    format!("UNIVERSE is larger than this platform can index\n{USAGE}")
-                })?,
-            ),
-            _ => return Err(format!("Expected an end session\n{USAGE}")),
-        };
-        let session = NaiveDate::parse_from_str(session.trim(), "%Y-%m-%d")
-            .map(SessionDate::from_date)
-            .map_err(|_| format!("END_SESSION must be YYYY-MM-DD\n{USAGE}"))?;
-        if universe < 2 {
-            return Err(format!("UNIVERSE must name at least two tickers\n{USAGE}"));
-        }
-        Ok(Self {
-            session,
-            lookback_days: lookback,
-            universe,
-        })
-    }
-}
-
-fn positive(raw: &str, name: &str) -> Result<i64, String> {
-    match raw.trim().parse::<i64>() {
-        Ok(value) if value > 0 => Ok(value),
-        _ => Err(format!("{name} must be a positive number\n{USAGE}")),
-    }
+/// Parses an Eastern calendar date.
+fn session_date(raw: &str) -> Result<SessionDate, String> {
+    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .map(SessionDate::from_date)
+        .map_err(|_| format!("expected an Eastern calendar date as YYYY-MM-DD, got {raw:?}"))
 }
 
 #[tokio::main]
 async fn main() {
+    let parameters = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
         "laboratory-intraday-convergence.log",
         Some("info"),
         "laboratory-intraday-convergence",
     );
-
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
-        Ok(parameters) => parameters,
-        Err(message) => {
-            eprintln!("{message}");
-            drop(tracing_guard);
-            std::process::exit(2);
-        }
-    };
 
     let code = match run(&parameters).await {
         Ok(()) => 0,
@@ -123,7 +96,7 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(parameters: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
 
@@ -191,7 +164,7 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
 
 /// The exchange's published hours for every session in the window.
 async fn session_hours(
-    parameters: &Parameters,
+    parameters: &Arguments,
 ) -> Result<BTreeMap<SessionDate, SessionHours>, Box<dyn std::error::Error>> {
     let client = TradingClient::from_env(AlpacaCredentials::from_env()?);
     let start = parameters.session.date() - chrono::Duration::days(parameters.lookback_days);
@@ -318,17 +291,19 @@ fn standing_at(entries: &[IntradayEntry], horizon: usize) -> Vec<IntradayEntry> 
 mod tests {
     use super::*;
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
+    fn parse(values: &[&str]) -> Result<Arguments, clap::Error> {
+        Arguments::try_parse_from(
+            std::iter::once("laboratory_intraday_convergence").chain(values.iter().copied()),
+        )
     }
 
     #[test]
     fn test_the_defaults_and_overrides_parse() {
-        let parameters = Parameters::parse(&arguments(&["2026-08-20"])).unwrap();
+        let parameters = parse(&["2026-08-20"]).unwrap();
         assert_eq!(parameters.lookback_days, 90);
         assert_eq!(parameters.universe, 200);
 
-        let parameters = Parameters::parse(&arguments(&["2026-08-20", "30", "50"])).unwrap();
+        let parameters = parse(&["2026-08-20", "30", "50"]).unwrap();
         assert_eq!(parameters.lookback_days, 30);
         assert_eq!(parameters.universe, 50);
     }
@@ -399,9 +374,9 @@ mod tests {
     /// clean null rather than as a refusal.
     #[test]
     fn test_an_unusable_window_is_refused() {
-        assert!(Parameters::parse(&arguments(&["2026-08-20", "30", "1"])).is_err());
-        assert!(Parameters::parse(&arguments(&["2026-08-20", "0"])).is_err());
-        assert!(Parameters::parse(&arguments(&["not-a-date"])).is_err());
-        assert!(Parameters::parse(&[]).is_err());
+        assert!(parse(&["2026-08-20", "30", "1"]).is_err());
+        assert!(parse(&["2026-08-20", "0"]).is_err());
+        assert!(parse(&["not-a-date"]).is_err());
+        assert!(parse(&[]).is_err());
     }
 }

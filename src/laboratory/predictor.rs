@@ -221,7 +221,8 @@ impl History<'_> {
 /// Reads a [`History`] rather than the panel, so the outcome it is scored against is out of reach
 /// by construction. A forecast that could see it would report a coefficient nobody could trade.
 pub trait Predictor {
-    fn name(&self) -> &str;
+    /// The arm's name with every free choice it carries, so two parameterisations are two rows.
+    fn name(&self) -> String;
     fn score(&self, history: &History) -> Vec<Option<f64>>;
 
     /// Whether a score is a return rather than only a place in an ordering.
@@ -241,8 +242,8 @@ pub trait Predictor {
 pub struct CrossSectionalMean;
 
 impl Predictor for CrossSectionalMean {
-    fn name(&self) -> &str {
-        "cross_sectional_mean"
+    fn name(&self) -> String {
+        "cross_sectional_mean".to_string()
     }
 
     fn score(&self, history: &History) -> Vec<Option<f64>> {
@@ -260,8 +261,8 @@ impl Predictor for CrossSectionalMean {
 pub struct Persistence;
 
 impl Predictor for Persistence {
-    fn name(&self) -> &str {
-        "persistence"
+    fn name(&self) -> String {
+        "persistence".to_string()
     }
 
     fn score(&self, history: &History) -> Vec<Option<f64>> {
@@ -279,8 +280,8 @@ pub struct Momentum {
 }
 
 impl Predictor for Momentum {
-    fn name(&self) -> &str {
-        "momentum"
+    fn name(&self) -> String {
+        format!("momentum_{}", self.sessions)
     }
 
     fn score(&self, history: &History) -> Vec<Option<f64>> {
@@ -323,8 +324,8 @@ pub struct RandomRanking {
 }
 
 impl Predictor for RandomRanking {
-    fn name(&self) -> &str {
-        "random_ranking"
+    fn name(&self) -> String {
+        format!("random_ranking_seed_{:#x}", self.seed)
     }
 
     /// A uniform draw is positive everywhere, so its directional accuracy would be the share of
@@ -384,7 +385,7 @@ pub fn evaluate(predictor: &dyn Predictor, panel: &Panel) -> Evaluation {
     }
 
     Evaluation {
-        predictor: predictor.name().to_string(),
+        predictor: predictor.name(),
         information_coefficient: metrics::summarize(
             sessions.iter().map(|s| s.information_coefficient),
         ),
@@ -530,7 +531,7 @@ mod tests {
                     .score(&original.history_before(0))
                     .iter()
                     .all(Option::is_none)
-                    || baseline.name() == "random_ranking",
+                    || baseline.name().starts_with("random_ranking"),
                 "{} scored the first session, which has nothing before it",
                 baseline.name()
             );
@@ -817,5 +818,16 @@ mod tests {
         assert_eq!(evaluation.sessions.len(), 4);
         // Nothing precedes the first session, so it yields no readings.
         assert_eq!(evaluation.sessions[0], SessionMetrics::default());
+    }
+
+    #[test]
+    fn test_an_arm_name_carries_its_free_choices() {
+        assert_eq!(Momentum { sessions: 20 }.name(), "momentum_20");
+        assert_eq!(Momentum { sessions: 5 }.name(), "momentum_5");
+        assert_eq!(
+            RandomRanking { seed: 0x5EED }.name(),
+            "random_ranking_seed_0x5eed"
+        );
+        assert_eq!(Persistence.name(), "persistence");
     }
 }

@@ -5,6 +5,8 @@
 use std::num::NonZeroUsize;
 
 use chrono::Utc;
+use clap::builder::RangedU64ValueParser;
+use clap::Parser;
 use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
@@ -21,9 +23,6 @@ use fund::laboratory::predictor::{
     RandomRanking,
 };
 
-const USAGE: &str =
-    "Usage: laboratory_baselines [LOOKBACK_DAYS] [MOMENTUM_SESSIONS] [QUOTED_SPREAD_BASIS_POINTS]";
-
 /// Calendar days of archive to measure over by default.
 ///
 /// Twice the trainer's window, because nothing here is trained and a standard error over one year
@@ -31,7 +30,7 @@ const USAGE: &str =
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
 
 /// Sessions the momentum baseline sums over by default.
-const DEFAULT_MOMENTUM_SESSIONS: i64 = 20;
+const DEFAULT_MOMENTUM_SESSIONS: usize = 20;
 
 /// Fixed, so two runs over one archive draw the same orderings and differ only where the data does.
 const RANDOM_SEED: u64 = 0x5EED;
@@ -40,7 +39,9 @@ const RANDOM_SEED: u64 = 0x5EED;
 ///
 /// Named rather than left last in the list: a control identified by its position in a `Vec` is a
 /// convention, and the next predictor appended to that list silently becomes the control.
-const CONTROL: &str = "random_ranking";
+fn control_name() -> String {
+    RandomRanking { seed: RANDOM_SEED }.name()
+}
 
 /// The multiple-testing bucket these comparisons are spent against.
 const FAMILY: &str = "daily-baselines";
@@ -51,98 +52,52 @@ const FAMILY: &str = "daily-baselines";
 /// the whole-market spread distribution on record was taken over mixed-provenance partitions and is
 /// flagged contaminated. It is an argument so that the free choice is made before the reading and
 /// recorded beside it.
-const DEFAULT_QUOTED_SPREAD_BASIS_POINTS: f64 = 10.0;
+const DEFAULT_QUOTED_SPREAD_BASIS_POINTS: &str = "10";
 
 /// What to measure, and over how much.
-struct Parameters {
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_baselines",
+    about = "Measures the forecasts a model has to beat"
+)]
+struct Arguments {
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
     lookback_days: i64,
+    #[arg(
+        default_value_t = DEFAULT_MOMENTUM_SESSIONS,
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..),
+    )]
     momentum_sessions: usize,
+    /// Zero is admissible: a locked book is a cost assumption rather than a missing one.
+    #[arg(
+        value_name = "QUOTED_SPREAD_BASIS_POINTS",
+        default_value = DEFAULT_QUOTED_SPREAD_BASIS_POINTS,
+        value_parser = quoted_spread,
+    )]
     quoted_spread: BasisPoints,
 }
 
-impl Parameters {
-    /// Reads the three positional arguments, each falling back to its default.
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (lookback_days, momentum_sessions, spread) = match arguments {
-            [] => (
-                DEFAULT_LOOKBACK_DAYS,
-                DEFAULT_MOMENTUM_SESSIONS,
-                DEFAULT_QUOTED_SPREAD_BASIS_POINTS,
-            ),
-            [lookback] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                DEFAULT_MOMENTUM_SESSIONS,
-                DEFAULT_QUOTED_SPREAD_BASIS_POINTS,
-            ),
-            [lookback, momentum] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(momentum, "MOMENTUM_SESSIONS")?,
-                DEFAULT_QUOTED_SPREAD_BASIS_POINTS,
-            ),
-            [lookback, momentum, spread] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(momentum, "MOMENTUM_SESSIONS")?,
-                spread.trim().parse::<f64>().map_err(|_| {
-                    format!("QUOTED_SPREAD_BASIS_POINTS must be a number, got {spread:?}\n{USAGE}")
-                })?,
-            ),
-            _ => return Err(format!("Too many arguments\n{USAGE}")),
-        };
-        Ok(Self {
-            lookback_days,
-            // Checked rather than cast: `as usize` truncates a value past the pointer width, and a
-            // momentum window that truncated to zero would abstain on every session in silence.
-            momentum_sessions: usize::try_from(momentum_sessions).map_err(|_| {
-                format!("MOMENTUM_SESSIONS is larger than this platform can index\n{USAGE}")
-            })?,
-            // Zero is admissible and means a locked book, which is a cost assumption rather than a
-            // missing one. Everything `BasisPoints` refuses is named, not just the negative case: a
-            // NaN told it "must not be negative" sends an operator looking for a minus sign.
-            quoted_spread: BasisPoints::new(spread).ok_or_else(|| {
-                format!(
-                    "QUOTED_SPREAD_BASIS_POINTS must be a finite width of zero or more, got \
-                     {spread}\n{USAGE}"
-                )
-            })?,
-        })
-    }
-}
-
-/// Parses a positive integer, refusing a typo rather than falling back to the default.
-///
-/// An operator who passed a window is asking for that window; quietly measuring a different one
-/// would put a number in the journal against a fingerprint nobody chose.
-fn positive(raw: &str, name: &str) -> Result<i64, String> {
-    let value: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name} must be a positive integer, got {raw:?}\n{USAGE}"))?;
-    if value <= 0 {
-        return Err(format!(
-            "{name} must be greater than zero, got {value}\n{USAGE}"
-        ));
-    }
-    Ok(value)
+/// Parses a quoted spread, refusing everything `BasisPoints` refuses rather than only a negative.
+fn quoted_spread(raw: &str) -> Result<BasisPoints, String> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .and_then(BasisPoints::new)
+        .ok_or_else(|| format!("expected a finite width of zero or more, got {raw:?}"))
 }
 
 #[tokio::main]
 async fn main() {
+    let parameters = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
         "laboratory-baselines.log",
         Some("info"),
         "laboratory-baselines",
     );
-
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
-        Ok(parameters) => parameters,
-        Err(message) => {
-            eprintln!("{message}");
-            drop(tracing_guard);
-            std::process::exit(2);
-        }
-    };
 
     let code = match run(&parameters).await {
         Ok(report) => {
@@ -166,7 +121,7 @@ async fn main() {
 ///
 /// Reads `AWS_S3_ARCHIVE_BUCKET_NAME` and writes to the laboratory journal. Nothing is fetched and nothing
 /// is published: this measures what the archive already holds.
-async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Error>> {
+async fn run(parameters: &Arguments) -> Result<String, Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
 
@@ -307,21 +262,22 @@ async fn run(parameters: &Parameters) -> Result<String, Box<dyn std::error::Erro
 /// three that carries return units and can therefore be asked whether it pays for its own spread. A
 /// rank correlation of 0.02 is uninterpretable next to a cost.
 fn measure(
-    parameters: &Parameters,
+    parameters: &Arguments,
     evaluations: &[Evaluation],
     sessions: &[i64],
     screen: Screen,
     fingerprint: &DatasetFingerprint,
 ) -> Result<Vec<StudyResult>, Box<dyn std::error::Error>> {
+    let control_name = control_name();
     let control = evaluations
         .iter()
-        .find(|evaluation| evaluation.predictor == CONTROL)
+        .find(|evaluation| evaluation.predictor == control_name)
         .ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!("no {CONTROL} arm was scored, so nothing has a control").into()
+            format!("no {control_name} arm was scored, so nothing has a control").into()
         })?;
     let treatments: Vec<&Evaluation> = evaluations
         .iter()
-        .filter(|evaluation| evaluation.predictor != CONTROL)
+        .filter(|evaluation| evaluation.predictor != control_name)
         .collect();
     let tests =
         NonZeroUsize::new(treatments.len()).ok_or_else(|| -> Box<dyn std::error::Error> {
@@ -417,13 +373,15 @@ mod tests {
     use super::*;
     use fund::laboratory::metrics::Distribution;
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
+    fn parse(values: &[&str]) -> Result<Arguments, clap::Error> {
+        Arguments::try_parse_from(
+            std::iter::once("laboratory_baselines").chain(values.iter().copied()),
+        )
     }
 
     #[test]
     fn test_no_arguments_measures_the_default_window() {
-        let parameters = Parameters::parse(&[]).unwrap();
+        let parameters = parse(&[]).unwrap();
         assert_eq!(parameters.lookback_days, 730);
         assert_eq!(parameters.momentum_sessions, 20);
         assert_eq!(parameters.quoted_spread.value(), 10.0);
@@ -431,15 +389,15 @@ mod tests {
 
     #[test]
     fn test_arguments_are_read_in_order_and_default_from_the_right() {
-        let parameters = Parameters::parse(&arguments(&["365"])).unwrap();
+        let parameters = parse(&["365"]).unwrap();
         assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.momentum_sessions, 20);
 
-        let parameters = Parameters::parse(&arguments(&["365", "5"])).unwrap();
+        let parameters = parse(&["365", "5"]).unwrap();
         assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.momentum_sessions, 5);
 
-        let parameters = Parameters::parse(&arguments(&["365", "5", "3.25"])).unwrap();
+        let parameters = parse(&["365", "5", "3.25"]).unwrap();
         assert_eq!(parameters.quoted_spread.value(), 3.25);
     }
 
@@ -448,14 +406,11 @@ mod tests {
     #[test]
     fn test_a_locked_book_is_a_spread_and_a_negative_one_is_not() {
         assert_eq!(
-            Parameters::parse(&arguments(&["365", "5", "0"]))
-                .unwrap()
-                .quoted_spread
-                .value(),
+            parse(&["365", "5", "0"]).unwrap().quoted_spread.value(),
             0.0
         );
-        assert!(Parameters::parse(&arguments(&["365", "5", "-1"])).is_err());
-        assert!(Parameters::parse(&arguments(&["365", "5", "wide"])).is_err());
+        assert!(parse(&["365", "5", "-1"]).is_err());
+        assert!(parse(&["365", "5", "wide"]).is_err());
     }
 
     /// A typo must stop the run rather than fall back. A baseline that quietly measured a different
@@ -464,17 +419,14 @@ mod tests {
     #[test]
     fn test_an_unusable_argument_is_refused() {
         for value in ["3o5", "0", "-5", ""] {
-            assert!(
-                Parameters::parse(&arguments(&[value])).is_err(),
-                "{value:?} must be refused"
-            );
+            assert!(parse(&[value]).is_err(), "{value:?} must be refused");
         }
-        assert!(Parameters::parse(&arguments(&["365", "0"])).is_err());
-        assert!(Parameters::parse(&arguments(&["365", "20", "7", "extra"])).is_err());
+        assert!(parse(&["365", "0"]).is_err());
+        assert!(parse(&["365", "20", "7", "extra"]).is_err());
     }
 
-    fn parameters() -> Parameters {
-        Parameters::parse(&arguments(&["365", "20", "10"])).expect("the fixture must parse")
+    fn parameters() -> Arguments {
+        parse(&["365", "20", "10"]).expect("the fixture must parse")
     }
 
     fn fingerprint() -> DatasetFingerprint {
@@ -527,8 +479,8 @@ mod tests {
     fn test_the_named_control_is_excluded_and_sets_the_family_count() {
         let evaluations = vec![
             evaluation("persistence", [Some(0.001); 4]),
-            evaluation("momentum", [Some(0.002); 4]),
-            evaluation(CONTROL, [Some(0.0); 4]),
+            evaluation("momentum_20", [Some(0.002); 4]),
+            evaluation(&control_name(), [Some(0.0); 4]),
         ];
 
         let studies = measure(
@@ -542,14 +494,16 @@ mod tests {
 
         assert_eq!(studies.len(), 2, "the control is not a test of itself");
         for study in &studies {
-            assert_eq!(study.control_name(), CONTROL);
+            assert_eq!(study.control_name(), "random_ranking_seed_0x5eed");
             assert_eq!(study.declaration().family().tests().get(), 2);
         }
         let questions: Vec<&str> = studies
             .iter()
             .map(|study| study.declaration().question())
             .collect();
-        assert!(questions.iter().all(|question| !question.contains(CONTROL)));
+        assert!(questions
+            .iter()
+            .all(|question| !question.contains("random_ranking")));
     }
 
     /// A fraction on the panel and basis points in the cost model, so the conversion has to happen
@@ -559,7 +513,7 @@ mod tests {
         let evaluations = vec![
             // Ten basis points a session, against a control that earns nothing.
             evaluation("persistence", [Some(0.001); 4]),
-            evaluation(CONTROL, [Some(0.0); 4]),
+            evaluation(&control_name(), [Some(0.0); 4]),
         ];
 
         let studies = measure(
@@ -575,9 +529,9 @@ mod tests {
         assert!((difference.mean - 10.0).abs() < 1e-9, "{difference:?}");
         // A pair round trip at the fixture's 10bp quoted spread costs 20bp, so ten does not pay.
         match studies[0].net_of_cost() {
-            fund::laboratory::harness::NetOfCost::Net {
+            Some(fund::laboratory::harness::NetOfCost::Net {
                 net_basis_points, ..
-            } => assert!((net_basis_points + 10.0).abs() < 1e-9, "{net_basis_points}"),
+            }) => assert!((net_basis_points + 10.0).abs() < 1e-9, "{net_basis_points}"),
             other => panic!("an aggressive fill is costable, got {other:?}"),
         }
     }
@@ -595,7 +549,7 @@ mod tests {
         )
         .is_err());
 
-        let only_control = vec![evaluation(CONTROL, [Some(0.0); 4])];
+        let only_control = vec![evaluation(&control_name(), [Some(0.0); 4])];
         assert!(measure(
             &parameters(),
             &only_control,

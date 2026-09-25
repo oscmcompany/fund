@@ -28,8 +28,9 @@ use crate::laboratory::stability::{Association, SignAgreement};
 /// `factor_specification`, naming the factor set a residual panel was fitted against. v5 adds the
 /// `study_measured` observation — the first record carrying a declaration alongside a reading — and
 /// `screen_window` beside the fingerprint's floor, because a screen is a floor *and* the stretch of
-/// history it was applied over. v6 adds `slippage_measured`.
-pub const SCHEMA_VERSION: u32 = 6;
+/// history it was applied over. v6 adds `slippage_measured`. v7 writes an unmeasurable
+/// `net_of_cost` as null where v5 and v6 wrote `{"outcome": "unmeasured"}`; both read as `None`.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Errors writing the laboratory journal.
 #[derive(Debug, thiserror::Error)]
@@ -108,7 +109,25 @@ pub struct StudyMeasured {
     pub family_wise_error_rate: f64,
     /// `None` where nothing was measurable, which is not the same as a reading that failed the bar.
     pub clears_haircut: Option<bool>,
-    pub net_of_cost: NetOfCost,
+    /// `None` exactly where `difference` is.
+    #[serde(deserialize_with = "net_of_cost_through_every_version")]
+    pub net_of_cost: Option<NetOfCost>,
+}
+
+/// Reads a `net_of_cost` from any version, mapping the retired `unmeasured` outcome to `None`.
+fn net_of_cost_through_every_version<'de, D>(deserializer: D) -> Result<Option<NetOfCost>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) if value["outcome"] == "unmeasured" => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
 }
 
 impl From<&StudyResult> for StudyMeasured {
@@ -790,6 +809,43 @@ mod tests {
         );
     }
 
+    /// A v6 record wrote an unmeasurable cost as an outcome that no longer exists; it reads as
+    /// absent rather than failing the whole record.
+    #[test]
+    fn test_a_retired_unmeasured_outcome_reads_as_absent() {
+        use crate::laboratory::harness::{DeclaredUniverse, Horizon, Pairing, Quantity, Units};
+        let unmeasured = StudyMeasured {
+            question: "does anything differ".to_string(),
+            family: "residual-panel".to_string(),
+            family_tests: 2,
+            universe: DeclaredUniverse::Unscreened,
+            horizon: Horizon::Sessions(std::num::NonZeroUsize::new(1).unwrap()),
+            quantity: Quantity::Unpriced {
+                units: Units::Share,
+            },
+            pairing: Pairing::Matched,
+            treatment: "treatment".to_string(),
+            control: "control".to_string(),
+            observations: 0,
+            treatment_reading: None,
+            control_reading: None,
+            difference: None,
+            standard_errors: None,
+            required_standard_errors: 2.24,
+            family_wise_error_rate: 0.05,
+            clears_haircut: None,
+            net_of_cost: None,
+        };
+        let mut value = serde_json::to_value(&unmeasured).unwrap();
+        assert_eq!(value["net_of_cost"], serde_json::Value::Null);
+        value["net_of_cost"] = serde_json::json!({"outcome": "unmeasured"});
+        let read: StudyMeasured = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(read.net_of_cost, None);
+        value["net_of_cost"] = serde_json::Value::Null;
+        let read: StudyMeasured = serde_json::from_value(value).unwrap();
+        assert_eq!(read.net_of_cost, None);
+    }
+
     /// The application's journal names its files by session date. Reading one of those as a
     /// laboratory file would file an instant under a trading day.
     #[test]
@@ -839,7 +895,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["schema_version"], serde_json::json!(6));
+        assert_eq!(value["schema_version"], serde_json::json!(7));
         assert_eq!(value["run_id"], serde_json::json!(run_id.to_string()));
         assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
         assert_eq!(

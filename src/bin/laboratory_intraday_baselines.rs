@@ -6,6 +6,7 @@ use chrono::NaiveDate;
 use std::collections::BTreeMap;
 
 use chrono::Timelike;
+use clap::Parser;
 use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, TradingClient};
@@ -17,9 +18,6 @@ use fund::laboratory::metrics;
 use fund::laboratory::predictor::{
     evaluate, Momentum, Panel, Persistence, Predictor, RandomRanking,
 };
-
-const USAGE: &str = "Usage: laboratory_intraday_baselines END_SESSION [LOOKBACK_DAYS]\n\
-                     END_SESSION is an Eastern calendar date: YYYY-MM-DD.";
 
 /// Calendar days of intraday archive to measure over by default.
 ///
@@ -42,56 +40,38 @@ const RANDOM_SEED: u64 = 0x5EED;
 /// reading at two cannot be mistaken for the start of a decay it is not part of.
 const SKIPS: [usize; 2] = [2, 3];
 
-struct Parameters {
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_intraday_baselines",
+    about = "Measures what a five-minute bar predicts about the next one"
+)]
+struct Arguments {
+    /// An Eastern calendar date: YYYY-MM-DD.
+    #[arg(value_name = "END_SESSION", value_parser = session_date)]
     session: SessionDate,
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
     lookback_days: i64,
 }
 
-impl Parameters {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (session, lookback) = match arguments {
-            [session] => (session, DEFAULT_LOOKBACK_DAYS),
-            [session, lookback] => (
-                session,
-                lookback
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|_| format!("LOOKBACK_DAYS must be a number\n{USAGE}"))?,
-            ),
-            _ => return Err(format!("Expected an end session\n{USAGE}")),
-        };
-        if lookback <= 0 {
-            return Err(format!("LOOKBACK_DAYS must be positive\n{USAGE}"));
-        }
-        let session = NaiveDate::parse_from_str(session.trim(), "%Y-%m-%d")
-            .map(SessionDate::from_date)
-            .map_err(|_| format!("END_SESSION must be YYYY-MM-DD\n{USAGE}"))?;
-
-        Ok(Self {
-            session,
-            lookback_days: lookback,
-        })
-    }
+/// Parses an Eastern calendar date.
+fn session_date(raw: &str) -> Result<SessionDate, String> {
+    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .map(SessionDate::from_date)
+        .map_err(|_| format!("expected an Eastern calendar date as YYYY-MM-DD, got {raw:?}"))
 }
 
 #[tokio::main]
 async fn main() {
+    let parameters = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
         "laboratory-intraday-baselines.log",
         Some("info"),
         "laboratory-intraday-baselines",
     );
-
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
-        Ok(parameters) => parameters,
-        Err(message) => {
-            eprintln!("{message}");
-            drop(tracing_guard);
-            std::process::exit(2);
-        }
-    };
 
     let code = match run(&parameters).await {
         Ok(()) => 0,
@@ -105,7 +85,7 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(parameters: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
 
@@ -153,7 +133,7 @@ async fn run(parameters: &Parameters) -> Result<(), Box<dyn std::error::Error>> 
 /// From the calendar rather than assumed, because a half-day closes at 13:00 and a fixed 16:00
 /// would read three hours of post-market prints as regular bars.
 async fn session_hours(
-    parameters: &Parameters,
+    parameters: &Arguments,
 ) -> Result<BTreeMap<SessionDate, SessionHours>, Box<dyn std::error::Error>> {
     let client = TradingClient::from_env(AlpacaCredentials::from_env()?);
     let start = parameters.session.date() - chrono::Duration::days(parameters.lookback_days);
@@ -225,29 +205,24 @@ fn report_bounce(sessions: &[SessionReturns]) {
 /// One panel per session and the coefficients averaged: a panel spanning the window would put the
 /// overnight gap on the time axis, which is the mismatch this whole measurement exists to avoid.
 fn report_baselines(sessions: &[SessionReturns]) {
-    let mut predictors: Vec<(String, Box<dyn Predictor>)> = vec![
-        ("persistence".to_string(), Box::new(Persistence)),
-        (
-            "momentum".to_string(),
-            Box::new(Momentum {
-                sessions: MOMENTUM_BARS,
-            }),
-        ),
-        (
-            "random".to_string(),
-            Box::new(RandomRanking { seed: RANDOM_SEED }),
-        ),
+    let mut predictors: Vec<Box<dyn Predictor>> = vec![
+        Box::new(Persistence),
+        Box::new(Momentum {
+            sessions: MOMENTUM_BARS,
+        }),
+        Box::new(RandomRanking { seed: RANDOM_SEED }),
     ];
     // The skip-a-bar controls, which are what make the persistence row interpretable: bounce lives
     // between adjacent closes, so it should fade here while real reversion should not.
     for skip in SKIPS {
         if let Some(skipped) = intraday::SkippedPersistence::new(skip) {
-            predictors.push((format!("persistence skip-{skip}"), Box::new(skipped)));
+            predictors.push(Box::new(skipped));
         }
     }
 
     println!("\nbaselines, one information coefficient per session");
-    for (name, predictor) in &predictors {
+    for predictor in &predictors {
+        let name = predictor.name();
         // One reading per session, not one per bar. Bars within a session overlap in the names and
         // history they read, and this module's own finding is that they are serially dependent, so
         // pooling them and dividing by the square root of their count overstates significance.
@@ -285,11 +260,11 @@ fn report_baselines(sessions: &[SessionReturns]) {
                     0.0
                 };
                 println!(
-                    "  {name:<20} {:+.5}  se {:.5}  {ratio:+.2} standard errors  over {} sessions",
+                    "  {name:<28} {:+.5}  se {:.5}  {ratio:+.2} standard errors  over {} sessions",
                     distribution.mean, distribution.standard_error, distribution.sessions
                 );
             }
-            None => println!("  {name:<20} not measurable over this window"),
+            None => println!("  {name:<28} not measurable over this window"),
         }
     }
 }
@@ -298,28 +273,30 @@ fn report_baselines(sessions: &[SessionReturns]) {
 mod tests {
     use super::*;
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
+    fn parse(values: &[&str]) -> Result<Arguments, clap::Error> {
+        Arguments::try_parse_from(
+            std::iter::once("laboratory_intraday_baselines").chain(values.iter().copied()),
+        )
     }
 
     #[test]
     fn test_the_lookback_defaults_and_parses() {
-        let parameters = Parameters::parse(&arguments(&["2026-08-20"])).unwrap();
+        let parameters = parse(&["2026-08-20"]).unwrap();
         assert_eq!(parameters.lookback_days, 90);
         assert_eq!(
             parameters.session,
             SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 8, 20).unwrap())
         );
 
-        let parameters = Parameters::parse(&arguments(&["2026-08-20", "30"])).unwrap();
+        let parameters = parse(&["2026-08-20", "30"]).unwrap();
         assert_eq!(parameters.lookback_days, 30);
     }
 
     #[test]
     fn test_an_unusable_window_is_refused() {
-        assert!(Parameters::parse(&arguments(&["2026-08-20", "0"])).is_err());
-        assert!(Parameters::parse(&arguments(&["2026-08-20", "-5"])).is_err());
-        assert!(Parameters::parse(&arguments(&["not-a-date"])).is_err());
-        assert!(Parameters::parse(&[]).is_err());
+        assert!(parse(&["2026-08-20", "0"]).is_err());
+        assert!(parse(&["2026-08-20", "-5"]).is_err());
+        assert!(parse(&["not-a-date"]).is_err());
+        assert!(parse(&[]).is_err());
     }
 }
