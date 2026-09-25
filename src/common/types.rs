@@ -8,6 +8,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
 
 /// Which bound of a [`LiquidityFloor`] a name failed, and the reading that failed it.
 ///
@@ -724,6 +725,107 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
         let raw = <String as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
         PairID::parse(&raw)
             .ok_or_else(|| format!("invalid pair id decoded from database: {}", raw).into())
+    }
+}
+
+/// Which side of a pair an order opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairLeg {
+    Long,
+    Short,
+}
+
+impl PairLeg {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PairLeg::Long => "long",
+            PairLeg::Short => "short",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        [PairLeg::Long, PairLeg::Short]
+            .into_iter()
+            .find(|leg| leg.as_str() == raw)
+    }
+}
+
+/// The identifier an order is sent to Alpaca under.
+///
+/// The UUID keeps it unique across a pair opened, closed and reopened; the pair and leg make the
+/// broker's own order history say which trade an order belongs to. An order sent before the pair
+/// was encoded carries a bare UUID and parses with no pair, which is exactly what it records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientOrderId {
+    uuid: Uuid,
+    pair: Option<(PairID, PairLeg)>,
+}
+
+/// Alpaca's limit, measured against the paper account on 2026-09-25: 128 accepted, 129 refused.
+pub const CLIENT_ORDER_ID_MAXIMUM_LENGTH: usize = 128;
+
+/// The longest identifier the format can produce: two nine-character tickers, the longer leg name,
+/// and a hyphenated UUID, which must fit Alpaca's limit for every pair the ticker format admits.
+const _: () = assert!(
+    "pair:".len() + 9 + "-".len() + 9 + ":short:".len() + 36 <= CLIENT_ORDER_ID_MAXIMUM_LENGTH
+);
+
+impl ClientOrderId {
+    /// A fresh identifier for one leg of a pair.
+    pub fn for_pair(pair: &PairID, leg: PairLeg) -> Self {
+        Self {
+            uuid: Uuid::new_v4(),
+            pair: Some((pair.clone(), leg)),
+        }
+    }
+
+    /// Reads either form Alpaca may hand back; `None` for anything this system did not send.
+    ///
+    /// Only the exact spelling this system writes is accepted: the parsers beneath accept braced or
+    /// uppercase UUIDs and lowercase tickers, and a hand-placed order in one of those must not read
+    /// as ours.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::parse_any_spelling(raw).filter(|parsed| parsed.to_string() == raw)
+    }
+
+    fn parse_any_spelling(raw: &str) -> Option<Self> {
+        if let Ok(uuid) = Uuid::parse_str(raw) {
+            return Some(Self { uuid, pair: None });
+        }
+        let mut fields = raw.split(':');
+        let (Some("pair"), Some(pair), Some(leg), Some(uuid), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return None;
+        };
+        Some(Self {
+            uuid: Uuid::parse_str(uuid).ok()?,
+            pair: Some((PairID::parse(pair)?, PairLeg::parse(leg)?)),
+        })
+    }
+
+    /// The part the journal keys an order by.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
+    /// The pair and leg this order opens, where it was sent with them.
+    pub fn pair(&self) -> Option<(&PairID, PairLeg)> {
+        self.pair.as_ref().map(|(pair, leg)| (pair, *leg))
+    }
+}
+
+impl std::fmt::Display for ClientOrderId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.pair {
+            Some((pair, leg)) => write!(formatter, "pair:{pair}:{}:{}", leg.as_str(), self.uuid),
+            None => write!(formatter, "{}", self.uuid),
+        }
     }
 }
 
@@ -3047,5 +3149,58 @@ mod tests {
         assert_ne!(then.shares_outstanding(), now.shares_outstanding());
         assert_eq!(then.as_of(), session(2021, 9, 15));
         assert!(then.shares_outstanding().unwrap() > now.shares_outstanding().unwrap());
+    }
+
+    #[test]
+    fn test_a_pair_order_id_names_its_pair_and_round_trips() {
+        let pair = PairID::new(Ticker::new("BRK.B").unwrap(), Ticker::new("XOM").unwrap());
+        let sent = ClientOrderId::for_pair(&pair, PairLeg::Short);
+        let text = sent.to_string();
+        assert_eq!(text, format!("pair:BRK.B-XOM:short:{}", sent.uuid()));
+        let read = ClientOrderId::parse(&text).expect("what was sent must parse");
+        assert_eq!(read, sent);
+        assert_eq!(read.pair(), Some((&pair, PairLeg::Short)));
+    }
+
+    #[test]
+    fn test_an_order_sent_before_the_pair_was_encoded_parses_with_no_pair() {
+        let read = ClientOrderId::parse("7885f50f-a68f-4b06-a359-fec24d64b30a")
+            .expect("a bare UUID is the old form");
+        assert_eq!(read.pair(), None);
+        assert_eq!(
+            read.uuid().to_string(),
+            "7885f50f-a68f-4b06-a359-fec24d64b30a"
+        );
+    }
+
+    #[test]
+    fn test_an_identifier_this_system_did_not_send_is_refused() {
+        for raw in [
+            "",
+            "manual-order-1",
+            "pair:BRK.B-XOM:sideways:7885f50f-a68f-4b06-a359-fec24d64b30a",
+            "pair:BRKB:long:7885f50f-a68f-4b06-a359-fec24d64b30a",
+            "pair:BRK.B-XOM:long:not-a-uuid",
+            "pair:BRK.B-XOM:long:7885f50f-a68f-4b06-a359-fec24d64b30a:extra",
+            // Spellings the parsers beneath accept and this system never writes.
+            "pair:brk.b-XOM:long:7885f50f-a68f-4b06-a359-fec24d64b30a",
+            "pair:BRK.B-XOM:long:7885F50F-A68F-4B06-A359-FEC24D64B30A",
+            "7885f50fa68f4b06a359fec24d64b30a",
+            "{7885f50f-a68f-4b06-a359-fec24d64b30a}",
+            "urn:uuid:7885f50f-a68f-4b06-a359-fec24d64b30a",
+        ] {
+            assert_eq!(ClientOrderId::parse(raw), None, "{raw:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn test_the_longest_pair_order_id_fits_alpacas_limit() {
+        let pair = PairID::new(
+            Ticker::new("ABCDE.WSA").unwrap(),
+            Ticker::new("VWXYZ.WSB").unwrap(),
+        );
+        let text = ClientOrderId::for_pair(&pair, PairLeg::Short).to_string();
+        assert_eq!(text.len(), 67);
+        assert!(text.len() <= CLIENT_ORDER_ID_MAXIMUM_LENGTH);
     }
 }

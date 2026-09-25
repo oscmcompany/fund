@@ -8,11 +8,10 @@ use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::common::types::{
-    BoundaryReason, Dollars, EquityQuote, EquityTrade, SeriesBoundary, SessionDate, Tape, Ticker,
-    TradeConditions,
+    BoundaryReason, ClientOrderId, Dollars, EquityQuote, EquityTrade, SeriesBoundary, SessionDate,
+    Tape, Ticker, TradeConditions,
 };
 
 const PAPER_BASE_URL: &str = "https://paper-api.alpaca.markets";
@@ -475,7 +474,7 @@ impl OrderIntent {
     /// `position_intent` is sent explicitly rather than left to Alpaca's inference. Without it a
     /// sell against an existing long is read as a close rather than a short, which for a strategy
     /// that holds both sides of a pair is the difference between opening a hedge and unwinding one.
-    fn to_request(&self, client_order_id: Uuid) -> OrderRequest {
+    fn to_request(&self, client_order_id: &ClientOrderId) -> OrderRequest {
         match self {
             OrderIntent::OpenLong { ticker, notional } => OrderRequest {
                 symbol: ticker.as_str().to_string(),
@@ -1159,7 +1158,7 @@ impl TradingClient {
     pub async fn submit_order(
         &self,
         intent: &OrderIntent,
-        client_order_id: Uuid,
+        client_order_id: &ClientOrderId,
     ) -> Result<String, ClientError> {
         let url = format!("{}/v2/orders", self.base_url);
         let response = error_for_status(
@@ -2972,6 +2971,7 @@ impl TradePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::{PairID, PairLeg};
 
     use serial_test::serial;
 
@@ -3398,6 +3398,10 @@ mod tests {
         }
     }
 
+    fn order_id() -> ClientOrderId {
+        ClientOrderId::for_pair(&PairID::new(ticker("AAPL"), ticker("MSFT")), PairLeg::Long)
+    }
+
     /// A long leg is sized in dollars and a short leg in whole shares, and the two must not be
     /// interchangeable. Sending `qty` on a long would lose the fractional sizing that lets the two
     /// legs match on notional; sending `notional` on a short is rejected by Alpaca outright.
@@ -3407,7 +3411,7 @@ mod tests {
             ticker: ticker("AAPL"),
             notional: Dollars::new(Decimal::new(123456, 2)).unwrap(),
         }
-        .to_request(Uuid::nil());
+        .to_request(&order_id());
         assert_eq!(long.side, "buy");
         assert_eq!(long.notional.as_deref(), Some("1234.56"));
         assert_eq!(long.qty, None);
@@ -3417,7 +3421,7 @@ mod tests {
             ticker: ticker("MSFT"),
             quantity: shares(40),
         }
-        .to_request(Uuid::nil());
+        .to_request(&order_id());
         assert_eq!(short.side, "sell");
         assert_eq!(short.notional, None);
         assert_eq!(short.qty, Some(40));
@@ -3434,7 +3438,7 @@ mod tests {
                 ticker: ticker("MSFT"),
                 quantity: shares(10),
             }
-            .to_request(Uuid::nil()),
+            .to_request(&order_id()),
         )
         .unwrap();
         assert_eq!(body["position_intent"], "sell_to_open");
@@ -3630,12 +3634,14 @@ mod tests {
     #[tokio::test]
     async fn test_submit_order_returns_the_order_identifier() {
         let mut server = mockito::Server::new_async().await;
+        let sent = order_id();
         let mock = server
             .mock("POST", "/v2/orders")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "symbol": "AAPL",
                 "side": "buy",
                 "notional": "5000.00",
+                "client_order_id": format!("pair:AAPL-MSFT:long:{}", sent.uuid()),
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -3650,7 +3656,7 @@ mod tests {
                     ticker: ticker("AAPL"),
                     notional: Dollars::new(Decimal::new(5000, 0)).unwrap(),
                 },
-                Uuid::nil(),
+                &sent,
             )
             .await
             .expect("order must submit");

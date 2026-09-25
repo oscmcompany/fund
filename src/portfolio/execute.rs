@@ -15,7 +15,7 @@ use crate::common::journal::{
     CloseRequestReason, Journal, Observation, OrderOutcome, OrderResolved, OrderSubmitted,
     PositionCloseRequested,
 };
-use crate::common::types::{PairID, Ticker};
+use crate::common::types::{ClientOrderId, PairID, PairLeg, Ticker};
 use crate::portfolio::pairs::PairEntry;
 use crate::portfolio::size::SizedPair;
 
@@ -175,6 +175,7 @@ pub async fn open_pair(
             ticker: short_ticker.clone(),
             quantity: pair.short_shares(),
         },
+        ClientOrderId::for_pair(candidate.pair_id(), PairLeg::Short),
     )
     .await?
     {
@@ -199,6 +200,7 @@ pub async fn open_pair(
             ticker: long_ticker.clone(),
             notional: pair.long_notional(),
         },
+        ClientOrderId::for_pair(candidate.pair_id(), PairLeg::Long),
     )
     .await?
     {
@@ -357,12 +359,14 @@ enum Filled {
 /// Submits one order and polls until it reaches a terminal state or the timeout expires.
 ///
 /// The intent reaches the disk before the request leaves the process, and every exit writes a
-/// resolution, so an unresolved submission means only that the process died.
+/// resolution, so an unresolved submission means only that the process died. The journal keys the
+/// order by the identifier's UUID; the broker receives the whole identifier, pair and leg included.
 async fn submit_and_confirm(
     context: &ExecutionContext<'_>,
     intent: &OrderIntent,
+    sent_as: ClientOrderId,
 ) -> Result<Filled, ExecutionError> {
-    let client_order_id = Uuid::new_v4();
+    let client_order_id = sent_as.uuid();
     let (quantity, notional) = match intent {
         OrderIntent::OpenShort { quantity, .. } => (Some(Decimal::from(quantity.get())), None),
         OrderIntent::OpenLong { notional, .. } => (None, Some(notional.value())),
@@ -382,7 +386,7 @@ async fn submit_and_confirm(
         )
         .await;
 
-    let order_id = match context.client.submit_order(intent, client_order_id).await {
+    let order_id = match context.client.submit_order(intent, &sent_as).await {
         Ok(order_id) => order_id,
         Err(error) => {
             // The order never reached the broker, so there is no identifier to resolve it under.
@@ -1040,6 +1044,61 @@ mod tests {
             .iter()
             .filter(|record| record["event_type"] == event_type)
             .collect()
+    }
+
+    /// Each leg reaches the broker named by its pair and leg, and under the same UUID the journal
+    /// keys it by, so the broker's order history can rebuild the pair without our records.
+    #[tokio::test]
+    async fn test_each_leg_is_sent_under_its_pair_and_the_journals_uuid() {
+        let mut server = mockito::Server::new_async().await;
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen = std::sync::Arc::clone(&sent);
+        let _submit = server
+            .mock("POST", "/v2/orders")
+            .with_status(200)
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body().expect("a request body"))
+                        .expect("an order is JSON");
+                seen.lock()
+                    .expect("unpoisoned")
+                    .push(body["client_order_id"].as_str().unwrap_or("").to_string());
+                br#"{"id":"order-1","status":"accepted"}"#.to_vec()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let _confirm = server
+            .mock("GET", "/v2/orders/order-1")
+            .with_status(200)
+            .with_body(filled_body("order-1"))
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let log = journal("pair-in-client-order-id");
+        open_pair(&context(&client, &log), &pair())
+            .await
+            .expect("the open must succeed");
+
+        let journaled: Vec<String> = of_type(&recorded(&log), "order_submitted")
+            .iter()
+            .map(|record| {
+                record["payload"]["client_order_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let sent = sent.lock().expect("unpoisoned").clone();
+        assert_eq!(
+            sent,
+            vec![
+                format!("pair:AAAA-BBBB:short:{}", journaled[0]),
+                format!("pair:AAAA-BBBB:long:{}", journaled[1]),
+            ]
+        );
     }
 
     /// A broker rejection resolves the submission rather than leaving it dangling.
