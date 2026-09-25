@@ -29,7 +29,7 @@ use fund::data::export;
 use fund::data::nightly::{
     self, Leg, LegOutcome, NightlyReport, ReferenceCheck, ReferenceOutcome, ViewCheck,
 };
-use fund::data::{attribution, bars, details, quotes, trades};
+use fund::data::{attribution, bars, deletion, details, quotes, trades};
 
 /// One file for the whole seeder, since it is one process however it was invoked.
 ///
@@ -118,6 +118,42 @@ enum Command {
     ArchiveNightly(NightlyArguments),
     /// Ship this box's journal and logs to the records bucket, before it powers off.
     ExportRecords,
+    /// Delete session partitions, each only if a named route could rebuild it. Reports without
+    /// `--apply`.
+    ArchiveDelete(DeleteArguments),
+}
+
+/// Which partitions to delete.
+#[derive(Debug, Args)]
+struct DeleteArguments {
+    #[arg(long, value_enum)]
+    family: Family,
+    #[arg(long, value_enum)]
+    interval: Interval,
+    /// A session to delete; repeat for several. Every one is checked before any is deleted.
+    #[arg(long = "session", value_parser = session_date, required = true)]
+    sessions: Vec<SessionDate>,
+    /// Delete. Without it the run names each partition's route and removes nothing.
+    #[arg(long)]
+    apply: bool,
+}
+
+/// A family stored one partition per session, spelled as its archive prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Family {
+    Bars,
+    Quotes,
+    Trades,
+}
+
+impl Family {
+    fn session_family(self) -> archive::SessionFamily {
+        match self {
+            Family::Bars => archive::SessionFamily::Bars,
+            Family::Quotes => archive::SessionFamily::Quotes,
+            Family::Trades => archive::SessionFamily::Trades,
+        }
+    }
 }
 
 /// Which vendor a nightly run takes its quotes and prints from.
@@ -279,6 +315,7 @@ impl Command {
             Command::ArchiveCadence { .. } => "seed-archive-cadence",
             Command::ArchiveNightly(_) => "seed-archive-nightly",
             Command::ExportRecords => "seed-export-records",
+            Command::ArchiveDelete(_) => "seed-archive-delete",
         }
     }
 }
@@ -1172,6 +1209,7 @@ async fn run(command: &Command, today: SessionDate) -> Result<Outcome, SeedError
         Command::ArchiveNightly(arguments) => archive_nightly(arguments, today).await,
         Command::ArchiveCadence { action } => check_cadence(action).await,
         Command::ExportRecords => export_records(today).await,
+        Command::ArchiveDelete(arguments) => delete_partitions(arguments, today).await,
     }
 }
 
@@ -1858,6 +1896,76 @@ fn unshipped_records(
 /// Its own subcommand rather than a step inside the nightly, because a night that failed is the one
 /// whose records are most worth having: chaining the export to a successful fold would lose them
 /// exactly when they matter.
+/// Deletes the named partitions once every one has a route that would rebuild it.
+///
+/// All or nothing: a run that deleted the rebuildable half of a list and refused the rest would
+/// leave the operator reconciling two outcomes from one command.
+async fn delete_partitions(
+    arguments: &DeleteArguments,
+    today: SessionDate,
+) -> Result<Outcome, SeedError> {
+    let bucket = bucket_name()?;
+    let s3_client = fund::common::aws::s3_client().await;
+
+    let mut rederivable = Vec::with_capacity(arguments.sessions.len());
+    let mut refusals = Vec::new();
+    for &session in &arguments.sessions {
+        let address = deletion::PartitionAddress::new(
+            arguments.family.session_family(),
+            arguments.interval.bar_interval(),
+            session,
+        );
+        let raw_object_present = match address.raw_key() {
+            Some(key) => deletion::object_exists(&s3_client, &bucket, &key)
+                .await
+                .map_err(box_error)?,
+            None => false,
+        };
+        match deletion::rederivation_route(address, today, raw_object_present) {
+            Ok(found) => {
+                println!("{address}: rebuildable from {}", found.route());
+                rederivable.push(found);
+            }
+            Err(refusal) => {
+                println!("{refusal}");
+                refusals.push(refusal);
+            }
+        }
+    }
+    if !refusals.is_empty() {
+        return Err(SeedError::Failed(
+            format!(
+                "{} of {} partitions have no route that would rebuild them; nothing was deleted",
+                refusals.len(),
+                arguments.sessions.len()
+            )
+            .into(),
+        ));
+    }
+    if !arguments.apply {
+        println!(
+            "{} partitions rebuildable; pass --apply to delete them",
+            rederivable.len()
+        );
+        return Ok(Outcome::Complete);
+    }
+    let mut absent = 0;
+    for partition in &rederivable {
+        match deletion::delete_partition(&s3_client, &bucket, partition)
+            .await
+            .map_err(box_error)?
+        {
+            deletion::Deleted::Partition => {}
+            deletion::Deleted::Absent => absent += 1,
+        }
+    }
+    println!(
+        "{} partitions deleted, {absent} were not stored",
+        rederivable.len() - absent
+    );
+    Ok(Outcome::Complete)
+}
+
 async fn export_records(today: SessionDate) -> Result<Outcome, SeedError> {
     let bucket = std::env::var("AWS_S3_RECORDS_BUCKET_NAME")
         .map_err(|_| SeedError::Usage("AWS_S3_RECORDS_BUCKET_NAME must be set".to_string()))?;

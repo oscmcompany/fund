@@ -3430,6 +3430,16 @@ pub enum TradeSource<'a> {
 /// Nasdaq-listed ones, and 2023-07-05 is the first session sampled clean across both.
 const ALPACA_TRADES_FAITHFUL_FROM: (i32, u32, u32) = (2023, 7, 5);
 
+/// [`ALPACA_TRADES_FAITHFUL_FROM`] as a session, for the write guard here and the delete guard in
+/// [`crate::data::deletion`], which must agree on where an Alpaca fold stops being a downgrade.
+pub fn alpaca_trades_faithful_from() -> SessionDate {
+    let (year, month, day) = ALPACA_TRADES_FAITHFUL_FROM;
+    SessionDate::from_date(
+        NaiveDate::from_ymd_opt(year, month, day)
+            .expect("the faithful-from date is a real calendar date"),
+    )
+}
+
 impl TradeSource<'_> {
     /// Where this route's prints came from.
     ///
@@ -3450,13 +3460,7 @@ impl TradeSource<'_> {
     /// because the constraint is a property of the provider, not of any one command.
     pub fn faithful_from(&self) -> Option<SessionDate> {
         match self {
-            TradeSource::PerName(_) => {
-                let (year, month, day) = ALPACA_TRADES_FAITHFUL_FROM;
-                Some(SessionDate::from_date(
-                    NaiveDate::from_ymd_opt(year, month, day)
-                        .expect("the faithful-from date is a real calendar date"),
-                ))
-            }
+            TradeSource::PerName(_) => Some(alpaca_trades_faithful_from()),
             TradeSource::WholeSession(_) => None,
         }
     }
