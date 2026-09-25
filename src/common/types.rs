@@ -3265,8 +3265,8 @@ mod tests {
         assert!(text.len() <= CLIENT_ORDER_ID_MAXIMUM_LENGTH);
     }
 
-    /// A stored floor goes back through the constructor, so one the constructor would refuse is
-    /// refused on read rather than read back as a floor that screens nothing.
+    /// A stored floor is read back through the constructor, so a floor that the constructor would
+    /// refuse is refused on read rather than read back as a floor that screens nothing.
     #[test]
     fn test_a_stored_floor_the_constructor_would_refuse_is_refused() {
         let read: LiquidityFloor =

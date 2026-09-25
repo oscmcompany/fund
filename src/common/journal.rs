@@ -301,7 +301,11 @@ impl<'de> Deserialize<'de> for PlannedReason {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         crate::common::types::deserialize_named(deserializer, "planned reason", |raw| {
             match raw.strip_prefix("rank_") {
-                Some(rank) => rank.parse().ok().map(PlannedReason::Rank),
+                Some(rank) => rank
+                    .parse()
+                    .ok()
+                    .filter(|rank| *rank > 0)
+                    .map(PlannedReason::Rank),
                 None => CloseReason::parse(raw).map(PlannedReason::Close),
             }
         })
@@ -1264,6 +1268,20 @@ mod tests {
             }
             other => panic!("read as {other:?}"),
         }
+    }
+
+    /// Ranks are one-based, so a stored `rank_0` names no candidate and is refused.
+    #[test]
+    fn test_a_zero_rank_is_refused_on_read() {
+        assert_eq!(
+            serde_json::from_str::<PlannedReason>(r#""rank_3""#).unwrap(),
+            PlannedReason::Rank(3)
+        );
+        assert!(serde_json::from_str::<PlannedReason>(r#""rank_0""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<PlannedReason>(r#""stop_loss""#).unwrap(),
+            PlannedReason::Close(CloseReason::StopLoss)
+        );
     }
 
     fn every_observation() -> Vec<Observation> {

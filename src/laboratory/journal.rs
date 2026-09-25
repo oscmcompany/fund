@@ -429,12 +429,6 @@ pub struct JournalGuard<'a> {
     _appends_blocked: tokio::sync::MutexGuard<'a, Option<OpenSession>>,
 }
 
-/// Prefix naming files whose date is an Eastern session.
-///
-/// Distinct from the `laboratory-` files an earlier build wrote, whose date was the UTC day. The two
-/// disagree either side of 20:00 Eastern, and nothing in a file says which rule named it, so the
-/// generations are told apart by name rather than by inspection. Legacy files are inert: they are
-/// never appended to, exported, or deleted, and can be removed by hand.
 /// A line of the laboratory journal, read back.
 pub type ReadRecord = crate::common::journal::ReadLine<Record>;
 
@@ -443,6 +437,12 @@ pub fn read_records(contents: &str) -> Vec<ReadRecord> {
     crate::common::journal::read_lines(contents, "experiment_type")
 }
 
+/// Prefix naming files whose date is an Eastern session.
+///
+/// Distinct from the `laboratory-` files an earlier build wrote, whose date was the UTC day. The two
+/// disagree either side of 20:00 Eastern, and nothing in a file says which rule named it, so the
+/// generations are told apart by name rather than by inspection. Legacy files are inert: they are
+/// never appended to, exported, or deleted, and can be removed by hand.
 const SESSION_FILE_PREFIX: &str = "laboratory-session-";
 
 /// The file one session's records are written to.

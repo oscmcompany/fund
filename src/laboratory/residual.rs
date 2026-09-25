@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use polars::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::data::classification_table::Sector;
 use crate::data::reference::sector_of_stored;
@@ -36,10 +36,10 @@ pub struct FactorSpecification {
     minimum_residual_variance_share: f64,
 }
 
-impl<'de> serde::Deserialize<'de> for FactorSpecification {
+impl<'de> Deserialize<'de> for FactorSpecification {
     /// Through [`FactorSpecification::new`], so an impossible specification is refused on read.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(serde::Deserialize)]
+        #[derive(Deserialize)]
         struct Stored {
             volatility_sessions: usize,
             minimum_residual_variance_share: f64,

@@ -27,8 +27,17 @@ pub enum FillStyle {
 ///
 /// Counted in names rather than crossings so that a half-finished round trip cannot be expressed:
 /// a count of crossings admits odd numbers, and three crossings would price one and a half spreads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RoundTrip(u32);
+
+impl<'de> serde::Deserialize<'de> for RoundTrip {
+    /// Through [`RoundTrip::new`], so a stored round trip of no names, which would price every
+    /// crossing at zero, is refused on read.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let names = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+        RoundTrip::new(names).ok_or_else(|| serde::de::Error::custom("a round trip of no names"))
+    }
+}
 
 impl RoundTrip {
     /// One name, bought and sold.
@@ -303,5 +312,14 @@ mod tests {
         let paid = model.cost(basis_points(0.0)).expect("costable");
 
         assert!((paid.value() - 0.0).abs() < 1e-12, "got {paid}");
+    }
+
+    #[test]
+    fn test_a_stored_round_trip_of_no_names_is_refused() {
+        assert_eq!(
+            serde_json::from_str::<RoundTrip>("2").unwrap(),
+            RoundTrip::PAIR
+        );
+        assert!(serde_json::from_str::<RoundTrip>("0").is_err());
     }
 }
