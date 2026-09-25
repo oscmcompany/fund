@@ -781,7 +781,15 @@ impl ClientOrderId {
     }
 
     /// Reads either form Alpaca may hand back; `None` for anything this system did not send.
+    ///
+    /// Only the exact spelling this system writes is accepted: the parsers beneath accept braced or
+    /// uppercase UUIDs and lowercase tickers, and a hand-placed order in one of those must not read
+    /// as ours.
     pub fn parse(raw: &str) -> Option<Self> {
+        Self::parse_any_spelling(raw).filter(|parsed| parsed.to_string() == raw)
+    }
+
+    fn parse_any_spelling(raw: &str) -> Option<Self> {
         if let Ok(uuid) = Uuid::parse_str(raw) {
             return Some(Self { uuid, pair: None });
         }
@@ -3174,6 +3182,12 @@ mod tests {
             "pair:BRKB:long:7885f50f-a68f-4b06-a359-fec24d64b30a",
             "pair:BRK.B-XOM:long:not-a-uuid",
             "pair:BRK.B-XOM:long:7885f50f-a68f-4b06-a359-fec24d64b30a:extra",
+            // Spellings the parsers beneath accept and this system never writes.
+            "pair:brk.b-XOM:long:7885f50f-a68f-4b06-a359-fec24d64b30a",
+            "pair:BRK.B-XOM:long:7885F50F-A68F-4B06-A359-FEC24D64B30A",
+            "7885f50fa68f4b06a359fec24d64b30a",
+            "{7885f50f-a68f-4b06-a359-fec24d64b30a}",
+            "urn:uuid:7885f50f-a68f-4b06-a359-fec24d64b30a",
         ] {
             assert_eq!(ClientOrderId::parse(raw), None, "{raw:?} must not parse");
         }
