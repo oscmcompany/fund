@@ -2,9 +2,8 @@
 //!
 //! Catches non-linear association a rank correlation misses, before any architecture is committed to.
 
+use crate::laboratory::null::Permutation;
 use polars::prelude::*;
-use rand::seq::SliceRandom;
-use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
 
 use crate::laboratory::frame::{session_ranks, FrameError, TARGET_COLUMN};
@@ -223,7 +222,8 @@ pub fn measure_session(
     feature: &Feature,
     target: &[f64],
     bins: usize,
-    seed: u64,
+    null: Permutation,
+    stream: u64,
 ) -> Option<SessionInformation> {
     if feature.len() != target.len() {
         return None;
@@ -240,7 +240,7 @@ pub fn measure_session(
     let bits = mutual_information(&feature_bins, &target_bins)?;
 
     let mut shuffled = feature_bins;
-    shuffled.shuffle(&mut StdRng::seed_from_u64(seed));
+    null.shuffle_stream(&mut shuffled, stream);
     let null_bits = mutual_information(&shuffled, &target_bins)?;
     let target_entropy = entropy(&target_bins)?;
 
@@ -376,7 +376,8 @@ mod tests {
     #[test]
     fn test_a_perfect_association_carries_the_whole_entropy() {
         let (feature, target) = paired(1000, |index| index as f64);
-        let measured = measure_session(&feature, &target, DEFAULT_BINS, 1).unwrap();
+        let measured =
+            measure_session(&feature, &target, DEFAULT_BINS, Permutation::new(1), 0).unwrap();
 
         assert!(
             (measured.bits - 10.0_f64.log2()).abs() < 1e-9,
@@ -392,7 +393,8 @@ mod tests {
     #[test]
     fn test_excess_is_reported_as_a_share_of_what_the_target_carries() {
         let (feature, target) = paired(1000, |index| index as f64);
-        let measured = measure_session(&feature, &target, DEFAULT_BINS, 1).unwrap();
+        let measured =
+            measure_session(&feature, &target, DEFAULT_BINS, Permutation::new(1), 0).unwrap();
 
         assert!(
             (measured.target_entropy - 10.0_f64.log2()).abs() < 1e-9,
@@ -417,8 +419,8 @@ mod tests {
     fn test_a_coarser_target_lowers_the_bits_and_not_the_share() {
         let (feature, target) = paired(1000, |index| index as f64);
 
-        let ten = measure_session(&feature, &target, 10, 1).unwrap();
-        let two = measure_session(&feature, &target, 2, 1).unwrap();
+        let ten = measure_session(&feature, &target, 10, Permutation::new(1), 0).unwrap();
+        let two = measure_session(&feature, &target, 2, Permutation::new(1), 0).unwrap();
 
         assert!(
             (two.target_entropy - 1.0).abs() < 1e-9,
@@ -456,8 +458,10 @@ mod tests {
         let (feature, forward) = paired(1000, |index| index as f64);
         let reversed: Vec<f64> = forward.iter().map(|value| -value).collect();
 
-        let straight = measure_session(&feature, &forward, DEFAULT_BINS, 1).unwrap();
-        let backward = measure_session(&feature, &reversed, DEFAULT_BINS, 1).unwrap();
+        let straight =
+            measure_session(&feature, &forward, DEFAULT_BINS, Permutation::new(1), 0).unwrap();
+        let backward =
+            measure_session(&feature, &reversed, DEFAULT_BINS, Permutation::new(1), 0).unwrap();
         assert!((straight.bits - backward.bits).abs() < 1e-9);
     }
 
@@ -476,7 +480,8 @@ mod tests {
             &Feature::Continuous(feature.clone()),
             &target,
             DEFAULT_BINS,
-            1,
+            Permutation::new(1),
+            0,
         )
         .unwrap();
         assert!(
@@ -504,8 +509,14 @@ mod tests {
             .map(|index| ((index * 104_729) % names) as f64)
             .collect();
 
-        let measured =
-            measure_session(&Feature::Continuous(feature), &target, DEFAULT_BINS, 1).unwrap();
+        let measured = measure_session(
+            &Feature::Continuous(feature),
+            &target,
+            DEFAULT_BINS,
+            Permutation::new(1),
+            0,
+        )
+        .unwrap();
         assert!(
             measured.bits > 0.0,
             "the raw estimate is biased upward: {measured:?}"
@@ -527,8 +538,14 @@ mod tests {
         let bins = quantile_bins(&feature, DEFAULT_BINS).unwrap();
         assert!(bins.iter().all(|bin| *bin == 0));
 
-        let measured =
-            measure_session(&Feature::Continuous(feature), &target, DEFAULT_BINS, 1).unwrap();
+        let measured = measure_session(
+            &Feature::Continuous(feature),
+            &target,
+            DEFAULT_BINS,
+            Permutation::new(1),
+            0,
+        )
+        .unwrap();
         assert!(measured.bits.abs() < 1e-12, "{measured:?}");
         assert!(measured.excess().abs() < 1e-12, "{measured:?}");
     }
@@ -735,8 +752,10 @@ mod tests {
         let (feature, target) = paired(1000, |index| ((index * 37) % 1000) as f64);
         let shifted: Vec<f64> = target.iter().map(|value| value + 12.5).collect();
 
-        let plain = measure_session(&feature, &target, DEFAULT_BINS, 1).unwrap();
-        let moved = measure_session(&feature, &shifted, DEFAULT_BINS, 1).unwrap();
+        let plain =
+            measure_session(&feature, &target, DEFAULT_BINS, Permutation::new(1), 0).unwrap();
+        let moved =
+            measure_session(&feature, &shifted, DEFAULT_BINS, Permutation::new(1), 0).unwrap();
         // Equal to floating point rather than bitwise: the bins are identical, and what is left is
         // the last place of a sum over a hundred cells.
         assert!(
@@ -751,10 +770,13 @@ mod tests {
     #[test]
     fn test_a_cross_section_too_thin_to_fill_the_table_is_refused() {
         let (feature, target) = paired(99, |index| index as f64);
-        assert_eq!(measure_session(&feature, &target, DEFAULT_BINS, 1), None);
+        assert_eq!(
+            measure_session(&feature, &target, DEFAULT_BINS, Permutation::new(1), 0),
+            None
+        );
 
         let (feature, target) = paired(100, |index| index as f64);
-        assert!(measure_session(&feature, &target, DEFAULT_BINS, 1).is_some());
+        assert!(measure_session(&feature, &target, DEFAULT_BINS, Permutation::new(1), 0).is_some());
     }
 
     /// A nominal feature sets the width of the table itself, so the floor rises with the number of
@@ -767,12 +789,18 @@ mod tests {
         // A hundred groups against ten return bins is a thousand cells, which a thousand names
         // fills exactly.
         let hundred = Feature::Nominal((0..names).map(|index| index % 100).collect());
-        assert!(measure_session(&hundred, &target, DEFAULT_BINS, 1).is_some());
+        assert!(measure_session(&hundred, &target, DEFAULT_BINS, Permutation::new(1), 0).is_some());
 
         // A hundred and one does not.
         let hundred_and_one = Feature::Nominal((0..names).map(|index| index % 101).collect());
         assert_eq!(
-            measure_session(&hundred_and_one, &target, DEFAULT_BINS, 1),
+            measure_session(
+                &hundred_and_one,
+                &target,
+                DEFAULT_BINS,
+                Permutation::new(1),
+                0
+            ),
             None
         );
     }
@@ -817,10 +845,18 @@ mod tests {
             &Feature::Continuous(groups.iter().map(|group| *group as f64).collect()),
             &target,
             DEFAULT_BINS,
-            1,
+            Permutation::new(1),
+            0,
         )
         .unwrap();
-        let kept = measure_session(&Feature::Nominal(groups), &target, DEFAULT_BINS, 1).unwrap();
+        let kept = measure_session(
+            &Feature::Nominal(groups),
+            &target,
+            DEFAULT_BINS,
+            Permutation::new(1),
+            0,
+        )
+        .unwrap();
 
         assert!(
             kept.excess() > merged.excess() + 1.0,

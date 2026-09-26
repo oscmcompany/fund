@@ -656,6 +656,74 @@ impl StudyResult {
     }
 }
 
+/// How often families of noise cleared their own haircut, which the family-wise rate promises to bound.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+pub struct FamilyNull {
+    pub tests_per_family: usize,
+    pub families: usize,
+    /// Families where at least one test cleared: each is a false discovery by construction.
+    pub clearing: usize,
+    /// Families where no test was measurable, reported beside the rate rather than folded into it.
+    pub undefined: usize,
+    pub family_wise_error_rate: f64,
+    /// The standard deviation of each test's signed difference over its error: one for fresh draws.
+    pub statistic_spread: Option<f64>,
+}
+
+impl FamilyNull {
+    /// The share of measurable families that cleared, which should sit at or below the error rate.
+    pub fn rate(&self) -> Option<f64> {
+        let measured = self.families - self.undefined;
+        (measured > 0).then(|| self.clearing as f64 / measured as f64)
+    }
+}
+
+/// Groups noise studies into families of `tests` and counts the families any test cleared.
+///
+/// `None` unless the studies fill whole families and every one declares that family size, since a
+/// study judged against another family's haircut is not a draw from this family's null.
+pub fn family_null(results: &[StudyResult], tests: NonZeroUsize) -> Option<FamilyNull> {
+    if results.is_empty()
+        || results.len() % tests.get() != 0
+        || results
+            .iter()
+            .any(|result| result.declaration().family().tests() != tests)
+    {
+        return None;
+    }
+    let (mut clearing, mut undefined) = (0, 0);
+    for family in results.chunks_exact(tests.get()) {
+        let clears: Vec<Option<bool>> = family.iter().map(StudyResult::clears_haircut).collect();
+        if clears.contains(&Some(true)) {
+            clearing += 1;
+        } else if clears.iter().all(Option::is_none) {
+            undefined += 1;
+        }
+    }
+    let statistics: Vec<f64> = results
+        .iter()
+        .filter_map(StudyResult::standard_errors)
+        .collect();
+    let count = statistics.len() as f64;
+    let statistic_spread = (statistics.len() > 1).then(|| {
+        let mean = statistics.iter().sum::<f64>() / count;
+        (statistics
+            .iter()
+            .map(|statistic| (statistic - mean).powi(2))
+            .sum::<f64>()
+            / (count - 1.0))
+            .sqrt()
+    });
+    Some(FamilyNull {
+        tests_per_family: tests.get(),
+        families: results.len() / tests.get(),
+        clearing,
+        undefined,
+        family_wise_error_rate: FAMILY_WISE_ERROR_RATE,
+        statistic_spread,
+    })
+}
+
 /// One table per family, with the threshold that family's readings are judged against above it.
 ///
 /// The haircut is rendered once per header rather than per row because it is a property of the
@@ -1043,6 +1111,68 @@ mod tests {
             &fingerprint(None),
         )
         .expect("the fixture must assemble")
+    }
+
+    // --- the family null ----------------------------------------------------
+
+    fn in_family_of(size: usize, treatment: Arm) -> StudyResult {
+        Study::new(
+            Declaration::new(
+                "is this noise",
+                Family::new("noise", tests(size)),
+                Horizon::Sessions(tests(1)),
+                DeclaredUniverse::Unscreened,
+                unpriced(),
+            ),
+            Pairing::Matched,
+            treatment,
+            arm("control", &[0.0, 0.0, 0.0, 0.0]),
+            &fingerprint(None),
+        )
+        .expect("the fixture must assemble")
+        .measure()
+    }
+
+    /// A family clears when any member does, and is undefined only when no member was measurable.
+    #[test]
+    fn test_the_family_null_counts_families_rather_than_tests() {
+        let clears = || in_family_of(2, arm("treatment", &[1.0, 1.1, 0.9, 1.0]));
+        let fails = || in_family_of(2, arm("treatment", &[0.1, -0.1, 0.2, -0.2]));
+        let unmeasurable = || {
+            in_family_of(
+                2,
+                Arm::new("treatment", keyed(&[None, None, None, None]), 0).expect("usable"),
+            )
+        };
+        assert_eq!(clears().clears_haircut(), Some(true));
+        assert_eq!(fails().clears_haircut(), Some(false));
+        assert_eq!(unmeasurable().clears_haircut(), None);
+
+        let null = family_null(
+            &[
+                clears(),
+                fails(),
+                fails(),
+                fails(),
+                unmeasurable(),
+                unmeasurable(),
+            ],
+            tests(2),
+        )
+        .expect("three whole families");
+        assert_eq!(null.families, 3);
+        assert_eq!(null.clearing, 1);
+        assert_eq!(null.undefined, 1);
+        assert_eq!(null.rate(), Some(0.5));
+        assert!(null.statistic_spread.is_some_and(f64::is_finite));
+    }
+
+    #[test]
+    fn test_the_family_null_refuses_partial_or_foreign_families() {
+        let noise = || in_family_of(2, arm("treatment", &[0.1, -0.1, 0.2, -0.2]));
+        assert_eq!(family_null(&[noise(), noise(), noise()], tests(2)), None);
+        assert_eq!(family_null(&[noise(), noise()], tests(1)), None);
+        assert_eq!(family_null(&[], tests(2)), None);
     }
 
     // --- the multiple-testing threshold ------------------------------------

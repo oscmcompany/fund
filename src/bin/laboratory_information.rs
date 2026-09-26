@@ -12,6 +12,7 @@ use fund::laboratory::harness::distribution;
 use fund::laboratory::information::{self, Feature, Outcome, DEFAULT_BINS};
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::metrics;
+use fund::laboratory::null::Permutation;
 use fund::laboratory::{dataset, information::Paired};
 
 use polars::prelude::*;
@@ -283,7 +284,13 @@ fn triage(feature: &str, paired: &Paired, seed: u64) -> laboratory::FeatureTriag
         .map(|(session, (features, targets))| {
             // Keyed on the session rather than its position, so a run over a different window
             // shuffles each cross-section the same way this one did.
-            information::measure_session(features, targets, DEFAULT_BINS, seed ^ *session as u64)
+            information::measure_session(
+                features,
+                targets,
+                DEFAULT_BINS,
+                Permutation::new(seed),
+                *session as u64,
+            )
         })
         .collect();
 

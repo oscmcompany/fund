@@ -64,6 +64,20 @@ pub enum Verdict {
     Refute,
     /// Unmeasurable, underpowered, or the control fired too. Still counts in the family.
     Inconclusive,
+    /// The capability works and stays available, but measured as not earning default use.
+    LandedNotAdopted,
+}
+
+impl Verdict {
+    /// The name it is stored under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Accept => "accept",
+            Verdict::Refute => "refute",
+            Verdict::Inconclusive => "inconclusive",
+            Verdict::LandedNotAdopted => "landed_not_adopted",
+        }
+    }
 }
 
 /// The expected effect and interval committed before the study runs, in the verdict's units.
@@ -153,6 +167,8 @@ pub enum RegisterRefusal {
     AlreadySuperseded(AccessionNumber, AccessionNumber),
     #[error("an inconclusive verdict must name the one change its successor makes")]
     InconclusiveWithoutNotes,
+    #[error("a landed-not-adopted verdict must name what would earn it adoption")]
+    LandedWithoutAdoptionCondition,
 }
 
 /// Text that says something: `None` for an absent or blank value, so neither can stand in for one.
@@ -182,7 +198,17 @@ impl Accession {
             (Status::Open, Verdict::Inconclusive, None) => {
                 Err(RegisterRefusal::InconclusiveWithoutNotes)
             }
-            (Status::Open, _, _) => {
+            (Status::Open, Verdict::LandedNotAdopted, None) => {
+                Err(RegisterRefusal::LandedWithoutAdoptionCondition)
+            }
+            (
+                Status::Open,
+                Verdict::Accept
+                | Verdict::Refute
+                | Verdict::Inconclusive
+                | Verdict::LandedNotAdopted,
+                _,
+            ) => {
                 self.status = Status::Closed(closing);
                 Ok(self)
             }
@@ -205,7 +231,10 @@ impl Accession {
             Status::Open => Err(RegisterRefusal::StillOpen(self.number)),
             Status::Closed(closing) => match (closing.verdict, stated(&opening.substrate_change)) {
                 (Verdict::Accept, None) => Err(RegisterRefusal::AcceptedIsFrozen(self.number)),
-                (Verdict::Accept, Some(_)) | (Verdict::Refute | Verdict::Inconclusive, _) => Ok(()),
+                (Verdict::Accept, Some(_))
+                | (Verdict::Refute | Verdict::Inconclusive | Verdict::LandedNotAdopted, _) => {
+                    Ok(())
+                }
             },
         }
     }
@@ -481,6 +510,23 @@ mod tests {
         assert_eq!(AccessionNumber::new(0), None);
     }
 
+    /// The listing's name and the stored one are one spelling.
+    #[test]
+    fn test_a_verdict_is_named_as_it_is_stored() {
+        for verdict in [
+            Verdict::Accept,
+            Verdict::Refute,
+            Verdict::Inconclusive,
+            Verdict::LandedNotAdopted,
+        ] {
+            assert_eq!(
+                serde_json::to_value(verdict).unwrap(),
+                serde_json::json!(verdict.as_str())
+            );
+        }
+        assert_eq!(Verdict::LandedNotAdopted.as_str(), "landed_not_adopted");
+    }
+
     #[test]
     fn test_an_accession_closes_once() {
         let closed = Accession::open(number(1), opening())
@@ -506,6 +552,14 @@ mod tests {
             open.clone().close(blank),
             Err(RegisterRefusal::InconclusiveWithoutNotes)
         );
+        assert_eq!(
+            open.clone().close(closing(Verdict::LandedNotAdopted)),
+            Err(RegisterRefusal::LandedWithoutAdoptionCondition)
+        );
+        let mut adoption = closing(Verdict::LandedNotAdopted);
+        adoption.notes =
+            Some("adopt if volatility stops requiring consecutive sessions".to_string());
+        assert!(open.clone().close(adoption).is_ok());
         let mut with_notes = closing(Verdict::Inconclusive);
         with_notes.notes = Some("widen to two years".to_string());
         assert!(open.close(with_notes).is_ok());
