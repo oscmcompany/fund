@@ -525,12 +525,9 @@ async fn handle_market_data_sync(
     // rest of the Eastern date.
     state.close_history_cache.invalidate().await;
 
-    events::emit(
+    events::request(
         &state.pool,
-        crate::common::events::EventType::new(
-            Command::DatabaseExport,
-            crate::common::events::Outcome::Requested,
-        ),
+        Command::DatabaseExport,
         json!({ "chained_from": Command::MarketDataSync.as_str(), "session_date": today }),
     )
     .await?;

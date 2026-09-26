@@ -6,7 +6,7 @@ mod common;
 
 use chrono::{Duration, Utc};
 use fund::common::alpaca::{AccountSnapshot, ActivityType};
-use fund::common::events::{self, Command, EventType, Outcome};
+use fund::common::events::{self, Command, EventType, Outcome, Terminal};
 use fund::common::types::{PairID, SessionDate, Ticker};
 use fund::dashboard::database::fetch_dashboard_data;
 
@@ -114,9 +114,10 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
 
     common::seed_bar(&pool, "AAPL", SessionDate::at(now), 190.0).await;
 
-    events::emit(
+    events::record(
         &pool,
-        EventType::new(Command::PortfolioEvaluation, Outcome::Completed),
+        Command::PortfolioEvaluation,
+        Terminal::Completed,
         json!({"pairs_opened": 1}),
     )
     .await
