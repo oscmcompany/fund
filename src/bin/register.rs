@@ -63,6 +63,7 @@ enum VerdictArgument {
     Accept,
     Refute,
     Inconclusive,
+    LandedNotAdopted,
 }
 
 #[derive(Debug, Args)]
@@ -116,6 +117,7 @@ impl From<VerdictArgument> for Verdict {
             VerdictArgument::Accept => Verdict::Accept,
             VerdictArgument::Refute => Verdict::Refute,
             VerdictArgument::Inconclusive => Verdict::Inconclusive,
+            VerdictArgument::LandedNotAdopted => Verdict::LandedNotAdopted,
         }
     }
 }
@@ -245,13 +247,13 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 fn line(accession: &Accession, successor: Option<AccessionNumber>) -> String {
     let state = match &accession.status {
         Status::Open => "open".to_string(),
-        Status::Closed(closing) => format!("{:?}", closing.verdict).to_lowercase(),
+        Status::Closed(closing) => closing.verdict.as_str().to_string(),
     };
     let superseded = successor
         .map(|successor| format!(" -> {successor}"))
         .unwrap_or_default();
     format!(
-        "{}  {:<12} {:<20} {}{superseded}",
+        "{}  {:<18} {:<20} {}{superseded}",
         accession.number, state, accession.opening.family, accession.opening.hypothesis
     )
 }
@@ -276,7 +278,7 @@ mod tests {
         let accession = Accession::open(AccessionNumber::new(5).unwrap(), opening);
         assert_eq!(
             line(&accession, None),
-            "0005  open         overnight            overnight returns survive costs"
+            "0005  open               overnight            overnight returns survive costs"
         );
         assert!(line(&accession, AccessionNumber::new(21)).ends_with("-> 0021"));
     }

@@ -14,7 +14,7 @@ use crate::common::types::SessionDate;
 use crate::laboratory::convergence::Curve;
 use crate::laboratory::dataset::DatasetFingerprint;
 use crate::laboratory::harness::{
-    DeclaredUniverse, Horizon, NetOfCost, Pairing, Quantity, StudyResult,
+    DeclaredUniverse, FamilyNull, Horizon, NetOfCost, Pairing, Quantity, StudyResult,
 };
 use crate::laboratory::metrics::Distribution;
 use crate::laboratory::predictor::Evaluation;
@@ -23,8 +23,9 @@ use crate::laboratory::stability::{Association, SignAgreement};
 /// The shape of a laboratory record, versioned independently of the application journal.
 ///
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. v7 writes
-/// an unmeasurable `net_of_cost` as null where v5 and v6 wrote `{"outcome": "unmeasured"}`.
-pub const SCHEMA_VERSION: u32 = 7;
+/// an unmeasurable `net_of_cost` as null where v5 and v6 wrote `{"outcome": "unmeasured"}`; v8 adds
+/// `family_null_measured`.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Errors writing the laboratory journal.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +59,7 @@ pub enum Observation {
     ConvergenceMeasured(ConvergenceMeasured),
     StudyMeasured(StudyMeasured),
     SlippageMeasured(SlippageMeasured),
+    FamilyNullMeasured(FamilyNullMeasured),
 }
 
 impl Observation {
@@ -72,6 +74,7 @@ impl Observation {
             Observation::ConvergenceMeasured(_) => "convergence_measured",
             Observation::StudyMeasured(_) => "study_measured",
             Observation::SlippageMeasured(_) => "slippage_measured",
+            Observation::FamilyNullMeasured(_) => "family_null_measured",
         }
     }
 }
@@ -148,6 +151,16 @@ impl From<&StudyResult> for StudyMeasured {
             net_of_cost: result.net_of_cost(),
         }
     }
+}
+
+/// How often a family of noise arms cleared its own haircut, run through the identical study.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FamilyNullMeasured {
+    /// The real family this null calibrates.
+    pub family: String,
+    /// The noise arm, with the seeds it was drawn under.
+    pub arm: String,
+    pub null: FamilyNull,
 }
 
 /// Whether a dislocated spread closes, which is the premise the pair book rests on.
@@ -889,7 +902,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["schema_version"], serde_json::json!(7));
+        assert_eq!(value["schema_version"], serde_json::json!(8));
         assert_eq!(value["run_id"], serde_json::json!(run_id.to_string()));
         assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
         assert_eq!(
