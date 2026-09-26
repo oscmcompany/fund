@@ -58,9 +58,12 @@ struct Arguments {
 
 /// Parses an Eastern calendar date.
 fn session_date(raw: &str) -> Result<SessionDate, String> {
+    // `%Y` skips leading whitespace, so the date is only admitted when nothing surrounds it.
     NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .filter(|_| raw.trim() == raw)
         .map(SessionDate::from_date)
-        .map_err(|_| format!("expected an Eastern calendar date as YYYY-MM-DD, got {raw:?}"))
+        .ok_or_else(|| format!("expected an Eastern calendar date as YYYY-MM-DD, got {raw:?}"))
 }
 
 #[tokio::main]
@@ -303,5 +306,7 @@ mod tests {
     #[test]
     fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
         assert!(parse(&[" 2026-08-20 "]).is_err());
+        assert!(parse(&[" 2026-08-20"]).is_err());
+        assert!(parse(&["2026-08-20 "]).is_err());
     }
 }
