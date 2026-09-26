@@ -22,14 +22,8 @@ use crate::laboratory::stability::{Association, SignAgreement};
 
 /// The shape of a laboratory record, versioned independently of the application journal.
 ///
-/// Readers map old versions forward rather than rewriting files, so this only ever goes up. v2 added
-/// `liquidity_floor` to the `dataset_built` fingerprint and v3 added `reference_digest` beside it,
-/// naming the point-in-time universe the rows were classified against. v4 added
-/// `factor_specification`, naming the factor set a residual panel was fitted against. v5 adds the
-/// `study_measured` observation — the first record carrying a declaration alongside a reading — and
-/// `screen_window` beside the fingerprint's floor, because a screen is a floor *and* the stretch of
-/// history it was applied over. v6 adds `slippage_measured`. v7 writes an unmeasurable
-/// `net_of_cost` as null where v5 and v6 wrote `{"outcome": "unmeasured"}`; both read as `None`.
+/// Readers map old versions forward rather than rewriting files, so this only ever goes up. v7 writes
+/// an unmeasurable `net_of_cost` as null where v5 and v6 wrote `{"outcome": "unmeasured"}`.
 pub const SCHEMA_VERSION: u32 = 7;
 
 /// Errors writing the laboratory journal.

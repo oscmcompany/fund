@@ -82,8 +82,7 @@ struct Arguments {
 
 /// Parses a quoted spread, refusing everything `BasisPoints` refuses rather than only a negative.
 fn quoted_spread(raw: &str) -> Result<BasisPoints, String> {
-    raw.trim()
-        .parse::<f64>()
+    raw.parse::<f64>()
         .ok()
         .and_then(BasisPoints::new)
         .ok_or_else(|| format!("expected a finite width of zero or more, got {raw:?}"))
@@ -599,5 +598,10 @@ mod tests {
         let rendered = render(&[scored("cross_sectional_mean", None)]);
         assert!(rendered.contains("unmeasurable"), "{rendered}");
         assert!(!rendered.contains("0.000000"), "{rendered}");
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
+        assert!(parse(&["730", "20", " 10 "]).is_err());
     }
 }

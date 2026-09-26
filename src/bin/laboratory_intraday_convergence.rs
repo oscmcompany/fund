@@ -69,7 +69,7 @@ struct Arguments {
 
 /// Parses an Eastern calendar date.
 fn session_date(raw: &str) -> Result<SessionDate, String> {
-    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
         .map(SessionDate::from_date)
         .map_err(|_| format!("expected an Eastern calendar date as YYYY-MM-DD, got {raw:?}"))
 }
@@ -378,5 +378,10 @@ mod tests {
         assert!(parse(&["2026-08-20", "0"]).is_err());
         assert!(parse(&["not-a-date"]).is_err());
         assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
+        assert!(parse(&[" 2026-08-20 "]).is_err());
     }
 }

@@ -112,9 +112,9 @@ impl TryFrom<Arguments> for Parameters {
 /// One argument rather than a window and a mode, because the two are never independently useful and
 /// a mode argument silently ignored on the default path is a bug waiting for its first caller.
 fn screen_window(raw: &str) -> Result<ScreenWindow, String> {
-    let (per_session, digits) = match raw.trim().strip_prefix("per-session:") {
+    let (per_session, digits) = match raw.strip_prefix("per-session:") {
         Some(rest) => (true, rest),
-        None => (false, raw.trim()),
+        None => (false, raw),
     };
     let days = digits
         .parse::<u32>()
@@ -927,5 +927,10 @@ mod tests {
 
         assert_eq!(sectors_by_ticker(&once), sectors_by_ticker(&twice));
         assert_ne!(sectors_by_ticker(&once), sectors_by_ticker(&elsewhere));
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
+        assert!(parse(&["731", "60", "0.5", " per-session:30 "]).is_err());
     }
 }

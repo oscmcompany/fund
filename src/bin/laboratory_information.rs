@@ -97,7 +97,7 @@ struct Arguments {
 
 /// Parses the outcome a feature is ranked against.
 fn outcome(raw: &str) -> Result<Outcome, String> {
-    match raw.trim() {
+    match raw {
         "signed" => Ok(Outcome::Signed),
         "magnitude" => Ok(Outcome::Magnitude),
         "direction" => Ok(Outcome::Direction),
@@ -456,5 +456,10 @@ mod tests {
         }
         assert!(!CATEGORICAL_FEATURES.contains(&"ticker"));
         assert!(CONTINUOUS_FEATURES.contains(&"daily_return"));
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
+        assert!(parse(&["365", "3", " magnitude "]).is_err());
     }
 }
