@@ -375,9 +375,9 @@ impl Notification {
 /// A notification that asks for work, which is the only thing a handler is dispatched from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Request {
-    pub event_id: i64,
-    pub command: Command,
-    pub payload_truncated: bool,
+    event_id: i64,
+    command: Command,
+    payload_truncated: bool,
 }
 
 impl Request {
@@ -391,6 +391,19 @@ impl Request {
             }),
             Outcome::Completed | Outcome::Errored => None,
         }
+    }
+
+    pub fn event_id(self) -> i64 {
+        self.event_id
+    }
+
+    pub fn command(self) -> Command {
+        self.command
+    }
+
+    /// Whether the notification omitted the payload, which then has to be read from the row.
+    pub fn payload_truncated(self) -> bool {
+        self.payload_truncated
     }
 }
 

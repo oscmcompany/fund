@@ -192,15 +192,15 @@ async fn dispatch(state: &Arc<ServiceState>, handlers_in_flight: &mut JoinSet<()
     // The payload of a request carries nothing a handler reads today, but a truncated one is worth
     // saying out loud: it means a request grew past the notification limit, which is a shape change
     // the handler contract does not expect.
-    if request.payload_truncated {
-        match events::fetch_payload(state.pool(), request.event_id).await {
+    if request.payload_truncated() {
+        match events::fetch_payload(state.pool(), request.event_id()).await {
             Ok(payload) => warn!(
-                event_id = request.event_id,
+                event_id = request.event_id(),
                 %payload,
                 "Request notification was truncated; read the payload from the row"
             ),
             Err(error) => warn!(
-                event_id = request.event_id,
+                event_id = request.event_id(),
                 %error,
                 "Request notification was truncated and the row could not be read"
             ),
@@ -208,7 +208,7 @@ async fn dispatch(state: &Arc<ServiceState>, handlers_in_flight: &mut JoinSet<()
     }
 
     let state = Arc::clone(state);
-    let command = request.command;
+    let command = request.command();
     handlers_in_flight.spawn(async move { handlers::handle(&state, command).await });
 }
 
