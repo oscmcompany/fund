@@ -666,7 +666,7 @@ pub struct FamilyNull {
     /// Families where no test was measurable, reported beside the rate rather than folded into it.
     pub undefined: usize,
     pub family_wise_error_rate: f64,
-    /// The standard deviation of every test's standard errors, which is one when each is a fresh draw.
+    /// The standard deviation of each test's signed difference over its error: one for fresh draws.
     pub statistic_spread: Option<f64>,
 }
 

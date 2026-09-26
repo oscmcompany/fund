@@ -77,7 +77,8 @@ struct CloseArguments {
     sessions: usize,
     #[arg(long = "commit")]
     commits: Vec<String>,
-    /// For an inconclusive verdict, the one change its successor makes.
+    /// Required for inconclusive (the one change its successor makes) and landed-not-adopted (what
+    /// would earn adoption).
     #[arg(long)]
     notes: Option<String>,
     #[arg(long)]
@@ -107,6 +108,7 @@ struct SeedArguments {
     sessions: Option<usize>,
     #[arg(long = "commit")]
     commits: Vec<String>,
+    /// Required for inconclusive and landed-not-adopted, as on `close`.
     #[arg(long)]
     notes: Option<String>,
 }

@@ -722,4 +722,52 @@ mod tests {
     fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
         assert!(parse(&["730", "20", " 10 "]).is_err());
     }
+
+    /// Thirty names over twelve sessions, with returns that vary by name and session.
+    fn noise_panel() -> (Panel, Vec<i64>) {
+        use polars::prelude::*;
+        let (mut tickers, mut timestamps, mut returns) = (Vec::new(), Vec::new(), Vec::new());
+        for session in 0..12_i64 {
+            for name in 0..30_i64 {
+                tickers.push(format!("N{name:02}"));
+                timestamps.push(session * 86_400_000);
+                returns.push((((name * 7 + session * 13) % 17) as f64 - 8.0) / 1_000.0);
+            }
+        }
+        let frame = df!(
+            "ticker" => tickers,
+            "timestamp" => timestamps,
+            "daily_return" => returns,
+        )
+        .unwrap();
+        let panel = Panel::from_frame(&frame).unwrap();
+        let sessions = (0..panel.sessions())
+            .map(|index| panel.session_at(index))
+            .collect();
+        (panel, sessions)
+    }
+
+    /// Two seeds per study, whole families of the real family's size, none of them the control's.
+    #[test]
+    fn test_the_family_null_runs_whole_families_through_the_study() {
+        let (panel, sessions) = noise_panel();
+        let measured =
+            measure_family_null(&parameters(), 4, &panel, &sessions, &fingerprint(), 3).unwrap();
+        assert_eq!(measured.family, "daily-baselines");
+        assert_eq!(measured.arm, "random_ranking_seed_0x1..=0x18");
+        assert_eq!(measured.null.families, 4);
+        assert_eq!(measured.null.tests_per_family, 3);
+        assert!(measured.null.clearing + measured.null.undefined <= 4);
+    }
+
+    #[test]
+    fn test_the_family_null_is_bounded() {
+        assert!(parse(&["--family-null", "0"]).is_err());
+        assert!(parse(&["--family-null", "1001"]).is_err());
+        assert_eq!(
+            parse(&["--family-null", "1000"]).unwrap().family_null,
+            Some(1000)
+        );
+        assert_eq!(parse(&[]).unwrap().family_null, None);
+    }
 }
