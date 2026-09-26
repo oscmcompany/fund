@@ -495,7 +495,7 @@ impl Study {
             Pairing::Disjoint => disjoint_difference(treatment, control),
         };
 
-        let net_of_cost = net_of_cost(self.declaration.quantity, difference);
+        let quantity = self.declaration.quantity;
         StudyResult {
             declaration: self.declaration,
             pairing: self.pairing,
@@ -509,8 +509,10 @@ impl Study {
             },
             treatment,
             control,
-            difference,
-            net_of_cost,
+            difference: difference.map(|distribution| Difference {
+                distribution,
+                net_of_cost: net_of_cost(quantity, distribution),
+            }),
             haircut: self.haircut,
         }
     }
@@ -534,8 +536,8 @@ fn disjoint_difference(
 
 /// What the difference is worth once the round trip it implies has been paid for.
 ///
-/// Four outcomes rather than a number and a flag, because "no round trip to charge for" and "a
-/// round trip nobody can price" are different answers and only one of them is about the data.
+/// Three outcomes rather than a number and a flag, because "no round trip to charge for" and "a
+/// round trip nobody can price" are different answers. It exists only beside a measured difference.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum NetOfCost {
@@ -548,30 +550,32 @@ pub enum NetOfCost {
     NotAReturn { units: Units },
     /// A return the declared fill style cannot be costed from.
     Refused(CostRefusal),
-    /// No difference was measurable, so there is nothing to charge against.
-    Unmeasured,
 }
 
-fn net_of_cost(quantity: Quantity, difference: Option<Distribution>) -> NetOfCost {
+fn net_of_cost(quantity: Quantity, difference: Distribution) -> NetOfCost {
     match quantity {
         Quantity::Unpriced { units } => NetOfCost::NotAReturn { units },
         Quantity::ReturnPerRoundTrip {
             cost_model,
             quoted_spread,
-        } => match difference {
-            None => NetOfCost::Unmeasured,
-            Some(difference) => match cost_model.cost(quoted_spread) {
-                Err(refusal) => NetOfCost::Refused(refusal),
-                Ok(cost) => NetOfCost::Net {
-                    gross_basis_points: difference.mean,
-                    cost_basis_points: cost.value(),
-                    // Subtracted rather than signed-toward-zero: a strategy that earns a negative
-                    // gross does not get paid the spread for being wrong.
-                    net_basis_points: difference.mean - cost.value(),
-                },
+        } => match cost_model.cost(quoted_spread) {
+            Err(refusal) => NetOfCost::Refused(refusal),
+            Ok(cost) => NetOfCost::Net {
+                gross_basis_points: difference.mean,
+                cost_basis_points: cost.value(),
+                // Subtracted rather than signed-toward-zero: a strategy that earns a negative
+                // gross does not get paid the spread for being wrong.
+                net_basis_points: difference.mean - cost.value(),
             },
         },
     }
+}
+
+/// Treatment less control, and what it is worth after cost: one value, so neither exists alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Difference {
+    distribution: Distribution,
+    net_of_cost: NetOfCost,
 }
 
 /// What one study read, alongside everything that was fixed before it read it.
@@ -587,8 +591,7 @@ pub struct StudyResult {
     observations: usize,
     treatment: Option<Distribution>,
     control: Option<Distribution>,
-    difference: Option<Distribution>,
-    net_of_cost: NetOfCost,
+    difference: Option<Difference>,
     haircut: Haircut,
 }
 
@@ -622,11 +625,12 @@ impl StudyResult {
     }
 
     pub fn difference(&self) -> Option<Distribution> {
-        self.difference
+        self.difference.map(|difference| difference.distribution)
     }
 
-    pub fn net_of_cost(&self) -> NetOfCost {
-        self.net_of_cost
+    /// `None` exactly where the difference is, so a gross can never render without its cost.
+    pub fn net_of_cost(&self) -> Option<NetOfCost> {
+        self.difference.map(|difference| difference.net_of_cost)
     }
 
     pub fn haircut(&self) -> Haircut {
@@ -639,7 +643,7 @@ impl StudyResult {
     /// that never varied is pinned by the shape of the data rather than by an effect, so it has no
     /// number of errors rather than infinitely many.
     pub fn standard_errors(&self) -> Option<f64> {
-        let difference = self.difference?;
+        let difference = self.difference()?;
         (difference.standard_error > 0.0).then(|| difference.mean / difference.standard_error)
     }
 
@@ -731,7 +735,7 @@ fn render_group(results: &[&StudyResult]) -> String {
             truncated(&result.control_name, 16),
             distribution(result.treatment),
             distribution(result.control),
-            distribution(result.difference),
+            distribution(result.difference()),
             result
                 .standard_errors()
                 .map_or_else(|| "none".to_string(), |errors| format!("{errors:+.2}")),
@@ -740,7 +744,7 @@ fn render_group(results: &[&StudyResult]) -> String {
                 Some(false) => "no",
                 None => "-",
             },
-            net_of_cost_cell(result.net_of_cost),
+            net_of_cost_cell(result.net_of_cost()),
         ));
     }
 
@@ -775,16 +779,16 @@ pub fn distribution(value: Option<Distribution>) -> String {
     )
 }
 
-fn net_of_cost_cell(net_of_cost: NetOfCost) -> String {
+fn net_of_cost_cell(net_of_cost: Option<NetOfCost>) -> String {
     match net_of_cost {
-        NetOfCost::Net {
+        None => "unmeasurable".to_string(),
+        Some(NetOfCost::Net {
             cost_basis_points,
             net_basis_points,
             ..
-        } => format!("{net_basis_points:+.2} after {cost_basis_points:.2}bp"),
-        NetOfCost::NotAReturn { units } => units.to_string(),
-        NetOfCost::Refused(_) => "uncostable".to_string(),
-        NetOfCost::Unmeasured => "unmeasurable".to_string(),
+        }) => format!("{net_basis_points:+.2} after {cost_basis_points:.2}bp"),
+        Some(NetOfCost::NotAReturn { units }) => units.to_string(),
+        Some(NetOfCost::Refused(_)) => "uncostable".to_string(),
     }
 }
 
@@ -1649,12 +1653,7 @@ mod tests {
         assert_eq!(result.difference(), None);
         assert_eq!(result.standard_errors(), None);
         assert_eq!(result.clears_haircut(), None);
-        assert_eq!(
-            result.net_of_cost(),
-            NetOfCost::NotAReturn {
-                units: Units::Share
-            }
-        );
+        assert_eq!(result.net_of_cost(), None);
     }
 
     /// The reading that clears alone and fails once its family is counted. This is the entire
@@ -1739,11 +1738,11 @@ mod tests {
         .measure();
 
         match result.net_of_cost() {
-            NetOfCost::Net {
+            Some(NetOfCost::Net {
                 gross_basis_points,
                 cost_basis_points,
                 net_basis_points,
-            } => {
+            }) => {
                 assert!((gross_basis_points - 20.0).abs() < 1e-12);
                 // A pair round trip at a 10bp quoted spread, per the cost model's own arithmetic.
                 assert!((cost_basis_points - 20.0).abs() < 1e-12);
@@ -1771,7 +1770,7 @@ mod tests {
         .expect("the fixture must assemble")
         .measure();
 
-        assert!(matches!(result.net_of_cost(), NetOfCost::Refused(_)));
+        assert!(matches!(result.net_of_cost(), Some(NetOfCost::Refused(_))));
     }
 
     /// A variance share has no round trip behind it, so charging one would be inventing a trade.
@@ -1786,9 +1785,9 @@ mod tests {
 
         assert_eq!(
             result.net_of_cost(),
-            NetOfCost::NotAReturn {
+            Some(NetOfCost::NotAReturn {
                 units: Units::Share
-            }
+            })
         );
     }
 

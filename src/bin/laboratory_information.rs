@@ -3,6 +3,7 @@
 //! Trains nothing. It asks whether there is anything to learn before any architecture is committed to.
 
 use chrono::Utc;
+use clap::Parser;
 use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
@@ -16,14 +17,11 @@ use fund::laboratory::{dataset, information::Paired};
 use polars::prelude::*;
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-const USAGE: &str = "Usage: laboratory_information [LOOKBACK_DAYS] [SEED] [OUTCOME]\n\
-                     OUTCOME is signed (default), magnitude or direction";
-
 /// The whole archive, because a feature worth keeping should show over two years and not one month.
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
 
 /// Seeds the shuffle behind every null. Fixed so a ranking can be got back.
-const DEFAULT_SEED: i64 = 0x4E11;
+const DEFAULT_SEED: u64 = 0x4E11;
 
 /// Every feature the study frame carries that varies across a session's names.
 ///
@@ -76,75 +74,48 @@ fn defined_rows(frame: &DataFrame, column: &str) -> Result<DataFrame, PolarsErro
 /// works: a uniform draw must score zero excess bits.
 const CONTROL_FEATURE: &str = "uniform_control";
 
-struct Parameters {
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_information",
+    about = "Ranks the model's inputs by how much each says about the session it precedes"
+)]
+struct Arguments {
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
     lookback_days: i64,
+    #[arg(
+        default_value_t = DEFAULT_SEED,
+        value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64),
+    )]
     seed: u64,
+    /// One of signed, magnitude or direction.
+    #[arg(default_value = "signed", value_parser = outcome)]
     outcome: Outcome,
 }
 
-impl Parameters {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (lookback_days, seed) = match arguments {
-            [] => (DEFAULT_LOOKBACK_DAYS, DEFAULT_SEED),
-            [lookback] => (positive(lookback, "LOOKBACK_DAYS")?, DEFAULT_SEED),
-            [lookback, seed] | [lookback, seed, _] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(seed, "SEED")?,
-            ),
-            _ => return Err(format!("Too many arguments\n{USAGE}")),
-        };
-        let outcome = match arguments {
-            [_, _, outcome] => match outcome.trim() {
-                "signed" => Outcome::Signed,
-                "magnitude" => Outcome::Magnitude,
-                "direction" => Outcome::Direction,
-                other => {
-                    return Err(format!(
-                        "OUTCOME must be signed, magnitude or direction, got {other:?}\n{USAGE}"
-                    ))
-                }
-            },
-            _ => Outcome::Signed,
-        };
-        Ok(Self {
-            lookback_days,
-            seed: seed as u64,
-            outcome,
-        })
+/// Parses the outcome a feature is ranked against.
+fn outcome(raw: &str) -> Result<Outcome, String> {
+    match raw {
+        "signed" => Ok(Outcome::Signed),
+        "magnitude" => Ok(Outcome::Magnitude),
+        "direction" => Ok(Outcome::Direction),
+        other => Err(format!(
+            "expected signed, magnitude or direction, got {other:?}"
+        )),
     }
-}
-
-fn positive(raw: &str, name: &str) -> Result<i64, String> {
-    let value: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name} must be a positive integer, got {raw:?}\n{USAGE}"))?;
-    if value <= 0 {
-        return Err(format!(
-            "{name} must be greater than zero, got {value}\n{USAGE}"
-        ));
-    }
-    Ok(value)
 }
 
 #[tokio::main]
 async fn main() {
+    let parameters = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
         "laboratory-information.log",
         Some("info"),
         "laboratory-information",
     );
-
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
-        Ok(parameters) => parameters,
-        Err(message) => {
-            eprintln!("{message}");
-            drop(tracing_guard);
-            std::process::exit(2);
-        }
-    };
 
     let code = match run(&parameters).await {
         Ok(triaged) => {
@@ -162,7 +133,7 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn run(parameters: &Parameters) -> Result<Triaged, Box<dyn std::error::Error>> {
+async fn run(parameters: &Arguments) -> Result<Triaged, Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
 
@@ -392,27 +363,27 @@ mod tests {
     use super::*;
     use fund::laboratory::metrics::Distribution;
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
+    fn parse(values: &[&str]) -> Result<Arguments, clap::Error> {
+        Arguments::try_parse_from(
+            std::iter::once("laboratory_information").chain(values.iter().copied()),
+        )
     }
 
     #[test]
     fn test_arguments_default_from_the_right() {
-        let parameters = Parameters::parse(&[]).unwrap();
+        let parameters = parse(&[]).unwrap();
         assert_eq!(parameters.lookback_days, 730);
         assert_eq!(parameters.seed, 19_985);
 
-        let parameters = Parameters::parse(&arguments(&["365", "3"])).unwrap();
+        let parameters = parse(&["365", "3"]).unwrap();
         assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.seed, 3);
         assert_eq!(parameters.outcome, Outcome::Signed);
 
-        let parameters = Parameters::parse(&arguments(&["365", "3", "magnitude"])).unwrap();
+        let parameters = parse(&["365", "3", "magnitude"]).unwrap();
         assert_eq!(parameters.outcome, Outcome::Magnitude);
         assert_eq!(
-            Parameters::parse(&arguments(&["365", "3", "signed"]))
-                .unwrap()
-                .outcome,
+            parse(&["365", "3", "signed"]).unwrap().outcome,
             Outcome::Signed
         );
     }
@@ -420,14 +391,11 @@ mod tests {
     #[test]
     fn test_an_unusable_argument_is_refused() {
         for value in ["7f", "0", "-1", ""] {
-            assert!(
-                Parameters::parse(&arguments(&[value])).is_err(),
-                "{value:?} must be refused"
-            );
+            assert!(parse(&[value]).is_err(), "{value:?} must be refused");
         }
-        assert!(Parameters::parse(&arguments(&["365", "0"])).is_err());
-        assert!(Parameters::parse(&arguments(&["365", "3", "extra"])).is_err());
-        assert!(Parameters::parse(&arguments(&["365", "3", "signed", "more"])).is_err());
+        assert!(parse(&["365", "0"]).is_err());
+        assert!(parse(&["365", "3", "extra"]).is_err());
+        assert!(parse(&["365", "3", "signed", "more"]).is_err());
     }
 
     fn distribution_of(mean: f64) -> Distribution {
@@ -488,5 +456,10 @@ mod tests {
         }
         assert!(!CATEGORICAL_FEATURES.contains(&"ticker"));
         assert!(CONTINUOUS_FEATURES.contains(&"daily_return"));
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
+        assert!(parse(&["365", "3", " magnitude "]).is_err());
     }
 }

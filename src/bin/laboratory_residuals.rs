@@ -5,6 +5,8 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use chrono::Utc;
+use clap::builder::RangedU64ValueParser;
+use clap::Parser;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use tracing::{error, info, warn};
@@ -37,12 +39,6 @@ const TREATMENT_ARM: &str = "real sectors";
 const CONTROL_ARM: &str = "permuted sectors";
 const BASELINE_ARM: &str = "session mean";
 
-const USAGE: &str =
-    "Usage: laboratory_residuals [LOOKBACK_DAYS] [VOLATILITY_SESSIONS] [MINIMUM_VARIANCE_SHARE] \
-     [SCREEN_WINDOW_DAYS]\n\
-     SCREEN_WINDOW_DAYS absent screens every session loaded; a number screens that trailing \
-     window; `per-session:N` re-anchors that window on every session.";
-
 /// Calendar days of archive to measure over by default, matching the baselines binary.
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
 
@@ -61,59 +57,50 @@ struct Parameters {
     screen: Screen,
 }
 
-impl Parameters {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let current = FactorSpecification::CURRENT;
-        let (lookback_days, sessions, share, window_days) = match arguments {
-            [] => (
-                DEFAULT_LOOKBACK_DAYS,
-                current.volatility_sessions() as i64,
-                current.minimum_residual_variance_share(),
-                None,
-            ),
-            [lookback] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                current.volatility_sessions() as i64,
-                current.minimum_residual_variance_share(),
-                None,
-            ),
-            [lookback, sessions] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(sessions, "VOLATILITY_SESSIONS")?,
-                current.minimum_residual_variance_share(),
-                None,
-            ),
-            [lookback, sessions, share] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(sessions, "VOLATILITY_SESSIONS")?,
-                variance_share(share)?,
-                None,
-            ),
-            [lookback, sessions, share, window] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(sessions, "VOLATILITY_SESSIONS")?,
-                variance_share(share)?,
-                Some(window.as_str()),
-            ),
-            _ => return Err(format!("Too many arguments\n{USAGE}")),
-        };
+/// The positional arguments, before the specification and screen they name are validated.
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_residuals",
+    about = "Reports what the factor panel measures, what it refuses, and what it explains"
+)]
+struct Arguments {
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
+    lookback_days: i64,
+    #[arg(
+        default_value_t = FactorSpecification::CURRENT.volatility_sessions(),
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    volatility_sessions: usize,
+    #[arg(default_value_t = FactorSpecification::CURRENT.minimum_residual_variance_share())]
+    minimum_variance_share: f64,
+    /// Absent screens every session loaded; a number screens that trailing window;
+    /// `per-session:N` re-anchors that window on every session.
+    #[arg(value_name = "SCREEN_WINDOW_DAYS", value_parser = screen_window)]
+    screen_window: Option<ScreenWindow>,
+}
 
-        let sessions = usize::try_from(sessions).map_err(|_| {
-            format!("VOLATILITY_SESSIONS is larger than this platform can index\n{USAGE}")
-        })?;
+impl TryFrom<Arguments> for Parameters {
+    type Error = String;
+
+    fn try_from(arguments: Arguments) -> Result<Self, String> {
+        let sessions = arguments.volatility_sessions;
+        let share = arguments.minimum_variance_share;
         let specification = FactorSpecification::new(sessions, share).ok_or_else(|| {
-            format!("{sessions} sessions at a {share} variance share cannot measure a residual\n{USAGE}")
+            format!("{sessions} sessions at a {share} variance share cannot measure a residual")
         })?;
 
         // Only the window moves: naming one half of a screen has not renamed the other, and the
         // floor stays the research one whichever window a caller asks for.
-        let screen = match window_days {
+        let screen = match arguments.screen_window {
             None => dataset::RESEARCH_SCREEN,
-            Some(raw) => Screen::new(dataset::RESEARCH_SCREEN.floor(), screen_window(raw)?),
+            Some(window) => Screen::new(dataset::RESEARCH_SCREEN.floor(), window),
         };
 
         Ok(Self {
-            lookback_days,
+            lookback_days: arguments.lookback_days,
             specification,
             screen,
         })
@@ -125,9 +112,9 @@ impl Parameters {
 /// One argument rather than a window and a mode, because the two are never independently useful and
 /// a mode argument silently ignored on the default path is a bug waiting for its first caller.
 fn screen_window(raw: &str) -> Result<ScreenWindow, String> {
-    let (per_session, digits) = match raw.trim().strip_prefix("per-session:") {
+    let (per_session, digits) = match raw.strip_prefix("per-session:") {
         Some(rest) => (true, rest),
-        None => (false, raw.trim()),
+        None => (false, raw),
     };
     let days = digits
         .parse::<u32>()
@@ -135,8 +122,7 @@ fn screen_window(raw: &str) -> Result<ScreenWindow, String> {
         .and_then(NonZeroU32::new)
         .ok_or_else(|| {
             format!(
-                "SCREEN_WINDOW_DAYS must be a positive number of days, optionally prefixed \
-                 `per-session:`, got {raw:?}\n{USAGE}"
+                "expected a positive day count, optionally prefixed `per-session:`, got {raw:?}"
             )
         })?;
     Ok(if per_session {
@@ -146,29 +132,9 @@ fn screen_window(raw: &str) -> Result<ScreenWindow, String> {
     })
 }
 
-/// Parses the minimum residual variance share, refusing anything that is not a number.
-fn variance_share(raw: &str) -> Result<f64, String> {
-    raw.trim()
-        .parse::<f64>()
-        .map_err(|_| format!("MINIMUM_VARIANCE_SHARE must be a number, got {raw:?}\n{USAGE}"))
-}
-
-/// Parses a positive integer, refusing a typo rather than falling back to the default.
-fn positive(raw: &str, name: &str) -> Result<i64, String> {
-    let value: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name} must be a positive integer, got {raw:?}\n{USAGE}"))?;
-    if value <= 0 {
-        return Err(format!(
-            "{name} must be greater than zero, got {value}\n{USAGE}"
-        ));
-    }
-    Ok(value)
-}
-
 #[tokio::main]
 async fn main() {
+    let arguments = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = fund::common::log::init_tracing(
         "laboratory-residuals.log",
@@ -176,8 +142,7 @@ async fn main() {
         "laboratory-residuals",
     );
 
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
+    let parameters = match Parameters::try_from(arguments) {
         Ok(parameters) => parameters,
         Err(message) => {
             eprintln!("{message}");
@@ -656,13 +621,12 @@ fn render(
 mod tests {
     use super::*;
 
-    fn parse(arguments: &[&str]) -> Result<Parameters, String> {
-        Parameters::parse(
-            &arguments
-                .iter()
-                .map(|argument| (*argument).to_string())
-                .collect::<Vec<_>>(),
+    fn parse(values: &[&str]) -> Result<Parameters, String> {
+        let arguments = Arguments::try_parse_from(
+            std::iter::once("laboratory_residuals").chain(values.iter().copied()),
         )
+        .map_err(|error| error.to_string())?;
+        Parameters::try_from(arguments)
     }
 
     /// The prefix chooses the window's shape and must leave the floor alone.
@@ -805,10 +769,6 @@ mod tests {
         }
     }
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
     /// An absent window screens every session the frame holds, which is what the archive paths have
     /// always done and what every figure on record was measured over.
     #[test]
@@ -819,7 +779,7 @@ mod tests {
             vec!["730", "60"],
             vec!["730", "60", "0.5"],
         ] {
-            let parsed = Parameters::parse(&arguments(&given)).expect("a usable window");
+            let parsed = parse(&given).expect("a usable window");
             assert_eq!(
                 parsed.screen,
                 dataset::RESEARCH_SCREEN,
@@ -834,8 +794,7 @@ mod tests {
     /// would make the two runs of the measurement differ in two respects rather than the one.
     #[test]
     fn test_a_declared_window_moves_the_window_and_not_the_floor() {
-        let parsed =
-            Parameters::parse(&arguments(&["730", "60", "0.5", "30"])).expect("a usable window");
+        let parsed = parse(&["730", "60", "0.5", "30"]).expect("a usable window");
 
         assert_eq!(
             parsed.screen.window(),
@@ -853,12 +812,12 @@ mod tests {
     fn test_an_unusable_screen_window_is_refused() {
         for window in ["0", "-1", "thirty", "", "30.5"] {
             assert!(
-                Parameters::parse(&arguments(&["730", "60", "0.5", window])).is_err(),
+                parse(&["730", "60", "0.5", window]).is_err(),
                 "{window:?} must be refused"
             );
         }
         // A fifth argument is not a window either.
-        assert!(Parameters::parse(&arguments(&["730", "60", "0.5", "30", "7"])).is_err());
+        assert!(parse(&["730", "60", "0.5", "30", "7"]).is_err());
     }
 
     /// Two sessions, and every row shared. The second is deliberately the quieter of the two.
@@ -968,5 +927,10 @@ mod tests {
 
         assert_eq!(sectors_by_ticker(&once), sectors_by_ticker(&twice));
         assert_ne!(sectors_by_ticker(&once), sectors_by_ticker(&elsewhere));
+    }
+
+    #[test]
+    fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
+        assert!(parse(&["731", "60", "0.5", " per-session:30 "]).is_err());
     }
 }

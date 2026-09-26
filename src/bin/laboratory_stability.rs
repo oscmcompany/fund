@@ -3,6 +3,8 @@
 //! Trains nothing. It measures the one thing a cross-sectional statistic is blind to: time.
 
 use chrono::Utc;
+use clap::builder::RangedU64ValueParser;
+use clap::Parser;
 use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
@@ -14,13 +16,11 @@ use fund::laboratory::predictor::{
 };
 use fund::laboratory::stability::{self, DEFAULT_LAGS};
 
-const USAGE: &str = "Usage: laboratory_stability [LOOKBACK_DAYS] [MOMENTUM_SESSIONS]";
-
 /// Calendar days of archive to measure over by default, matching the baselines runner.
 const DEFAULT_LOOKBACK_DAYS: i64 = 730;
 
 /// Sessions the momentum baseline sums over by default.
-const DEFAULT_MOMENTUM_SESSIONS: i64 = 20;
+const DEFAULT_MOMENTUM_SESSIONS: usize = 20;
 
 /// Fixed, so the control draws the same orderings every run.
 const RANDOM_SEED: u64 = 0x5EED;
@@ -31,65 +31,33 @@ const RANDOM_SEED: u64 = 0x5EED;
 /// statistic whose per-session spread of 0.16 against a mean of zero raised the question.
 const STATISTIC: &str = "information_coefficient";
 
-struct Parameters {
+#[derive(Debug, Parser)]
+#[command(
+    name = "laboratory_stability",
+    about = "Asks whether a forecast's per-session reading predicts the next session's"
+)]
+struct Arguments {
+    #[arg(
+        default_value_t = DEFAULT_LOOKBACK_DAYS,
+        value_parser = clap::value_parser!(i64).range(1..),
+    )]
     lookback_days: i64,
+    #[arg(
+        default_value_t = DEFAULT_MOMENTUM_SESSIONS,
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..),
+    )]
     momentum_sessions: usize,
-}
-
-impl Parameters {
-    fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (lookback_days, momentum_sessions) = match arguments {
-            [] => (DEFAULT_LOOKBACK_DAYS, DEFAULT_MOMENTUM_SESSIONS),
-            [lookback] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                DEFAULT_MOMENTUM_SESSIONS,
-            ),
-            [lookback, momentum] => (
-                positive(lookback, "LOOKBACK_DAYS")?,
-                positive(momentum, "MOMENTUM_SESSIONS")?,
-            ),
-            _ => return Err(format!("Too many arguments\n{USAGE}")),
-        };
-        Ok(Self {
-            lookback_days,
-            momentum_sessions: usize::try_from(momentum_sessions).map_err(|_| {
-                format!("MOMENTUM_SESSIONS is larger than this platform can index\n{USAGE}")
-            })?,
-        })
-    }
-}
-
-fn positive(raw: &str, name: &str) -> Result<i64, String> {
-    let value: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| format!("{name} must be a positive integer, got {raw:?}\n{USAGE}"))?;
-    if value <= 0 {
-        return Err(format!(
-            "{name} must be greater than zero, got {value}\n{USAGE}"
-        ));
-    }
-    Ok(value)
 }
 
 #[tokio::main]
 async fn main() {
+    let parameters = Arguments::parse();
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
         "laboratory-stability.log",
         Some("info"),
         "laboratory-stability",
     );
-
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let parameters = match Parameters::parse(&arguments) {
-        Ok(parameters) => parameters,
-        Err(message) => {
-            eprintln!("{message}");
-            drop(tracing_guard);
-            std::process::exit(2);
-        }
-    };
 
     let code = match run(&parameters).await {
         Ok(measured) => {
@@ -109,7 +77,7 @@ async fn main() {
 
 /// Scores every baseline session by session, then follows each one's readings through time.
 async fn run(
-    parameters: &Parameters,
+    parameters: &Arguments,
 ) -> Result<Vec<laboratory::StabilityMeasured>, Box<dyn std::error::Error>> {
     let bucket = fund::common::aws::archive_bucket()?;
     let s3_client = fund::common::aws::s3_client().await;
@@ -275,21 +243,23 @@ mod tests {
     use super::*;
     use fund::laboratory::stability::{Association, SignAgreement};
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
+    fn parse(values: &[&str]) -> Result<Arguments, clap::Error> {
+        Arguments::try_parse_from(
+            std::iter::once("laboratory_stability").chain(values.iter().copied()),
+        )
     }
 
     #[test]
     fn test_arguments_default_from_the_right() {
-        let parameters = Parameters::parse(&[]).unwrap();
+        let parameters = parse(&[]).unwrap();
         assert_eq!(parameters.lookback_days, 730);
         assert_eq!(parameters.momentum_sessions, 20);
 
-        let parameters = Parameters::parse(&arguments(&["365"])).unwrap();
+        let parameters = parse(&["365"]).unwrap();
         assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.momentum_sessions, 20);
 
-        let parameters = Parameters::parse(&arguments(&["365", "5"])).unwrap();
+        let parameters = parse(&["365", "5"]).unwrap();
         assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.momentum_sessions, 5);
     }
@@ -297,13 +267,10 @@ mod tests {
     #[test]
     fn test_an_unusable_argument_is_refused() {
         for value in ["3o5", "0", "-5", ""] {
-            assert!(
-                Parameters::parse(&arguments(&[value])).is_err(),
-                "{value:?} must be refused"
-            );
+            assert!(parse(&[value]).is_err(), "{value:?} must be refused");
         }
-        assert!(Parameters::parse(&arguments(&["365", "0"])).is_err());
-        assert!(Parameters::parse(&arguments(&["365", "20", "7"])).is_err());
+        assert!(parse(&["365", "0"]).is_err());
+        assert!(parse(&["365", "20", "7"]).is_err());
     }
 
     /// The sign is the whole finding, and a negative autocorrelation is a different and tradeable
