@@ -13,6 +13,7 @@ pub mod intraday;
 pub mod intraday_convergence;
 pub mod journal;
 pub mod metrics;
+pub mod null;
 pub mod predictor;
 pub mod regime;
 pub mod register;

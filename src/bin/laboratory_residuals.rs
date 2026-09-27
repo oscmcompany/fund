@@ -7,8 +7,6 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use chrono::Utc;
 use clap::builder::RangedU64ValueParser;
 use clap::Parser;
-use rand::prelude::*;
-use rand::rngs::StdRng;
 use tracing::{error, info, warn};
 
 use fund::common::types::{Screen, ScreenWindow, SessionDate};
@@ -19,6 +17,7 @@ use fund::laboratory::harness::{
     Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study, StudyResult,
 };
 use fund::laboratory::journal as laboratory;
+use fund::laboratory::null::Permutation;
 use fund::laboratory::residual::{
     residual_returns, FactorSpecification, ResidualPanel, RESIDUAL_COLUMN,
 };
@@ -387,8 +386,7 @@ fn permute_sectors(frame: &DataFrame, seed: u64) -> Result<DataFrame, PolarsErro
         }
     }
 
-    let mut generator = StdRng::seed_from_u64(seed);
-    labels.shuffle(&mut generator);
+    Permutation::new(seed).shuffle(&mut labels);
 
     let permuted: Vec<Option<&str>> = (0..frame.height())
         .map(|row| {

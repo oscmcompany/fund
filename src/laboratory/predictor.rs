@@ -302,19 +302,6 @@ impl Predictor for Momentum {
     }
 }
 
-/// Stirs two values into one seed.
-///
-/// The splitmix64 finalizer, so a run and a session combine without colliding the way an exclusive
-/// or does: seed 7 at session 1 would otherwise draw the same ordering as seed 6 at session 0.
-fn mix(seed: u64, session: u64) -> u64 {
-    let mut value = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(session);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
 /// Scores names arbitrarily, reproducibly.
 ///
 /// The null for a ranking metric, where the cross-sectional mean is the null for a regression one:
@@ -341,8 +328,10 @@ impl Predictor for RandomRanking {
         if history.sessions() == 0 {
             return vec![None; history.tickers()];
         }
-        let mut generator =
-            StdRng::seed_from_u64(mix(self.seed, history.forecast_session() as u64));
+        let mut generator = StdRng::seed_from_u64(crate::laboratory::null::mix(
+            self.seed,
+            history.forecast_session() as u64,
+        ));
         (0..history.tickers())
             .map(|_| Some(generator.random::<f64>()))
             .collect()

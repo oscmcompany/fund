@@ -14,8 +14,8 @@ use fund::common::types::{BasisPoints, Screen, SessionDate};
 use fund::laboratory::cost::{CostModel, FillStyle, RoundTrip};
 use fund::laboratory::dataset::{self, DatasetFingerprint};
 use fund::laboratory::harness::{
-    distribution, Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing, Quantity, Study,
-    StudyResult,
+    distribution, family_null, Arm, Declaration, DeclaredUniverse, Family, Horizon, Pairing,
+    Quantity, Study, StudyResult,
 };
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::predictor::{
@@ -45,6 +45,9 @@ fn control_name() -> String {
 
 /// The multiple-testing bucket these comparisons are spent against.
 const FAMILY: &str = "daily-baselines";
+
+/// The bucket the family null's noise arms are declared under, so they never count against `FAMILY`.
+const FAMILY_NULL: &str = "daily-baselines-null";
 
 /// What one round trip is assumed to cost, when the operator declares no spread.
 ///
@@ -78,6 +81,9 @@ struct Arguments {
         value_parser = quoted_spread,
     )]
     quoted_spread: BasisPoints,
+    /// Families of random rankings to push through the identical study, calibrating its haircut.
+    #[arg(long, value_parser = RangedU64ValueParser::<usize>::new().range(1..=1000))]
+    family_null: Option<usize>,
 }
 
 /// Parses a quoted spread, refusing everything `BasisPoints` refuses rather than only a negative.
@@ -244,6 +250,27 @@ async fn run(parameters: &Arguments) -> Result<String, Box<dyn std::error::Error
         }
     }
 
+    let null = match parameters.family_null {
+        Some(families) => Some(measure_family_null(
+            parameters,
+            families,
+            &panel,
+            &sessions,
+            &fingerprint,
+            studies.len(),
+        )?),
+        None => None,
+    };
+    if let (Some(null), Some(journal)) = (&null, journal.as_ref()) {
+        journal
+            .record(
+                run_id,
+                Utc::now(),
+                laboratory::Observation::FamilyNullMeasured(null.clone()),
+            )
+            .await;
+    }
+
     let mut report = render(&scored);
     // The table above describes four predictors on three statistics; the one below tests the three
     // real ones against the random arm on the only statistic a book could be paid in.
@@ -252,6 +279,9 @@ async fn run(parameters: &Arguments) -> Result<String, Box<dyn std::error::Error
          trip.\n\n",
     );
     report.push_str(&fund::laboratory::harness::render(&studies));
+    if let Some(null) = &null {
+        report.push_str(&render_family_null(null));
+    }
     Ok(report)
 }
 
@@ -283,6 +313,99 @@ fn measure(
             "the control was the only arm scored".into()
         })?;
 
+    treatments
+        .into_iter()
+        .map(|treatment| {
+            study(
+                parameters,
+                treatment,
+                control,
+                Family::new(FAMILY, tests),
+                sessions,
+                screen,
+                fingerprint,
+            )
+        })
+        .collect()
+}
+
+/// Runs `families` families of random rankings through the identical study, one real family's size each.
+///
+/// Each noise study draws its own random control: one shared control makes every study a function of
+/// the same draw, which on 2026-09-25 shrank the statistics' spread to 0.72 and cleared no family.
+fn measure_family_null(
+    parameters: &Arguments,
+    families: usize,
+    panel: &Panel,
+    sessions: &[i64],
+    fingerprint: &DatasetFingerprint,
+    family_size: usize,
+) -> Result<laboratory::FamilyNullMeasured, Box<dyn std::error::Error>> {
+    let tests = NonZeroUsize::new(family_size)
+        .ok_or_else(|| -> Box<dyn std::error::Error> { "the real family is empty".into() })?;
+    // Two seeds per study, treatment then control, none of them the real control's.
+    let seeds: Vec<u64> = (1..)
+        .filter(|seed| *seed != RANDOM_SEED)
+        .take(2 * families * tests.get())
+        .collect();
+    let mut noise = Vec::with_capacity(seeds.len() / 2);
+    for pair in seeds.chunks_exact(2) {
+        let treatment = evaluate(&RandomRanking { seed: pair[0] }, panel);
+        let control = evaluate(&RandomRanking { seed: pair[1] }, panel);
+        noise.push(study(
+            parameters,
+            &treatment,
+            &control,
+            Family::new(FAMILY_NULL, tests),
+            sessions,
+            dataset::RESEARCH_SCREEN,
+            fingerprint,
+        )?);
+    }
+    let null = family_null(&noise, tests).ok_or_else(|| -> Box<dyn std::error::Error> {
+        "the noise arms did not fill whole families".into()
+    })?;
+    Ok(laboratory::FamilyNullMeasured {
+        family: FAMILY.to_string(),
+        arm: format!(
+            "random_ranking_seed_{:#x}..={:#x}",
+            seeds.first().copied().unwrap_or_default(),
+            seeds.last().copied().unwrap_or_default()
+        ),
+        null,
+    })
+}
+
+/// The family null's reading beside the rate it is supposed to sit under.
+fn render_family_null(measured: &laboratory::FamilyNullMeasured) -> String {
+    let null = measured.null;
+    format!(
+        "\nFamily null for {}: {} families of {} ({}), {} cleared, {} undefined, rate {} against a \
+         {:.0}% family-wise error rate; the test statistics spread {} where fresh draws spread 1.00\n",
+        measured.family,
+        null.families,
+        null.tests_per_family,
+        measured.arm,
+        null.clearing,
+        null.undefined,
+        null.rate()
+            .map_or_else(|| "unmeasurable".to_string(), |rate| format!("{:.1}%", rate * 100.0)),
+        null.family_wise_error_rate * 100.0,
+        null.statistic_spread
+            .map_or_else(|| "unmeasurable".to_string(), |spread| format!("{spread:.2}")),
+    )
+}
+
+/// One treatment's decile spread against the control's, declared under `family`.
+fn study(
+    parameters: &Arguments,
+    treatment: &Evaluation,
+    control: &Evaluation,
+    family: Family,
+    sessions: &[i64],
+    screen: Screen,
+    fingerprint: &DatasetFingerprint,
+) -> Result<StudyResult, Box<dyn std::error::Error>> {
     // Every arm reads the same panel, session for session, so the difference is taken per session
     // and the variation the whole cross-section shared on a day cancels instead of being counted.
     let arm = |evaluation: &Evaluation| {
@@ -302,32 +425,27 @@ fn measure(
         })
     };
 
-    treatments
-        .into_iter()
-        .map(|treatment| {
-            Study::new(
-                Declaration::new(
-                    format!("does {} pay for its own spread", treatment.predictor),
-                    Family::new(FAMILY, tests),
-                    // One session ahead: the panel's target is the next session's return.
-                    Horizon::Sessions(NonZeroUsize::new(1).expect("a positive count")),
-                    declared_universe(screen),
-                    Quantity::ReturnPerRoundTrip {
-                        // A decile long-short crosses one name on each side per dollar deployed,
-                        // whatever the decile's width, so the round trip is a pair.
-                        cost_model: CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR),
-                        quoted_spread: parameters.quoted_spread,
-                    },
-                ),
-                Pairing::Matched,
-                arm(treatment)?,
-                arm(control)?,
-                fingerprint,
-            )
-            .map(Study::measure)
-            .map_err(|refusal| -> Box<dyn std::error::Error> { refusal.to_string().into() })
-        })
-        .collect()
+    Study::new(
+        Declaration::new(
+            format!("does {} pay for its own spread", treatment.predictor),
+            family,
+            // One session ahead: the panel's target is the next session's return.
+            Horizon::Sessions(NonZeroUsize::new(1).expect("a positive count")),
+            declared_universe(screen),
+            Quantity::ReturnPerRoundTrip {
+                // A decile long-short crosses one name on each side per dollar deployed, whatever
+                // the decile's width, so the round trip is a pair.
+                cost_model: CostModel::new(FillStyle::Aggressive, RoundTrip::PAIR),
+                quoted_spread: parameters.quoted_spread,
+            },
+        ),
+        Pairing::Matched,
+        arm(treatment)?,
+        arm(control)?,
+        fingerprint,
+    )
+    .map(Study::measure)
+    .map_err(|refusal| -> Box<dyn std::error::Error> { refusal.to_string().into() })
 }
 
 /// The population the study declares, built from the screen it handed the loader.
@@ -603,5 +721,53 @@ mod tests {
     #[test]
     fn test_surrounding_whitespace_is_refused_rather_than_trimmed() {
         assert!(parse(&["730", "20", " 10 "]).is_err());
+    }
+
+    /// Thirty names over twelve sessions, with returns that vary by name and session.
+    fn noise_panel() -> (Panel, Vec<i64>) {
+        use polars::prelude::*;
+        let (mut tickers, mut timestamps, mut returns) = (Vec::new(), Vec::new(), Vec::new());
+        for session in 0..12_i64 {
+            for name in 0..30_i64 {
+                tickers.push(format!("N{name:02}"));
+                timestamps.push(session * 86_400_000);
+                returns.push((((name * 7 + session * 13) % 17) as f64 - 8.0) / 1_000.0);
+            }
+        }
+        let frame = df!(
+            "ticker" => tickers,
+            "timestamp" => timestamps,
+            "daily_return" => returns,
+        )
+        .unwrap();
+        let panel = Panel::from_frame(&frame).unwrap();
+        let sessions = (0..panel.sessions())
+            .map(|index| panel.session_at(index))
+            .collect();
+        (panel, sessions)
+    }
+
+    /// Two seeds per study, whole families of the real family's size, none of them the control's.
+    #[test]
+    fn test_the_family_null_runs_whole_families_through_the_study() {
+        let (panel, sessions) = noise_panel();
+        let measured =
+            measure_family_null(&parameters(), 4, &panel, &sessions, &fingerprint(), 3).unwrap();
+        assert_eq!(measured.family, "daily-baselines");
+        assert_eq!(measured.arm, "random_ranking_seed_0x1..=0x18");
+        assert_eq!(measured.null.families, 4);
+        assert_eq!(measured.null.tests_per_family, 3);
+        assert!(measured.null.clearing + measured.null.undefined <= 4);
+    }
+
+    #[test]
+    fn test_the_family_null_is_bounded() {
+        assert!(parse(&["--family-null", "0"]).is_err());
+        assert!(parse(&["--family-null", "1001"]).is_err());
+        assert_eq!(
+            parse(&["--family-null", "1000"]).unwrap().family_null,
+            Some(1000)
+        );
+        assert_eq!(parse(&[]).unwrap().family_null, None);
     }
 }
