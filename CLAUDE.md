@@ -17,7 +17,8 @@ This is a collection of guidelines and references.
 - `src/common/` holds the crate's shared pure code as `module.rs` beside `module/`; its modules and the pure
   `decide`/`solve` take no clients, are not `async`, and import no `tokio`, `reqwest`, `aws_sdk_*`,
   `std::fs` or `std::net`, which a check enforces once pivot task 10 lands
-- The live plans are `.scratchpad/plan_pivot.md` and `.scratchpad/plan_launch.md`, cited as "pivot task N"
+- The live plans are `.scratchpad/plan_pivot.md` and `.scratchpad/plan_launch.md`, local and deliberately untracked
+  (`.scratchpad/` is gitignored because they carry private strategy and capital details); cite them as "pivot task N"
   and "launch task N"
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
