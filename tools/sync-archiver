@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# sync-archiver -- Bring the archiver's checkout and binary up to origin/master.
+# sync-archiver -- Bring the archiver's checkout and binary up to origin/legacy.
 #
 # Runs on the worker itself, before each night's fold. Unlike `sync-application` there is no
 # process-compose to signal, so this only has to leave a good binary behind.
@@ -13,6 +13,9 @@ BINARY="$REPO_ROOT/target/release/seed"
 # freshness from the source files themselves, and a second answer to the same question is a second
 # thing to be wrong. A hand-run `cargo build` desynchronises this file and must stay harmless.
 STAMP="$REPO_ROOT/target/release/.seed-built-from"
+
+# The legacy system is frozen on its own branch while master is rebuilt underneath it.
+BRANCH=legacy
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
@@ -26,16 +29,16 @@ fi
 
 cd "$REPO_ROOT"
 
-if ! git fetch origin master 2>&1; then
+if ! git fetch origin "$BRANCH" 2>&1; then
   log "git fetch failed; keeping $(git rev-parse --short HEAD)"
   exit 0
 fi
 
-remote_head="$(git rev-parse origin/master)"
+remote_head="$(git rev-parse "origin/$BRANCH")"
 built_from="$(cat "$STAMP" 2>/dev/null || echo none)"
 
 log "Syncing to ${remote_head:0:8} (last successful build: ${built_from:0:8})"
-git reset --hard origin/master
+git reset --hard "origin/$BRANCH"
 
 # Built unconditionally. An up-to-date build is a freshness check cargo answers in seconds, and
 # skipping on a stamp is what let a failed build leave the worker on stale code until the next

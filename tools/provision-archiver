@@ -388,7 +388,7 @@ sudo -u ubuntu -H bash -c '
   set -euxo pipefail
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
   export PATH="\$HOME/.cargo/bin:\$PATH"
-  git clone https://github.com/oscmcompany/fund.git "\$HOME/fund"
+  git clone --branch legacy https://github.com/oscmcompany/fund.git "\$HOME/fund"
   cd "\$HOME/fund"
   export SQLX_OFFLINE=true
   cargo build --release --bin seed
@@ -687,7 +687,7 @@ else
 "! systemctl is-active --quiet fund-archiver.service",
 "printf '%s' '${PROFILE}' > /etc/fund-profile",
 "mkdir -p /var/log/fund /var/journal/fund && chown ubuntu:ubuntu /var/log/fund /var/journal/fund",
-"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
+"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin legacy && git reset -q --hard origin/legacy'",
 "bash /home/ubuntu/fund/tools/install-duckdb || echo 'duckdb was not installed; the reference checks will record Failed'",
 "install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
 "systemctl daemon-reload",
