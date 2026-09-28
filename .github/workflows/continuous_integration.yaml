@@ -22,16 +22,14 @@ jobs:
         uses: dorny/paths-filter@v3
         id: changes
         with:
-          # `.sqlx/` is Rust's: the build runs with SQLX_OFFLINE, so a wrong cache
-          # fails compilation and nothing else would catch it. devenv defines the
-          # toolchain both halves run under, so it triggers both rather than
-          # picking one.
+          # Rooted so `src_old/` never triggers the Rust checks; devenv defines
+          # the toolchain both halves share, so it triggers both.
           filters: |
             rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - '**/Cargo.lock'
-              - '.sqlx/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - 'devenv.nix'
               - 'devenv.lock'
             base:
@@ -40,9 +38,6 @@ jobs:
               - '**/*.yaml'
               - '**/*.yml'
               - '**/*.toml'
-              - '**/*.sql'
-              - '.sqlfluff'
-              - '.sqlfluffignore'
               - 'devenv.lock'
       # Deliberately no disk-freeing step. Removing dotnet, ghc and boost
       # cost 35-70s of every run; measured on run 32382969223 the runner starts
@@ -72,7 +67,7 @@ jobs:
       # it and 369s without. Swatinem/rust-cache above already covers ~/.cargo
       # and target/, which is why the second cache was redundant.
 
-      # Gated because it lints nix, markdown, yaml, toml and sql and none of those
+      # Gated because it lints nix, markdown, yaml, toml and none of those
       # are in most pull requests here: nineteen of the last twenty-five merged
       # were Rust-only, and each paid two and a half minutes to lint files they
       # did not touch. `Cargo.toml` matches both filters, so a dependency bump
@@ -80,42 +75,8 @@ jobs:
       - name: Run base checks
         if: steps.changes.outputs.base == 'true'
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:base
-      # The integration test targets need a database and an S3-compatible
-      # object store. Only those two are started, not the fund services: those
-      # would connect to Alpaca and are not what is under test here.
-      - name: Start test services
-        if: steps.changes.outputs.rust == 'true'
-        run: >-
-          devenv --secretspec-provider env --secretspec-profile development
-          --profile test up postgres object-store --detach
-      - name: Wait for test services
-        if: steps.changes.outputs.rust == 'true'
-        run: |
-          # Any HTTP response means the object store is listening. `curl -f`
-          # would treat a 403 as down, and an unsigned GET / returns 403 on
-          # MinIO and on real S3, so the probe must not assume a 200 there.
-          object_store_up() {
-            status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8333 || true)
-            [ -n "${status}" ] && [ "${status}" != "000" ]
-          }
-          for attempt in $(seq 1 90); do
-            postgres_ready=false
-            object_store_ready=false
-            pg_isready -h localhost -p 5432 -q && postgres_ready=true
-            object_store_up && object_store_ready=true
-            if [ "$postgres_ready" = true ] && [ "$object_store_ready" = true ]; then
-              echo "Test services ready after ${attempt}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Test services not ready within 90s"
-          echo "  postgres:     $postgres_ready"
-          echo "  object-store: $object_store_ready"
-          exit 1
       - name: Run Rust checks
         if: steps.changes.outputs.rust == 'true'
         env:
-          SQLX_OFFLINE: "true"
           CARGO_INCREMENTAL: "0"
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:rust

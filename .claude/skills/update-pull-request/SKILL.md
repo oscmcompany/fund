@@ -230,7 +230,7 @@ Follow these steps:
 
 - After implementing each group's fixes, run verification checks locally:
   - Run `devenv tasks run checks:rust` if any Rust files were modified.
-  - Run `devenv tasks run checks:base` if any nix, markdown, yaml, toml, or sql files were modified.
+  - Run `devenv tasks run checks:base` if any nix, markdown, yaml, or toml files were modified.
   - **Note**: Local verification confirms fixes work in the development environment. Remote continuous integration will re-run after changes are pushed in the "Commit and Push Changes" step.
 - If checks fail, resolve issues and re-run until passing before moving to the next group.
 - Do not proceed to the next feedback group until current group's changes pass verification.
