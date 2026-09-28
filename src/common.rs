@@ -1,14 +1,9 @@
-//! Shared vocabulary and service infrastructure.
+//! Pure domain code shared by every host.
 
-pub mod alpaca;
-pub mod aws;
-pub mod crypto;
-pub mod database;
-pub mod edgar;
-pub mod events;
-pub mod flatfiles;
-pub mod journal;
-pub mod log;
-pub mod massive;
-pub mod provenance;
-pub mod types;
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_crate_builds_and_runs_its_tests() {
+        assert_eq!(1 + 1, 2);
+    }
+}

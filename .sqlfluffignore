@@ -1,5 +1,0 @@
-.devenv/
-target/
-.venv/
-.scratchpad/
-tools/duckdb_initialization.sql

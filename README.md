@@ -14,65 +14,18 @@ Below are resources for the project and repository.
 
 ### Setup
 
-#### Local
-
 ```sh
 # Install devenv (https://devenv.sh/getting-started/), clone the repository
-# and enter the directory - available commands are printed on shell entry, and
-# start the application services.
+# and enter the directory - available tasks are printed on shell entry.
 git clone git@github.com:oscmcompany/fund.git
 cd fund
-devenv --profile application up
+devenv shell
+
+# Run every check.
+devenv tasks run checks:all
 ```
 
-#### Remote
-
-```sh
-# Provision the application VM from your local machine then SSH in and
-# start services with sync cron.
-provision-production-application-vm
-ssh oscm-fund-production-application.exe.dev
-start-application
-
-# Seed ticker metadata and historical bars into PostgreSQL on the running
-# application. 
-SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed:postgres
-
-# Share the VM with the team and publish the dashboard externally.
-ssh exe.dev share add oscm-fund-production-application team
-ssh exe.dev share access allow oscm-fund-production-application
-ssh exe.dev publish oscm-fund-production-application 8084:8084
-
-# Provision the researcher VM (still the `trainer` profile) from your local
-# machine, then SSH in and install its nightly cron job.
-provision-production-trainer-vm
-ssh oscm-fund-production-trainer.exe.dev
-start-trainer
-
-# Seed the S3 bar archive the laboratory reads. Needed once on a fresh bucket.
-devenv tasks run data:seed:s3
-
-# Launch DuckDB for a local query interface against S3 with all data lake views
-# pre-loaded. The argument names the shared archive the data/** views read; the
-# exports/** views read this profile's own bucket. Once in the DuckDB shell, run
-# .help for commands and SHOW TABLES to list loaded views.
-start-duckdb oscm-fund-archive
-```
-
-> For development VMs, run the equivalent `development` scripts.
-> The provision script handles environment-specific configuration.
-
-#### Notes
-
-- Application services run in a tmux session; attach with `tmux attach -t fund`
-- Two processes run there: `fund`, the service, and `dashboard`. The service is one event loop woken
-  by pg_cron through `LISTEN`/`NOTIFY`, not a set of per-module workers
-- Dashboard is available at `http://<vm-name>.vm.exe.dev:8084`
-- Git sync checks for updates every minute on both VMs; view logs at
-  `/var/log/fund/sync-application.log` and `/var/log/fund/sync-trainer.log`
-- `run-researcher` runs weekdays at 23:00 UTC and ships the researcher's journal and logs to the
-  records bucket; view logs at `/var/log/fund/run-researcher.log`
-- The local `~/lab.duckdb` file is scratch space. It can be deleted and rebuilt from S3 at any time.
+The legacy system is parked in `src_old/` for porting; see its README.
 
 ### Principles
 
