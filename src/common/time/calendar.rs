@@ -2,6 +2,7 @@
 //! Built from plain session rows, so any provider can feed it; fetching them is not this module's job.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use chrono::{DateTime, NaiveTime, TimeDelta, Utc};
 
@@ -122,9 +123,9 @@ impl TradingCalendar {
         })
     }
 
-    /// Whether the published range spans the whole of `[start, end]`.
+    /// Whether the published range spans the whole of `[start, end]`; a reversed range is never covered.
     pub fn covers(&self, start: SessionDate, end: SessionDate) -> bool {
-        self.first <= start && end <= self.last
+        start <= end && self.first <= start && end <= self.last
     }
 
     /// Whether the market trades on `date`; a date outside the range answers `false`.
@@ -161,7 +162,7 @@ impl TradingCalendar {
     /// The earliest trading day strictly after `date`, or `None` when the range holds none.
     pub fn next_trading_day(&self, date: SessionDate) -> Option<SessionDate> {
         self.sessions
-            .range(date.plus_calendar_days(1)..)
+            .range((Bound::Excluded(date), Bound::Unbounded))
             .next()
             .map(|(day, _)| *day)
     }
@@ -298,6 +299,17 @@ mod tests {
         assert!(calendar.covers(date(2026, 11, 23), date(2026, 11, 30)));
         assert!(!calendar.covers(date(2026, 11, 22), date(2026, 11, 30)));
         assert!(!calendar.covers(date(2026, 11, 23), date(2026, 12, 1)));
+    }
+
+    #[test]
+    fn test_covers_refuses_a_reversed_range() {
+        assert!(!calendar().covers(date(2026, 11, 30), date(2026, 11, 23)));
+    }
+
+    #[test]
+    fn test_next_trading_day_after_the_last_representable_date_is_none() {
+        let last = SessionDate::from_date(NaiveDate::MAX);
+        assert_eq!(calendar().next_trading_day(last), None);
     }
 
     #[test]
