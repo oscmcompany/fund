@@ -100,6 +100,14 @@ fi
 
 RECORDS_BUCKET="${RECORDS_BUCKET_STEM}-${SLUG}"
 
+# The branch the box clones and syncs. Checked before anything changes, because a fresh clone of a
+# missing branch leaves a box with no binary, and a reconcile would stop the service first.
+BRANCH="legacy"
+if ! git ls-remote --exit-code --heads https://github.com/oscmcompany/fund.git "$BRANCH" >/dev/null; then
+  echo "Error: branch \"$BRANCH\" does not exist on origin; create it before provisioning." >&2
+  exit 1
+fi
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 DRIFT=0
@@ -388,7 +396,7 @@ sudo -u ubuntu -H bash -c '
   set -euxo pipefail
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
   export PATH="\$HOME/.cargo/bin:\$PATH"
-  git clone https://github.com/oscmcompany/fund.git "\$HOME/fund"
+  git clone --branch ${BRANCH} https://github.com/oscmcompany/fund.git "\$HOME/fund"
   cd "\$HOME/fund"
   export SQLX_OFFLINE=true
   cargo build --release --bin seed
@@ -680,6 +688,7 @@ else
   cat > "$RECONCILE_COMMANDS" <<JSON
 {"commands":[
 "set -e",
+"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin ${BRANCH}'",
 "mkdir -p /var/lib/fund && chown ubuntu:ubuntu /var/lib/fund",
 "touch /var/lib/fund/inhibit-once && chown ubuntu:ubuntu /var/lib/fund/inhibit-once",
 "systemctl kill -s KILL fund-archiver.service 2>/dev/null || true",
@@ -687,7 +696,7 @@ else
 "! systemctl is-active --quiet fund-archiver.service",
 "printf '%s' '${PROFILE}' > /etc/fund-profile",
 "mkdir -p /var/log/fund /var/journal/fund && chown ubuntu:ubuntu /var/log/fund /var/journal/fund",
-"sudo -u ubuntu -H bash -lc 'cd ~/fund && git fetch -q origin master && git reset -q --hard origin/master'",
+"sudo -u ubuntu -H bash -lc 'cd ~/fund && git reset -q --hard origin/${BRANCH}'",
 "bash /home/ubuntu/fund/tools/install-duckdb || echo 'duckdb was not installed; the reference checks will record Failed'",
 "install -m 0644 /home/ubuntu/fund/tools/fund-archiver.service /etc/systemd/system/fund-archiver.service",
 "systemctl daemon-reload",
