@@ -1,0 +1,58 @@
+{
+  "_comment": "Routes that are true by construction rather than observable in a log. Read by `seed archive-provenance backfill --from-configuration`. Logs win where both answer.",
+  "declarations": [
+    {
+      "_why": "Massive's per-ticker and grouped aggregate routes, which Starter answers inside its rolling five-year window. No pass logs these, so nothing else can attribute them.",
+      "dataset": "equity_bars",
+      "interval": "five_minute",
+      "provider": "massive",
+      "subscription": "stocks_starter",
+      "transport": "rest"
+    },
+    {
+      "dataset": "equity_bars",
+      "interval": "one_day",
+      "provider": "massive",
+      "subscription": "stocks_starter",
+      "transport": "rest"
+    },
+    {
+      "_why": "Trades have one route by construction and no repair path: a trade file *is* the session, so a name absent from it is absent from the tape. Declared because two sessions were folded outside the logs kept here.",
+      "dataset": "equity_trades",
+      "provider": "massive",
+      "subscription": "stocks_advanced",
+      "transport": "flat_file"
+    },
+    {
+      "_why": "Splits are rewritten whole from Massive's reference route; boundaries are windowed from Alpaca. Both are one object rather than a partition tree, so no session-keyed log can attribute them.",
+      "dataset": "equity_corporate_action_splits",
+      "provider": "massive",
+      "subscription": "stocks_starter",
+      "transport": "rest"
+    },
+    {
+      "dataset": "equity_corporate_action_boundaries",
+      "provider": "alpaca",
+      "subscription": "algo_trader_plus"
+    },
+    {
+      "_why": "The raw tee is Massive's own bytes by construction; all three datasets sit behind Stocks Advanced.",
+      "dataset": "raw_equity_quotes",
+      "provider": "massive",
+      "subscription": "stocks_advanced",
+      "transport": "flat_file"
+    },
+    {
+      "dataset": "raw_equity_trades",
+      "provider": "massive",
+      "subscription": "stocks_advanced",
+      "transport": "flat_file"
+    },
+    {
+      "dataset": "raw_equity_minute_aggs",
+      "provider": "massive",
+      "subscription": "stocks_advanced",
+      "transport": "flat_file"
+    }
+  ]
+}

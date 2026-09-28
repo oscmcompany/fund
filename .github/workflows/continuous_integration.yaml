@@ -22,9 +22,8 @@ jobs:
         uses: dorny/paths-filter@v3
         id: changes
         with:
-          # Rooted rather than `**/` so the frozen `src_old/` crate never triggers
-          # the Rust checks. devenv defines the toolchain both halves run under,
-          # so it triggers both rather than picking one.
+          # Rooted so `src_old/` never triggers the Rust checks; devenv defines
+          # the toolchain both halves share, so it triggers both.
           filters: |
             rust:
               - 'src/**'

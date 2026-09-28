@@ -18,6 +18,7 @@ data/*
 **/*.safetensor
 **/*.json
 !src_old/.sqlx/*.json
+!src_old/data/archive_provenance.json
 .claude/tasks/
 .claude/settings.local.json*
 .scratchpad/
