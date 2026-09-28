@@ -49,8 +49,8 @@ This is a collection of guidelines and references.
 - `fund-role` and `fund-profile` are different axes and neither absorbs the other: the role is which kind
   of host (`archiver`), the profile is which environment (`production`), and provisioning filters on both
   so a second environment cannot adopt the first's box
-- "Profile" already means a role in devenv and an environment in secretspec, so never introduce a third
-  sense of it; a record's host partition is `producer=`
+- "Profile" means an environment (secretspec's `production`, `development/<name>`) and nothing else, so never
+  give it a second sense; a record's host partition is `producer=`
 - Apply the spell-it-out rule to new code and to identifiers you touch; already-shipped schema identifiers
   and stored values are effectively fixed and change only via an explicit migration
 - Always match existing styles and patterns in the codebase for consistency
@@ -81,8 +81,8 @@ This is a collection of guidelines and references.
   and an associative combine, and a round trip that returns the original are the shapes worth reaching for
 - Test those laws (identity, associativity, round trip) with proptest rather than hand-picked examples
 - Time has exactly two kinds and they never mix: an instant is a moment on the timeline and is always UTC
-  (`DateTime<Utc>`, `TIMESTAMPTZ`), while a session is a trading day and is always an `America/New_York`
-  calendar date — that is what the exchange's day is, not a display preference
+  (`DateTime<Utc>`, and a UTC timestamp wherever it is stored), while a session is a trading day and is
+  always an `America/New_York` calendar date — that is what the exchange's day is, not a display preference
 - A session is a `SessionDate`, never a bare `NaiveDate`: derive one from an instant with
   `SessionDate::at` and convert back with `.midnight()`/`.bounds()`, never via `Utc::now().date_naive()`
   or a hardcoded offset
