@@ -8,3 +8,9 @@ edition = "2024"
 exclude = ["src_old"]
 
 [dependencies]
+# No `clock` feature, so pure code cannot read the wall clock.
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+
+[dev-dependencies]
+proptest = "1"
