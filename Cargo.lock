@@ -82,7 +82,9 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "proc-macro2",
  "proptest",
+ "syn",
 ]
 
 [[package]]

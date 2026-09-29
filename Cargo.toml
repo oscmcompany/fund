@@ -14,3 +14,11 @@ chrono-tz = "0.10"
 
 [dev-dependencies]
 proptest = "1"
+# Walks macro bodies for the purity check, which syn leaves unparsed.
+proc-macro2 = "1"
+# Parses `src/common/` for the purity check.
+syn = { version = "2", default-features = false, features = [
+  "full",
+  "parsing",
+  "visit",
+] }
