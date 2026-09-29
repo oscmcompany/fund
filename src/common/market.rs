@@ -144,6 +144,30 @@ impl std::fmt::Display for Shares {
     }
 }
 
+/// A number of trades, kept apart from `Shares` so the two counts cannot be swapped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TradeCount(u64);
+
+impl TradeCount {
+    pub fn new(count: u64) -> Self {
+        Self(count)
+    }
+
+    pub fn count(self) -> u64 {
+        self.0
+    }
+
+    pub fn plus(self, other: Self) -> Self {
+        Self(self.0.checked_add(other.0).expect("trade count fits u64"))
+    }
+}
+
+impl std::fmt::Display for TradeCount {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// A sum of price × shares in ticks, `PRICE_SCALE` ticks to the dollar.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DollarVolume(i128);

@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
 use super::record::{Bar, BarInterval, Ohlc, Trade};
-use super::{DollarVolume, Price, Shares, Symbol};
+use super::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
 
 /// Count, volume and dollar volume of a set of trades, all exact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TradeTotals {
-    count: u64,
+    count: TradeCount,
     volume: Shares,
     dollar_volume: DollarVolume,
 }
@@ -20,13 +20,13 @@ pub struct TradeTotals {
 impl TradeTotals {
     pub fn of(trade: &Trade) -> Self {
         Self {
-            count: 1,
+            count: TradeCount::new(1),
             volume: trade.size(),
             dollar_volume: DollarVolume::of(trade.price(), trade.size()),
         }
     }
 
-    pub fn count(&self) -> u64 {
+    pub fn count(&self) -> TradeCount {
         self.count
     }
 
@@ -54,7 +54,7 @@ impl Monoid for TradeTotals {
 
     fn combine(self, other: Self) -> Self {
         Self {
-            count: self.count + other.count,
+            count: self.count.plus(other.count),
             volume: self.volume.plus(other.volume),
             dollar_volume: self.dollar_volume.plus(other.dollar_volume),
         }
@@ -211,7 +211,7 @@ mod tests {
                 .iter()
                 .map(TradeTotals::of),
         );
-        assert_eq!(totals.count(), 2);
+        assert_eq!(totals.count(), TradeCount::new(2));
         assert_eq!(totals.volume(), Shares::new(400));
         assert_eq!(totals.dollar_volume().to_string(), "4060.0000");
         assert_eq!(totals.volume_weighted_average_price(), Some(10.15));
@@ -233,8 +233,8 @@ mod tests {
         )
         .unwrap();
         let bars = [
-            minute_bar("2026-07-31T14:32:00Z", 10.3, 10.9, 10.1, 10.8, 50),
-            minute_bar("2026-07-31T14:30:00Z", 10.0, 10.5, 9.8, 10.2, 100),
+            minute_bar("2026-07-31T14:32:00Z", 10.3, 10.9, 10.1, 10.15, 50),
+            minute_bar("2026-07-31T14:30:00Z", 10.25, 10.5, 9.8, 10.2, 100),
             other,
             minute_bar("2026-07-31T14:36:00Z", 10.8, 11.0, 10.7, 10.9, 30),
             minute_bar("2026-07-31T14:31:00Z", 10.2, 10.4, 9.5, 10.3, 70),
@@ -255,7 +255,7 @@ mod tests {
         let prices = rolled[0].prices();
         assert_eq!(
             (prices.open(), prices.high(), prices.low(), prices.close()),
-            (price(10.0), price(10.9), price(9.5), price(10.8))
+            (price(10.25), price(10.9), price(9.5), price(10.15))
         );
         assert_eq!(
             rolled.iter().map(|bar| bar.volume()).collect::<Vec<_>>(),
@@ -322,32 +322,42 @@ mod tests {
         })
     }
 
-    /// One-minute bars for two symbols over a dozen minutes, so buckets are shared and timestamps tie.
-    fn any_bar() -> impl Strategy<Value = BarRollup> {
+    /// One-minute bars for two symbols over a dozen minutes on two sessions, so buckets are shared and
+    /// timestamps tie.
+    fn any_minute_bar() -> impl Strategy<Value = Bar> {
         (
             prop::sample::select(vec!["AAPL", "MSFT"]),
+            0_i64..2,
             0_i64..12,
             prop::array::uniform4(1_i64..1_000),
             0_u64..1_000_000,
+        )
+            .prop_map(|(symbol, day, minute, mut ticks, volume)| {
+                ticks.sort();
+                let [low, first, second, high] = ticks.map(|tick| Price::from_ticks(tick).unwrap());
+                Bar::new(
+                    Symbol::new(symbol).unwrap(),
+                    BarInterval::OneMinute,
+                    instant("2026-07-30T14:30:00Z")
+                        + TimeDelta::days(day)
+                        + TimeDelta::minutes(minute),
+                    Ohlc::new(first, high, low, second).unwrap(),
+                    Shares::new(volume),
+                )
+                .unwrap()
+            })
+    }
+
+    fn any_bar() -> impl Strategy<Value = BarRollup> {
+        (
+            any_minute_bar(),
             prop::sample::select(vec![
                 BarInterval::OneMinute,
                 BarInterval::FiveMinute,
                 BarInterval::OneDay,
             ]),
         )
-            .prop_map(|(symbol, minute, mut ticks, volume, interval)| {
-                ticks.sort();
-                let [low, first, second, high] = ticks.map(|tick| Price::from_ticks(tick).unwrap());
-                let bar = Bar::new(
-                    Symbol::new(symbol).unwrap(),
-                    BarInterval::OneMinute,
-                    instant("2026-07-31T14:30:00Z") + TimeDelta::minutes(minute),
-                    Ohlc::new(first, high, low, second).unwrap(),
-                    Shares::new(volume),
-                )
-                .unwrap();
-                BarRollup::of(&bar, interval).unwrap()
-            })
+            .prop_map(|(bar, interval)| BarRollup::of(&bar, interval).unwrap())
     }
 
     fn any_rollup() -> impl Strategy<Value = BarRollup> {
@@ -375,6 +385,20 @@ mod tests {
             first in any_rollup(), second in any_rollup(), third in any_rollup()
         ) {
             laws::check(first, second, third)?;
+        }
+
+        /// Rolling up in stages builds the same bars as rolling up at once.
+        #[test]
+        fn property_rollups_compose(bars in prop::collection::vec(any_minute_bar(), 0..50)) {
+            let direct = roll(&bars, BarInterval::OneDay);
+            prop_assert_eq!(
+                roll(&roll(&bars, BarInterval::FiveMinute), BarInterval::OneDay),
+                direct.clone()
+            );
+            prop_assert_eq!(
+                roll(&roll(&bars, BarInterval::OneMinute), BarInterval::OneDay),
+                direct
+            );
         }
 
         #[test]
