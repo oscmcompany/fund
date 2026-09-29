@@ -62,6 +62,9 @@ This is a collection of guidelines and references.
   from its first line, with a round-trip test wherever serde's casing must agree
 - Wrap primitive types in tuple structs to enforce domain type safety (e.g., `struct Price(f64)`); never
   accept a raw `f64` or `String` where a specific domain value is required
+- Money is integer: a `Price` or `DollarVolume` counts ticks, `PRICE_SCALE` (10,000) to the dollar, and a share
+  count is `Shares(u64)`, so every sum is exact; a float appears only to present a value (a log line, a report) and
+  is never combined
 - Prefer validated constructors with private fields over public struct literals — a value in scope should
   be proof of its own validity, not a candidate for re-checking downstream
 - Use `match` (not `if let` chains) when handling enum variants, and never write a wildcard arm — the
