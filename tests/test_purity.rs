@@ -7,7 +7,16 @@ use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// Crates a pure module may name, with `prop` for proptest's prelude alias; adding one is the review.
-const PURE_CRATES: [&str; 5] = ["chrono", "chrono_tz", "proptest", "prop", "strum"];
+const PURE_CRATES: [&str; 8] = [
+    "chrono",
+    "chrono_tz",
+    "proptest",
+    "prop",
+    "serde",
+    "serde_json",
+    "strum",
+    "uuid",
+];
 
 /// The parts of `std` that reach outside the process's memory, `time` among them for its clocks.
 const EFFECTFUL_STD_MODULES: [&str; 8] =
@@ -69,9 +78,14 @@ impl Checker {
         if let Err(violation) = outcome {
             self.violations.push(violation);
         }
-        if segments.len() > 1 && segments.last().is_some_and(|last| last == "now") {
+        let effect = match segments.last().map(String::as_str) {
+            Some("now") => Some("reads the clock"),
+            Some("new_v4") => Some("draws randomness"),
+            _ => None,
+        };
+        if let Some(effect) = effect.filter(|_| segments.len() > 1) {
             self.violations
-                .push(format!("reads the clock through `{}`", segments.join("::")));
+                .push(format!("{effect} through `{}`", segments.join("::")));
         }
     }
 
@@ -353,6 +367,10 @@ fn test_each_effect_is_named() {
         (
             "fn f() { chrono::Utc::now(); }",
             "reads the clock through `chrono::Utc::now`",
+        ),
+        (
+            "fn f() { uuid::Uuid::new_v4(); }",
+            "draws randomness through `uuid::Uuid::new_v4`",
         ),
         ("async fn f() {}", "declares `async fn f`"),
         ("fn f() { let _ = async {}; }", "uses an async block"),
