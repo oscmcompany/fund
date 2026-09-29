@@ -14,3 +14,9 @@ chrono-tz = "0.10"
 
 [dev-dependencies]
 proptest = "1"
+# Parses `src/common/` for the purity check.
+syn = { version = "2", default-features = false, features = [
+  "full",
+  "parsing",
+  "visit",
+] }

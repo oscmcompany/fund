@@ -83,6 +83,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "proptest",
+ "syn",
 ]
 
 [[package]]
