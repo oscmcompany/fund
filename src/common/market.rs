@@ -24,18 +24,18 @@ pub enum SymbolRefusal {
 }
 
 impl Symbol {
-    /// Trims and uppercases, so `" brk.b "` reads as `BRK.B`.
+    /// Taken exactly as written: case carries meaning in vendor notation (Massive's preferred `BCpC` is not the
+    /// common stock `BCPC`), so a reader maps its vendor's form before this and nothing here normalizes.
     pub fn new(raw: &str) -> Result<Self, SymbolRefusal> {
-        let symbol = raw.trim().to_ascii_uppercase();
-        let (root, suffix) = match symbol.split_once('.') {
+        let (root, suffix) = match raw.split_once('.') {
             Some((root, suffix)) => (root, Some(suffix)),
-            None => (symbol.as_str(), None),
+            None => (raw, None),
         };
         let letters = |part: &str, most: usize| {
             (1..=most).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_uppercase())
         };
         if letters(root, 5) && suffix.is_none_or(|suffix| letters(suffix, 3)) {
-            Ok(Self(symbol))
+            Ok(Self(raw.to_string()))
         } else {
             Err(SymbolRefusal::Malformed {
                 raw: raw.to_string(),
@@ -185,14 +185,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_a_symbol_is_trimmed_and_uppercased() {
-        assert_eq!(Symbol::new(" brk.b ").unwrap().as_str(), "BRK.B");
+    fn test_a_symbol_is_taken_as_written() {
+        assert_eq!(Symbol::new("BRK.B").unwrap().as_str(), "BRK.B");
         assert_eq!(Symbol::new("AAPL").unwrap().to_string(), "AAPL");
     }
 
     #[test]
     fn test_a_malformed_symbol_is_refused_with_its_text() {
-        for raw in ["", "TOOLONG", "BRK.ABCD", "A1", ".B", "BRK."] {
+        for raw in [
+            "", "TOOLONG", "BRK.ABCD", "A1", ".B", "BRK.", "BCpC", "brk.b", " BRK.B ",
+        ] {
             assert_eq!(
                 Symbol::new(raw),
                 Err(SymbolRefusal::Malformed {
