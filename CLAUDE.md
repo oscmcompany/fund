@@ -6,12 +6,20 @@
 
 This is a collection of guidelines and references.
 
-- [devenv](https://devenv.sh/) manages the development environment, tasks, and local services
-- Services run on a single exe.dev VM via `devenv --profile application up` in both dev and production
+- [devenv](https://devenv.sh/) manages the development environment and tasks
+- Every host runs on AWS EC2; the running archiver builds from the `legacy` branch, not from `master`
 - Secrets are managed via [secretspec](https://secretspec.dev/) with the `awssm` provider, stored in AWS
   Secrets Manager as `secretspec/{project}/{profile}/{key}`
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks; `devenv tasks run` supports prefix group
-  execution, so `checks:rust` runs every `checks:rust:*` subtask
+  execution, so `checks:rust` runs every `checks:rust:*` subtask, and `checks:all` is the full check
+- `src_old/` is frozen legacy code that no check builds: edit it only for a fix the `legacy` branch needs,
+  and port by copying the minimum into `src/`, never by importing from it
+- `src/common/` holds the crate's shared pure code as `module.rs` beside `module/`; its modules and the pure
+  `decide`/`solve` take no clients, are not `async`, and import no `tokio`, `reqwest`, `aws_sdk_*`,
+  `std::fs` or `std::net`, which a check enforces once pivot task 10 lands
+- The live plans are `.scratchpad/plan_pivot.md` and `.scratchpad/plan_launch.md`, local and deliberately untracked
+  (`.scratchpad/` is gitignored because they carry private strategy and capital details); cite them as "pivot task N"
+  and "launch task N"
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - See `README.md` "Principles" section for developer philosophy
@@ -30,23 +38,19 @@ This is a collection of guidelines and references.
 - Keep only universally-understood acronyms as-is: formats, protocols, and identity (`csv`, `json`, `sql`,
   `http`, `url`, `uri`, `io`, `id`, `uuid`, `api`) and established domain or proper-noun terms (`aws`,
   `utc`, `etf`, `ohlcv`); case acronyms as ordinary words per language convention
-- Never rename fixed external identifiers: devenv profile names (`application`, `trainer`), the `awssm`
-  secretspec provider, the `tide` model and package name, environment variables and secret keys, library
-  import aliases, linter directives, and external library fields and parameters
-- Three hosts do the work and each has one name, used for the instance, its tags, its scripts, and the
+- Never rename fixed external identifiers: the `awssm` secretspec provider, environment variables and
+  secret keys, library import aliases, linter directives, and external library fields and parameters
+- Three EC2 hosts do the work and each has one name, used for the instance, its tags, its scripts, and the
   `producer=` partition its journals and logs are written under: `archiver` collects data, `trader`
   executes, and `researcher` runs experiments and model training
 - The host name is the anchor and a module name is never a host name — `researcher` runs every
   `laboratory_*` binary and would run training beside them, so the module appears in the finer key
   (`service=` for a log, `experiment_type=` for an experiment) rather than in the host's name
-- The devenv profiles still read `application` and `trainer`, which is a recorded mismatch rather than a
-  defect: they are renamed to `trader` and `researcher` when the exe.dev dependency is retired, and until
-  then the line above governs everything except those two profile names
 - `fund-role` and `fund-profile` are different axes and neither absorbs the other: the role is which kind
   of host (`archiver`), the profile is which environment (`production`), and provisioning filters on both
   so a second environment cannot adopt the first's box
-- "Profile" already means a role in devenv and an environment in secretspec, so never introduce a third
-  sense of it; a record's host partition is `producer=`
+- "Profile" means an environment (secretspec's `production`, `development/<name>`) and nothing else, so never
+  give it a second sense; a record's host partition is `producer=`
 - Apply the spell-it-out rule to new code and to identifiers you touch; already-shipped schema identifiers
   and stored values are effectively fixed and change only via an explicit migration
 - Always match existing styles and patterns in the codebase for consistency
@@ -54,6 +58,8 @@ This is a collection of guidelines and references.
   "STARTING DATA SYNC")
 - Encode domain constraints in the type system: use enums with per-variant data to make invalid states
   unrepresentable at compile time rather than checking validity at runtime
+- Derive a string-backed enum's names with strum (`Display`, `EnumString`, `IntoStaticStr`, `EnumIter`)
+  from its first line, with a round-trip test wherever serde's casing must agree
 - Wrap primitive types in tuple structs to enforce domain type safety (e.g., `struct Price(f64)`); never
   accept a raw `f64` or `String` where a specific domain value is required
 - Prefer validated constructors with private fields over public struct literals — a value in scope should
@@ -73,10 +79,11 @@ This is a collection of guidelines and references.
   avoid deep nesting or struct embedding as a substitute for inheritance
 - Prefer transformations that compose: a mapping that preserves structure, an operation with an identity
   and an associative combine, and a round trip that returns the original are the shapes worth reaching for
+- Test those laws (identity, associativity, round trip) with proptest rather than hand-picked examples
 - Time has exactly two kinds and they never mix: an instant is a moment on the timeline and is always UTC
-  (`DateTime<Utc>`, `TIMESTAMPTZ`), while a session is a trading day and is always an `America/New_York`
-  calendar date — that is what the exchange's day is, not a display preference
-- A session is `data::calendar::SessionDate`, never a bare `NaiveDate`: derive one from an instant with
+  (`DateTime<Utc>`, and a UTC timestamp wherever it is stored), while a session is a trading day and is
+  always an `America/New_York` calendar date — that is what the exchange's day is, not a display preference
+- A session is a `SessionDate`, never a bare `NaiveDate`: derive one from an instant with
   `SessionDate::at` and convert back with `.midnight()`/`.bounds()`, never via `Utc::now().date_naive()`
   or a hardcoded offset
 - `SessionDate::from_date` is for dates already expressed in Eastern terms, so transport modules keep
@@ -178,7 +185,7 @@ This is a collection of guidelines and references.
 - Prove changes work before marking tasks complete - run `devenv tasks run` checks, compare behavior,
   demonstrate correctness
 - Verify against real data before reporting done, and say which route was used: `secretspec run -- curl`
-  against a provider, DuckDB over the S3 parquet, or a trainer rehearsal read back from `/var/log/fund/`;
+  against a provider, DuckDB over the S3 parquet, or a researcher run read back from `/var/log/fund/`;
   when only fixtures were exercised, say so plainly, and ask to be pointed at real data rather than
   inferring
 - When debugging or fixing bugs, check structured logs and error log files in `/var/log/fund/` to
