@@ -7,7 +7,7 @@ use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// Crates a pure module may name, with `prop` for proptest's prelude alias; adding one is the review.
-const PURE_CRATES: [&str; 4] = ["chrono", "chrono_tz", "proptest", "prop"];
+const PURE_CRATES: [&str; 5] = ["chrono", "chrono_tz", "proptest", "prop", "strum"];
 
 /// The parts of `std` that reach outside the process's memory, `time` among them for its clocks.
 const EFFECTFUL_STD_MODULES: [&str; 8] =
