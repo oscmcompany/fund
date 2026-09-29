@@ -1,9 +1,9 @@
 //! Fails when a pure module can reach an effect: `async`, the clock, an effectful part of `std`, a crate off the
-//! allowlist, or a path that leaves `common`. Capability generics show an effect in a signature but cannot forbid an
-//! ambient call, so this check is what enforces purity.
+//! allowlist, or a path that leaves `common`.
 
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// Crates a pure module may name, with `prop` for proptest's prelude alias; adding one is the review.
@@ -18,28 +18,10 @@ const PRIMITIVES: [&str; 17] = [
     "i128", "isize", "f32", "f64",
 ];
 
-/// Collects the lowercase names a file brings into scope itself: its modules and its imports.
-#[derive(Default)]
-struct Scope {
-    names: Vec<String>,
-}
-
-impl Visit<'_> for Scope {
-    fn visit_item_mod(&mut self, item: &syn::ItemMod) {
-        self.names.push(item.ident.to_string());
-        visit::visit_item_mod(self, item);
-    }
-
-    fn visit_item_use(&mut self, item: &syn::ItemUse) {
-        for path in use_paths(&item.tree) {
-            self.names.extend(path.last().cloned());
-        }
-    }
-}
-
 struct Checker {
     module: Vec<String>,
-    scope: Vec<String>,
+    /// The names each enclosing module binds itself, innermost last; a path's root resolves in the innermost.
+    scopes: Vec<Vec<String>>,
     violations: Vec<String>,
 }
 
@@ -75,7 +57,10 @@ impl Checker {
             name if name.starts_with(char::is_uppercase)
                 || PURE_CRATES.contains(&name)
                 || PRIMITIVES.contains(&name)
-                || self.scope.iter().any(|scoped| scoped == name) =>
+                || self
+                    .scopes
+                    .last()
+                    .is_some_and(|scope| scope.iter().any(|scoped| scoped == name)) =>
             {
                 Ok(())
             }
@@ -90,25 +75,100 @@ impl Checker {
         }
     }
 
-    /// Macro bodies are not parsed, so their tokens are scanned for paths and `async`/`await`.
-    fn check_tokens(&mut self, tokens: &str) {
-        for path in token_paths(tokens) {
-            match path.as_slice() {
-                [word] if word == "async" || word == "await" => {
-                    self.violations.push(format!("uses `{word}` in a macro"))
+    /// Syn leaves macro bodies unparsed, so their token trees are walked for paths and `async`/`await`.
+    fn check_tokens(&mut self, tokens: TokenStream) {
+        let trees: Vec<TokenTree> = tokens.into_iter().collect();
+        let mut path: Vec<String> = Vec::new();
+        let mut qualified = false;
+        let mut after_separator = false;
+        let mut after_generics = false;
+        let mut index = 0;
+        while index < trees.len() {
+            let separator = matches!(
+                (&trees[index], trees.get(index + 1)),
+                (TokenTree::Punct(first), Some(TokenTree::Punct(second)))
+                    if first.as_char() == ':' && first.spacing() == Spacing::Joint && second.as_char() == ':'
+            );
+            if separator {
+                if path.is_empty() {
+                    // `::` after a turbofish's `>` continues a type, not a root; otherwise it roots a path.
+                    if after_generics {
+                        path.push(String::new());
+                    } else {
+                        qualified = true;
+                    }
                 }
-                [_] => {}
-                _ => self.check(&path),
+                after_separator = true;
+                after_generics = false;
+                index += 2;
+                continue;
             }
+            match &trees[index] {
+                TokenTree::Ident(ident) => {
+                    let word = ident.to_string();
+                    if word == "async" || word == "await" {
+                        self.violations.push(format!("uses `{word}` in a macro"));
+                    }
+                    if !after_separator {
+                        self.flush(&mut path, &mut qualified);
+                    }
+                    path.push(word);
+                    after_generics = false;
+                }
+                TokenTree::Group(group) => {
+                    self.flush(&mut path, &mut qualified);
+                    self.check_tokens(group.stream());
+                    after_generics = false;
+                }
+                TokenTree::Punct(punct) => {
+                    self.flush(&mut path, &mut qualified);
+                    after_generics = punct.as_char() == '>';
+                }
+                TokenTree::Literal(_) => {
+                    self.flush(&mut path, &mut qualified);
+                    after_generics = false;
+                }
+            }
+            after_separator = false;
+            index += 1;
         }
+        self.flush(&mut path, &mut qualified);
+    }
+
+    fn flush(&mut self, path: &mut Vec<String>, qualified: &mut bool) {
+        let rooted = path.first().is_some_and(|root| !root.is_empty());
+        if rooted && (path.len() > 1 || *qualified) {
+            self.check(path);
+        }
+        path.clear();
+        *qualified = false;
     }
 }
 
 impl Visit<'_> for Checker {
+    fn visit_file(&mut self, file: &syn::File) {
+        self.scopes.push(bindings(&file.items, None));
+        visit::visit_file(self, file);
+        self.scopes.pop();
+    }
+
     fn visit_item_mod(&mut self, item: &syn::ItemMod) {
         self.module.push(item.ident.to_string());
+        let scope = item
+            .content
+            .as_ref()
+            .map(|(_, items)| bindings(items, self.scopes.last()));
+        let entered = scope.is_some();
+        self.scopes.extend(scope);
         visit::visit_item_mod(self, item);
+        if entered {
+            self.scopes.pop();
+        }
         self.module.pop();
+    }
+
+    fn visit_item_extern_crate(&mut self, item: &syn::ItemExternCrate) {
+        self.check(&[item.ident.to_string()]);
     }
 
     fn visit_item_use(&mut self, item: &syn::ItemUse) {
@@ -155,7 +215,16 @@ impl Visit<'_> for Checker {
     }
 
     fn visit_macro(&mut self, invocation: &syn::Macro) {
-        self.check_tokens(&invocation.tokens.to_string());
+        if invocation
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "include")
+        {
+            self.violations
+                .push("includes unchecked source".to_string());
+        }
+        self.check_tokens(invocation.tokens.clone());
         visit::visit_macro(self, invocation);
     }
 }
@@ -174,61 +243,58 @@ fn use_paths(tree: &syn::UseTree) -> Vec<Vec<String>> {
     }
 }
 
-/// The `a::b::c` runs in a macro's printed tokens, skipping string literals and runs that follow `::`.
-fn token_paths(tokens: &str) -> Vec<Vec<String>> {
-    let mut paths = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-    let mut after_separator = false;
-    let mut characters = tokens.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character.is_alphanumeric() || character == '_' {
-            let mut word = character.to_string();
-            while let Some(next) = characters.next_if(|next| next.is_alphanumeric() || *next == '_')
-            {
-                word.push(next);
-            }
-            if current.is_empty() || after_separator {
-                current.push(word);
-            } else {
-                paths.push(std::mem::replace(&mut current, vec![word]));
-            }
-            after_separator = false;
-        } else if character == ':' && characters.next_if_eq(&':').is_some() {
-            if current.is_empty() {
-                // A run after a turbofish (`Vec::<u8>::new`) is not a root.
-                current.push(String::new());
-            }
-            after_separator = true;
-        } else if !character.is_whitespace() {
-            if character == '"' {
-                while let Some(next) = characters.next() {
-                    match next {
-                        '\\' => {
-                            characters.next();
-                        }
-                        '"' => break,
-                        _ => {}
-                    }
+/// The names a module's own items bind: child modules, imports as named or renamed, and extern crate aliases.
+/// `use super::*` also binds everything the parent binds.
+fn bindings(items: &[syn::Item], parent: Option<&Vec<String>>) -> Vec<String> {
+    let mut names = Vec::new();
+    for item in items {
+        match item {
+            syn::Item::Mod(module) => names.push(module.ident.to_string()),
+            syn::Item::Use(import) => {
+                if let syn::UseTree::Path(path) = &import.tree
+                    && path.ident == "super"
+                    && matches!(*path.tree, syn::UseTree::Glob(_))
+                {
+                    names.extend(parent.into_iter().flatten().cloned());
                 }
+                names.extend(use_bindings(&import.tree, None));
             }
-            paths.push(std::mem::take(&mut current));
-            after_separator = false;
+            syn::Item::ExternCrate(extern_crate) => names.push(
+                extern_crate
+                    .rename
+                    .as_ref()
+                    .map_or(&extern_crate.ident, |(_, rename)| rename)
+                    .to_string(),
+            ),
+            _ => {}
         }
     }
-    paths.push(current);
-    paths
-        .into_iter()
-        .filter(|path| !path.is_empty() && !path[0].is_empty())
-        .collect()
+    names
+}
+
+/// The names a `use` tree binds, where `{self}` binds its parent.
+fn use_bindings(tree: &syn::UseTree, parent: Option<&syn::Ident>) -> Vec<String> {
+    match tree {
+        syn::UseTree::Path(path) => use_bindings(&path.tree, Some(&path.ident)),
+        syn::UseTree::Name(name) if name.ident == "self" => {
+            parent.map(ToString::to_string).into_iter().collect()
+        }
+        syn::UseTree::Name(name) => vec![name.ident.to_string()],
+        syn::UseTree::Rename(rename) => vec![rename.rename.to_string()],
+        syn::UseTree::Glob(_) => Vec::new(),
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .flat_map(|item| use_bindings(item, parent))
+            .collect(),
+    }
 }
 
 fn violations(source: &str, module: &[&str]) -> Vec<String> {
     let file = syn::parse_file(source).expect("pure module parses");
-    let mut scope = Scope::default();
-    scope.visit_file(&file);
     let mut checker = Checker {
         module: module.iter().map(|segment| segment.to_string()).collect(),
-        scope: scope.names,
+        scopes: Vec::new(),
         violations: Vec::new(),
     };
     checker.visit_file(&file);
@@ -300,6 +366,23 @@ fn test_each_effect_is_named() {
             "fn f() { assert!(tokio::spawn(g)); }",
             "names crate `tokio`",
         ),
+        (
+            "fn f() { assert!(::tokio::spawn(g)); }",
+            "names crate `tokio`",
+        ),
+        (
+            r#"fn f() { assert!(c == '"', "{}", std::fs::read(x)); }"#,
+            "names `std::fs`",
+        ),
+        (
+            "mod nested { mod tokio {} } fn f() { tokio::spawn(); }",
+            "names crate `tokio`",
+        ),
+        ("extern crate tokio as Runtime;", "names crate `tokio`"),
+        (
+            r#"fn f() { include!("../effectful.rs"); }"#,
+            "includes unchecked source",
+        ),
     ];
     for (source, expected) in cases {
         assert_eq!(violations(source, &["common"]), vec![expected], "{source}");
@@ -321,13 +404,24 @@ fn test_pure_paths_pass() {
             assert_eq!(Self::now_or_never, "std::fs is only a string");
             u32::MAX
         }
+        mod tests {
+            use super::*;
+            fn g() { calendar::next(); }
+        }
     "#;
-    assert_eq!(
-        violations(source, &["common", "time"]),
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        violations("use super::calendar;", &["common", "time"]),
-        Vec::<String>::new()
-    );
+    let cases = [
+        source,
+        "use super::calendar;",
+        r##"fn f() { concat!(r#"a "std::fs"#); }"##,
+        r#"fn f() { assert!(c == '"' && Vec::<u8>::new().is_empty()); }"#,
+        "use std::collections as maps; fn f() { maps::BTreeMap::<u8, u8>::new(); }",
+        "use std::collections::{self}; fn f() { collections::BTreeMap::<u8, u8>::new(); }",
+    ];
+    for source in cases {
+        assert_eq!(
+            violations(source, &["common", "time"]),
+            Vec::<String>::new(),
+            "{source}"
+        );
+    }
 }
