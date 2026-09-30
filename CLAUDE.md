@@ -15,7 +15,7 @@ This is a collection of guidelines and references.
 - `src_old/` is frozen legacy code that no check builds: edit it only for a fix the `legacy` branch needs,
   and port by copying the minimum into `src/`, never by importing from it
 - `src/common/` holds the crate's shared pure code as `module.rs` beside `module/`; its modules and the pure
-  `decide`/`solve` take no clients, are not `async`, and import no `tokio`, `reqwest`, `aws_sdk_*`,
+  `decide`/`solve` take no clients, are not `async`, read no clock or randomness, and import no `tokio`, `reqwest`, `aws_sdk_*`,
   `std::fs` or `std::net`, and name only allowlisted crates, which `tests/test_purity.rs` enforces
 - The live plans are `.scratchpad/plan_pivot.md` and `.scratchpad/plan_launch.md`, local and deliberately untracked
   (`.scratchpad/` is gitignored because they carry private strategy and capital details); cite them as "pivot task N"
