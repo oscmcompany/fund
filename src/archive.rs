@@ -26,7 +26,7 @@ pub enum ArchiveError {
         reason: String,
     },
     /// Read back different bytes than were written.
-    ReadBackDiffers {
+    ReadBackMismatch {
         path: String,
         written: usize,
         read: usize,
@@ -38,7 +38,7 @@ impl std::fmt::Display for ArchiveError {
         match self {
             Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
             Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
-            Self::ReadBackDiffers {
+            Self::ReadBackMismatch {
                 path,
                 written,
                 read,
@@ -78,7 +78,7 @@ impl Archive {
             })?;
         match self.get(key).await? {
             Some(read) if read == body => Ok(()),
-            read => Err(ArchiveError::ReadBackDiffers {
+            read => Err(ArchiveError::ReadBackMismatch {
                 path,
                 written: body.len(),
                 read: read.map_or(0, |read| read.len()),
