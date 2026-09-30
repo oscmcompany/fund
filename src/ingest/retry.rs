@@ -29,6 +29,13 @@ impl std::fmt::Display for FetchError {
     }
 }
 
+/// A request that has not answered in this long is abandoned and retried; the largest body, a full grouped daily,
+/// is a few megabytes.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How much of a refused response's body is kept, which Alpaca's `invalid symbol` message fits well inside.
+const ERROR_BODY_LIMIT: usize = 4 * 1024;
+
 /// One attempt's result.
 pub(crate) enum Outcome {
     Body(Vec<u8>),
@@ -36,25 +43,51 @@ pub(crate) enum Outcome {
     Refused { status: u16, body: String },
 }
 
-/// Sends one request: 429, 5xx and transport failures are transient, any other failure status is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Class {
+    Success,
+    Transient,
+    Refused,
+}
+
+/// 429 and 5xx are transient; any other failure status is refused.
+pub(crate) fn classify(status: reqwest::StatusCode) -> Class {
+    if status.is_success() {
+        Class::Success
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        Class::Transient
+    } else {
+        Class::Refused
+    }
+}
+
+/// Sends one request under a deadline, reading a body only once its status says it is wanted. Errors are kept
+/// without their URL, so a credential in a query can never reach a log through one.
 pub(crate) async fn send(request: reqwest::RequestBuilder) -> Outcome {
-    let response = match request.send().await {
+    let mut response = match request.timeout(REQUEST_TIMEOUT).send().await {
         Ok(response) => response,
-        Err(error) => return Outcome::Transient(error.to_string()),
+        Err(error) => return Outcome::Transient(error.without_url().to_string()),
     };
     let status = response.status();
-    let body = match response.bytes().await {
-        Ok(body) => body.to_vec(),
-        Err(error) => return Outcome::Transient(error.to_string()),
-    };
-    if status.is_success() {
-        Outcome::Body(body)
-    } else if status.as_u16() == 429 || status.is_server_error() {
-        Outcome::Transient(format!("status {status}"))
-    } else {
-        Outcome::Refused {
-            status: status.as_u16(),
-            body: String::from_utf8_lossy(&body).into_owned(),
+    match classify(status) {
+        Class::Success => match response.bytes().await {
+            Ok(body) => Outcome::Body(body.to_vec()),
+            Err(error) => Outcome::Transient(error.without_url().to_string()),
+        },
+        Class::Transient => Outcome::Transient(format!("status {status}")),
+        Class::Refused => {
+            let mut body = Vec::new();
+            while body.len() < ERROR_BODY_LIMIT {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            body.truncate(ERROR_BODY_LIMIT);
+            Outcome::Refused {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&body).into_owned(),
+            }
         }
     }
 }
@@ -89,6 +122,39 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn test_only_rate_limits_and_server_errors_are_transient() {
+        let classes: Vec<(u16, Class)> = [200, 204, 400, 401, 403, 404, 429, 500, 502, 503]
+            .into_iter()
+            .map(|code| (code, classify(reqwest::StatusCode::from_u16(code).unwrap())))
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                (200, Class::Success),
+                (204, Class::Success),
+                (400, Class::Refused),
+                (401, Class::Refused),
+                (403, Class::Refused),
+                (404, Class::Refused),
+                (429, Class::Transient),
+                (500, Class::Transient),
+                (502, Class::Transient),
+                (503, Class::Transient),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_transport_error_does_not_carry_its_url() {
+        // Nothing listens on port 1, so the connection is refused locally.
+        let request = reqwest::Client::new().get("http://127.0.0.1:1/bars?apiKey=hidden");
+        match send(request).await {
+            Outcome::Transient(cause) => assert!(!cause.contains("hidden"), "{cause}"),
+            Outcome::Body(_) | Outcome::Refused { .. } => panic!("port 1 answered"),
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn test_transient_failures_are_retried_with_backoff() {

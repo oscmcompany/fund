@@ -91,7 +91,7 @@ pub enum PriceRefusal {
     OutOfRange {
         ticks: i64,
     },
-    /// Further from the ten-thousandth grid than float noise explains.
+    /// Further from the millionth grid than float noise explains.
     OffGrid {
         dollars: f64,
     },
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_divisor_is_ten_thousand() {
+    fn test_the_price_divisor_is_a_million() {
         let price = Price::from_dollars(123.4567).unwrap();
         assert_eq!(price.ticks(), 123_456_700);
         assert_eq!(price.to_string(), "123.4567");

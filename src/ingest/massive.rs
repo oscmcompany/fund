@@ -79,11 +79,12 @@ impl Massive {
             self.base_url
         );
         let body = with_retries(|| {
-            send(self.http.get(&url).query(&[
-                ("adjusted", "false"),
-                ("include_otc", "false"),
-                ("apiKey", self.api_key.as_str()),
-            ]))
+            send(
+                self.http
+                    .get(&url)
+                    .bearer_auth(&self.api_key)
+                    .query(&[("adjusted", "false"), ("include_otc", "false")]),
+            )
         })
         .await?;
         parse_grouped_daily(&body, session)

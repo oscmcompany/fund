@@ -104,10 +104,9 @@ impl Alpaca {
         let end = end - TimeDelta::seconds(1);
         let as_of = session.to_string();
         let (start, end) = (start.to_rfc3339(), end.to_rfc3339());
-        let mut pages = Vec::new();
-        let mut page_token: Option<String> = None;
-        loop {
-            let body = with_retries(|| {
+        let (joined, start, end, as_of) = (&joined, &start, &end, &as_of);
+        paginate(|page_token| async move {
+            with_retries(|| {
                 let mut query = vec![
                     ("symbols", joined.as_str()),
                     ("timeframe", "1Min"),
@@ -130,13 +129,9 @@ impl Alpaca {
                         .query(&query),
                 )
             })
-            .await?;
-            page_token = next_page_token(&body)?;
-            pages.push(body);
-            if page_token.is_none() {
-                return Ok(pages);
-            }
-        }
+            .await
+        })
+        .await
     }
 }
 
@@ -167,6 +162,32 @@ where
         }
     }
     Ok((Vec::new(), requested, invalid))
+}
+
+/// Follows `next_page_token` until it is null. A token seen before means the pages cycle, which would otherwise
+/// request forever while holding every page, so it is refused.
+async fn paginate<Fetch, Pending>(mut fetch_page: Fetch) -> Result<Vec<Vec<u8>>, FetchError>
+where
+    Fetch: FnMut(Option<String>) -> Pending,
+    Pending: std::future::Future<Output = Result<Vec<u8>, FetchError>>,
+{
+    let mut pages = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut token = None;
+    loop {
+        let body = fetch_page(token).await?;
+        let next = next_page_token(&body)?;
+        pages.push(body);
+        match next {
+            None => return Ok(pages),
+            Some(next) if !seen.insert(next.clone()) => {
+                return Err(FetchError::Malformed {
+                    reason: format!("page token {next} repeated"),
+                });
+            }
+            Some(next) => token = Some(next),
+        }
+    }
 }
 
 fn next_page_token(body: &[u8]) -> Result<Option<String>, FetchError> {
@@ -338,6 +359,63 @@ mod tests {
         );
         assert_eq!(invalid_symbol(r#"{"message":"forbidden"}"#), None);
         assert_eq!(invalid_symbol("<html>"), None);
+    }
+
+    fn page(token: Option<&str>) -> Vec<u8> {
+        let token = token.map_or("null".to_string(), |token| format!("\"{token}\""));
+        format!(r#"{{"bars":{{}},"next_page_token":{token}}}"#).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_pages_are_followed_until_the_token_is_null() {
+        let requested = std::cell::RefCell::new(Vec::new());
+        let pages = paginate(|token| {
+            requested.borrow_mut().push(token.clone());
+            async move {
+                Ok(match token.as_deref() {
+                    None => page(Some("a")),
+                    Some("a") => page(Some("b")),
+                    _ => page(None),
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pages.len(), 3);
+        assert_eq!(
+            *requested.borrow(),
+            [None, Some("a".to_string()), Some("b".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cycling_page_token_is_refused() {
+        let calls = std::cell::Cell::new(0);
+        let result = paginate(|token| {
+            calls.set(calls.get() + 1);
+            // A cap, so a broken cycle check fails this test instead of hanging it.
+            let exhausted = calls.get() > 10;
+            async move {
+                if exhausted {
+                    return Err(FetchError::Exhausted {
+                        attempts: 10,
+                        last: "cycle never detected".to_string(),
+                    });
+                }
+                Ok(match token.as_deref() {
+                    None | Some("b") => page(Some("a")),
+                    _ => page(Some("b")),
+                })
+            }
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err(FetchError::Malformed {
+                reason: "page token a repeated".to_string()
+            })
+        );
+        assert_eq!(calls.get(), 3);
     }
 
     fn refusal(name: &str) -> FetchError {
