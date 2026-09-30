@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Timelike, Utc};
 
-use super::{Price, Shares, Symbol};
+use super::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::time::SessionDate;
 
 #[derive(
@@ -91,6 +91,10 @@ pub struct Bar {
     timestamp: DateTime<Utc>,
     prices: Ohlc,
     volume: Shares,
+    /// `None` when the vendor did not report it.
+    trade_count: Option<TradeCount>,
+    /// `None` when the vendor did not report an average to derive it from.
+    dollar_volume: Option<DollarVolume>,
 }
 
 /// Why a bar was refused.
@@ -110,6 +114,8 @@ impl Bar {
         timestamp: DateTime<Utc>,
         prices: Ohlc,
         volume: Shares,
+        trade_count: Option<TradeCount>,
+        dollar_volume: Option<DollarVolume>,
     ) -> Result<Self, BarRefusal> {
         let on_minute = timestamp.second() == 0 && timestamp.nanosecond() == 0;
         let aligned = match interval {
@@ -129,6 +135,8 @@ impl Bar {
             timestamp,
             prices,
             volume,
+            trade_count,
+            dollar_volume,
         })
     }
 
@@ -150,6 +158,19 @@ impl Bar {
 
     pub fn volume(&self) -> Shares {
         self.volume
+    }
+
+    pub fn trade_count(&self) -> Option<TradeCount> {
+        self.trade_count
+    }
+
+    pub fn dollar_volume(&self) -> Option<DollarVolume> {
+        self.dollar_volume
+    }
+
+    /// In dollars, for presentation; `None` when unreported or when nothing traded.
+    pub fn volume_weighted_average_price(&self) -> Option<f64> {
+        self.dollar_volume?.average_over(self.volume)
     }
 }
 
@@ -239,7 +260,7 @@ impl Trade {
         price: Price,
         size: Shares,
     ) -> Result<Self, TradeRefusal> {
-        if size.count() == 0 {
+        if size.is_zero() {
             return Err(TradeRefusal::NoShares { price });
         }
         Ok(Self {
@@ -291,7 +312,9 @@ mod tests {
             interval,
             instant(timestamp),
             prices(),
-            Shares::new(100),
+            Shares::whole(100).unwrap(),
+            None,
+            None,
         )
     }
 
@@ -344,6 +367,34 @@ mod tests {
     }
 
     #[test]
+    fn test_a_bar_derives_its_average_from_its_dollar_volume() {
+        let volume = Shares::whole(200).unwrap();
+        let bar = Bar::new(
+            Symbol::new("AAPL").unwrap(),
+            BarInterval::OneMinute,
+            instant("2026-07-31T14:31:00Z"),
+            prices(),
+            volume,
+            Some(TradeCount::new(3)),
+            Some(DollarVolume::of(price(10.25), volume)),
+        )
+        .unwrap();
+        assert_eq!(bar.volume_weighted_average_price(), Some(10.25));
+        assert_eq!(bar.trade_count(), Some(TradeCount::new(3)));
+        let quiet = Bar::new(
+            Symbol::new("AAPL").unwrap(),
+            BarInterval::OneMinute,
+            instant("2026-07-31T14:31:00Z"),
+            prices(),
+            Shares::default(),
+            Some(TradeCount::new(0)),
+            Some(DollarVolume::default()),
+        )
+        .unwrap();
+        assert_eq!(quiet.volume_weighted_average_price(), None);
+    }
+
+    #[test]
     fn test_a_crossed_quote_is_refused_and_a_locked_one_is_not() {
         let quote = |bid: f64, ask: f64| {
             Quote::new(
@@ -351,8 +402,8 @@ mod tests {
                 instant("2026-07-31T14:31:00Z"),
                 price(bid),
                 price(ask),
-                Shares::new(100),
-                Shares::new(200),
+                Shares::whole(100).unwrap(),
+                Shares::whole(200).unwrap(),
             )
         };
         assert_eq!(
@@ -365,7 +416,7 @@ mod tests {
         let locked = quote(10.0, 10.0).unwrap();
         assert_eq!(
             (locked.bid_size(), locked.ask_size()),
-            (Shares::new(100), Shares::new(200))
+            (Shares::whole(100).unwrap(), Shares::whole(200).unwrap())
         );
     }
 
@@ -376,10 +427,10 @@ mod tests {
                 Symbol::new("AAPL").unwrap(),
                 instant("2026-07-31T14:31:00Z"),
                 price(10.0),
-                Shares::new(size),
+                Shares::whole(size).unwrap(),
             )
         };
         assert_eq!(trade(0), Err(TradeRefusal::NoShares { price: price(10.0) }));
-        assert_eq!(trade(1).unwrap().size(), Shares::new(1));
+        assert_eq!(trade(1).unwrap().size(), Shares::whole(1).unwrap());
     }
 }

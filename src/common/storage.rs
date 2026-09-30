@@ -191,11 +191,6 @@ impl Key {
         }
     }
 
-    /// The provenance record beside the object.
-    pub fn sidecar_path(&self) -> String {
-        format!("{}.provenance.json", self.path())
-    }
-
     /// The one host allowed to write this object: the archiver for data, the producer for an export.
     pub fn writer(&self) -> Host {
         match self {
@@ -414,7 +409,7 @@ mod tests {
             "data/equity/bars/origin=fetched/provider=alpaca/interval=one_day/year=2026/month=08/day=03/data.parquet",
             "exports/logs/producer=archiver/service=Archiver/year=2026/month=08/day=03/data.parquet",
             "data/equity/reference/provider=massive/as_of=2026-8-3/data.parquet",
-            "exports/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.provenance.json",
+            "exports/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.metadata",
         ] {
             assert_eq!(
                 Key::parse(path),
@@ -424,18 +419,6 @@ mod tests {
                 "{path}"
             );
         }
-    }
-
-    #[test]
-    fn test_a_sidecar_sits_beside_its_object() {
-        let key = Key::Reference {
-            provider: Provider::Massive,
-            as_of: session(),
-        };
-        assert_eq!(
-            key.sidecar_path(),
-            "data/equity/reference/provider=massive/as_of=2026-08-03/data.parquet.provenance.json"
-        );
     }
 
     #[test]
