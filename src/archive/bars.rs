@@ -151,6 +151,15 @@ pub enum DecodeRefusal {
         index: usize,
         reason: String,
     },
+    /// Columns other than this layout's, named as found.
+    Schema {
+        found: String,
+    },
+    /// Provenance naming another provider than the key's.
+    Provider {
+        subscription: Subscription,
+        key: Provider,
+    },
 }
 
 /// The key's interval and session, refused unless it is a bars key.
@@ -303,12 +312,27 @@ fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
 /// The bars and provenance a file written by `encode` under `key` holds, each row rebuilt through the domain's own
 /// constructors so a file edited out of band cannot hand back an invalid bar.
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
-    let (_, interval, _) = bars_key(key).ok_or(DecodeRefusal::NotABarsKey)?;
+    let (provider, interval, session) = bars_key(key).ok_or(DecodeRefusal::NotABarsKey)?;
     let parquet = |error: &dyn std::fmt::Display| DecodeRefusal::Parquet {
         reason: error.to_string(),
     };
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
         .map_err(|error| parquet(&error))?;
+    // One comparison covers column count, order, names, decimal scales and nullability, so a non-null column is
+    // guaranteed by the reader rather than rechecked per row.
+    if builder.schema().fields() != schema().fields() {
+        let found = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                let optional = if field.is_nullable() { "?" } else { "" };
+                format!("{} {}{optional}", field.name(), field.data_type())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DecodeRefusal::Schema { found });
+    }
     let entries: Vec<KeyValue> = builder
         .metadata()
         .file_metadata()
@@ -349,6 +373,12 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
                 name: "fund.commit",
             })?,
     };
+    if provenance.subscription.provider() != provider {
+        return Err(DecodeRefusal::Provider {
+            subscription: provenance.subscription,
+            key: provider,
+        });
+    }
     let mut bars = Vec::new();
     for batch in builder.build().map_err(|error| parquet(&error))? {
         let batch = batch.map_err(|error| parquet(&error))?;
@@ -375,6 +405,9 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
                 Symbol::new(symbols.value(row)).map_err(|error| refused(format!("{error:?}")))?;
             let timestamp = DateTime::from_timestamp_micros(timestamps.value(row))
                 .ok_or_else(|| refused("timestamp out of range".to_string()))?;
+            if SessionDate::at(timestamp) != session {
+                return Err(refused(format!("{timestamp} is outside session {session}")));
+            }
             let prices = Ohlc::new(
                 price(prices[0])?,
                 price(prices[1])?,
@@ -595,6 +628,91 @@ mod tests {
             decode(&minute_key(), later).map(|_| ()),
             Err(DecodeRefusal::Layout {
                 version: "2".to_string()
+            })
+        );
+    }
+
+    /// A file carrying valid provenance under `schema`, with no rows.
+    fn file_with(schema: Schema) -> Vec<u8> {
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(metadata(&provenance(Subscription::AlgoTraderPlus))))
+            .build();
+        let mut bytes = Vec::new();
+        ArrowWriter::try_new(&mut bytes, Arc::new(schema), Some(properties))
+            .unwrap()
+            .close()
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn test_a_file_whose_columns_differ_from_the_layout_is_refused() {
+        let fields = |edit: &dyn Fn(&mut Vec<Field>)| {
+            let mut fields: Vec<Field> = schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            edit(&mut fields);
+            Schema::new(fields)
+        };
+        let dropped = fields(&|fields| {
+            fields.pop();
+        });
+        let rescaled = fields(&|fields| {
+            fields[2] = Field::new("open", DataType::Decimal128(18, 4), false);
+        });
+        let nullable = fields(&|fields| {
+            fields[6] = Field::new("volume", SHARES_TYPE, true);
+        });
+        let swapped = fields(&|fields| fields.swap(2, 5));
+        for (name, schema) in [
+            ("dropped", dropped),
+            ("rescaled", rescaled),
+            ("nullable", nullable),
+            ("swapped", swapped),
+        ] {
+            assert!(
+                matches!(
+                    decode(&minute_key(), file_with(schema)),
+                    Err(DecodeRefusal::Schema { .. })
+                ),
+                "{name}"
+            );
+        }
+        assert!(decode(&minute_key(), file_with(schema())).is_ok());
+    }
+
+    #[test]
+    fn test_a_file_is_refused_under_another_session_or_provider() {
+        let bars = [bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None)];
+        let bytes = encode(
+            &minute_key(),
+            &bars,
+            &provenance(Subscription::AlgoTraderPlus),
+        )
+        .unwrap();
+        let next_day = Key::Bars {
+            provider: Provider::Alpaca,
+            origin: Origin::Fetched,
+            interval: BarInterval::OneMinute,
+            session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()),
+        };
+        assert!(matches!(
+            decode(&next_day, bytes.clone()),
+            Err(DecodeRefusal::Row { index: 0, .. })
+        ));
+        let massive = Key::Bars {
+            provider: Provider::Massive,
+            origin: Origin::Fetched,
+            interval: BarInterval::OneMinute,
+            session: session(),
+        };
+        assert_eq!(
+            decode(&massive, bytes).map(|_| ()),
+            Err(DecodeRefusal::Provider {
+                subscription: Subscription::AlgoTraderPlus,
+                key: Provider::Massive
             })
         );
     }
