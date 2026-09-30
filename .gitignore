@@ -19,7 +19,6 @@ data/*
 **/*.json
 !src_old/.sqlx/*.json
 !src_old/data/archive_provenance.json
-!src/ingest/fixtures/*.json
 .claude/tasks/
 .claude/settings.local.json*
 .scratchpad/
