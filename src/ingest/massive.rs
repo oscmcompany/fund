@@ -4,7 +4,7 @@ use chrono::DateTime;
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{MissingVariable, RefusedRow, RowRefusal, variable};
+use super::{Accepted, MissingVariable, RefusedRow, RowRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
@@ -24,12 +24,28 @@ pub struct Massive {
     api_key: String,
 }
 
-/// One session's daily bars, with every ticker that did not become one.
+/// One session's daily bars, with every ticker that did not become one: each row of the response is exactly one of a
+/// bar, a test ticker or a refusal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DailyBars {
-    pub bars: Vec<Bar>,
-    pub test_tickers: Vec<String>,
-    pub refused: Vec<RefusedRow>,
+    bars: Vec<Bar>,
+    test_tickers: Vec<String>,
+    refused: Vec<RefusedRow>,
+}
+
+impl DailyBars {
+    /// One bar per symbol, in symbol order.
+    pub fn bars(&self) -> &[Bar] {
+        &self.bars
+    }
+
+    pub fn test_tickers(&self) -> &[String] {
+        &self.test_tickers
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
 }
 
 #[derive(Deserialize)]
@@ -96,25 +112,25 @@ fn parse_grouped_daily(body: &[u8], session: SessionDate) -> Result<DailyBars, F
         serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
             reason: error.to_string(),
         })?;
-    let mut daily = DailyBars {
-        bars: Vec::new(),
-        test_tickers: Vec::new(),
-        refused: Vec::new(),
-    };
+    let mut test_tickers = Vec::new();
+    // Keyed by symbol, so two tickers the notation map sends to one symbol (`ABCw` and `ABC.WS`) keep neither.
+    let mut accepted = Accepted::new();
     for row in response.results {
         if EXCHANGE_TEST_TICKERS.contains(&row.ticker.as_str()) {
-            daily.test_tickers.push(row.ticker);
+            test_tickers.push(row.ticker);
             continue;
         }
         match daily_bar(&row, session) {
-            Ok(bar) => daily.bars.push(bar),
-            Err(cause) => daily.refused.push(RefusedRow {
-                ticker: row.ticker,
-                cause,
-            }),
+            Ok(bar) => accepted.offer(bar.symbol().clone(), row.ticker, bar),
+            Err(cause) => accepted.refuse(row.ticker, cause),
         }
     }
-    Ok(daily)
+    let (bars, refused) = accepted.finish();
+    Ok(DailyBars {
+        bars,
+        test_tickers,
+        refused,
+    })
 }
 
 fn daily_bar(row: &GroupedRow, session: SessionDate) -> Result<Bar, RowRefusal> {
@@ -250,7 +266,7 @@ mod tests {
         assert_eq!(
             bars,
             [
-                "INEO", "PEB.PRF", "GTOQ", "CRVL", "BRK.B", "BC.PRC", "AAPL", "SBXD.U", "AIIA.RT"
+                "AAPL", "AIIA.RT", "BC.PRC", "BRK.B", "CRVL", "GTOQ", "INEO", "PEB.PRF", "SBXD.U"
             ]
         );
         assert_eq!(daily.test_tickers, ["ZBZX", "ZTST"]);
@@ -268,6 +284,43 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// Each of the fixture's 14 rows is exactly one of a bar, a test ticker or a refusal.
+    #[test]
+    fn test_every_grouped_row_is_accounted_for_once() {
+        let daily = fixture();
+        assert_eq!(
+            (
+                daily.bars().len(),
+                daily.test_tickers().len(),
+                daily.refused().len()
+            ),
+            (9, 2, 3)
+        );
+    }
+
+    #[test]
+    fn test_two_tickers_naming_one_symbol_keep_neither() {
+        let body = br#"{"results":[
+            {"T":"ABCw","o":1,"h":1,"l":1,"c":1,"v":1,"t":1790366400000},
+            {"T":"ABC.WS","o":2,"h":2,"l":2,"c":2,"v":1,"t":1790366400000}
+        ]}"#;
+        let daily = parse_grouped_daily(body, session()).unwrap();
+        assert!(daily.bars().is_empty());
+        assert_eq!(
+            daily.refused(),
+            [
+                RefusedRow {
+                    ticker: "ABCw".to_string(),
+                    cause: RowRefusal::Duplicate
+                },
+                RefusedRow {
+                    ticker: "ABC.WS".to_string(),
+                    cause: RowRefusal::Duplicate
+                }
+            ]
+        );
     }
 
     #[test]
@@ -309,6 +362,21 @@ mod tests {
             parse_grouped_daily(b"<html>", session()),
             Err(FetchError::Malformed { .. })
         ));
+    }
+
+    proptest::proptest! {
+        /// The rules never send two Massive forms to one symbol; the one collision they cannot see, a warrant written
+        /// both `ABCw` and `ABC.WS`, is refused at runtime as a duplicate.
+        #[test]
+        fn property_the_notation_map_is_injective_across_forms(first in "[A-Z]{1,4}", second in "[A-Z]{1,4}") {
+            let tickers: std::collections::BTreeSet<String> = [&first, &second]
+                .iter()
+                .flat_map(|root| [root.to_string(), format!("{root}pA"), format!("{root}w"), format!("{root}r")])
+                .collect();
+            let symbols: std::collections::BTreeSet<Symbol> =
+                tickers.iter().map(|ticker| alpaca_symbol(ticker).unwrap()).collect();
+            proptest::prop_assert_eq!(symbols.len(), tickers.len());
+        }
     }
 
     #[test]

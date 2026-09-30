@@ -6,7 +6,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{MissingVariable, RefusedRow, RowRefusal, variable};
+use super::{Accepted, MissingVariable, RefusedRow, RowRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::time::SessionDate;
@@ -22,15 +22,85 @@ pub struct Alpaca {
     secret: String,
 }
 
-/// One batch's one-minute bars, with every requested symbol that produced none and every row that was refused.
+/// One batch's one-minute bars. Every symbol asked for is exactly one of answered (its rows are bars or refusals),
+/// missing or invalid, and every row is a bar or a refusal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MinuteBars {
-    pub bars: Vec<Bar>,
-    /// Requested but absent from every page: Alpaca drops a name it does not know without saying so.
-    pub missing: Vec<Symbol>,
-    /// Named invalid by Alpaca, which otherwise fails the whole batch; dropped and the batch retried without it.
-    pub invalid: Vec<Symbol>,
-    pub refused: Vec<RefusedRow>,
+    bars: Vec<Bar>,
+    missing: Vec<Symbol>,
+    invalid: Vec<Symbol>,
+    refused: Vec<RefusedRow>,
+}
+
+impl MinuteBars {
+    /// Reads the pages answering for `requested`; `invalid` are the symbols dropped before they were fetched.
+    fn from_pages(
+        pages: &[Vec<u8>],
+        requested: &[Symbol],
+        invalid: Vec<Symbol>,
+        session: SessionDate,
+    ) -> Result<Self, FetchError> {
+        let asked: BTreeSet<&str> = requested.iter().map(Symbol::as_str).collect();
+        let mut answered = BTreeSet::new();
+        let mut accepted = Accepted::new();
+        for page in pages {
+            let page: BarsPage =
+                serde_json::from_slice(page).map_err(|error| FetchError::Malformed {
+                    reason: error.to_string(),
+                })?;
+            for (ticker, rows) in page.bars.unwrap_or_default() {
+                let was_asked = asked.contains(ticker.as_str());
+                for row in rows {
+                    let bar = match was_asked {
+                        true => minute_bar(&ticker, &row, session),
+                        false => Err(RowRefusal::Unrequested),
+                    };
+                    match bar {
+                        Ok(bar) => accepted.offer(
+                            (bar.symbol().clone(), bar.timestamp()),
+                            ticker.clone(),
+                            bar,
+                        ),
+                        Err(cause) => accepted.refuse(ticker.clone(), cause),
+                    }
+                }
+                if was_asked {
+                    answered.insert(ticker);
+                }
+            }
+        }
+        let missing = requested
+            .iter()
+            .filter(|symbol| !answered.contains(symbol.as_str()))
+            .cloned()
+            .collect();
+        let (bars, refused) = accepted.finish();
+        Ok(Self {
+            bars,
+            missing,
+            invalid,
+            refused,
+        })
+    }
+
+    /// In symbol, then timestamp, order.
+    pub fn bars(&self) -> &[Bar] {
+        &self.bars
+    }
+
+    /// Asked for but absent from every page: Alpaca drops a name it does not know without saying so.
+    pub fn missing(&self) -> &[Symbol] {
+        &self.missing
+    }
+
+    /// Named invalid by Alpaca, which fails the whole batch, so dropped and the rest fetched again.
+    pub fn invalid(&self) -> &[Symbol] {
+        &self.invalid
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
 }
 
 #[derive(Deserialize)]
@@ -84,9 +154,7 @@ impl Alpaca {
     ) -> Result<MinuteBars, FetchError> {
         let (pages, requested, invalid) =
             dropping_invalid(symbols, |requested| self.pages(requested, session)).await?;
-        let mut batch = minute_bars_from(&pages, &requested, session)?;
-        batch.invalid = invalid;
-        Ok(batch)
+        MinuteBars::from_pages(&pages, &requested, invalid, session)
     }
 
     async fn pages(
@@ -206,44 +274,6 @@ fn invalid_symbol(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn minute_bars_from(
-    pages: &[Vec<u8>],
-    requested: &[Symbol],
-    session: SessionDate,
-) -> Result<MinuteBars, FetchError> {
-    let mut batch = MinuteBars {
-        bars: Vec::new(),
-        missing: Vec::new(),
-        invalid: Vec::new(),
-        refused: Vec::new(),
-    };
-    let mut returned = BTreeSet::new();
-    for page in pages {
-        let page: BarsPage =
-            serde_json::from_slice(page).map_err(|error| FetchError::Malformed {
-                reason: error.to_string(),
-            })?;
-        for (ticker, rows) in page.bars.unwrap_or_default() {
-            for row in rows {
-                match minute_bar(&ticker, &row, session) {
-                    Ok(bar) => batch.bars.push(bar),
-                    Err(cause) => batch.refused.push(RefusedRow {
-                        ticker: ticker.clone(),
-                        cause,
-                    }),
-                }
-            }
-            returned.insert(ticker);
-        }
-    }
-    batch.missing = requested
-        .iter()
-        .filter(|symbol| !returned.contains(symbol.as_str()))
-        .cloned()
-        .collect();
-    Ok(batch)
-}
-
 fn minute_bar(ticker: &str, row: &AlpacaBar, session: SessionDate) -> Result<Bar, RowRefusal> {
     let symbol = Symbol::new(ticker).map_err(RowRefusal::Symbol)?;
     if SessionDate::at(row.timestamp) != session {
@@ -287,6 +317,10 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap())
     }
 
+    fn read(pages: &[Vec<u8>], requested: &[Symbol]) -> Result<MinuteBars, FetchError> {
+        MinuteBars::from_pages(pages, requested, Vec::new(), session())
+    }
+
     fn symbols(names: &[&str]) -> Vec<Symbol> {
         names
             .iter()
@@ -310,12 +344,7 @@ mod tests {
 
     #[test]
     fn test_a_page_becomes_minute_bars_and_names_what_is_missing() {
-        let batch = minute_bars_from(
-            &[FIXTURE.to_vec()],
-            &symbols(&["AAPL", "BRK.B", "ZTST"]),
-            session(),
-        )
-        .unwrap();
+        let batch = read(&[FIXTURE.to_vec()], &symbols(&["AAPL", "BRK.B", "ZTST"])).unwrap();
         assert_eq!(batch.bars.len(), 6);
         assert_eq!(batch.missing, symbols(&["ZTST"]));
         assert!(batch.refused.is_empty());
@@ -336,12 +365,7 @@ mod tests {
         let second = br#"{"bars":null,"next_page_token":null}"#;
         assert_eq!(next_page_token(first), Ok(Some("abc".to_string())));
         assert_eq!(next_page_token(second), Ok(None));
-        let batch = minute_bars_from(
-            &[first.to_vec(), second.to_vec()],
-            &symbols(&["AAC.WS"]),
-            session(),
-        )
-        .unwrap();
+        let batch = read(&[first.to_vec(), second.to_vec()], &symbols(&["AAC.WS"])).unwrap();
         assert_eq!(batch.bars.len(), 1);
         assert_eq!(batch.bars[0].volume_weighted_average_price(), None);
         assert!(batch.missing.is_empty());
@@ -350,7 +374,7 @@ mod tests {
     #[test]
     fn test_a_bar_from_another_session_is_refused() {
         let page = br#"{"bars":{"AAPL":[{"t":"2026-09-26T04:00:00Z","o":1,"h":1,"l":1,"c":1,"v":1}]},"next_page_token":null}"#;
-        let batch = minute_bars_from(&[page.to_vec()], &symbols(&["AAPL"]), session()).unwrap();
+        let batch = read(&[page.to_vec()], &symbols(&["AAPL"])).unwrap();
         assert_eq!(
             batch.refused,
             [RefusedRow {
@@ -360,6 +384,72 @@ mod tests {
                 }
             }]
         );
+    }
+
+    /// Every symbol asked for lands in exactly one of answered, missing or invalid.
+    #[test]
+    fn test_every_requested_symbol_is_accounted_for_once() {
+        let batch = MinuteBars::from_pages(
+            &[FIXTURE.to_vec()],
+            &symbols(&["AAPL", "BRK.B", "ZTST"]),
+            symbols(&["BC.PRC"]),
+            session(),
+        )
+        .unwrap();
+        let answered: BTreeSet<&str> = batch
+            .bars()
+            .iter()
+            .map(|bar| bar.symbol().as_str())
+            .chain(batch.refused().iter().map(RefusedRow::ticker))
+            .collect();
+        let mut accounted: Vec<&str> = answered
+            .into_iter()
+            .chain(batch.missing().iter().map(Symbol::as_str))
+            .chain(batch.invalid().iter().map(Symbol::as_str))
+            .collect();
+        accounted.sort();
+        assert_eq!(accounted, ["AAPL", "BC.PRC", "BRK.B", "ZTST"]);
+    }
+
+    #[test]
+    fn test_a_symbol_answered_but_not_asked_for_is_refused() {
+        // What Alpaca sent back for `BCpC`: the unrelated common stock.
+        let page = br#"{"bars":{"BCPC":[{"t":"2026-09-25T14:00:00Z","o":167,"h":168,"l":166,"c":167,"v":10}]},"next_page_token":null}"#;
+        let batch = read(&[page.to_vec()], &symbols(&["BC.PRC"])).unwrap();
+        assert!(batch.bars().is_empty());
+        assert_eq!(batch.missing(), symbols(&["BC.PRC"]));
+        assert_eq!(
+            batch.refused(),
+            [RefusedRow {
+                ticker: "BCPC".to_string(),
+                cause: RowRefusal::Unrequested
+            }]
+        );
+    }
+
+    #[test]
+    fn test_a_minute_repeated_across_pages_keeps_neither_row() {
+        let row = |close: u32| {
+            format!(
+                r#"{{"bars":{{"AAPL":[{{"t":"2026-09-25T14:00:00Z","o":1,"h":2,"l":1,"c":{close},"v":10}}]}},"next_page_token":null}}"#
+            )
+            .into_bytes()
+        };
+        let batch = read(&[row(1), row(2), row(2)], &symbols(&["AAPL"])).unwrap();
+        assert!(batch.bars().is_empty());
+        assert_eq!(
+            batch
+                .refused()
+                .iter()
+                .map(|row| row.cause().clone())
+                .collect::<Vec<_>>(),
+            [
+                RowRefusal::Duplicate,
+                RowRefusal::Duplicate,
+                RowRefusal::Duplicate
+            ]
+        );
+        assert!(batch.missing().is_empty());
     }
 
     #[test]
