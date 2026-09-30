@@ -3,4 +3,5 @@
 pub mod journal;
 pub mod market;
 pub mod monoid;
+pub mod storage;
 pub mod time;
