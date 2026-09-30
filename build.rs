@@ -25,9 +25,15 @@ fn checked_out_reference() -> Option<String> {
     Some(head.trim().strip_prefix("ref: ")?.to_string())
 }
 
-/// The commit, with `-dirty` when the working tree differs from it, so a record never names code that did not run.
+/// The commit, with `-dirty` when the working tree differs from it, so a record never names code that did not run;
+/// `None` for anything the journal's `Commit` would refuse.
 fn commit() -> Option<String> {
     let commit = git(&["rev-parse", "HEAD"])?;
+    // A SHA-256 repository prints 64 characters, which the journal's `Commit` refuses.
+    let hexadecimal = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+    if commit.len() != 40 || !commit.bytes().all(hexadecimal) {
+        return None;
+    }
     let dirty = !git(&["status", "--porcelain"])?.is_empty();
     Some(if dirty {
         format!("{commit}-dirty")
