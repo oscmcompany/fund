@@ -14,7 +14,7 @@ use strum::IntoEnumIterator;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::archive::Archive;
+use crate::archive::Bucket;
 use crate::archive::bars::{Provenance, Subscription, decode, encode};
 use crate::common::heal::{Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, window};
 use crate::common::journal::{
@@ -33,6 +33,7 @@ use crate::journal::Journal;
 const DEFAULT_LOOKBACK_SESSIONS: NonZeroUsize = NonZeroUsize::new(5).expect("5 is not zero");
 const DEFAULT_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(240).expect("240 is not zero");
 const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
+const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 /// A whole-market session measured 2026-09-30 at about 33 s with these two.
 const DEFAULT_MINUTE_BATCH_SYMBOLS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is not zero");
 const DEFAULT_MINUTE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
@@ -48,6 +49,7 @@ pub struct Parameters {
     lookback_sessions: NonZeroUsize,
     budget: Duration,
     journal_directory: PathBuf,
+    log_directory: PathBuf,
     minute_batch_symbols: NonZeroUsize,
     minute_concurrency: NonZeroUsize,
 }
@@ -89,6 +91,11 @@ impl Parameters {
                 DEFAULT_JOURNAL_DIRECTORY.to_string(),
                 &mut resolved,
             )?),
+            log_directory: PathBuf::from(record(
+                read(Parameter::LogDirectory)?,
+                DEFAULT_LOG_DIRECTORY.to_string(),
+                &mut resolved,
+            )?),
             minute_batch_symbols: record(
                 read(Parameter::MinuteBatchSymbols)?,
                 DEFAULT_MINUTE_BATCH_SYMBOLS,
@@ -105,6 +112,10 @@ impl Parameters {
 
     pub fn journal_directory(&self) -> &PathBuf {
         &self.journal_directory
+    }
+
+    pub fn log_directory(&self) -> &PathBuf {
+        &self.log_directory
     }
 }
 
@@ -184,7 +195,7 @@ pub fn lock(directory: &std::path::Path) -> Result<std::fs::File, LockRefusal> {
 pub enum HealError {
     Calendar(FetchError),
     Window(WindowRefusal),
-    List(crate::archive::ArchiveError),
+    List(crate::archive::BucketError),
     /// A partition was written but its record was not, so the run stops rather than write what it cannot record.
     Journal(std::io::Error),
 }
@@ -204,14 +215,14 @@ impl std::fmt::Display for HealError {
 
 /// The clients the heal reads from and writes to.
 pub struct Clients {
-    archive: Archive,
+    archive: Bucket,
     massive: Massive,
     /// Shared by the concurrent one-minute batches, so its secret is held once rather than copied into each.
     alpaca: Arc<Alpaca>,
 }
 
 impl Clients {
-    pub fn new(archive: Archive, massive: Massive, alpaca: Alpaca) -> Self {
+    pub fn new(archive: Bucket, massive: Massive, alpaca: Alpaca) -> Self {
         Self {
             archive,
             massive,
@@ -535,6 +546,11 @@ mod tests {
                 (
                     Parameter::JournalDirectory,
                     "/var/journal/fund",
+                    ParameterSource::Default
+                ),
+                (
+                    Parameter::LogDirectory,
+                    "/var/log/fund",
                     ParameterSource::Default
                 ),
                 (

@@ -123,6 +123,10 @@ impl Record {
         }
     }
 
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
     pub fn run_id(&self) -> RunId {
         self.run_id
     }
@@ -348,15 +352,20 @@ pub fn read(contents: &str) -> Vec<ReadLine> {
     contents
         .lines()
         .enumerate()
-        .map(|(index, line)| match read_line(line) {
-            Ok(record) => ReadLine::Read(Box::new(record)),
-            Err(cause) => ReadLine::Unreadable {
-                line: index + 1,
-                text: line.to_string(),
-                cause,
-            },
-        })
+        .map(|(index, text)| read_one(index + 1, text))
         .collect()
+}
+
+/// Line `line` of a journal file, as `read` would give it.
+pub fn read_one(line: usize, text: &str) -> ReadLine {
+    match read_line(text) {
+        Ok(record) => ReadLine::Read(Box::new(record)),
+        Err(cause) => ReadLine::Unreadable {
+            line,
+            text: text.to_string(),
+            cause,
+        },
+    }
 }
 
 fn read_line(line: &str) -> Result<Record, UnreadableCause> {
