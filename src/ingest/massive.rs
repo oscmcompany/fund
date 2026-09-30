@@ -19,7 +19,7 @@ const EXCHANGE_TEST_TICKERS: [&str; 34] = [
 ];
 
 pub struct Massive {
-    http: reqwest::Client,
+    http_client: reqwest::Client,
     base_url: String,
     api_key: String,
 }
@@ -64,9 +64,9 @@ struct GroupedRow {
 
 impl Massive {
     /// Reads `MASSIVE_BASE_URL` and `MASSIVE_API_KEY`.
-    pub fn from_environment(http: reqwest::Client) -> Result<Self, MissingVariable> {
+    pub fn from_environment(http_client: reqwest::Client) -> Result<Self, MissingVariable> {
         Ok(Self {
-            http,
+            http_client,
             base_url: variable("MASSIVE_BASE_URL")?,
             api_key: variable("MASSIVE_API_KEY")?,
         })
@@ -80,7 +80,7 @@ impl Massive {
         );
         let body = with_retries(|| {
             send(
-                self.http
+                self.http_client
                     .get(&url)
                     .bearer_auth(&self.api_key)
                     .query(&[("adjusted", "false"), ("include_otc", "false")]),

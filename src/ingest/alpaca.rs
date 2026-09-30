@@ -17,7 +17,7 @@ const BARS_URL: &str = "https://data.alpaca.markets/v2/stocks/bars";
 const PAGE_LIMIT: &str = "10000";
 
 pub struct Alpaca {
-    http: reqwest::Client,
+    http_client: reqwest::Client,
     key_id: String,
     secret: String,
 }
@@ -67,9 +67,9 @@ struct ErrorBody {
 
 impl Alpaca {
     /// Reads `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET`.
-    pub fn from_environment(http: reqwest::Client) -> Result<Self, MissingVariable> {
+    pub fn from_environment(http_client: reqwest::Client) -> Result<Self, MissingVariable> {
         Ok(Self {
-            http,
+            http_client,
             key_id: variable("ALPACA_API_KEY_ID")?,
             secret: variable("ALPACA_API_SECRET")?,
         })
@@ -122,7 +122,7 @@ impl Alpaca {
                     query.push(("page_token", token));
                 }
                 send(
-                    self.http
+                    self.http_client
                         .get(BARS_URL)
                         .header("APCA-API-KEY-ID", &self.key_id)
                         .header("APCA-API-SECRET-KEY", &self.secret)
