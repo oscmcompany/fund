@@ -26,13 +26,23 @@ pub(crate) mod laws {
         second: M,
         third: M,
     ) -> Result<(), TestCaseError> {
+        check_ordered(first.clone(), second.clone(), third)?;
+        prop_assert_eq!(first.clone().combine(second.clone()), second.combine(first));
+        Ok(())
+    }
+
+    /// Identity on both sides and associativity, which a concatenation claims without commuting.
+    pub(crate) fn check_ordered<M: Monoid + Clone + PartialEq + Debug>(
+        first: M,
+        second: M,
+        third: M,
+    ) -> Result<(), TestCaseError> {
         prop_assert_eq!(M::empty().combine(first.clone()), first.clone());
         prop_assert_eq!(first.clone().combine(M::empty()), first.clone());
         prop_assert_eq!(
             first.clone().combine(second.clone()).combine(third.clone()),
-            first.clone().combine(second.clone().combine(third))
+            first.combine(second.combine(third))
         );
-        prop_assert_eq!(first.clone().combine(second.clone()), second.combine(first));
         Ok(())
     }
 

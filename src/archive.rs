@@ -7,7 +7,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 
 use crate::common::storage::Key;
-use crate::ingest::MissingVariable;
+use crate::ingest::VariableRefusal;
 
 pub struct Archive {
     s3_client: aws_sdk_s3::Client,
@@ -25,6 +25,10 @@ pub enum ArchiveError {
         path: String,
         reason: String,
     },
+    List {
+        prefix: String,
+        reason: String,
+    },
     /// Read back different bytes than were written.
     ReadBackMismatch {
         path: String,
@@ -38,6 +42,7 @@ impl std::fmt::Display for ArchiveError {
         match self {
             Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
             Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
+            Self::List { prefix, reason } => write!(formatter, "listing {prefix} failed: {reason}"),
             Self::ReadBackMismatch {
                 path,
                 written,
@@ -54,7 +59,7 @@ impl Archive {
     /// The shared archive bucket named by `AWS_S3_ARCHIVE_BUCKET_NAME`.
     pub fn from_environment(
         configuration: &aws_config::SdkConfig,
-    ) -> Result<Self, MissingVariable> {
+    ) -> Result<Self, VariableRefusal> {
         Ok(Self {
             s3_client: aws_sdk_s3::Client::new(configuration),
             bucket: crate::ingest::variable("AWS_S3_ARCHIVE_BUCKET_NAME")?,
@@ -84,6 +89,30 @@ impl Archive {
                 read: read.map_or(0, |read| read.len()),
             }),
         }
+    }
+
+    /// Every path under `prefix`, across as many pages as S3 answers with.
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>, ArchiveError> {
+        let mut pages = self
+            .s3_client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+        let mut paths = Vec::new();
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(|error| ArchiveError::List {
+                prefix: prefix.to_string(),
+                reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
+            })?;
+            paths.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(String::from)),
+            );
+        }
+        Ok(paths)
     }
 
     /// The object under `key`, or `None` when nothing is there; S3 verifies the stored checksum as it streams.

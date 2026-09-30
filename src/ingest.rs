@@ -12,20 +12,30 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal};
 use crate::common::market::{DollarVolumeRefusal, PriceRefusal, SharesRefusal, SymbolRefusal};
 
-/// An environment variable a client needs and did not find.
+/// Why an environment variable a client needs was not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingVariable {
-    name: &'static str,
+pub enum VariableRefusal {
+    Missing {
+        name: &'static str,
+    },
+    /// Set, but to a value outside the few it may take.
+    Malformed {
+        name: &'static str,
+        raw: String,
+    },
 }
 
-impl MissingVariable {
-    pub fn name(&self) -> &'static str {
-        self.name
+impl std::fmt::Display for VariableRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { name } => write!(formatter, "{name} is not set"),
+            Self::Malformed { name, raw } => write!(formatter, "{name} is `{raw}`"),
+        }
     }
 }
 
-pub(crate) fn variable(name: &'static str) -> Result<String, MissingVariable> {
-    std::env::var(name).map_err(|_| MissingVariable { name })
+pub(crate) fn variable(name: &'static str) -> Result<String, VariableRefusal> {
+    std::env::var(name).map_err(|_| VariableRefusal::Missing { name })
 }
 
 /// A vendor row that did not become a record, named as the vendor wrote it.
@@ -45,7 +55,8 @@ impl RefusedRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum RowRefusal {
     Symbol(SymbolRefusal),
     /// Stamped for a session other than the one requested.
@@ -61,6 +72,15 @@ pub enum RowRefusal {
     Unrequested,
     /// One of several rows claiming the same record; none is kept, since nothing says which is true.
     Duplicate,
+}
+
+/// Refused rows counted by the name of their cause.
+pub fn refused_by_cause(rows: &[RefusedRow]) -> BTreeMap<String, u64> {
+    rows.iter().fold(BTreeMap::new(), |mut counts, row| {
+        let cause: &'static str = row.cause().into();
+        *counts.entry(cause.to_string()).or_insert(0) += 1;
+        counts
+    })
 }
 
 /// Collects a report's bars by the record each claims to be, so a key claimed twice keeps neither row.

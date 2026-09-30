@@ -8,6 +8,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::common::heal::{Leg, SessionOutcome};
+use crate::common::market::Symbol;
+use crate::common::parameter::Parameter;
 use crate::common::time::SessionDate;
 
 /// Stamped on every record this build writes; it only goes up, and a reader maps old versions forward.
@@ -158,6 +161,8 @@ impl Record {
 #[strum(serialize_all = "snake_case")]
 pub enum Observation {
     ConfigurationResolved(ConfigurationResolved),
+    PartitionWritten(PartitionWritten),
+    HealFinished(HealFinished),
 }
 
 impl Observation {
@@ -170,16 +175,100 @@ impl Observation {
 /// reads the run's own values rather than today's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigurationResolved {
-    parameters: BTreeMap<String, ResolvedParameter>,
+    parameters: BTreeMap<Parameter, ResolvedParameter>,
 }
 
 impl ConfigurationResolved {
-    pub fn new(parameters: BTreeMap<String, ResolvedParameter>) -> Self {
+    pub fn new(parameters: BTreeMap<Parameter, ResolvedParameter>) -> Self {
         Self { parameters }
     }
 
-    pub fn parameters(&self) -> &BTreeMap<String, ResolvedParameter> {
+    pub fn parameters(&self) -> &BTreeMap<Parameter, ResolvedParameter> {
         &self.parameters
+    }
+}
+
+/// One leg's session written to the archive and read back, with every symbol and row that did not become a bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionWritten {
+    leg: Leg,
+    session: SessionDate,
+    bars: u64,
+    /// Refused rows counted by cause, the `RowRefusal` variant in snake case.
+    refused: BTreeMap<String, u64>,
+    unanswered: BTreeMap<Symbol, Unanswered>,
+}
+
+impl PartitionWritten {
+    pub fn new(
+        leg: Leg,
+        session: SessionDate,
+        bars: u64,
+        refused: BTreeMap<String, u64>,
+        unanswered: BTreeMap<Symbol, Unanswered>,
+    ) -> Self {
+        Self {
+            leg,
+            session,
+            bars,
+            refused,
+            unanswered,
+        }
+    }
+
+    pub fn leg(&self) -> Leg {
+        self.leg
+    }
+
+    pub fn session(&self) -> SessionDate {
+        self.session
+    }
+
+    pub fn bars(&self) -> u64 {
+        self.bars
+    }
+
+    pub fn refused(&self) -> &BTreeMap<String, u64> {
+        &self.refused
+    }
+
+    pub fn unanswered(&self) -> &BTreeMap<Symbol, Unanswered> {
+        &self.unanswered
+    }
+}
+
+/// Why a symbol asked for returned no rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unanswered {
+    /// Left out of the answer without a word, as Alpaca does with a name it does not know.
+    Missing,
+    /// Named invalid by the vendor and dropped from the request.
+    Invalid,
+}
+
+/// A run's heal: the window it covered and how each owed session of each leg ended. A session of the window with no
+/// outcome was already held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealFinished {
+    window: Vec<SessionDate>,
+    outcomes: BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>>,
+}
+
+impl HealFinished {
+    pub fn new(
+        window: Vec<SessionDate>,
+        outcomes: BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>>,
+    ) -> Self {
+        Self { window, outcomes }
+    }
+
+    pub fn window(&self) -> &[SessionDate] {
+        &self.window
+    }
+
+    pub fn outcomes(&self) -> &BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>> {
+        &self.outcomes
     }
 }
 
@@ -304,11 +393,11 @@ mod tests {
     fn record(commit: Option<Commit>) -> Record {
         let parameters = BTreeMap::from([
             (
-                "liquidity_floor".to_string(),
-                ResolvedParameter::new("2.0".to_string(), ParameterSource::Default),
+                Parameter::BudgetMinutes,
+                ResolvedParameter::new("240".to_string(), ParameterSource::Default),
             ),
             (
-                "lookback_sessions".to_string(),
+                Parameter::LookbackSessions,
                 ResolvedParameter::new("20".to_string(), ParameterSource::Environment),
             ),
         ]);
@@ -329,8 +418,74 @@ mod tests {
                 r#"{"schema_version":1,"run_id":"00000000-0000-0000-0000-000000000001","sequence":1,"#,
                 r#""timestamp":"2026-07-31T14:30:00Z","commit":"0123456789abcdef0123456789abcdef01234567","#,
                 r#""event_type":"configuration_resolved","payload":{"parameters":{"#,
-                r#""liquidity_floor":{"value":"2.0","source":"default"},"#,
-                r#""lookback_sessions":{"value":"20","source":"environment"}}}}"#,
+                r#""lookback_sessions":{"value":"20","source":"environment"},"#,
+                r#""budget_minutes":{"value":"240","source":"default"}}}}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn test_the_heal_records_encode_to_their_wire_format() {
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
+        let envelope = |observation| {
+            Record::new(
+                RunId::new(Uuid::from_u128(1)),
+                NonZeroU64::MIN,
+                "2026-09-30T07:00:00Z".parse().unwrap(),
+                None,
+                observation,
+            )
+            .encode()
+        };
+        let written = PartitionWritten::new(
+            Leg::AlpacaMinuteBars,
+            session,
+            1_872_987,
+            BTreeMap::from([("duplicate".to_string(), 2)]),
+            BTreeMap::from([
+                (Symbol::new("ABC").unwrap(), Unanswered::Missing),
+                (Symbol::new("BC.PRC").unwrap(), Unanswered::Invalid),
+            ]),
+        );
+        let finished = HealFinished::new(
+            vec![session],
+            BTreeMap::from([(
+                Leg::MassiveDailyBars,
+                BTreeMap::from([
+                    (
+                        session,
+                        SessionOutcome::Failed {
+                            cause: "refused with 403".to_string(),
+                        },
+                    ),
+                    (session.plus_calendar_days(-1), SessionOutcome::Unreached),
+                ]),
+            )]),
+        );
+        let prefix = concat!(
+            r#"{"schema_version":1,"run_id":"00000000-0000-0000-0000-000000000001","sequence":1,"#,
+            r#""timestamp":"2026-09-30T07:00:00Z","commit":null,"#,
+        );
+        assert_eq!(
+            envelope(Observation::PartitionWritten(written)),
+            format!(
+                "{prefix}{}",
+                concat!(
+                    r#""event_type":"partition_written","payload":{"leg":"alpaca_minute_bars","#,
+                    r#""session":"2026-09-29","bars":1872987,"refused":{"duplicate":2},"#,
+                    r#""unanswered":{"ABC":"missing","BC.PRC":"invalid"}}}"#,
+                )
+            )
+        );
+        assert_eq!(
+            envelope(Observation::HealFinished(finished)),
+            format!(
+                "{prefix}{}",
+                concat!(
+                    r#""event_type":"heal_finished","payload":{"window":["2026-09-29"],"#,
+                    r#""outcomes":{"massive_daily_bars":{"2026-09-28":{"outcome":"unreached"},"#,
+                    r#""2026-09-29":{"outcome":"failed","cause":"refused with 403"}}}}}"#,
+                )
             )
         );
     }
@@ -479,6 +634,63 @@ mod tests {
         ));
     }
 
+    fn any_session() -> impl Strategy<Value = SessionDate> {
+        (0_i64..40_000).prop_map(|days| {
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(1990, 1, 1).unwrap())
+                .plus_calendar_days(days)
+        })
+    }
+
+    fn any_observation() -> impl Strategy<Value = Observation> {
+        let parameter = prop::sample::select(Parameter::iter().collect::<Vec<_>>());
+        let source = prop::sample::select(ParameterSource::iter().collect::<Vec<_>>());
+        let leg = prop::sample::select(Leg::iter().collect::<Vec<_>>());
+        let symbol = "[A-Z]{1,5}(\\.[A-Z]{1,3})?".prop_map(|raw| Symbol::new(&raw).unwrap());
+        let unanswered = prop::sample::select(vec![Unanswered::Missing, Unanswered::Invalid]);
+        let outcome = prop_oneof![
+            Just(SessionOutcome::Written),
+            Just(SessionOutcome::Unreached),
+            ".{0,20}".prop_map(|cause| SessionOutcome::Failed { cause }),
+        ];
+        prop_oneof![
+            prop::collection::btree_map(parameter, (".{0,20}", source), 0..6).prop_map(
+                |parameters| {
+                    Observation::ConfigurationResolved(ConfigurationResolved::new(
+                        parameters
+                            .into_iter()
+                            .map(|(name, (value, source))| {
+                                (name, ResolvedParameter::new(value, source))
+                            })
+                            .collect(),
+                    ))
+                }
+            ),
+            (
+                leg.clone(),
+                any_session(),
+                any::<u64>(),
+                prop::collection::btree_map("[a-z_]{1,12}", any::<u64>(), 0..4),
+                prop::collection::btree_map(symbol, unanswered, 0..6),
+            )
+                .prop_map(|(leg, session, bars, refused, unanswered)| {
+                    Observation::PartitionWritten(PartitionWritten::new(
+                        leg, session, bars, refused, unanswered,
+                    ))
+                }),
+            (
+                prop::collection::vec(any_session(), 0..6),
+                prop::collection::btree_map(
+                    leg,
+                    prop::collection::btree_map(any_session(), outcome, 0..4),
+                    0..3
+                ),
+            )
+                .prop_map(|(window, outcomes)| {
+                    Observation::HealFinished(HealFinished::new(window, outcomes))
+                }),
+        ]
+    }
+
     fn any_record() -> impl Strategy<Value = Record> {
         (
             any::<u128>(),
@@ -486,35 +698,19 @@ mod tests {
             0_i64..4_102_444_800,
             0_u32..1_000_000_000,
             prop::option::of(("[0-9a-f]{40}", any::<bool>())),
-            prop::collection::btree_map(
-                "[a-z_]{1,20}",
-                (
-                    ".{0,20}",
-                    prop::sample::select(vec![
-                        ParameterSource::Environment,
-                        ParameterSource::Default,
-                    ]),
-                ),
-                0..8,
-            ),
+            any_observation(),
         )
             .prop_map(
-                |(run, sequence, seconds, nanoseconds, commit, parameters)| {
+                |(run, sequence, seconds, nanoseconds, commit, observation)| {
                     let commit = commit.map(|(sha, dirty)| {
                         Commit::new(&if dirty { format!("{sha}-dirty") } else { sha }).unwrap()
                     });
-                    let parameters = parameters
-                        .into_iter()
-                        .map(|(name, (value, source))| {
-                            (name, ResolvedParameter::new(value, source))
-                        })
-                        .collect();
                     Record::new(
                         RunId::new(Uuid::from_u128(run)),
                         NonZeroU64::new(sequence).unwrap(),
                         DateTime::from_timestamp(seconds, nanoseconds).unwrap(),
                         commit,
-                        Observation::ConfigurationResolved(ConfigurationResolved::new(parameters)),
+                        observation,
                     )
                 },
             )
