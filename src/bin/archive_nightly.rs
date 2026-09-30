@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use chrono::Utc;
 use tracing::Instrument;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -21,7 +22,7 @@ use fund::heal::{Clients, Parameters, lock, run};
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::massive::Massive;
 use fund::journal::{Journal, built_commit};
-use fund::records::{log_file_name, ship};
+use fund::records::{log_file_name, ship, shipped_filter};
 use uuid::Uuid;
 
 const SERVICE: &str = "archive_nightly";
@@ -32,26 +33,22 @@ async fn main() -> ExitCode {
     let today = SessionDate::at(Utc::now());
     let service = Service::new(SERVICE).expect("the service name is one path segment");
     let resolved = Parameters::from_environment();
-    let log_file = resolved.as_ref().ok().map(|(parameters, _)| {
-        std::fs::create_dir_all(parameters.log_directory()).and_then(|()| {
-            File::options().create(true).append(true).open(
-                parameters
-                    .log_directory()
-                    .join(log_file_name(&service, today)),
-            )
+    let log_file = Parameters::log_directory_from_environment().map(|directory| {
+        std::fs::create_dir_all(&directory).and_then(|()| {
+            File::options()
+                .create(true)
+                .append(true)
+                .open(directory.join(log_file_name(&service, today)))
         })
     });
+    // A refused log directory is reported with the other parameters; only a directory that resolved can fail to open.
     let (log_writer, log_file_error) = match log_file {
-        Some(Ok(file)) => (Some(Mutex::new(file)), None),
-        Some(Err(error)) => (None, Some(error)),
-        None => (None, None),
+        Ok(Ok(file)) => (Some(Mutex::new(file)), None),
+        Ok(Err(error)) => (None, Some(error)),
+        Err(_) => (None, None),
     };
     tracing_subscriber::registry()
-        // The SDK logs its credential chain at info, which does not belong in shipped logs.
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,aws_config=warn")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
             fmt::layer()
                 .json()
@@ -64,6 +61,7 @@ async fn main() -> ExitCode {
                 .with_current_span(true)
                 .with_span_list(false)
                 .with_writer(writer)
+                .with_filter(shipped_filter())
         }))
         .init();
     let run_id = RunId::new(Uuid::new_v4());
@@ -148,7 +146,8 @@ async fn main() -> ExitCode {
             &service,
             parameters.journal_directory(),
             parameters.log_directory(),
-            today,
+            // Taken now, so a run that crossed midnight ships the journal file its last records went to.
+            SessionDate::at(Utc::now()),
         )
         .await;
         let mut all_shipped = true;

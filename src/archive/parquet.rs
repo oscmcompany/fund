@@ -92,9 +92,16 @@ pub(crate) fn read(
         .key_value_metadata()
         .cloned()
         .unwrap_or_default();
-    let version = value(&entries, LAYOUT_VERSION_KEY).ok_or(ReadRefusal::Metadata {
-        name: LAYOUT_VERSION_KEY,
-    })?;
+    let versions = entries
+        .iter()
+        .filter(|entry| entry.key == LAYOUT_VERSION_KEY)
+        .count();
+    // Two versions would leave the reader choosing between them.
+    let version = value(&entries, LAYOUT_VERSION_KEY)
+        .filter(|_| versions == 1)
+        .ok_or(ReadRefusal::Metadata {
+            name: LAYOUT_VERSION_KEY,
+        })?;
     if version != layout_version {
         return Err(ReadRefusal::Layout { version });
     }

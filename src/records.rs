@@ -4,6 +4,9 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
+use tracing::Level;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+
 use crate::archive::{Bucket, journal, logs};
 use crate::common::journal::read;
 use crate::common::storage::{Host, Key, Service};
@@ -11,6 +14,14 @@ use crate::common::time::SessionDate;
 
 /// Calendar days of local files shipped each run, today included, so a week of failed shipments heals by itself.
 const RESHIPPED_DAYS: i64 = 7;
+
+/// What the shipped log file keeps: everything the process logs, except the SDK's credential chain below a warning,
+/// which does not belong in a bucket whatever `RUST_LOG` asks stdout for.
+pub fn shipped_filter() -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_target("aws_config", Level::WARN)
+}
 
 /// The file one service's runs log to in a session, named for the session the run started in.
 pub fn log_file_name(service: &Service, session: SessionDate) -> String {
@@ -93,6 +104,15 @@ mod tests {
 
     fn date(text: &str) -> SessionDate {
         SessionDate::from_date(text.parse::<NaiveDate>().unwrap())
+    }
+
+    #[test]
+    fn test_the_shipped_log_leaves_out_the_credential_chain() {
+        let filter = shipped_filter();
+        assert!(!filter.would_enable("aws_config::profile::credentials", &Level::INFO));
+        assert!(filter.would_enable("aws_config::profile::credentials", &Level::WARN));
+        assert!(filter.would_enable("fund::heal", &Level::INFO));
+        assert!(filter.would_enable("archive_nightly", &Level::DEBUG));
     }
 
     #[test]

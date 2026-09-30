@@ -592,6 +592,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_a_file_naming_its_layout_twice_is_refused() {
+        let mut entries = metadata(&provenance(Subscription::AlgoTraderPlus));
+        for version in [LAYOUT_VERSION, LAYOUT_VERSION] {
+            entries.push(KeyValue::new(
+                "fund.layout_version".to_string(),
+                Some(version.to_string()),
+            ));
+        }
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(entries))
+            .build();
+        let mut bytes = Vec::new();
+        ArrowWriter::try_new(&mut bytes, Arc::new(schema()), Some(properties))
+            .unwrap()
+            .close()
+            .unwrap();
+        assert_eq!(
+            decode(&minute_key(), bytes).map(|_| ()),
+            Err(DecodeRefusal::Metadata {
+                name: "fund.layout_version"
+            })
+        );
+    }
+
     /// A file carrying valid provenance under `schema`, with no rows.
     fn file_with(schema: Schema) -> Vec<u8> {
         let mut entries = metadata(&provenance(Subscription::AlgoTraderPlus));

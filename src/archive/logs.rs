@@ -95,7 +95,18 @@ fn parse_line(line: u64, text: &str) -> Option<LogLine> {
     };
     let text_of = |value: Option<Value>| match value {
         Some(Value::String(text)) => Some(text),
-        _ => None,
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_),
+        )
+        | None => None,
+    };
+    // `Some(None)` when absent, which is no value; `None` when present but not text, which is not our line.
+    let optional_text = |value: Option<Value>| match value {
+        None => Some(None),
+        Some(Value::String(text)) => Some(Some(text)),
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_),
+        ) => None,
     };
     let timestamp = text_of(object.remove("timestamp"))?.parse().ok()?;
     let level = text_of(object.remove("level"))?.parse().ok()?;
@@ -104,17 +115,26 @@ fn parse_line(line: u64, text: &str) -> Option<LogLine> {
         return None;
     };
     let message = text_of(fields.remove("message"))?;
+    // A span other than the run's, such as a library's, carries neither field.
     let (run_id, commit) = match object.remove("span") {
         None => (None, None),
         Some(Value::Object(mut span)) => {
-            let run_id = Uuid::parse_str(&text_of(span.remove("run_id"))?).ok()?;
-            let commit = match text_of(span.remove("commit"))? {
-                unknown if unknown == "unknown" => None,
-                sha => Some(Commit::new(&sha).ok()?),
+            let run_id = match optional_text(span.remove("run_id"))? {
+                None => None,
+                Some(raw) => Some(RunId::new(Uuid::parse_str(&raw).ok()?)),
             };
-            (Some(RunId::new(run_id)), commit)
+            let commit = match optional_text(span.remove("commit"))? {
+                None => None,
+                Some(unknown) if unknown == "unknown" => None,
+                Some(sha) => Some(Commit::new(&sha).ok()?),
+            };
+            (run_id, commit)
         }
-        Some(_) => return None,
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
+        ) => {
+            return None;
+        }
     };
     Some(LogLine::Read {
         line,
@@ -323,6 +343,28 @@ mod tests {
             matches!(&lines[1], LogLine::Read { commit: None, level, .. } if *level == Level::ERROR)
         );
         assert!(matches!(&lines[2], LogLine::Unreadable { line: 3, .. }));
+    }
+
+    #[test]
+    fn test_a_span_without_the_runs_fields_still_reads() {
+        let lines = parse(
+            r#"{"timestamp":"2026-09-30T18:45:05Z","level":"INFO","fields":{"message":"Sent"},"target":"aws_smithy","span":{"name":"send"}}"#,
+        );
+        assert!(
+            matches!(
+                &lines[..],
+                [LogLine::Read {
+                    run_id: None,
+                    commit: None,
+                    ..
+                }]
+            ),
+            "{lines:?}"
+        );
+        let malformed = parse(
+            r#"{"timestamp":"2026-09-30T18:45:05Z","level":"INFO","fields":{"message":"Sent"},"target":"archive_nightly","span":{"run_id":"not-a-uuid"}}"#,
+        );
+        assert!(matches!(&malformed[..], [LogLine::Unreadable { .. }]));
     }
 
     #[test]

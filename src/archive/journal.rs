@@ -151,7 +151,7 @@ pub fn encode(key: &Key, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRefusal> {
 /// The lines a file written by `encode` under `key` holds, each read again through the journal's own reader, so a
 /// row edited out of band reads back as what it now says rather than what it was.
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal> {
-    session_of(key).ok_or(DecodeRefusal::NotAJournalKey)?;
+    let session = session_of(key).ok_or(DecodeRefusal::NotAJournalKey)?;
     let (batches, _) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let mut lines = Vec::new();
     for batch in batches {
@@ -172,8 +172,16 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal>
                 reason: reason.to_string(),
             };
             let number = usize::try_from(line).map_err(|_| refused("line number overflows"))?;
+            // A record from another session contradicts the key, however the row came to hold it.
+            let in_session = |read: ReadLine| match read {
+                ReadLine::Read(record) if record.session() != session => Err(refused(&format!(
+                    "a record from {} under {session}",
+                    record.session()
+                ))),
+                ReadLine::Read(_) | ReadLine::Unreadable { .. } => Ok(read),
+            };
             if unreadables.is_valid(row) {
-                lines.push(read_one(number, unreadables.value(row)));
+                lines.push(in_session(read_one(number, unreadables.value(row)))?);
                 continue;
             }
             let present = [versions.is_valid(row), run_ids.is_valid(row)]
@@ -198,7 +206,7 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal>
             })
             .to_string();
             match read_one(number, &text) {
-                ReadLine::Read(record) => lines.push(ReadLine::Read(record)),
+                ReadLine::Read(record) => lines.push(in_session(ReadLine::Read(record))?),
                 ReadLine::Unreadable { cause, .. } => {
                     return Err(refused(&format!("{cause:?}")));
                 }
@@ -284,6 +292,19 @@ mod tests {
         ));
         let bytes = encode(&key(), &lines).unwrap();
         assert_eq!(decode(&key(), bytes).unwrap(), lines);
+    }
+
+    #[test]
+    fn test_a_file_read_under_another_session_is_refused() {
+        let bytes = encode(&key(), &read(&session_file())).unwrap();
+        let next = Key::Journal {
+            host: Host::Archiver,
+            session: session().plus_calendar_days(1),
+        };
+        assert!(matches!(
+            decode(&next, bytes),
+            Err(DecodeRefusal::Row { line: 1, .. })
+        ));
     }
 
     #[test]

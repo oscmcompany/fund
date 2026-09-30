@@ -110,6 +110,20 @@ impl Parameters {
         Ok((parameters, ConfigurationResolved::new(resolved)))
     }
 
+    /// Only the log directory, resolved on its own so a refusal of any other parameter still reaches the log file.
+    pub fn log_directory_from_environment() -> Result<PathBuf, ParameterRefusal> {
+        let (parameter, supplied) = (
+            Parameter::LogDirectory,
+            environment_variable(Parameter::LogDirectory)?,
+        );
+        record(
+            (parameter, supplied),
+            DEFAULT_LOG_DIRECTORY.to_string(),
+            &mut BTreeMap::new(),
+        )
+        .map(PathBuf::from)
+    }
+
     pub fn journal_directory(&self) -> &PathBuf {
         &self.journal_directory
     }
