@@ -303,6 +303,27 @@ mod tests {
         assert_eq!(rolled[2].volume_weighted_average_price(), None);
     }
 
+    /// The laws alone also admit reading unreported as zero, so the absorbing rule is asserted directly.
+    #[test]
+    fn test_one_unreported_fragment_leaves_the_bucket_unreported() {
+        let reported = minute_bar("2026-07-31T14:30:00Z", 10.0, 10.5, 9.8, 10.2, 100);
+        let unreported = Bar::new(
+            symbol(),
+            BarInterval::OneMinute,
+            instant("2026-07-31T14:31:00Z"),
+            Ohlc::new(price(10.2), price(10.4), price(9.5), price(10.3)).unwrap(),
+            Shares::whole(70).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let rolled = roll(&[reported, unreported], BarInterval::FiveMinute);
+        assert_eq!(rolled.len(), 1);
+        assert_eq!(rolled[0].volume(), Shares::whole(170).unwrap());
+        assert_eq!(rolled[0].trade_count(), None);
+        assert_eq!(rolled[0].dollar_volume(), None);
+    }
+
     #[test]
     fn test_a_daily_rollup_is_stamped_at_its_session_close() {
         let bars = [
@@ -371,7 +392,7 @@ mod tests {
             prop::array::uniform4(1_i64..1_000),
             0_u64..1_000_000,
             prop::option::of(0_u64..10_000),
-            prop::option::of(0_i128..1_000_000_000_000_000),
+            prop::option::of(0_u128..1_000_000_000_000_000),
         )
             .prop_map(
                 |(symbol, day, minute, mut ticks, volume, trades, dollar_units)| {
