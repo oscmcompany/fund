@@ -10,11 +10,13 @@ use tracing_subscriber::EnvFilter;
 use fund::archive::Archive;
 use fund::common::heal::is_complete;
 use fund::common::journal::Observation;
+use fund::common::journal::{Commit, RunId};
 use fund::common::time::SessionDate;
 use fund::heal::{Clients, Parameters, lock, run};
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::massive::Massive;
-use fund::journal::Journal;
+use fund::journal::{Journal, built_commit};
+use uuid::Uuid;
 
 const REFUSED_TO_START: u8 = 2;
 
@@ -28,26 +30,28 @@ async fn main() -> ExitCode {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let (parameters, configuration) = match Parameters::from_environment() {
-        Ok(resolved) => resolved,
-        Err(refusal) => {
-            tracing::error!(%refusal, "Parameters refused");
-            return ExitCode::from(REFUSED_TO_START);
-        }
-    };
-    let mut journal = match Journal::open(parameters.journal_directory()) {
-        Ok(journal) => journal,
-        Err(error) => {
-            tracing::error!(%error, "Journal did not open");
-            return ExitCode::from(REFUSED_TO_START);
-        }
-    };
+    let run_id = RunId::new(Uuid::new_v4());
+    let commit = built_commit();
     let span = tracing::info_span!(
         "run",
-        run_id = %journal.run_id(),
-        commit = journal.commit().map_or("unknown", |commit| commit.as_str()),
+        %run_id,
+        commit = commit.as_ref().map_or("unknown", Commit::as_str),
     );
     async move {
+        let (parameters, configuration) = match Parameters::from_environment() {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                tracing::error!(%refusal, "Parameters refused");
+                return ExitCode::from(REFUSED_TO_START);
+            }
+        };
+        let mut journal = match Journal::open(parameters.journal_directory(), run_id) {
+            Ok(journal) => journal,
+            Err(error) => {
+                tracing::error!(%error, "Journal did not open");
+                return ExitCode::from(REFUSED_TO_START);
+            }
+        };
         // Held until the process exits.
         let _lock = match lock(parameters.journal_directory()) {
             Ok(file) => file,

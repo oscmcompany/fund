@@ -6,11 +6,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
-use uuid::Uuid;
-
 use crate::common::journal::{Commit, Observation, Record, RunId};
 use crate::common::time::SessionDate;
+use chrono::{DateTime, Utc};
 
 /// Writes one run's records.
 pub struct Journal {
@@ -22,8 +20,9 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Starts a run writing into `directory`, creating it if needed.
-    pub fn open(directory: impl Into<PathBuf>) -> io::Result<Self> {
+    /// Starts run `run_id` writing into `directory`, creating it if needed; the caller draws the id so it can stamp
+    /// logs before anything here can fail.
+    pub fn open(directory: impl Into<PathBuf>, run_id: RunId) -> io::Result<Self> {
         let directory = directory.into();
         let missing: Vec<PathBuf> = directory
             .ancestors()
@@ -37,7 +36,7 @@ impl Journal {
         }
         Ok(Self {
             directory,
-            run_id: RunId::new(Uuid::new_v4()),
+            run_id,
             commit: built_commit(),
             next_sequence: NonZeroU64::MIN,
             open: None,
@@ -134,7 +133,7 @@ pub fn file_name(session: SessionDate) -> String {
 }
 
 /// The commit `build.rs` stamped, or `None` when the build could not ask git.
-fn built_commit() -> Option<Commit> {
+pub fn built_commit() -> Option<Commit> {
     option_env!("FUND_COMMIT")
         .map(|raw| Commit::new(raw).expect("build.rs stamps a 40-character sha"))
 }
@@ -142,6 +141,8 @@ fn built_commit() -> Option<Commit> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use uuid::Uuid;
 
     use super::*;
     use crate::common::journal::{ConfigurationResolved, ReadLine, UnreadableCause, read};
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn test_records_land_in_their_session_file_in_sequence() {
         let directory = std::env::temp_dir().join(format!("fund-journal-{}", Uuid::new_v4()));
-        let mut journal = Journal::open(&directory).unwrap();
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         for timestamp in [
             "2026-07-31T14:30:00Z",
             // 23:00 Eastern, still July 31.
@@ -213,7 +214,7 @@ mod tests {
             r#"{"schema_version":1,"run"#,
         )
         .unwrap();
-        let mut journal = Journal::open(&directory).unwrap();
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         journal
             .append("2026-07-31T14:30:00Z".parse().unwrap(), observation())
             .unwrap();
@@ -238,7 +239,7 @@ mod tests {
     #[test]
     fn test_a_failed_append_consumes_its_sequence() {
         let directory = temporary_directory();
-        let mut journal = Journal::open(&directory).unwrap();
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         let blocker = directory.join("session-2026-07-31.jsonl");
         std::fs::create_dir(&blocker).unwrap();
         assert!(

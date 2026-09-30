@@ -25,6 +25,8 @@ use crate::common::journal::{ParameterSource, ResolvedParameter};
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
+/// A variant is never removed while a journal names it, since the record that names it would stop reading; a retired
+/// parameter keeps its variant.
 pub enum Parameter {
     /// Trading days before today the archive heal looks back over.
     LookbackSessions,
@@ -52,6 +54,12 @@ pub enum ParameterRefusal {
         raw: String,
         reason: String,
     },
+    /// Parsed, but past the most the parameter may be.
+    OutOfRange {
+        parameter: Parameter,
+        value: String,
+        most: String,
+    },
 }
 
 impl Display for ParameterRefusal {
@@ -64,6 +72,15 @@ impl Display for ParameterRefusal {
             } => write!(
                 formatter,
                 "{} is `{raw}`, which is not a valid {parameter}: {reason}",
+                parameter.variable()
+            ),
+            Self::OutOfRange {
+                parameter,
+                value,
+                most,
+            } => write!(
+                formatter,
+                "{} is {value}, past its most of {most}",
                 parameter.variable()
             ),
         }
@@ -95,6 +112,23 @@ where
     };
     let resolved = ResolvedParameter::new(value.to_string(), source);
     Ok((value, resolved))
+}
+
+/// `value` when it is no more than `most`.
+pub fn at_most<Value: PartialOrd + Display>(
+    parameter: Parameter,
+    value: Value,
+    most: Value,
+) -> Result<Value, ParameterRefusal> {
+    if value <= most {
+        Ok(value)
+    } else {
+        Err(ParameterRefusal::OutOfRange {
+            parameter,
+            value: value.to_string(),
+            most: most.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +178,19 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedParameter::new("5".to_string(), ParameterSource::Default)
+        );
+    }
+
+    #[test]
+    fn test_a_value_past_its_most_is_refused_with_both() {
+        assert_eq!(at_most(Parameter::BudgetMinutes, 1_440, 1_440), Ok(1_440));
+        assert_eq!(
+            at_most(Parameter::BudgetMinutes, 1_441, 1_440),
+            Err(ParameterRefusal::OutOfRange {
+                parameter: Parameter::BudgetMinutes,
+                value: "1441".to_string(),
+                most: "1440".to_string(),
+            })
         );
     }
 

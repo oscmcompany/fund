@@ -23,7 +23,7 @@ use crate::common::journal::{
 use crate::common::market::Symbol;
 use crate::common::market::record::Bar;
 use crate::common::monoid::{Monoid, concatenate};
-use crate::common::parameter::{Parameter, ParameterRefusal, resolve};
+use crate::common::parameter::{Parameter, ParameterRefusal, at_most, resolve};
 use crate::common::time::SessionDate;
 use crate::ingest::alpaca::{Alpaca, MinuteBars};
 use crate::ingest::massive::Massive;
@@ -36,6 +36,11 @@ const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
 /// A whole-market session measured 2026-09-30 at about 33 s with these two.
 const DEFAULT_MINUTE_BATCH_SYMBOLS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is not zero");
 const DEFAULT_MINUTE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
+/// Five years of sessions, as far back as Massive Starter reaches.
+const MAXIMUM_LOOKBACK_SESSIONS: NonZeroUsize =
+    NonZeroUsize::new(1_260).expect("1,260 is not zero");
+/// One day, past which one night's run would meet the next.
+const MAXIMUM_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(1_440).expect("1,440 is not zero");
 
 /// The heal's settings, each resolved once at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,31 +55,47 @@ pub struct Parameters {
 impl Parameters {
     /// Reads each parameter's variable, returning the configuration the journal records for them.
     pub fn from_environment() -> Result<(Self, ConfigurationResolved), ParameterRefusal> {
+        Self::resolved(&environment_variable)
+    }
+
+    /// Resolves each parameter from what `supplied` returns for it, or its default when that is nothing.
+    fn resolved(
+        supplied: &impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal>,
+    ) -> Result<(Self, ConfigurationResolved), ParameterRefusal> {
         let mut resolved = BTreeMap::new();
-        let budget_minutes: NonZeroU64 = read(
+        let read = |parameter| Ok::<_, ParameterRefusal>((parameter, supplied(parameter)?));
+        let budget_minutes = at_most(
             Parameter::BudgetMinutes,
-            DEFAULT_BUDGET_MINUTES,
-            &mut resolved,
-        )?;
-        let parameters = Self {
-            lookback_sessions: read(
-                Parameter::LookbackSessions,
-                DEFAULT_LOOKBACK_SESSIONS,
+            record(
+                read(Parameter::BudgetMinutes)?,
+                DEFAULT_BUDGET_MINUTES,
                 &mut resolved,
             )?,
-            budget: Duration::from_secs(budget_minutes.get().saturating_mul(60)),
-            journal_directory: PathBuf::from(read(
-                Parameter::JournalDirectory,
+            MAXIMUM_BUDGET_MINUTES,
+        )?;
+        let parameters = Self {
+            lookback_sessions: at_most(
+                Parameter::LookbackSessions,
+                record(
+                    read(Parameter::LookbackSessions)?,
+                    DEFAULT_LOOKBACK_SESSIONS,
+                    &mut resolved,
+                )?,
+                MAXIMUM_LOOKBACK_SESSIONS,
+            )?,
+            budget: Duration::from_secs(budget_minutes.get() * 60),
+            journal_directory: PathBuf::from(record(
+                read(Parameter::JournalDirectory)?,
                 DEFAULT_JOURNAL_DIRECTORY.to_string(),
                 &mut resolved,
             )?),
-            minute_batch_symbols: read(
-                Parameter::MinuteBatchSymbols,
+            minute_batch_symbols: record(
+                read(Parameter::MinuteBatchSymbols)?,
                 DEFAULT_MINUTE_BATCH_SYMBOLS,
                 &mut resolved,
             )?,
-            minute_concurrency: read(
-                Parameter::MinuteConcurrency,
+            minute_concurrency: record(
+                read(Parameter::MinuteConcurrency)?,
                 DEFAULT_MINUTE_CONCURRENCY,
                 &mut resolved,
             )?,
@@ -87,8 +108,21 @@ impl Parameters {
     }
 }
 
-fn read<Value>(
-    parameter: Parameter,
+fn environment_variable(parameter: Parameter) -> Result<Option<String>, ParameterRefusal> {
+    match std::env::var(parameter.variable()) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(raw)) => Err(ParameterRefusal::Unparsable {
+            parameter,
+            raw: raw.to_string_lossy().into_owned(),
+            reason: "not unicode".to_string(),
+        }),
+    }
+}
+
+/// Parses one parameter's supplied value, keeping what the journal records for it.
+fn record<Value>(
+    (parameter, supplied): (Parameter, Option<String>),
     default: Value,
     resolved: &mut BTreeMap<Parameter, crate::common::journal::ResolvedParameter>,
 ) -> Result<Value, ParameterRefusal>
@@ -96,17 +130,6 @@ where
     Value: std::str::FromStr + std::fmt::Display,
     Value::Err: std::fmt::Display,
 {
-    let supplied = match std::env::var(parameter.variable()) {
-        Ok(raw) => Some(raw),
-        Err(VarError::NotPresent) => None,
-        Err(VarError::NotUnicode(raw)) => {
-            return Err(ParameterRefusal::Unparsable {
-                parameter,
-                raw: raw.to_string_lossy().into_owned(),
-                reason: "not unicode".to_string(),
-            });
-        }
-    };
     let (value, parameter_resolved) = resolve(parameter, supplied.as_deref(), default)?;
     resolved.insert(parameter, parameter_resolved);
     Ok(value)
@@ -395,6 +418,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::common::journal::ParameterSource;
 
     /// The batches' symbols in the order they were concatenated.
     #[derive(Debug, Clone, PartialEq)]
@@ -476,6 +500,78 @@ mod tests {
         );
         // The second batch fails at once, so only the two first in flight ever started.
         assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    fn supplied(
+        values: &[(Parameter, &str)],
+    ) -> impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal> {
+        let values: BTreeMap<Parameter, String> = values
+            .iter()
+            .map(|(parameter, raw)| (*parameter, raw.to_string()))
+            .collect();
+        move |parameter| Ok(values.get(&parameter).cloned())
+    }
+
+    #[test]
+    fn test_every_parameter_is_journaled_with_its_source() {
+        let (parameters, configuration) =
+            Parameters::resolved(&supplied(&[(Parameter::LookbackSessions, "10")])).unwrap();
+        assert_eq!(parameters.lookback_sessions.get(), 10);
+        assert_eq!(parameters.budget, Duration::from_secs(240 * 60));
+        let sources: Vec<(Parameter, &str, ParameterSource)> = configuration
+            .parameters()
+            .iter()
+            .map(|(parameter, resolved)| (*parameter, resolved.value(), resolved.source()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                (
+                    Parameter::LookbackSessions,
+                    "10",
+                    ParameterSource::Environment
+                ),
+                (Parameter::BudgetMinutes, "240", ParameterSource::Default),
+                (
+                    Parameter::JournalDirectory,
+                    "/var/journal/fund",
+                    ParameterSource::Default
+                ),
+                (
+                    Parameter::MinuteBatchSymbols,
+                    "200",
+                    ParameterSource::Default
+                ),
+                (Parameter::MinuteConcurrency, "8", ParameterSource::Default),
+            ]
+        );
+    }
+
+    /// Past these, the deadline and the calendar range overflow and the run would panic rather than refuse.
+    #[test]
+    fn test_a_lookback_or_budget_past_its_most_refuses_to_start() {
+        for (parameter, most, past) in [
+            (Parameter::LookbackSessions, "1260", "1261"),
+            (Parameter::BudgetMinutes, "1440", "1441"),
+        ] {
+            assert!(Parameters::resolved(&supplied(&[(parameter, most)])).is_ok());
+            assert_eq!(
+                Parameters::resolved(&supplied(&[(parameter, past)])).map(|_| ()),
+                Err(ParameterRefusal::OutOfRange {
+                    parameter,
+                    value: past.to_string(),
+                    most: most.to_string(),
+                })
+            );
+        }
+        let today = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap());
+        let (first, _) = calendar_range(today, MAXIMUM_LOOKBACK_SESSIONS);
+        assert_eq!(first.to_string(), "2019-10-30");
+        assert!(
+            Instant::now()
+                .checked_add(Duration::from_secs(1_440 * 60))
+                .is_some()
+        );
     }
 
     #[test]
