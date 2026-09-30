@@ -48,6 +48,10 @@ impl Journal {
         self.run_id
     }
 
+    pub fn commit(&self) -> Option<&Commit> {
+        self.commit.as_ref()
+    }
+
     /// Returns once the record is durable, so a caller that waits before acting knows the observation survives the
     /// crash the action might cause. Every append consumes a sequence, so a failure leaves a gap, never a duplicate.
     pub fn append(&mut self, timestamp: DateTime<Utc>, observation: Observation) -> io::Result<()> {

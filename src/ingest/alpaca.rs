@@ -1,17 +1,24 @@
-//! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session.
+//! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session, and its
+//! published trading calendar.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{Accepted, MissingVariable, RefusedRow, RowRefusal, variable};
+use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
+use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
+use crate::common::time::calendar::{TradingCalendar, TradingSession};
 
 const BARS_URL: &str = "https://data.alpaca.markets/v2/stocks/bars";
+
+/// The trading API, which serves the calendar; paper and live keys each work only against their own.
+const PAPER_TRADING_URL: &str = "https://paper-api.alpaca.markets";
+const LIVE_TRADING_URL: &str = "https://api.alpaca.markets";
 
 /// Bars per page, the endpoint's maximum.
 const PAGE_LIMIT: &str = "10000";
@@ -20,6 +27,7 @@ pub struct Alpaca {
     http_client: reqwest::Client,
     key_id: String,
     secret: String,
+    trading_url: &'static str,
 }
 
 /// One batch's one-minute bars. Every symbol asked for is exactly one of answered (its rows are bars or refusals),
@@ -103,6 +111,27 @@ impl MinuteBars {
     }
 }
 
+/// Batches over disjoint symbols concatenate in the order they were asked, which keeps the bars in symbol order when
+/// the batches were cut from a sorted list.
+impl Monoid for MinuteBars {
+    fn empty() -> Self {
+        Self {
+            bars: Vec::new(),
+            missing: Vec::new(),
+            invalid: Vec::new(),
+            refused: Vec::new(),
+        }
+    }
+
+    fn combine(mut self, other: Self) -> Self {
+        self.bars.extend(other.bars);
+        self.missing.extend(other.missing);
+        self.invalid.extend(other.invalid);
+        self.refused.extend(other.refused);
+        self
+    }
+}
+
 #[derive(Deserialize)]
 struct BarsPage {
     /// `null` on a page with no bars.
@@ -131,18 +160,60 @@ struct AlpacaBar {
 }
 
 #[derive(Deserialize)]
+struct CalendarRow {
+    date: NaiveDate,
+    /// Eastern wall-clock `HH:MM`.
+    open: String,
+    close: String,
+}
+
+#[derive(Deserialize)]
 struct ErrorBody {
     message: String,
 }
 
 impl Alpaca {
-    /// Reads `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET`.
-    pub fn from_environment(http_client: reqwest::Client) -> Result<Self, MissingVariable> {
+    /// Reads `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET` and `ALPACA_IS_PAPER`, which must be `true` or `false`.
+    pub fn from_environment(http_client: reqwest::Client) -> Result<Self, VariableRefusal> {
+        let name = "ALPACA_IS_PAPER";
+        let trading_url = match variable(name)?.as_str() {
+            "true" => PAPER_TRADING_URL,
+            "false" => LIVE_TRADING_URL,
+            raw => {
+                return Err(VariableRefusal::Malformed {
+                    name,
+                    raw: raw.to_string(),
+                });
+            }
+        };
         Ok(Self {
             http_client,
             key_id: variable("ALPACA_API_KEY_ID")?,
             secret: variable("ALPACA_API_SECRET")?,
+            trading_url,
         })
+    }
+
+    /// The published sessions over `[first, last]`. A row that does not read refuses the whole calendar, since
+    /// dropping it would turn a trading day into a holiday that no heal ever owes.
+    pub async fn calendar(
+        &self,
+        first: SessionDate,
+        last: SessionDate,
+    ) -> Result<TradingCalendar, FetchError> {
+        let url = format!("{}/v2/calendar", self.trading_url);
+        let (start, end) = (first.to_string(), last.to_string());
+        let body = with_retries(|| {
+            send(
+                self.http_client
+                    .get(&url)
+                    .header("APCA-API-KEY-ID", &self.key_id)
+                    .header("APCA-API-SECRET-KEY", &self.secret)
+                    .query(&[("start", start.as_str()), ("end", end.as_str())]),
+            )
+        })
+        .await?;
+        parse_calendar(&body, first, last)
     }
 
     /// Raw one-minute SIP bars across the whole Eastern day of `session`, with symbols resolved as of that session so
@@ -201,6 +272,32 @@ impl Alpaca {
         })
         .await
     }
+}
+
+fn parse_calendar(
+    body: &[u8],
+    first: SessionDate,
+    last: SessionDate,
+) -> Result<TradingCalendar, FetchError> {
+    let malformed = |reason: String| FetchError::Malformed { reason };
+    let rows: Vec<CalendarRow> =
+        serde_json::from_slice(body).map_err(|error| malformed(error.to_string()))?;
+    let time = |text: &str| {
+        NaiveTime::parse_from_str(text, "%H:%M")
+            .map_err(|error| malformed(format!("`{text}`: {error}")))
+    };
+    let sessions = rows
+        .iter()
+        .map(|row| {
+            TradingSession::new(
+                SessionDate::from_date(row.date),
+                time(&row.open)?,
+                time(&row.close)?,
+            )
+            .map_err(|refusal| malformed(format!("{refusal:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    TradingCalendar::new(sessions, first, last).map_err(|refusal| malformed(format!("{refusal:?}")))
 }
 
 /// Fetches `symbols`, and whenever Alpaca names one invalid (which fails the whole request) drops it and fetches the
@@ -310,8 +407,10 @@ fn minute_bar(ticker: &str, row: &AlpacaBar, session: SessionDate) -> Result<Bar
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
+    use proptest::prelude::*;
 
     use super::*;
+    use crate::common::monoid::laws;
 
     fn session() -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap())
@@ -564,6 +663,79 @@ mod tests {
         let result =
             dropping_invalid(&symbols(&["AAPL"]), |_| async { Err(refusal("AAPL")) }).await;
         assert_eq!(result, Ok((Vec::new(), Vec::new(), symbols(&["AAPL"]))));
+    }
+
+    fn any_batch() -> impl Strategy<Value = MinuteBars> {
+        let pool = read(&[FIXTURE.to_vec()], &symbols(&["AAPL", "BRK.B"]))
+            .unwrap()
+            .bars;
+        let names = symbols(&["ZTST", "BC.PRC", "ABC", "XYZ"]);
+        let causes = prop::sample::select(vec![RowRefusal::Unrequested, RowRefusal::Duplicate]);
+        (
+            prop::sample::subsequence(pool.clone(), 0..=pool.len()),
+            prop::sample::subsequence(names.clone(), 0..=names.len()),
+            prop::sample::subsequence(names, 0..=2),
+            prop::collection::vec(("[A-Z]{1,4}", causes), 0..3),
+        )
+            .prop_map(|(bars, missing, invalid, refused)| MinuteBars {
+                bars,
+                missing,
+                invalid,
+                refused: refused
+                    .into_iter()
+                    .map(|(ticker, cause)| RefusedRow { ticker, cause })
+                    .collect(),
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn property_batches_concatenate_as_a_monoid(
+            first in any_batch(),
+            second in any_batch(),
+            third in any_batch(),
+        ) {
+            laws::check_ordered(first, second, third)?;
+        }
+    }
+
+    /// The live calendar over Thanksgiving 2026, probed with the development key.
+    const CALENDAR: &[u8] = br#"[{"close":"16:00","date":"2026-11-25","open":"09:30","session_close":"2000","session_open":"0400","settlement_date":"2026-11-27"},{"close":"13:00","date":"2026-11-27","open":"09:30","session_close":"1700","session_open":"0400","settlement_date":"2026-11-30"},{"close":"16:00","date":"2026-11-30","open":"09:30","session_close":"2000","session_open":"0400","settlement_date":"2026-12-01"}]"#;
+
+    fn day(text: &str) -> SessionDate {
+        SessionDate::from_date(text.parse().unwrap())
+    }
+
+    #[test]
+    fn test_the_calendar_reads_holidays_and_early_closes() {
+        let calendar = parse_calendar(CALENDAR, day("2026-11-25"), day("2026-11-30")).unwrap();
+        let trading: Vec<String> = calendar
+            .trading_days_in_range(day("2026-11-25"), day("2026-11-30"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(trading, ["2026-11-25", "2026-11-27", "2026-11-30"]);
+        let early: Vec<(String, String)> = calendar
+            .early_closes()
+            .map(|session| (session.date().to_string(), session.close().to_string()))
+            .collect();
+        assert_eq!(early, [("2026-11-27".to_string(), "13:00:00".to_string())]);
+    }
+
+    #[test]
+    fn test_one_unreadable_calendar_row_refuses_the_calendar() {
+        let unreadable = String::from_utf8(CALENDAR.to_vec())
+            .unwrap()
+            .replace(r#""close":"13:00""#, r#""close":"1300""#);
+        assert!(matches!(
+            parse_calendar(unreadable.as_bytes(), day("2026-11-25"), day("2026-11-30")),
+            Err(FetchError::Malformed { .. })
+        ));
+        // A range narrower than the answer is a row outside the calendar, never a row silently dropped.
+        assert!(matches!(
+            parse_calendar(CALENDAR, day("2026-11-25"), day("2026-11-27")),
+            Err(FetchError::Malformed { .. })
+        ));
     }
 
     #[tokio::test]

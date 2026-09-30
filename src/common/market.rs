@@ -37,7 +37,10 @@ fn write_decimal(
 }
 
 /// An exchange ticker: one to five letters, with an optional `.` and one to three letter class suffix.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
 pub struct Symbol(String);
 
 /// Why a symbol was refused.
@@ -68,6 +71,28 @@ impl Symbol {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for SymbolRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed { raw } => write!(formatter, "`{raw}` is not a ticker"),
+        }
+    }
+}
+
+impl TryFrom<String> for Symbol {
+    type Error = SymbolRefusal;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::new(&raw)
+    }
+}
+
+impl From<Symbol> for String {
+    fn from(symbol: Symbol) -> Self {
+        symbol.0
     }
 }
 

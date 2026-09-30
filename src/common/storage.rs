@@ -146,48 +146,53 @@ pub enum KeyRefusal {
 
 impl Key {
     pub fn path(&self) -> String {
+        let partition = match self {
+            Self::Reference { as_of, .. } => format!("as_of={as_of}"),
+            Self::Bars { session, .. }
+            | Self::Quotes { session, .. }
+            | Self::Trades { session, .. }
+            | Self::Journal { session, .. }
+            | Self::Logs { session, .. } => date_partition(*session),
+        };
+        format!("{}{partition}/data.parquet", self.series())
+    }
+
+    /// The prefix every session of this key's series shares, so listing it finds the sessions held.
+    pub fn series(&self) -> String {
         match self {
             Self::Bars {
                 provider,
                 origin,
                 interval,
-                session,
-            } => format!(
-                "{DATA_ROOT}/bars/provider={provider}/origin={origin}/interval={interval}/{}/data.parquet",
-                date_partition(*session)
-            ),
-            Self::Quotes {
-                provider,
-                interval,
-                session,
-            } => format!(
-                "{DATA_ROOT}/quotes/provider={provider}/interval={interval}/{}/data.parquet",
-                date_partition(*session)
-            ),
-            Self::Trades {
-                provider,
-                interval,
-                session,
-            } => format!(
-                "{DATA_ROOT}/trades/provider={provider}/interval={interval}/{}/data.parquet",
-                date_partition(*session)
-            ),
-            Self::Reference { provider, as_of } => {
-                format!("{DATA_ROOT}/reference/provider={provider}/as_of={as_of}/data.parquet")
+                ..
+            } => {
+                format!("{DATA_ROOT}/bars/provider={provider}/origin={origin}/interval={interval}/")
             }
-            Self::Journal { host, session } => format!(
-                "{EXPORT_ROOT}/journal/producer={host}/{}/data.parquet",
-                date_partition(*session)
+            Self::Quotes {
+                provider, interval, ..
+            } => format!("{DATA_ROOT}/quotes/provider={provider}/interval={interval}/"),
+            Self::Trades {
+                provider, interval, ..
+            } => format!("{DATA_ROOT}/trades/provider={provider}/interval={interval}/"),
+            Self::Reference { provider, .. } => {
+                format!("{DATA_ROOT}/reference/provider={provider}/")
+            }
+            Self::Journal { host, .. } => format!("{EXPORT_ROOT}/journal/producer={host}/"),
+            Self::Logs { host, service, .. } => format!(
+                "{EXPORT_ROOT}/logs/producer={host}/service={}/",
+                service.as_str()
             ),
-            Self::Logs {
-                host,
-                service,
-                session,
-            } => format!(
-                "{EXPORT_ROOT}/logs/producer={host}/service={}/{}/data.parquet",
-                service.as_str(),
-                date_partition(*session)
-            ),
+        }
+    }
+
+    pub fn session(&self) -> SessionDate {
+        match self {
+            Self::Reference { as_of, .. } => *as_of,
+            Self::Bars { session, .. }
+            | Self::Quotes { session, .. }
+            | Self::Trades { session, .. }
+            | Self::Journal { session, .. }
+            | Self::Logs { session, .. } => *session,
         }
     }
 
@@ -455,6 +460,47 @@ mod tests {
         }
     }
 
+    /// The same key on another session.
+    fn at(key: &Key, session: SessionDate) -> Key {
+        match key.clone() {
+            Key::Bars {
+                provider,
+                origin,
+                interval,
+                ..
+            } => Key::Bars {
+                provider,
+                origin,
+                interval,
+                session,
+            },
+            Key::Quotes {
+                provider, interval, ..
+            } => Key::Quotes {
+                provider,
+                interval,
+                session,
+            },
+            Key::Trades {
+                provider, interval, ..
+            } => Key::Trades {
+                provider,
+                interval,
+                session,
+            },
+            Key::Reference { provider, .. } => Key::Reference {
+                provider,
+                as_of: session,
+            },
+            Key::Journal { host, .. } => Key::Journal { host, session },
+            Key::Logs { host, service, .. } => Key::Logs {
+                host,
+                service,
+                session,
+            },
+        }
+    }
+
     fn any_key() -> impl Strategy<Value = Key> {
         let provider = prop::sample::select(Provider::iter().collect::<Vec<_>>());
         let origin = prop::sample::select(Origin::iter().collect::<Vec<_>>());
@@ -506,6 +552,29 @@ mod tests {
         #[test]
         fn property_a_path_parses_back_to_its_key(key in any_key()) {
             prop_assert_eq!(Key::parse(&key.path()), Ok(key));
+        }
+
+        #[test]
+        fn property_a_path_lies_under_its_series(key in any_key()) {
+            let path = key.path();
+            let rest = path.strip_prefix(&key.series());
+            prop_assert!(rest.is_some(), "{} outside {}", path, key.series());
+            prop_assert!(!rest.unwrap().contains("provider="), "{}", path);
+            prop_assert_eq!(Key::parse(&path).map(|parsed| parsed.session()), Ok(key.session()));
+        }
+
+        /// A listing under one series finds exactly the sessions of one key's series, and never a neighbour's.
+        #[test]
+        fn property_two_keys_share_a_series_when_only_their_session_differs(
+            first in any_key(),
+            second in any_key(),
+        ) {
+            prop_assert_eq!(
+                first.series() == second.series(),
+                at(&first, second.session()) == second
+            );
+            let within_one_series = at(&first, second.session());
+            prop_assert_eq!(within_one_series.series(), first.series());
         }
 
         #[test]

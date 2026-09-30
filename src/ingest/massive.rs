@@ -4,7 +4,7 @@ use chrono::DateTime;
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{Accepted, MissingVariable, RefusedRow, RowRefusal, variable};
+use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
@@ -80,7 +80,7 @@ struct GroupedRow {
 
 impl Massive {
     /// Reads `MASSIVE_BASE_URL` and `MASSIVE_API_KEY`.
-    pub fn from_environment(http_client: reqwest::Client) -> Result<Self, MissingVariable> {
+    pub fn from_environment(http_client: reqwest::Client) -> Result<Self, VariableRefusal> {
         Ok(Self {
             http_client,
             base_url: variable("MASSIVE_BASE_URL")?,

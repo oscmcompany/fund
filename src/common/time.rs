@@ -18,7 +18,10 @@ const REGULAR_CLOSE: NaiveTime = match NaiveTime::from_hms_opt(16, 0, 0) {
 ///
 /// It guarantees the timezone, not tradability: weekends and holidays are representable, and only
 /// [`calendar::TradingCalendar::is_trading_day`] answers whether a date trades.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct SessionDate(NaiveDate);
 
 impl SessionDate {
