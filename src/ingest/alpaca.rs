@@ -162,9 +162,17 @@ struct AlpacaBar {
 #[derive(Deserialize)]
 struct CalendarRow {
     date: NaiveDate,
-    /// Eastern wall-clock `HH:MM`.
-    open: String,
-    close: String,
+    #[serde(deserialize_with = "hour_minute")]
+    open: NaiveTime,
+    #[serde(deserialize_with = "hour_minute")]
+    close: NaiveTime,
+}
+
+/// Alpaca's Eastern wall-clock `HH:MM`, which chrono's default `HH:MM:SS` does not read.
+fn hour_minute<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<NaiveTime, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    NaiveTime::parse_from_str(&text, "%H:%M")
+        .map_err(|error| serde::de::Error::custom(format!("`{text}`: {error}")))
 }
 
 #[derive(Deserialize)]
@@ -173,24 +181,13 @@ struct ErrorBody {
 }
 
 impl Alpaca {
-    /// Reads `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET` and `ALPACA_IS_PAPER`, which must be `true` or `false`.
+    /// Reads `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET` and `ALPACA_IS_PAPER`, which is `true` or `false` in any case.
     pub fn from_environment(http_client: reqwest::Client) -> Result<Self, VariableRefusal> {
-        let name = "ALPACA_IS_PAPER";
-        let trading_url = match variable(name)?.as_str() {
-            "true" => PAPER_TRADING_URL,
-            "false" => LIVE_TRADING_URL,
-            raw => {
-                return Err(VariableRefusal::Malformed {
-                    name,
-                    raw: raw.to_string(),
-                });
-            }
-        };
         Ok(Self {
             http_client,
             key_id: variable("ALPACA_API_KEY_ID")?,
             secret: variable("ALPACA_API_SECRET")?,
-            trading_url,
+            trading_url: trading_url(variable("ALPACA_IS_PAPER")?)?,
         })
     }
 
@@ -274,6 +271,18 @@ impl Alpaca {
     }
 }
 
+/// The trading API a paper flag names.
+fn trading_url(is_paper: String) -> Result<&'static str, VariableRefusal> {
+    match is_paper.to_ascii_lowercase().parse::<bool>() {
+        Ok(true) => Ok(PAPER_TRADING_URL),
+        Ok(false) => Ok(LIVE_TRADING_URL),
+        Err(_) => Err(VariableRefusal::Malformed {
+            name: "ALPACA_IS_PAPER",
+            raw: is_paper,
+        }),
+    }
+}
+
 fn parse_calendar(
     body: &[u8],
     first: SessionDate,
@@ -282,19 +291,11 @@ fn parse_calendar(
     let malformed = |reason: String| FetchError::Malformed { reason };
     let rows: Vec<CalendarRow> =
         serde_json::from_slice(body).map_err(|error| malformed(error.to_string()))?;
-    let time = |text: &str| {
-        NaiveTime::parse_from_str(text, "%H:%M")
-            .map_err(|error| malformed(format!("`{text}`: {error}")))
-    };
     let sessions = rows
         .iter()
         .map(|row| {
-            TradingSession::new(
-                SessionDate::from_date(row.date),
-                time(&row.open)?,
-                time(&row.close)?,
-            )
-            .map_err(|refusal| malformed(format!("{refusal:?}")))
+            TradingSession::new(SessionDate::from_date(row.date), row.open, row.close)
+                .map_err(|refusal| malformed(format!("{refusal:?}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
     TradingCalendar::new(sessions, first, last).map_err(|refusal| malformed(format!("{refusal:?}")))
@@ -704,6 +705,31 @@ mod tests {
 
     fn day(text: &str) -> SessionDate {
         SessionDate::from_date(text.parse().unwrap())
+    }
+
+    #[test]
+    fn test_the_paper_flag_is_read_in_any_case_and_nothing_else() {
+        for raw in ["true", "TRUE", "True"] {
+            assert_eq!(
+                trading_url(raw.to_string()),
+                Ok("https://paper-api.alpaca.markets")
+            );
+        }
+        for raw in ["false", "FALSE", "False"] {
+            assert_eq!(
+                trading_url(raw.to_string()),
+                Ok("https://api.alpaca.markets")
+            );
+        }
+        for raw in ["", "yes", "1", " true"] {
+            assert_eq!(
+                trading_url(raw.to_string()),
+                Err(VariableRefusal::Malformed {
+                    name: "ALPACA_IS_PAPER",
+                    raw: raw.to_string()
+                })
+            );
+        }
     }
 
     #[test]

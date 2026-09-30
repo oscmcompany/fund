@@ -30,6 +30,13 @@ use crate::ingest::massive::Massive;
 use crate::ingest::{FetchError, refused_by_cause};
 use crate::journal::Journal;
 
+const DEFAULT_LOOKBACK_SESSIONS: NonZeroUsize = NonZeroUsize::new(5).expect("5 is not zero");
+const DEFAULT_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(240).expect("240 is not zero");
+const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
+/// A whole-market session measured 2026-09-30 at about 33 s with these two.
+const DEFAULT_MINUTE_BATCH_SYMBOLS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is not zero");
+const DEFAULT_MINUTE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
+
 /// The heal's settings, each resolved once at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parameters {
@@ -46,29 +53,29 @@ impl Parameters {
         let mut resolved = BTreeMap::new();
         let budget_minutes: NonZeroU64 = read(
             Parameter::BudgetMinutes,
-            NonZeroU64::new(240).expect("240 is not zero"),
+            DEFAULT_BUDGET_MINUTES,
             &mut resolved,
         )?;
         let parameters = Self {
             lookback_sessions: read(
                 Parameter::LookbackSessions,
-                NonZeroUsize::new(5).expect("5 is not zero"),
+                DEFAULT_LOOKBACK_SESSIONS,
                 &mut resolved,
             )?,
             budget: Duration::from_secs(budget_minutes.get().saturating_mul(60)),
             journal_directory: PathBuf::from(read(
                 Parameter::JournalDirectory,
-                "/var/journal/fund".to_string(),
+                DEFAULT_JOURNAL_DIRECTORY.to_string(),
                 &mut resolved,
             )?),
             minute_batch_symbols: read(
                 Parameter::MinuteBatchSymbols,
-                NonZeroUsize::new(200).expect("200 is not zero"),
+                DEFAULT_MINUTE_BATCH_SYMBOLS,
                 &mut resolved,
             )?,
             minute_concurrency: read(
                 Parameter::MinuteConcurrency,
-                NonZeroUsize::new(8).expect("8 is not zero"),
+                DEFAULT_MINUTE_CONCURRENCY,
                 &mut resolved,
             )?,
         };
@@ -176,6 +183,7 @@ impl std::fmt::Display for HealError {
 pub struct Clients {
     archive: Archive,
     massive: Massive,
+    /// Shared by the concurrent one-minute batches, so its secret is held once rather than copied into each.
     alpaca: Arc<Alpaca>,
 }
 

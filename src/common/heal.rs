@@ -90,10 +90,14 @@ impl std::fmt::Display for WindowRefusal {
     }
 }
 
-/// The calendar days a window of `sessions` trading days before `today` is drawn from: twice as many plus a week,
-/// which holds that many trading days through any run of holidays.
+/// Calendar days drawn per trading day wanted, which with the padding holds the window through any run of holidays.
+const CALENDAR_DAYS_PER_SESSION: i64 = 2;
+const HOLIDAY_PADDING_DAYS: i64 = 7;
+
+/// The calendar days a window of `sessions` trading days before `today` is drawn from.
 pub fn calendar_range(today: SessionDate, sessions: NonZeroUsize) -> (SessionDate, SessionDate) {
-    let days = i64::try_from(sessions.get()).unwrap_or(i64::MAX / 4) * 2 + 7;
+    let sessions = i64::try_from(sessions.get()).unwrap_or(i64::MAX / 4);
+    let days = sessions * CALENDAR_DAYS_PER_SESSION + HOLIDAY_PADDING_DAYS;
     (
         today.plus_calendar_days(-days),
         today.plus_calendar_days(-1),
