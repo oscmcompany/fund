@@ -207,12 +207,13 @@ impl Key {
         }
     }
 
+    /// Accepts only the exact path `path()` writes, so no two paths name one key.
     pub fn parse(path: &str) -> Result<Self, KeyRefusal> {
-        parse_segments(&path.split('/').collect::<Vec<_>>()).ok_or_else(|| {
-            KeyRefusal::Unrecognized {
+        parse_segments(&path.split('/').collect::<Vec<_>>())
+            .filter(|key| key.path() == path)
+            .ok_or_else(|| KeyRefusal::Unrecognized {
                 path: path.to_string(),
-            }
-        })
+            })
     }
 }
 
@@ -261,30 +262,33 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
         [
             "data",
             "equity",
-            dataset @ ("quotes" | "trades"),
+            "quotes",
             provider,
             interval,
             year,
             month,
             day,
             "data.parquet",
-        ] => {
-            let provider = hive(provider, "provider")?;
-            let interval = hive(interval, "interval")?;
-            let session = session(year, month, day)?;
-            Some(match *dataset {
-                "quotes" => Key::Quotes {
-                    provider,
-                    interval,
-                    session,
-                },
-                _ => Key::Trades {
-                    provider,
-                    interval,
-                    session,
-                },
-            })
-        }
+        ] => Some(Key::Quotes {
+            provider: hive(provider, "provider")?,
+            interval: hive(interval, "interval")?,
+            session: session(year, month, day)?,
+        }),
+        [
+            "data",
+            "equity",
+            "trades",
+            provider,
+            interval,
+            year,
+            month,
+            day,
+            "data.parquet",
+        ] => Some(Key::Trades {
+            provider: hive(provider, "provider")?,
+            interval: hive(interval, "interval")?,
+            session: session(year, month, day)?,
+        }),
         [
             "data",
             "equity",
@@ -323,15 +327,13 @@ fn hive<T: std::str::FromStr>(segment: &str, name: &str) -> Option<T> {
     segment.strip_prefix(name)?.strip_prefix('=')?.parse().ok()
 }
 
-/// A date partition, refused unless it is exactly the form `date_partition` writes.
 fn session(year: &str, month: &str, day: &str) -> Option<SessionDate> {
-    let date = NaiveDate::from_ymd_opt(
+    NaiveDate::from_ymd_opt(
         hive(year, "year")?,
         hive(month, "month")?,
         hive(day, "day")?,
-    )?;
-    let session = SessionDate::from_date(date);
-    (date_partition(session) == format!("{year}/{month}/{day}")).then_some(session)
+    )
+    .map(SessionDate::from_date)
 }
 
 #[cfg(test)]
@@ -411,6 +413,7 @@ mod tests {
             "data/equity/bars/provider=alpaca/origin=fetched/interval=one_day/year=2026/month=02/day=30/data.parquet",
             "data/equity/bars/origin=fetched/provider=alpaca/interval=one_day/year=2026/month=08/day=03/data.parquet",
             "exports/logs/producer=archiver/service=Archiver/year=2026/month=08/day=03/data.parquet",
+            "data/equity/reference/provider=massive/as_of=2026-8-3/data.parquet",
             "exports/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.provenance.json",
         ] {
             assert_eq!(
