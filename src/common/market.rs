@@ -120,27 +120,92 @@ impl std::fmt::Display for Price {
     }
 }
 
-/// A whole number of shares, where zero is a measurement: an empty book side or a bar nobody traded in.
+/// Millionths of a share per share: fractional-share trades report to six decimals, so every share count is an
+/// integer scaled by this.
+pub const SHARE_SCALE: u64 = 1_000_000;
+
+/// A number of shares held in millionths, `SHARE_SCALE` to the share, where zero is a measurement: an empty book
+/// side or a bar nobody traded in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Shares(u64);
 
+/// Why a share count was refused.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SharesRefusal {
+    NotFinite {
+        shares: f64,
+    },
+    /// Negative, or past `u64` once scaled.
+    OutOfRange {
+        shares: f64,
+    },
+    /// Finer than a millionth by more than float precision explains.
+    OffGrid {
+        shares: f64,
+    },
+}
+
 impl Shares {
-    pub fn new(count: u64) -> Self {
-        Self(count)
+    /// Whole shares, as SIP quotes and trades report them.
+    pub fn whole(count: u64) -> Result<Self, SharesRefusal> {
+        count
+            .checked_mul(SHARE_SCALE)
+            .map(Self)
+            .ok_or(SharesRefusal::OutOfRange {
+                shares: count as f64,
+            })
     }
 
-    pub fn count(self) -> u64 {
+    /// A share count read back from its stored integer.
+    pub fn from_units(units: u64) -> Self {
+        Self(units)
+    }
+
+    /// A vendor's float share count, snapped to the grid when it misses by float noise and refused when it misses by
+    /// more. Noise grows with magnitude, so the tolerance does too.
+    pub fn from_float(shares: f64) -> Result<Self, SharesRefusal> {
+        if !shares.is_finite() {
+            return Err(SharesRefusal::NotFinite { shares });
+        }
+        let scaled = shares * SHARE_SCALE as f64;
+        let units = scaled.round();
+        if units < 0.0 || units >= u64::MAX as f64 {
+            return Err(SharesRefusal::OutOfRange { shares });
+        }
+        let tolerance = (scaled.abs() * 4.0 * f64::EPSILON).max(1e-3);
+        if (scaled - units).abs() > tolerance {
+            return Err(SharesRefusal::OffGrid { shares });
+        }
+        Ok(Self(units as u64))
+    }
+
+    pub fn units(self) -> u64 {
         self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == 0
     }
 
     pub fn plus(self, other: Self) -> Self {
         Self(self.0.checked_add(other.0).expect("share count fits u64"))
     }
+
+    /// The count in shares, for presentation only: sums belong on `units`.
+    pub fn shares(self) -> f64 {
+        self.0 as f64 / SHARE_SCALE as f64
+    }
 }
 
 impl std::fmt::Display for Shares {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
+        let (whole, fraction) = (self.0 / SHARE_SCALE, self.0 % SHARE_SCALE);
+        if fraction == 0 {
+            write!(formatter, "{whole}")
+        } else {
+            let digits = format!("{fraction:06}");
+            write!(formatter, "{whole}.{}", digits.trim_end_matches('0'))
+        }
     }
 }
 
@@ -168,13 +233,31 @@ impl std::fmt::Display for TradeCount {
     }
 }
 
-/// A sum of price × shares in ticks, `PRICE_SCALE` ticks to the dollar.
+/// A sum of price × shares, held in ticks × millionths of a share: `PRICE_SCALE × SHARE_SCALE` to the dollar.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DollarVolume(i128);
+
+/// Why a vendor's average price was not turned into a dollar volume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DollarVolumeRefusal {
+    /// Not finite, or negative.
+    Invalid { average: f64 },
+}
 
 impl DollarVolume {
     pub fn of(price: Price, shares: Shares) -> Self {
         Self(i128::from(price.0) * i128::from(shares.0))
+    }
+
+    /// The dollar volume a vendor's volume-weighted average price implies. It is exact to the float precision of the
+    /// average, and from here on it sums exactly, so a derived bar's average is recovered from sums, not averages.
+    pub fn from_average(average: f64, volume: Shares) -> Result<Self, DollarVolumeRefusal> {
+        if !average.is_finite() || average < 0.0 {
+            return Err(DollarVolumeRefusal::Invalid { average });
+        }
+        Ok(Self(
+            (average * PRICE_SCALE as f64 * volume.0 as f64).round() as i128,
+        ))
     }
 
     pub fn plus(self, other: Self) -> Self {
@@ -185,20 +268,36 @@ impl DollarVolume {
         )
     }
 
-    pub fn ticks(self) -> i128 {
+    /// A dollar volume read back from its stored integer.
+    pub fn from_units(units: i128) -> Self {
+        Self(units)
+    }
+
+    pub fn units(self) -> i128 {
         self.0
     }
 
-    /// The amount in dollars, for presentation only: sums belong on `ticks`.
+    /// The amount in dollars, for presentation only: sums belong on `units`.
     pub fn dollars(self) -> f64 {
-        self.0 as f64 / PRICE_SCALE as f64
+        self.0 as f64 / (PRICE_SCALE as f64 * SHARE_SCALE as f64)
+    }
+
+    /// The average price in dollars over `volume`, for presentation; `None` when nothing traded.
+    pub fn average_over(self, volume: Shares) -> Option<f64> {
+        match volume.0 {
+            0 => None,
+            units => Some(self.0 as f64 / PRICE_SCALE as f64 / units as f64),
+        }
     }
 }
 
 impl std::fmt::Display for DollarVolume {
+    /// Rounded to the tick, which is as fine as a dollar amount is presented.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let per_tick = i128::from(SHARE_SCALE);
+        let ticks = (self.0 + per_tick / 2) / per_tick;
         let scale = i128::from(PRICE_SCALE);
-        write!(formatter, "{}.{:04}", self.0 / scale, self.0 % scale)
+        write!(formatter, "{}.{:04}", ticks / scale, ticks % scale)
     }
 }
 
@@ -275,10 +374,70 @@ mod tests {
 
     #[test]
     fn test_dollar_volume_is_exact() {
-        let volume = DollarVolume::of(Price::from_dollars(1.5).unwrap(), Shares::new(3));
-        assert_eq!(volume.ticks(), 45_000);
+        let volume = DollarVolume::of(Price::from_dollars(1.5).unwrap(), Shares::whole(3).unwrap());
+        assert_eq!(volume.units(), 45_000_000_000);
         assert_eq!(volume.plus(volume).to_string(), "9.0000");
         assert_eq!(volume.dollars(), 4.5);
+        assert_eq!(volume.average_over(Shares::whole(3).unwrap()), Some(1.5));
+        assert_eq!(volume.average_over(Shares::default()), None);
+    }
+
+    #[test]
+    fn test_the_share_divisor_is_a_million() {
+        let fractional = Shares::from_float(213_849.305_802).unwrap();
+        assert_eq!(fractional.units(), 213_849_305_802);
+        assert_eq!(fractional.to_string(), "213849.305802");
+        assert_eq!(Shares::whole(100).unwrap().to_string(), "100");
+        assert_eq!(Shares::from_units(1_500_000).to_string(), "1.5");
+    }
+
+    #[test]
+    fn test_share_float_noise_snaps_and_finer_counts_are_refused() {
+        // A summed float from the grouped daily, carrying sixteen decimals of noise.
+        assert_eq!(
+            Shares::from_float(16_902.906_000_000_003).unwrap().units(),
+            16_902_906_000
+        );
+        assert_eq!(
+            Shares::from_float(518_029_038.771_163).unwrap().units(),
+            518_029_038_771_163
+        );
+        assert_eq!(
+            Shares::from_float(1.000_000_5),
+            Err(SharesRefusal::OffGrid {
+                shares: 1.000_000_5
+            })
+        );
+        assert_eq!(
+            Shares::from_float(-1.0),
+            Err(SharesRefusal::OutOfRange { shares: -1.0 })
+        );
+        assert!(matches!(
+            Shares::from_float(f64::NAN),
+            Err(SharesRefusal::NotFinite { .. })
+        ));
+        assert_eq!(
+            Shares::whole(u64::MAX),
+            Err(SharesRefusal::OutOfRange {
+                shares: u64::MAX as f64
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_vendor_average_becomes_a_dollar_volume_it_can_be_recovered_from() {
+        let volume = Shares::whole(436_147).unwrap();
+        let dollar_volume = DollarVolume::from_average(335.929_638, volume).unwrap();
+        let recovered = dollar_volume.average_over(volume).unwrap();
+        assert!((recovered - 335.929_638).abs() < 1e-9, "{recovered}");
+        assert_eq!(
+            DollarVolume::from_average(0.0, Shares::default()),
+            Ok(DollarVolume::default())
+        );
+        assert_eq!(
+            DollarVolume::from_average(-1.0, volume),
+            Err(DollarVolumeRefusal::Invalid { average: -1.0 })
+        );
     }
 
     proptest! {
@@ -286,6 +445,13 @@ mod tests {
         fn property_a_symbol_reads_back_as_itself(raw in "[A-Z]{1,5}(\\.[A-Z]{1,3})?") {
             let symbol = Symbol::new(&raw).unwrap();
             prop_assert_eq!(Symbol::new(symbol.as_str()), Ok(symbol));
+        }
+
+        /// Exact below a billion shares; past that the division by `SHARE_SCALE` rounds in the float.
+        #[test]
+        fn property_shares_survive_their_presentation_float(units in 0_u64..1_000_000_000_000_000) {
+            let shares = Shares::from_units(units);
+            prop_assert_eq!(Shares::from_float(shares.shares()), Ok(shares));
         }
 
         #[test]

@@ -40,10 +40,7 @@ impl TradeTotals {
 
     /// In dollars, derived from the exact sums; `None` when nothing traded.
     pub fn volume_weighted_average_price(&self) -> Option<f64> {
-        match self.volume.count() {
-            0 => None,
-            shares => Some(self.dollar_volume.dollars() / shares as f64),
-        }
+        self.dollar_volume.average_over(self.volume)
     }
 }
 
@@ -82,6 +79,9 @@ struct Span {
     high: Price,
     low: Price,
     volume: Shares,
+    /// Unreported in any fragment makes it unreported for the bar, since a partial sum reads as a whole one.
+    trade_count: Option<TradeCount>,
+    dollar_volume: Option<DollarVolume>,
 }
 
 impl Span {
@@ -92,6 +92,14 @@ impl Span {
             high: self.high.max(other.high),
             low: self.low.min(other.low),
             volume: self.volume.plus(other.volume),
+            trade_count: self
+                .trade_count
+                .zip(other.trade_count)
+                .map(|(left, right)| left.plus(right)),
+            dollar_volume: self
+                .dollar_volume
+                .zip(other.dollar_volume)
+                .map(|(left, right)| left.plus(right)),
         }
     }
 }
@@ -129,6 +137,8 @@ impl BarRollup {
             high: prices.high(),
             low: prices.low(),
             volume: bar.volume(),
+            trade_count: bar.trade_count(),
+            dollar_volume: bar.dollar_volume(),
         };
         Ok(Self(BTreeMap::from([(key, span)])))
     }
@@ -140,8 +150,16 @@ impl BarRollup {
             .map(|(key, span)| {
                 let prices = Ohlc::new(span.first.1, span.high, span.low, span.last.1)
                     .expect("every combined open and close lies within the combined range");
-                Bar::new(key.symbol, key.interval, key.timestamp, prices, span.volume)
-                    .expect("a bucket timestamp sits on its interval's grid")
+                Bar::new(
+                    key.symbol,
+                    key.interval,
+                    key.timestamp,
+                    prices,
+                    span.volume,
+                    span.trade_count,
+                    span.dollar_volume,
+                )
+                .expect("a bucket timestamp sits on its interval's grid")
             })
             .collect()
     }
@@ -188,7 +206,7 @@ mod tests {
             symbol(),
             instant("2026-07-31T14:31:00Z"),
             price(dollars),
-            Shares::new(size),
+            Shares::whole(size).unwrap(),
         )
         .unwrap()
     }
@@ -199,7 +217,12 @@ mod tests {
             BarInterval::OneMinute,
             instant(timestamp),
             Ohlc::new(price(open), price(high), price(low), price(close)).unwrap(),
-            Shares::new(volume),
+            Shares::whole(volume).unwrap(),
+            Some(TradeCount::new(volume / 10)),
+            Some(DollarVolume::of(
+                price(close),
+                Shares::whole(volume).unwrap(),
+            )),
         )
         .unwrap()
     }
@@ -212,7 +235,7 @@ mod tests {
                 .map(TradeTotals::of),
         );
         assert_eq!(totals.count(), TradeCount::new(2));
-        assert_eq!(totals.volume(), Shares::new(400));
+        assert_eq!(totals.volume(), Shares::whole(400).unwrap());
         assert_eq!(totals.dollar_volume().to_string(), "4060.0000");
         assert_eq!(totals.volume_weighted_average_price(), Some(10.15));
         assert_eq!(TradeTotals::empty().volume_weighted_average_price(), None);
@@ -229,7 +252,9 @@ mod tests {
             BarInterval::OneMinute,
             instant("2026-07-31T14:31:00Z"),
             Ohlc::new(price(400.0), price(401.0), price(399.0), price(400.5)).unwrap(),
-            Shares::new(10),
+            Shares::whole(10).unwrap(),
+            None,
+            None,
         )
         .unwrap();
         let bars = [
@@ -259,9 +284,23 @@ mod tests {
         );
         assert_eq!(
             rolled.iter().map(|bar| bar.volume()).collect::<Vec<_>>(),
-            [Shares::new(220), Shares::new(30), Shares::new(10)]
+            [
+                Shares::whole(220).unwrap(),
+                Shares::whole(30).unwrap(),
+                Shares::whole(10).unwrap()
+            ]
         );
         assert_eq!(rolled[2].prices().open(), price(400.0));
+        // The AAPL 14:30 bucket sums reported counts; MSFT reported none, so neither does its bar.
+        assert_eq!(
+            rolled
+                .iter()
+                .map(|bar| bar.trade_count())
+                .collect::<Vec<_>>(),
+            [Some(TradeCount::new(22)), Some(TradeCount::new(3)), None]
+        );
+        assert_eq!(rolled[0].dollar_volume().unwrap().to_string(), "2248.5000");
+        assert_eq!(rolled[2].volume_weighted_average_price(), None);
     }
 
     #[test]
@@ -315,7 +354,7 @@ mod tests {
                     symbol(),
                     instant("2026-07-31T14:31:00Z"),
                     Price::from_ticks(ticks).unwrap(),
-                    Shares::new(size),
+                    Shares::whole(size).unwrap(),
                 )
                 .unwrap(),
             )
@@ -331,21 +370,28 @@ mod tests {
             0_i64..12,
             prop::array::uniform4(1_i64..1_000),
             0_u64..1_000_000,
+            prop::option::of(0_u64..10_000),
+            prop::option::of(0_i128..1_000_000_000_000_000),
         )
-            .prop_map(|(symbol, day, minute, mut ticks, volume)| {
-                ticks.sort();
-                let [low, first, second, high] = ticks.map(|tick| Price::from_ticks(tick).unwrap());
-                Bar::new(
-                    Symbol::new(symbol).unwrap(),
-                    BarInterval::OneMinute,
-                    instant("2026-07-30T14:30:00Z")
-                        + TimeDelta::days(day)
-                        + TimeDelta::minutes(minute),
-                    Ohlc::new(first, high, low, second).unwrap(),
-                    Shares::new(volume),
-                )
-                .unwrap()
-            })
+            .prop_map(
+                |(symbol, day, minute, mut ticks, volume, trades, dollar_units)| {
+                    ticks.sort();
+                    let [low, first, second, high] =
+                        ticks.map(|tick| Price::from_ticks(tick).unwrap());
+                    Bar::new(
+                        Symbol::new(symbol).unwrap(),
+                        BarInterval::OneMinute,
+                        instant("2026-07-30T14:30:00Z")
+                            + TimeDelta::days(day)
+                            + TimeDelta::minutes(minute),
+                        Ohlc::new(first, high, low, second).unwrap(),
+                        Shares::whole(volume).unwrap(),
+                        trades.map(TradeCount::new),
+                        dollar_units.map(DollarVolume::from_units),
+                    )
+                    .unwrap()
+                },
+            )
     }
 
     fn any_bar() -> impl Strategy<Value = BarRollup> {
