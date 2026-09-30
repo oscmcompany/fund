@@ -3,6 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -16,7 +17,7 @@ pub struct Journal {
     directory: PathBuf,
     run_id: RunId,
     commit: Option<Commit>,
-    next_sequence: u64,
+    next_sequence: NonZeroU64,
     open: Option<(SessionDate, File)>,
 }
 
@@ -38,7 +39,7 @@ impl Journal {
             directory,
             run_id: RunId::new(Uuid::new_v4()),
             commit: built_commit(),
-            next_sequence: 1,
+            next_sequence: NonZeroU64::MIN,
             open: None,
         })
     }
@@ -51,7 +52,9 @@ impl Journal {
     /// crash the action might cause. Every append consumes a sequence, so a failure leaves a gap, never a duplicate.
     pub fn append(&mut self, timestamp: DateTime<Utc>, observation: Observation) -> io::Result<()> {
         let sequence = self.next_sequence;
-        self.next_sequence += 1;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .expect("a run appends fewer than u64::MAX records");
         let record = Record::new(
             self.run_id,
             sequence,
@@ -86,16 +89,16 @@ impl Journal {
 }
 
 /// Opens a session file for appending, ending a torn last line so the next record starts on a line of its own.
+///
+/// The directory is synced on every open, not only on creation, so a sync that failed once is not skipped on retry.
 fn open_session_file(path: &Path) -> io::Result<File> {
-    let created = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)?;
-    if created {
-        sync_parent(path)?;
-    } else if ends_mid_line(&mut file)? {
+    sync_parent(path)?;
+    if ends_mid_line(&mut file)? {
         file.write_all(b"\n")?;
     }
     Ok(file)
@@ -173,7 +176,7 @@ mod tests {
                     ReadLine::Read(record) => {
                         (record.sequence(), record.run_id(), record.commit().cloned())
                     }
-                    ReadLine::Unreadable { line, cause } => panic!("line {line}: {cause:?}"),
+                    ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
                 })
                 .collect()
         };
@@ -217,7 +220,8 @@ mod tests {
                 [
                     ReadLine::Unreadable {
                         line: 1,
-                        cause: UnreadableCause::NotJson { .. }
+                        cause: UnreadableCause::NotJson { .. },
+                        ..
                     },
                     ReadLine::Read(record)
                 ] if record.sequence() == 1
@@ -246,7 +250,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 ReadLine::Read(record) => record.sequence(),
-                ReadLine::Unreadable { line, cause } => panic!("line {line}: {cause:?}"),
+                ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
             .collect();
         assert_eq!(sequences, [2]);

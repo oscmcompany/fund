@@ -6,10 +6,16 @@ use std::process::Command;
 fn main() {
     // `src` is watched because an edit there changes the binary and must change the dirty stamp with it.
     println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Some(reference) = checked_out_reference() {
-        let path = format!(".git/{reference}");
-        if Path::new(&path).exists() {
+    // Paths come from git so a worktree, a packed ref and the reflog are watched where git keeps them.
+    let reference = git(&["symbolic-ref", "-q", "HEAD"]);
+    for name in ["HEAD", "logs/HEAD", "packed-refs"]
+        .map(str::to_string)
+        .into_iter()
+        .chain(reference)
+    {
+        if let Some(path) =
+            git(&["rev-parse", "--git-path", &name]).filter(|path| Path::new(path).exists())
+        {
             println!("cargo:rerun-if-changed={path}");
         }
     }
@@ -17,12 +23,6 @@ fn main() {
     if let Some(commit) = commit() {
         println!("cargo:rustc-env=FUND_COMMIT={commit}");
     }
-}
-
-/// The ref `HEAD` points at, or `None` on a detached head.
-fn checked_out_reference() -> Option<String> {
-    let head = std::fs::read_to_string(".git/HEAD").ok()?;
-    Some(head.trim().strip_prefix("ref: ")?.to_string())
 }
 
 /// The commit, with `-dirty` when the working tree differs from it, so a record never names code that did not run;

@@ -2,6 +2,7 @@
 //! wrote it so a reader never infers it.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -93,7 +94,7 @@ pub struct Record {
     schema_version: u64,
     run_id: RunId,
     /// Counts from 1 within a run, so a gap is a lost record.
-    sequence: u64,
+    sequence: NonZeroU64,
     timestamp: DateTime<Utc>,
     /// Absent when the build could not ask git.
     commit: Option<Commit>,
@@ -104,7 +105,7 @@ pub struct Record {
 impl Record {
     pub fn new(
         run_id: RunId,
-        sequence: u64,
+        sequence: NonZeroU64,
         timestamp: DateTime<Utc>,
         commit: Option<Commit>,
         observation: Observation,
@@ -124,7 +125,7 @@ impl Record {
     }
 
     pub fn sequence(&self) -> u64 {
-        self.sequence
+        self.sequence.get()
     }
 
     pub fn timestamp(&self) -> DateTime<Utc> {
@@ -228,7 +229,12 @@ pub enum ParameterSource {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadLine {
     Read(Box<Record>),
-    Unreadable { line: usize, cause: UnreadableCause },
+    /// `text` is the line as written, kept so an unsupported record can be preserved or migrated.
+    Unreadable {
+        line: usize,
+        text: String,
+        cause: UnreadableCause,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,16 +253,17 @@ pub enum UnreadableCause {
     },
 }
 
-/// Reads every non-blank line of a journal file in the order it was written, checking each line's version first.
+/// Reads every line of a journal file in the order it was written, checking each line's version first. The writer
+/// never emits a blank line, so one reads back as unreadable rather than being skipped.
 pub fn read(contents: &str) -> Vec<ReadLine> {
     contents
         .lines()
         .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
         .map(|(index, line)| match read_line(line) {
             Ok(record) => ReadLine::Read(Box::new(record)),
             Err(cause) => ReadLine::Unreadable {
                 line: index + 1,
+                text: line.to_string(),
                 cause,
             },
         })
@@ -307,7 +314,7 @@ mod tests {
         ]);
         Record::new(
             RunId::new(Uuid::from_u128(1)),
-            1,
+            NonZeroU64::MIN,
             "2026-07-31T14:30:00Z".parse().unwrap(),
             commit,
             Observation::ConfigurationResolved(ConfigurationResolved::new(parameters)),
@@ -374,7 +381,7 @@ mod tests {
     fn test_a_record_is_filed_under_its_eastern_session() {
         let late = Record::new(
             RunId::new(Uuid::from_u128(1)),
-            2,
+            NonZeroU64::new(2).unwrap(),
             // 23:00 Eastern on July 31.
             "2026-08-01T03:00:00Z".parse().unwrap(),
             None,
@@ -387,61 +394,74 @@ mod tests {
     fn test_every_line_reads_back_or_says_why_not() {
         let good = record(None).encode();
         let malformed = good.replace("configuration_resolved", "configuration_guessed");
-        let contents = [
-            good.as_str(),
+        let unreadable = [
             "",
             "not json",
             r#"{"sequence":1}"#,
             r#"{"schema_version":2,"event_type":"configuration_resolved"}"#,
             malformed.as_str(),
-        ]
-        .join("\n");
+        ];
+        let contents = [&[good.as_str()][..], &unreadable].concat().join("\n");
         let lines = read(&contents);
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
         assert_eq!(lines[0], ReadLine::Read(Box::new(record(None))));
-        let causes: Vec<(usize, UnreadableCause)> = lines[1..]
+        // Parser messages are serde's, so the reasons are blanked before comparing.
+        let found: Vec<(usize, String, UnreadableCause)> = lines[1..]
             .iter()
             .map(|line| match line {
-                ReadLine::Unreadable { line, cause } => (*line, cause.clone()),
+                ReadLine::Unreadable { line, text, cause } => {
+                    let cause = match cause.clone() {
+                        UnreadableCause::NotJson { .. } => UnreadableCause::NotJson {
+                            reason: String::new(),
+                        },
+                        UnreadableCause::Malformed { event_type, .. } => {
+                            UnreadableCause::Malformed {
+                                event_type,
+                                reason: String::new(),
+                            }
+                        }
+                        cause => cause,
+                    };
+                    (*line, text.clone(), cause)
+                }
                 ReadLine::Read(record) => panic!("read {record:?}"),
             })
-            .map(|(line, cause)| match cause {
-                UnreadableCause::NotJson { .. } => (
-                    line,
-                    UnreadableCause::NotJson {
-                        reason: String::new(),
-                    },
-                ),
-                UnreadableCause::Malformed { event_type, .. } => (
-                    line,
-                    UnreadableCause::Malformed {
-                        event_type,
-                        reason: String::new(),
-                    },
-                ),
-                cause => (line, cause),
-            })
             .collect();
-        assert_eq!(
-            causes,
-            [
-                (
-                    3,
-                    UnreadableCause::NotJson {
-                        reason: String::new()
-                    }
-                ),
-                (4, UnreadableCause::NoVersion),
-                (5, UnreadableCause::OtherVersion { schema_version: 2 }),
-                (
-                    6,
-                    UnreadableCause::Malformed {
-                        event_type: Some("configuration_guessed".to_string()),
-                        reason: String::new()
-                    }
-                ),
-            ]
-        );
+        let not_json = UnreadableCause::NotJson {
+            reason: String::new(),
+        };
+        let causes = [
+            not_json.clone(),
+            not_json,
+            UnreadableCause::NoVersion,
+            UnreadableCause::OtherVersion { schema_version: 2 },
+            UnreadableCause::Malformed {
+                event_type: Some("configuration_guessed".to_string()),
+                reason: String::new(),
+            },
+        ];
+        let expected: Vec<(usize, String, UnreadableCause)> = unreadable
+            .iter()
+            .zip(causes)
+            .enumerate()
+            .map(|(index, (text, cause))| (index + 2, text.to_string(), cause))
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn test_a_zero_sequence_is_refused_on_read() {
+        let contents = record(None)
+            .encode()
+            .replace(r#""sequence":1"#, r#""sequence":0"#);
+        assert!(matches!(
+            read(&contents).as_slice(),
+            [ReadLine::Unreadable {
+                line: 1,
+                cause: UnreadableCause::Malformed { .. },
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -453,7 +473,8 @@ mod tests {
             read(&contents).as_slice(),
             [ReadLine::Unreadable {
                 line: 1,
-                cause: UnreadableCause::Malformed { .. }
+                cause: UnreadableCause::Malformed { .. },
+                ..
             }]
         ));
     }
@@ -490,7 +511,7 @@ mod tests {
                         .collect();
                     Record::new(
                         RunId::new(Uuid::from_u128(run)),
-                        sequence,
+                        NonZeroU64::new(sequence).unwrap(),
                         DateTime::from_timestamp(seconds, nanoseconds).unwrap(),
                         commit,
                         Observation::ConfigurationResolved(ConfigurationResolved::new(parameters)),
