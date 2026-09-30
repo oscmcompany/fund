@@ -24,7 +24,7 @@ impl MissingVariable {
     }
 }
 
-fn variable(name: &'static str) -> Result<String, MissingVariable> {
+pub(crate) fn variable(name: &'static str) -> Result<String, MissingVariable> {
     std::env::var(name).map_err(|_| MissingVariable { name })
 }
 
