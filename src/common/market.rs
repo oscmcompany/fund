@@ -1,17 +1,40 @@
-//! Market units: symbols, prices and share counts. A price is a whole number of ten-thousandths of a dollar so
-//! that every sum over prices is exact; a float appears only when a value is presented.
+//! Market units: symbols, prices and share counts. Prices and share counts are whole numbers of millionths so that
+//! every sum is exact; a float appears only when a value is presented.
 
 pub mod aggregate;
 pub mod record;
 
-/// Ten-thousandths of a dollar per dollar: every stored price and dollar amount is an integer scaled by this.
-pub const PRICE_SCALE: i64 = 10_000;
+/// Millionths of a dollar per dollar: consolidated prints reach six decimals (midpoint and average-price trades), so
+/// every stored price is an integer scaled by this.
+pub const PRICE_SCALE: i64 = 1_000_000;
 
-/// Ten million dollars, far above any listed share, keeping price × shares well inside `i128`.
+/// Ten million dollars, far above any listed share, keeping price × shares well inside `u128`.
 const MAXIMUM_PRICE_TICKS: i64 = 10_000_000 * PRICE_SCALE;
 
-/// How far a vendor float may sit from the grid, in ticks, and still be read as float noise.
-const OFF_GRID_TOLERANCE_TICKS: f64 = 1e-3;
+/// `scaled` rounded to the nearest integer, or `None` when it misses by more than float noise explains: twice the
+/// float's spacing at that magnitude, and never less than a thousandth of a unit.
+fn snap(scaled: f64) -> Option<f64> {
+    let nearest = scaled.round();
+    let magnitude = scaled.abs();
+    let spacing = f64::from_bits(magnitude.to_bits() + 1) - magnitude;
+    ((scaled - nearest).abs() <= (2.0 * spacing).max(1e-3)).then_some(nearest)
+}
+
+/// `whole.fraction`, the fraction written to `digits` places and trimmed of trailing zeros down to `minimum`.
+fn write_decimal(
+    formatter: &mut std::fmt::Formatter<'_>,
+    whole: u128,
+    fraction: u128,
+    digits: usize,
+    minimum: usize,
+) -> std::fmt::Result {
+    let text = format!("{fraction:0digits$}");
+    let kept = text.trim_end_matches('0').len().max(minimum);
+    match kept {
+        0 => write!(formatter, "{whole}"),
+        kept => write!(formatter, "{whole}.{}", &text[..kept]),
+    }
+}
 
 /// An exchange ticker: one to five letters, with an optional `.` and one to three letter class suffix.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,7 +91,7 @@ pub enum PriceRefusal {
     OutOfRange {
         ticks: i64,
     },
-    /// Further from the ten-thousandth grid than float noise explains.
+    /// Further from the millionth grid than float noise explains.
     OffGrid {
         dollars: f64,
     },
@@ -90,13 +113,12 @@ impl Price {
             return Err(PriceRefusal::NotFinite { dollars });
         }
         let scaled = dollars * PRICE_SCALE as f64;
-        let ticks = scaled.round();
         // The cast saturates, so a huge value still reaches the range check as out of range.
-        let price = Self::from_ticks(ticks as i64)?;
-        if (scaled - ticks).abs() > OFF_GRID_TOLERANCE_TICKS {
-            return Err(PriceRefusal::OffGrid { dollars });
+        let price = Self::from_ticks(scaled.round() as i64)?;
+        match snap(scaled) {
+            Some(_) => Ok(price),
+            None => Err(PriceRefusal::OffGrid { dollars }),
         }
-        Ok(price)
     }
 
     pub fn ticks(self) -> i64 {
@@ -111,11 +133,13 @@ impl Price {
 
 impl std::fmt::Display for Price {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
+        let (whole, fraction) = (self.0 / PRICE_SCALE, self.0 % PRICE_SCALE);
+        write_decimal(
             formatter,
-            "{}.{:04}",
-            self.0 / PRICE_SCALE,
-            self.0 % PRICE_SCALE
+            u128::from(whole.unsigned_abs()),
+            u128::from(fraction.unsigned_abs()),
+            6,
+            2,
         )
     }
 }
@@ -173,12 +197,10 @@ impl Shares {
         if shares < 0.0 || scaled >= u64::MAX as f64 {
             return Err(SharesRefusal::OutOfRange { shares });
         }
-        let units = scaled.round();
-        let spacing = f64::from_bits(scaled.to_bits() + 1) - scaled;
-        if (scaled - units).abs() > (2.0 * spacing).max(1e-3) {
-            return Err(SharesRefusal::OffGrid { shares });
+        match snap(scaled) {
+            Some(units) => Ok(Self(units as u64)),
+            None => Err(SharesRefusal::OffGrid { shares }),
         }
-        Ok(Self(units as u64))
     }
 
     pub fn units(self) -> u64 {
@@ -201,13 +223,13 @@ impl Shares {
 
 impl std::fmt::Display for Shares {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (whole, fraction) = (self.0 / SHARE_SCALE, self.0 % SHARE_SCALE);
-        if fraction == 0 {
-            write!(formatter, "{whole}")
-        } else {
-            let digits = format!("{fraction:06}");
-            write!(formatter, "{whole}.{}", digits.trim_end_matches('0'))
-        }
+        write_decimal(
+            formatter,
+            u128::from(self.0 / SHARE_SCALE),
+            u128::from(self.0 % SHARE_SCALE),
+            6,
+            0,
+        )
     }
 }
 
@@ -308,7 +330,7 @@ impl std::fmt::Display for DollarVolume {
         let per_tick = u128::from(SHARE_SCALE);
         let ticks = self.0 / per_tick + u128::from(self.0 % per_tick >= per_tick / 2);
         let scale = u128::from(PRICE_SCALE.unsigned_abs());
-        write!(formatter, "{}.{:04}", ticks / scale, ticks % scale)
+        write_decimal(formatter, ticks / scale, ticks % scale, 6, 2)
     }
 }
 
@@ -340,24 +362,30 @@ mod tests {
     }
 
     #[test]
-    fn test_the_divisor_is_ten_thousand() {
+    fn test_the_price_divisor_is_a_million() {
         let price = Price::from_dollars(123.4567).unwrap();
-        assert_eq!(price.ticks(), 1_234_567);
+        assert_eq!(price.ticks(), 123_456_700);
         assert_eq!(price.to_string(), "123.4567");
         assert_eq!(price.dollars(), 123.4567);
-        assert_eq!(Price::from_ticks(5).unwrap().to_string(), "0.0005");
+        assert_eq!(Price::from_ticks(500).unwrap().to_string(), "0.0005");
+        assert_eq!(Price::from_ticks(5).unwrap().to_string(), "0.000005");
+        assert_eq!(Price::from_ticks(73_730_000).unwrap().to_string(), "73.73");
+        // A midpoint print at half a sub-penny, from the 2026-09-25 grouped daily.
+        assert_eq!(Price::from_dollars(0.18205).unwrap().ticks(), 182_050);
     }
 
     #[test]
     fn test_float_noise_snaps_to_the_grid() {
-        assert_eq!(Price::from_dollars(0.1 + 0.2).unwrap().ticks(), 3_000);
+        assert_eq!(Price::from_dollars(0.1 + 0.2).unwrap().ticks(), 300_000);
     }
 
     #[test]
     fn test_a_price_off_the_grid_or_out_of_range_is_refused_with_its_value() {
         assert_eq!(
-            Price::from_dollars(1.00005),
-            Err(PriceRefusal::OffGrid { dollars: 1.00005 })
+            Price::from_dollars(1.000_000_5),
+            Err(PriceRefusal::OffGrid {
+                dollars: 1.000_000_5
+            })
         );
         assert_eq!(
             Price::from_dollars(0.0),
@@ -365,12 +393,12 @@ mod tests {
         );
         assert_eq!(
             Price::from_dollars(-1.0),
-            Err(PriceRefusal::OutOfRange { ticks: -10_000 })
+            Err(PriceRefusal::OutOfRange { ticks: -1_000_000 })
         );
         assert_eq!(
             Price::from_dollars(10_000_000.000_1),
             Err(PriceRefusal::OutOfRange {
-                ticks: 100_000_000_001
+                ticks: 10_000_000_000_100
             })
         );
         assert!(matches!(
@@ -378,16 +406,16 @@ mod tests {
             Err(PriceRefusal::NotFinite { .. })
         ));
         assert_eq!(
-            Price::from_ticks(100_000_000_000).unwrap().to_string(),
-            "10000000.0000"
+            Price::from_ticks(10_000_000_000_000).unwrap().to_string(),
+            "10000000.00"
         );
     }
 
     #[test]
     fn test_dollar_volume_is_exact() {
         let volume = DollarVolume::of(Price::from_dollars(1.5).unwrap(), Shares::whole(3).unwrap());
-        assert_eq!(volume.units(), 45_000_000_000);
-        assert_eq!(volume.plus(volume).to_string(), "9.0000");
+        assert_eq!(volume.units(), 4_500_000_000_000);
+        assert_eq!(volume.plus(volume).to_string(), "9.00");
         assert_eq!(volume.dollars(), 4.5);
         assert_eq!(volume.average_over(Shares::whole(3).unwrap()), Some(1.5));
         assert_eq!(volume.average_over(Shares::default()), None);

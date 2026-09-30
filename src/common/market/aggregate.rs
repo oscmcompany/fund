@@ -236,7 +236,7 @@ mod tests {
         );
         assert_eq!(totals.count(), TradeCount::new(2));
         assert_eq!(totals.volume(), Shares::whole(400).unwrap());
-        assert_eq!(totals.dollar_volume().to_string(), "4060.0000");
+        assert_eq!(totals.dollar_volume().to_string(), "4060.00");
         assert_eq!(totals.volume_weighted_average_price(), Some(10.15));
         assert_eq!(TradeTotals::empty().volume_weighted_average_price(), None);
     }
@@ -299,7 +299,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(TradeCount::new(22)), Some(TradeCount::new(3)), None]
         );
-        assert_eq!(rolled[0].dollar_volume().unwrap().to_string(), "2248.5000");
+        assert_eq!(rolled[0].dollar_volume().unwrap().to_string(), "2248.50");
         assert_eq!(rolled[2].volume_weighted_average_price(), None);
     }
 
