@@ -504,21 +504,26 @@ ROLE_POLICY="$(cat <<JSON
       "Action": ["s3:PutObject"],
       "Resource": [
         "arn:aws:s3:::${RECORDS_BUCKET}/exports/journal/producer=archiver/*",
-        "arn:aws:s3:::${RECORDS_BUCKET}/exports/logs/producer=archiver/*"
+        "arn:aws:s3:::${RECORDS_BUCKET}/exports/logs/producer=archiver/*",
+        "arn:aws:s3:::${RECORDS_BUCKET}/records/journal/producer=archiver/*",
+        "arn:aws:s3:::${RECORDS_BUCKET}/records/logs/producer=archiver/*"
       ]
     },
     {
       "Sid": "ReadRecordsForTheViewCheck",
       "Effect": "Allow",
       "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/exports/*"
+      "Resource": [
+        "arn:aws:s3:::${RECORDS_BUCKET}/exports/*",
+        "arn:aws:s3:::${RECORDS_BUCKET}/records/*"
+      ]
     },
     {
       "Sid": "ListRecordsForTheViewCheck",
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
       "Resource": "arn:aws:s3:::${RECORDS_BUCKET}",
-      "Condition": {"StringLike": {"s3:prefix": "exports/*"}}
+      "Condition": {"StringLike": {"s3:prefix": ["exports/*", "records/*"]}}
     },
     {
       "Sid": "StopSelfWhenDone",

@@ -40,9 +40,13 @@ OPTIONAL_KEYS="MASSIVE_S3_ENDPOINT MASSIVE_S3_ACCESS_KEY_ID MASSIVE_S3_SECRET_AC
 # or Alpaca outage stop the very command that ships the diagnostics explaining it -- the export runs
 # after a failed night, which is exactly when a credential problem is likely to be the cause.
 case "${1:-}" in
-  export-records | check-views)
+  export-records | check-views | check-archive-views)
     REQUIRED_KEYS=""
     OPTIONAL_KEYS=""
+    ;;
+  # The rebuilt archiver reads only the vendors' keys; it ships its own journal and logs.
+  heal-archive)
+    OPTIONAL_KEYS="ALPACA_IS_PAPER"
     ;;
   # The drift checks come through here for this environment alone. Keys per tool: the
   # classification check reads a public feed, and loading Massive's credential for it would let a
@@ -116,6 +120,20 @@ fi
 
 if [[ "${1:-}" == "check-views" ]]; then
   exec tools/check-views
+fi
+
+# The rebuilt archiver from the master checkout `sync-new-archiver` keeps, with directories of its own so the legacy
+# export never reads its files. `ALPACA_IS_PAPER` defaults as secretspec.toml declares it for production.
+NEW_ROOT="${FUND_NEW_ROOT:-$HOME/fund-master}"
+if [[ "${1:-}" == "heal-archive" ]]; then
+  export ALPACA_IS_PAPER="${ALPACA_IS_PAPER:-false}"
+  export FUND_JOURNAL_DIRECTORY="$HOME/archive_nightly/journal"
+  export FUND_LOG_DIRECTORY="$HOME/archive_nightly/logs"
+  exec "$NEW_ROOT/target/release/archive_nightly"
+fi
+
+if [[ "${1:-}" == "check-archive-views" ]]; then
+  exec "$NEW_ROOT/check-views"
 fi
 
 exec ./target/release/seed "$@"

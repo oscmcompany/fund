@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sync-new-archiver -- Bring a second checkout, of master, and its `archive_nightly` up to origin/master.
+#
+# The rebuilt archiver (master's pivot task 16) runs on this box beside the legacy fold until cutover, so its layout
+# collects nightly. It gets its own checkout and target directory, since `sync-archiver` resets this one to legacy.
+
+ROOT="${FUND_NEW_ROOT:-${HOME:+$HOME/fund-master}}"
+BRANCH=master
+
+log() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+if [[ -z "$ROOT" ]]; then
+  log "ERROR: set FUND_NEW_ROOT; HOME is unset, so the checkout cannot be derived"
+  exit 1
+fi
+if [[ -d "${HOME:-}/.cargo/bin" ]]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+if [[ ! -d "$ROOT/.git" ]]; then
+  log "Cloning $BRANCH into $ROOT"
+  git clone --branch "$BRANCH" https://github.com/oscmcompany/fund.git "$ROOT"
+fi
+cd "$ROOT"
+if git fetch origin "$BRANCH" 2>&1; then
+  git reset --hard "origin/$BRANCH"
+else
+  log "git fetch failed; keeping $(git rev-parse --short HEAD)"
+fi
+
+# Built unconditionally; cargo answers an up-to-date build in seconds.
+if cargo build --release --bin archive_nightly; then
+  log "Built $(git rev-parse --short HEAD)"
+  exit 0
+fi
+log "ERROR: build failed at $(git rev-parse --short HEAD)"
+exit 1

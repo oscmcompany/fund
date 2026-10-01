@@ -132,6 +132,19 @@ else
   log "Skipping the fold; the checkout did not sync"
 fi
 
+# The rebuilt archiver, run beside the legacy fold until cutover so its layout collects nightly. Independent of the
+# legacy sync, and never in the way of the export below: its own records ship from inside the binary.
+NEW_ARCHIVER_STATUS=0
+VIEWS_STATUS=0
+log "Running the rebuilt archiver"
+if run_wrapped sync-new-archiver tools/sync-new-archiver; then
+  run_wrapped archive-nightly tools/run-backfill heal-archive || NEW_ARCHIVER_STATUS=$?
+  run_wrapped archive-views-check timeout 600 tools/run-backfill check-archive-views || VIEWS_STATUS=$?
+else
+  NEW_ARCHIVER_STATUS=1
+fi
+log "Rebuilt archiver finished with status ${NEW_ARCHIVER_STATUS}, its views with ${VIEWS_STATUS}"
+
 # Before the trap stops the box, which is the whole point: an export that raced the shutdown would
 # collect nothing and leave the night on a machine that is off.
 EXPORT_STATUS=0
@@ -145,4 +158,4 @@ fi
 
 # Either leg. This used to exit the fold's status alone, so a night whose records never left the box
 # -- the one failure a box that powers itself off cannot recover from -- reported success.
-exit "$(first_failure "$FOLD_STATUS" "$EXPORT_STATUS")"
+exit "$(first_failure "$FOLD_STATUS" "$NEW_ARCHIVER_STATUS" "$VIEWS_STATUS" "$EXPORT_STATUS")"
