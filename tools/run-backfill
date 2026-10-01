@@ -123,12 +123,23 @@ if [[ "${1:-}" == "check-views" ]]; then
 fi
 
 # The rebuilt archiver from the master checkout `sync-new-archiver` keeps, with directories of its own so the legacy
-# export never reads its files. `ALPACA_IS_PAPER` defaults as secretspec.toml declares it for production.
-NEW_ROOT="${FUND_NEW_ROOT:-$HOME/fund-master}"
+# export never reads its files. Derived here only, so the commands above never need HOME.
+if [[ "${1:-}" == "heal-archive" || "${1:-}" == "check-archive-views" ]]; then
+  NEW_ROOT="${FUND_NEW_ROOT:-${HOME:+$HOME/fund-master}}"
+  if [[ -z "$NEW_ROOT" ]]; then
+    echo "Error: set FUND_NEW_ROOT to the master checkout; HOME is unset, so it cannot be derived." >&2
+    exit 1
+  fi
+fi
+
 if [[ "${1:-}" == "heal-archive" ]]; then
-  export ALPACA_IS_PAPER="${ALPACA_IS_PAPER:-false}"
-  export FUND_JOURNAL_DIRECTORY="$HOME/archive_nightly/journal"
-  export FUND_LOG_DIRECTORY="$HOME/archive_nightly/logs"
+  # The default secretspec.toml declares for each profile, so a development box never reaches live Alpaca.
+  case "$PROFILE" in
+    production) export ALPACA_IS_PAPER="${ALPACA_IS_PAPER:-false}" ;;
+    *) export ALPACA_IS_PAPER="${ALPACA_IS_PAPER:-true}" ;;
+  esac
+  export FUND_JOURNAL_DIRECTORY="$NEW_ROOT-records/journal"
+  export FUND_LOG_DIRECTORY="$NEW_ROOT-records/logs"
   exec "$NEW_ROOT/target/release/archive_nightly"
 fi
 

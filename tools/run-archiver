@@ -137,8 +137,10 @@ fi
 NEW_ARCHIVER_STATUS=0
 VIEWS_STATUS=0
 log "Running the rebuilt archiver"
-if run_wrapped sync-new-archiver tools/sync-new-archiver; then
-  run_wrapped archive-nightly tools/run-backfill heal-archive || NEW_ARCHIVER_STATUS=$?
+# Bounded so a hang cannot hold the export: the build well under the stall alarm's idle hour, the heal past its own
+# 240-minute budget, which it checks only between sessions.
+if run_wrapped sync-new-archiver timeout 1800 tools/sync-new-archiver; then
+  run_wrapped archive-nightly timeout 18000 tools/run-backfill heal-archive || NEW_ARCHIVER_STATUS=$?
   run_wrapped archive-views-check timeout 600 tools/run-backfill check-archive-views || VIEWS_STATUS=$?
 else
   NEW_ARCHIVER_STATUS=1
