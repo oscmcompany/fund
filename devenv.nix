@@ -169,6 +169,16 @@ in {
     echo "Nix checks completed successfully"
   '';
 
+  scripts.start-duckdb.exec = ''
+    set -euo pipefail
+    cd "$DEVENV_ROOT"
+    duckdb -init views.sql "$@"
+  '';
+
+  scripts.check-views.exec = ''
+    "$DEVENV_ROOT/check-views" "$@"
+  '';
+
   scripts.bump-rust-dependencies.exec = ''
     set -euo pipefail
     cargo update
@@ -241,6 +251,8 @@ in {
       echo ""
       echo "  Scripts:"
       echo "    bump-rust-dependencies      Update the Cargo lockfile"
+      echo "    start-duckdb                DuckDB with the archive views"
+      echo "    check-views                 Fail on any archive view that is empty"
     } >&2
   '';
 }
