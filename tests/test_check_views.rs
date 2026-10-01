@@ -157,6 +157,12 @@ fn test_production_records_are_live() {
     let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), "production");
     assert_eq!(status, 3, "{output}");
     assert!(output.contains("journal: did not create"), "{output}");
+    // Each records view on its own: logs missing while the journal reads.
+    let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
+    answers.push(("journal", Answer::Rows(2)));
+    let (status, output) = real(&answers, "production");
+    assert_eq!(status, 3, "{output}");
+    assert!(output.contains("logs: did not create"), "{output}");
 }
 
 #[test]
