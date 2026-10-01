@@ -33,6 +33,7 @@ use crate::journal::Journal;
 const DEFAULT_LOOKBACK_SESSIONS: NonZeroUsize = NonZeroUsize::new(5).expect("5 is not zero");
 const DEFAULT_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(240).expect("240 is not zero");
 const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
+const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 /// A whole-market session measured 2026-09-30 at about 33 s with these two.
 const DEFAULT_MINUTE_BATCH_SYMBOLS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is not zero");
 const DEFAULT_MINUTE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
@@ -48,6 +49,7 @@ pub struct Parameters {
     lookback_sessions: NonZeroUsize,
     budget: Duration,
     journal_directory: PathBuf,
+    log_directory: PathBuf,
     minute_batch_symbols: NonZeroUsize,
     minute_concurrency: NonZeroUsize,
 }
@@ -89,6 +91,11 @@ impl Parameters {
                 DEFAULT_JOURNAL_DIRECTORY.to_string(),
                 &mut resolved,
             )?),
+            log_directory: PathBuf::from(record(
+                read(Parameter::LogDirectory)?,
+                DEFAULT_LOG_DIRECTORY.to_string(),
+                &mut resolved,
+            )?),
             minute_batch_symbols: record(
                 read(Parameter::MinuteBatchSymbols)?,
                 DEFAULT_MINUTE_BATCH_SYMBOLS,
@@ -103,8 +110,26 @@ impl Parameters {
         Ok((parameters, ConfigurationResolved::new(resolved)))
     }
 
+    /// Only the log directory, resolved on its own so a refusal of any other parameter still reaches the log file.
+    pub fn log_directory_from_environment() -> Result<PathBuf, ParameterRefusal> {
+        let (parameter, supplied) = (
+            Parameter::LogDirectory,
+            environment_variable(Parameter::LogDirectory)?,
+        );
+        record(
+            (parameter, supplied),
+            DEFAULT_LOG_DIRECTORY.to_string(),
+            &mut BTreeMap::new(),
+        )
+        .map(PathBuf::from)
+    }
+
     pub fn journal_directory(&self) -> &PathBuf {
         &self.journal_directory
+    }
+
+    pub fn log_directory(&self) -> &PathBuf {
+        &self.log_directory
     }
 }
 
@@ -535,6 +560,11 @@ mod tests {
                 (
                     Parameter::JournalDirectory,
                     "/var/journal/fund",
+                    ParameterSource::Default
+                ),
+                (
+                    Parameter::LogDirectory,
+                    "/var/log/fund",
                     ParameterSource::Default
                 ),
                 (

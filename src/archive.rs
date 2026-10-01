@@ -1,7 +1,10 @@
-//! The market-data archive in S3: objects written under their `Key`, checked by S3 against a SHA-256 on upload and
-//! read back byte for byte before a write counts as done.
+//! The fund's S3 buckets: the shared market-data archive and each profile's records, with objects written under their
+//! `Key`, checked by S3 against a SHA-256 on upload and read back byte for byte before a write counts as done.
 
 pub mod bars;
+pub mod journal;
+pub mod logs;
+pub mod parquet;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
@@ -9,9 +12,10 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 use crate::common::storage::Key;
 use crate::ingest::VariableRefusal;
 
+/// One S3 bucket the fund writes: the shared market data or a profile's records.
 pub struct Archive {
     s3_client: aws_sdk_s3::Client,
-    bucket: String,
+    bucket_name: String,
 }
 
 /// Why a write or read did not complete.
@@ -56,13 +60,23 @@ impl std::fmt::Display for ArchiveError {
 }
 
 impl Archive {
-    /// The shared archive bucket named by `AWS_S3_ARCHIVE_BUCKET_NAME`.
-    pub fn from_environment(
+    /// The shared market-data archive named by `AWS_S3_ARCHIVE_BUCKET_NAME`, which only the archiver writes.
+    pub fn market_data(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {
+        Self::named(configuration, "AWS_S3_ARCHIVE_BUCKET_NAME")
+    }
+
+    /// This profile's journals and logs, named by `AWS_S3_RECORDS_BUCKET_NAME`.
+    pub fn records(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {
+        Self::named(configuration, "AWS_S3_RECORDS_BUCKET_NAME")
+    }
+
+    fn named(
         configuration: &aws_config::SdkConfig,
+        variable: &'static str,
     ) -> Result<Self, VariableRefusal> {
         Ok(Self {
             s3_client: aws_sdk_s3::Client::new(configuration),
-            bucket: crate::ingest::variable("AWS_S3_ARCHIVE_BUCKET_NAME")?,
+            bucket_name: crate::ingest::variable(variable)?,
         })
     }
 
@@ -71,7 +85,7 @@ impl Archive {
         let path = key.path();
         self.s3_client
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(&self.bucket_name)
             .key(&path)
             .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .body(ByteStream::from(body.clone()))
@@ -96,7 +110,7 @@ impl Archive {
         let mut pages = self
             .s3_client
             .list_objects_v2()
-            .bucket(&self.bucket)
+            .bucket(&self.bucket_name)
             .prefix(prefix)
             .into_paginator()
             .send();
@@ -125,7 +139,7 @@ impl Archive {
         let response = match self
             .s3_client
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(&self.bucket_name)
             .key(&path)
             .checksum_mode(ChecksumMode::Enabled)
             .send()
@@ -191,7 +205,7 @@ mod tests {
         );
         let body = encode(&key, daily.bars(), &provenance).unwrap();
         let configuration = aws_config::load_from_env().await;
-        let archive = Archive::from_environment(&configuration).unwrap();
+        let archive = Archive::market_data(&configuration).unwrap();
         archive.put(&key, body.clone()).await.unwrap();
         let (bars, read) = decode(&key, archive.get(&key).await.unwrap().unwrap()).unwrap();
         println!("{} bars, {} bytes, {}", bars.len(), body.len(), key.path());

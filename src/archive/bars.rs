@@ -3,20 +3,17 @@
 
 use std::sync::Arc;
 
+use ::parquet::file::metadata::KeyValue;
 use arrow_array::builder::{
     Decimal128Builder, StringBuilder, TimestampMicrosecondBuilder, UInt64Builder,
 };
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    UInt64Array,
+    Array, ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
-use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::Compression;
-use parquet::file::metadata::KeyValue;
-use parquet::file::properties::WriterProperties;
+
+use super::parquet;
 
 use crate::common::journal::{Commit, RunId};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
@@ -259,12 +256,8 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
         trade_counts.append_option(bar.trade_count().map(TradeCount::count));
         dollar_volumes.append_option(dollar_volume);
     }
-    let parquet = |error: &dyn std::fmt::Display| EncodeRefusal::Parquet {
-        reason: error.to_string(),
-    };
     let [open, high, low, close] =
         prices.map(|mut builder| Arc::new(builder.finish().with_data_type(PRICE_TYPE)) as ArrayRef);
-    let schema = Arc::new(schema());
     let columns: Vec<ArrayRef> = vec![
         Arc::new(symbols.finish()),
         Arc::new(timestamps.finish()),
@@ -276,23 +269,13 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
         Arc::new(trade_counts.finish()),
         Arc::new(dollar_volumes.finish().with_data_type(DOLLAR_VOLUME_TYPE)),
     ];
-    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|error| parquet(&error))?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_key_value_metadata(Some(metadata(provenance)))
-        .build();
-    let mut bytes = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties))
-        .map_err(|error| parquet(&error))?;
-    writer.write(&batch).map_err(|error| parquet(&error))?;
-    writer.close().map_err(|error| parquet(&error))?;
-    Ok(bytes)
+    parquet::write(schema(), columns, LAYOUT_VERSION, metadata(provenance))
+        .map_err(|reason| EncodeRefusal::Parquet { reason })
 }
 
 fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
     let entry = |name: &str, value: Option<String>| KeyValue::new(name.to_string(), value);
     vec![
-        entry("fund.layout_version", Some(LAYOUT_VERSION.to_string())),
         entry(
             "fund.subscription",
             Some(provenance.subscription.to_string()),
@@ -313,43 +296,9 @@ fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
 /// constructors so a file edited out of band cannot hand back an invalid bar.
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
     let (provider, interval, session) = bars_key(key).ok_or(DecodeRefusal::NotABarsKey)?;
-    let parquet = |error: &dyn std::fmt::Display| DecodeRefusal::Parquet {
-        reason: error.to_string(),
-    };
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-        .map_err(|error| parquet(&error))?;
-    // One comparison covers column count, order, names, decimal scales and nullability, so a non-null column is
-    // guaranteed by the reader rather than rechecked per row.
-    if builder.schema().fields() != schema().fields() {
-        let found = builder
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let optional = if field.is_nullable() { "?" } else { "" };
-                format!("{} {}{optional}", field.name(), field.data_type())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(DecodeRefusal::Schema { found });
-    }
-    let entries: Vec<KeyValue> = builder
-        .metadata()
-        .file_metadata()
-        .key_value_metadata()
-        .cloned()
-        .unwrap_or_default();
-    let value = |name: &'static str| {
-        entries
-            .iter()
-            .find(|entry| entry.key == name)
-            .and_then(|entry| entry.value.clone())
-    };
+    let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
+    let value = |name: &'static str| parquet::value(&entries, name);
     let required = |name: &'static str| value(name).ok_or(DecodeRefusal::Metadata { name });
-    let version = required("fund.layout_version")?;
-    if version != LAYOUT_VERSION {
-        return Err(DecodeRefusal::Layout { version });
-    }
     let provenance = Provenance {
         subscription: required("fund.subscription")?.parse().map_err(|_| {
             DecodeRefusal::Metadata {
@@ -380,8 +329,7 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
         });
     }
     let mut bars = Vec::new();
-    for batch in builder.build().map_err(|error| parquet(&error))? {
-        let batch = batch.map_err(|error| parquet(&error))?;
+    for batch in batches {
         let symbols = downcast::<StringArray>(batch.column(0))?;
         let timestamps = downcast::<TimestampMicrosecondArray>(batch.column(1))?;
         let prices: Vec<&Decimal128Array> = (2..6)
@@ -446,16 +394,25 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
 }
 
 fn downcast<T: 'static>(column: &ArrayRef) -> Result<&T, DecodeRefusal> {
-    column
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or(DecodeRefusal::Parquet {
-            reason: format!("column is {}", column.data_type()),
-        })
+    Ok(parquet::downcast(column)?)
+}
+
+impl From<parquet::ReadRefusal> for DecodeRefusal {
+    fn from(refusal: parquet::ReadRefusal) -> Self {
+        match refusal {
+            parquet::ReadRefusal::Parquet { reason } => Self::Parquet { reason },
+            parquet::ReadRefusal::Schema { found } => Self::Schema { found },
+            parquet::ReadRefusal::Metadata { name } => Self::Metadata { name },
+            parquet::ReadRefusal::Layout { version } => Self::Layout { version },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use ::parquet::arrow::ArrowWriter;
+    use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use ::parquet::file::properties::WriterProperties;
     use chrono::{NaiveDate, TimeDelta};
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -616,7 +573,10 @@ mod tests {
             })
         );
         let mut entries = metadata(&written);
-        entries[0] = KeyValue::new("fund.layout_version".to_string(), Some("2".to_string()));
+        entries.push(KeyValue::new(
+            "fund.layout_version".to_string(),
+            Some("2".to_string()),
+        ));
         let properties = WriterProperties::builder()
             .set_key_value_metadata(Some(entries))
             .build();
@@ -632,10 +592,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_a_file_naming_its_layout_twice_is_refused() {
+        let mut entries = metadata(&provenance(Subscription::AlgoTraderPlus));
+        for version in [LAYOUT_VERSION, LAYOUT_VERSION] {
+            entries.push(KeyValue::new(
+                "fund.layout_version".to_string(),
+                Some(version.to_string()),
+            ));
+        }
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(entries))
+            .build();
+        let mut bytes = Vec::new();
+        ArrowWriter::try_new(&mut bytes, Arc::new(schema()), Some(properties))
+            .unwrap()
+            .close()
+            .unwrap();
+        assert_eq!(
+            decode(&minute_key(), bytes).map(|_| ()),
+            Err(DecodeRefusal::Metadata {
+                name: "fund.layout_version"
+            })
+        );
+    }
+
     /// A file carrying valid provenance under `schema`, with no rows.
     fn file_with(schema: Schema) -> Vec<u8> {
+        let mut entries = metadata(&provenance(Subscription::AlgoTraderPlus));
+        entries.push(KeyValue::new(
+            "fund.layout_version".to_string(),
+            Some(LAYOUT_VERSION.to_string()),
+        ));
         let properties = WriterProperties::builder()
-            .set_key_value_metadata(Some(metadata(&provenance(Subscription::AlgoTraderPlus))))
+            .set_key_value_metadata(Some(entries))
             .build();
         let mut bytes = Vec::new();
         ArrowWriter::try_new(&mut bytes, Arc::new(schema), Some(properties))

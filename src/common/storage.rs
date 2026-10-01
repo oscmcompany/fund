@@ -1,4 +1,4 @@
-//! Object keys for the archive and the exports. Each key is a hive path whose partition values a reader surfaces as
+//! Object keys for the archive and the records. Each key is a hive path whose partition values a reader surfaces as
 //! columns, each parses back to the parts that built it, and each has exactly one host allowed to write it.
 
 use chrono::{Datelike, NaiveDate};
@@ -6,10 +6,10 @@ use chrono::{Datelike, NaiveDate};
 use crate::common::market::record::BarInterval;
 use crate::common::time::SessionDate;
 
-/// Everything this layout writes lives under these roots; the legacy archive's `data/derived/` is never among them,
-/// so no glob reads the two together.
+/// Everything this layout writes lives under these roots; legacy's `data/derived/` and `exports/` are never among
+/// them, so no glob reads the two together and no key is written by both.
 const DATA_ROOT: &str = "data/equity";
-const EXPORT_ROOT: &str = "exports";
+const RECORDS_ROOT: &str = "records";
 
 #[derive(
     Debug,
@@ -177,9 +177,9 @@ impl Key {
             Self::Reference { provider, .. } => {
                 format!("{DATA_ROOT}/reference/provider={provider}/")
             }
-            Self::Journal { host, .. } => format!("{EXPORT_ROOT}/journal/producer={host}/"),
+            Self::Journal { host, .. } => format!("{RECORDS_ROOT}/journal/producer={host}/"),
             Self::Logs { host, service, .. } => format!(
-                "{EXPORT_ROOT}/logs/producer={host}/service={}/",
+                "{RECORDS_ROOT}/logs/producer={host}/service={}/",
                 service.as_str()
             ),
         }
@@ -220,12 +220,12 @@ impl Key {
 impl Host {
     /// The prefixes this host may write, which its IAM grant is built from.
     pub fn writable_prefixes(self) -> Vec<String> {
-        let exports = ["journal", "logs"]
-            .map(|kind| format!("{EXPORT_ROOT}/{kind}/producer={self}/"))
+        let records = ["journal", "logs"]
+            .map(|kind| format!("{RECORDS_ROOT}/{kind}/producer={self}/"))
             .to_vec();
         match self {
-            Self::Archiver => [vec![format!("{DATA_ROOT}/")], exports].concat(),
-            Self::Trader | Self::Researcher => exports,
+            Self::Archiver => [vec![format!("{DATA_ROOT}/")], records].concat(),
+            Self::Trader | Self::Researcher => records,
         }
     }
 }
@@ -300,12 +300,12 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             provider: hive(provider, "provider")?,
             as_of: hive::<NaiveDate>(as_of, "as_of").map(SessionDate::from_date)?,
         }),
-        ["exports", "journal", host, year, month, day, "data.parquet"] => Some(Key::Journal {
+        ["records", "journal", host, year, month, day, "data.parquet"] => Some(Key::Journal {
             host: hive(host, "producer")?,
             session: session(year, month, day)?,
         }),
         [
-            "exports",
+            "records",
             "logs",
             host,
             service,
@@ -387,7 +387,7 @@ mod tests {
                     host: Host::Trader,
                     session: session(),
                 },
-                "exports/journal/producer=trader/year=2026/month=08/day=03/data.parquet",
+                "records/journal/producer=trader/year=2026/month=08/day=03/data.parquet",
             ),
             (
                 Key::Logs {
@@ -395,7 +395,7 @@ mod tests {
                     service: Service::new("archiver").unwrap(),
                     session: session(),
                 },
-                "exports/logs/producer=archiver/service=archiver/year=2026/month=08/day=03/data.parquet",
+                "records/logs/producer=archiver/service=archiver/year=2026/month=08/day=03/data.parquet",
             ),
         ];
         for (key, path) in cases {
@@ -412,9 +412,9 @@ mod tests {
             "data/equity/bars/provider=alpaca/origin=fetched/interval=one_day/year=2026/month=8/day=03/data.parquet",
             "data/equity/bars/provider=alpaca/origin=fetched/interval=one_day/year=2026/month=02/day=30/data.parquet",
             "data/equity/bars/origin=fetched/provider=alpaca/interval=one_day/year=2026/month=08/day=03/data.parquet",
-            "exports/logs/producer=archiver/service=Archiver/year=2026/month=08/day=03/data.parquet",
+            "records/logs/producer=archiver/service=Archiver/year=2026/month=08/day=03/data.parquet",
             "data/equity/reference/provider=massive/as_of=2026-8-3/data.parquet",
-            "exports/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.metadata",
+            "records/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.metadata",
         ] {
             assert_eq!(
                 Key::parse(path),
@@ -432,15 +432,15 @@ mod tests {
             Host::Archiver.writable_prefixes(),
             [
                 "data/equity/",
-                "exports/journal/producer=archiver/",
-                "exports/logs/producer=archiver/"
+                "records/journal/producer=archiver/",
+                "records/logs/producer=archiver/"
             ]
         );
         assert_eq!(
             Host::Trader.writable_prefixes(),
             [
-                "exports/journal/producer=trader/",
-                "exports/logs/producer=trader/"
+                "records/journal/producer=trader/",
+                "records/logs/producer=trader/"
             ]
         );
     }

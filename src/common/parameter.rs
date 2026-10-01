@@ -33,6 +33,7 @@ pub enum Parameter {
     /// Minutes the archive heal may start new work within.
     BudgetMinutes,
     JournalDirectory,
+    LogDirectory,
     /// Symbols per one-minute bars request.
     MinuteBatchSymbols,
     /// One-minute bars requests in flight at once.
@@ -148,6 +149,7 @@ mod tests {
                 "FUND_LOOKBACK_SESSIONS",
                 "FUND_BUDGET_MINUTES",
                 "FUND_JOURNAL_DIRECTORY",
+                "FUND_LOG_DIRECTORY",
                 "FUND_MINUTE_BATCH_SYMBOLS",
                 "FUND_MINUTE_CONCURRENCY",
             ]
