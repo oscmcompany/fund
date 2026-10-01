@@ -13,7 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use fund::archive::Bucket;
+use fund::archive::Archive;
 use fund::common::heal::is_complete;
 use fund::common::journal::{Commit, Observation, RunId};
 use fund::common::storage::{Host, Service};
@@ -105,8 +105,8 @@ async fn main() -> ExitCode {
         let http_client = reqwest::Client::new();
         let sdk_configuration = aws_config::load_from_env().await;
         let (clients, records) = match (
-            Bucket::archive(&sdk_configuration),
-            Bucket::records(&sdk_configuration),
+            Archive::market_data(&sdk_configuration),
+            Archive::records(&sdk_configuration),
             Massive::from_environment(http_client.clone()),
             Alpaca::from_environment(http_client),
         ) {

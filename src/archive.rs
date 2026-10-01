@@ -12,14 +12,15 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 use crate::common::storage::Key;
 use crate::ingest::VariableRefusal;
 
-pub struct Bucket {
+/// One S3 bucket the fund writes: the shared market data or a profile's records.
+pub struct Archive {
     s3_client: aws_sdk_s3::Client,
-    bucket: String,
+    bucket_name: String,
 }
 
 /// Why a write or read did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BucketError {
+pub enum ArchiveError {
     Put {
         path: String,
         reason: String,
@@ -40,7 +41,7 @@ pub enum BucketError {
     },
 }
 
-impl std::fmt::Display for BucketError {
+impl std::fmt::Display for ArchiveError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
@@ -58,9 +59,9 @@ impl std::fmt::Display for BucketError {
     }
 }
 
-impl Bucket {
+impl Archive {
     /// The shared market-data archive named by `AWS_S3_ARCHIVE_BUCKET_NAME`, which only the archiver writes.
-    pub fn archive(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {
+    pub fn market_data(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {
         Self::named(configuration, "AWS_S3_ARCHIVE_BUCKET_NAME")
     }
 
@@ -75,28 +76,28 @@ impl Bucket {
     ) -> Result<Self, VariableRefusal> {
         Ok(Self {
             s3_client: aws_sdk_s3::Client::new(configuration),
-            bucket: crate::ingest::variable(variable)?,
+            bucket_name: crate::ingest::variable(variable)?,
         })
     }
 
     /// Writes `body` under `key` and returns once the same bytes have been read back.
-    pub async fn put(&self, key: &Key, body: Vec<u8>) -> Result<(), BucketError> {
+    pub async fn put(&self, key: &Key, body: Vec<u8>) -> Result<(), ArchiveError> {
         let path = key.path();
         self.s3_client
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(&self.bucket_name)
             .key(&path)
             .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .body(ByteStream::from(body.clone()))
             .send()
             .await
-            .map_err(|error| BucketError::Put {
+            .map_err(|error| ArchiveError::Put {
                 path: path.clone(),
                 reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
             })?;
         match self.get(key).await? {
             Some(read) if read == body => Ok(()),
-            read => Err(BucketError::ReadBackMismatch {
+            read => Err(ArchiveError::ReadBackMismatch {
                 path,
                 written: body.len(),
                 read: read.map_or(0, |read| read.len()),
@@ -105,17 +106,17 @@ impl Bucket {
     }
 
     /// Every path under `prefix`, across as many pages as S3 answers with.
-    pub async fn list(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>, ArchiveError> {
         let mut pages = self
             .s3_client
             .list_objects_v2()
-            .bucket(&self.bucket)
+            .bucket(&self.bucket_name)
             .prefix(prefix)
             .into_paginator()
             .send();
         let mut paths = Vec::new();
         while let Some(page) = pages.next().await {
-            let page = page.map_err(|error| BucketError::List {
+            let page = page.map_err(|error| ArchiveError::List {
                 prefix: prefix.to_string(),
                 reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
             })?;
@@ -129,16 +130,16 @@ impl Bucket {
     }
 
     /// The object under `key`, or `None` when nothing is there; S3 verifies the stored checksum as it streams.
-    pub async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, BucketError> {
+    pub async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, ArchiveError> {
         let path = key.path();
-        let failed = |reason: String| BucketError::Get {
+        let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
             reason,
         };
         let response = match self
             .s3_client
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(&self.bucket_name)
             .key(&path)
             .checksum_mode(ChecksumMode::Enabled)
             .send()
@@ -204,7 +205,7 @@ mod tests {
         );
         let body = encode(&key, daily.bars(), &provenance).unwrap();
         let configuration = aws_config::load_from_env().await;
-        let archive = Bucket::archive(&configuration).unwrap();
+        let archive = Archive::market_data(&configuration).unwrap();
         archive.put(&key, body.clone()).await.unwrap();
         let (bars, read) = decode(&key, archive.get(&key).await.unwrap().unwrap()).unwrap();
         println!("{} bars, {} bytes, {}", bars.len(), body.len(), key.path());

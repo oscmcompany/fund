@@ -7,7 +7,7 @@ use std::path::Path;
 use tracing::Level;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
-use crate::archive::{Bucket, journal, logs};
+use crate::archive::{Archive, journal, logs};
 use crate::common::journal::read;
 use crate::common::storage::{Host, Key, Service};
 use crate::common::time::SessionDate;
@@ -75,7 +75,7 @@ fn contents(path: &Path) -> Option<Result<String, String>> {
 
 /// Ships every recent file, returning each key with whether it landed.
 pub async fn ship(
-    bucket: &Bucket,
+    archive: &Archive,
     host: Host,
     service: &Service,
     journal_directory: &Path,
@@ -85,7 +85,7 @@ pub async fn ship(
     let mut shipped = Vec::new();
     for (key, encoded) in shipments(host, service, journal_directory, log_directory, today) {
         let outcome = match encoded {
-            Ok(body) => bucket
+            Ok(body) => archive
                 .put(&key, body)
                 .await
                 .map_err(|error| error.to_string()),

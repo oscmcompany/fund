@@ -14,7 +14,7 @@ use strum::IntoEnumIterator;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::archive::Bucket;
+use crate::archive::Archive;
 use crate::archive::bars::{Provenance, Subscription, decode, encode};
 use crate::common::heal::{Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, window};
 use crate::common::journal::{
@@ -209,7 +209,7 @@ pub fn lock(directory: &std::path::Path) -> Result<std::fs::File, LockRefusal> {
 pub enum HealError {
     Calendar(FetchError),
     Window(WindowRefusal),
-    List(crate::archive::BucketError),
+    List(crate::archive::ArchiveError),
     /// A partition was written but its record was not, so the run stops rather than write what it cannot record.
     Journal(std::io::Error),
 }
@@ -229,14 +229,14 @@ impl std::fmt::Display for HealError {
 
 /// The clients the heal reads from and writes to.
 pub struct Clients {
-    archive: Bucket,
+    archive: Archive,
     massive: Massive,
     /// Shared by the concurrent one-minute batches, so its secret is held once rather than copied into each.
     alpaca: Arc<Alpaca>,
 }
 
 impl Clients {
-    pub fn new(archive: Bucket, massive: Massive, alpaca: Alpaca) -> Self {
+    pub fn new(archive: Archive, massive: Massive, alpaca: Alpaca) -> Self {
         Self {
             archive,
             massive,
