@@ -143,14 +143,6 @@ impl Register {
         })
     }
 
-    /// TEMPORARY, removed before merge: writes a legacy seed under its own number, refused if that number is taken.
-    pub async fn import(&self, accession: &Accession) -> Result<(), RegisterError> {
-        let key = Key::Register {
-            number: accession.number(),
-        };
-        Ok(self.archive.create(&key, encode(accession)).await?)
-    }
-
     /// Records the verdict, written only over the version read, so a concurrent close is never overwritten.
     pub async fn close(
         &self,

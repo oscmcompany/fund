@@ -74,128 +74,6 @@ enum Command {
     List,
     /// One accession as stored.
     Show { number: AccessionNumber },
-    /// TEMPORARY, removed before merge: copies legacy `exports/register/` seeds, downloaded to `directory`, under
-    /// their own numbers, converting each prose field to its legacy variant.
-    ImportLegacy {
-        directory: std::path::PathBuf,
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-mod legacy {
-    use serde::Deserialize;
-
-    use fund::common::register::Verdict;
-    use fund::common::time::SessionDate;
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Accession {
-        pub number: u32,
-        pub opening: Opening,
-        pub status: Status,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Opening {
-        pub family: String,
-        pub universe: String,
-        pub horizon: String,
-        pub hypothesis: String,
-        pub bid: Bid,
-        pub opened: SessionDate,
-        pub supersedes: Option<u32>,
-        pub substrate_change: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Bid {
-        Recorded(String),
-        Unrecorded,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Status {
-        Open,
-        Closed(Closing),
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Closing {
-        pub verdict: Verdict,
-        pub statistic: String,
-        pub sessions: Sessions,
-        pub commits: Vec<String>,
-        pub closed: SessionDate,
-        pub notes: Option<String>,
-        pub cost: Cost,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Sessions {
-        Counted(u32),
-        Unrecorded,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Cost {
-        pub wall_clock_seconds: Option<u64>,
-        pub bytes_read: Option<u64>,
-        pub dollars: Option<f64>,
-    }
-}
-
-/// A legacy seed carried over field for field, prose kept as prose and nothing reconstructed.
-fn converted(seed: legacy::Accession) -> Result<Accession, Box<dyn std::error::Error>> {
-    let number = AccessionNumber::new(seed.number).ok_or("accession number 0")?;
-    let opening = Opening::new(
-        seed.opening.family.parse()?,
-        Universe::Legacy(seed.opening.universe),
-        Horizon::Described(seed.opening.horizon),
-        seed.opening.hypothesis,
-        match seed.opening.bid {
-            legacy::Bid::Recorded(text) => Bid::Written(text),
-            legacy::Bid::Unrecorded => Bid::Unrecorded,
-        },
-        seed.opening.opened,
-        seed.opening.supersedes.and_then(AccessionNumber::new),
-        seed.opening.substrate_change,
-    )?;
-    let accession = Accession::open(number, opening);
-    match seed.status {
-        legacy::Status::Open => Ok(accession),
-        legacy::Status::Closed(closing) => {
-            let closing = Closing::new(
-                closing.verdict,
-                closing.statistic,
-                Measured::Unrecorded,
-                match closing.sessions {
-                    legacy::Sessions::Counted(count) => Sessions::Counted(count),
-                    legacy::Sessions::Unrecorded => Sessions::Unrecorded,
-                },
-                closing
-                    .commits
-                    .iter()
-                    .map(|raw| raw.parse())
-                    .collect::<Result<_, _>>()?,
-                closing.closed,
-                closing.notes,
-                StudyCost {
-                    wall_clock_seconds: closing.cost.wall_clock_seconds,
-                    bytes_read: closing.cost.bytes_read,
-                    dollars: closing.cost.dollars.map(Dollars::from_float).transpose()?,
-                },
-            )?;
-            Ok(accession.close(closing)?)
-        }
-    }
 }
 
 fn measured(raw: &str) -> Result<Measured, String> {
@@ -305,27 +183,6 @@ async fn run(register: &Register, command: Command) -> Result<(), Box<dyn std::e
                 .map_err(|error| error.to_string())?;
             println!("{}", serde_json::to_string_pretty(&accession)?);
         }
-        Command::ImportLegacy { directory, dry_run } => {
-            let mut paths: Vec<_> = std::fs::read_dir(&directory)?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<Result<_, _>>()?;
-            paths.sort();
-            let accessions = paths
-                .iter()
-                .map(|path| converted(serde_json::from_slice(&std::fs::read(path)?)?))
-                .collect::<Result<Vec<_>, _>>()?;
-            for accession in accessions {
-                if dry_run {
-                    println!("{}", serde_json::to_string(&accession)?);
-                } else {
-                    register
-                        .import(&accession)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    println!("Imported accession {}", accession.number());
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -385,10 +242,7 @@ mod tests {
                 assert_eq!((bid.estimate(), bid.coverage_percent()), (4.0, 80));
                 assert_eq!(supersedes, AccessionNumber::new(5));
             }
-            Command::Close { .. }
-            | Command::List
-            | Command::Show { .. }
-            | Command::ImportLegacy { .. } => {
+            Command::Close { .. } | Command::List | Command::Show { .. } => {
                 panic!("parsed as another command")
             }
         }
