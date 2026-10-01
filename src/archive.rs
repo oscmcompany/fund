@@ -33,6 +33,10 @@ pub enum ArchiveError {
         prefix: String,
         reason: String,
     },
+    /// A create found the key already written, or a replace found it changed since it was read.
+    Contended {
+        path: String,
+    },
     /// Read back different bytes than were written.
     ReadBackMismatch {
         path: String,
@@ -47,6 +51,12 @@ impl std::fmt::Display for ArchiveError {
             Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
             Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
             Self::List { prefix, reason } => write!(formatter, "listing {prefix} failed: {reason}"),
+            Self::Contended { path } => {
+                write!(
+                    formatter,
+                    "{path} was written by someone else first; read it again"
+                )
+            }
             Self::ReadBackMismatch {
                 path,
                 written,
@@ -70,6 +80,11 @@ impl Archive {
         Self::named(configuration, "AWS_S3_RECORDS_BUCKET_NAME")
     }
 
+    /// The one Register every profile shares, named by `AWS_S3_REGISTER_BUCKET_NAME`.
+    pub fn register(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {
+        Self::named(configuration, "AWS_S3_REGISTER_BUCKET_NAME")
+    }
+
     fn named(
         configuration: &aws_config::SdkConfig,
         variable: &'static str,
@@ -82,19 +97,51 @@ impl Archive {
 
     /// Writes `body` under `key` and returns once the same bytes have been read back.
     pub async fn put(&self, key: &Key, body: Vec<u8>) -> Result<(), ArchiveError> {
+        self.write(key, body, Condition::Any).await
+    }
+
+    /// Writes `body` only if nothing is under `key` yet, so two writers can never both take it.
+    pub async fn create(&self, key: &Key, body: Vec<u8>) -> Result<(), ArchiveError> {
+        self.write(key, body, Condition::Absent).await
+    }
+
+    /// Writes `body` only if `key` still holds the version `tag` names.
+    pub async fn replace(&self, key: &Key, body: Vec<u8>, tag: &Tag) -> Result<(), ArchiveError> {
+        self.write(key, body, Condition::Unchanged(tag)).await
+    }
+
+    async fn write(
+        &self,
+        key: &Key,
+        body: Vec<u8>,
+        condition: Condition<'_>,
+    ) -> Result<(), ArchiveError> {
         let path = key.path();
-        self.s3_client
+        let request = self
+            .s3_client
             .put_object()
             .bucket(&self.bucket_name)
             .key(&path)
             .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .body(ByteStream::from(body.clone()))
-            .send()
-            .await
-            .map_err(|error| ArchiveError::Put {
-                path: path.clone(),
-                reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
-            })?;
+            .body(ByteStream::from(body.clone()));
+        let request = match condition {
+            Condition::Any => request,
+            Condition::Absent => request.if_none_match("*"),
+            Condition::Unchanged(tag) => request.if_match(&tag.0),
+        };
+        request.send().await.map_err(|error| {
+            // 412 is a precondition that failed; 409 is a conditional write that raced another.
+            match error
+                .raw_response()
+                .map(|response| response.status().as_u16())
+            {
+                Some(409 | 412) => ArchiveError::Contended { path: path.clone() },
+                Some(_) | None => ArchiveError::Put {
+                    path: path.clone(),
+                    reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
+                },
+            }
+        })?;
         match self.get(key).await? {
             Some(read) if read == body => Ok(()),
             read => Err(ArchiveError::ReadBackMismatch {
@@ -131,6 +178,11 @@ impl Archive {
 
     /// The object under `key`, or `None` when nothing is there; S3 verifies the stored checksum as it streams.
     pub async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, ArchiveError> {
+        Ok(self.get_tagged(key).await?.map(|(body, _)| body))
+    }
+
+    /// The object under `key` with the tag of the version read, which a `replace` must still match.
+    pub async fn get_tagged(&self, key: &Key) -> Result<Option<(Vec<u8>, Tag)>, ArchiveError> {
         let path = key.path();
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
@@ -159,13 +211,27 @@ impl Archive {
                 ));
             }
         };
+        let tag = Tag(response
+            .e_tag()
+            .ok_or_else(|| failed("no entity tag".to_string()))?
+            .to_string());
         let body = response
             .body
             .collect()
             .await
             .map_err(|error| failed(error.to_string()))?;
-        Ok(Some(body.into_bytes().to_vec()))
+        Ok(Some((body.into_bytes().to_vec(), tag)))
     }
+}
+
+/// The version of an object a read saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag(String);
+
+enum Condition<'a> {
+    Any,
+    Absent,
+    Unchanged(&'a Tag),
 }
 
 #[cfg(test)]

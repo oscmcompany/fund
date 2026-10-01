@@ -5,5 +5,6 @@ pub mod journal;
 pub mod market;
 pub mod monoid;
 pub mod parameter;
+pub mod register;
 pub mod storage;
 pub mod time;

@@ -6,3 +6,4 @@ pub mod heal;
 pub mod ingest;
 pub mod journal;
 pub mod records;
+pub mod register;
