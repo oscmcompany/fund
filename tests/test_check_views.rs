@@ -125,8 +125,8 @@ fn test_a_view_that_does_not_create_fails() {
 }
 
 #[test]
-fn test_a_dormant_view_is_empty_in_every_development_profile_and_production() {
-    for profile in ["production", "development", "development/john.forstmeier"] {
+fn test_a_dormant_view_is_empty_in_every_development_profile() {
+    for profile in ["development", "development/john.forstmeier"] {
         let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), profile);
         assert_eq!(status, 0, "{profile}: {output}");
         assert!(output.contains("journal: dormant\n"), "{profile}: {output}");
@@ -138,7 +138,7 @@ fn test_a_dormant_view_is_empty_in_every_development_profile_and_production() {
 fn test_a_dormant_view_that_reads_rows_fails() {
     let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
     answers.push(("journal", Answer::Rows(4)));
-    let (status, output) = real(&answers, "production");
+    let (status, output) = real(&answers, "development");
     assert_eq!(status, 3, "{output}");
     assert!(
         output.contains("journal: dormant but reads 4 rows"),
@@ -146,12 +146,33 @@ fn test_a_dormant_view_that_reads_rows_fails() {
     );
 }
 
+/// The archiver host ships production's records nightly, so there they are live and must read rows.
+#[test]
+fn test_production_records_are_live() {
+    let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
+    answers.extend([("journal", Answer::Rows(2)), ("logs", Answer::Rows(3))]);
+    let (status, output) = real(&answers, "production");
+    assert_eq!(status, 0, "{output}");
+    assert!(output.contains("journal: 2 rows\n"), "{output}");
+    let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), "production");
+    assert_eq!(status, 3, "{output}");
+    assert!(output.contains("journal: did not create"), "{output}");
+    // Each records view on its own: logs missing while the journal reads.
+    let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
+    answers.push(("journal", Answer::Rows(2)));
+    let (status, output) = real(&answers, "production");
+    assert_eq!(status, 3, "{output}");
+    assert!(output.contains("logs: did not create"), "{output}");
+}
+
 #[test]
 fn test_every_live_view_out_of_reach_is_a_check_not_made() {
-    let (status, output) = real(
-        &bars(Answer::Error(OUT_OF_REACH), Answer::Error(OUT_OF_REACH)),
-        "production",
-    );
+    let mut answers = bars(Answer::Error(OUT_OF_REACH), Answer::Error(OUT_OF_REACH));
+    answers.extend([
+        ("journal", Answer::Error(OUT_OF_REACH)),
+        ("logs", Answer::Error(OUT_OF_REACH)),
+    ]);
+    let (status, output) = real(&answers, "production");
     assert_eq!(status, 1, "{output}");
 }
 
