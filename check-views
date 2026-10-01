@@ -24,8 +24,7 @@ fi
 
 # Each is a claim about the world: a dormant view that starts reading rows fails, so its line is removed on purpose.
 case "${FUND_PROFILE:-}" in
-  # Until the new archiver ships records from its host (pivot task 25).
-  production) dormant=" journal logs " ;;
+  # No developer runs an archiver that ships to their own bucket; production's ships from the archiver host nightly.
   development | development/*) dormant=" journal logs " ;;
   *) dormant=" " ;;
 esac
