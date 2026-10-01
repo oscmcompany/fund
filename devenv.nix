@@ -169,6 +169,82 @@ in {
     echo "Nix checks completed successfully"
   '';
 
+  scripts.start-duckdb.exec = ''
+    set -euo pipefail
+    cd "$DEVENV_ROOT"
+    duckdb -init views.sql "$@"
+  '';
+
+  # Creates each view of views.sql alone against the real buckets and counts its rows. An empty view and one that does
+  # not create both answer nothing, so both fail; a view whose producer does not run in this profile must be empty.
+  # Exits 0 when every view is as expected, 3 when any is not, and 1 when the check could not be made.
+  scripts.check-views.exec = ''
+    set -euo pipefail
+    cd "$DEVENV_ROOT"
+    for variable in AWS_S3_ARCHIVE_BUCKET_NAME AWS_S3_RECORDS_BUCKET_NAME; do
+      if [[ -z "''${!variable:-}" ]]; then
+        echo "Error: $variable is not set" >&2
+        exit 1
+      fi
+    done
+    mapfile -t views < <(sed -nE 's/^CREATE OR REPLACE VIEW ([a-z_]+) AS$/\1/p' views.sql)
+    if [[ ''${#views[@]} -eq 0 ]]; then
+      echo "Error: found no views in views.sql" >&2
+      exit 1
+    fi
+    # Each is a claim about the world: a dormant view that starts reading rows fails, so its line is removed on purpose.
+    case "''${FUND_PROFILE:-}" in
+      # Until the new archiver ships records from its host (pivot task 25).
+      production) dormant=" journal logs " ;;
+      development/*) dormant=" journal logs " ;;
+      *) dormant=" " ;;
+    esac
+    preamble="$(awk '/^CREATE OR REPLACE VIEW /{exit} {print}' views.sql)"
+    broken=0 live=0 unread=0
+    for view in "''${views[@]}"; do
+      statement="$(awk -v start="CREATE OR REPLACE VIEW $view AS" '$0 == start {inside = 1} inside {print} inside && /^\);$/ {exit}' views.sql)"
+      # Bailing on the first error keeps a failed creation from adding a second error of its own.
+      if output="$(printf '%s\n.bail on\n%s\nSELECT count(*) FROM %s;\n' "$preamble" "$statement" "$view" | duckdb -csv -noheader 2>&1)"; then
+        rows="$(grep -E '^[0-9]+$' <<<"$output" | tail -n 1)"
+      else
+        rows=""
+      fi
+      if [[ "$dormant" == *" $view "* ]]; then
+        if [[ -n "$rows" && "$rows" -gt 0 ]]; then
+          echo "$view: dormant but reads $rows rows; remove it from the dormant list"
+          broken=$((broken + 1))
+        elif [[ -n "$rows" ]] || { grep -q 'No files found that match the pattern' <<<"$output" && [[ "$(grep -c 'Error' <<<"$output")" -eq 1 ]]; }; then
+          echo "$view: dormant"
+        else
+          echo "$view: dormant, and failed for another reason than nothing being written: $(grep -m 1 'Error' <<<"$output")"
+          broken=$((broken + 1))
+        fi
+        continue
+      fi
+      live=$((live + 1))
+      if [[ -z "$rows" ]]; then
+        echo "$view: did not create: $(grep -m 1 'Error' <<<"$output" || echo "$output")"
+        broken=$((broken + 1))
+        unread=$((unread + 1))
+      elif [[ "$rows" -eq 0 ]]; then
+        echo "$view: reads no rows"
+        broken=$((broken + 1))
+      else
+        echo "$view: $rows rows"
+      fi
+    done
+    # Every live view unreadable is the check failing to reach S3, not every view breaking at once.
+    if [[ "$live" -gt 0 && "$unread" -eq "$live" ]]; then
+      echo "Error: no live view could be read; the check was not made" >&2
+      exit 1
+    fi
+    if [[ "$broken" -gt 0 ]]; then
+      echo "$broken of ''${#views[@]} views are not as this profile expects"
+      exit 3
+    fi
+    echo "All $live live views read rows"
+  '';
+
   scripts.bump-rust-dependencies.exec = ''
     set -euo pipefail
     cargo update
@@ -241,6 +317,8 @@ in {
       echo ""
       echo "  Scripts:"
       echo "    bump-rust-dependencies      Update the Cargo lockfile"
+      echo "    start-duckdb                DuckDB with the archive views"
+      echo "    check-views                 Fail on any archive view that is empty"
     } >&2
   '';
 }
