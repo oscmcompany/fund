@@ -2,6 +2,8 @@
 //! the denominator the multiple-testing haircut reads. Fields legacy wrote as prose keep a variant saying so, and are
 //! never reconstructed into the structured form.
 
+pub mod readings;
+
 use std::fmt::Display;
 use std::num::NonZeroU32;
 use std::str::FromStr;

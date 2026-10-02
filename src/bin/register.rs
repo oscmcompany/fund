@@ -78,6 +78,8 @@ enum Command {
     },
     /// One accession as stored.
     Show { number: AccessionNumber },
+    /// Bid calibration, tests by quarter, and the spread of study cost.
+    Report,
 }
 
 fn measured(raw: &str) -> Result<Measured, String> {
@@ -179,6 +181,10 @@ async fn run(register: &Register, command: Command) -> Result<(), Box<dyn std::e
                 }
             }
         }
+        Command::Report => {
+            let accessions = register.all().await.map_err(|error| error.to_string())?;
+            print!("{}", fund::common::register::readings::report(&accessions));
+        }
         Command::Show { number } => {
             let accession = register
                 .read(number)
@@ -245,7 +251,10 @@ mod tests {
                 assert_eq!((bid.estimate(), bid.coverage_percent()), (4.0, 80));
                 assert_eq!(supersedes, AccessionNumber::new(5));
             }
-            Command::Close { .. } | Command::List { .. } | Command::Show { .. } => {
+            Command::Close { .. }
+            | Command::List { .. }
+            | Command::Show { .. }
+            | Command::Report => {
                 panic!("parsed as another command")
             }
         }
@@ -323,7 +332,10 @@ mod tests {
                 (statistic.as_str(), measured),
                 ("-5.7bp net", Measured::Value(-5.7))
             ),
-            Command::Open { .. } | Command::List { .. } | Command::Show { .. } => {
+            Command::Open { .. }
+            | Command::List { .. }
+            | Command::Show { .. }
+            | Command::Report => {
                 panic!("parsed as another command")
             }
         }
