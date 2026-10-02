@@ -4,6 +4,7 @@
 
 pub mod cost;
 pub mod haircut;
+pub mod permutation;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal};
 use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
+use crate::common::laboratory::permutation::Generator;
 use crate::common::register::{
     Accession, AccessionNumber, Family, Horizon, OpenAccession, Unit, Universe,
 };
@@ -225,10 +227,24 @@ impl Exploration {
     }
 }
 
-/// Which questions a study may answer: only a registered one has a bar to clear.
+/// What a registered study's reading is set against, fixed before it runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "null", rename_all = "snake_case")]
+pub enum Null {
+    /// Labels permuted `permutations` times: matched arms flip each session's sign, disjoint arms reshuffle their
+    /// pooled sessions into groups of the original sizes.
+    Permuted { seed: u64, permutations: NonZeroU32 },
+    /// No null, and why, so its absence is read beside the result.
+    Omitted { reason: String },
+}
+
+/// Which questions a study may answer: only a registered one has a bar to clear and a null to clear it against.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lane {
-    Registered(OpenAccession),
+    Registered {
+        accession: OpenAccession,
+        null: Null,
+    },
     Exploratory(Exploration),
 }
 
@@ -237,6 +253,7 @@ pub enum Lane {
 pub enum StudyRefusal {
     BlankName,
     BlankQuestion,
+    BlankReason,
     NoReadings {
         arm: String,
     },
@@ -279,6 +296,7 @@ impl std::fmt::Display for StudyRefusal {
         match self {
             Self::BlankName => write!(formatter, "an arm has no name"),
             Self::BlankQuestion => write!(formatter, "the exploration asks no question"),
+            Self::BlankReason => write!(formatter, "the null is omitted without a reason"),
             Self::NoReadings { arm } => write!(formatter, "arm {arm} read no sessions"),
             Self::ReadTwice { arm, session } => write!(formatter, "arm {arm} read {session} twice"),
             Self::OutOfRange {
@@ -340,6 +358,14 @@ impl Study {
         treatment: Arm,
         control: Arm,
     ) -> Result<Self, StudyRefusal> {
+        if let Lane::Registered {
+            null: Null::Omitted { reason },
+            ..
+        } = &lane
+            && reason.trim().is_empty()
+        {
+            return Err(StudyRefusal::BlankReason);
+        }
         if treatment.name == control.name {
             return Err(StudyRefusal::ArmsNotDistinct {
                 name: treatment.name,
@@ -412,9 +438,23 @@ impl Study {
             .distribution
             .map(|distribution| Effect::of(&self.quantity, distribution.mean));
         let finding = match self.lane {
-            Lane::Registered(accession) => Finding::Registered {
+            Lane::Registered { accession, null } => Finding::Registered {
                 accession: accession.number(),
                 family: accession.family(),
+                null: match null {
+                    Null::Permuted { seed, permutations } => NullRead::Permuted {
+                        seed,
+                        permutations,
+                        at_least_as_extreme: at_least_as_extreme(
+                            self.pairing,
+                            &self.treatment,
+                            &self.control,
+                            &mut Generator::new(seed),
+                            permutations,
+                        ),
+                    },
+                    Null::Omitted { reason } => NullRead::Omitted { reason },
+                },
                 effect,
                 standard_error: difference
                     .distribution
@@ -505,6 +545,75 @@ fn welch(treatment: Distribution, control: Distribution) -> Distribution {
         standard_error: (treatment_variance + control_variance).sqrt(),
         degrees_of_freedom,
     }
+}
+
+/// How many of `permutations` relabelings move the means at least as far apart as the arms as read; `None` where the
+/// difference itself could not be measured.
+fn at_least_as_extreme(
+    pairing: Pairing,
+    treatment: &Arm,
+    control: &Arm,
+    generator: &mut Generator,
+    permutations: NonZeroU32,
+) -> Option<u32> {
+    let measured = |arm: &Arm| -> Vec<f64> { arm.readings.values().flatten().copied().collect() };
+    // A relabeling that reproduces the reading can differ from it in the last bits, and must still count.
+    let reaches = |statistic: f64, observed: f64, scale: f64| statistic >= observed - 1e-12 * scale;
+    let count = match pairing {
+        Pairing::Matched => {
+            let differences: Vec<f64> = treatment
+                .readings
+                .values()
+                .zip(control.readings.values())
+                .filter_map(|(treatment, control)| Some((*treatment)? - (*control)?))
+                .collect();
+            if differences.len() < 2 {
+                return None;
+            }
+            let observed = differences.iter().sum::<f64>().abs();
+            let scale = differences
+                .iter()
+                .map(|difference| difference.abs())
+                .sum::<f64>();
+            (0..permutations.get())
+                .filter(|_| {
+                    let flipped: f64 = differences
+                        .iter()
+                        .map(|difference| match generator.coin() {
+                            true => -difference,
+                            false => *difference,
+                        })
+                        .sum();
+                    reaches(flipped.abs(), observed, scale)
+                })
+                .count()
+        }
+        Pairing::Disjoint => {
+            let (treatment, control) = (measured(treatment), measured(control));
+            if treatment.len() < 2 || control.len() < 2 {
+                return None;
+            }
+            let treatment_sessions = treatment.len();
+            let gap = |pooled: &[f64]| {
+                let (left, right) = pooled.split_at(treatment_sessions);
+                (left.iter().sum::<f64>() / left.len() as f64
+                    - right.iter().sum::<f64>() / right.len() as f64)
+                    .abs()
+            };
+            let mut pooled = [treatment, control].concat();
+            let observed = gap(&pooled);
+            let scale = pooled
+                .iter()
+                .fold(0.0, |largest: f64, value| largest.max(value.abs()));
+            (0..permutations.get())
+                .filter(|_| {
+                    generator.shuffle(&mut pooled);
+                    reaches(gap(&pooled), observed, scale)
+                })
+                .count()
+        }
+    };
+    Some(u32::try_from(count).expect("a count of permutations fits the u32 it was drawn from"))
 }
 
 /// What the difference is worth, so a gross return never appears without its charge.
@@ -616,6 +725,7 @@ pub enum Finding {
     Registered {
         accession: AccessionNumber,
         family: Family,
+        null: NullRead,
         effect: Option<Effect>,
         standard_error: Option<f64>,
         degrees_of_freedom: Option<DegreesOfFreedom>,
@@ -623,6 +733,21 @@ pub enum Finding {
     Exploratory {
         exploration: Exploration,
         effect: Option<Effect>,
+    },
+}
+
+/// What the null read, beside the reading it is set against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "null", rename_all = "snake_case")]
+pub enum NullRead {
+    Permuted {
+        seed: u64,
+        permutations: NonZeroU32,
+        /// `None` where the difference itself could not be measured.
+        at_least_as_extreme: Option<u32>,
+    },
+    Omitted {
+        reason: String,
     },
 }
 
@@ -713,6 +838,28 @@ impl StudyRan {
         }
     }
 
+    /// The share of label permutations at least as extreme as the reading, counting the reading itself so it is never
+    /// zero: a p-value that assumes nothing about the readings' distribution.
+    pub fn permutation_share(&self) -> Option<f64> {
+        match &self.finding {
+            Finding::Registered {
+                null:
+                    NullRead::Permuted {
+                        permutations,
+                        at_least_as_extreme,
+                        ..
+                    },
+                ..
+            } => at_least_as_extreme
+                .map(|count| (f64::from(count) + 1.0) / (f64::from(permutations.get()) + 1.0)),
+            Finding::Registered {
+                null: NullRead::Omitted { .. },
+                ..
+            }
+            | Finding::Exploratory { .. } => None,
+        }
+    }
+
     /// Whether an exploratory effect reaches its kill line in the declared direction.
     pub fn survives_kill_line(&self) -> Option<bool> {
         match &self.finding {
@@ -733,6 +880,7 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::common::laboratory::cost::FillStyle;
+    use crate::common::laboratory::permutation::Generator;
     use crate::common::register::{Bid, Closing, Measured, Opening, Sample, StudyCost, Verdict};
 
     fn session(day: i64) -> SessionDate {
@@ -775,7 +923,56 @@ mod tests {
 
     /// Accession 1, open in the overnight family.
     fn registered() -> Lane {
-        Lane::Registered(accession(1, Family::Overnight).study().unwrap())
+        registered_with(Null::Permuted {
+            seed: 7,
+            permutations: NonZeroU32::new(199).unwrap(),
+        })
+    }
+
+    fn registered_with(null: Null) -> Lane {
+        Lane::Registered {
+            accession: accession(1, Family::Overnight).study().unwrap(),
+            null,
+        }
+    }
+
+    fn at_least_as_extreme_of(ran: &StudyRan) -> Option<u32> {
+        match ran.finding() {
+            Finding::Registered {
+                null:
+                    NullRead::Permuted {
+                        at_least_as_extreme,
+                        ..
+                    },
+                ..
+            } => *at_least_as_extreme,
+            Finding::Registered { .. } | Finding::Exploratory { .. } => panic!("a permuted null"),
+        }
+    }
+
+    /// A standard normal draw by Box–Muller, for noise whose truth is known.
+    fn normal(generator: &mut Generator) -> f64 {
+        let uniform = |generator: &mut Generator| {
+            ((generator.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let (radius, angle) = (uniform(generator), uniform(generator));
+        (-2.0 * radius.ln()).sqrt() * (2.0 * std::f64::consts::PI * angle).cos()
+    }
+
+    /// A matched study of `sessions` noise differences shifted by `effect`, judged with no null.
+    fn noise(generator: &mut Generator, sessions: usize, effect: f64) -> StudyRan {
+        let differences: Vec<Option<f64>> = (0..sessions)
+            .map(|_| Some(effect + normal(generator)))
+            .collect();
+        measure(
+            registered_with(Null::Omitted {
+                reason: "calibration".to_string(),
+            }),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &differences),
+            arm("control", &vec![Some(0.0); sessions]),
+        )
     }
 
     /// A register whose overnight family has opened `tests` accessions, accession 1 among them.
@@ -1222,6 +1419,203 @@ mod tests {
             let encoded = serde_json::to_string(&ran).unwrap();
             assert_eq!(serde_json::from_str::<StudyRan>(&encoded).unwrap(), ran);
         }
+    }
+
+    /// Twenty positive differences: only the two all-same-sign relabelings reach them, about one in half a million.
+    #[test]
+    fn test_a_consistent_effect_is_rare_under_its_null() {
+        let differences: Vec<Option<f64>> = (1..=20).map(|day| Some(f64::from(day))).collect();
+        let ran = measure(
+            registered(),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &differences),
+            arm("control", &[Some(0.0); 20]),
+        );
+        assert_eq!(at_least_as_extreme_of(&ran), Some(0));
+        assert_eq!(ran.permutation_share(), Some(1.0 / 200.0));
+    }
+
+    /// Three equal differences tie the reading exactly on two of eight relabelings, and a tie counts.
+    #[test]
+    fn test_a_relabeling_that_ties_the_reading_counts_as_extreme() {
+        let ran = measure(
+            registered(),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &[Some(1.0), Some(1.0), Some(1.0)]),
+            arm("control", &[Some(0.0); 3]),
+        );
+        let count = at_least_as_extreme_of(&ran).unwrap();
+        assert!((30..=70).contains(&count), "{count} of 199");
+    }
+
+    #[test]
+    fn test_disjoint_groups_are_reshuffled_into_their_own_sizes() {
+        let separated = measure(
+            registered(),
+            unpriced(),
+            Pairing::Disjoint,
+            arm(
+                "treatment",
+                &[Some(10.0), Some(11.0), Some(12.0), Some(13.0), Some(14.0)],
+            ),
+            arm_from(
+                "control",
+                20,
+                &[
+                    Some(0.0),
+                    Some(1.0),
+                    Some(2.0),
+                    Some(3.0),
+                    Some(4.0),
+                    Some(5.0),
+                ],
+            ),
+        );
+        // Only the one split of eleven readings into five and six that reproduces the groups is as extreme.
+        assert!(at_least_as_extreme_of(&separated).unwrap() <= 1);
+        let interleaved = measure(
+            registered(),
+            unpriced(),
+            Pairing::Disjoint,
+            arm("treatment", &[Some(0.0), Some(2.0), Some(4.0), Some(6.0)]),
+            arm_from("control", 20, &[Some(1.0), Some(3.0), Some(5.0), Some(7.0)]),
+        );
+        assert!(
+            interleaved.permutation_share().unwrap() > 0.5,
+            "{:?}",
+            interleaved.permutation_share()
+        );
+    }
+
+    #[test]
+    fn test_a_seed_redraws_the_same_null() {
+        let mut generator = Generator::new(3);
+        let differences: Vec<Option<f64>> = (0..30)
+            .map(|_| Some(0.3 + normal(&mut generator)))
+            .collect();
+        let run = |seed| {
+            measure(
+                registered_with(Null::Permuted {
+                    seed,
+                    permutations: NonZeroU32::new(999).unwrap(),
+                }),
+                unpriced(),
+                Pairing::Matched,
+                arm("treatment", &differences),
+                arm("control", &[Some(0.0); 30]),
+            )
+        };
+        assert_eq!(
+            at_least_as_extreme_of(&run(1)),
+            at_least_as_extreme_of(&run(1))
+        );
+        assert_ne!(
+            at_least_as_extreme_of(&run(1)),
+            at_least_as_extreme_of(&run(2))
+        );
+    }
+
+    #[test]
+    fn test_a_null_is_either_drawn_or_omitted_with_its_reason() {
+        let study = |null| {
+            Study::new(
+                registered_with(null),
+                unpriced(),
+                Pairing::Matched,
+                arm("treatment", &[Some(1.0), Some(2.0)]),
+                arm("control", &[Some(0.0), Some(0.0)]),
+            )
+        };
+        assert_eq!(
+            study(Null::Omitted {
+                reason: " ".to_string()
+            }),
+            Err(StudyRefusal::BlankReason)
+        );
+        let omitted = study(Null::Omitted {
+            reason: "the arms share no exchangeable label".to_string(),
+        })
+        .unwrap()
+        .measure();
+        assert_eq!(omitted.permutation_share(), None);
+        match omitted.finding() {
+            Finding::Registered {
+                null: NullRead::Omitted { reason },
+                ..
+            } => assert_eq!(reason, "the arms share no exchangeable label"),
+            Finding::Registered { .. } | Finding::Exploratory { .. } => panic!("omitted"),
+        }
+        let unmeasured = measure(
+            registered(),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &[Some(1.0), None]),
+            arm("control", &[Some(0.0), Some(0.0)]),
+        );
+        assert_eq!(
+            (
+                at_least_as_extreme_of(&unmeasured),
+                unmeasured.permutation_share()
+            ),
+            (None, None)
+        );
+    }
+
+    /// Families of ten noise studies clear their haircut at no more than the promised 5%, at thirty sessions and at
+    /// three, where a normal cutoff would clear far more often; a real effect clears nearly always.
+    #[test]
+    fn test_noise_families_clear_no_more_often_than_the_family_wise_rate() {
+        let mut generator = Generator::new(2026);
+        let register = family(10);
+        for sessions in [30, 3] {
+            let families = 300;
+            let clearing = (0..families)
+                .filter(|_| {
+                    (0..10).any(|_| {
+                        noise(&mut generator, sessions, 0.0).clears_haircut(&register) == Some(true)
+                    })
+                })
+                .count();
+            let rate = clearing as f64 / f64::from(families);
+            assert!(
+                (0.01..=0.083).contains(&rate),
+                "{sessions} sessions: {clearing} of {families}"
+            );
+        }
+        let found = (0..100)
+            .filter(|_| noise(&mut generator, 30, 1.0).clears_haircut(&family(1)) == Some(true))
+            .count();
+        assert!(found >= 95, "{found} of 100");
+    }
+
+    /// Under noise a p-value is uniform, so the permutation share lands below 5% and below a half about as often.
+    #[test]
+    fn test_the_permutation_share_is_uniform_under_noise() {
+        let mut generator = Generator::new(17);
+        let shares: Vec<f64> = (0..400)
+            .map(|seed| {
+                let differences: Vec<Option<f64>> =
+                    (0..20).map(|_| Some(normal(&mut generator))).collect();
+                measure(
+                    registered_with(Null::Permuted {
+                        seed,
+                        permutations: NonZeroU32::new(99).unwrap(),
+                    }),
+                    unpriced(),
+                    Pairing::Matched,
+                    arm("treatment", &differences),
+                    arm("control", &[Some(0.0); 20]),
+                )
+                .permutation_share()
+                .unwrap()
+            })
+            .collect();
+        let below =
+            |line: f64| shares.iter().filter(|share| **share <= line).count() as f64 / 400.0;
+        assert!((0.017..=0.083).contains(&below(0.05)), "{}", below(0.05));
+        assert!((0.43..=0.57).contains(&below(0.5)), "{}", below(0.5));
     }
 
     fn readings() -> impl Strategy<Value = Vec<(f64, f64, f64)>> {
