@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::archive::bars::{DecodeRefusal, decode};
 use crate::archive::{Archive, ArchiveError};
 use crate::common::heal::Leg;
-use crate::common::laboratory::dataset::{Fingerprint, FingerprintRefusal};
+use crate::common::laboratory::dataset::{Contamination, Fingerprint, FingerprintRefusal};
 use crate::common::market::record::Bar;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
@@ -70,9 +70,8 @@ pub async fn daily_bars(
     last: SessionDate,
 ) -> Result<Dataset, DatasetError> {
     let leg = Leg::MassiveDailyBars;
-    let series = leg.key(first).series();
     // Taken empty first, so the window is checked before any read and its missing sessions are the ones to read.
-    let owed = Fingerprint::new(series.clone(), first, last, calendar, BTreeMap::new())
+    let owed = Fingerprint::new(leg, first, last, calendar, BTreeMap::new())
         .map_err(DatasetError::Window)?;
     let (mut bars, mut tags) = (BTreeMap::new(), BTreeMap::new());
     for session in owed.missing() {
@@ -92,8 +91,22 @@ pub async fn daily_bars(
         tags.insert(*session, tag.as_str().to_string());
     }
     let fingerprint =
-        Fingerprint::new(series, first, last, calendar, tags).map_err(DatasetError::Window)?;
+        Fingerprint::new(leg, first, last, calendar, tags).map_err(DatasetError::Window)?;
     Ok(Dataset { bars, fingerprint })
+}
+
+/// Every partition `fingerprint` read that has since been rewritten or removed, each tag looked up now.
+pub async fn lineage(
+    archive: &Archive,
+    fingerprint: &Fingerprint,
+) -> Result<Vec<Contamination>, ArchiveError> {
+    let mut current = BTreeMap::new();
+    for session in fingerprint.partitions().keys() {
+        if let Some(tag) = archive.tag(&fingerprint.leg().key(*session)).await? {
+            current.insert(*session, tag.as_str().to_string());
+        }
+    }
+    Ok(fingerprint.contaminated(&current))
 }
 
 fn admit(session: SessionDate, bars: Vec<Bar>) -> Result<Vec<Bar>, DatasetError> {
@@ -150,6 +163,7 @@ mod tests {
         }
         let again = daily_bars(&archive, &calendar, first, last).await.unwrap();
         assert_eq!(again.fingerprint(), fingerprint);
+        assert_eq!(lineage(&archive, fingerprint).await.unwrap(), []);
         println!(
             "{} sessions read, {} missing, {} bars; {:?}",
             fingerprint.partitions().len(),

@@ -6,7 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use crate::common::journal::{Commit, Observation, Record, RunId};
+use crate::common::journal::{Commit, Observation, ReadLine, Record, RunId, read};
 use crate::common::time::SessionDate;
 use chrono::{DateTime, Utc};
 
@@ -49,6 +49,30 @@ impl Journal {
 
     pub fn commit(&self) -> Option<&Commit> {
         self.commit.as_ref()
+    }
+
+    /// Every readable record in this journal's directory, from every run, oldest file first. An unreadable line is
+    /// skipped: a crash can lose a record, and a torn line is that loss.
+    pub fn history(&self) -> io::Result<Vec<Record>> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&self.directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<_>>()?;
+        files.retain(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("session-") && name.ends_with(".jsonl"))
+        });
+        files.sort();
+        let mut records = Vec::new();
+        for file in files {
+            for line in read(&std::fs::read_to_string(file)?) {
+                match line {
+                    ReadLine::Read(record) => records.push(*record),
+                    ReadLine::Unreadable { .. } => {}
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// Returns once the record is durable, so a caller that waits before acting knows the observation survives the
