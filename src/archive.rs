@@ -228,6 +228,12 @@ impl Archive {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag(String);
 
+impl Tag {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 enum Condition<'a> {
     Any,
     Absent,
