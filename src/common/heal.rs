@@ -149,7 +149,8 @@ impl Held {
         for path in paths {
             let session = Key::parse(&path)
                 .ok()
-                .and_then(|key| key.session().filter(|session| key == leg.key(*session)));
+                .filter(|key| *key == leg.key(key.session()))
+                .map(|key| key.session());
             match session {
                 Some(session) => {
                     held.sessions.insert(session);

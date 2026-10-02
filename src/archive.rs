@@ -80,11 +80,6 @@ impl Archive {
         Self::named(configuration, "AWS_S3_RECORDS_BUCKET_NAME")
     }
 
-    /// The one Register every profile shares, named by `AWS_S3_REGISTER_BUCKET_NAME`.
-    pub fn register(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {
-        Self::named(configuration, "AWS_S3_REGISTER_BUCKET_NAME")
-    }
-
     fn named(
         configuration: &aws_config::SdkConfig,
         variable: &'static str,
