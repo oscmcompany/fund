@@ -6,7 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use crate::common::journal::{Commit, Observation, ReadLine, Record, RunId, read};
+use crate::common::journal::{Commit, Observation, ReadLine, Record, RunId, UnreadableCause, read};
 use crate::common::time::SessionDate;
 use chrono::{DateTime, Utc};
 
@@ -51,8 +51,13 @@ impl Journal {
         self.commit.as_ref()
     }
 
-    /// Every readable record in this journal's directory, from every run, oldest file first. An unreadable line is
-    /// skipped: a crash can lose a record, and a torn line is that loss.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Every record in this journal's directory, from every run, oldest file first. A line that is not JSON is
+    /// skipped, since a crash can tear the last line it wrote; a complete record this build cannot read is an error,
+    /// so a reader never acts on a history with a record silently missing.
     pub fn history(&self) -> io::Result<Vec<Record>> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&self.directory)?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -65,10 +70,22 @@ impl Journal {
         files.sort();
         let mut records = Vec::new();
         for file in files {
-            for line in read(&std::fs::read_to_string(file)?) {
+            for line in read(&std::fs::read_to_string(&file)?) {
                 match line {
                     ReadLine::Read(record) => records.push(*record),
-                    ReadLine::Unreadable { .. } => {}
+                    ReadLine::Unreadable {
+                        cause: UnreadableCause::NotJson { .. },
+                        ..
+                    } => {}
+                    ReadLine::Unreadable { line, cause, .. } => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{} line {line} is a record this build cannot read: {cause:?}",
+                                file.display()
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -218,6 +235,40 @@ mod tests {
             sequences("session-2026-08-03.jsonl"),
             [(3, run, built_commit())]
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A torn fragment is a lost record and is skipped; a complete record this build cannot read stops the history.
+    #[test]
+    fn test_history_skips_a_torn_line_and_refuses_an_unreadable_record() {
+        let directory = temporary_directory();
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        journal
+            .append("2026-07-31T14:30:00Z".parse().unwrap(), observation())
+            .unwrap();
+        let file = directory.join("session-2026-07-31.jsonl");
+        let append = |text: &str| {
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap();
+            handle.write_all(text.as_bytes()).unwrap();
+        };
+        append("{\"torn\n");
+        std::fs::write(directory.join("heal.lock"), "").unwrap();
+        assert_eq!(journal.history().unwrap().len(), 1);
+        for unreadable in [
+            "{\"schema_version\":1,\"event_type\":\"study_ran\"}\n",
+            "{\"schema_version\":99}\n",
+            "{\"event_type\":\"study_ran\"}\n",
+        ] {
+            let before = std::fs::read_to_string(&file).unwrap();
+            append(unreadable);
+            let error = journal.history().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{unreadable}");
+            assert!(error.to_string().contains("line 3"), "{error}");
+            std::fs::write(&file, before).unwrap();
+        }
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

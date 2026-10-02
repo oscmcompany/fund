@@ -43,8 +43,16 @@ pub fn studies_ran(journal: &Journal) -> io::Result<Vec<(RunId, StudyRan)>> {
 }
 
 /// Measures `study` and returns the reading once its `study_ran` record is durable. A registered study is first held
-/// against the exploratory runs this journal holds, read here so no caller can hand in a shorter history.
+/// against the exploratory runs this journal holds, read here so no caller can hand in a shorter history, under a lock
+/// on the directory so no run lands between the check and the append.
 pub fn run(study: Study, journal: &mut Journal) -> Result<StudyRan, RunError> {
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(journal.directory().join("laboratory.lock"))
+        .map_err(RunError::Journal)?;
+    lock.lock().map_err(RunError::Journal)?;
     let history = studies_ran(journal).map_err(RunError::Journal)?;
     study
         .holdout(history.iter().map(|(run, ran)| (*run, ran)))
@@ -115,10 +123,12 @@ mod tests {
         let ran = run(study, &mut journal).unwrap();
         let file = std::fs::read_dir(&directory)
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap();
         let held: Vec<Observation> = read(&std::fs::read_to_string(file).unwrap())
             .into_iter()
             .map(|line| match line {
@@ -251,6 +261,66 @@ mod tests {
         }
         assert!(run(study(registered(), 4..8), &mut journal).is_ok());
         assert_eq!(studies_ran(&journal).unwrap().len(), 2);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A run waits for the directory's lock, so none can land between another's history read and its append.
+    #[test]
+    fn test_a_run_waits_for_the_journal_directory_lock() {
+        let directory = std::env::temp_dir().join(format!("fund-laboratory-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let held = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(directory.join("laboratory.lock"))
+            .unwrap();
+        held.lock().unwrap();
+        let lane = Lane::Exploratory(
+            Exploration::new(
+                Family::Overnight,
+                "liquid-common@1".parse().unwrap(),
+                "1 sessions".parse().unwrap(),
+                "does the gap persist",
+                KillLine::new(0.0, Direction::Higher).unwrap(),
+            )
+            .unwrap(),
+        );
+        let session = |day| {
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap())
+                .plus_calendar_days(day)
+        };
+        let arm =
+            |name| Arm::new(name, (0..2).map(|day| (session(day), Some(day as f64))), 2).unwrap();
+        let study = Study::new(
+            lane,
+            Source::Synthetic {
+                description: "a lock test".to_string(),
+            },
+            Quantity::Unpriced {
+                units: "net-bp".parse().unwrap(),
+            },
+            Pairing::Matched,
+            arm("treatment"),
+            arm("control"),
+        )
+        .unwrap();
+        let (finished, waiting) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let ran = run(study, &mut journal).is_ok();
+            finished.send(ran).unwrap();
+        });
+        assert!(
+            waiting
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err()
+        );
+        held.unlock().unwrap();
+        assert_eq!(
+            waiting.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true)
+        );
+        runner.join().unwrap();
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
