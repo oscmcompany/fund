@@ -58,7 +58,8 @@ fn session_of(key: &Key) -> Option<SessionDate> {
         | Key::Quotes { .. }
         | Key::Trades { .. }
         | Key::Reference { .. }
-        | Key::Logs { .. } => None,
+        | Key::Logs { .. }
+        | Key::Register { .. } => None,
     }
 }
 

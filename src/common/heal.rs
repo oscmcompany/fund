@@ -147,11 +147,14 @@ impl Held {
     pub fn of(leg: Leg, paths: impl IntoIterator<Item = String>) -> Self {
         let mut held = Self::default();
         for path in paths {
-            match Key::parse(&path) {
-                Ok(key) if key == leg.key(key.session()) => {
-                    held.sessions.insert(key.session());
+            let session = Key::parse(&path)
+                .ok()
+                .and_then(|key| key.session().filter(|session| key == leg.key(*session)));
+            match session {
+                Some(session) => {
+                    held.sessions.insert(session);
                 }
-                Ok(_) | Err(_) => held.unrecognized.push(path),
+                None => held.unrecognized.push(path),
             }
         }
         held

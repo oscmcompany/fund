@@ -359,11 +359,158 @@ impl std::fmt::Display for DollarVolume {
     }
 }
 
+/// A non-negative amount of money in millionths of a dollar, `PRICE_SCALE` to the dollar, such as a study's spend.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct Dollars(u64);
+
+/// Why an amount was refused.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DollarsRefusal {
+    /// Negative, not finite, too large, or finer than a millionth.
+    Unrepresentable {
+        dollars: f64,
+    },
+    Unparsable {
+        raw: String,
+    },
+}
+
+impl std::fmt::Display for DollarsRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unrepresentable { dollars } => {
+                write!(
+                    formatter,
+                    "{dollars} is not a non-negative whole number of millionths of a dollar"
+                )
+            }
+            Self::Unparsable { raw } => {
+                write!(
+                    formatter,
+                    "`{raw}` is not dollars with at most six decimal places"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DollarsRefusal {}
+
+impl Dollars {
+    pub fn from_millionths(millionths: u64) -> Self {
+        Self(millionths)
+    }
+
+    pub fn from_float(dollars: f64) -> Result<Self, DollarsRefusal> {
+        // Refused before snapping, which would round a tiny negative to zero.
+        if dollars < 0.0 {
+            return Err(DollarsRefusal::Unrepresentable { dollars });
+        }
+        let scaled = dollars * PRICE_SCALE as f64;
+        snap(scaled)
+            .filter(|nearest| (0.0..u64::MAX as f64).contains(nearest))
+            .map(|nearest| Self(nearest as u64))
+            .ok_or(DollarsRefusal::Unrepresentable { dollars })
+    }
+
+    pub fn millionths(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::str::FromStr for Dollars {
+    type Err = DollarsRefusal;
+
+    /// Read digit by digit, so no amount passes through a float: up to six decimal places, no sign.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let refused = || DollarsRefusal::Unparsable {
+            raw: raw.to_string(),
+        };
+        let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+        let digits =
+            |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+        let fraction_allowed = match raw.contains('.') {
+            true => digits(fraction) && fraction.len() <= 6,
+            false => true,
+        };
+        if !digits(whole) || !fraction_allowed {
+            return Err(refused());
+        }
+        let scale = PRICE_SCALE.unsigned_abs();
+        let fraction = format!("{fraction:0<6}");
+        whole
+            .parse::<u64>()
+            .ok()
+            .and_then(|whole| whole.checked_mul(scale))
+            .zip(fraction.parse::<u64>().ok())
+            .and_then(|(whole, fraction)| whole.checked_add(fraction))
+            .map(Self)
+            .ok_or_else(refused)
+    }
+}
+
+impl std::fmt::Display for Dollars {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scale = PRICE_SCALE.unsigned_abs();
+        write_decimal(
+            formatter,
+            u128::from(self.0 / scale),
+            u128::from(self.0 % scale),
+            6,
+            2,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn test_dollars_are_exact_millionths() {
+        let dollars = |raw: &str| raw.parse::<Dollars>();
+        assert_eq!(dollars("1.49").map(Dollars::millionths), Ok(1_490_000));
+        assert_eq!(dollars("0.001").map(Dollars::millionths), Ok(1_000));
+        assert_eq!(dollars("0").map(Dollars::millionths), Ok(0));
+        assert_eq!(Dollars::from_millionths(1_000).to_string(), "0.001");
+        assert_eq!(Dollars::from_millionths(1_490_000).to_string(), "1.49");
+        for refused in [
+            "-0.01",
+            "0.0000001",
+            "NaN",
+            "inf",
+            "",
+            "1e30",
+            ".5",
+            "5.",
+            "1,000",
+            "18446744073710",
+        ] {
+            assert!(dollars(refused).is_err(), "{refused}");
+        }
+        assert_eq!(
+            Dollars::from_float(0.001).map(Dollars::millionths),
+            Ok(1_000)
+        );
+        for refused in [-0.01, -1e-10, 1e-7, f64::NAN, f64::INFINITY] {
+            assert!(Dollars::from_float(refused).is_err(), "{refused}");
+        }
+    }
 
     #[test]
     fn test_a_symbol_is_taken_as_written() {
@@ -541,6 +688,14 @@ mod tests {
         fn property_a_price_survives_its_presentation_float(ticks in 1..=MAXIMUM_PRICE_TICKS) {
             let price = Price::from_ticks(ticks).unwrap();
             prop_assert_eq!(Price::from_dollars(price.dollars()), Ok(price));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn property_dollars_read_back_from_their_display(millionths in any::<u64>()) {
+            let dollars = Dollars::from_millionths(millionths);
+            prop_assert_eq!(dollars.to_string().parse::<Dollars>(), Ok(dollars));
         }
     }
 }

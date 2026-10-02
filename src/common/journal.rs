@@ -75,6 +75,16 @@ impl Commit {
     }
 }
 
+impl std::error::Error for CommitRefusal {}
+
+impl std::str::FromStr for Commit {
+    type Err = CommitRefusal;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::new(raw)
+    }
+}
+
 impl TryFrom<String> for Commit {
     type Error = CommitRefusal;
 

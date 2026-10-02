@@ -14,11 +14,14 @@ use crate::common::time::SessionDate;
     PartialOrd,
     Ord,
     Hash,
+    serde::Serialize,
+    serde::Deserialize,
     strum::Display,
     strum::EnumString,
     strum::IntoStaticStr,
     strum::EnumIter,
 )]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum BarInterval {
     OneMinute,
@@ -324,6 +327,12 @@ mod tests {
         assert_eq!(names, ["one_minute", "five_minute", "one_day"]);
         for interval in BarInterval::iter() {
             assert_eq!(interval.to_string().parse(), Ok(interval));
+            let json = serde_json::to_string(&interval).unwrap();
+            assert_eq!(json, format!("\"{interval}\""));
+            assert_eq!(
+                serde_json::from_str::<BarInterval>(&json).unwrap(),
+                interval
+            );
         }
     }
 
