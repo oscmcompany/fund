@@ -23,7 +23,9 @@ mod tests {
 
     use super::*;
     use crate::common::journal::{ReadLine, RunId, read};
-    use crate::common::laboratory::{Arm, Exploration, Lane, Pairing, Quantity};
+    use crate::common::laboratory::{
+        Arm, Direction, Exploration, KillLine, Lane, Pairing, Quantity,
+    };
     use crate::common::register::Family;
     use crate::common::time::SessionDate;
 
@@ -47,7 +49,7 @@ mod tests {
                 "liquid-common@1".parse().unwrap(),
                 "1 sessions".parse().unwrap(),
                 "does the gap persist",
-                0.5,
+                KillLine::new(0.5, Direction::Higher).unwrap(),
             )
             .unwrap(),
         );

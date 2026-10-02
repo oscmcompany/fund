@@ -6,12 +6,15 @@ pub mod cost;
 pub mod haircut;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal};
-use crate::common::laboratory::haircut::Haircut;
-use crate::common::register::{AccessionNumber, Family, Horizon, OpenAccession, Unit, Universe};
+use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
+use crate::common::register::{
+    Accession, AccessionNumber, Family, Horizon, OpenAccession, Unit, Universe,
+};
 use crate::common::time::SessionDate;
 
 /// What a reading measures, and therefore whether a round trip is charged against it.
@@ -39,6 +42,10 @@ pub enum Pairing {
     Disjoint,
 }
 
+/// The largest reading magnitude an arm admits; no measured quantity comes near it, and below it every sum, square
+/// and Welch term stays finite.
+pub const READING_BOUND: f64 = 1e50;
+
 /// One side of a comparison, read per session because sessions are what vary; rows within a session share their
 /// legs, so a per-event or per-bar arm folds to the session and `observations` carries the row count.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,8 +68,14 @@ impl Arm {
         }
         let mut held = BTreeMap::new();
         for (session, reading) in readings {
-            if reading.is_some_and(|value| !value.is_finite()) {
-                return Err(StudyRefusal::NotFinite { arm: name, session });
+            if let Some(value) =
+                reading.filter(|value| value.is_nan() || value.abs() > READING_BOUND)
+            {
+                return Err(StudyRefusal::OutOfRange {
+                    arm: name,
+                    session,
+                    value,
+                });
             }
             if held.insert(session, reading).is_some() {
                 return Err(StudyRefusal::ReadTwice { arm: name, session });
@@ -85,16 +98,101 @@ impl Arm {
     }
 }
 
-/// What an exploratory study commits to before it reads: the question, where it looks, and the effect below which
-/// the direction is dropped.
+/// Which side of a kill line an effect must land on to survive.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Direction {
+    Higher,
+    Lower,
+}
+
+/// The effect beyond which an exploratory direction is worth pursuing, in the effect's own units: net basis points
+/// for a return, the declared units otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "KillLineFields")]
+pub struct KillLine {
+    threshold: f64,
+    direction: Direction,
+}
+
+#[derive(Deserialize)]
+struct KillLineFields {
+    threshold: f64,
+    direction: Direction,
+}
+
+impl TryFrom<KillLineFields> for KillLine {
+    type Error = StudyRefusal;
+
+    fn try_from(fields: KillLineFields) -> Result<Self, Self::Error> {
+        Self::new(fields.threshold, fields.direction)
+    }
+}
+
+impl KillLine {
+    pub fn new(threshold: f64, direction: Direction) -> Result<Self, StudyRefusal> {
+        match threshold.is_finite() {
+            true => Ok(Self {
+                threshold,
+                direction,
+            }),
+            false => Err(StudyRefusal::KillLineNotFinite { threshold }),
+        }
+    }
+
+    /// Whether `effect` reaches the line, inclusively, on the declared side.
+    pub fn admits(self, effect: f64) -> bool {
+        match self.direction {
+            Direction::Higher => effect >= self.threshold,
+            Direction::Lower => effect <= self.threshold,
+        }
+    }
+}
+
+/// What an exploratory study commits to before it reads: the question, where it looks, and its kill line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ExplorationFields")]
 pub struct Exploration {
     family: Family,
     universe: Universe,
     horizon: Horizon,
     question: String,
-    /// In the effect's own units: net basis points for a return, the declared units otherwise.
-    kill_line: f64,
+    kill_line: KillLine,
+}
+
+#[derive(Deserialize)]
+struct ExplorationFields {
+    family: Family,
+    universe: Universe,
+    horizon: Horizon,
+    question: String,
+    kill_line: KillLine,
+}
+
+impl TryFrom<ExplorationFields> for Exploration {
+    type Error = StudyRefusal;
+
+    fn try_from(fields: ExplorationFields) -> Result<Self, Self::Error> {
+        Self::new(
+            fields.family,
+            fields.universe,
+            fields.horizon,
+            fields.question,
+            fields.kill_line,
+        )
+    }
 }
 
 impl Exploration {
@@ -103,13 +201,12 @@ impl Exploration {
         universe: Universe,
         horizon: Horizon,
         question: impl Into<String>,
-        kill_line: f64,
+        kill_line: KillLine,
     ) -> Result<Self, StudyRefusal> {
         let question = question.into();
-        match (question.trim().is_empty(), kill_line.is_finite()) {
-            (true, _) => Err(StudyRefusal::BlankQuestion),
-            (false, false) => Err(StudyRefusal::KillLineNotFinite { kill_line }),
-            (false, true) => Ok(Self {
+        match question.trim().is_empty() {
+            true => Err(StudyRefusal::BlankQuestion),
+            false => Ok(Self {
                 family,
                 universe,
                 horizon,
@@ -123,7 +220,7 @@ impl Exploration {
         self.family
     }
 
-    pub fn kill_line(&self) -> f64 {
+    pub fn kill_line(&self) -> KillLine {
         self.kill_line
     }
 }
@@ -147,9 +244,11 @@ pub enum StudyRefusal {
         arm: String,
         session: SessionDate,
     },
-    NotFinite {
+    /// Beyond `READING_BOUND`, or not a number.
+    OutOfRange {
         arm: String,
         session: SessionDate,
+        value: f64,
     },
     /// A reading folds from rows, so more readings than rows counted something twice.
     FewerObservationsThanReadings {
@@ -158,7 +257,7 @@ pub enum StudyRefusal {
         measured: u64,
     },
     KillLineNotFinite {
-        kill_line: f64,
+        threshold: f64,
     },
     /// Two arms under one name are one arm counted twice.
     ArmsNotDistinct {
@@ -182,9 +281,14 @@ impl std::fmt::Display for StudyRefusal {
             Self::BlankQuestion => write!(formatter, "the exploration asks no question"),
             Self::NoReadings { arm } => write!(formatter, "arm {arm} read no sessions"),
             Self::ReadTwice { arm, session } => write!(formatter, "arm {arm} read {session} twice"),
-            Self::NotFinite { arm, session } => {
-                write!(formatter, "arm {arm} read a non-finite value on {session}")
-            }
+            Self::OutOfRange {
+                arm,
+                session,
+                value,
+            } => write!(
+                formatter,
+                "arm {arm} read {value} on {session}, beyond {READING_BOUND:e}"
+            ),
             Self::FewerObservationsThanReadings {
                 arm,
                 observations,
@@ -193,8 +297,8 @@ impl std::fmt::Display for StudyRefusal {
                 formatter,
                 "arm {arm} claims {measured} readings from {observations} observations"
             ),
-            Self::KillLineNotFinite { kill_line } => {
-                write!(formatter, "a kill line of {kill_line} is not a number")
+            Self::KillLineNotFinite { threshold } => {
+                write!(formatter, "a kill line of {threshold} is not a number")
             }
             Self::ArmsNotDistinct { name } => {
                 write!(
@@ -297,12 +401,10 @@ impl Study {
                 Summary {
                     sessions: treatment.sessions + control.sessions,
                     undefined: treatment.undefined + control.undefined,
-                    distribution: treatment.distribution.zip(control.distribution).map(
-                        |(treatment, control)| Distribution {
-                            mean: treatment.mean - control.mean,
-                            standard_error: treatment.standard_error.hypot(control.standard_error),
-                        },
-                    ),
+                    distribution: treatment
+                        .distribution
+                        .zip(control.distribution)
+                        .map(|(treatment, control)| welch(treatment, control)),
                 }
             }
         };
@@ -312,11 +414,14 @@ impl Study {
         let finding = match self.lane {
             Lane::Registered(accession) => Finding::Registered {
                 accession: accession.number(),
-                haircut: Haircut::new(accession.family_tests()),
+                family: accession.family(),
                 effect,
                 standard_error: difference
                     .distribution
                     .map(|distribution| distribution.standard_error),
+                degrees_of_freedom: difference
+                    .distribution
+                    .and_then(|distribution| distribution.degrees_of_freedom),
             },
             Lane::Exploratory(exploration) => Finding::Exploratory {
                 exploration,
@@ -339,6 +444,8 @@ impl Study {
 struct Distribution {
     mean: f64,
     standard_error: f64,
+    /// `None` where no spread was seen to estimate the error from.
+    degrees_of_freedom: Option<DegreesOfFreedom>,
 }
 
 /// A mean over the measured sessions, with the unmeasured ones counted beside it.
@@ -365,12 +472,38 @@ fn summarize(readings: impl IntoIterator<Item = Option<f64>>) -> Summary {
         Distribution {
             mean,
             standard_error: (variance / count).sqrt(),
+            degrees_of_freedom: DegreesOfFreedom::new(count - 1.0),
         }
     });
     Summary {
         sessions: measured.len(),
         undefined: undefined.len(),
         distribution,
+    }
+}
+
+/// Treatment less control over disjoint sessions: errors in quadrature, with Welch–Satterthwaite degrees of freedom
+/// because the arms' variances need not agree.
+fn welch(treatment: Distribution, control: Distribution) -> Distribution {
+    let freedom =
+        |distribution: Distribution| distribution.degrees_of_freedom.map(DegreesOfFreedom::value);
+    let (treatment_variance, control_variance) = (
+        treatment.standard_error.powi(2),
+        control.standard_error.powi(2),
+    );
+    let degrees_of_freedom = freedom(treatment).zip(freedom(control)).and_then(
+        |(treatment_freedom, control_freedom)| {
+            DegreesOfFreedom::new(
+                (treatment_variance + control_variance).powi(2)
+                    / (treatment_variance.powi(2) / treatment_freedom
+                        + control_variance.powi(2) / control_freedom),
+            )
+        },
+    );
+    Distribution {
+        mean: treatment.mean - control.mean,
+        standard_error: (treatment_variance + control_variance).sqrt(),
+        degrees_of_freedom,
     }
 }
 
@@ -482,9 +615,10 @@ impl ArmRead {
 pub enum Finding {
     Registered {
         accession: AccessionNumber,
-        haircut: Haircut,
+        family: Family,
         effect: Option<Effect>,
         standard_error: Option<f64>,
+        degrees_of_freedom: Option<DegreesOfFreedom>,
     },
     Exploratory {
         exploration: Exploration,
@@ -552,11 +686,29 @@ impl StudyRan {
         }
     }
 
-    /// Whether a registered reading clears its family's haircut; `None` where nothing could be measured, which has
-    /// not failed the bar but failed to reach it.
-    pub fn clears_haircut(&self) -> Option<bool> {
+    /// Whether a registered reading clears its family's haircut as `register` counts it, so every result is judged
+    /// at the family's current size; `None` where nothing could be measured, which has not failed the bar but failed
+    /// to reach it.
+    pub fn clears_haircut(&self, register: &[Accession]) -> Option<bool> {
         match &self.finding {
-            Finding::Registered { haircut, .. } => Some(haircut.clears(self.standard_errors()?)),
+            Finding::Registered {
+                accession,
+                family,
+                degrees_of_freedom,
+                ..
+            } => {
+                let others = register
+                    .iter()
+                    .filter(|other| {
+                        other.number() != *accession && other.opening().family() == *family
+                    })
+                    .count();
+                let tests = u32::try_from(others)
+                    .ok()
+                    .and_then(|others| NonZeroU32::MIN.checked_add(others))
+                    .expect("a register numbers fewer than u32::MAX accessions");
+                Some(Haircut::new(tests).clears(self.standard_errors()?, (*degrees_of_freedom)?))
+            }
             Finding::Exploratory { .. } => None,
         }
     }
@@ -567,7 +719,7 @@ impl StudyRan {
             Finding::Exploratory {
                 exploration,
                 effect,
-            } => Some(effect.as_ref()?.headline()? >= exploration.kill_line),
+            } => Some(exploration.kill_line.admits(effect.as_ref()?.headline()?)),
             Finding::Registered { .. } => None,
         }
     }
@@ -577,33 +729,35 @@ impl StudyRan {
 mod tests {
     use super::*;
 
-    use std::num::NonZeroU32;
-
     use chrono::NaiveDate;
     use proptest::prelude::*;
 
     use crate::common::laboratory::cost::FillStyle;
-    use crate::common::register::{Accession, Bid, Opening};
+    use crate::common::register::{Bid, Closing, Measured, Opening, Sample, StudyCost, Verdict};
 
     fn session(day: i64) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
     }
 
     fn arm(name: &str, readings: &[Option<f64>]) -> Arm {
+        arm_from(name, 0, readings)
+    }
+
+    fn arm_from(name: &str, first_day: i64, readings: &[Option<f64>]) -> Arm {
         Arm::new(
             name,
             readings
                 .iter()
                 .enumerate()
-                .map(|(day, reading)| (session(day as i64), *reading)),
+                .map(|(day, reading)| (session(first_day + day as i64), *reading)),
             readings.len() as u64,
         )
         .unwrap()
     }
 
-    fn opening() -> Opening {
+    fn opening(family: Family) -> Opening {
         Opening::new(
-            Family::Overnight,
+            family,
             "liquid-common@1".parse().unwrap(),
             "1 sessions".parse().unwrap(),
             "close-to-open returns persist".to_string(),
@@ -615,22 +769,30 @@ mod tests {
         .unwrap()
     }
 
-    /// An open accession in a family that has opened `tests` accessions.
-    fn registered(tests: u32) -> Lane {
-        let register: Vec<Accession> = (1..=tests)
-            .map(|number| Accession::open(AccessionNumber::new(number).unwrap(), opening()))
-            .collect();
-        Lane::Registered(register[0].study(&register).unwrap())
+    fn accession(number: u32, family: Family) -> Accession {
+        Accession::open(AccessionNumber::new(number).unwrap(), opening(family))
     }
 
-    fn exploratory(kill_line: f64) -> Lane {
+    /// Accession 1, open in the overnight family.
+    fn registered() -> Lane {
+        Lane::Registered(accession(1, Family::Overnight).study().unwrap())
+    }
+
+    /// A register whose overnight family has opened `tests` accessions, accession 1 among them.
+    fn family(tests: u32) -> Vec<Accession> {
+        (1..=tests)
+            .map(|number| accession(number, Family::Overnight))
+            .collect()
+    }
+
+    fn exploratory(threshold: f64, direction: Direction) -> Lane {
         Lane::Exploratory(
             Exploration::new(
                 Family::Overnight,
                 "liquid-common@1".parse().unwrap(),
                 "1 sessions".parse().unwrap(),
                 "does the gap persist",
-                kill_line,
+                KillLine::new(threshold, direction).unwrap(),
             )
             .unwrap(),
         )
@@ -661,6 +823,15 @@ mod tests {
             .measure()
     }
 
+    fn degrees_of_freedom(ran: &StudyRan) -> Option<f64> {
+        match ran.finding() {
+            Finding::Registered {
+                degrees_of_freedom, ..
+            } => degrees_of_freedom.map(DegreesOfFreedom::value),
+            Finding::Exploratory { .. } => panic!("registered"),
+        }
+    }
+
     #[test]
     fn test_an_arm_refuses_what_it_could_not_have_read() {
         let twice = [(session(0), Some(1.0)), (session(0), Some(2.0))];
@@ -671,13 +842,21 @@ mod tests {
                 session: session(0)
             })
         );
-        assert_eq!(
+        for value in [1e308, -1e51, f64::INFINITY] {
+            assert_eq!(
+                Arm::new("a", [(session(1), Some(value))], 1),
+                Err(StudyRefusal::OutOfRange {
+                    arm: "a".to_string(),
+                    session: session(1),
+                    value
+                })
+            );
+        }
+        assert!(matches!(
             Arm::new("a", [(session(1), Some(f64::NAN))], 1),
-            Err(StudyRefusal::NotFinite {
-                arm: "a".to_string(),
-                session: session(1)
-            })
-        );
+            Err(StudyRefusal::OutOfRange { .. })
+        ));
+        assert!(Arm::new("a", [(session(1), Some(-1e50))], 1).is_ok());
         assert_eq!(
             Arm::new(
                 "a",
@@ -710,7 +889,13 @@ mod tests {
     #[test]
     fn test_a_study_refuses_arms_whose_difference_would_mean_nothing() {
         let study = |pairing, treatment, control| {
-            Study::new(exploratory(0.0), unpriced(), pairing, treatment, control)
+            Study::new(
+                exploratory(0.0, Direction::Higher),
+                unpriced(),
+                pairing,
+                treatment,
+                control,
+            )
         };
         assert_eq!(
             study(
@@ -722,23 +907,10 @@ mod tests {
                 name: "a".to_string()
             })
         );
-        let offset = Arm::new(
-            "control",
-            [(session(1), Some(1.0)), (session(2), Some(1.0))],
-            2,
-        )
-        .unwrap();
+        let offset = arm_from("control", 1, &[Some(1.0), Some(1.0)]);
         for (treatment, control) in [
             (arm("treatment", &[Some(1.0), Some(1.0)]), offset.clone()),
-            (
-                offset.clone(),
-                Arm::new(
-                    "treatment",
-                    [(session(0), Some(1.0)), (session(1), Some(1.0))],
-                    2,
-                )
-                .unwrap(),
-            ),
+            (offset.clone(), arm("treatment", &[Some(1.0), Some(1.0)])),
         ] {
             assert_eq!(
                 study(Pairing::Matched, treatment, control),
@@ -764,7 +936,7 @@ mod tests {
     #[test]
     fn test_a_matched_difference_removes_the_variation_both_arms_share() {
         let ran = measure(
-            registered(1),
+            registered(),
             unpriced(),
             Pairing::Matched,
             arm(
@@ -784,31 +956,23 @@ mod tests {
             "{standard_errors}"
         );
         assert_eq!((ran.sessions(), ran.undefined()), (4, 0));
+        assert_eq!(degrees_of_freedom(&ran), Some(3.0));
     }
 
+    /// Treatment 1, 3 (squared error 1, one degree of freedom) against control 0, 0, 3 (squared error 1, two).
     #[test]
-    fn test_disjoint_arms_add_their_errors_in_quadrature() {
-        let treatment = arm("treatment", &[Some(1.0), Some(3.0)]);
-        let control = Arm::new(
-            "control",
-            [
-                (session(5), Some(0.0)),
-                (session(6), Some(0.0)),
-                (session(7), Some(3.0)),
-            ],
-            3,
-        )
-        .unwrap();
+    fn test_disjoint_arms_add_their_errors_in_quadrature_with_welch_freedom() {
         let ran = measure(
-            registered(1),
+            registered(),
             unpriced(),
             Pairing::Disjoint,
-            treatment,
-            control,
+            arm("treatment", &[Some(1.0), Some(3.0)]),
+            arm_from("control", 5, &[Some(0.0), Some(0.0), Some(3.0)]),
         );
         assert_eq!(ran.effect().map(Effect::difference), Some(1.0));
-        // Treatment error 1, control error 1: √2 together.
         assert!((ran.standard_errors().unwrap() - 1.0 / 2f64.sqrt()).abs() < 1e-12);
+        let welch = degrees_of_freedom(&ran).unwrap();
+        assert!((welch - 4.0 / 1.5).abs() < 1e-12, "{welch}");
         assert_eq!((ran.sessions(), ran.undefined()), (5, 0));
         assert_eq!(
             (ran.control().sessions(), ran.control().name()),
@@ -819,7 +983,7 @@ mod tests {
     #[test]
     fn test_an_unmeasured_session_is_counted_rather_than_zeroed() {
         let ran = measure(
-            registered(1),
+            registered(),
             unpriced(),
             Pairing::Matched,
             arm("treatment", &[Some(2.0), None, Some(4.0), Some(6.0)]),
@@ -836,82 +1000,129 @@ mod tests {
     #[test]
     fn test_a_difference_that_never_varied_has_no_standard_errors() {
         let ran = measure(
-            registered(1),
+            registered(),
             unpriced(),
             Pairing::Matched,
             arm("treatment", &[Some(2.0), Some(3.0)]),
             arm("control", &[Some(1.0), Some(2.0)]),
         );
         assert_eq!(ran.effect().map(Effect::difference), Some(1.0));
-        assert_eq!((ran.standard_errors(), ran.clears_haircut()), (None, None));
+        assert_eq!(
+            (ran.standard_errors(), ran.clears_haircut(&family(1))),
+            (None, None)
+        );
         let single = measure(
-            registered(1),
+            registered(),
             unpriced(),
             Pairing::Matched,
-            arm("t", &[Some(2.0)]),
-            arm("c", &[Some(1.0)]),
+            arm("treatment", &[Some(2.0)]),
+            arm("control", &[Some(1.0)]),
         );
-        assert_eq!((single.effect(), single.clears_haircut()), (None, None));
+        assert_eq!(
+            (single.effect(), single.clears_haircut(&family(1))),
+            (None, None)
+        );
     }
 
-    /// 2.5 standard errors clears a family of one and fails a family of forty.
+    /// Thirty-two matched differences at `standard_errors`, so thirty-one degrees of freedom.
+    fn thirty_two_sessions_at(standard_errors: f64) -> StudyRan {
+        let mean = standard_errors / 31f64.sqrt();
+        let differences: Vec<Option<f64>> = (0..32)
+            .map(|day| Some(mean + if day % 2 == 0 { 1.0 } else { -1.0 }))
+            .collect();
+        measure(
+            registered(),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &differences),
+            arm("control", &[Some(0.0); 32]),
+        )
+    }
+
+    /// At 31 degrees of freedom one test needs 2.04 and two need 2.36, so 2.2 tells a family of one from two.
     #[test]
-    fn test_a_reading_that_clears_alone_fails_once_its_family_is_counted() {
-        let reading = |tests| {
-            measure(
-                registered(tests),
-                unpriced(),
-                Pairing::Disjoint,
-                arm("treatment", &[Some(2.5 - 1.0), Some(2.5 + 1.0)]),
-                Arm::new(
-                    "control",
-                    [(session(9), Some(0.0)), (session(10), Some(0.0))],
-                    2,
+    fn test_a_reading_is_judged_against_its_family_as_the_register_counts_it() {
+        let borderline = thirty_two_sessions_at(2.2);
+        assert_eq!(borderline.clears_haircut(&family(1)), Some(true));
+        assert_eq!(borderline.clears_haircut(&family(2)), Some(false));
+        let ran = thirty_two_sessions_at(2.5);
+        assert!((ran.standard_errors().unwrap() - 2.5).abs() < 1e-9);
+        assert_eq!(degrees_of_freedom(&ran), Some(31.0));
+        assert_eq!(ran.clears_haircut(&family(1)), Some(true));
+        assert_eq!(ran.clears_haircut(&family(40)), Some(false));
+        // Other families, and the accession itself, do not add tests; a closed one in the family does.
+        let mut register = vec![
+            accession(2, Family::Execution),
+            accession(3, Family::Execution),
+        ];
+        assert_eq!(ran.clears_haircut(&register), Some(true));
+        register.extend((4..=42).map(|number| {
+            accession(number, Family::Overnight)
+                .close(
+                    Closing::new(
+                        Verdict::Refute,
+                        "no effect".to_string(),
+                        Measured::NotMeasured,
+                        Sample::Unrecorded,
+                        Vec::new(),
+                        session(1),
+                        None,
+                        StudyCost::default(),
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-        };
-        assert!((reading(1).standard_errors().unwrap() - 2.5).abs() < 1e-12);
-        assert_eq!(reading(1).clears_haircut(), Some(true));
-        assert_eq!(reading(40).clears_haircut(), Some(false));
-        match reading(40).finding() {
-            Finding::Registered {
-                accession, haircut, ..
-            } => {
-                assert_eq!(
-                    (accession.to_string().as_str(), haircut.tests().get()),
-                    ("000001", 40)
-                );
-            }
-            Finding::Exploratory { .. } => panic!("registered"),
-        }
+                .unwrap()
+        }));
+        assert_eq!(ran.clears_haircut(&register), Some(false));
+    }
+
+    /// 2.5 standard errors clears the normal's 1.96 but not Student's 12.7 at one degree of freedom.
+    #[test]
+    fn test_a_small_sample_is_judged_at_its_own_degrees_of_freedom() {
+        let ran = measure(
+            registered(),
+            unpriced(),
+            Pairing::Disjoint,
+            arm("treatment", &[Some(2.5 - 1.0), Some(2.5 + 1.0)]),
+            arm_from("control", 9, &[Some(0.0), Some(0.0)]),
+        );
+        assert!((ran.standard_errors().unwrap() - 2.5).abs() < 1e-12);
+        assert_eq!(degrees_of_freedom(&ran), Some(1.0));
+        assert_eq!(ran.clears_haircut(&family(1)), Some(false));
     }
 
     #[test]
     fn test_an_exploratory_study_has_no_quotable_statistic_only_a_kill_line() {
-        let ran = |kill_line, quantity| {
+        let ran = |threshold, direction, quantity| {
             measure(
-                exploratory(kill_line),
+                exploratory(threshold, direction),
                 quantity,
                 Pairing::Matched,
                 arm("treatment", &[Some(10.0), Some(14.0)]),
                 arm("control", &[Some(0.0), Some(0.0)]),
             )
         };
-        let net = ran(5.0, priced(FillStyle::Aggressive, 6.0));
-        assert_eq!((net.standard_errors(), net.clears_haircut()), (None, None));
+        let net = ran(5.0, Direction::Higher, priced(FillStyle::Aggressive, 6.0));
+        assert_eq!(
+            (net.standard_errors(), net.clears_haircut(&family(1))),
+            (None, None)
+        );
         assert_eq!(net.effect().and_then(Effect::headline), Some(6.0));
         assert_eq!(net.survives_kill_line(), Some(true));
-        assert_eq!(
-            ran(6.5, priced(FillStyle::Aggressive, 6.0)).survives_kill_line(),
-            Some(false)
-        );
-        assert_eq!(
-            ran(6.0, priced(FillStyle::Aggressive, 6.0)).survives_kill_line(),
-            Some(true)
-        );
-        assert_eq!(ran(11.0, unpriced()).survives_kill_line(), Some(true));
-        let refused = ran(-100.0, priced(FillStyle::Passive, 6.0));
+        for (threshold, direction, survives) in [
+            (6.5, Direction::Higher, false),
+            (6.0, Direction::Higher, true),
+            (6.0, Direction::Lower, true),
+            (5.0, Direction::Lower, false),
+            (7.0, Direction::Lower, true),
+        ] {
+            assert_eq!(
+                ran(threshold, direction, priced(FillStyle::Aggressive, 6.0)).survives_kill_line(),
+                Some(survives),
+                "{threshold} {direction}"
+            );
+        }
+        let refused = ran(-100.0, Direction::Higher, priced(FillStyle::Passive, 6.0));
         assert_eq!(refused.effect().map(Effect::difference), Some(12.0));
         assert_eq!(refused.survives_kill_line(), None);
         match serde_json::to_value(net.finding()).unwrap() {
@@ -925,25 +1136,58 @@ mod tests {
         }
     }
 
+    /// A reduction study survives by landing below its line: −8 against −5 survives, −3 does not.
     #[test]
-    fn test_an_exploration_commits_to_a_question_and_a_finite_kill_line() {
-        let exploration = |question, kill_line| {
+    fn test_a_lower_kill_line_admits_the_larger_reduction() {
+        let line = KillLine::new(-5.0, Direction::Lower).unwrap();
+        assert!(line.admits(-8.0));
+        assert!(line.admits(-5.0));
+        assert!(!line.admits(-3.0));
+        for refused in [f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                KillLine::new(refused, Direction::Lower),
+                Err(StudyRefusal::KillLineNotFinite { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_an_exploration_commits_to_a_question_even_when_stored() {
+        let line = KillLine::new(1.0, Direction::Higher).unwrap();
+        let exploration = |question| {
             Exploration::new(
                 Family::Overnight,
                 "liquid-common@1".parse().unwrap(),
                 "1 sessions".parse().unwrap(),
                 question,
-                kill_line,
+                line,
             )
         };
-        assert_eq!(exploration(" ", 1.0), Err(StudyRefusal::BlankQuestion));
+        assert_eq!(exploration(" "), Err(StudyRefusal::BlankQuestion));
+        let stored = serde_json::to_value(exploration("q").unwrap()).unwrap();
         assert_eq!(
-            exploration("q", f64::INFINITY),
-            Err(StudyRefusal::KillLineNotFinite {
-                kill_line: f64::INFINITY
-            })
+            serde_json::from_value::<Exploration>(stored.clone()).unwrap(),
+            exploration("q").unwrap()
         );
-        assert_eq!(exploration("q", -2.0).unwrap().kill_line(), -2.0);
+        let mut blank = stored.clone();
+        blank["question"] = serde_json::json!("  ");
+        assert!(serde_json::from_value::<Exploration>(blank).is_err());
+        let mut sideways = stored;
+        sideways["kill_line"]["direction"] = serde_json::json!("sideways");
+        assert!(serde_json::from_value::<Exploration>(sideways).is_err());
+    }
+
+    #[test]
+    fn test_direction_names_agree_between_strum_and_serde() {
+        use strum::IntoEnumIterator;
+        for direction in Direction::iter() {
+            assert_eq!(
+                serde_json::to_string(&direction).unwrap(),
+                format!("\"{direction}\"")
+            );
+            assert_eq!(direction.to_string().parse::<Direction>(), Ok(direction));
+        }
+        assert_eq!(Direction::Lower.to_string(), "lower");
     }
 
     #[test]
@@ -951,6 +1195,33 @@ mod tests {
         let effect = Effect::of(&priced(FillStyle::Aggressive, 3.0), -2.0);
         assert_eq!(effect.headline(), Some(-5.0));
         assert_eq!(effect.difference(), -2.0);
+    }
+
+    /// Readings at the bound measure finite and read back from the journal as written.
+    #[test]
+    fn test_readings_at_the_bound_measure_finite() {
+        for pairing in [Pairing::Matched, Pairing::Disjoint] {
+            let control_first_day = match pairing {
+                Pairing::Matched => 0,
+                Pairing::Disjoint => 10,
+            };
+            let ran = measure(
+                registered(),
+                unpriced(),
+                pairing,
+                arm("treatment", &[Some(1e50), Some(-1e50), Some(1e50)]),
+                arm_from(
+                    "control",
+                    control_first_day,
+                    &[Some(-1e50), Some(1e50), Some(-1e50)],
+                ),
+            );
+            let standard_errors = ran.standard_errors().unwrap();
+            assert!(standard_errors.is_finite(), "{pairing}: {standard_errors}");
+            assert!(degrees_of_freedom(&ran).is_some(), "{pairing}");
+            let encoded = serde_json::to_string(&ran).unwrap();
+            assert_eq!(serde_json::from_str::<StudyRan>(&encoded).unwrap(), ran);
+        }
     }
 
     fn readings() -> impl Strategy<Value = Vec<(f64, f64, f64)>> {
@@ -962,9 +1233,12 @@ mod tests {
         #[test]
         fn test_a_shared_shock_cancels_in_a_matched_difference(rows in readings()) {
             let read = |shocked: bool| {
-                let treatment: Vec<Option<f64>> = rows.iter().map(|(t, _, s)| Some(t + if shocked { *s } else { 0.0 })).collect();
-                let control: Vec<Option<f64>> = rows.iter().map(|(_, c, s)| Some(c + if shocked { *s } else { 0.0 })).collect();
-                let ran = measure(registered(1), unpriced(), Pairing::Matched, arm("t", &treatment), arm("c", &control));
+                let shock = |value: f64| if shocked { value } else { 0.0 };
+                let treatment: Vec<Option<f64>> =
+                    rows.iter().map(|(treatment, _, common)| Some(treatment + shock(*common))).collect();
+                let control: Vec<Option<f64>> =
+                    rows.iter().map(|(_, control, common)| Some(control + shock(*common))).collect();
+                let ran = measure(registered(), unpriced(), Pairing::Matched, arm("treatment", &treatment), arm("control", &control));
                 (ran.effect().map(Effect::difference).unwrap(), ran.standard_errors())
             };
             let (plain, shocked) = (read(false), read(true));
@@ -975,27 +1249,28 @@ mod tests {
             }
         }
 
-        /// Swapping disjoint arms negates the difference and keeps its error.
+        /// Swapping disjoint arms negates the difference and keeps its error and its degrees of freedom.
         #[test]
         fn test_swapping_disjoint_arms_negates_the_difference(rows in readings()) {
-            let treatment = Arm::new("t", rows.iter().enumerate().map(|(day, (t, _, _))| (session(day as i64), Some(*t))), rows.len() as u64).unwrap();
-            let control = Arm::new("c", rows.iter().enumerate().map(|(day, (_, c, _))| (session(100 + day as i64), Some(*c))), rows.len() as u64).unwrap();
-            let forward = measure(registered(1), unpriced(), Pairing::Disjoint, treatment.clone(), control.clone());
-            let backward = measure(registered(1), unpriced(), Pairing::Disjoint, control, treatment);
+            let treatment = arm_from("treatment", 0, &rows.iter().map(|(treatment, _, _)| Some(*treatment)).collect::<Vec<_>>());
+            let control = arm_from("control", 100, &rows.iter().map(|(_, control, _)| Some(*control)).collect::<Vec<_>>());
+            let forward = measure(registered(), unpriced(), Pairing::Disjoint, treatment.clone(), control.clone());
+            let backward = measure(registered(), unpriced(), Pairing::Disjoint, control, treatment);
             prop_assert_eq!(
                 forward.effect().map(Effect::difference).map(|value| -value),
                 backward.effect().map(Effect::difference)
             );
             prop_assert_eq!(forward.standard_errors().map(|value| -value), backward.standard_errors());
+            prop_assert_eq!(degrees_of_freedom(&forward), degrees_of_freedom(&backward));
         }
 
         /// A study's record reads back as the record written, which is what lets the journal stand in for the run.
         #[test]
         fn test_a_study_ran_record_round_trips(rows in readings(), spread in 0.0..50.0f64, explore in any::<bool>()) {
-            let treatment: Vec<Option<f64>> = rows.iter().map(|(t, _, _)| Some(*t)).collect();
-            let control: Vec<Option<f64>> = rows.iter().map(|(_, c, _)| Some(*c)).collect();
-            let lane = if explore { exploratory(spread) } else { registered(3) };
-            let ran = measure(lane, priced(FillStyle::Aggressive, spread), Pairing::Matched, arm("t", &treatment), arm("c", &control));
+            let treatment: Vec<Option<f64>> = rows.iter().map(|(treatment, _, _)| Some(*treatment)).collect();
+            let control: Vec<Option<f64>> = rows.iter().map(|(_, control, _)| Some(*control)).collect();
+            let lane = if explore { exploratory(spread, Direction::Lower) } else { registered() };
+            let ran = measure(lane, priced(FillStyle::Aggressive, spread), Pairing::Matched, arm("treatment", &treatment), arm("control", &control));
             let encoded = serde_json::to_string(&ran).unwrap();
             prop_assert_eq!(serde_json::from_str::<StudyRan>(&encoded).unwrap(), ran);
         }

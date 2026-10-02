@@ -109,12 +109,7 @@ impl Register {
 
     /// The proof a study needs, refused unless the accession it names is open now.
     pub async fn study(&self, number: AccessionNumber) -> Result<OpenAccession, RegisterError> {
-        let accessions = self.all().await?;
-        let accession = accessions
-            .iter()
-            .find(|accession| accession.number() == number)
-            .ok_or(RegisterError::Missing { number })?;
-        Ok(accession.study(&accessions)?)
+        Ok(self.read(number).await?.study()?)
     }
 
     /// Opens `opening` under the next free number; a successor is admitted only as its predecessor allows.

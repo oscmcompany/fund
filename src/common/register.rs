@@ -668,7 +668,6 @@ pub struct Accession {
 pub struct OpenAccession {
     number: AccessionNumber,
     family: Family,
-    family_tests: NonZeroU32,
 }
 
 impl OpenAccession {
@@ -678,11 +677,6 @@ impl OpenAccession {
 
     pub fn family(&self) -> Family {
         self.family
-    }
-
-    /// Every accession the family has opened, this one included, which is the count its haircut is taken over.
-    pub fn family_tests(&self) -> NonZeroU32 {
-        self.family_tests
     }
 }
 
@@ -826,23 +820,12 @@ impl Accession {
         }
     }
 
-    /// The proof a study needs to run, given only while this accession is open, counting its family's tests across
-    /// `register`.
-    pub fn study(&self, register: &[Accession]) -> Result<OpenAccession, RegisterRefusal> {
-        let others = register
-            .iter()
-            .filter(|other| {
-                other.number != self.number && other.opening.family == self.opening.family
-            })
-            .count();
+    /// The proof a study needs to run, given only while this accession is open.
+    pub fn study(&self) -> Result<OpenAccession, RegisterRefusal> {
         match self.status {
             Status::Open => Ok(OpenAccession {
                 number: self.number,
                 family: self.opening.family,
-                family_tests: u32::try_from(others)
-                    .ok()
-                    .and_then(|others| NonZeroU32::MIN.checked_add(others))
-                    .expect("a register numbers fewer than u32::MAX accessions"),
             }),
             Status::Closed(_) => Err(RegisterRefusal::NotOpen {
                 number: self.number,
@@ -898,35 +881,6 @@ mod tests {
             substrate_change.map(str::to_string),
         )
         .unwrap()
-    }
-
-    /// A family's haircut counts every accession it has opened, open or closed, once each.
-    #[test]
-    fn test_a_study_counts_every_test_its_family_has_opened() {
-        let elsewhere = Opening::new(
-            Family::Execution,
-            "liquid-common@1".parse().unwrap(),
-            "per orders".parse().unwrap(),
-            "resting orders fill".to_string(),
-            Bid::Unrecorded,
-            session(),
-            None,
-            None,
-        )
-        .unwrap();
-        let open = Accession::open(number(5), opening(None));
-        let register = [
-            Accession::open(number(1), opening(None))
-                .close(closing(Verdict::Refute, None).unwrap())
-                .unwrap(),
-            Accession::open(number(2), elsewhere),
-            Accession::open(number(3), opening(None)),
-            open.clone(),
-        ];
-        let tests = |register: &[Accession]| open.study(register).unwrap().family_tests().get();
-        assert_eq!(tests(&register), 3);
-        assert_eq!(tests(&register[..2]), 2);
-        assert_eq!(tests(&[]), 1);
     }
 
     fn closing(verdict: Verdict, notes: Option<&str>) -> Result<Closing, RegisterRefusal> {
@@ -1091,13 +1045,13 @@ mod tests {
     fn test_an_accession_closes_once_and_studies_run_only_while_open() {
         let open = Accession::open(number(5), opening(None));
         assert_eq!(
-            open.study(&[])
+            open.study()
                 .map(|proof| (proof.number(), proof.family().to_string())),
             Ok((number(5), "overnight".to_string()))
         );
         let closed = open.close(closing(Verdict::Refute, None).unwrap()).unwrap();
         assert_eq!(
-            closed.study(&[]),
+            closed.study(),
             Err(RegisterRefusal::NotOpen { number: number(5) })
         );
         assert_eq!(
