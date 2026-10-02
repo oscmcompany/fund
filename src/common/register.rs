@@ -12,6 +12,7 @@ use crate::common::journal::Commit;
 use crate::common::market::Dollars;
 use crate::common::market::record::BarInterval;
 use crate::common::time::SessionDate;
+use chrono::NaiveTime;
 
 /// Assigned once, in order, and never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -57,28 +58,66 @@ pub fn next_number(held: impl IntoIterator<Item = AccessionNumber>) -> Option<Ac
     }
 }
 
-/// The multiple-testing bucket a haircut is taken over: lowercase letters, digits and `-`.
+/// The multiple-testing bucket a haircut is taken over. A fixed list, so opening a new family is a deliberate change
+/// rather than a way around the haircut.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum Family {
+    Baselines,
+    DailyDirection,
+    DataSourceEvaluation,
+    EtfRebalance,
+    ExchangeComplex,
+    Execution,
+    ForecastModel,
+    IntradayReversal,
+    Microstructure,
+    OptionsVariance,
+    Overnight,
+    PairConvergence,
+    RiskManagement,
+    SessionReading,
+}
+
+/// A unit a quantity is counted or measured in, such as `net-bp`, `sessions` or `orders`: lowercase letters, digits
+/// and `-`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct Family(String);
+pub struct Unit(String);
 
-impl Family {
+impl Unit {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl FromStr for Family {
+impl FromStr for Unit {
     type Err = RegisterRefusal;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         is_slug(raw)
             .then(|| Self(raw.to_string()))
-            .ok_or_else(|| malformed("family", raw))
+            .ok_or_else(|| malformed("unit", raw))
     }
 }
 
-impl TryFrom<String> for Family {
+impl TryFrom<String> for Unit {
     type Error = RegisterRefusal;
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
@@ -86,9 +125,9 @@ impl TryFrom<String> for Family {
     }
 }
 
-impl From<Family> for String {
-    fn from(family: Family) -> Self {
-        family.0
+impl From<Unit> for String {
+    fn from(unit: Unit) -> Self {
+        unit.0
     }
 }
 
@@ -125,7 +164,7 @@ impl FromStr for Universe {
     }
 }
 
-/// How far ahead a test reads.
+/// How far ahead, or over what, a test reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Horizon {
@@ -134,6 +173,15 @@ pub enum Horizon {
         interval: BarInterval,
         count: NonZeroU32,
     },
+    /// A span of the Eastern trading day, start before end.
+    Window {
+        start: NaiveTime,
+        end: NaiveTime,
+    },
+    /// Each occurrence of an event, such as each order until it fills.
+    PerEvent {
+        unit: Unit,
+    },
     /// Described in prose before horizons were typed.
     Described(String),
 }
@@ -141,10 +189,18 @@ pub enum Horizon {
 impl FromStr for Horizon {
     type Err = RegisterRefusal;
 
-    /// `<count> sessions` or `<count> <interval> bars`, as in `12 one_minute bars`.
+    /// `<count> sessions`, `<count> <interval> bars`, `<HH:MM>-<HH:MM>` in Eastern time, or `per <unit>`, as in
+    /// `12 one_minute bars`, `09:30-10:00` or `per order`.
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let words: Vec<&str> = raw.split_whitespace().collect();
+        let time = |text: &str| NaiveTime::parse_from_str(text, "%H:%M").ok();
         let parsed = match words.as_slice() {
+            [window] => window
+                .split_once('-')
+                .and_then(|(start, end)| Some((time(start)?, time(end)?)))
+                .filter(|(start, end)| start < end)
+                .map(|(start, end)| Self::Window { start, end }),
+            ["per", unit] => unit.parse().ok().map(|unit| Self::PerEvent { unit }),
             [count, "sessions"] => count.parse().ok().map(Self::Sessions),
             [count, interval, "bars"] => count
                 .parse()
@@ -176,7 +232,7 @@ pub struct Interval {
     low: f64,
     high: f64,
     coverage_percent: u8,
-    units: String,
+    units: Unit,
 }
 
 #[derive(Deserialize)]
@@ -185,7 +241,7 @@ struct IntervalFields {
     low: f64,
     high: f64,
     coverage_percent: u8,
-    units: String,
+    units: Unit,
 }
 
 impl TryFrom<IntervalFields> for Interval {
@@ -209,12 +265,12 @@ impl Interval {
         low: f64,
         high: f64,
         coverage_percent: u8,
-        units: String,
+        units: Unit,
     ) -> Result<Self, RegisterRefusal> {
         let ordered = [low, estimate, high].iter().all(|value| value.is_finite())
             && low <= estimate
             && estimate <= high;
-        if !ordered || !(1..=99).contains(&coverage_percent) || !is_slug(&units) {
+        if !ordered || !(1..=99).contains(&coverage_percent) {
             return Err(RegisterRefusal::Interval {
                 estimate,
                 low,
@@ -248,7 +304,7 @@ impl Interval {
         self.coverage_percent
     }
 
-    pub fn units(&self) -> &str {
+    pub fn units(&self) -> &Unit {
         &self.units
     }
 }
@@ -268,7 +324,7 @@ impl FromStr for Interval {
                 low.trim().parse().ok()?,
                 high.trim().parse().ok()?,
                 coverage.parse().ok()?,
-                units.trim().to_string(),
+                units.trim().parse().ok()?,
             ))
         })();
         let (estimate, low, high, coverage, units) =
@@ -315,11 +371,28 @@ pub enum Measured {
     Unrecorded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The effective sample a verdict rests on, counted in what actually varies: sessions, orders, name-sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Sessions {
-    Counted(u32),
+pub enum Sample {
+    Counted { count: u32, unit: Unit },
     Unrecorded,
+}
+
+impl FromStr for Sample {
+    type Err = RegisterRefusal;
+
+    /// `<count> <unit>`, as in `1253 sessions` or `4210 orders`.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        raw.split_once(' ')
+            .and_then(|(count, unit)| {
+                Some(Self::Counted {
+                    count: count.parse().ok()?,
+                    unit: unit.parse().ok()?,
+                })
+            })
+            .ok_or_else(|| malformed("sample (count unit)", raw))
+    }
 }
 
 /// What a test cost, so a two-week pass counts differently from a minute's check.
@@ -396,6 +469,16 @@ impl Opening {
             }
             Universe::Versioned { .. } | Universe::Legacy(_) => {}
         }
+        match &horizon {
+            Horizon::Window { start, end } if start >= end => {
+                return Err(malformed("horizon window", &format!("{start}-{end}")));
+            }
+            Horizon::Window { .. }
+            | Horizon::Sessions(_)
+            | Horizon::Bars { .. }
+            | Horizon::PerEvent { .. }
+            | Horizon::Described(_) => {}
+        }
         Ok(Self {
             family,
             universe,
@@ -408,8 +491,8 @@ impl Opening {
         })
     }
 
-    pub fn family(&self) -> &Family {
-        &self.family
+    pub fn family(&self) -> Family {
+        self.family
     }
 
     pub fn universe(&self) -> &Universe {
@@ -449,7 +532,7 @@ pub struct Closing {
     /// The finding in a sentence, beside the number in `measured`.
     statistic: String,
     measured: Measured,
-    sessions: Sessions,
+    sample: Sample,
     commits: Vec<Commit>,
     closed: SessionDate,
     /// For an inconclusive verdict, the one change its successor makes; for landed-not-adopted, what would earn
@@ -463,7 +546,7 @@ struct ClosingFields {
     verdict: Verdict,
     statistic: String,
     measured: Measured,
-    sessions: Sessions,
+    sample: Sample,
     commits: Vec<Commit>,
     closed: SessionDate,
     notes: Option<String>,
@@ -478,7 +561,7 @@ impl TryFrom<ClosingFields> for Closing {
             fields.verdict,
             fields.statistic,
             fields.measured,
-            fields.sessions,
+            fields.sample,
             fields.commits,
             fields.closed,
             fields.notes,
@@ -493,7 +576,7 @@ impl Closing {
         verdict: Verdict,
         statistic: String,
         measured: Measured,
-        sessions: Sessions,
+        sample: Sample,
         commits: Vec<Commit>,
         closed: SessionDate,
         notes: Option<String>,
@@ -523,7 +606,7 @@ impl Closing {
                 verdict,
                 statistic,
                 measured,
-                sessions,
+                sample,
                 commits,
                 closed,
                 notes,
@@ -544,8 +627,8 @@ impl Closing {
         self.measured
     }
 
-    pub fn sessions(&self) -> Sessions {
-        self.sessions
+    pub fn sample(&self) -> &Sample {
+        &self.sample
     }
 
     pub fn commits(&self) -> &[Commit] {
@@ -592,8 +675,8 @@ impl OpenAccession {
         self.number
     }
 
-    pub fn family(&self) -> &Family {
-        &self.family
+    pub fn family(&self) -> Family {
+        self.family
     }
 }
 
@@ -612,7 +695,7 @@ pub enum RegisterRefusal {
         low: f64,
         high: f64,
         coverage_percent: u8,
-        units: String,
+        units: Unit,
     },
     InconclusiveWithoutNotes,
     LandedWithoutAdoptionCondition,
@@ -648,8 +731,9 @@ impl Display for RegisterRefusal {
                 units,
             } => write!(
                 formatter,
-                "{estimate} [{low}, {high}] {coverage_percent}% {units} is not an estimate inside its interval, \
-                 with coverage between 1 and 99 and named units"
+                "{estimate} [{low}, {high}] {coverage_percent}% {} is not an estimate inside its interval with \
+                 coverage between 1 and 99",
+                units.as_str()
             ),
             Self::InconclusiveWithoutNotes => {
                 write!(
@@ -741,7 +825,7 @@ impl Accession {
         match self.status {
             Status::Open => Ok(OpenAccession {
                 number: self.number,
-                family: self.opening.family.clone(),
+                family: self.opening.family,
             }),
             Status::Closed(_) => Err(RegisterRefusal::NotOpen {
                 number: self.number,
@@ -804,7 +888,7 @@ mod tests {
             verdict,
             "-5.7bp net".to_string(),
             Measured::Value(-5.7),
-            Sessions::Counted(1253),
+            "1253 sessions".parse().unwrap(),
             Vec::new(),
             session(),
             notes.map(str::to_string),
@@ -855,10 +939,43 @@ mod tests {
                 interval.low(),
                 interval.high(),
                 interval.coverage_percent(),
-                interval.units()
+                interval.units().as_str()
             ),
             (4.0, 0.0, 9.5, 80, "net-bp")
         );
+        let time = |text: &str| NaiveTime::parse_from_str(text, "%H:%M").unwrap();
+        assert_eq!(
+            "09:30-10:00".parse(),
+            Ok(Horizon::Window {
+                start: time("09:30"),
+                end: time("10:00")
+            })
+        );
+        assert_eq!(
+            "per order".parse(),
+            Ok(Horizon::PerEvent {
+                unit: "order".parse().unwrap()
+            })
+        );
+        assert_eq!(
+            "4210 orders".parse(),
+            Ok(Sample::Counted {
+                count: 4210,
+                unit: "orders".parse().unwrap()
+            })
+        );
+        for refused in [
+            "10:00-09:30",
+            "09:30-09:30",
+            "9:30am-10",
+            "per",
+            "per Order",
+        ] {
+            assert!(refused.parse::<Horizon>().is_err(), "{refused}");
+        }
+        for refused in ["sessions", "-1 sessions", "12", "12 Orders"] {
+            assert!(refused.parse::<Sample>().is_err(), "{refused}");
+        }
         for refused in ["liquid-common", "Liquid@1", "x@0"] {
             assert!(refused.parse::<Universe>().is_err(), "{refused}");
         }
@@ -901,7 +1018,7 @@ mod tests {
             Verdict::Refute,
             " ".to_string(),
             Measured::NotMeasured,
-            Sessions::Unrecorded,
+            Sample::Unrecorded,
             Vec::new(),
             session(),
             None,
@@ -929,7 +1046,7 @@ mod tests {
         let open = Accession::open(number(5), opening(None));
         assert_eq!(
             open.study()
-                .map(|proof| (proof.number(), proof.family().as_str().to_string())),
+                .map(|proof| (proof.number(), proof.family().to_string())),
             Ok((number(5), "overnight".to_string()))
         );
         let closed = open.close(closing(Verdict::Refute, None).unwrap()).unwrap();
@@ -976,12 +1093,22 @@ mod tests {
         let wire = serde_json::to_string(&closed(Verdict::Refute)).unwrap();
         let named = wire.replace(r#""name":"liquid-common""#, r#""name":"Bad Name""#);
         assert!(serde_json::from_str::<Accession>(&named).is_err());
+        let backwards = wire.replace(
+            r#""horizon":{"sessions":1}"#,
+            r#""horizon":{"window":{"start":"10:00:00","end":"09:30:00"}}"#,
+        );
+        assert!(serde_json::from_str::<Accession>(&backwards).is_err());
+        let forwards = backwards.replace(
+            r#""10:00:00","end":"09:30:00""#,
+            r#""09:30:00","end":"10:00:00""#,
+        );
+        assert!(serde_json::from_str::<Accession>(&forwards).is_ok());
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let refused = Closing::new(
                 Verdict::Refute,
                 "s".to_string(),
                 Measured::Value(value),
-                Sessions::Unrecorded,
+                Sample::Unrecorded,
                 Vec::new(),
                 session(),
                 None,
@@ -992,6 +1119,37 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// Pinned, so adding or renaming a family is a visible change to this list.
+    #[test]
+    fn test_the_families_are_a_fixed_list() {
+        let names: Vec<String> = Family::iter().map(|family| family.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "baselines",
+                "daily-direction",
+                "data-source-evaluation",
+                "etf-rebalance",
+                "exchange-complex",
+                "execution",
+                "forecast-model",
+                "intraday-reversal",
+                "microstructure",
+                "options-variance",
+                "overnight",
+                "pair-convergence",
+                "risk-management",
+                "session-reading",
+            ]
+        );
+        for family in Family::iter() {
+            let json = serde_json::to_string(&family).unwrap();
+            assert_eq!(json, format!("\"{family}\""));
+            assert_eq!(family.to_string().parse::<Family>(), Ok(family));
+        }
+        assert!("new-idea".parse::<Family>().is_err());
     }
 
     #[test]
@@ -1014,7 +1172,8 @@ mod tests {
                 r#""bid":{"interval":{"estimate":4.0,"low":0.0,"high":9.0,"coverage_percent":80,"units":"net-bp"}},"#,
                 r#""opened":"2026-10-01","supersedes":null,"substrate_change":null},"#,
                 r#""status":{"closed":{"verdict":"refute","statistic":"-5.7bp net","measured":{"value":-5.7},"#,
-                r#""sessions":{"counted":1253},"commits":[],"closed":"2026-10-01","notes":"one change","#,
+                r#""sample":{"counted":{"count":1253,"unit":"sessions"}},"commits":[],"closed":"2026-10-01","#,
+                r#""notes":"one change","#,
                 r#""cost":{"wall_clock_seconds":null,"bytes_read":null,"dollars":null}}}}"#,
             )
         );
@@ -1050,6 +1209,17 @@ mod tests {
         let horizon = prop_oneof![
             (1_u32..100).prop_map(|count| Horizon::Sessions(NonZeroU32::new(count).unwrap())),
             ".{1,20}".prop_map(Horizon::Described),
+            (0_u32..1_439, 1_u32..60).prop_map(|(start, length)| Horizon::Window {
+                start: NaiveTime::from_num_seconds_from_midnight_opt(start * 60, 0).unwrap(),
+                end: NaiveTime::from_num_seconds_from_midnight_opt(
+                    (start + length).min(1_439) * 60 + 59,
+                    0
+                )
+                .unwrap(),
+            }),
+            "[a-z][a-z-]{0,10}".prop_map(|unit| Horizon::PerEvent {
+                unit: unit.parse().unwrap()
+            }),
         ];
         let bid = prop_oneof![
             Just(Bid::Unrecorded),
@@ -1061,7 +1231,7 @@ mod tests {
                         f64::from(estimate - width),
                         f64::from(estimate + width),
                         coverage,
-                        "net-bp".to_string(),
+                        "net-bp".parse().unwrap(),
                     )
                     .unwrap(),
                 )
@@ -1104,7 +1274,10 @@ mod tests {
                             verdict,
                             "a finding".to_string(),
                             measured,
-                            sessions.map_or(Sessions::Unrecorded, Sessions::Counted),
+                            sessions.map_or(Sample::Unrecorded, |count| Sample::Counted {
+                                count,
+                                unit: "sessions".parse().unwrap(),
+                            }),
                             Vec::new(),
                             session(),
                             Some("the one change".to_string()),

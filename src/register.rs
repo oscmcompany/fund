@@ -203,13 +203,14 @@ mod tests {
 
     use super::*;
     use crate::common::register::{
-        Bid, Closing, Horizon, Measured, RegisterRefusal, Sessions, StudyCost, Universe, Verdict,
+        Bid, Closing, Family, Horizon, Measured, RegisterRefusal, Sample, StudyCost, Universe,
+        Verdict,
     };
     use crate::common::time::SessionDate;
 
     fn opening(supersedes: Option<AccessionNumber>) -> Opening {
         Opening::new(
-            "live-check".parse().unwrap(),
+            Family::Baselines,
             Universe::Legacy("the register's own seam".to_string()),
             Horizon::Described("none".to_string()),
             "the Register's S3 seam behaves as its rules say".to_string(),
@@ -226,7 +227,10 @@ mod tests {
             Verdict::Refute,
             "a live check".to_string(),
             Measured::NotMeasured,
-            Sessions::Counted(0),
+            Sample::Counted {
+                count: 0,
+                unit: "checks".parse().unwrap(),
+            },
             Vec::new(),
             SessionDate::at(Utc::now()),
             None,

@@ -10,8 +10,8 @@ use fund::archive::Archive;
 use fund::common::journal::Commit;
 use fund::common::market::Dollars;
 use fund::common::register::{
-    Accession, AccessionNumber, Bid, Closing, Family, Horizon, Interval, Measured, Opening,
-    Sessions, Status, StudyCost, Universe, Verdict,
+    Accession, AccessionNumber, Bid, Closing, Family, Horizon, Interval, Measured, Opening, Sample,
+    Status, StudyCost, Universe, Verdict,
 };
 use fund::common::time::SessionDate;
 use fund::register::Register;
@@ -32,7 +32,7 @@ enum Command {
         /// `name@version`.
         #[arg(long)]
         universe: Universe,
-        /// `<count> sessions` or `<count> <interval> bars`.
+        /// `<count> sessions`, `<count> <interval> bars`, `<HH:MM>-<HH:MM>` Eastern, or `per <unit>`.
         #[arg(long)]
         horizon: Horizon,
         #[arg(long, allow_hyphen_values = true)]
@@ -57,8 +57,9 @@ enum Command {
         /// The number the verdict rests on, in the bid's units, or `not-measured`.
         #[arg(long, value_parser = measured, allow_hyphen_values = true)]
         measured: Measured,
+        /// The effective sample, `<count> <unit>`, as in `1253 sessions` or `4210 orders`.
         #[arg(long)]
-        sessions: u32,
+        sample: Sample,
         #[arg(long = "commit")]
         commits: Vec<Commit>,
         #[arg(long, allow_hyphen_values = true)]
@@ -70,8 +71,11 @@ enum Command {
         #[arg(long)]
         dollars: Option<Dollars>,
     },
-    /// One line per accession.
-    List,
+    /// One line per accession, or every accession as JSON for a program to read.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// One accession as stored.
     Show { number: AccessionNumber },
 }
@@ -142,7 +146,7 @@ async fn run(register: &Register, command: Command) -> Result<(), Box<dyn std::e
             verdict,
             statistic,
             measured,
-            sessions,
+            sample,
             commits,
             notes,
             wall_clock_seconds,
@@ -155,14 +159,7 @@ async fn run(register: &Register, command: Command) -> Result<(), Box<dyn std::e
                 dollars,
             };
             let closing = Closing::new(
-                verdict,
-                statistic,
-                measured,
-                Sessions::Counted(sessions),
-                commits,
-                today,
-                notes,
-                cost,
+                verdict, statistic, measured, sample, commits, today, notes, cost,
             )
             .map_err(|refusal| refusal.to_string())?;
             register
@@ -171,9 +168,15 @@ async fn run(register: &Register, command: Command) -> Result<(), Box<dyn std::e
                 .map_err(|error| error.to_string())?;
             println!("Closed accession {number} as {verdict}");
         }
-        Command::List => {
-            for accession in register.all().await.map_err(|error| error.to_string())? {
-                println!("{}", line(&accession));
+        Command::List { json } => {
+            let accessions = register.all().await.map_err(|error| error.to_string())?;
+            match json {
+                true => println!("{}", serde_json::to_string(&accessions)?),
+                false => {
+                    for accession in &accessions {
+                        println!("{}", line(accession));
+                    }
+                }
             }
         }
         Command::Show { number } => {
@@ -198,7 +201,7 @@ fn line(accession: &Accession) -> String {
         accession.number(),
         opening.opened(),
         status,
-        opening.family().as_str(),
+        opening.family().to_string(),
         opening.hypothesis()
     )
 }
@@ -237,12 +240,12 @@ mod tests {
                 supersedes,
                 ..
             } => {
-                assert_eq!(family.as_str(), "overnight");
+                assert_eq!(family, Family::Overnight);
                 assert_eq!(universe, "liquid-common@2".parse().unwrap());
                 assert_eq!((bid.estimate(), bid.coverage_percent()), (4.0, 80));
                 assert_eq!(supersedes, AccessionNumber::new(5));
             }
-            Command::Close { .. } | Command::List | Command::Show { .. } => {
+            Command::Close { .. } | Command::List { .. } | Command::Show { .. } => {
                 panic!("parsed as another command")
             }
         }
@@ -274,8 +277,8 @@ mod tests {
                 "s",
                 "--measured",
                 "1",
-                "--sessions",
-                "1"
+                "--sample",
+                "1 sessions"
             ])
             .is_err()
         );
@@ -289,11 +292,41 @@ mod tests {
                 "s",
                 "--measured",
                 "1",
-                "--sessions",
-                "1"
+                "--sample",
+                "1 sessions"
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_a_leading_hyphen_is_a_value_not_a_flag() {
+        let command = parse(&[
+            "close",
+            "7",
+            "--verdict",
+            "refute",
+            "--statistic",
+            "-5.7bp net",
+            "--measured",
+            "-5.7",
+            "--sample",
+            "1253 sessions",
+        ])
+        .unwrap();
+        match command {
+            Command::Close {
+                statistic,
+                measured,
+                ..
+            } => assert_eq!(
+                (statistic.as_str(), measured),
+                ("-5.7bp net", Measured::Value(-5.7))
+            ),
+            Command::Open { .. } | Command::List { .. } | Command::Show { .. } => {
+                panic!("parsed as another command")
+            }
+        }
     }
 
     #[test]
