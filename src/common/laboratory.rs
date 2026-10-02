@@ -232,7 +232,7 @@ impl Exploration {
 #[serde(tag = "null", rename_all = "snake_case")]
 pub enum Null {
     /// Labels permuted `permutations` times: matched arms flip each session's sign, disjoint arms reshuffle their
-    /// pooled sessions into groups of the original sizes.
+    /// pooled sessions into groups of the original sizes. Sessions are treated as exchangeable, as the t's error does.
     Permuted { seed: u64, permutations: NonZeroU32 },
     /// No null, and why, so its absence is read beside the result.
     Omitted { reason: String },
@@ -358,13 +358,16 @@ impl Study {
         treatment: Arm,
         control: Arm,
     ) -> Result<Self, StudyRefusal> {
-        if let Lane::Registered {
-            null: Null::Omitted { reason },
-            ..
-        } = &lane
-            && reason.trim().is_empty()
-        {
-            return Err(StudyRefusal::BlankReason);
+        match &lane {
+            Lane::Registered {
+                null: Null::Omitted { reason },
+                ..
+            } if reason.trim().is_empty() => return Err(StudyRefusal::BlankReason),
+            Lane::Registered {
+                null: Null::Omitted { .. } | Null::Permuted { .. },
+                ..
+            }
+            | Lane::Exploratory(_) => {}
         }
         if treatment.name == control.name {
             return Err(StudyRefusal::ArmsNotDistinct {
@@ -557,8 +560,6 @@ fn at_least_as_extreme(
     permutations: NonZeroU32,
 ) -> Option<u32> {
     let measured = |arm: &Arm| -> Vec<f64> { arm.readings.values().flatten().copied().collect() };
-    // A relabeling that reproduces the reading can differ from it in the last bits, and must still count.
-    let reaches = |statistic: f64, observed: f64, scale: f64| statistic >= observed - 1e-12 * scale;
     let count = match pairing {
         Pairing::Matched => {
             let differences: Vec<f64> = treatment
@@ -570,11 +571,8 @@ fn at_least_as_extreme(
             if differences.len() < 2 {
                 return None;
             }
+            // Summed in session order, so a relabeling that reproduces the reading, or negates it, ties it exactly.
             let observed = differences.iter().sum::<f64>().abs();
-            let scale = differences
-                .iter()
-                .map(|difference| difference.abs())
-                .sum::<f64>();
             (0..permutations.get())
                 .filter(|_| {
                     let flipped: f64 = differences
@@ -584,7 +582,7 @@ fn at_least_as_extreme(
                             false => *difference,
                         })
                         .sum();
-                    reaches(flipped.abs(), observed, scale)
+                    flipped.abs() >= observed
                 })
                 .count()
         }
@@ -594,21 +592,22 @@ fn at_least_as_extreme(
                 return None;
             }
             let treatment_sessions = treatment.len();
+            // Each group summed in sorted order, so the same readings give the same gap whatever order the shuffle left.
+            let mean = |group: &[f64]| {
+                let mut sorted = group.to_vec();
+                sorted.sort_by(f64::total_cmp);
+                sorted.iter().sum::<f64>() / sorted.len() as f64
+            };
             let gap = |pooled: &[f64]| {
                 let (left, right) = pooled.split_at(treatment_sessions);
-                (left.iter().sum::<f64>() / left.len() as f64
-                    - right.iter().sum::<f64>() / right.len() as f64)
-                    .abs()
+                (mean(left) - mean(right)).abs()
             };
             let mut pooled = [treatment, control].concat();
             let observed = gap(&pooled);
-            let scale = pooled
-                .iter()
-                .fold(0.0, |largest: f64, value| largest.max(value.abs()));
             (0..permutations.get())
                 .filter(|_| {
                     generator.shuffle(&mut pooled);
-                    reaches(gap(&pooled), observed, scale)
+                    gap(&pooled) >= observed
                 })
                 .count()
         }
@@ -1434,6 +1433,40 @@ mod tests {
         );
         assert_eq!(at_least_as_extreme_of(&ran), Some(0));
         assert_eq!(ran.permutation_share(), Some(1.0 / 200.0));
+    }
+
+    /// A one-dollar gap between readings near a trillion is reached by 2 of the 6 two-by-two splits, not all of them.
+    #[test]
+    fn test_a_small_gap_between_large_readings_is_not_tied_by_every_split() {
+        let ran = measure(
+            registered_with(Null::Permuted {
+                seed: 5,
+                permutations: NonZeroU32::new(599).unwrap(),
+            }),
+            unpriced(),
+            Pairing::Disjoint,
+            arm("treatment", &[Some(1e12 + 1.0), Some(1e12 + 1.0)]),
+            arm_from("control", 10, &[Some(1e12), Some(1e12)]),
+        );
+        let count = at_least_as_extreme_of(&ran).unwrap();
+        assert!((150..=250).contains(&count), "{count} of 599");
+    }
+
+    /// Readings whose plain sum depends on their order (±1e17 absorbs the small ones) still give one gap per set: the
+    /// reading's gap is zero, so every relabeling is at least as extreme.
+    #[test]
+    fn test_the_same_readings_give_the_same_gap_in_any_order() {
+        let ran = measure(
+            registered(),
+            unpriced(),
+            Pairing::Disjoint,
+            arm(
+                "treatment",
+                &[Some(0.1), Some(1e17), Some(0.7), Some(-1e17), Some(0.2)],
+            ),
+            arm_from("control", 10, &[Some(0.0); 5]),
+        );
+        assert_eq!(at_least_as_extreme_of(&ran), Some(199));
     }
 
     /// Three equal differences tie the reading exactly on two of eight relabelings, and a tie counts.
