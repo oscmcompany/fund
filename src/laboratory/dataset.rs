@@ -35,6 +35,10 @@ pub enum DatasetError {
         session: SessionDate,
         refusal: DecodeRefusal,
     },
+    /// A partition that holds no bars is a defect in the archive, not a gap, so it is refused rather than read.
+    EmptyPartition {
+        session: SessionDate,
+    },
 }
 
 impl std::fmt::Display for DatasetError {
@@ -42,6 +46,9 @@ impl std::fmt::Display for DatasetError {
         match self {
             Self::Window(refusal) => write!(formatter, "{refusal}"),
             Self::Archive(error) => write!(formatter, "{error}"),
+            Self::EmptyPartition { session } => {
+                write!(formatter, "the partition for {session} holds no bars")
+            }
             Self::Decode { session, refusal } => {
                 write!(
                     formatter,
@@ -81,12 +88,19 @@ pub async fn daily_bars(
             session: *session,
             refusal,
         })?;
-        bars.insert(*session, read);
+        bars.insert(*session, admit(*session, read)?);
         tags.insert(*session, tag.as_str().to_string());
     }
     let fingerprint =
         Fingerprint::new(series, first, last, calendar, tags).map_err(DatasetError::Window)?;
     Ok(Dataset { bars, fingerprint })
+}
+
+fn admit(session: SessionDate, bars: Vec<Bar>) -> Result<Vec<Bar>, DatasetError> {
+    match bars.is_empty() {
+        true => Err(DatasetError::EmptyPartition { session }),
+        false => Ok(bars),
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +109,15 @@ mod tests {
 
     use super::*;
     use crate::ingest::alpaca::Alpaca;
+
+    #[test]
+    fn test_an_empty_partition_is_refused_rather_than_read() {
+        let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 28).unwrap());
+        assert!(matches!(
+            admit(session, Vec::new()),
+            Err(DatasetError::EmptyPartition { session: refused }) if refused == session
+        ));
+    }
 
     /// Read-only: one week of the production archive, read twice, under secretspec. The week holds the layout's first
     /// sessions, 2026-09-28 and 09-29, so it always reads something.

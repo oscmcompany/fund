@@ -11,6 +11,7 @@ use crate::common::time::calendar::TradingCalendar;
 /// The partitions a study read, by session with the entity tag of the version read, and every trading session in the
 /// window that had none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "FingerprintFields")]
 pub struct Fingerprint {
     series: String,
     first: SessionDate,
@@ -18,6 +19,53 @@ pub struct Fingerprint {
     partitions: BTreeMap<SessionDate, String>,
     /// Trading sessions in the window with no partition, so an absence is read as one rather than as a short window.
     missing: Vec<SessionDate>,
+}
+
+#[derive(Deserialize)]
+struct FingerprintFields {
+    series: String,
+    first: SessionDate,
+    last: SessionDate,
+    partitions: BTreeMap<SessionDate, String>,
+    missing: Vec<SessionDate>,
+}
+
+impl TryFrom<FingerprintFields> for Fingerprint {
+    type Error = FingerprintRefusal;
+
+    /// Checks what holds without a calendar; that every session trades was checked when the fingerprint was taken.
+    fn try_from(fields: FingerprintFields) -> Result<Self, Self::Error> {
+        let (first, last) = (fields.first, fields.last);
+        if last < first {
+            return Err(FingerprintRefusal::Inverted { first, last });
+        }
+        let outside = |session: &&SessionDate| **session < first || last < **session;
+        if let Some(session) = fields
+            .partitions
+            .keys()
+            .chain(&fields.missing)
+            .find(outside)
+        {
+            return Err(FingerprintRefusal::NotATradingSession { session: *session });
+        }
+        if let Some(session) = fields
+            .missing
+            .iter()
+            .find(|session| fields.partitions.contains_key(session))
+        {
+            return Err(FingerprintRefusal::ReadAndMissing { session: *session });
+        }
+        if !fields.missing.is_sorted() {
+            return Err(FingerprintRefusal::MissingUnordered);
+        }
+        Ok(Self {
+            series: fields.series,
+            first,
+            last,
+            partitions: fields.partitions,
+            missing: fields.missing,
+        })
+    }
 }
 
 /// Why a fingerprint could not be taken.
@@ -32,7 +80,13 @@ pub enum FingerprintRefusal {
         last: SessionDate,
     },
     /// A partition for a day the calendar does not trade, or outside the window.
-    NotATradingSession { session: SessionDate },
+    NotATradingSession {
+        session: SessionDate,
+    },
+    ReadAndMissing {
+        session: SessionDate,
+    },
+    MissingUnordered,
 }
 
 impl std::fmt::Display for FingerprintRefusal {
@@ -45,6 +99,10 @@ impl std::fmt::Display for FingerprintRefusal {
             Self::CalendarShort { first, last } => {
                 write!(formatter, "the calendar does not cover {first} to {last}")
             }
+            Self::ReadAndMissing { session } => {
+                write!(formatter, "{session} is both read and missing")
+            }
+            Self::MissingUnordered => write!(formatter, "the missing sessions are out of order"),
             Self::NotATradingSession { session } => {
                 write!(
                     formatter,
@@ -56,8 +114,9 @@ impl std::fmt::Display for FingerprintRefusal {
 }
 
 impl Fingerprint {
-    /// `partitions` holds what was found; every other trading session from `first` to `last` is recorded missing.
-    pub fn new(
+    /// `partitions` holds what was found; every other trading session from `first` to `last` is recorded missing. Taken
+    /// only by the crate's loaders, so a study cannot vouch for partitions nothing read.
+    pub(crate) fn new(
         series: impl Into<String>,
         first: SessionDate,
         last: SessionDate,
@@ -176,6 +235,35 @@ mod tests {
                 Err(FingerprintRefusal::NotATradingSession {
                     session: session(day)
                 })
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_stored_fingerprint_must_agree_with_its_own_window() {
+        let stored = serde_json::to_value(
+            Fingerprint::new(
+                "data/bars/",
+                session(21),
+                session(25),
+                &calendar(),
+                tags(&[21, 24]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut outside = stored.clone();
+        outside["partitions"]["2026-09-28"] = serde_json::json!("\"tag\"");
+        let mut both = stored.clone();
+        both["missing"] = serde_json::json!(["2026-09-21", "2026-09-22"]);
+        let mut unordered = stored.clone();
+        unordered["missing"] = serde_json::json!(["2026-09-23", "2026-09-22"]);
+        let mut inverted = stored;
+        inverted["last"] = serde_json::json!("2026-09-20");
+        for refused in [outside, both, unordered, inverted] {
+            assert!(
+                serde_json::from_value::<Fingerprint>(refused.clone()).is_err(),
+                "{refused}"
             );
         }
     }
