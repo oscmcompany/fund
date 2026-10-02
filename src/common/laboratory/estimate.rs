@@ -79,20 +79,14 @@ pub fn summarize(series: &Series) -> Summary {
         .fold(Summary::EMPTY, Summary::combine)
 }
 
-/// A standard error that is positive, with the degrees of freedom it was estimated on.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StandardError {
-    value: f64,
-    degrees_of_freedom: DegreesOfFreedom,
-}
-
-/// A mean with its sample; `error` is `None` where the readings never varied, so there is nothing to judge it by.
+/// A mean with its sample, its standard error (zero where the readings never varied) and the freedom it was taken on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Estimate {
     mean: f64,
     sessions: u64,
     undefined: u64,
-    error: Option<StandardError>,
+    standard_error: f64,
+    degrees_of_freedom: DegreesOfFreedom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +94,10 @@ pub enum EstimateRefusal {
     Series(SeriesRefusal),
     /// A matched comparison where only one arm read `session`.
     Unmatched {
+        session: SessionDate,
+    },
+    /// A disjoint comparison where both arms read `session`, so their errors would not add in quadrature.
+    Shared {
         session: SessionDate,
     },
     /// Below two measured sessions there is no spread to take an error from.
@@ -116,6 +114,12 @@ impl std::fmt::Display for EstimateRefusal {
                 write!(
                     formatter,
                     "only one arm read {session}, so it cannot be matched"
+                )
+            }
+            Self::Shared { session } => {
+                write!(
+                    formatter,
+                    "both arms read {session}, so they are not disjoint"
                 )
             }
             Self::TooFewSessions { measured } => {
@@ -140,16 +144,13 @@ impl TryFrom<Summary> for Estimate {
             });
         }
         let count = summary.measured as f64;
-        let error = (summary.squared_deviations > 0.0).then(|| StandardError {
-            value: (summary.squared_deviations / (count - 1.0) / count).sqrt(),
-            degrees_of_freedom: DegreesOfFreedom::new(count - 1.0)
-                .expect("two or more sessions leave at least one degree of freedom"),
-        });
         Ok(Self {
             mean: summary.mean,
             sessions: summary.measured,
             undefined: summary.undefined,
-            error,
+            standard_error: (summary.squared_deviations / (count - 1.0) / count).sqrt(),
+            degrees_of_freedom: DegreesOfFreedom::new(count - 1.0)
+                .expect("two or more sessions leave at least one degree of freedom"),
         })
     }
 }
@@ -168,22 +169,21 @@ impl Estimate {
         self.undefined
     }
 
-    pub fn standard_error(self) -> Option<f64> {
-        self.error.map(|error| error.value)
+    pub fn standard_error(self) -> f64 {
+        self.standard_error
     }
 
-    pub fn degrees_of_freedom(self) -> Option<DegreesOfFreedom> {
-        self.error.map(|error| error.degrees_of_freedom)
+    pub fn degrees_of_freedom(self) -> DegreesOfFreedom {
+        self.degrees_of_freedom
     }
 
-    /// The mean in standard errors.
+    /// The mean in standard errors; `None` where the error is zero, since no ratio over it is measurable.
     pub fn t(self) -> Option<f64> {
-        self.error.map(|error| self.mean / error.value)
+        (self.standard_error > 0.0).then(|| self.mean / self.standard_error)
     }
 
     pub fn clears(self, haircut: Haircut) -> Option<bool> {
-        self.error
-            .map(|error| haircut.clears(self.mean / error.value, error.degrees_of_freedom))
+        self.t().map(|t| haircut.clears(t, self.degrees_of_freedom))
     }
 }
 
@@ -227,43 +227,69 @@ pub fn paired(
 }
 
 /// Treatment less control over arms that share no session: errors in quadrature, with Welch–Satterthwaite degrees
-/// of freedom because the arms' variances need not agree. The arms' disjointness is the caller's to ensure.
+/// of freedom because the arms' variances need not agree.
 pub fn welch(
-    Treatment(treatment): Treatment<Estimate>,
-    Control(control): Control<Estimate>,
-) -> Estimate {
-    let error = match (treatment.error, control.error) {
-        (Some(treatment), Some(control)) => {
-            let (treatment_variance, control_variance) =
-                (treatment.value.powi(2), control.value.powi(2));
-            Some(StandardError {
-                value: (treatment_variance + control_variance).sqrt(),
-                degrees_of_freedom: DegreesOfFreedom::new(
-                    (treatment_variance + control_variance).powi(2)
-                        / (treatment_variance.powi(2) / treatment.degrees_of_freedom.value()
-                            + control_variance.powi(2) / control.degrees_of_freedom.value()),
-                )
-                .expect("Welch freedom lies between the smaller arm's and the sum of both"),
-            })
+    Treatment(treatment): Treatment<&Series>,
+    Control(control): Control<&Series>,
+) -> Result<Estimate, EstimateRefusal> {
+    disjoint(treatment, control)?;
+    let (treatment, control) = (
+        Estimate::try_from(summarize(treatment))?,
+        Estimate::try_from(summarize(control))?,
+    );
+    let (treatment_variance, control_variance) = (
+        treatment.standard_error.powi(2),
+        control.standard_error.powi(2),
+    );
+    let variance = treatment_variance + control_variance;
+    let (treatment_freedom, control_freedom) = (
+        treatment.degrees_of_freedom.value(),
+        control.degrees_of_freedom.value(),
+    );
+    // Taken over shares of the variance, which cannot underflow; with no variance at all, the limit where each
+    // variance scales with its freedom.
+    let freedom = match variance > 0.0 {
+        true => {
+            let (treatment_share, control_share) =
+                (treatment_variance / variance, control_variance / variance);
+            1.0 / (treatment_share.powi(2) / treatment_freedom
+                + control_share.powi(2) / control_freedom)
         }
-        // A side that never varied adds no variance, and the formula reduces to the other side's.
-        (Some(error), None) | (None, Some(error)) => Some(error),
-        (None, None) => None,
+        false => treatment_freedom + control_freedom,
     };
-    Estimate {
+    Ok(Estimate {
         mean: treatment.mean - control.mean,
         sessions: treatment.sessions + control.sessions,
         undefined: treatment.undefined + control.undefined,
-        error,
+        standard_error: variance.sqrt(),
+        degrees_of_freedom: DegreesOfFreedom::new(freedom)
+            .expect("Welch freedom lies between the smaller arm's and the sum of both"),
+    })
+}
+
+fn disjoint(treatment: &Series, control: &Series) -> Result<(), EstimateRefusal> {
+    match treatment
+        .readings()
+        .keys()
+        .find(|session| control.readings().contains_key(session))
+    {
+        Some(session) => Err(EstimateRefusal::Shared { session: *session }),
+        None => Ok(()),
     }
 }
 
 /// The share of sign flips of `differences` whose sum is at least as far from zero as the reading's, counting the
-/// reading itself so it is never zero; `None` below two measured differences.
-pub fn flipped_share(differences: &Series, seed: u64, permutations: NonZeroU32) -> Option<f64> {
+/// reading itself so it is never zero.
+pub fn flipped_share(
+    differences: &Series,
+    seed: u64,
+    permutations: NonZeroU32,
+) -> Result<f64, EstimateRefusal> {
     let measured: Vec<f64> = differences.readings().values().flatten().copied().collect();
     if measured.len() < 2 {
-        return None;
+        return Err(EstimateRefusal::TooFewSessions {
+            measured: measured.len() as u64,
+        });
     }
     let mut generator = Generator::new(seed);
     // Summed in session order, so a relabeling that reproduces the reading, or negates it, ties it exactly.
@@ -280,22 +306,26 @@ pub fn flipped_share(differences: &Series, seed: u64, permutations: NonZeroU32) 
             flipped.abs() >= observed
         })
         .count();
-    Some(share(count, permutations))
+    Ok(share(count, permutations))
 }
 
 /// The share of reshufflings of both arms' readings, into groups of their own sizes, whose means lie at least as far
-/// apart as the arms' do; `None` below two measured readings in either arm.
+/// apart as the arms' do; refused over a shared session or below two measured readings in either arm.
 pub fn shuffled_share(
     Treatment(treatment): Treatment<&Series>,
     Control(control): Control<&Series>,
     seed: u64,
     permutations: NonZeroU32,
-) -> Option<f64> {
+) -> Result<f64, EstimateRefusal> {
+    disjoint(treatment, control)?;
     let measured =
         |series: &Series| -> Vec<f64> { series.readings().values().flatten().copied().collect() };
     let (treatment, control) = (measured(treatment), measured(control));
-    if treatment.len() < 2 || control.len() < 2 {
-        return None;
+    let fewest = treatment.len().min(control.len());
+    if fewest < 2 {
+        return Err(EstimateRefusal::TooFewSessions {
+            measured: fewest as u64,
+        });
     }
     let treatment_sessions = treatment.len();
     // Each group summed in sorted order, so the same readings give the same gap whatever order the shuffle left.
@@ -317,7 +347,7 @@ pub fn shuffled_share(
             gap(&pooled) >= observed
         })
         .count();
-    Some(share(count, permutations))
+    Ok(share(count, permutations))
 }
 
 fn share(at_least_as_extreme: usize, permutations: NonZeroU32) -> f64 {
@@ -385,14 +415,8 @@ mod tests {
         .unwrap();
         // Differences 1, 1, 2, 2: standard deviation 1/√3, over √4.
         assert_eq!(paired.mean(), 1.5);
-        assert!(close(
-            paired.standard_error().unwrap(),
-            1.0 / 3f64.sqrt() / 2.0
-        ));
-        assert_eq!(
-            paired.degrees_of_freedom().map(DegreesOfFreedom::value),
-            Some(3.0)
-        );
+        assert!(close(paired.standard_error(), 1.0 / 3f64.sqrt() / 2.0));
+        assert_eq!(paired.degrees_of_freedom().value(), 3.0);
         assert_eq!((paired.sessions(), paired.undefined()), (4, 0));
     }
 
@@ -400,31 +424,35 @@ mod tests {
     #[test]
     fn test_disjoint_arms_add_their_errors_in_quadrature_with_welch_freedom() {
         let difference = welch(
-            Treatment(estimate(&[1.0, 3.0])),
-            Control(estimate(&[0.0, 0.0, 3.0])),
-        );
+            Treatment(&measured(0, &[1.0, 3.0])),
+            Control(&measured(10, &[0.0, 0.0, 3.0])),
+        )
+        .unwrap();
         assert_eq!(difference.mean(), 1.0);
-        assert!(close(difference.standard_error().unwrap(), 2f64.sqrt()));
-        assert!(close(
-            difference.degrees_of_freedom().unwrap().value(),
-            4.0 / 1.5
-        ));
+        assert!(close(difference.standard_error(), 2f64.sqrt()));
+        assert!(close(difference.degrees_of_freedom().value(), 4.0 / 1.5));
         assert_eq!(difference.sessions(), 5);
     }
 
     #[test]
     fn test_a_side_that_never_varied_leaves_the_other_sides_error() {
-        let varied = estimate(&[1.0, 3.0, 8.0]);
-        let flat = estimate(&[2.0, 2.0]);
+        let (varied, flat) = (measured(0, &[1.0, 3.0, 8.0]), measured(10, &[2.0, 2.0]));
+        let alone = estimate(&[1.0, 3.0, 8.0]);
+        let forward = welch(Treatment(&varied), Control(&flat)).unwrap();
+        let backward = welch(Treatment(&flat), Control(&varied)).unwrap();
         assert_eq!(
-            welch(Treatment(varied), Control(flat)).standard_error(),
-            varied.standard_error()
+            (forward.standard_error(), backward.degrees_of_freedom()),
+            (alone.standard_error(), alone.degrees_of_freedom())
         );
+        let neither = welch(Treatment(&flat), Control(&measured(20, &[5.0, 5.0, 5.0]))).unwrap();
         assert_eq!(
-            welch(Treatment(flat), Control(varied)).degrees_of_freedom(),
-            varied.degrees_of_freedom()
+            (
+                neither.standard_error(),
+                neither.degrees_of_freedom().value(),
+                neither.t()
+            ),
+            (0.0, 3.0, None)
         );
-        assert_eq!(welch(Treatment(flat), Control(flat)).standard_error(), None);
     }
 
     #[test]
@@ -470,9 +498,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (flat.mean(), flat.t(), flat.clears(haircut(1))),
-            (1.0, None, None)
+            (
+                flat.mean(),
+                flat.standard_error(),
+                flat.degrees_of_freedom().value()
+            ),
+            (1.0, 0.0, 1.0)
         );
+        assert_eq!((flat.t(), flat.clears(haircut(1))), (None, None));
         assert_eq!(
             Estimate::try_from(summarize(&series(0, &[Some(1.0), None]))),
             Err(EstimateRefusal::TooFewSessions { measured: 1 })
@@ -498,9 +531,10 @@ mod tests {
     #[test]
     fn test_a_small_sample_is_judged_at_its_own_degrees_of_freedom() {
         let small = welch(
-            Treatment(estimate(&[1.5, 3.5])),
-            Control(estimate(&[0.0, 0.0])),
-        );
+            Treatment(&measured(0, &[1.5, 3.5])),
+            Control(&measured(10, &[0.0, 0.0])),
+        )
+        .unwrap();
         assert!(close(small.t().unwrap(), 2.5));
         assert_eq!(small.clears(haircut(1)), Some(false));
     }
@@ -517,11 +551,37 @@ mod tests {
             Err(EstimateRefusal::Series(SeriesRefusal::OutOfRange { .. }))
         ));
         let disjoint = welch(
-            Treatment(Estimate::try_from(summarize(&high)).unwrap()),
-            Control(Estimate::try_from(summarize(&low)).unwrap()),
+            Treatment(&high),
+            Control(&measured(10, &[-1e50, 1e50, -1e50])),
+        )
+        .unwrap();
+        assert!(disjoint.standard_error().is_finite());
+        assert!(disjoint.t().is_some_and(f64::is_finite));
+    }
+
+    /// Variances that underflow when squared again still give Welch a usable freedom rather than a panic.
+    #[test]
+    fn test_tiny_variances_do_not_underflow_welch() {
+        let tiny = welch(
+            Treatment(&measured(0, &[0.0, 1e-161])),
+            Control(&measured(10, &[0.0, 1e-161])),
+        )
+        .unwrap();
+        assert!(tiny.standard_error() > 0.0);
+        assert!(close(tiny.degrees_of_freedom().value(), 2.0));
+    }
+
+    #[test]
+    fn test_disjoint_comparisons_refuse_a_shared_session() {
+        let (treatment, control) = (measured(0, &[1.0, 2.0, 3.0]), measured(2, &[4.0, 5.0]));
+        let shared = EstimateRefusal::Shared {
+            session: session(2),
+        };
+        assert_eq!(welch(Treatment(&treatment), Control(&control)), Err(shared));
+        assert_eq!(
+            shuffled_share(Treatment(&treatment), Control(&control), 1, permutations(9)),
+            Err(shared)
         );
-        assert!(disjoint.standard_error().unwrap().is_finite());
-        assert!(disjoint.degrees_of_freedom().is_some());
     }
 
     /// Twenty positive differences: only the two all-same-sign relabelings reach them, about one in half a million.
@@ -530,11 +590,11 @@ mod tests {
         let differences = measured(0, &(1..=20).map(f64::from).collect::<Vec<_>>());
         assert_eq!(
             flipped_share(&differences, 1, permutations(199)),
-            Some(1.0 / 200.0)
+            Ok(1.0 / 200.0)
         );
         assert_eq!(
             flipped_share(&series(0, &[Some(1.0), None]), 1, permutations(199)),
-            None
+            Err(EstimateRefusal::TooFewSessions { measured: 1 })
         );
     }
 
@@ -568,7 +628,7 @@ mod tests {
             1,
             permutations(199),
         );
-        assert_eq!(share, Some(1.0));
+        assert_eq!(share, Ok(1.0));
     }
 
     #[test]
@@ -597,7 +657,7 @@ mod tests {
                 1,
                 permutations(9)
             ),
-            None
+            Err(EstimateRefusal::TooFewSessions { measured: 1 })
         );
     }
 
@@ -718,7 +778,7 @@ mod tests {
             let mean = differences.iter().sum::<f64>() / count;
             let variance = differences.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / (count - 1.0);
             prop_assert!(close(estimate.mean(), mean));
-            prop_assert!((estimate.standard_error().unwrap_or(0.0) - (variance / count).sqrt()).abs() < 1e-9);
+            prop_assert!((estimate.standard_error() - (variance / count).sqrt()).abs() < 1e-9);
         }
 
         /// Adding the same per-session shock to both matched arms moves neither the difference nor its error.
@@ -732,19 +792,16 @@ mod tests {
             };
             let (plain, shocked) = (read(false), read(true));
             prop_assert!((plain.mean() - shocked.mean()).abs() < 1e-6);
-            match (plain.standard_error(), shocked.standard_error()) {
-                (Some(left), Some(right)) => prop_assert!((left - right).abs() < 1e-4 * left.max(1.0)),
-                (left, right) => prop_assert_eq!(left.is_some(), right.is_some()),
-            }
+            prop_assert!((plain.standard_error() - shocked.standard_error()).abs() < 1e-4 * plain.standard_error().max(1.0));
         }
 
         /// Swapping disjoint arms negates the difference and keeps its error and its degrees of freedom.
         #[test]
         fn test_swapping_disjoint_arms_negates_the_difference(treatment in prop::collection::vec(-100.0..100.0f64, 2..40), control in prop::collection::vec(-100.0..100.0f64, 2..40)) {
-            let (treatment, control) = (estimate(&treatment), estimate(&control));
-            let forward = welch(Treatment(treatment), Control(control));
+            let (treatment, control) = (measured(0, &treatment), measured(100, &control));
+            let forward = welch(Treatment(&treatment), Control(&control)).unwrap();
             // The relabeling is the point: the old control is named the treatment.
-            let backward = welch(Treatment(control), Control(treatment));
+            let backward = welch(Treatment(&control), Control(&treatment)).unwrap();
             prop_assert_eq!(forward.mean(), -backward.mean());
             prop_assert_eq!(forward.standard_error(), backward.standard_error());
             prop_assert_eq!(forward.degrees_of_freedom(), backward.degrees_of_freedom());
