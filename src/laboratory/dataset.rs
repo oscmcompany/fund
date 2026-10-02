@@ -6,6 +6,7 @@ use crate::archive::bars::{DecodeRefusal, decode};
 use crate::archive::{Archive, ArchiveError};
 use crate::common::heal::Leg;
 use crate::common::laboratory::dataset::{Contamination, Fingerprint, FingerprintRefusal};
+use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
@@ -24,6 +25,15 @@ impl Dataset {
 
     pub fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    /// One reading per session read, `read` folding that session's bars; a missing session stays out of the series.
+    pub fn series(&self, read: impl Fn(&[Bar]) -> Option<f64>) -> Result<Series, SeriesRefusal> {
+        Series::new(
+            self.bars
+                .iter()
+                .map(|(session, bars)| (*session, read(bars))),
+        )
     }
 }
 
@@ -161,6 +171,11 @@ mod tests {
         for (session, bars) in dataset.bars() {
             assert!(bars.len() > 1000, "{session}: {} bars", bars.len());
         }
+        let counts = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
+        assert_eq!(
+            counts.readings().keys().collect::<Vec<_>>(),
+            fingerprint.partitions().keys().collect::<Vec<_>>()
+        );
         let again = daily_bars(&archive, &calendar, first, last).await.unwrap();
         assert_eq!(again.fingerprint(), fingerprint);
         assert_eq!(lineage(&archive, fingerprint).await.unwrap(), []);
