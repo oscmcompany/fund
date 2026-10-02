@@ -1,3 +1,3 @@
-//! Loads what studies read; the study code itself is throwaway and lives in `examples/`.
+//! Loads what studies read, each dataset with the fingerprint of exactly the partitions it came from.
 
 pub mod dataset;
