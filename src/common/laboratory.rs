@@ -4,8 +4,10 @@
 
 pub mod cost;
 pub mod dataset;
+pub mod estimate;
 pub mod haircut;
 pub mod permutation;
+pub mod series;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;

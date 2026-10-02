@@ -6,6 +6,7 @@ use crate::archive::bars::{DecodeRefusal, decode};
 use crate::archive::{Archive, ArchiveError};
 use crate::common::heal::Leg;
 use crate::common::laboratory::dataset::{Contamination, Fingerprint, FingerprintRefusal};
+use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
@@ -24,6 +25,15 @@ impl Dataset {
 
     pub fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    /// One reading per session read, `read` folding that session's bars; a missing session stays out of the series.
+    pub fn series(&self, read: impl Fn(&[Bar]) -> Option<f64>) -> Result<Series, SeriesRefusal> {
+        Series::new(
+            self.bars
+                .iter()
+                .map(|(session, bars)| (*session, read(bars))),
+        )
     }
 }
 
@@ -121,7 +131,71 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
+    use crate::common::market::record::{BarInterval, Ohlc};
+    use crate::common::market::{Price, Shares, Symbol};
+    use crate::common::time::calendar::TradingSession;
     use crate::ingest::alpaca::Alpaca;
+
+    /// Three sessions read and one missing; the series keeps exactly the sessions read, an unmeasured one as `None`.
+    #[test]
+    fn test_a_series_holds_one_reading_per_session_read() {
+        let session = |day| {
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap())
+                .plus_calendar_days(day)
+        };
+        let (open, close) = (
+            chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        );
+        let calendar = TradingCalendar::new(
+            (0..4)
+                .map(|day| TradingSession::new(session(day), open, close).unwrap())
+                .collect(),
+            session(0),
+            session(3),
+        )
+        .unwrap();
+        let price = |dollars: f64| Price::from_dollars(dollars).unwrap();
+        let bars = |day: i64, count: usize| {
+            let bar = Bar::new(
+                Symbol::new("AAPL").unwrap(),
+                BarInterval::OneDay,
+                session(day).regular_close(),
+                Ohlc::new(price(10.0), price(12.0), price(9.5), price(11.0)).unwrap(),
+                Shares::from_float(100.0).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+            (session(day), vec![bar; count])
+        };
+        let read = [0, 1, 3]
+            .map(|day| (session(day), format!("\"tag-{day}\"")))
+            .into();
+        let dataset = Dataset {
+            bars: [bars(0, 1), bars(1, 2), bars(3, 3)].into(),
+            fingerprint: Fingerprint::new(
+                Leg::MassiveDailyBars,
+                session(0),
+                session(3),
+                &calendar,
+                read,
+            )
+            .unwrap(),
+        };
+        let series = dataset
+            .series(|bars| (bars.len() != 2).then_some(bars.len() as f64))
+            .unwrap();
+        assert_eq!(
+            series.readings().iter().collect::<Vec<_>>(),
+            [
+                (&session(0), &Some(1.0)),
+                (&session(1), &None),
+                (&session(3), &Some(3.0))
+            ]
+        );
+        assert_eq!(dataset.fingerprint().missing(), [session(2)]);
+    }
 
     #[test]
     fn test_an_empty_partition_is_refused_rather_than_read() {
@@ -161,6 +235,11 @@ mod tests {
         for (session, bars) in dataset.bars() {
             assert!(bars.len() > 1000, "{session}: {} bars", bars.len());
         }
+        let counts = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
+        assert_eq!(
+            counts.readings().keys().collect::<Vec<_>>(),
+            fingerprint.partitions().keys().collect::<Vec<_>>()
+        );
         let again = daily_bars(&archive, &calendar, first, last).await.unwrap();
         assert_eq!(again.fingerprint(), fingerprint);
         assert_eq!(lineage(&archive, fingerprint).await.unwrap(), []);
