@@ -1,6 +1,8 @@
 //! Runs studies. A study is measured only here, and only after its run is journaled, so no reading exists that the
 //! journal does not hold.
 
+pub mod dataset;
+
 use std::io;
 
 use chrono::Utc;
@@ -24,7 +26,7 @@ mod tests {
     use super::*;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::laboratory::{
-        Arm, Direction, Exploration, KillLine, Lane, Pairing, Quantity,
+        Arm, Direction, Exploration, KillLine, Lane, Pairing, Quantity, Source,
     };
     use crate::common::register::Family;
     use crate::common::time::SessionDate;
@@ -58,6 +60,9 @@ mod tests {
         };
         let study = Study::new(
             lane,
+            Source::Synthetic {
+                description: "three sessions written in the test".to_string(),
+            },
             quantity,
             Pairing::Matched,
             arm("gap-top-decile", [1.0, 2.0, 4.0]),

@@ -3,6 +3,7 @@
 //! kill line, so a number that was never registered cannot be quoted as if it had been.
 
 pub mod cost;
+pub mod dataset;
 pub mod haircut;
 pub mod permutation;
 
@@ -12,6 +13,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Serialize};
 
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal};
+use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
 use crate::common::laboratory::permutation::Generator;
 use crate::common::register::{
@@ -238,6 +240,19 @@ pub enum Null {
     Omitted { reason: String },
 }
 
+/// Where a study's readings came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum Source {
+    Archive {
+        fingerprint: Fingerprint,
+    },
+    /// Generated in code, as a calibration's noise is; named so it is never read as a reading of the archive.
+    Synthetic {
+        description: String,
+    },
+}
+
 /// Which questions a study may answer: only a registered one has a bar to clear and a null to clear it against.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lane {
@@ -254,6 +269,12 @@ pub enum StudyRefusal {
     BlankName,
     BlankQuestion,
     BlankReason,
+    BlankDescription,
+    /// An arm read a session its source holds no partition for.
+    SessionNotInSource {
+        arm: String,
+        session: SessionDate,
+    },
     NoReadings {
         arm: String,
     },
@@ -297,6 +318,13 @@ impl std::fmt::Display for StudyRefusal {
             Self::BlankName => write!(formatter, "an arm has no name"),
             Self::BlankQuestion => write!(formatter, "the exploration asks no question"),
             Self::BlankReason => write!(formatter, "the null is omitted without a reason"),
+            Self::BlankDescription => write!(formatter, "the synthetic source is not described"),
+            Self::SessionNotInSource { arm, session } => {
+                write!(
+                    formatter,
+                    "arm {arm} read {session}, which its source holds no partition for"
+                )
+            }
             Self::NoReadings { arm } => write!(formatter, "arm {arm} read no sessions"),
             Self::ReadTwice { arm, session } => write!(formatter, "arm {arm} read {session} twice"),
             Self::OutOfRange {
@@ -342,6 +370,7 @@ impl std::fmt::Display for StudyRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Study {
     lane: Lane,
+    source: Source,
     quantity: Quantity,
     pairing: Pairing,
     treatment: Arm,
@@ -353,11 +382,32 @@ impl Study {
     /// sessions, or disjoint arms that share one.
     pub fn new(
         lane: Lane,
+        source: Source,
         quantity: Quantity,
         pairing: Pairing,
         treatment: Arm,
         control: Arm,
     ) -> Result<Self, StudyRefusal> {
+        match &source {
+            Source::Synthetic { description } if description.trim().is_empty() => {
+                return Err(StudyRefusal::BlankDescription);
+            }
+            Source::Synthetic { .. } => {}
+            Source::Archive { fingerprint } => {
+                for arm in [&treatment, &control] {
+                    if let Some(session) = arm
+                        .readings
+                        .keys()
+                        .find(|session| !fingerprint.partitions().contains_key(session))
+                    {
+                        return Err(StudyRefusal::SessionNotInSource {
+                            arm: arm.name.clone(),
+                            session: *session,
+                        });
+                    }
+                }
+            }
+        }
         match &lane {
             Lane::Registered {
                 null: Null::Omitted { reason },
@@ -407,6 +457,7 @@ impl Study {
         }
         Ok(Self {
             lane,
+            source,
             quantity,
             pairing,
             treatment,
@@ -472,6 +523,7 @@ impl Study {
             },
         };
         StudyRan {
+            source: self.source,
             pairing: self.pairing,
             quantity: self.quantity,
             treatment: ArmRead::of(&self.treatment),
@@ -753,6 +805,7 @@ pub enum NullRead {
 /// One study's run, journaled whole: the declaration, both arms' populations, and the finding in its lane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StudyRan {
+    source: Source,
     pairing: Pairing,
     quantity: Quantity,
     treatment: ArmRead,
@@ -764,6 +817,10 @@ pub struct StudyRan {
 }
 
 impl StudyRan {
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
     pub fn treatment(&self) -> &ArmRead {
         &self.treatment
     }
@@ -994,6 +1051,12 @@ mod tests {
         )
     }
 
+    fn synthetic() -> Source {
+        Source::Synthetic {
+            description: "fixture readings".to_string(),
+        }
+    }
+
     fn unpriced() -> Quantity {
         Quantity::Unpriced {
             units: "correlation".parse().unwrap(),
@@ -1014,7 +1077,7 @@ mod tests {
         treatment: Arm,
         control: Arm,
     ) -> StudyRan {
-        Study::new(lane, quantity, pairing, treatment, control)
+        Study::new(lane, synthetic(), quantity, pairing, treatment, control)
             .unwrap()
             .measure()
     }
@@ -1087,6 +1150,7 @@ mod tests {
         let study = |pairing, treatment, control| {
             Study::new(
                 exploratory(0.0, Direction::Higher),
+                synthetic(),
                 unpriced(),
                 pairing,
                 treatment,
@@ -1550,11 +1614,64 @@ mod tests {
         );
     }
 
+    /// An archive source vouches for every session an arm read; a synthetic one must say what it is.
+    #[test]
+    fn test_a_study_reads_only_what_its_source_holds() {
+        let open = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        let close = chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+        let calendar = crate::common::time::calendar::TradingCalendar::new(
+            (0..5)
+                .map(|day| {
+                    crate::common::time::calendar::TradingSession::new(session(day), open, close)
+                        .unwrap()
+                })
+                .collect(),
+            session(0),
+            session(4),
+        )
+        .unwrap();
+        let held: BTreeMap<SessionDate, String> = [0, 1, 3]
+            .map(|day| (session(day), format!("\"tag-{day}\"")))
+            .into();
+        let archive = Source::Archive {
+            fingerprint: Fingerprint::new("data/bars/", session(0), session(4), &calendar, held)
+                .unwrap(),
+        };
+        let study = |source, control_first_day| {
+            Study::new(
+                registered(),
+                source,
+                unpriced(),
+                Pairing::Disjoint,
+                arm("treatment", &[Some(1.0), Some(2.0)]),
+                arm_from("control", control_first_day, &[Some(0.0)]),
+            )
+        };
+        assert!(study(archive.clone(), 3).is_ok());
+        assert_eq!(
+            study(archive, 2),
+            Err(StudyRefusal::SessionNotInSource {
+                arm: "control".to_string(),
+                session: session(2)
+            })
+        );
+        assert_eq!(
+            study(
+                Source::Synthetic {
+                    description: " ".to_string()
+                },
+                3
+            ),
+            Err(StudyRefusal::BlankDescription)
+        );
+    }
+
     #[test]
     fn test_a_null_is_either_drawn_or_omitted_with_its_reason() {
         let study = |null| {
             Study::new(
                 registered_with(null),
+                synthetic(),
                 unpriced(),
                 Pairing::Matched,
                 arm("treatment", &[Some(1.0), Some(2.0)]),
