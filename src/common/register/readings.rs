@@ -130,7 +130,7 @@ fn tests_by_quarter(accessions: &[Accession]) -> BTreeMap<Quarter, Tests> {
 #[derive(Debug, Clone, PartialEq)]
 struct Spread {
     unrecorded: usize,
-    /// Sorted ascending; the median of an even count is the lower middle, so it is always a recorded value.
+    /// Sorted ascending.
     recorded: Vec<u64>,
 }
 
@@ -146,7 +146,8 @@ impl Spread {
         }
     }
 
-    /// Minimum, median and maximum; `None` when nothing was recorded.
+    /// Minimum, lower median and maximum; `None` when nothing was recorded. The lower middle of an even count rather
+    /// than an average of two, so it is always a recorded value and never a half-unit of seconds or millionths.
     fn bounds(&self) -> Option<(u64, u64, u64)> {
         let (first, last) = (self.recorded.first()?, self.recorded.last()?);
         Some((*first, self.recorded[(self.recorded.len() - 1) / 2], *last))
@@ -170,15 +171,7 @@ fn most_expensive_refutation(accessions: &[Accession]) -> Option<(AccessionNumbe
 pub fn report(accessions: &[Accession]) -> String {
     let mut text = String::new();
     let overall = BidCalibration::of(accessions);
-    let _ = writeln!(
-        text,
-        "Bids: {} closed, {} open; {} scored, {} without an interval bid, {} without a measured value",
-        overall.closed(),
-        overall.open,
-        overall.scored,
-        overall.bid_absent,
-        overall.measurement_absent
-    );
+    let _ = writeln!(text, "Bids: {}", population(&overall));
     write_calibration(&mut text, "  ", &overall);
     for family in Family::iter() {
         let calibration = BidCalibration::of(
@@ -186,8 +179,8 @@ pub fn report(accessions: &[Accession]) -> String {
                 .iter()
                 .filter(|accession| accession.opening().family() == family),
         );
-        if calibration.scored > 0 {
-            let _ = writeln!(text, "  {family}:");
+        if calibration.open + calibration.closed() > 0 {
+            let _ = writeln!(text, "  {family}: {}", population(&calibration));
             write_calibration(&mut text, "    ", &calibration);
         }
     }
@@ -251,7 +244,7 @@ fn write_spread(text: &mut String, name: &str, spread: &Spread, show: impl Fn(u6
     let _ = match spread.bounds() {
         Some((minimum, median, maximum)) => writeln!(
             text,
-            "  {name}: {} recorded, {} unrecorded; minimum {}, median {}, maximum {}",
+            "  {name}: {} recorded, {} unrecorded; minimum {}, lower median {}, maximum {}",
             spread.recorded.len(),
             spread.unrecorded,
             show(minimum),
@@ -262,9 +255,21 @@ fn write_spread(text: &mut String, name: &str, spread: &Spread, show: impl Fn(u6
     };
 }
 
+/// Every accession counted once, as scored or by why it could not be.
+fn population(calibration: &BidCalibration) -> String {
+    format!(
+        "{} closed, {} open; {} scored, {} without an interval bid, {} without a measured value",
+        calibration.closed(),
+        calibration.open,
+        calibration.scored,
+        calibration.bid_absent,
+        calibration.measurement_absent
+    )
+}
+
+/// Coverage and error, written only when something was scored; the population line already says when nothing was.
 fn write_calibration(text: &mut String, indent: &str, calibration: &BidCalibration) {
     if calibration.scored == 0 {
-        let _ = writeln!(text, "{indent}no bid scored yet");
         return;
     }
     let caveat = match calibration.scored < MINIMUM_SCORED_BIDS {
@@ -512,10 +517,11 @@ mod tests {
             "Bids: 5 closed, 1 open; 3 scored, 1 without an interval bid, 1 without a measured value",
             "  covered 2 of 3 (67%) against a declared 83%; fewer than 20 scored, so not yet meaningful",
             "  net-bp: 2 scored, mean signed error -0.50, mean width 9.00",
-            "  overnight:",
+            "  overnight: 2 closed, 1 open; 2 scored, 0 without an interval bid, 0 without a measured value",
+            "  baselines: 1 closed, 0 open; 0 scored, 1 without an interval bid, 0 without a measured value",
             "  2026Q3: 5 opened, 5 closed, 1 accepted (20%)",
             "  2026Q4: 1 opened, 0 closed, 0 accepted (no verdicts yet)",
-            "  wall clock: 4 recorded, 1 unrecorded; minimum 30s, median 60s, maximum 6000s",
+            "  wall clock: 4 recorded, 1 unrecorded; minimum 30s, lower median 60s, maximum 6000s",
             "  dollars: none recorded of 5",
             "  most expensive refutation: 000005, 6000s",
         ] {
@@ -524,7 +530,8 @@ mod tests {
                 "missing {line:?} in\n{report}"
             );
         }
-        assert!(!report.contains("baselines:"), "{report}");
+        // A family with no accessions has no section.
+        assert!(!report.contains("forecast-model:"), "{report}");
     }
 
     #[test]
@@ -547,6 +554,8 @@ mod tests {
             .collect();
         assert!(!report(&register).contains("not yet meaningful"));
         assert!(report(&register[..19]).contains("not yet meaningful"));
-        assert!(report(&[]).contains("no bid scored yet"));
+        assert!(report(&[]).starts_with(
+            "Bids: 0 closed, 0 open; 0 scored, 0 without an interval bid, 0 without a measured value\nTests"
+        ));
     }
 }
