@@ -181,6 +181,38 @@ impl Archive {
         Ok(self.get_tagged(key).await?.map(|(body, _)| body))
     }
 
+    /// The tag of the version under `key` now, without reading it; `None` when the object is gone.
+    pub async fn tag(&self, key: &Key) -> Result<Option<Tag>, ArchiveError> {
+        let path = key.path();
+        let failed = |reason: String| ArchiveError::Get {
+            path: path.clone(),
+            reason,
+        };
+        match self
+            .s3_client
+            .head_object()
+            .bucket(&self.bucket_name)
+            .key(&path)
+            .send()
+            .await
+        {
+            Ok(response) => Ok(Some(Tag(response
+                .e_tag()
+                .ok_or_else(|| failed("no entity tag".to_string()))?
+                .to_string()))),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_not_found()) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(failed(
+                aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
+            )),
+        }
+    }
+
     /// The object under `key` with the tag of the version read, which a `replace` must still match.
     pub async fn get_tagged(&self, key: &Key) -> Result<Option<(Vec<u8>, Tag)>, ArchiveError> {
         let path = key.path();

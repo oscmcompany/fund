@@ -12,6 +12,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::journal::RunId;
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal};
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
@@ -465,6 +466,44 @@ impl Study {
         })
     }
 
+    /// Refuses a registered study over archive partitions that an exploratory run in its family already read, so a
+    /// prior found by exploring is never confirmed on the data that suggested it.
+    pub(crate) fn holdout<'a>(
+        &self,
+        history: impl IntoIterator<Item = (RunId, &'a StudyRan)>,
+    ) -> Result<(), HoldoutRefusal> {
+        let (family, fingerprint) = match (&self.lane, &self.source) {
+            (Lane::Registered { accession, .. }, Source::Archive { fingerprint }) => {
+                (accession.family(), fingerprint)
+            }
+            (Lane::Registered { .. }, Source::Synthetic { .. }) | (Lane::Exploratory(_), _) => {
+                return Ok(());
+            }
+        };
+        let overlaps: Vec<Overlap> = history
+            .into_iter()
+            .filter_map(|(run, prior)| match (&prior.finding, &prior.source) {
+                (
+                    Finding::Exploratory { exploration, .. },
+                    Source::Archive { fingerprint: read },
+                ) if exploration.family() == family && read.leg() == fingerprint.leg() => {
+                    let sessions: Vec<SessionDate> = read
+                        .partitions()
+                        .keys()
+                        .filter(|session| fingerprint.partitions().contains_key(session))
+                        .copied()
+                        .collect();
+                    (!sessions.is_empty()).then_some(Overlap { run, sessions })
+                }
+                (Finding::Exploratory { .. } | Finding::Registered { .. }, _) => None,
+            })
+            .collect();
+        match overlaps.is_empty() {
+            true => Ok(()),
+            false => Err(HoldoutRefusal { overlaps }),
+        }
+    }
+
     /// Scores the study, consuming it so the declaration travels with the number it produced.
     pub(crate) fn measure(self) -> StudyRan {
         let difference = match self.pairing {
@@ -667,6 +706,42 @@ fn at_least_as_extreme(
     Some(u32::try_from(count).expect("a count of permutations fits the u32 it was drawn from"))
 }
 
+/// Why a registered run was refused: exploratory runs in its family already read sessions it would read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldoutRefusal {
+    pub overlaps: Vec<Overlap>,
+}
+
+/// One earlier exploratory run and the sessions it shares with the refused run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlap {
+    pub run: RunId,
+    pub sessions: Vec<SessionDate>,
+}
+
+impl std::fmt::Display for HoldoutRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "exploratory runs in this family already read its data:"
+        )?;
+        for overlap in &self.overlaps {
+            let (first, last) = (overlap.sessions.first(), overlap.sessions.last());
+            write!(
+                formatter,
+                " run {} shares {} session(s), {} to {};",
+                overlap.run,
+                overlap.sessions.len(),
+                first.map(ToString::to_string).unwrap_or_default(),
+                last.map(ToString::to_string).unwrap_or_default()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HoldoutRefusal {}
+
 /// What the difference is worth, so a gross return never appears without its charge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -867,10 +942,11 @@ impl StudyRan {
         }
     }
 
-    /// Whether a registered reading clears its family's haircut as `register` counts it, so every result is judged
-    /// at the family's current size; `None` where nothing could be measured, which has not failed the bar but failed
+    /// Whether a registered reading clears its family's haircut, counting the family's accessions in `register` and its
+    /// exploratory runs in `history`, so every result is judged at the family's current size and the fortieth look
+    /// faces the fortieth look's bar; `None` where nothing could be measured, which has not failed the bar but failed
     /// to reach it.
-    pub fn clears_haircut(&self, register: &[Accession]) -> Option<bool> {
+    pub fn clears_haircut(&self, register: &[Accession], history: &[StudyRan]) -> Option<bool> {
         match &self.finding {
             Finding::Registered {
                 accession,
@@ -884,10 +960,17 @@ impl StudyRan {
                         other.number() != *accession && other.opening().family() == *family
                     })
                     .count();
-                let tests = u32::try_from(others)
+                let looks = history
+                    .iter()
+                    .filter(|prior| match &prior.finding {
+                        Finding::Exploratory { exploration, .. } => exploration.family() == *family,
+                        Finding::Registered { .. } => false,
+                    })
+                    .count();
+                let tests = u32::try_from(others + looks)
                     .ok()
                     .and_then(|others| NonZeroU32::MIN.checked_add(others))
-                    .expect("a register numbers fewer than u32::MAX accessions");
+                    .expect("a family holds fewer than u32::MAX tests");
                 Some(Haircut::new(tests).clears(self.standard_errors()?, (*degrees_of_freedom)?))
             }
             Finding::Exploratory { .. } => None,
@@ -935,9 +1018,11 @@ mod tests {
     use chrono::NaiveDate;
     use proptest::prelude::*;
 
+    use crate::common::heal::Leg;
     use crate::common::laboratory::cost::FillStyle;
     use crate::common::laboratory::permutation::Generator;
     use crate::common::register::{Bid, Closing, Measured, Opening, Sample, StudyCost, Verdict};
+    use crate::common::time::calendar::{TradingCalendar, TradingSession};
 
     fn session(day: i64) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
@@ -1049,6 +1134,57 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// An archive source over sessions 0 to 19, every one a trading day, that read the partitions `days`.
+    fn archive_source(leg: Leg, days: &[i64]) -> Source {
+        let open = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        let close = chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+        let calendar = TradingCalendar::new(
+            (0..20)
+                .map(|day| TradingSession::new(session(day), open, close).unwrap())
+                .collect(),
+            session(0),
+            session(19),
+        )
+        .unwrap();
+        let read = days
+            .iter()
+            .map(|day| (session(*day), format!("\"tag-{day}\"")))
+            .collect();
+        Source::Archive {
+            fingerprint: Fingerprint::new(leg, session(0), session(19), &calendar, read).unwrap(),
+        }
+    }
+
+    /// An exploratory overnight study that read `days`, as a prior run in a journal.
+    fn explored(leg: Leg, family: Family, days: &[i64]) -> StudyRan {
+        let lane = Lane::Exploratory(
+            Exploration::new(
+                family,
+                "liquid-common@1".parse().unwrap(),
+                "1 sessions".parse().unwrap(),
+                "does the gap persist",
+                KillLine::new(0.0, Direction::Higher).unwrap(),
+            )
+            .unwrap(),
+        );
+        let readings: Vec<(SessionDate, Option<f64>)> =
+            days.iter().map(|day| (session(*day), Some(1.0))).collect();
+        Study::new(
+            lane,
+            archive_source(leg, days),
+            unpriced(),
+            Pairing::Matched,
+            Arm::new("treatment", readings.clone(), days.len() as u64).unwrap(),
+            Arm::new("control", readings, days.len() as u64).unwrap(),
+        )
+        .unwrap()
+        .measure()
+    }
+
+    fn run_id(seed: u128) -> RunId {
+        RunId::new(uuid::Uuid::from_u128(seed))
     }
 
     fn synthetic() -> Source {
@@ -1268,7 +1404,7 @@ mod tests {
         );
         assert_eq!(ran.effect().map(Effect::difference), Some(1.0));
         assert_eq!(
-            (ran.standard_errors(), ran.clears_haircut(&family(1))),
+            (ran.standard_errors(), ran.clears_haircut(&family(1), &[])),
             (None, None)
         );
         let single = measure(
@@ -1279,7 +1415,7 @@ mod tests {
             arm("control", &[Some(1.0)]),
         );
         assert_eq!(
-            (single.effect(), single.clears_haircut(&family(1))),
+            (single.effect(), single.clears_haircut(&family(1), &[])),
             (None, None)
         );
     }
@@ -1303,19 +1439,19 @@ mod tests {
     #[test]
     fn test_a_reading_is_judged_against_its_family_as_the_register_counts_it() {
         let borderline = thirty_two_sessions_at(2.2);
-        assert_eq!(borderline.clears_haircut(&family(1)), Some(true));
-        assert_eq!(borderline.clears_haircut(&family(2)), Some(false));
+        assert_eq!(borderline.clears_haircut(&family(1), &[]), Some(true));
+        assert_eq!(borderline.clears_haircut(&family(2), &[]), Some(false));
         let ran = thirty_two_sessions_at(2.5);
         assert!((ran.standard_errors().unwrap() - 2.5).abs() < 1e-9);
         assert_eq!(degrees_of_freedom(&ran), Some(31.0));
-        assert_eq!(ran.clears_haircut(&family(1)), Some(true));
-        assert_eq!(ran.clears_haircut(&family(40)), Some(false));
+        assert_eq!(ran.clears_haircut(&family(1), &[]), Some(true));
+        assert_eq!(ran.clears_haircut(&family(40), &[]), Some(false));
         // Other families, and the accession itself, do not add tests; a closed one in the family does.
         let mut register = vec![
             accession(2, Family::Execution),
             accession(3, Family::Execution),
         ];
-        assert_eq!(ran.clears_haircut(&register), Some(true));
+        assert_eq!(ran.clears_haircut(&register, &[]), Some(true));
         register.extend((4..=42).map(|number| {
             accession(number, Family::Overnight)
                 .close(
@@ -1333,7 +1469,7 @@ mod tests {
                 )
                 .unwrap()
         }));
-        assert_eq!(ran.clears_haircut(&register), Some(false));
+        assert_eq!(ran.clears_haircut(&register, &[]), Some(false));
     }
 
     /// 2.5 standard errors clears the normal's 1.96 but not Student's 12.7 at one degree of freedom.
@@ -1348,7 +1484,7 @@ mod tests {
         );
         assert!((ran.standard_errors().unwrap() - 2.5).abs() < 1e-12);
         assert_eq!(degrees_of_freedom(&ran), Some(1.0));
-        assert_eq!(ran.clears_haircut(&family(1)), Some(false));
+        assert_eq!(ran.clears_haircut(&family(1), &[]), Some(false));
     }
 
     #[test]
@@ -1364,7 +1500,7 @@ mod tests {
         };
         let net = ran(5.0, Direction::Higher, priced(FillStyle::Aggressive, 6.0));
         assert_eq!(
-            (net.standard_errors(), net.clears_haircut(&family(1))),
+            (net.standard_errors(), net.clears_haircut(&family(1), &[])),
             (None, None)
         );
         assert_eq!(net.effect().and_then(Effect::headline), Some(6.0));
@@ -1617,26 +1753,7 @@ mod tests {
     /// An archive source vouches for every session an arm read; a synthetic one must say what it is.
     #[test]
     fn test_a_study_reads_only_what_its_source_holds() {
-        let open = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
-        let close = chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap();
-        let calendar = crate::common::time::calendar::TradingCalendar::new(
-            (0..5)
-                .map(|day| {
-                    crate::common::time::calendar::TradingSession::new(session(day), open, close)
-                        .unwrap()
-                })
-                .collect(),
-            session(0),
-            session(4),
-        )
-        .unwrap();
-        let held: BTreeMap<SessionDate, String> = [0, 1, 3]
-            .map(|day| (session(day), format!("\"tag-{day}\"")))
-            .into();
-        let archive = Source::Archive {
-            fingerprint: Fingerprint::new("data/bars/", session(0), session(4), &calendar, held)
-                .unwrap(),
-        };
+        let archive = archive_source(Leg::MassiveDailyBars, &[0, 1, 3]);
         let study = |source, control_first_day| {
             Study::new(
                 registered(),
@@ -1663,6 +1780,81 @@ mod tests {
                 3
             ),
             Err(StudyRefusal::BlankDescription)
+        );
+    }
+
+    /// A registered study over sessions 5 to 9 against priors that read other ranges, families and legs.
+    #[test]
+    fn test_a_registered_study_is_held_out_from_its_familys_exploration() {
+        let days: Vec<i64> = (5..10).collect();
+        let study = Study::new(
+            registered(),
+            archive_source(Leg::MassiveDailyBars, &days),
+            unpriced(),
+            Pairing::Disjoint,
+            arm_from("treatment", 5, &[Some(1.0), Some(2.0)]),
+            arm_from("control", 7, &[Some(0.0), Some(1.0)]),
+        )
+        .unwrap();
+        let overlapping = explored(Leg::MassiveDailyBars, Family::Overnight, &[0, 1, 8, 9]);
+        let earlier = explored(Leg::MassiveDailyBars, Family::Overnight, &[0, 1, 2, 3, 4]);
+        let elsewhere = explored(Leg::MassiveDailyBars, Family::Execution, &days);
+        let other_leg = explored(Leg::AlpacaMinuteBars, Family::Overnight, &days);
+        let registered_prior = measure(
+            registered(),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &[Some(1.0); 3]),
+            arm("control", &[Some(0.0); 3]),
+        );
+        assert_eq!(
+            study.holdout([
+                (run_id(1), &overlapping),
+                (run_id(2), &earlier),
+                (run_id(3), &elsewhere),
+                (run_id(4), &other_leg),
+                (run_id(5), &registered_prior)
+            ]),
+            Err(HoldoutRefusal {
+                overlaps: vec![Overlap {
+                    run: run_id(1),
+                    sessions: vec![session(8), session(9)]
+                }]
+            })
+        );
+        assert_eq!(
+            study.holdout([(run_id(2), &earlier), (run_id(3), &elsewhere)]),
+            Ok(())
+        );
+        // Synthetic data reads no partition, so it cannot have been explored.
+        let synthetic_study = Study::new(
+            registered(),
+            synthetic(),
+            unpriced(),
+            Pairing::Matched,
+            arm("treatment", &[Some(1.0)]),
+            arm("control", &[Some(0.0)]),
+        )
+        .unwrap();
+        assert_eq!(synthetic_study.holdout([(run_id(1), &overlapping)]), Ok(()));
+    }
+
+    /// At 31 degrees of freedom 2.2 clears a family of one test and fails one of two; an exploratory look in the family
+    /// is the second test, and one in another family is not.
+    #[test]
+    fn test_every_exploratory_look_in_the_family_raises_the_bar() {
+        let borderline = thirty_two_sessions_at(2.2);
+        let register = family(1);
+        assert_eq!(borderline.clears_haircut(&register, &[]), Some(true));
+        let elsewhere = explored(Leg::MassiveDailyBars, Family::Execution, &[0, 1]);
+        assert_eq!(
+            borderline.clears_haircut(&register, std::slice::from_ref(&elsewhere)),
+            Some(true)
+        );
+        let look = explored(Leg::MassiveDailyBars, Family::Overnight, &[0, 1]);
+        assert_eq!(
+            borderline.clears_haircut(&register, &[elsewhere, look]),
+            Some(false)
         );
     }
 
@@ -1724,7 +1916,8 @@ mod tests {
             let clearing = (0..families)
                 .filter(|_| {
                     (0..10).any(|_| {
-                        noise(&mut generator, sessions, 0.0).clears_haircut(&register) == Some(true)
+                        noise(&mut generator, sessions, 0.0).clears_haircut(&register, &[])
+                            == Some(true)
                     })
                 })
                 .count();
@@ -1735,7 +1928,9 @@ mod tests {
             );
         }
         let found = (0..100)
-            .filter(|_| noise(&mut generator, 30, 1.0).clears_haircut(&family(1)) == Some(true))
+            .filter(|_| {
+                noise(&mut generator, 30, 1.0).clears_haircut(&family(1), &[]) == Some(true)
+            })
             .count();
         assert!(found >= 95, "{found} of 100");
     }

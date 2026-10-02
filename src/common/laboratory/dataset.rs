@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::heal::Leg;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 
@@ -13,7 +14,7 @@ use crate::common::time::calendar::TradingCalendar;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "FingerprintFields")]
 pub struct Fingerprint {
-    series: String,
+    leg: Leg,
     first: SessionDate,
     last: SessionDate,
     partitions: BTreeMap<SessionDate, String>,
@@ -23,7 +24,7 @@ pub struct Fingerprint {
 
 #[derive(Deserialize)]
 struct FingerprintFields {
-    series: String,
+    leg: Leg,
     first: SessionDate,
     last: SessionDate,
     partitions: BTreeMap<SessionDate, String>,
@@ -59,7 +60,7 @@ impl TryFrom<FingerprintFields> for Fingerprint {
             return Err(FingerprintRefusal::MissingUnordered);
         }
         Ok(Self {
-            series: fields.series,
+            leg: fields.leg,
             first,
             last,
             partitions: fields.partitions,
@@ -117,7 +118,7 @@ impl Fingerprint {
     /// `partitions` holds what was found; every other trading session from `first` to `last` is recorded missing. Taken
     /// only by the crate's loaders, so a study cannot vouch for partitions nothing read.
     pub(crate) fn new(
-        series: impl Into<String>,
+        leg: Leg,
         first: SessionDate,
         last: SessionDate,
         calendar: &TradingCalendar,
@@ -141,7 +142,7 @@ impl Fingerprint {
             .filter(|session| !partitions.contains_key(session))
             .collect();
         Ok(Self {
-            series: series.into(),
+            leg,
             first,
             last,
             partitions,
@@ -149,8 +150,8 @@ impl Fingerprint {
         })
     }
 
-    pub fn series(&self) -> &str {
-        &self.series
+    pub fn leg(&self) -> Leg {
+        self.leg
     }
 
     pub fn partitions(&self) -> &BTreeMap<SessionDate, String> {
@@ -160,6 +161,29 @@ impl Fingerprint {
     pub fn missing(&self) -> &[SessionDate] {
         &self.missing
     }
+
+    /// Every partition read whose version is no longer the one read; `current` holds each partition's tag now, and a
+    /// partition absent from it is gone. A study reading one of these rests on data that has since been rewritten.
+    pub fn contaminated(&self, current: &BTreeMap<SessionDate, String>) -> Vec<Contamination> {
+        self.partitions
+            .iter()
+            .filter(|(session, read)| current.get(session) != Some(read))
+            .map(|(session, read)| Contamination {
+                session: *session,
+                read: read.clone(),
+                now: current.get(session).cloned(),
+            })
+            .collect()
+    }
+}
+
+/// A partition read under one version that now holds another, or is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contamination {
+    pub session: SessionDate,
+    pub read: String,
+    /// `None` when the partition is gone.
+    pub now: Option<String>,
 }
 
 #[cfg(test)]
@@ -197,7 +221,7 @@ mod tests {
     #[test]
     fn test_every_trading_session_is_read_or_named_missing() {
         let fingerprint = Fingerprint::new(
-            "data/bars/",
+            Leg::MassiveDailyBars,
             session(21),
             session(27),
             &calendar(),
@@ -209,20 +233,32 @@ mod tests {
             [session(21), session(22), session(25)]
         );
         assert_eq!(fingerprint.missing(), [session(23), session(24)]);
-        assert_eq!(fingerprint.series(), "data/bars/");
+        assert_eq!(fingerprint.leg(), Leg::MassiveDailyBars);
     }
 
     #[test]
     fn test_a_fingerprint_refuses_what_it_could_not_have_read() {
         assert_eq!(
-            Fingerprint::new("s", session(25), session(21), &calendar(), tags(&[])),
+            Fingerprint::new(
+                Leg::MassiveDailyBars,
+                session(25),
+                session(21),
+                &calendar(),
+                tags(&[])
+            ),
             Err(FingerprintRefusal::Inverted {
                 first: session(25),
                 last: session(21)
             })
         );
         assert_eq!(
-            Fingerprint::new("s", session(21), session(28), &calendar(), tags(&[])),
+            Fingerprint::new(
+                Leg::MassiveDailyBars,
+                session(21),
+                session(28),
+                &calendar(),
+                tags(&[])
+            ),
             Err(FingerprintRefusal::CalendarShort {
                 first: session(21),
                 last: session(28)
@@ -231,7 +267,13 @@ mod tests {
         // Saturday, and a session outside the window.
         for day in [26, 25] {
             assert_eq!(
-                Fingerprint::new("s", session(21), session(24), &calendar(), tags(&[21, day])),
+                Fingerprint::new(
+                    Leg::MassiveDailyBars,
+                    session(21),
+                    session(24),
+                    &calendar(),
+                    tags(&[21, day])
+                ),
                 Err(FingerprintRefusal::NotATradingSession {
                     session: session(day)
                 })
@@ -240,10 +282,41 @@ mod tests {
     }
 
     #[test]
+    fn test_a_partition_rewritten_or_gone_since_it_was_read_is_contaminated() {
+        let fingerprint = Fingerprint::new(
+            Leg::MassiveDailyBars,
+            session(21),
+            session(25),
+            &calendar(),
+            tags(&[21, 22, 24]),
+        )
+        .unwrap();
+        let mut current = tags(&[21, 22, 24, 25]);
+        assert_eq!(fingerprint.contaminated(&current), []);
+        current.insert(session(22), "\"rewritten\"".to_string());
+        current.remove(&session(24));
+        assert_eq!(
+            fingerprint.contaminated(&current),
+            [
+                Contamination {
+                    session: session(22),
+                    read: "\"tag-22\"".to_string(),
+                    now: Some("\"rewritten\"".to_string())
+                },
+                Contamination {
+                    session: session(24),
+                    read: "\"tag-24\"".to_string(),
+                    now: None
+                }
+            ]
+        );
+    }
+
+    #[test]
     fn test_a_stored_fingerprint_must_agree_with_its_own_window() {
         let stored = serde_json::to_value(
             Fingerprint::new(
-                "data/bars/",
+                Leg::MassiveDailyBars,
                 session(21),
                 session(25),
                 &calendar(),
@@ -271,7 +344,7 @@ mod tests {
     #[test]
     fn test_a_fingerprint_reads_back_as_written() {
         let fingerprint = Fingerprint::new(
-            "data/bars/",
+            Leg::MassiveDailyBars,
             session(21),
             session(25),
             &calendar(),
