@@ -390,6 +390,12 @@ impl Opening {
         let hypothesis = stated(Some(hypothesis)).ok_or(RegisterRefusal::Blank {
             field: "hypothesis",
         })?;
+        match &universe {
+            Universe::Versioned { name, .. } if !is_slug(name) => {
+                return Err(malformed("universe name", name));
+            }
+            Universe::Versioned { .. } | Universe::Legacy(_) => {}
+        }
         Ok(Self {
             family,
             universe,
@@ -495,6 +501,12 @@ impl Closing {
     ) -> Result<Self, RegisterRefusal> {
         let statistic =
             stated(Some(statistic)).ok_or(RegisterRefusal::Blank { field: "statistic" })?;
+        match measured {
+            Measured::Value(value) if !value.is_finite() => {
+                return Err(RegisterRefusal::NotFinite { value });
+            }
+            Measured::Value(_) | Measured::NotMeasured | Measured::Unrecorded => {}
+        }
         let notes = stated(notes);
         match (verdict, &notes) {
             (Verdict::Inconclusive, None) => Err(RegisterRefusal::InconclusiveWithoutNotes),
@@ -617,9 +629,9 @@ pub enum RegisterRefusal {
     AcceptedIsFrozen {
         number: AccessionNumber,
     },
-    AlreadySuperseded {
-        number: AccessionNumber,
-        successor: AccessionNumber,
+    /// JSON has no NaN or infinity, so such a measurement would not read back.
+    NotFinite {
+        value: f64,
     },
 }
 
@@ -670,12 +682,7 @@ impl Display for RegisterRefusal {
                 formatter,
                 "accession {number} was accepted and is frozen; its successor must name the substrate change"
             ),
-            Self::AlreadySuperseded { number, successor } => {
-                write!(
-                    formatter,
-                    "accession {number} is already superseded by {successor}"
-                )
-            }
+            Self::NotFinite { value } => write!(formatter, "the measurement {value} is not finite"),
         }
     }
 }
@@ -742,19 +749,9 @@ impl Accession {
         }
     }
 
-    /// Refuses `successor` unless this accession has a verdict and no successor yet; an accepted one is frozen, so
-    /// its successor must name what changed underneath it.
-    pub fn admit_successor(
-        &self,
-        existing_successor: Option<AccessionNumber>,
-        successor: &Opening,
-    ) -> Result<(), RegisterRefusal> {
-        if let Some(existing) = existing_successor {
-            return Err(RegisterRefusal::AlreadySuperseded {
-                number: self.number,
-                successor: existing,
-            });
-        }
+    /// Refuses `successor` unless this accession has a verdict; an accepted one is frozen, so its successor must name
+    /// what changed underneath it. Any number of successors may re-test one accession, each a test of its own.
+    pub fn admit_successor(&self, successor: &Opening) -> Result<(), RegisterRefusal> {
         match &self.status {
             Status::Open => Err(RegisterRefusal::StillOpen {
                 number: self.number,
@@ -770,18 +767,6 @@ impl Accession {
             },
         }
     }
-}
-
-/// The accession naming `predecessor` in its `supersedes`, derived rather than stored so the two directions of the
-/// link cannot disagree.
-pub fn successor_of(
-    accessions: &[Accession],
-    predecessor: AccessionNumber,
-) -> Option<AccessionNumber> {
-    accessions
-        .iter()
-        .find(|accession| accession.opening.supersedes == Some(predecessor))
-        .map(Accession::number)
 }
 
 #[cfg(test)]
@@ -962,16 +947,16 @@ mod tests {
     fn test_a_successor_needs_a_verdict_and_an_accepted_one_a_substrate_change() {
         let open = Accession::open(number(5), opening(None));
         assert_eq!(
-            open.admit_successor(None, &opening(None)),
+            open.admit_successor(&opening(None)),
             Err(RegisterRefusal::StillOpen { number: number(5) })
         );
         assert_eq!(
-            closed(Verdict::Accept).admit_successor(None, &opening(Some(" "))),
+            closed(Verdict::Accept).admit_successor(&opening(Some(" "))),
             Err(RegisterRefusal::AcceptedIsFrozen { number: number(5) })
         );
         assert!(
             closed(Verdict::Accept)
-                .admit_successor(None, &opening(Some("re-fold of 2026-10")))
+                .admit_successor(&opening(Some("re-fold of 2026-10")))
                 .is_ok()
         );
         for verdict in [
@@ -980,28 +965,33 @@ mod tests {
             Verdict::LandedNotAdopted,
         ] {
             assert!(
-                closed(verdict)
-                    .admit_successor(None, &opening(None))
-                    .is_ok(),
+                closed(verdict).admit_successor(&opening(None)).is_ok(),
                 "{verdict}"
             );
         }
-        assert_eq!(
-            closed(Verdict::Refute).admit_successor(Some(number(6)), &opening(None)),
-            Err(RegisterRefusal::AlreadySuperseded {
-                number: number(5),
-                successor: number(6)
-            })
-        );
     }
 
     #[test]
-    fn test_the_successor_is_derived_from_its_own_link() {
-        let mut later = opening(None);
-        later.supersedes = Some(number(5));
-        let accessions = [closed(Verdict::Refute), Accession::open(number(8), later)];
-        assert_eq!(successor_of(&accessions, number(5)), Some(number(8)));
-        assert_eq!(successor_of(&accessions, number(8)), None);
+    fn test_a_versioned_universe_or_a_measurement_cannot_bypass_its_rule() {
+        let wire = serde_json::to_string(&closed(Verdict::Refute)).unwrap();
+        let named = wire.replace(r#""name":"liquid-common""#, r#""name":"Bad Name""#);
+        assert!(serde_json::from_str::<Accession>(&named).is_err());
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let refused = Closing::new(
+                Verdict::Refute,
+                "s".to_string(),
+                Measured::Value(value),
+                Sessions::Unrecorded,
+                Vec::new(),
+                session(),
+                None,
+                StudyCost::default(),
+            );
+            assert!(
+                matches!(refused, Err(RegisterRefusal::NotFinite { .. })),
+                "{value}"
+            );
+        }
     }
 
     #[test]

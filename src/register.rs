@@ -4,7 +4,6 @@
 use crate::archive::{Archive, ArchiveError};
 use crate::common::register::{
     Accession, AccessionNumber, Closing, OpenAccession, Opening, RegisterRefusal, next_number,
-    successor_of,
 };
 use crate::common::storage::Key;
 
@@ -115,18 +114,13 @@ impl Register {
 
     /// Opens `opening` under the next free number; a successor is admitted only as its predecessor allows.
     pub async fn open(&self, opening: Opening) -> Result<Accession, RegisterError> {
-        if let Some(predecessor) = opening.supersedes() {
-            let accessions = self.all().await?;
-            let held = accessions
-                .iter()
-                .find(|accession| accession.number() == predecessor)
-                .ok_or(RegisterError::Missing {
-                    number: predecessor,
-                })?;
-            held.admit_successor(successor_of(&accessions, predecessor), &opening)?;
-        }
         for _ in 0..OPEN_ATTEMPTS {
-            let number = next_number(self.numbers().await?).ok_or(RegisterError::Exhausted)?;
+            let accessions = self.all().await?;
+            if let Some(predecessor) = opening.supersedes() {
+                admit(&accessions, predecessor, &opening)?;
+            }
+            let number = next_number(accessions.iter().map(Accession::number))
+                .ok_or(RegisterError::Exhausted)?;
             let accession = Accession::open(number, opening.clone());
             match self
                 .archive
@@ -181,10 +175,113 @@ impl Register {
     }
 }
 
+fn admit(
+    accessions: &[Accession],
+    predecessor: AccessionNumber,
+    successor: &Opening,
+) -> Result<(), RegisterError> {
+    let held = accessions
+        .iter()
+        .find(|accession| accession.number() == predecessor)
+        .ok_or(RegisterError::Missing {
+            number: predecessor,
+        })?;
+    Ok(held.admit_successor(successor)?)
+}
+
 /// Pretty-printed with a trailing newline, since people read these objects directly.
 fn encode(accession: &Accession) -> Vec<u8> {
     let mut body = serde_json::to_vec_pretty(accession)
         .expect("an accession has only string keys, so it serializes");
     body.push(b'\n');
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+    use crate::common::register::{
+        Bid, Closing, Horizon, Measured, RegisterRefusal, Sessions, StudyCost, Universe, Verdict,
+    };
+    use crate::common::time::SessionDate;
+
+    fn opening(supersedes: Option<AccessionNumber>) -> Opening {
+        Opening::new(
+            "live-check".parse().unwrap(),
+            Universe::Legacy("the register's own seam".to_string()),
+            Horizon::Described("none".to_string()),
+            "the Register's S3 seam behaves as its rules say".to_string(),
+            Bid::Unrecorded,
+            SessionDate::at(Utc::now()),
+            supersedes,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn refute() -> Closing {
+        Closing::new(
+            Verdict::Refute,
+            "a live check".to_string(),
+            Measured::NotMeasured,
+            Sessions::Counted(0),
+            Vec::new(),
+            SessionDate::at(Utc::now()),
+            None,
+            StudyCost::default(),
+        )
+        .unwrap()
+    }
+
+    /// Opening, closing, a create over a taken number, and successors, against real conditional writes.
+    #[tokio::test]
+    #[ignore = "writes accessions to the bucket AWS_S3_REGISTER_BUCKET_NAME names, which must be a development bucket; \
+                clear its records/register/ objects and versions afterwards"]
+    async fn live_the_register_seam_keeps_its_rules() {
+        let bucket = std::env::var("AWS_S3_REGISTER_BUCKET_NAME").unwrap();
+        assert!(
+            bucket.contains("development"),
+            "refusing to write test accessions into {bucket}"
+        );
+        let configuration = aws_config::load_from_env().await;
+        let register = Register::new(Archive::register(&configuration).unwrap());
+
+        let first = register.open(opening(None)).await.unwrap();
+        register.close(first.number(), refute()).await.unwrap();
+        assert!(matches!(
+            register.close(first.number(), refute()).await,
+            Err(RegisterError::Refused(
+                RegisterRefusal::AlreadyClosed { .. }
+            ))
+        ));
+        assert!(matches!(
+            register
+                .archive
+                .create(
+                    &Key::Register {
+                        number: first.number()
+                    },
+                    encode(&first)
+                )
+                .await,
+            Err(ArchiveError::Contended { .. })
+        ));
+
+        // Two re-tests of one accession are two tests; a re-test of one still open is refused.
+        let successor = register.open(opening(Some(first.number()))).await.unwrap();
+        let second = register.open(opening(Some(first.number()))).await.unwrap();
+        assert_eq!(
+            (
+                successor.opening().supersedes(),
+                second.opening().supersedes()
+            ),
+            (Some(first.number()), Some(first.number()))
+        );
+        assert!(matches!(
+            register.open(opening(Some(second.number()))).await,
+            Err(RegisterError::Refused(RegisterRefusal::StillOpen { .. }))
+        ));
+    }
 }

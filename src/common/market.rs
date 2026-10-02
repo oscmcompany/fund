@@ -415,6 +415,10 @@ impl Dollars {
     }
 
     pub fn from_float(dollars: f64) -> Result<Self, DollarsRefusal> {
+        // Refused before snapping, which would round a tiny negative to zero.
+        if dollars < 0.0 {
+            return Err(DollarsRefusal::Unrepresentable { dollars });
+        }
         let scaled = dollars * PRICE_SCALE as f64;
         snap(scaled)
             .filter(|nearest| (0.0..u64::MAX as f64).contains(nearest))
@@ -503,7 +507,7 @@ mod tests {
             Dollars::from_float(0.001).map(Dollars::millionths),
             Ok(1_000)
         );
-        for refused in [-0.01, 1e-7, f64::NAN, f64::INFINITY] {
+        for refused in [-0.01, -1e-10, 1e-7, f64::NAN, f64::INFINITY] {
             assert!(Dollars::from_float(refused).is_err(), "{refused}");
         }
     }
