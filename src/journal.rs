@@ -258,9 +258,9 @@ mod tests {
         std::fs::write(directory.join("heal.lock"), "").unwrap();
         assert_eq!(journal.history().unwrap().len(), 1);
         for unreadable in [
-            "{\"schema_version\":1,\"event_type\":\"study_ran\"}\n",
+            "{\"schema_version\":1,\"event_type\":\"heal_finished\"}\n",
             "{\"schema_version\":99}\n",
-            "{\"event_type\":\"study_ran\"}\n",
+            "{\"event_type\":\"heal_finished\"}\n",
         ] {
             let before = std::fs::read_to_string(&file).unwrap();
             append(unreadable);

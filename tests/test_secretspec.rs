@@ -52,30 +52,3 @@ fn test_the_named_profiles_read_their_literal_buckets() {
         Some("oscm-fund-development-john-forstmeier")
     );
 }
-
-/// One Register for every profile, since a profile's own copy would quietly split the multiple-testing denominator.
-#[test]
-fn test_every_profile_shares_one_register() {
-    let manifest = std::fs::read_to_string("secretspec.toml").unwrap();
-    let mut profiles = 0;
-    let mut buckets = Vec::new();
-    for line in manifest.lines() {
-        if line.starts_with("[profiles.") {
-            profiles += 1;
-        } else if line.starts_with("AWS_S3_REGISTER_BUCKET_NAME") {
-            buckets.push(
-                line.split("default = \"")
-                    .nth(1)
-                    .and_then(|rest| rest.split('"').next())
-                    .map(str::to_string),
-            );
-        }
-    }
-    assert_eq!(buckets.len(), profiles);
-    assert!(
-        buckets
-            .iter()
-            .all(|bucket| bucket.as_deref() == Some("oscm-fund-production")),
-        "{buckets:?}"
-    );
-}

@@ -172,8 +172,7 @@ fn bars_key(key: &Key) -> Option<(Provider, BarInterval, SessionDate)> {
         | Key::Trades { .. }
         | Key::Reference { .. }
         | Key::Journal { .. }
-        | Key::Logs { .. }
-        | Key::Register { .. } => None,
+        | Key::Logs { .. } => None,
     }
 }
 

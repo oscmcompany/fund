@@ -4,7 +4,6 @@
 use chrono::{Datelike, NaiveDate};
 
 use crate::common::market::record::BarInterval;
-use crate::common::register::AccessionNumber;
 use crate::common::time::SessionDate;
 
 /// Everything this layout writes lives under these roots; legacy's `data/derived/` and `exports/` are never among
@@ -137,16 +136,12 @@ pub enum Key {
         service: Service,
         session: SessionDate,
     },
-    Register {
-        number: AccessionNumber,
-    },
 }
 
-/// Who may write a key: one host, or a person through the `register` binary, which no host's grant includes.
+/// Who may write a key: the one host whose grant covers its prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writer {
     Host(Host),
-    Operator,
 }
 
 /// Why a path was not read as a key.
@@ -159,7 +154,6 @@ impl Key {
     pub fn path(&self) -> String {
         let series = self.series();
         match self {
-            Self::Register { number } => format!("{series}{number}.json"),
             Self::Reference { as_of, .. } => format!("{series}as_of={as_of}/data.parquet"),
             Self::Bars { session, .. }
             | Self::Quotes { session, .. }
@@ -171,7 +165,7 @@ impl Key {
         }
     }
 
-    /// The prefix every session (or every accession) of this key's series shares, so listing it finds what is held.
+    /// The prefix every session of this key's series shares, so listing it finds what is held.
     pub fn series(&self) -> String {
         match self {
             Self::Bars {
@@ -196,24 +190,22 @@ impl Key {
                 "{RECORDS_ROOT}/logs/producer={host}/service={}/",
                 service.as_str()
             ),
-            Self::Register { .. } => format!("{RECORDS_ROOT}/register/"),
         }
     }
 
-    /// The session a dated key is for; an accession has none.
-    pub fn session(&self) -> Option<SessionDate> {
+    /// The session a key is for.
+    pub fn session(&self) -> SessionDate {
         match self {
-            Self::Reference { as_of, .. } => Some(*as_of),
+            Self::Reference { as_of, .. } => *as_of,
             Self::Bars { session, .. }
             | Self::Quotes { session, .. }
             | Self::Trades { session, .. }
             | Self::Journal { session, .. }
-            | Self::Logs { session, .. } => Some(*session),
-            Self::Register { .. } => None,
+            | Self::Logs { session, .. } => *session,
         }
     }
 
-    /// The one writer of this object: the archiver for data, the producer for a record, a person for an accession.
+    /// The one writer of this object: the archiver for data, the producer for a record.
     pub fn writer(&self) -> Writer {
         match self {
             Self::Bars { .. }
@@ -221,7 +213,6 @@ impl Key {
             | Self::Trades { .. }
             | Self::Reference { .. } => Writer::Host(Host::Archiver),
             Self::Journal { host, .. } | Self::Logs { host, .. } => Writer::Host(*host),
-            Self::Register { .. } => Writer::Operator,
         }
     }
 
@@ -336,9 +327,6 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             service: Service::new(service.strip_prefix("service=")?).ok()?,
             session: session(year, month, day)?,
         }),
-        ["records", "register", file] => Some(Key::Register {
-            number: file.strip_suffix(".json")?.parse().ok()?,
-        }),
         _ => None,
     }
 }
@@ -418,12 +406,6 @@ mod tests {
                 },
                 "records/logs/producer=archiver/service=archiver/year=2026/month=08/day=03/data.parquet",
             ),
-            (
-                Key::Register {
-                    number: AccessionNumber::new(10_000).unwrap(),
-                },
-                "records/register/010000.json",
-            ),
         ];
         for (key, path) in cases {
             assert_eq!(key.path(), path);
@@ -442,9 +424,6 @@ mod tests {
             "records/logs/producer=archiver/service=Archiver/year=2026/month=08/day=03/data.parquet",
             "data/equity/reference/provider=massive/as_of=2026-8-3/data.parquet",
             "records/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.metadata",
-            "records/register/7.json",
-            "records/register/000000.json",
-            "records/register/000007.parquet",
         ] {
             assert_eq!(
                 Key::parse(path),
@@ -490,71 +469,45 @@ mod tests {
         }
     }
 
-    /// `key` moved to where `to` sits within its series: `to`'s session, or `to`'s accession number. A key of
-    /// another kind than `to` stays where it is.
+    /// `key` moved to `to`'s session, within its own series.
     fn moved(key: &Key, to: &Key) -> Key {
-        match (key.clone(), to.session(), to) {
-            (Key::Register { .. }, _, Key::Register { number }) => {
-                Key::Register { number: *number }
-            }
-            (
-                Key::Bars {
-                    provider,
-                    origin,
-                    interval,
-                    ..
-                },
-                Some(session),
-                _,
-            ) => Key::Bars {
+        let session = to.session();
+        match key.clone() {
+            Key::Bars {
+                provider,
+                origin,
+                interval,
+                ..
+            } => Key::Bars {
                 provider,
                 origin,
                 interval,
                 session,
             },
-            (
-                Key::Quotes {
-                    provider, interval, ..
-                },
-                Some(session),
-                _,
-            ) => Key::Quotes {
+            Key::Quotes {
+                provider, interval, ..
+            } => Key::Quotes {
                 provider,
                 interval,
                 session,
             },
-            (
-                Key::Trades {
-                    provider, interval, ..
-                },
-                Some(session),
-                _,
-            ) => Key::Trades {
+            Key::Trades {
+                provider, interval, ..
+            } => Key::Trades {
                 provider,
                 interval,
                 session,
             },
-            (Key::Reference { provider, .. }, Some(session), _) => Key::Reference {
+            Key::Reference { provider, .. } => Key::Reference {
                 provider,
                 as_of: session,
             },
-            (Key::Journal { host, .. }, Some(session), _) => Key::Journal { host, session },
-            (Key::Logs { host, service, .. }, Some(session), _) => Key::Logs {
+            Key::Journal { host, .. } => Key::Journal { host, session },
+            Key::Logs { host, service, .. } => Key::Logs {
                 host,
                 service,
                 session,
             },
-            (
-                unmoved @ (Key::Register { .. }
-                | Key::Bars { .. }
-                | Key::Quotes { .. }
-                | Key::Trades { .. }
-                | Key::Reference { .. }
-                | Key::Journal { .. }
-                | Key::Logs { .. }),
-                _,
-                _,
-            ) => unmoved,
         }
     }
 
@@ -600,9 +553,6 @@ mod tests {
                 host,
                 service,
                 session
-            }),
-            (1_u32..2_000_000).prop_map(|number| Key::Register {
-                number: AccessionNumber::new(number).unwrap()
             }),
         ]
     }
