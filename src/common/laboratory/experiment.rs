@@ -1,6 +1,7 @@
 //! What the catalogue records about a study: each dataset it read and each experiment it ran, with the inputs,
 //! outputs and machine behind them, so past work can be found and read back rather than redone blind.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -33,17 +34,19 @@ impl Elapsed {
     }
 }
 
+/// The name of a setting, estimate or metric; validated wherever it is built, deserialization included.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Name(String);
+
 /// One experiment's settings, by name.
 ///
 /// Strings to strings on purpose: whether two runs tried the same variant is answered by equality, and strings
 /// compare exactly where floats do not (0.1 written two ways, NaN); untyped values also let every study name its
 /// own settings without a schema change. Typing the values would make float equality decide what counts as a repeat.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    try_from = "BTreeMap<String, String>",
-    into = "BTreeMap<String, String>"
-)]
-pub struct Parameters(BTreeMap<String, String>);
+#[serde(transparent)]
+pub struct Parameters(BTreeMap<Name, String>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExperimentRefusal {
@@ -109,21 +112,35 @@ impl Machine {
     }
 }
 
+impl Name {
+    pub fn new(raw: impl Into<String>) -> Result<Self, ExperimentRefusal> {
+        text(raw.into(), ExperimentRefusal::BlankName).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// So a map keyed by `Name` is indexed by a plain `&str`.
+impl Borrow<str> for Name {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl Parameters {
-    pub fn new<Name: Into<String>, Value: Into<String>>(
-        settings: impl IntoIterator<Item = (Name, Value)>,
+    pub fn new<Setting: Into<String>, Value: Into<String>>(
+        settings: impl IntoIterator<Item = (Setting, Value)>,
     ) -> Result<Self, ExperimentRefusal> {
         let mut held = BTreeMap::new();
         for (name, value) in settings {
-            held.insert(
-                text(name.into(), ExperimentRefusal::BlankName)?,
-                value.into(),
-            );
+            held.insert(Name::new(name)?, value.into());
         }
         Ok(Self(held))
     }
 
-    pub fn settings(&self) -> &BTreeMap<String, String> {
+    pub fn settings(&self) -> &BTreeMap<Name, String> {
         &self.0
     }
 }
@@ -148,7 +165,7 @@ macro_rules! string_conversions {
 
 string_conversions!(Label, String);
 string_conversions!(Machine, String);
-string_conversions!(Parameters, BTreeMap<String, String>);
+string_conversions!(Name, String);
 
 /// A loader read `fingerprint` for the study `label` names, on `machine`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,17 +205,18 @@ pub struct ExperimentRan {
     machine: Machine,
     parameters: Parameters,
     fingerprints: Vec<Fingerprint>,
-    estimates: BTreeMap<String, Estimate>,
-    metrics: BTreeMap<String, f64>,
-    /// One experiment's own time is the gap to the one before.
+    estimates: BTreeMap<Name, Estimate>,
+    metrics: BTreeMap<Name, f64>,
+    /// Cumulative from the study's opening, not this experiment's own time, which is the difference from the
+    /// experiment recorded before it.
     since_opened: Elapsed,
 }
 
 /// The outputs an experiment reports, kept apart from its inputs so a caller names each once.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Outputs {
-    estimates: BTreeMap<String, Estimate>,
-    metrics: BTreeMap<String, f64>,
+    estimates: BTreeMap<Name, Estimate>,
+    metrics: BTreeMap<Name, f64>,
 }
 
 impl Outputs {
@@ -207,8 +225,7 @@ impl Outputs {
         name: impl Into<String>,
         estimate: Estimate,
     ) -> Result<Self, ExperimentRefusal> {
-        self.estimates
-            .insert(text(name.into(), ExperimentRefusal::BlankName)?, estimate);
+        self.estimates.insert(Name::new(name)?, estimate);
         Ok(self)
     }
 
@@ -217,10 +234,10 @@ impl Outputs {
         name: impl Into<String>,
         value: f64,
     ) -> Result<Self, ExperimentRefusal> {
-        let name = text(name.into(), ExperimentRefusal::BlankName)?;
+        let name = Name::new(name)?;
         if !value.is_finite() {
             return Err(ExperimentRefusal::NotFinite {
-                metric: name,
+                metric: name.0,
                 value,
             });
         }
@@ -265,11 +282,11 @@ impl ExperimentRan {
         &self.fingerprints
     }
 
-    pub fn estimates(&self) -> &BTreeMap<String, Estimate> {
+    pub fn estimates(&self) -> &BTreeMap<Name, Estimate> {
         &self.estimates
     }
 
-    pub fn metrics(&self) -> &BTreeMap<String, f64> {
+    pub fn metrics(&self) -> &BTreeMap<Name, f64> {
         &self.metrics
     }
 
@@ -350,6 +367,7 @@ mod tests {
         ));
         assert!(serde_json::from_str::<Label>("\" \"").is_err());
         assert!(serde_json::from_str::<Parameters>(r#"{"":"1"}"#).is_err());
+        assert!(serde_json::from_str::<Name>("\"net\\nreturn\"").is_err());
     }
 
     #[test]

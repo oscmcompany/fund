@@ -403,6 +403,23 @@ fn read_line(line: &str) -> Result<Record, UnreadableCause> {
     })
 }
 
+/// `held` with every line of `adding` it lacks appended, so two writers shipping one session's object both keep
+/// their records. A record is the same record by run and sequence; an unreadable line by its text.
+pub fn merge(held: Vec<ReadLine>, adding: Vec<ReadLine>) -> Vec<ReadLine> {
+    let identity = |line: &ReadLine| match line {
+        ReadLine::Read(record) => (Some((record.run_id(), record.sequence())), None),
+        ReadLine::Unreadable { text, .. } => (None, Some(text.clone())),
+    };
+    let mut seen: std::collections::BTreeSet<_> = held.iter().map(identity).collect();
+    let mut merged = held;
+    merged.extend(
+        adding
+            .into_iter()
+            .filter(|line| seen.insert(identity(line))),
+    );
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -430,6 +447,30 @@ mod tests {
             commit,
             Observation::ConfigurationResolved(ConfigurationResolved::new(parameters)),
         )
+    }
+
+    /// A line for run `run` at `sequence`, or an unreadable line holding `text` when `run` is zero.
+    fn line(run: u128, sequence: u64) -> ReadLine {
+        match run {
+            0 => read_one(1, &format!("torn {sequence}")),
+            _ => ReadLine::Read(Box::new(Record::new(
+                RunId::new(Uuid::from_u128(run)),
+                NonZeroU64::new(sequence).unwrap(),
+                "2026-07-31T14:30:00Z".parse().unwrap(),
+                None,
+                Observation::ConfigurationResolved(ConfigurationResolved::new(BTreeMap::new())),
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_a_merge_keeps_both_writers_records_once() {
+        let held = vec![line(1, 1), line(1, 2), line(0, 7)];
+        let adding = vec![line(2, 1), line(1, 2), line(0, 7), line(0, 8)];
+        assert_eq!(
+            merge(held, adding),
+            [line(1, 1), line(1, 2), line(0, 7), line(2, 1), line(0, 8)]
+        );
     }
 
     #[test]
@@ -738,7 +779,25 @@ mod tests {
             )
     }
 
+    fn lines() -> impl Strategy<Value = Vec<ReadLine>> {
+        prop::collection::btree_set((0..4u128, 1..6u64), 0..12).prop_map(|keys| {
+            keys.into_iter()
+                .map(|(run, sequence)| line(run, sequence))
+                .collect()
+        })
+    }
+
     proptest! {
+        /// Shipping a file twice changes nothing, and a merge loses no line either writer held.
+        #[test]
+        fn test_merge_is_idempotent_and_loses_nothing(held in lines(), adding in lines()) {
+            let merged = merge(held.clone(), adding.clone());
+            prop_assert_eq!(merge(merged.clone(), adding.clone()), merged.clone());
+            prop_assert_eq!(merge(held.clone(), held.clone()), held.clone());
+            prop_assert!(held.iter().chain(&adding).all(|line| merged.contains(line)));
+            prop_assert_eq!(&merged[..held.len()], &held[..]);
+        }
+
         #[test]
         fn property_a_record_reads_back_as_itself(record in any_record()) {
             prop_assert_eq!(read(&record.encode()), vec![ReadLine::Read(Box::new(record))]);

@@ -109,7 +109,9 @@ impl TryFrom<EstimateFields> for Estimate {
         let admitted = fields.mean.is_finite()
             && fields.standard_error.is_finite()
             && fields.standard_error >= 0.0
-            && fields.sessions >= 2;
+            && fields.sessions >= 2
+            // `n - 1` for a matched estimate, at most the arms' `n - 2` together for Welch.
+            && fields.degrees_of_freedom.value() <= (fields.sessions - 1) as f64;
         if !admitted {
             return Err(format!(
                 "mean {}, standard error {} over {} sessions is not an estimate",
@@ -777,6 +779,7 @@ mod tests {
             r#"{"mean":1.0,"sessions":4,"undefined":0,"standard_error":-0.5,"degrees_of_freedom":3.0}"#,
             r#"{"mean":1.0,"sessions":1,"undefined":0,"standard_error":0.5,"degrees_of_freedom":3.0}"#,
             r#"{"mean":1.0,"sessions":4,"undefined":0,"standard_error":0.5,"degrees_of_freedom":0.5}"#,
+            r#"{"mean":1.0,"sessions":2,"undefined":0,"standard_error":0.5,"degrees_of_freedom":1000.0}"#,
         ] {
             assert!(
                 serde_json::from_str::<Estimate>(stored).is_err(),

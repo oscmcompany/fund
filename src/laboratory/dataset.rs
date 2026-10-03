@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use crate::archive::bars::{DecodeRefusal, decode};
 use crate::archive::{Archive, ArchiveError};
 use crate::common::heal::Leg;
+use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{Contamination, Fingerprint, FingerprintRefusal};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
@@ -17,6 +18,8 @@ use crate::laboratory::Study;
 pub struct Dataset {
     bars: BTreeMap<SessionDate, Vec<Bar>>,
     fingerprint: Fingerprint,
+    /// The run whose journal holds this read.
+    run: RunId,
 }
 
 impl Dataset {
@@ -26,6 +29,10 @@ impl Dataset {
 
     pub fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    pub fn run(&self) -> RunId {
+        self.run
     }
 
     /// One reading per session read, `read` folding that session's bars; a missing session stays out of the series.
@@ -108,7 +115,11 @@ pub async fn daily_bars(
     let fingerprint =
         Fingerprint::new(leg, first, last, calendar, tags).map_err(DatasetError::Window)?;
     study.read(&fingerprint).map_err(DatasetError::Journal)?;
-    Ok(Dataset { bars, fingerprint })
+    Ok(Dataset {
+        bars,
+        fingerprint,
+        run: study.run_id(),
+    })
 }
 
 /// Every partition `fingerprint` read that has since been rewritten or removed, each tag looked up now.
@@ -150,8 +161,8 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
     }
 
-    /// Sessions 0, 1 and 3 read with one, two and three bars, and session 2 missing.
-    fn dataset() -> Dataset {
+    /// Sessions 0, 1 and 3 read by `run` with one, two and three bars, and session 2 missing.
+    fn dataset(run: RunId) -> Dataset {
         let (open, close) = (
             chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
             chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
@@ -191,13 +202,14 @@ mod tests {
                 read,
             )
             .unwrap(),
+            run,
         }
     }
 
     /// The series keeps exactly the sessions read, an unmeasured one as `None`.
     #[test]
     fn test_a_series_holds_one_reading_per_session_read() {
-        let dataset = dataset();
+        let dataset = dataset(RunId::new(uuid::Uuid::new_v4()));
         let series = dataset
             .series(|bars| (bars.len() != 2).then_some(bars.len() as f64))
             .unwrap();
@@ -218,7 +230,7 @@ mod tests {
     fn test_a_study_catalogues_what_it_read_and_ran() {
         let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
         let mut study = Study::open(Label::new("bar counts").unwrap(), &directory).unwrap();
-        let dataset = dataset();
+        let dataset = dataset(study.run_id());
         study.read(dataset.fingerprint()).unwrap();
         let series = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
         let estimate = Estimate::try_from(summarize(&series)).unwrap();
@@ -282,6 +294,27 @@ mod tests {
             crate::archive::journal::decode(&key, encoded).unwrap(),
             lines
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A dataset another run read carries no `dataset_read` in this run's journal, so it is refused rather than
+    /// recorded as this run's input.
+    #[test]
+    fn test_an_experiment_refuses_a_dataset_another_run_read() {
+        let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
+        let mut study = Study::open(Label::new("bar counts").unwrap(), &directory).unwrap();
+        let elsewhere = RunId::new(uuid::Uuid::new_v4());
+        assert!(matches!(
+            study.experiment(Parameters::default(), &[&dataset(elsewhere)], Outputs::default()),
+            Err(crate::laboratory::StudyError::ReadByAnotherRun { run }) if run == elsewhere
+        ));
+        assert!(!directory.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        }));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
