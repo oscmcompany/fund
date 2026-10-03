@@ -20,6 +20,11 @@ This is a collection of guidelines and references.
 - The live plans are `.scratchpad/plan_pivot.md` and `.scratchpad/plan_launch.md`, local and deliberately untracked
   (`.scratchpad/` is gitignored because they carry private strategy and capital details); cite them as "pivot task N"
   and "launch task N"
+- Read the `experiments` view (`start-duckdb`) before starting a study to see what has already been tried, under each
+  profile or with `SET VARIABLE records_bucket` set to the other bucket, and journal every experiment through a `Study`;
+  the catalogue records the work and gates none of it, so holdouts are designed per study
+- Studies are throwaway files in the gitignored `examples/`, and a `Study` journals into the gitignored `journal/` at
+  the root, which `finish` ships to the profile's records bucket
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - See `README.md` "Principles" section for developer philosophy

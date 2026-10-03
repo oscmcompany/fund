@@ -22,6 +22,8 @@ data/*
 .claude/tasks/
 .claude/settings.local.json*
 .scratchpad/
+/examples/
+/journal/
 .devenv
 .env
 .understand-anything
