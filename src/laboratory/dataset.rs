@@ -5,17 +5,21 @@ use std::collections::BTreeMap;
 use crate::archive::bars::{DecodeRefusal, decode};
 use crate::archive::{Archive, ArchiveError};
 use crate::common::heal::Leg;
+use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{Contamination, Fingerprint, FingerprintRefusal};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
+use crate::laboratory::Study;
 
 /// Bars by session and the fingerprint of the partitions they came from.
 #[derive(Debug)]
 pub struct Dataset {
     bars: BTreeMap<SessionDate, Vec<Bar>>,
     fingerprint: Fingerprint,
+    /// The run whose journal holds this read.
+    run: RunId,
 }
 
 impl Dataset {
@@ -25,6 +29,10 @@ impl Dataset {
 
     pub fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    pub fn run(&self) -> RunId {
+        self.run
     }
 
     /// One reading per session read, `read` folding that session's bars; a missing session stays out of the series.
@@ -40,6 +48,8 @@ impl Dataset {
 #[derive(Debug)]
 pub enum DatasetError {
     Window(FingerprintRefusal),
+    /// The read could not be journaled, so it is not returned: a study holds only catalogued data.
+    Journal(std::io::Error),
     Archive(ArchiveError),
     Decode {
         session: SessionDate,
@@ -55,6 +65,7 @@ impl std::fmt::Display for DatasetError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Window(refusal) => write!(formatter, "{refusal}"),
+            Self::Journal(error) => write!(formatter, "the read could not be journaled: {error}"),
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::EmptyPartition { session } => {
                 write!(formatter, "the partition for {session} holds no bars")
@@ -71,13 +82,14 @@ impl std::fmt::Display for DatasetError {
 
 impl std::error::Error for DatasetError {}
 
-/// Massive daily bars for every trading session from `first` to `last`; a session with no partition is recorded
-/// missing in the fingerprint rather than refused.
+/// Massive daily bars for every trading session from `first` to `last`, journaled to `study` before it is returned; a
+/// session with no partition is recorded missing in the fingerprint rather than refused.
 pub async fn daily_bars(
     archive: &Archive,
     calendar: &TradingCalendar,
     first: SessionDate,
     last: SessionDate,
+    study: &mut Study,
 ) -> Result<Dataset, DatasetError> {
     let leg = Leg::MassiveDailyBars;
     // Taken empty first, so the window is checked before any read and its missing sessions are the ones to read.
@@ -102,7 +114,12 @@ pub async fn daily_bars(
     }
     let fingerprint =
         Fingerprint::new(leg, first, last, calendar, tags).map_err(DatasetError::Window)?;
-    Ok(Dataset { bars, fingerprint })
+    study.read(&fingerprint).map_err(DatasetError::Journal)?;
+    Ok(Dataset {
+        bars,
+        fingerprint,
+        run: study.run_id(),
+    })
 }
 
 /// Every partition `fingerprint` read that has since been rewritten or removed, each tag looked up now.
@@ -131,18 +148,21 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
+    use crate::common::journal::{Observation, ReadLine, read};
+    use crate::common::laboratory::estimate::{Estimate, summarize};
+    use crate::common::laboratory::experiment::{Label, Outputs, Parameters};
     use crate::common::market::record::{BarInterval, Ohlc};
     use crate::common::market::{Price, Shares, Symbol};
+    use crate::common::storage::{Host, Key};
     use crate::common::time::calendar::TradingSession;
     use crate::ingest::alpaca::Alpaca;
 
-    /// Three sessions read and one missing; the series keeps exactly the sessions read, an unmeasured one as `None`.
-    #[test]
-    fn test_a_series_holds_one_reading_per_session_read() {
-        let session = |day| {
-            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap())
-                .plus_calendar_days(day)
-        };
+    fn session(day: i64) -> SessionDate {
+        SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
+    }
+
+    /// Sessions 0, 1 and 3 read by `run` with one, two and three bars, and session 2 missing.
+    fn dataset(run: RunId) -> Dataset {
         let (open, close) = (
             chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
             chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
@@ -172,7 +192,7 @@ mod tests {
         let read = [0, 1, 3]
             .map(|day| (session(day), format!("\"tag-{day}\"")))
             .into();
-        let dataset = Dataset {
+        Dataset {
             bars: [bars(0, 1), bars(1, 2), bars(3, 3)].into(),
             fingerprint: Fingerprint::new(
                 Leg::MassiveDailyBars,
@@ -182,7 +202,14 @@ mod tests {
                 read,
             )
             .unwrap(),
-        };
+            run,
+        }
+    }
+
+    /// The series keeps exactly the sessions read, an unmeasured one as `None`.
+    #[test]
+    fn test_a_series_holds_one_reading_per_session_read() {
+        let dataset = dataset(RunId::new(uuid::Uuid::new_v4()));
         let series = dataset
             .series(|bars| (bars.len() != 2).then_some(bars.len() as f64))
             .unwrap();
@@ -195,6 +222,107 @@ mod tests {
             ]
         );
         assert_eq!(dataset.fingerprint().missing(), [session(2)]);
+    }
+
+    /// A study's reads and experiments land in its journal in order, name exactly the data read, and survive the
+    /// parquet encoding the records bucket stores.
+    #[test]
+    fn test_a_study_catalogues_what_it_read_and_ran() {
+        let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
+        let mut study = Study::open(Label::new("bar counts").unwrap(), &directory).unwrap();
+        let dataset = dataset(study.run_id());
+        study.read(dataset.fingerprint()).unwrap();
+        let series = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
+        let estimate = Estimate::try_from(summarize(&series)).unwrap();
+        for variant in ["all", "none"] {
+            study
+                .experiment(
+                    Parameters::new([("variant", variant)]).unwrap(),
+                    &[&dataset],
+                    Outputs::default()
+                        .estimate("bars per session", estimate)
+                        .unwrap()
+                        .metric("sessions", 3.0)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let file = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap();
+        let lines = read(&std::fs::read_to_string(&file).unwrap());
+        let observations: Vec<Observation> = lines
+            .iter()
+            .map(|line| match line {
+                ReadLine::Read(record) => record.observation().clone(),
+                ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
+            })
+            .collect();
+        assert_eq!(
+            observations
+                .iter()
+                .map(Observation::event_type)
+                .collect::<Vec<_>>(),
+            ["dataset_read", "experiment_ran", "experiment_ran"]
+        );
+        let (first, second) = match (&observations[1], &observations[2]) {
+            (Observation::ExperimentRan(first), Observation::ExperimentRan(second)) => {
+                (first, second)
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first.fingerprints(), [dataset.fingerprint().clone()]);
+        assert_eq!(first.parameters().settings()["variant"], "all");
+        assert_eq!(first.estimates()["bars per session"], estimate);
+        assert!(!first.machine().hostname().is_empty());
+        assert_eq!(
+            (
+                first.machine().architecture(),
+                first.machine().operating_system()
+            ),
+            (std::env::consts::ARCH, std::env::consts::OS)
+        );
+        assert!(first.since_opened() <= second.since_opened());
+        let session = match &lines[0] {
+            ReadLine::Read(record) => record.session(),
+            ReadLine::Unreadable { .. } => unreachable!("every line read above"),
+        };
+        let key = Key::Journal {
+            host: Host::Researcher,
+            session,
+        };
+        let encoded = crate::archive::journal::encode(&key, &lines).unwrap();
+        assert_eq!(
+            crate::archive::journal::decode(&key, encoded).unwrap(),
+            lines
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A dataset another run read carries no `dataset_read` in this run's journal, so it is refused rather than
+    /// recorded as this run's input.
+    #[test]
+    fn test_an_experiment_refuses_a_dataset_another_run_read() {
+        let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
+        let mut study = Study::open(Label::new("bar counts").unwrap(), &directory).unwrap();
+        let elsewhere = RunId::new(uuid::Uuid::new_v4());
+        assert!(matches!(
+            study.experiment(Parameters::default(), &[&dataset(elsewhere)], Outputs::default()),
+            Err(crate::laboratory::StudyError::ReadByAnotherRun { run }) if run == elsewhere
+        ));
+        assert!(!directory.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        }));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -218,7 +346,11 @@ mod tests {
             |month, day| SessionDate::from_date(NaiveDate::from_ymd_opt(2026, month, day).unwrap());
         let (first, last) = (session(9, 28), session(10, 2));
         let calendar = alpaca.calendar(first, last).await.unwrap();
-        let dataset = daily_bars(&archive, &calendar, first, last).await.unwrap();
+        let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
+        let mut study = Study::open(Label::new("live loader check").unwrap(), &directory).unwrap();
+        let dataset = daily_bars(&archive, &calendar, first, last, &mut study)
+            .await
+            .unwrap();
         let fingerprint = dataset.fingerprint();
         assert!(
             fingerprint.partitions().contains_key(&session(9, 28)),
@@ -240,7 +372,15 @@ mod tests {
             counts.readings().keys().collect::<Vec<_>>(),
             fingerprint.partitions().keys().collect::<Vec<_>>()
         );
-        let again = daily_bars(&archive, &calendar, first, last).await.unwrap();
+        let again = daily_bars(&archive, &calendar, first, last, &mut study)
+            .await
+            .unwrap();
+        let journaled: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(journaled.concat().matches("\"dataset_read\"").count(), 2);
+        std::fs::remove_dir_all(&directory).unwrap();
         assert_eq!(again.fingerprint(), fingerprint);
         assert_eq!(lineage(&archive, fingerprint).await.unwrap(), []);
         println!(

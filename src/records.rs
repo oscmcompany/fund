@@ -13,7 +13,7 @@ use crate::common::storage::{Host, Key, Service};
 use crate::common::time::SessionDate;
 
 /// Calendar days of local files shipped each run, today included, so a week of failed shipments heals by itself.
-const RESHIPPED_DAYS: i64 = 7;
+pub const RESHIPPED_DAYS: i64 = 7;
 
 /// What the shipped log file keeps: everything the process logs, except the SDK's credential chain below a warning,
 /// which does not belong in a bucket whatever `RUST_LOG` asks stdout for.

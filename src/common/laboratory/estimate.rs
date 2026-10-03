@@ -3,6 +3,8 @@
 
 use std::num::NonZeroU32;
 
+use serde::{Deserialize, Serialize};
+
 use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
 use crate::common::laboratory::permutation::Generator;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
@@ -80,13 +82,50 @@ pub fn summarize(series: &Series) -> Summary {
 }
 
 /// A mean with its sample, its standard error (zero where the readings never varied) and the freedom it was taken on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "EstimateFields")]
 pub struct Estimate {
     mean: f64,
     sessions: u64,
     undefined: u64,
     standard_error: f64,
     degrees_of_freedom: DegreesOfFreedom,
+}
+
+/// An estimate as stored, admitted only if `TryFrom<Summary>` or `welch` could have produced it.
+#[derive(Deserialize)]
+struct EstimateFields {
+    mean: f64,
+    sessions: u64,
+    undefined: u64,
+    standard_error: f64,
+    degrees_of_freedom: DegreesOfFreedom,
+}
+
+impl TryFrom<EstimateFields> for Estimate {
+    type Error = String;
+
+    fn try_from(fields: EstimateFields) -> Result<Self, Self::Error> {
+        let admitted = fields.mean.is_finite()
+            && fields.standard_error.is_finite()
+            && fields.standard_error >= 0.0
+            && fields.sessions >= 2
+            // `n - 1` for a matched estimate, at most the arms' `n - 2` together for Welch.
+            && fields.degrees_of_freedom.value() <= (fields.sessions - 1) as f64;
+        if !admitted {
+            return Err(format!(
+                "mean {}, standard error {} over {} sessions is not an estimate",
+                fields.mean, fields.standard_error, fields.sessions
+            ));
+        }
+        Ok(Self {
+            mean: fields.mean,
+            sessions: fields.sessions,
+            undefined: fields.undefined,
+            standard_error: fields.standard_error,
+            degrees_of_freedom: fields.degrees_of_freedom,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -721,6 +760,32 @@ mod tests {
             |line: f64| shares.iter().filter(|share| **share <= line).count() as f64 / 400.0;
         assert!((0.017..=0.083).contains(&below(0.05)), "{}", below(0.05));
         assert!((0.43..=0.57).contains(&below(0.5)), "{}", below(0.5));
+    }
+
+    /// A stored estimate reads back whole, and one no estimator could have produced is refused.
+    #[test]
+    fn test_an_estimate_round_trips_and_refuses_what_no_estimator_makes() {
+        let estimate = paired(
+            Treatment(&measured(0, &[11.0, -19.0, 32.0, -8.0])),
+            Control(&measured(0, &[10.0, -20.0, 30.0, -10.0])),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&estimate).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Estimate>(&encoded).unwrap(),
+            estimate
+        );
+        for stored in [
+            r#"{"mean":1.0,"sessions":4,"undefined":0,"standard_error":-0.5,"degrees_of_freedom":3.0}"#,
+            r#"{"mean":1.0,"sessions":1,"undefined":0,"standard_error":0.5,"degrees_of_freedom":3.0}"#,
+            r#"{"mean":1.0,"sessions":4,"undefined":0,"standard_error":0.5,"degrees_of_freedom":0.5}"#,
+            r#"{"mean":1.0,"sessions":2,"undefined":0,"standard_error":0.5,"degrees_of_freedom":1000.0}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Estimate>(stored).is_err(),
+                "{stored}"
+            );
+        }
     }
 
     fn readings() -> impl Strategy<Value = Vec<Option<f64>>> {
