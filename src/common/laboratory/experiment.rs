@@ -3,6 +3,7 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,10 +15,38 @@ use crate::common::laboratory::estimate::Estimate;
 #[serde(try_from = "String", into = "String")]
 pub struct Label(String);
 
-/// The machine a study ran on, by its hostname, so a laptop run and a researcher-host run read apart.
+/// The machine a study ran on: its hostname, so a laptop run and a researcher-host run read apart, and what can
+/// change how a result reads, the architecture (floating-point results can differ across them) and the cores a
+/// duration was measured on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct Machine(String);
+#[serde(try_from = "MachineFields")]
+pub struct Machine {
+    hostname: String,
+    architecture: String,
+    operating_system: String,
+    cores: NonZeroU32,
+}
+
+#[derive(Deserialize)]
+struct MachineFields {
+    hostname: String,
+    architecture: String,
+    operating_system: String,
+    cores: NonZeroU32,
+}
+
+impl TryFrom<MachineFields> for Machine {
+    type Error = ExperimentRefusal;
+
+    fn try_from(fields: MachineFields) -> Result<Self, Self::Error> {
+        Self::new(
+            fields.hostname,
+            fields.architecture,
+            fields.operating_system,
+            fields.cores,
+        )
+    }
+}
 
 /// Milliseconds since a study opened, measured on the study's monotonic clock and stored as a count so a pure module
 /// holds no clock type.
@@ -68,7 +97,10 @@ impl std::fmt::Display for ExperimentRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BlankLabel => write!(formatter, "a study needs a label"),
-            Self::BlankMachine => write!(formatter, "a machine needs a hostname"),
+            Self::BlankMachine => write!(
+                formatter,
+                "a machine needs a hostname, an architecture and an operating system"
+            ),
             Self::LineBreak { text } => write!(formatter, "{text:?} holds a line break"),
             Self::BlankName => write!(formatter, "a parameter, estimate or metric needs a name"),
             Self::NotFinite { metric, value } => {
@@ -99,16 +131,35 @@ impl Label {
 }
 
 impl Machine {
-    pub fn new(hostname: impl Into<String>) -> Result<Self, ExperimentRefusal> {
-        text(
-            hostname.into().trim().to_string(),
-            ExperimentRefusal::BlankMachine,
-        )
-        .map(Self)
+    pub fn new(
+        hostname: impl Into<String>,
+        architecture: impl Into<String>,
+        operating_system: impl Into<String>,
+        cores: NonZeroU32,
+    ) -> Result<Self, ExperimentRefusal> {
+        let field = |raw: String| text(raw.trim().to_string(), ExperimentRefusal::BlankMachine);
+        Ok(Self {
+            hostname: field(hostname.into())?,
+            architecture: field(architecture.into())?,
+            operating_system: field(operating_system.into())?,
+            cores,
+        })
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    pub fn architecture(&self) -> &str {
+        &self.architecture
+    }
+
+    pub fn operating_system(&self) -> &str {
+        &self.operating_system
+    }
+
+    pub fn cores(&self) -> NonZeroU32 {
+        self.cores
     }
 }
 
@@ -164,7 +215,6 @@ macro_rules! string_conversions {
 }
 
 string_conversions!(Label, String);
-string_conversions!(Machine, String);
 string_conversions!(Name, String);
 
 /// A loader read `fingerprint` for the study `label` names, on `machine`.
@@ -346,10 +396,32 @@ mod tests {
                 text: "gap\npersists".to_string()
             })
         );
-        assert_eq!(Machine::new("\n"), Err(ExperimentRefusal::BlankMachine));
+        let cores = NonZeroU32::new(8).unwrap();
         assert_eq!(
-            Machine::new("ip-10-0-0-1\n").unwrap().as_str(),
+            Machine::new("\n", "aarch64", "macos", cores),
+            Err(ExperimentRefusal::BlankMachine)
+        );
+        assert_eq!(
+            Machine::new("laptop", "", "macos", cores),
+            Err(ExperimentRefusal::BlankMachine)
+        );
+        assert_eq!(
+            Machine::new("ip-10-0-0-1\n", "x86_64", "linux", cores)
+                .unwrap()
+                .hostname(),
             "ip-10-0-0-1"
+        );
+        assert!(
+            serde_json::from_str::<Machine>(
+                r#"{"hostname":"laptop","architecture":" ","operating_system":"macos","cores":8}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Machine>(
+                r#"{"hostname":"laptop","architecture":"aarch64","operating_system":"macos","cores":0}"#
+            )
+            .is_err()
         );
         assert_eq!(
             Parameters::new([("", "1")]),
@@ -399,7 +471,7 @@ mod tests {
             let estimate = Estimate::try_from(summarize(&series)).unwrap();
             let ran = ExperimentRan::new(
                 Label::new("overnight gap").unwrap(),
-                Machine::new("laptop").unwrap(),
+                Machine::new("laptop", "aarch64", "macos", NonZeroU32::new(8).unwrap()).unwrap(),
                 Parameters::new(settings).unwrap(),
                 vec![fingerprint()],
                 Outputs::default()

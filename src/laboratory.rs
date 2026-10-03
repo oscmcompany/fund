@@ -4,6 +4,7 @@
 pub mod dataset;
 
 use std::io;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -65,8 +66,14 @@ impl Study {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        let machine = Machine::new(String::from_utf8_lossy(&output.stdout))
-            .map_err(|refusal| io::Error::new(io::ErrorKind::InvalidData, refusal.to_string()))?;
+        let cores = std::thread::available_parallelism()?;
+        let machine = Machine::new(
+            String::from_utf8_lossy(&output.stdout),
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            NonZeroU32::try_from(cores).unwrap_or(NonZeroU32::MAX),
+        )
+        .map_err(|refusal| io::Error::new(io::ErrorKind::InvalidData, refusal.to_string()))?;
         Ok(Self {
             journal: Journal::open(directory, RunId::new(Uuid::new_v4()))?,
             label,

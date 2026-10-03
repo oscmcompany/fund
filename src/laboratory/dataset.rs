@@ -279,7 +279,14 @@ mod tests {
         assert_eq!(first.fingerprints(), [dataset.fingerprint().clone()]);
         assert_eq!(first.parameters().settings()["variant"], "all");
         assert_eq!(first.estimates()["bars per session"], estimate);
-        assert!(!first.machine().as_str().is_empty());
+        assert!(!first.machine().hostname().is_empty());
+        assert_eq!(
+            (
+                first.machine().architecture(),
+                first.machine().operating_system()
+            ),
+            (std::env::consts::ARCH, std::env::consts::OS)
+        );
         assert!(first.since_opened() <= second.since_opened());
         let session = match &lines[0] {
             ReadLine::Read(record) => record.session(),
