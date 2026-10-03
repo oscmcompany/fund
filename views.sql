@@ -63,7 +63,8 @@ FROM read_parquet(
 );
 
 -- Every experiment a study journaled, one row each; settings and outputs stay JSON for `json_extract`, and an
--- experiment line this build could not read shows in `journal` with `unreadable` set rather than here.
+-- experiment line this build could not read shows in `journal` with `unreadable` set rather than here. Like every
+-- view here, it does not create in a bucket holding no researcher journal, and the error names the empty glob.
 CREATE OR REPLACE VIEW experiments AS
 SELECT
     timestamp,
