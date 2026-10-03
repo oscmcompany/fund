@@ -4,6 +4,7 @@
 pub mod cost;
 pub mod dataset;
 pub mod estimate;
+pub mod experiment;
 pub mod haircut;
 pub mod permutation;
 pub mod series;

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::heal::{Leg, SessionOutcome};
+use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
 use crate::common::parameter::Parameter;
 use crate::common::time::SessionDate;
@@ -177,6 +178,8 @@ pub enum Observation {
     ConfigurationResolved(ConfigurationResolved),
     PartitionWritten(PartitionWritten),
     HealFinished(HealFinished),
+    DatasetRead(Box<DatasetRead>),
+    ExperimentRan(Box<ExperimentRan>),
 }
 
 impl Observation {
