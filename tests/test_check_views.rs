@@ -87,7 +87,11 @@ fn reported(output: &str) -> Vec<&str> {
 #[test]
 fn test_every_view_in_views_sql_is_checked() {
     let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
-    answers.extend([("journal", Answer::Rows(2)), ("logs", Answer::Rows(3))]);
+    answers.extend([
+        ("journal", Answer::Rows(2)),
+        ("logs", Answer::Rows(3)),
+        ("experiments", Answer::Rows(1)),
+    ]);
     let (status, output) = real(&answers, "");
     assert_eq!(
         reported(&output),
@@ -95,7 +99,8 @@ fn test_every_view_in_views_sql_is_checked() {
             "massive_daily_bars",
             "alpaca_minute_bars",
             "journal",
-            "logs"
+            "logs",
+            "experiments"
         ]
     );
     assert_eq!(status, 0, "{output}");
@@ -129,7 +134,6 @@ fn test_a_dormant_view_is_empty_in_every_development_profile() {
     for profile in ["development", "development/john.forstmeier"] {
         let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), profile);
         assert_eq!(status, 0, "{profile}: {output}");
-        assert!(output.contains("journal: dormant\n"), "{profile}: {output}");
         assert!(output.contains("logs: dormant\n"), "{profile}: {output}");
     }
 }
@@ -137,11 +141,50 @@ fn test_a_dormant_view_is_empty_in_every_development_profile() {
 #[test]
 fn test_a_dormant_view_that_reads_rows_fails() {
     let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
-    answers.push(("journal", Answer::Rows(4)));
+    answers.push(("logs", Answer::Rows(4)));
     let (status, output) = real(&answers, "development");
     assert_eq!(status, 3, "{output}");
     assert!(
-        output.contains("journal: dormant but reads 4 rows"),
+        output.contains("logs: dormant but reads 4 rows"),
+        "{output}"
+    );
+}
+
+/// A developer's studies may or may not have shipped, so their journal and experiments pass either way.
+#[test]
+fn test_an_optional_view_passes_empty_or_read_but_fails_when_broken() {
+    let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), "development");
+    assert_eq!(status, 0, "{output}");
+    assert!(
+        output.contains("journal: optional, nothing written\n"),
+        "{output}"
+    );
+    assert!(
+        output.contains("experiments: optional, nothing written\n"),
+        "{output}"
+    );
+    let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
+    answers.extend([
+        ("journal", Answer::Rows(4)),
+        ("experiments", Answer::Rows(0)),
+    ]);
+    let (status, output) = real(&answers, "development/john.forstmeier");
+    assert_eq!(status, 0, "{output}");
+    assert!(output.contains("journal: optional, 4 rows\n"), "{output}");
+    assert!(
+        output.contains("experiments: optional, 0 rows\n"),
+        "{output}"
+    );
+    let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
+    answers.extend([
+        ("journal", Answer::Rows(2)),
+        ("logs", Answer::Rows(3)),
+        ("experiments", Answer::Error("Binder Error: no column")),
+    ]);
+    let (status, output) = real(&answers, "production");
+    assert_eq!(status, 3, "{output}");
+    assert!(
+        output.contains("experiments: optional, and did not create: Binder Error: no column"),
         "{output}"
     );
 }
@@ -171,6 +214,7 @@ fn test_every_live_view_out_of_reach_is_a_check_not_made() {
     answers.extend([
         ("journal", Answer::Error(OUT_OF_REACH)),
         ("logs", Answer::Error(OUT_OF_REACH)),
+        ("experiments", Answer::Error(OUT_OF_REACH)),
     ]);
     let (status, output) = real(&answers, "production");
     assert_eq!(status, 1, "{output}");

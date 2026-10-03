@@ -80,26 +80,14 @@ impl Archive {
         Self::named(configuration, "AWS_S3_RECORDS_BUCKET_NAME")
     }
 
-    /// The records bucket named `bucket_name`, for reading another profile's journals beside this one's.
-    pub fn records_in(configuration: &aws_config::SdkConfig, bucket_name: String) -> Self {
-        Self {
-            s3_client: aws_sdk_s3::Client::new(configuration),
-            bucket_name,
-        }
-    }
-
-    pub fn bucket_name(&self) -> &str {
-        &self.bucket_name
-    }
-
     fn named(
         configuration: &aws_config::SdkConfig,
         variable: &'static str,
     ) -> Result<Self, VariableRefusal> {
-        Ok(Self::records_in(
-            configuration,
-            crate::ingest::variable(variable)?,
-        ))
+        Ok(Self {
+            s3_client: aws_sdk_s3::Client::new(configuration),
+            bucket_name: crate::ingest::variable(variable)?,
+        })
     }
 
     /// Writes `body` under `key` and returns once the same bytes have been read back.

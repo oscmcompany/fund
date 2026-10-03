@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Creates each view of views.sql alone against the real buckets and counts its rows. An empty view and one that does
-# not create both answer nothing, so both fail; a view whose producer does not run in this profile must be empty.
+# not create both answer nothing, so both fail; a view whose producer does not run in this profile must be empty, and
+# an optional view may be empty but must still create.
 # Exits 0 when every view is as expected, 3 when any is not, and 1 when the check could not be made. `DUCKDB`
 # overrides the binary.
 set -euo pipefail
@@ -24,9 +25,16 @@ fi
 
 # Each is a claim about the world: a dormant view that starts reading rows fails, so its line is removed on purpose.
 case "${FUND_PROFILE:-}" in
-  # No developer runs an archiver that ships to their own bucket; production's ships from the archiver host nightly.
-  development | development/*) dormant=" journal logs " ;;
-  *) dormant=" " ;;
+  # No developer runs an archiver that ships to their own bucket, but a developer's studies may ship researcher journals.
+  development | development/*)
+    dormant=" logs "
+    optional=" journal experiments "
+    ;;
+  # The archiver ships production's records nightly; no researcher host runs studies there yet.
+  *)
+    dormant=" "
+    optional=" experiments "
+    ;;
 esac
 
 unwritten='No files found that match the pattern'
@@ -53,6 +61,17 @@ for view in "${views[@]}"; do
       echo "${view}: dormant"
     else
       echo "${view}: dormant, and failed for another reason than nothing being written: ${error:-${output}}"
+      broken=$((broken + 1))
+    fi
+    continue
+  fi
+  if [[ "${optional}" == *" ${view} "* ]]; then
+    if [[ -n "${rows}" ]]; then
+      echo "${view}: optional, ${rows} rows"
+    elif [[ "${error}" == *"${unwritten}"* ]]; then
+      echo "${view}: optional, nothing written"
+    else
+      echo "${view}: optional, and did not create: ${error:-${output}}"
       broken=$((broken + 1))
     fi
     continue

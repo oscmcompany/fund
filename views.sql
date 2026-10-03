@@ -61,3 +61,34 @@ FROM read_parquet(
     hive_partitioning = true,
     hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
 );
+
+-- Every experiment a study journaled, one row each; settings and outputs stay JSON for `json_extract`, and an
+-- experiment line this build could not read shows in `journal` with `unreadable` set rather than here.
+CREATE OR REPLACE VIEW experiments AS
+SELECT
+    timestamp,
+    session,
+    payload ->> '$.label' AS label,
+    payload -> '$.parameters' AS parameters,
+    list_sort(list_distinct(CAST(payload ->> '$.fingerprints[*].leg' AS VARCHAR[]))) AS legs,
+    CAST(list_min(CAST(payload ->> '$.fingerprints[*].first' AS VARCHAR[])) AS DATE) AS first,
+    CAST(list_max(CAST(payload ->> '$.fingerprints[*].last' AS VARCHAR[])) AS DATE) AS last,
+    payload -> '$.estimates' AS estimates,
+    payload -> '$.metrics' AS metrics,
+    "commit",
+    payload ->> '$.machine.hostname' AS hostname,
+    payload ->> '$.machine.architecture' AS architecture,
+    payload ->> '$.machine.operating_system' AS operating_system,
+    CAST(payload ->> '$.machine.cores' AS BIGINT) AS cores,
+    CAST(payload ->> '$.since_opened' AS BIGINT) AS milliseconds_since_opened,
+    run_id
+FROM (
+    SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+    FROM read_parquet(
+        's3://' || getvariable('records_bucket')
+            || '/records/journal/producer=researcher/year=*/month=*/day=*/data.parquet',
+        hive_partitioning = true,
+        hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+    )
+    WHERE event_type = 'experiment_ran'
+);

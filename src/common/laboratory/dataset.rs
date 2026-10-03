@@ -154,14 +154,6 @@ impl Fingerprint {
         self.leg
     }
 
-    pub fn first(&self) -> SessionDate {
-        self.first
-    }
-
-    pub fn last(&self) -> SessionDate {
-        self.last
-    }
-
     pub fn partitions(&self) -> &BTreeMap<SessionDate, String> {
         &self.partitions
     }
