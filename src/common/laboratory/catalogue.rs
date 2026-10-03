@@ -90,13 +90,13 @@ impl Query {
 }
 
 /// One experiment as a line: when, what, which settings, over which window, what it measured, and which build, host
-/// and run produced it.
+/// and run produced it. Setting values are escaped, so a line break inside one cannot split the line.
 pub fn line(record: &Record, experiment: &ExperimentRan) -> String {
     let parameters = experiment
         .parameters()
         .settings()
         .iter()
-        .map(|(name, value)| format!("{}={value}", name.as_str()))
+        .map(|(name, value)| format!("{}={}", name.as_str(), value.escape_debug()))
         .collect::<Vec<_>>();
     let mut legs = experiment
         .fingerprints()
@@ -285,6 +285,26 @@ mod tests {
         assert_eq!(selected(&window, &records), [run(2)]);
         assert!(window.selects_session(session(23)) && window.selects_session(session(24)));
         assert!(!window.selects_session(session(22)) && !window.selects_session(session(25)));
+    }
+
+    #[test]
+    fn test_a_setting_with_line_breaks_stays_on_one_line() {
+        let experiment = ExperimentRan::new(
+            Label::new("Breaks").unwrap(),
+            machine(),
+            Parameters::new([("note", "first\nsecond\rthird")]).unwrap(),
+            Vec::new(),
+            Outputs::default(),
+            Elapsed::from_milliseconds(0),
+        );
+        let record = record(
+            1,
+            22,
+            Observation::ExperimentRan(Box::new(experiment.clone())),
+        );
+        let text = line(&record, &experiment);
+        assert!(!text.contains(['\n', '\r']), "{text}");
+        assert!(text.contains(r"[note=first\nsecond\rthird]"), "{text}");
     }
 
     #[test]

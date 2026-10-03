@@ -1,6 +1,7 @@
 //! Reads the experiment catalogue: every `experiment_ran` the researcher journals hold, one line each, oldest first.
-//! Exits 0 when every journal read, 1 when any object or bucket did not, and 2 when the query was refused.
+//! Exits 0 when every journal read whole, 1 when any bucket, object or line did not, and 2 when the query was refused.
 
+use std::collections::BTreeSet;
 use std::process::ExitCode;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -83,7 +84,10 @@ async fn experiments(query: &Query, records_buckets: Vec<String>) -> ExitCode {
             }
         }
     } else {
+        // A bucket named twice is read once, so no experiment prints twice.
         records_buckets
+            .into_iter()
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .map(|name| Archive::records_in(&configuration, name))
             .collect()
@@ -123,7 +127,7 @@ async fn experiments(query: &Query, records_buckets: Vec<String>) -> ExitCode {
                 Ok(Some(body)) => {
                     journal::decode(&key, body).map_err(|refusal| format!("{refusal:?}"))
                 }
-                Ok(None) => Ok(Vec::new()),
+                Ok(None) => Err("it was listed but is gone".to_string()),
                 Err(error) => Err(error.to_string()),
             };
             match held {
@@ -136,7 +140,10 @@ async fn experiments(query: &Query, records_buckets: Vec<String>) -> ExitCode {
                                     lines.push((record.timestamp(), line(&record, experiment)));
                                 }
                             }
-                            ReadLine::Unreadable { .. } => unreadable += 1,
+                            ReadLine::Unreadable { line, cause, .. } => {
+                                eprintln!("{} line {line} is unreadable: {cause:?}", key.path());
+                                unreadable += 1;
+                            }
                         }
                     }
                 }
@@ -156,7 +163,8 @@ async fn experiments(query: &Query, records_buckets: Vec<String>) -> ExitCode {
         lines.len(),
         buckets.len(),
     );
-    match failures {
+    // An unreadable line may be an experiment this build cannot read, so the catalogue is not known to be whole.
+    match failures + unreadable {
         0 => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
