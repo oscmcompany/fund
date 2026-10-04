@@ -27,6 +27,10 @@ pub struct SessionDate(NaiveDate);
 impl SessionDate {
     /// The session an instant falls in, which rolls over at Eastern midnight rather than UTC midnight.
     pub fn at(instant: DateTime<Utc>) -> Self {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the date is taken after converting to Eastern"
+        )]
         Self(instant.with_timezone(&New_York).date_naive())
     }
 
@@ -191,6 +195,10 @@ mod tests {
 
     /// 00:30 UTC on 1 August is 20:30 on 31 July in New York, so a UTC-named run names the wrong session.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test shows the UTC date is the wrong session"
+    )]
     fn test_eastern_datetime_names_the_session_the_instant_belongs_to() {
         let after_utc_midnight = instant("2026-08-01T00:30:00Z");
         assert_eq!(

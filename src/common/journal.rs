@@ -638,7 +638,8 @@ mod tests {
                                 reason: String::new(),
                             }
                         }
-                        cause => cause,
+                        cause @ (UnreadableCause::NoVersion
+                        | UnreadableCause::OtherVersion { .. }) => cause,
                     };
                     (*line, text.clone(), cause)
                 }

@@ -13,7 +13,7 @@ in {
       enable = true;
       name = "Check all Rust code";
       entry = "check-rust";
-      files = "(\\.rs|Cargo\\.(toml|lock))$";
+      files = "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec)\\.toml|views\\.sql|check-views)$";
       excludes = ["^src_old/"];
       pass_filenames = false;
       language = "system";
@@ -73,6 +73,7 @@ in {
     awscli2
     cargo-llvm-cov
     cargo-machete
+    cargo-mutants
     curl
     duckdb # retained for local data exploration and experimentation
     gh
@@ -105,6 +106,13 @@ in {
     echo "Checking for unused Rust dependencies"
     cargo machete
     echo "No unused dependencies found"
+  '';
+
+  scripts.mutate-rust.exec = ''
+    set -euo pipefail
+    echo "Running mutation tests on the lines changed in ''${1:?a unified diff file}"
+    cargo mutants --in-diff "$1"
+    echo "Every mutant in the diff was caught"
   '';
 
   scripts.test-rust.exec = ''
@@ -253,6 +261,7 @@ in {
       echo "    bump-rust-dependencies      Update the Cargo lockfile"
       echo "    start-duckdb                DuckDB with the archive views"
       echo "    check-views                 Fail on any archive view that is empty"
+      echo "    mutate-rust <diff>          Mutation-test the lines a diff changes"
     } >&2
   '';
 }

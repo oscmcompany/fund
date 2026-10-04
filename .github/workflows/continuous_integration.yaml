@@ -28,8 +28,14 @@ jobs:
             rust:
               - 'src/**'
               - 'tests/**'
+              - 'studies/**'
+              - 'build.rs'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'clippy.toml'
+              - 'secretspec.toml'
+              - 'views.sql'
+              - 'check-views'
               - 'devenv.nix'
               - 'devenv.lock'
             base:
@@ -80,3 +86,15 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:rust
+      # Advisory until the surviving-mutant rate is known; scoped to the diff so it stays bounded.
+      - name: Run mutation tests on changed code
+        if: github.event_name == 'pull_request' && steps.changes.outputs.rust == 'true'
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          CARGO_INCREMENTAL: "0"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > "$RUNNER_TEMP/pull_request.diff"
+          devenv --secretspec-provider env --secretspec-profile development \
+            shell -- mutate-rust "$RUNNER_TEMP/pull_request.diff"
