@@ -24,13 +24,8 @@ fn scratch() -> PathBuf {
     directory
 }
 
-fn executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// Runs `script` with a `duckdb` that answers each view as `answers` says, and any other view as a producer that has
-/// written nothing.
+/// written nothing. Nothing this process writes is executed, so no sibling test's fork can leave it busy.
 fn check(script: &Path, answers: &[(&str, Answer)], profile: &str) -> (i32, String) {
     let directory = scratch();
     let cases: String = answers
@@ -40,19 +35,19 @@ fn check(script: &Path, answers: &[(&str, Answer)], profile: &str) -> (i32, Stri
             Answer::Error(error) => format!("  {view}) echo '{error}' >&2; exit 1 ;;\n"),
         })
         .collect();
-    let fake = directory.join("duckdb");
+    let answers_file = directory.join("answers.sh");
     std::fs::write(
-        &fake,
+        &answers_file,
         format!(
-            "#!/usr/bin/env bash\n\
-             view=\"$(sed -nE 's/^CREATE OR REPLACE VIEW ([a-z0-9_]+) AS$/\\1/p')\"\n\
+            "view=\"$(sed -nE 's/^CREATE OR REPLACE VIEW ([a-z0-9_]+) AS$/\\1/p')\"\n\
              case \"$view\" in\n{cases}  *) echo '{NOTHING_WRITTEN}' >&2; exit 1 ;;\nesac\n"
         ),
     )
     .unwrap();
-    executable(&fake);
-    let output = Command::new(script)
-        .env("DUCKDB", &fake)
+    let output = Command::new("bash")
+        .arg(script)
+        .env("DUCKDB", root().join("tests/fixtures/fake-duckdb"))
+        .env("FAKE_DUCKDB_ANSWERS", &answers_file)
         .env("AWS_S3_ARCHIVE_BUCKET_NAME", "archive")
         .env("AWS_S3_RECORDS_BUCKET_NAME", "records")
         .env("FUND_PROFILE", profile)
@@ -238,7 +233,6 @@ fn test_every_live_glob_matching_nothing_is_a_broken_view() {
 fn test_a_declaration_the_parser_misses_fails_the_check() {
     let directory = scratch();
     std::fs::copy(root().join("check-views"), directory.join("check-views")).unwrap();
-    executable(&directory.join("check-views"));
     let read_one = "CREATE OR REPLACE VIEW bars_1m AS\nSELECT 1\n);\n";
     std::fs::write(directory.join("views.sql"), read_one).unwrap();
     let (status, output) = check(
