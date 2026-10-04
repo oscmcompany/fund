@@ -48,7 +48,7 @@ impl Dataset {
 #[derive(Debug)]
 pub enum DatasetError {
     Window(FingerprintRefusal),
-    /// The read could not be journaled, so it is not returned: a study holds only catalogued data.
+    /// The read could not be journaled, so it is not returned: a study holds only cataloged data.
     Journal(std::io::Error),
     Archive(ArchiveError),
     Decode {
@@ -227,7 +227,7 @@ mod tests {
     /// A study's reads and experiments land in its journal in order, name exactly the data read, and survive the
     /// parquet encoding the records bucket stores.
     #[test]
-    fn test_a_study_catalogues_what_it_read_and_ran() {
+    fn test_a_study_catalogs_what_it_read_and_ran() {
         let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
         let mut study = Study::open(Label::new("bar counts").unwrap(), &directory).unwrap();
         let dataset = dataset(study.run_id());

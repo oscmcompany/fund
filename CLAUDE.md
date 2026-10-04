@@ -22,7 +22,7 @@ This is a collection of guidelines and references.
   details); cite them as "pivot task N", "launch task N" and "archive task N"
 - Read the `experiments` view (`start-duckdb`) before starting a study to see what has already been tried, under each
   profile or with `SET VARIABLE records_bucket` set to the other bucket, and journal every experiment through a `Study`;
-  the catalogue records the work and gates none of it, so holdouts are designed per study
+  the catalog records the work and gates none of it, so holdouts are designed per study
 - Studies are throwaway binaries in the gitignored `studies/src/bin/`, run with `cargo run -p studies --bin <name>`,
   and a `Study` journals into the gitignored `journal/` at the root, which `finish` ships to the profile's records
   bucket
