@@ -5,16 +5,38 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::heal::Leg;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
+
+/// One archive series a study can read, under the name the journal stores.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum DatasetLeg {
+    MassiveDailyBars,
+    /// The legacy archiver's daily bars under `data/derived/`; archive task A6 deletes it with the legacy reader.
+    LegacyDailyBars,
+}
 
 /// The partitions a study read, by session with the entity tag of the version read, and every trading session in the
 /// window that had none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "FingerprintFields")]
 pub struct Fingerprint {
-    leg: Leg,
+    leg: DatasetLeg,
     first: SessionDate,
     last: SessionDate,
     partitions: BTreeMap<SessionDate, String>,
@@ -24,7 +46,7 @@ pub struct Fingerprint {
 
 #[derive(Deserialize)]
 struct FingerprintFields {
-    leg: Leg,
+    leg: DatasetLeg,
     first: SessionDate,
     last: SessionDate,
     partitions: BTreeMap<SessionDate, String>,
@@ -118,7 +140,7 @@ impl Fingerprint {
     /// `partitions` holds what was found; every other trading session from `first` to `last` is recorded missing. Taken
     /// only by the crate's loaders, so a study cannot vouch for partitions nothing read.
     pub(crate) fn new(
-        leg: Leg,
+        leg: DatasetLeg,
         first: SessionDate,
         last: SessionDate,
         calendar: &TradingCalendar,
@@ -150,7 +172,7 @@ impl Fingerprint {
         })
     }
 
-    pub fn leg(&self) -> Leg {
+    pub fn leg(&self) -> DatasetLeg {
         self.leg
     }
 
@@ -221,7 +243,7 @@ mod tests {
     #[test]
     fn test_every_trading_session_is_read_or_named_missing() {
         let fingerprint = Fingerprint::new(
-            Leg::MassiveDailyBars,
+            DatasetLeg::MassiveDailyBars,
             session(21),
             session(27),
             &calendar(),
@@ -233,14 +255,14 @@ mod tests {
             [session(21), session(22), session(25)]
         );
         assert_eq!(fingerprint.missing(), [session(23), session(24)]);
-        assert_eq!(fingerprint.leg(), Leg::MassiveDailyBars);
+        assert_eq!(fingerprint.leg(), DatasetLeg::MassiveDailyBars);
     }
 
     #[test]
     fn test_a_fingerprint_refuses_what_it_could_not_have_read() {
         assert_eq!(
             Fingerprint::new(
-                Leg::MassiveDailyBars,
+                DatasetLeg::MassiveDailyBars,
                 session(25),
                 session(21),
                 &calendar(),
@@ -253,7 +275,7 @@ mod tests {
         );
         assert_eq!(
             Fingerprint::new(
-                Leg::MassiveDailyBars,
+                DatasetLeg::MassiveDailyBars,
                 session(21),
                 session(28),
                 &calendar(),
@@ -268,7 +290,7 @@ mod tests {
         for day in [26, 25] {
             assert_eq!(
                 Fingerprint::new(
-                    Leg::MassiveDailyBars,
+                    DatasetLeg::MassiveDailyBars,
                     session(21),
                     session(24),
                     &calendar(),
@@ -284,7 +306,7 @@ mod tests {
     #[test]
     fn test_a_partition_rewritten_or_gone_since_it_was_read_is_contaminated() {
         let fingerprint = Fingerprint::new(
-            Leg::MassiveDailyBars,
+            DatasetLeg::MassiveDailyBars,
             session(21),
             session(25),
             &calendar(),
@@ -316,7 +338,7 @@ mod tests {
     fn test_a_stored_fingerprint_must_agree_with_its_own_window() {
         let stored = serde_json::to_value(
             Fingerprint::new(
-                Leg::MassiveDailyBars,
+                DatasetLeg::MassiveDailyBars,
                 session(21),
                 session(25),
                 &calendar(),
@@ -344,7 +366,7 @@ mod tests {
     #[test]
     fn test_a_fingerprint_reads_back_as_written() {
         let fingerprint = Fingerprint::new(
-            Leg::MassiveDailyBars,
+            DatasetLeg::MassiveDailyBars,
             session(21),
             session(25),
             &calendar(),
@@ -356,5 +378,21 @@ mod tests {
             serde_json::from_str::<Fingerprint>(&encoded).unwrap(),
             fingerprint
         );
+    }
+
+    /// Each leg keeps the name journals already hold, and serde and strum agree on it.
+    #[test]
+    fn test_a_dataset_leg_round_trips_under_its_stored_name() {
+        use strum::IntoEnumIterator;
+        assert_eq!(
+            DatasetLeg::iter().map(<&str>::from).collect::<Vec<_>>(),
+            ["massive_daily_bars", "legacy_daily_bars"]
+        );
+        for leg in DatasetLeg::iter() {
+            let stored = serde_json::to_value(leg).unwrap();
+            assert_eq!(stored, serde_json::json!(leg.to_string()));
+            assert_eq!(serde_json::from_value::<DatasetLeg>(stored).unwrap(), leg);
+            assert_eq!(leg.to_string().parse::<DatasetLeg>().unwrap(), leg);
+        }
     }
 }

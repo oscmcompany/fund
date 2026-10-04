@@ -351,7 +351,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::common::heal::Leg;
+    use crate::common::laboratory::dataset::DatasetLeg;
     use crate::common::laboratory::estimate::summarize;
     use crate::common::laboratory::series::Series;
     use crate::common::time::SessionDate;
@@ -378,7 +378,7 @@ mod tests {
             .map(|day| (session(day), format!("\"tag-{day}\"")))
             .into();
         Fingerprint::new(
-            Leg::MassiveDailyBars,
+            DatasetLeg::MassiveDailyBars,
             session(0),
             session(2),
             &calendar,

@@ -18,6 +18,11 @@ const EXCHANGE_TEST_TICKERS: [&str; 34] = [
     "ZZZTS", "ZZZTT", "ZZZTX",
 ];
 
+/// Whether `ticker` is an exchange test ticker; the legacy reader shares it until archive task A6 deletes that reader.
+pub(crate) fn is_exchange_test_ticker(ticker: &str) -> bool {
+    EXCHANGE_TEST_TICKERS.contains(&ticker)
+}
+
 pub struct Massive {
     http_client: reqwest::Client,
     base_url: String,
@@ -116,7 +121,7 @@ fn parse_grouped_daily(body: &[u8], session: SessionDate) -> Result<DailyBars, F
     // Keyed by symbol, so two tickers the notation map sends to one symbol (`ABCw` and `ABC.WS`) keep neither.
     let mut accepted = Accepted::new();
     for row in response.results {
-        if EXCHANGE_TEST_TICKERS.contains(&row.ticker.as_str()) {
+        if is_exchange_test_ticker(&row.ticker) {
             test_tickers.push(row.ticker);
             continue;
         }
