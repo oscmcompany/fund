@@ -22,7 +22,7 @@ data/*
 .claude/tasks/
 .claude/settings.local.json*
 .scratchpad/
-/examples/
+/studies/src/bin/
 /journal/
 .devenv
 .env

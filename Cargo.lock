@@ -2790,6 +2790,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "studies"
+version = "0.0.0"
+dependencies = [
+ "aws-config",
+ "chrono",
+ "fund",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
