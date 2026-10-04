@@ -337,7 +337,7 @@ mod tests {
                     r#"{"bars":12533,"leg":"massive_daily_bars","refused":"{\"symbol\": 7}","session":"2026-09-28","unanswered":0}"#
                 );
             }
-            other => panic!("{other:?}"),
+            other @ LogLine::Unreadable { .. } => panic!("{other:?}"),
         }
         assert!(
             matches!(&lines[1], LogLine::Read { commit: None, level, .. } if *level == Level::ERROR)

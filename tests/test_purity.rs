@@ -272,6 +272,10 @@ fn use_paths(tree: &syn::UseTree) -> Vec<Vec<String>> {
 fn bindings(items: &[syn::Item], parent: Option<&Vec<String>>) -> Vec<String> {
     let mut names = Vec::new();
     for item in items {
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "`syn::Item` is non-exhaustive, so a catch-all arm is required"
+        )]
         match item {
             syn::Item::Mod(module) => names.push(module.ident.to_string()),
             syn::Item::Use(import) => {

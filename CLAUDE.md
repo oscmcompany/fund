@@ -6,7 +6,6 @@
 
 This is a collection of guidelines and references.
 
-- [devenv](https://devenv.sh/) manages the development environment and tasks
 - Every host runs on AWS EC2; the running archiver builds from the `legacy` branch, not from `master`
 - Secrets are managed via [secretspec](https://secretspec.dev/) with the `awssm` provider, stored in AWS
   Secrets Manager as `secretspec/{project}/{profile}/{key}`
@@ -32,9 +31,13 @@ This is a collection of guidelines and references.
 - Docstrings are one sentence on what the item is for, plus at most two more for a caveat, invariant, or
   assumption a caller cannot read off the signature; module documentation is three lines maximum, and an
   in-line comment is one line where a step is genuinely surprising, with two the hard ceiling
+- A docstring or comment claims only what the code enforces — a promise that two sites agree, with nothing
+  making them agree, reads as a bug
 - Rationale belongs in the commit message rather than the source — why this approach and not the obvious
   one, what broke before, what the alternative would cost; the source states the constraint and the commit
   argues it
+- Name things in our own vocabulary rather than a vendor's, and keep sibling names consistent (`Bar` beside
+  `BarInterval`, not `Ohlc`)
 - Spell identifiers out fully in code (variables, functions, fields, modules): prefer `dataframe` over
   `df`, `message` over `msg`, `quantity` over `qty`, `index` over `idx`, `value` over `val`, `column` over
   `col`, and `volatility` over `vol`
@@ -59,7 +62,6 @@ This is a collection of guidelines and references.
   give it a second sense; a record's host partition is `producer=`
 - Apply the spell-it-out rule to new code and to identifiers you touch; already-shipped schema identifiers
   and stored values are effectively fixed and change only via an explicit migration
-- Always match existing styles and patterns in the codebase for consistency
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not
   "STARTING DATA SYNC")
 - Encode domain constraints in the type system: use enums with per-variant data to make invalid states
@@ -103,14 +105,11 @@ This is a collection of guidelines and references.
   trades — never infer it from the type
 - Write `Eastern` or `America/New_York`, never `EST` or `EDT` — each names only half the year; elapsed
   durations and timeouts carry no zone, so measure them on a monotonic clock (`tokio::time::Instant`), and
-  schedule trading jobs with a UTC cron expression gated on the Eastern wall clock, a pairing that
-  `tests/test_schedules.rs` enforces
+  schedule trading jobs with a UTC cron expression gated on the Eastern wall clock
 - Guard against division by zero when computing ratios or percentages from DataFrame aggregations, and
   handle the `None` that Polars `Series.sum()` returns on an empty or all-null series
-- Ensure Rust automated test suites achieve at least 75% line or statement coverage, excluding generated
-  code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository;
-  coverage is a proxy for the real question, so judge new code on whether a mutation to it fails a test
-  rather than on the line rate alone
+- Judge new code on whether a mutation to it fails a test rather than on the coverage line rate alone;
+  `mutate-rust <diff>` runs cargo-mutants over the lines a diff changes
 - When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after
   the fix
 - Pin test expectations to literals, never to the constant or list the test is checking — an expectation
@@ -158,8 +157,8 @@ This is a collection of guidelines and references.
   refutation closes doors that are still open and under-claiming reopens ones that are shut
 - Correcting an instance does not generalise the lesson; run the check deliberately against each new
   measurement rather than remembering it as a past mistake
-- A tooling trap that a check could detect is owed a check, not a memory — a memory is read after the trap
-  fires; only a hazard of a typed command that no check can observe stays a note
+- A tooling trap or a recurring review comment that a check could detect is owed a check, not a memory — a
+  memory is read after the trap fires; only a hazard of a typed command that no check can observe stays a note
 - Standard errors assume independent observations, which financial data never is — aggregate to the level
   that actually varies and report effective sample size rather than row count
 - Always report the undefined share alongside an estimate; an estimator silently defined on 60% of its
@@ -185,14 +184,13 @@ This is a collection of guidelines and references.
   D is returned by a query for D+1
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - For non-trivial changes, pause and ask "Is there a more elegant way?" before implementing
-- Make every change as simple as possible, touching only what is necessary to avoid introducing bugs
-- Find root causes and avoid temporary fixes - maintain high standards
+- For work larger than one slice, agree the types, signatures and module layout before writing any bodies
 - Do not introduce abstractions for single-use code
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
 - Invoke skills and suggest commands based on conversational context rather than waiting for explicit slash
   commands
-- Prove changes work before marking tasks complete - run `devenv tasks run` checks, compare behavior,
-  demonstrate correctness
+- Prove changes work before marking tasks complete — run targeted `cargo test` while iterating and
+  `devenv tasks run checks:all` once before each push, compare behavior, demonstrate correctness
 - Verify against real data before reporting done, and say which route was used: `secretspec run -- curl`
   against a provider, DuckDB over the S3 parquet, or a researcher run read back from `/var/log/fund/`;
   when only fixtures were exercised, say so plainly, and ask to be pointed at real data rather than
@@ -202,6 +200,10 @@ This is a collection of guidelines and references.
 - A bug-fix commit message states the root cause and the fix rather than restating the diff
 - When creating GitHub issues or pull requests, use the templates in the `.github/` directory and follow
   commented instructions
+- Keep a pull request to roughly 250–500 lines of production code, excluding tests and lockfiles; when a plan
+  or a diff grows past that, propose splitting it into stacked slices
+- Before opening a pull request or pushing to one, spawn the `reviewer` subagent over the diff and let it fix
+  what it finds, without waiting on the user
 - When naming branches, use an all-lowercase, hyphenated, and concise summary of the work being done
 - Only use existing repository labels for GitHub issues and pull requests
 - Do not use emojis in commit messages, GitHub issues, or pull requests - maintain a professional tone

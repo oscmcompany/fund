@@ -1,0 +1,20 @@
+# Abbreviations CLAUDE.md asks to spell out; `..` keeps clippy's defaults.
+disallowed-names = [
+  "..",
+  "col",
+  "crps",
+  "df",
+  "eod",
+  "idx",
+  "mae",
+  "msg",
+  "qty",
+  "rmse",
+  "val",
+  "vol",
+]
+disallowed-methods = [
+  { path = "chrono::DateTime::date_naive", reason = "derive a session with `SessionDate::at`, which uses the Eastern date" },
+  { path = "chrono::FixedOffset::east_opt", reason = "write `America/New_York` through chrono-tz, never a hardcoded offset" },
+  { path = "chrono::FixedOffset::west_opt", reason = "write `America/New_York` through chrono-tz, never a hardcoded offset" },
+]

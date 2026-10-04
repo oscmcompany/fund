@@ -8,6 +8,13 @@ edition = "2024"
 members = ["studies"]
 exclude = ["src_old"]
 
+[workspace.lints.clippy]
+match_wildcard_for_single_variants = "deny"
+wildcard_enum_match_arm = "deny"
+
+[lints]
+workspace = true
+
 [dependencies]
 arrow-array = "60.0.0"
 arrow-schema = "60.0.0"
