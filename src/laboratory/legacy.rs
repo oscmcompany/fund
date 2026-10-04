@@ -228,6 +228,8 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use chrono::{NaiveDate, TimeDelta};
     use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
     use proptest::prelude::*;
 
     use super::*;
@@ -261,7 +263,8 @@ mod tests {
         }
     }
 
-    /// A file in the legacy archiver's columns, with strings as `LargeUtf8` the way Polars stored them, `except` left out.
+    /// A file in the legacy archiver's columns, compressed with zstd and with strings as `LargeUtf8` the way Polars
+    /// stored them, `except` left out.
     fn file(rows: &[Row], except: Option<&str>) -> Vec<u8> {
         let floats = |read: &dyn Fn(&Row) -> Option<f64>| -> ArrayRef {
             Arc::new(Float64Array::from(
@@ -309,7 +312,10 @@ mod tests {
         )
         .unwrap();
         let mut bytes = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         bytes
