@@ -26,7 +26,7 @@ Highlight nothing if nothing qualifies, and say so.
 
 Links point at `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>-L<end>` with the pull request's
 `headRefOid`. If local `HEAD` differs from it, the newest commits are not pushed: say so, and give `path:start-end`
-for ranges that exist only locally.
+for ranges that exist only locally. Without a pull request, give `path:start-end` for every range.
 
 ## 2. Choose
 

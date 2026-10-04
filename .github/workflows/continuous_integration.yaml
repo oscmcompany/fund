@@ -93,8 +93,9 @@ jobs:
         timeout-minutes: 20
         env:
           CARGO_INCREMENTAL: "0"
-          GH_TOKEN: ${{ github.token }}
+        # The checkout is the merge commit, so diff it against its base parent to keep line numbers aligned.
         run: |
-          gh pr diff ${{ github.event.pull_request.number }} > "$RUNNER_TEMP/pull_request.diff"
+          git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
+          git diff HEAD^1 HEAD > "$RUNNER_TEMP/pull_request.diff"
           devenv --secretspec-provider env --secretspec-profile development \
             shell -- mutate-rust "$RUNNER_TEMP/pull_request.diff"
