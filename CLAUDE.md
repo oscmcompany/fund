@@ -17,9 +17,15 @@ This is a collection of guidelines and references.
 - `src/common/` holds the crate's shared pure code as `module.rs` beside `module/`; its modules and the pure
   `decide`/`solve` take no clients, are not `async`, read no clock or randomness, and import no `tokio`, `reqwest`, `aws_sdk_*`,
   `std::fs` or `std::net`, and name only allowlisted crates, which `tests/test_purity.rs` enforces
-- The live plans are `.scratchpad/plan_pivot.md` and `.scratchpad/plan_launch.md`, local and deliberately untracked
-  (`.scratchpad/` is gitignored because they carry private strategy and capital details); cite them as "pivot task N"
-  and "launch task N"
+- The live plans are `.scratchpad/plan_pivot.md`, `.scratchpad/plan_launch.md` and `.scratchpad/plan_archive.md`,
+  local and deliberately untracked (`.scratchpad/` is gitignored because they carry private strategy and capital
+  details); cite them as "pivot task N", "launch task N" and "archive task N"
+- Read the `experiments` view (`start-duckdb`) before starting a study to see what has already been tried, under each
+  profile or with `SET VARIABLE records_bucket` set to the other bucket, and journal every experiment through a `Study`;
+  the catalog records the work and gates none of it, so holdouts are designed per study
+- Studies are throwaway binaries in the gitignored `studies/src/bin/`, run with `cargo run -p studies --bin <name>`,
+  and a `Study` journals into the gitignored `journal/` at the root, which `finish` ships to the profile's records
+  bucket
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - See `README.md` "Principles" section for developer philosophy

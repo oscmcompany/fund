@@ -1,4 +1,4 @@
-//! What the catalogue records about a study: each dataset it read and each experiment it ran, with the inputs,
+//! What the catalog records about a study: each dataset it read and each experiment it ran, with the inputs,
 //! outputs and machine behind them, so past work can be found and read back rather than redone blind.
 
 use std::borrow::Borrow;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::estimate::Estimate;
 
-/// Free text naming what a study is about, for searching the catalogue; it gates nothing.
+/// Free text naming what a study is about, for searching the catalog; it gates nothing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Label(String);
@@ -81,7 +81,7 @@ pub struct Parameters(BTreeMap<Name, String>);
 pub enum ExperimentRefusal {
     BlankLabel,
     BlankMachine,
-    /// A label or name with a line break would split a catalogue line.
+    /// A label or name with a line break would split a catalog line.
     LineBreak {
         text: String,
     },
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_catalogue_text_refuses_what_would_not_search_or_split_a_line() {
+    fn test_catalog_text_refuses_what_would_not_search_or_split_a_line() {
         assert_eq!(Label::new("  "), Err(ExperimentRefusal::BlankLabel));
         assert_eq!(
             Label::new("gap\npersists"),

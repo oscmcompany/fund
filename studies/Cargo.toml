@@ -1,0 +1,21 @@
+[package]
+name = "studies"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fund = { path = ".." }
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+  "rustls",
+  "http2",
+  "query",
+  "gzip",
+] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+
+# The binaries that use these are gitignored, so a clean checkout has no code to read them from.
+[package.metadata.cargo-machete]
+ignored = ["aws-config", "chrono", "fund", "reqwest", "tokio"]

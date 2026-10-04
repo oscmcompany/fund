@@ -1,4 +1,4 @@
-//! Loads what studies read and catalogues what they do: a `Study` journals every dataset its loaders read and every
+//! Loads what studies read and catalogs what they do: a `Study` journals every dataset its loaders read and every
 //! experiment it reports, then merges the journal into the records bucket.
 
 pub mod dataset;
@@ -86,7 +86,7 @@ impl Study {
         self.journal.run_id()
     }
 
-    /// Journals a read; only loaders call it, so every dataset a study holds was catalogued.
+    /// Journals a read; only loaders call it, so every dataset a study holds was cataloged.
     pub(crate) fn read(&mut self, fingerprint: &Fingerprint) -> io::Result<()> {
         let read = DatasetRead::new(
             self.label.clone(),

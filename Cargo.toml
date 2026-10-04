@@ -5,6 +5,7 @@ edition = "2024"
 
 # The legacy crate keeps its own manifest and lockfile and is never built from here.
 [workspace]
+members = ["studies"]
 exclude = ["src_old"]
 
 [dependencies]
