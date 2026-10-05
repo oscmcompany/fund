@@ -1318,10 +1318,6 @@ async fn fold_trades(
             }
         }
         let session = listed_file.session();
-        let hours = calendar
-            .session(session)
-            .map(|trading| trading.hours())
-            .expect("owed sessions are trading days");
         let archive = archive.clone();
         let conditions = conditions.clone();
         let stream = flat_files.stream(FlatFileDataset::Trades, &listed_file, STREAM_AHEAD);
@@ -1335,8 +1331,7 @@ async fn fold_trades(
             async move {
                 let started = tokio::time::Instant::now();
                 let outcome =
-                    fold_trades_one(&archive, stream, session, hours, conditions, &provenance)
-                        .await;
+                    fold_trades_one(&archive, stream, session, conditions, &provenance).await;
                 match &outcome {
                     Ok(()) => tracing::info!(
                         session = %session,
@@ -1379,13 +1374,11 @@ async fn fold_trades_one(
     archive: &Archive,
     stream: FlatFileStream,
     session: SessionDate,
-    (open, close): (DateTime<Utc>, DateTime<Utc>),
     conditions: TradeConditions,
     provenance: &Provenance,
 ) -> Result<(), FoldFailure> {
     let folded = tokio::task::spawn_blocking(move || {
-        let mut fold = TradeFold::new(open, close, conditions)
-            .expect("a trading session closes after it opens");
+        let mut fold = TradeFold::new(session, conditions);
         let mut test_tickers = 0_u64;
         let mut refused = Vec::new();
         read_trades(stream, |outcome| match outcome {
@@ -1434,7 +1427,7 @@ async fn fold_trades_one(
         symbols,
         minute_bars = minutes.len(),
         folded = counts.folded(),
-        outside_hours = counts.outside_hours(),
+        other_session = counts.other_session(),
         corrected = counts.corrected(),
         volume_ineligible = counts.volume_ineligible(),
         unresolved = counts.unresolved(),

@@ -1,5 +1,5 @@
-//! Trade bars: what a session's prints during its regular hours add up to under the consolidated tape's condition
-//! rules, as exact totals and the prices only eligible prints may set, rolling up from one minute to five and the day.
+//! Trade bars: what a session's prints, extended hours and closing cross included, add up to under the consolidated
+//! tape's condition rules, as exact totals and the prices only eligible prints may set, rolling up from one minute to five and the day.
 
 use std::collections::BTreeMap;
 
@@ -371,7 +371,8 @@ impl Monoid for TradeRollup {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TradeFoldCounts {
     folded: u64,
-    outside_hours: u64,
+    /// Stamped for another session's Eastern date.
+    other_session: u64,
     /// Marked as corrected by the vendor, which leaves them out entirely.
     corrected: u64,
     volume_ineligible: u64,
@@ -383,8 +384,8 @@ impl TradeFoldCounts {
         self.folded
     }
 
-    pub fn outside_hours(&self) -> u64 {
-        self.outside_hours
+    pub fn other_session(&self) -> u64 {
+        self.other_session
     }
 
     pub fn corrected(&self) -> u64 {
@@ -400,46 +401,29 @@ impl TradeFoldCounts {
     }
 }
 
-/// One session's prints folded into one-minute trade bars over `[open, close)`.
+/// One session's prints folded into one-minute trade bars over its whole Eastern day; the condition rules, not the
+/// hours, decide what a print may set, so an extended-hours print adds volume and the closing cross sets the close.
 pub struct TradeFold {
-    open: DateTime<Utc>,
-    close: DateTime<Utc>,
+    session: SessionDate,
     conditions: TradeConditions,
     minutes: TradeRollup,
     counts: TradeFoldCounts,
 }
 
-/// Why a fold could not start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TradeFoldRefusal {
-    CloseNotAfterOpen {
-        open: DateTime<Utc>,
-        close: DateTime<Utc>,
-    },
-}
-
 impl TradeFold {
-    pub fn new(
-        open: DateTime<Utc>,
-        close: DateTime<Utc>,
-        conditions: TradeConditions,
-    ) -> Result<Self, TradeFoldRefusal> {
-        if close <= open {
-            return Err(TradeFoldRefusal::CloseNotAfterOpen { open, close });
-        }
-        Ok(Self {
-            open,
-            close,
+    pub fn new(session: SessionDate, conditions: TradeConditions) -> Self {
+        Self {
+            session,
             conditions,
             minutes: TradeRollup::empty(),
             counts: TradeFoldCounts::default(),
-        })
+        }
     }
 
-    /// Folds one print carrying the vendor's condition `codes`, unless it falls outside the hours or was corrected.
+    /// Folds one print carrying the vendor's condition `codes`, unless it is another session's or was corrected.
     pub fn push(&mut self, trade: &Trade, codes: &[u16], corrected: bool) {
-        if !(self.open..self.close).contains(&trade.timestamp()) {
-            self.counts.outside_hours += 1;
+        if SessionDate::at(trade.timestamp()) != self.session {
+            self.counts.other_session += 1;
             return;
         }
         if corrected {
@@ -499,13 +483,12 @@ mod tests {
         ]))
     }
 
+    fn october_second() -> SessionDate {
+        SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap())
+    }
+
     fn session() -> TradeFold {
-        TradeFold::new(
-            instant("2026-10-02T13:30:00Z"),
-            instant("2026-10-02T20:00:00Z"),
-            conditions(),
-        )
-        .unwrap()
+        TradeFold::new(october_second(), conditions())
     }
 
     #[test]
@@ -545,15 +528,40 @@ mod tests {
     }
 
     #[test]
+    fn test_the_closing_cross_after_four_sets_the_close_and_after_hours_adds_volume_only() {
+        // The closing print's code sets everything and lands after 16:00 Eastern; Form T only adds volume.
+        let conditions = TradeConditions::new(BTreeMap::from([
+            (8, UpdateRules::new(true, true, true)),
+            (12, UpdateRules::new(true, false, false)),
+        ]));
+        let mut fold = TradeFold::new(october_second(), conditions);
+        fold.push(&trade("2026-10-02T19:59:59Z", 100.00, 100.0), &[], false);
+        fold.push(&trade("2026-10-02T20:02:10Z", 100.05, 7_000.0), &[8], false);
+        fold.push(&trade("2026-10-02T21:30:00Z", 101.00, 50.0), &[12], false);
+        let minutes = fold.finish().0;
+        let daily = concatenate(
+            minutes
+                .iter()
+                .map(|bar| TradeRollup::of(bar, BarInterval::OneDay).unwrap()),
+        )
+        .into_bars();
+        let sums = daily[0].sums();
+        assert_eq!(sums.totals().volume().units(), 7_150_000_000);
+        assert_eq!(sums.open_close().unwrap().close().1.ticks(), 100_050_000);
+        assert_eq!(sums.high_low().unwrap().high().ticks(), 100_050_000);
+    }
+
+    #[test]
     fn test_an_unknown_condition_counts_volume_and_sets_no_price() {
         let mut fold = session();
         fold.push(&trade("2026-10-02T13:30:01Z", 100.00, 50.0), &[99], false);
-        fold.push(&trade("2026-10-02T20:00:00Z", 100.00, 50.0), &[], false);
+        // 00:30 Eastern on the next day is another session's.
+        fold.push(&trade("2026-10-03T04:30:00Z", 100.00, 50.0), &[], false);
         let (bars, counts) = fold.finish();
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].sums().totals().volume().units(), 50_000_000);
         assert_eq!(bars[0].sums().open_close(), None);
-        assert_eq!((counts.unresolved(), counts.outside_hours()), (1, 1));
+        assert_eq!((counts.unresolved(), counts.other_session()), (1, 1));
     }
 
     fn any_rollup() -> impl Strategy<Value = TradeRollup> {

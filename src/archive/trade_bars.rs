@@ -347,11 +347,9 @@ mod tests {
             session,
         };
         let mut fold = TradeFold::new(
-            "2026-10-02T13:30:00Z".parse().unwrap(),
-            "2026-10-02T20:00:00Z".parse().unwrap(),
+            session,
             TradeConditions::new(BTreeMap::from([(37, UpdateRules::new(true, false, false))])),
-        )
-        .unwrap();
+        );
         for (at, dollars, shares, codes) in [
             ("2026-10-02T13:30:01.000000123Z", 100.01, 300.0, vec![]),
             ("2026-10-02T13:31:00Z", 100.02, 0.25, vec![37]),
