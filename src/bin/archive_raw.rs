@@ -25,6 +25,13 @@ use fund::journal::built_commit;
 
 const REFUSED_TO_START: u8 = 2;
 
+/// The first session the nightly heal writes Massive's REST daily bars for, which carry the dollar volume a flat
+/// file lacks; a create-only parse written first would hold that session against them.
+const HEAL_DAILY_BARS_FROM: NaiveDate = match NaiveDate::from_ymd_opt(2026, 9, 28) {
+    Some(date) => date,
+    None => panic!("2026-09-28 is a date"),
+};
+
 /// Sessions named in one log line; the count beside them says how many there are.
 const LISTED_SESSIONS: usize = 50;
 
@@ -345,6 +352,17 @@ async fn parse_bars(
             return ExitCode::from(REFUSED_TO_START);
         }
     };
+    let heal_start = SessionDate::from_date(HEAL_DAILY_BARS_FROM);
+    match dataset {
+        FlatFileDataset::DailyBars if last >= heal_start => {
+            tracing::error!(%last, %heal_start, "Daily bars from this session on are the nightly heal's to write");
+            return ExitCode::from(REFUSED_TO_START);
+        }
+        FlatFileDataset::DailyBars
+        | FlatFileDataset::MinuteBars
+        | FlatFileDataset::Quotes
+        | FlatFileDataset::Trades => {}
+    }
     let bars_key = move |session| Key::Bars {
         provider: Provider::Massive,
         origin: Origin::Vendor,
