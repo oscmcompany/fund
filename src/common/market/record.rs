@@ -1,6 +1,6 @@
 //! The market records every reader maps into: bars, quotes and trades, each valid by construction.
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
 use super::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::time::SessionDate;
@@ -153,6 +153,15 @@ impl Bar {
 
     pub fn timestamp(&self) -> DateTime<Utc> {
         self.timestamp
+    }
+
+    /// The instant the bar's period ends: an intraday bar is stamped at its start and a daily bar at its close.
+    pub fn ends(&self) -> DateTime<Utc> {
+        match self.interval {
+            BarInterval::OneMinute => self.timestamp + TimeDelta::minutes(1),
+            BarInterval::FiveMinute => self.timestamp + TimeDelta::minutes(5),
+            BarInterval::OneDay => self.timestamp,
+        }
     }
 
     pub fn prices(&self) -> Ohlc {
@@ -371,6 +380,33 @@ mod tests {
                     timestamp: instant(timestamp)
                 }),
                 "{interval} {timestamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_bar_ends_after_its_period_and_a_daily_bar_at_its_stamp() {
+        for (interval, timestamp, ends) in [
+            (
+                BarInterval::OneMinute,
+                "2026-07-31T14:31:00Z",
+                "2026-07-31T14:32:00Z",
+            ),
+            (
+                BarInterval::FiveMinute,
+                "2026-07-31T14:35:00Z",
+                "2026-07-31T14:40:00Z",
+            ),
+            (
+                BarInterval::OneDay,
+                "2026-07-31T20:00:00Z",
+                "2026-07-31T20:00:00Z",
+            ),
+        ] {
+            assert_eq!(
+                bar(interval, timestamp).unwrap().ends(),
+                instant(ends),
+                "{interval}"
             );
         }
     }

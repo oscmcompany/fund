@@ -3,6 +3,7 @@
 
 pub mod dataset;
 pub mod legacy;
+pub mod replay;
 
 use std::io;
 use std::num::NonZeroU32;
