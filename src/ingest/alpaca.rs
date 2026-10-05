@@ -611,7 +611,7 @@ fn next_page_token(body: &[u8]) -> Result<Option<String>, FetchError> {
 }
 
 /// The symbol an Alpaca 400 names, from a body such as `{"message":"invalid symbol: BC-C"}`.
-fn invalid_symbol(body: &str) -> Option<String> {
+pub(crate) fn invalid_symbol(body: &str) -> Option<String> {
     let error: ErrorBody = serde_json::from_str(body).ok()?;
     error
         .message

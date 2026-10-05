@@ -12,13 +12,15 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 
 use super::bars::{Provenance, provenance_from};
-use super::parquet;
+use super::{Archive, parquet};
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
 use crate::common::market::trade_bars::{Condition, TradeConditions, UpdateRules};
 use crate::common::market::{Dollars, Shares, Symbol};
 use crate::common::storage::{Key, Provider, ReferenceTable};
+use crate::common::time::SessionDate;
+use chrono::NaiveDate;
 
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
@@ -228,6 +230,36 @@ pub fn decode_conditions(
         }
     }
     Ok((TradeConditions::new(rules), provenance))
+}
+
+/// Massive's conditions snapshot taken on `as_of`.
+pub fn conditions_key(as_of: SessionDate) -> Key {
+    Key::Reference {
+        provider: Provider::Massive,
+        table: ReferenceTable::Conditions,
+        as_of,
+    }
+}
+
+/// The newest conditions snapshot the archive holds, with its key.
+pub async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), String> {
+    let series = conditions_key(SessionDate::from_date(NaiveDate::MIN)).series();
+    let latest = archive
+        .list(&series)
+        .await
+        .map_err(|error| error.to_string())?
+        .iter()
+        .filter_map(|path| Key::parse(path).ok())
+        .max_by_key(Key::session)
+        .ok_or_else(|| format!("no conditions table under {series}"))?;
+    let bytes = archive
+        .get(&latest)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("{} vanished", latest.path()))?;
+    let (conditions, _) =
+        decode_conditions(&latest, bytes).map_err(|refusal| format!("{refusal:?}"))?;
+    Ok((latest, conditions))
 }
 
 fn security_details_schema() -> Schema {

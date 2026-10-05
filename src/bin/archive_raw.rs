@@ -1237,15 +1237,6 @@ struct QuoteRowCounts {
     refused: Vec<RefusedRow>,
 }
 
-/// The conditions table's key for a snapshot taken on `as_of`.
-fn conditions_key(as_of: SessionDate) -> Key {
-    Key::Reference {
-        provider: Provider::Massive,
-        table: ReferenceTable::Conditions,
-        as_of,
-    }
-}
-
 /// Fetches Massive's condition table and writes it as today's snapshot.
 async fn fetch_conditions(
     archive: &Archive,
@@ -1261,7 +1252,7 @@ async fn fetch_conditions(
             return ExitCode::FAILURE;
         }
     };
-    let key = conditions_key(SessionDate::at(fetched_at));
+    let key = reference::conditions_key(SessionDate::at(fetched_at));
     let provenance = Provenance::new(Subscription::StocksStarter, fetched_at, run_id, commit);
     let written = reference::encode_conditions(&key, &conditions, &provenance)
         .map_err(|refusal| format!("{refusal:?}"))
@@ -1286,27 +1277,6 @@ async fn fetch_conditions(
             ExitCode::FAILURE
         }
     }
-}
-
-/// The newest conditions snapshot the archive holds.
-async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), String> {
-    let series = conditions_key(SessionDate::from_date(NaiveDate::MIN)).series();
-    let latest = archive
-        .list(&series)
-        .await
-        .map_err(|error| error.to_string())?
-        .iter()
-        .filter_map(|path| Key::parse(path).ok())
-        .max_by_key(Key::session)
-        .ok_or_else(|| format!("no conditions table under {series}"))?;
-    let bytes = archive
-        .get(&latest)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("{} vanished", latest.path()))?;
-    let (conditions, _) =
-        reference::decode_conditions(&latest, bytes).map_err(|refusal| format!("{refusal:?}"))?;
-    Ok((latest, conditions))
 }
 
 /// Trade bars at every interval for a session, minutes first, keyed where each is written.
@@ -1336,7 +1306,7 @@ async fn fold_trades(
     run_id: RunId,
     commit: Option<Commit>,
 ) -> ExitCode {
-    let (conditions_key, conditions) = match latest_conditions(archive).await {
+    let (conditions_key, conditions) = match reference::latest_conditions(archive).await {
         Ok(latest) => latest,
         Err(reason) => {
             tracing::error!(reason, "Conditions table not read");

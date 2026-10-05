@@ -9,23 +9,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use strum::IntoEnumIterator;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::archive::Archive;
 use crate::archive::bars::{Provenance, Subscription, decode, encode};
+use crate::archive::reference::latest_conditions;
+use crate::archive::{quote_bars, trade_bars};
 use crate::common::heal::{Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, window};
 use crate::common::journal::{
     ConfigurationResolved, HealFinished, Observation, PartitionWritten, Unanswered,
 };
 use crate::common::market::Symbol;
-use crate::common::market::record::Bar;
+use crate::common::market::quote_bars::{QuoteFold, QuoteRollup};
+use crate::common::market::record::{Bar, BarInterval};
+use crate::common::market::trade_bars::{TradeFold, TradeRollup};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, resolve};
+use crate::common::storage::Key;
 use crate::common::time::SessionDate;
-use crate::ingest::alpaca::{Alpaca, MinuteBars};
+use crate::ingest::alpaca::{
+    Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
+};
 use crate::ingest::massive::Massive;
 use crate::ingest::{FetchError, refused_by_cause};
 use crate::journal::Journal;
@@ -37,6 +44,8 @@ const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 /// A whole-market session measured 2026-09-30 at about 33 s with these two.
 const DEFAULT_MINUTE_BATCH_SYMBOLS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is not zero");
 const DEFAULT_MINUTE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
+/// Each symbol's ticks are one serial chain of pages, so a session is bounded by its longest names.
+const DEFAULT_TICK_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).expect("16 is not zero");
 /// Five years of sessions, as far back as Massive Starter reaches.
 const MAXIMUM_LOOKBACK_SESSIONS: NonZeroUsize =
     NonZeroUsize::new(1_260).expect("1,260 is not zero");
@@ -52,6 +61,7 @@ pub struct Parameters {
     log_directory: PathBuf,
     minute_batch_symbols: NonZeroUsize,
     minute_concurrency: NonZeroUsize,
+    tick_concurrency: NonZeroUsize,
 }
 
 impl Parameters {
@@ -104,6 +114,11 @@ impl Parameters {
             minute_concurrency: record(
                 read(Parameter::MinuteConcurrency)?,
                 DEFAULT_MINUTE_CONCURRENCY,
+                &mut resolved,
+            )?,
+            tick_concurrency: record(
+                read(Parameter::TickConcurrency)?,
+                DEFAULT_TICK_CONCURRENCY,
                 &mut resolved,
             )?,
         };
@@ -281,7 +296,11 @@ pub async fn run(
             let outcome = if Instant::now() >= deadline {
                 SessionOutcome::Unreached
             } else {
-                match write(leg, session, parameters, clients, journal).await {
+                let hours = calendar
+                    .session(session)
+                    .map(|trading| trading.hours())
+                    .ok_or_else(|| format!("{session} is not in the calendar"));
+                match write(leg, session, hours, parameters, clients, journal).await {
                     Ok(written) => {
                         tracing::info!(%leg, %session, bars = written.bars(), refused = ?written.refused(), unanswered = written.unanswered().len(), "Partition written");
                         journal
@@ -306,12 +325,17 @@ pub async fn run(
 async fn write(
     leg: Leg,
     session: SessionDate,
+    hours: Result<(DateTime<Utc>, DateTime<Utc>), String>,
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
 ) -> Result<PartitionWritten, String> {
     let key = leg.key(session);
     let (bars, refused, unanswered, subscription) = match leg {
+        Leg::AlpacaQuotes => {
+            return write_quotes(session, hours?, parameters, clients, journal).await;
+        }
+        Leg::AlpacaTrades => return write_trades(session, parameters, clients, journal).await,
         Leg::MassiveDailyBars => {
             let daily = clients
                 .massive
@@ -385,6 +409,233 @@ async fn write(
         refused,
         unanswered,
     ))
+}
+
+/// Keys for a tick leg's bars at every interval, minutes first and the daily, which marks the session held, last.
+fn tick_keys(leg_key: &Key) -> [Key; 3] {
+    let intervals = [
+        BarInterval::OneMinute,
+        BarInterval::FiveMinute,
+        BarInterval::OneDay,
+    ];
+    match leg_key {
+        Key::Quotes {
+            provider,
+            origin,
+            session,
+            ..
+        } => intervals.map(|interval| Key::Quotes {
+            provider: *provider,
+            origin: *origin,
+            interval,
+            session: *session,
+        }),
+        Key::Trades {
+            provider,
+            origin,
+            session,
+            ..
+        } => intervals.map(|interval| Key::Trades {
+            provider: *provider,
+            origin: *origin,
+            interval,
+            session: *session,
+        }),
+        Key::Bars { .. }
+        | Key::Reference { .. }
+        | Key::RawBars { .. }
+        | Key::RawQuotes { .. }
+        | Key::RawTrades { .. }
+        | Key::Journal { .. }
+        | Key::Logs { .. } => unreachable!("a tick leg's key is a quotes or trades key"),
+    }
+}
+
+/// Folds Alpaca's quotes for every symbol of the session and writes its quote bars.
+async fn write_quotes(
+    session: SessionDate,
+    (open, close): (DateTime<Utc>, DateTime<Utc>),
+    parameters: &Parameters,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, String> {
+    let symbols = symbol_list(clients, session).await?;
+    let mut fold = QuoteFold::new(open, close).map_err(|refusal| format!("{refusal:?}"))?;
+    let mut refused = Vec::new();
+    let mut one_sided = 0_u64;
+    let invalid = per_symbol(
+        &symbols,
+        parameters.tick_concurrency,
+        |symbol| {
+            let alpaca = Arc::clone(&clients.alpaca);
+            async move { alpaca.quotes(&symbol, session).await }
+        },
+        |outcome| match outcome {
+            AlpacaQuoteOutcome::Quote(quote) => fold.push(&quote),
+            AlpacaQuoteOutcome::OneSided => one_sided += 1,
+            AlpacaQuoteOutcome::Refused(row) => refused.push(row),
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let (minutes, counts) = fold.finish();
+    if minutes.is_empty() {
+        return Err("the vendor answered with no quotes".to_string());
+    }
+    let provenance = tick_provenance(journal);
+    let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaQuotes.key(session));
+    let rollup =
+        |interval| {
+            concatenate(minutes.iter().map(|bar| {
+                QuoteRollup::of(bar, interval).expect("minutes roll up to coarser bars")
+            }))
+            .into_bars()
+        };
+    for (key, bars) in [
+        (minute_key, minutes.clone()),
+        (five_minute_key, rollup(BarInterval::FiveMinute)),
+        (daily_key, rollup(BarInterval::OneDay)),
+    ] {
+        let body = quote_bars::encode(&key, &bars, &provenance)
+            .map_err(|refusal| format!("{refusal:?}"))?;
+        clients
+            .archive
+            .put(&key, body)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    tracing::info!(%session, quotes = counts.accepted(), out_of_order = counts.out_of_order(), one_sided, "Alpaca quotes folded");
+    Ok(PartitionWritten::new(
+        Leg::AlpacaQuotes,
+        session,
+        u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
+        refused_by_cause(&refused),
+        invalid
+            .into_iter()
+            .map(|symbol| (symbol, Unanswered::Invalid))
+            .collect(),
+    ))
+}
+
+/// Folds Alpaca's trades for every symbol of the session under the newest conditions table and writes its trade bars.
+async fn write_trades(
+    session: SessionDate,
+    parameters: &Parameters,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, String> {
+    let symbols = symbol_list(clients, session).await?;
+    let (_, conditions) = latest_conditions(&clients.archive).await?;
+    let mut fold = TradeFold::new(session, conditions);
+    let mut refused = Vec::new();
+    let invalid = per_symbol(
+        &symbols,
+        parameters.tick_concurrency,
+        |symbol| {
+            let alpaca = Arc::clone(&clients.alpaca);
+            async move { alpaca.trades(&symbol, session).await }
+        },
+        |outcome| match outcome {
+            AlpacaTradeOutcome::Print {
+                print,
+                tape,
+                letters,
+                corrected,
+            } => fold.push_lettered(&print, tape, &letters, corrected),
+            AlpacaTradeOutcome::Refused(row) => refused.push(row),
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let (minutes, counts) = fold.finish();
+    if minutes.is_empty() {
+        return Err("the vendor answered with no trades".to_string());
+    }
+    let provenance = tick_provenance(journal);
+    let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaTrades.key(session));
+    let rollup =
+        |interval| {
+            concatenate(minutes.iter().map(|bar| {
+                TradeRollup::of(bar, interval).expect("minutes roll up to coarser bars")
+            }))
+            .into_bars()
+        };
+    for (key, bars) in [
+        (minute_key, minutes.clone()),
+        (five_minute_key, rollup(BarInterval::FiveMinute)),
+        (daily_key, rollup(BarInterval::OneDay)),
+    ] {
+        let body = trade_bars::encode(&key, &bars, &provenance)
+            .map_err(|refusal| format!("{refusal:?}"))?;
+        clients
+            .archive
+            .put(&key, body)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    tracing::info!(%session, folded = counts.folded(), corrected = counts.corrected(), unresolved = counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
+    Ok(PartitionWritten::new(
+        Leg::AlpacaTrades,
+        session,
+        u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
+        refused_by_cause(&refused),
+        invalid
+            .into_iter()
+            .map(|symbol| (symbol, Unanswered::Invalid))
+            .collect(),
+    ))
+}
+
+fn tick_provenance(journal: &Journal) -> Provenance {
+    Provenance::new(
+        Subscription::AlgoTraderPlus,
+        Utc::now(),
+        journal.run_id(),
+        journal.commit().cloned(),
+    )
+}
+
+/// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` as its symbol
+/// finishes; a symbol Alpaca names invalid is returned rather than failing the session, and any other failure fails it.
+async fn per_symbol<Fetch, Pending, Row>(
+    symbols: &[Symbol],
+    concurrency: NonZeroUsize,
+    fetch: Fetch,
+    mut each: impl FnMut(Row),
+) -> Result<Vec<Symbol>, FetchError>
+where
+    Fetch: Fn(Symbol) -> Pending,
+    Pending: Future<Output = Result<Vec<Row>, FetchError>> + Send + 'static,
+    Row: Send + 'static,
+{
+    let mut pending = symbols.iter().cloned();
+    let mut in_flight = JoinSet::new();
+    let mut invalid = Vec::new();
+    loop {
+        while in_flight.len() < concurrency.get() {
+            let Some(symbol) = pending.next() else {
+                break;
+            };
+            let answer = fetch(symbol.clone());
+            in_flight.spawn(async move { (symbol, answer.await) });
+        }
+        match in_flight.join_next().await {
+            None => return Ok(invalid),
+            Some(joined) => {
+                let (symbol, answer) =
+                    joined.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
+                match answer {
+                    Ok(rows) => rows.into_iter().for_each(&mut each),
+                    Err(FetchError::Refused { status: 400, body })
+                        if invalid_symbol(&body).as_deref() == Some(symbol.as_str()) =>
+                    {
+                        invalid.push(symbol);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
 }
 
 /// The session's symbols, read from its written daily bars, since those name what traded that day.
@@ -573,6 +824,7 @@ mod tests {
                     ParameterSource::Default
                 ),
                 (Parameter::MinuteConcurrency, "8", ParameterSource::Default),
+                (Parameter::TickConcurrency, "16", ParameterSource::Default),
             ]
         );
     }
