@@ -70,6 +70,9 @@ fn is_logs_key(key: &Key) -> bool {
         | Key::Quotes { .. }
         | Key::Trades { .. }
         | Key::Reference { .. }
+        | Key::RawBars { .. }
+        | Key::RawQuotes { .. }
+        | Key::RawTrades { .. }
         | Key::Journal { .. } => false,
     }
 }

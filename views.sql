@@ -27,7 +27,7 @@ CREATE OR REPLACE VIEW massive_daily_bars AS
 SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
 FROM read_parquet(
     's3://' || getvariable('market_data_bucket')
-        || '/data/equity/bars/provider=massive/origin=fetched/interval=one_day/year=*/month=*/day=*/data.parquet',
+        || '/data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/year=*/month=*/day=*/data.parquet',
     hive_partitioning = true,
     hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
 );
@@ -37,7 +37,7 @@ CREATE OR REPLACE VIEW alpaca_minute_bars AS
 SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
 FROM read_parquet(
     's3://' || getvariable('market_data_bucket')
-        || '/data/equity/bars/provider=alpaca/origin=fetched/interval=one_minute/year=*/month=*/day=*/data.parquet',
+        || '/data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/year=*/month=*/day=*/data.parquet',
     hive_partitioning = true,
     hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
 );

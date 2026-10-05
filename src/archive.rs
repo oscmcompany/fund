@@ -298,7 +298,7 @@ mod tests {
         let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
         let key = Key::Bars {
             provider: Provider::Massive,
-            origin: Origin::Fetched,
+            origin: Origin::Vendor,
             interval: BarInterval::OneDay,
             session,
         };
