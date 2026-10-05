@@ -1,7 +1,6 @@
-//! Copies Massive's flat files into the archive's raw stage, and verifies each copy against the legacy archiver's.
-//! `archive_raw copy <dataset> <first> <last> <concurrency>` copies every listed session not yet held;
-//! `archive_raw verify <dataset>` compares checksums; `archive_raw parse <dataset> <first> <last> <concurrency>` writes
-//! held raw bar files as vendor bars. Exits 0 when everything succeeded, 1 when not, 2 on bad usage.
+//! Massive's flat files into the raw stage: `copy` fetches each session not held, `verify` compares it with the legacy
+//! copy by checksum, and `parse` writes held raw bar files as vendor bars; `main` logs the arguments each takes.
+//! Exits 0 when everything succeeded, 1 when not, 2 on bad usage.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -70,7 +69,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
             Some(Command::Parse {
                 dataset: dataset.parse().ok()?,
                 first: date(first)?,
-                last: date(last)?,
+                last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
                 concurrency: concurrency
                     .parse()
                     .ok()
@@ -299,7 +298,14 @@ enum ParseFailure {
     /// The raw copy records no fetch time, which the bars' provenance needs.
     Unstamped,
     Parse(ParseRefusal),
+    /// No row became a bar, so writing the session would mark it done with nothing in it.
+    Empty {
+        test_tickers: usize,
+        refused: usize,
+    },
     Encode(EncodeRefusal),
+    /// The blocking parse did not finish.
+    Interrupted(String),
 }
 
 impl std::fmt::Display for ParseFailure {
@@ -309,6 +315,14 @@ impl std::fmt::Display for ParseFailure {
             Self::Missing => write!(formatter, "the raw file is gone"),
             Self::Unstamped => write!(formatter, "the raw file records no fetch time"),
             Self::Parse(refusal) => write!(formatter, "{refusal}"),
+            Self::Empty {
+                test_tickers,
+                refused,
+            } => write!(
+                formatter,
+                "no bars: {test_tickers} test tickers and {refused} refused rows"
+            ),
+            Self::Interrupted(reason) => write!(formatter, "the parse did not finish: {reason}"),
             Self::Encode(refusal) => write!(formatter, "{refusal:?}"),
         }
     }
@@ -481,11 +495,25 @@ async fn parse_one(
         .await
         .map_err(ParseFailure::Archive)?
         .ok_or(ParseFailure::Missing)?;
-    let parsed = dataset
-        .parse_bars(&gzipped, session)
-        .map_err(ParseFailure::Parse)?;
     let provenance = Provenance::new(Subscription::StocksAdvanced, fetched_at, run_id, commit);
-    let body = encode(key, parsed.bars(), &provenance).map_err(ParseFailure::Encode)?;
+    let encoded_key = key.clone();
+    // Decompressing, parsing and encoding a minute file is seconds of CPU, which belongs off the async workers.
+    let (parsed, body) = tokio::task::spawn_blocking(move || {
+        let parsed = dataset
+            .parse_bars(&gzipped, session)
+            .map_err(ParseFailure::Parse)?;
+        if parsed.bars().is_empty() {
+            return Err(ParseFailure::Empty {
+                test_tickers: parsed.test_tickers().len(),
+                refused: parsed.refused().len(),
+            });
+        }
+        let body =
+            encode(&encoded_key, parsed.bars(), &provenance).map_err(ParseFailure::Encode)?;
+        Ok((parsed, body))
+    })
+    .await
+    .map_err(|error| ParseFailure::Interrupted(error.to_string()))??;
     archive
         .create(key, body)
         .await
@@ -693,6 +721,8 @@ mod tests {
         };
         assert!(parse(&arguments("2021-08-23", "2021-08-23")).is_some());
         assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
+        let parsing = ["parse", "daily_bars", "2021-08-24", "2021-08-23", "4"].map(String::from);
+        assert!(parse(&parsing).is_none());
     }
 
     #[test]
