@@ -5,14 +5,16 @@ pub mod bars;
 pub mod journal;
 pub mod logs;
 pub mod parquet;
+pub mod raw;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 
-use crate::common::storage::Key;
+use crate::common::storage::{Key, StorageClass};
 use crate::ingest::VariableRefusal;
 
 /// One S3 bucket the fund writes: the shared market data or a profile's records.
+#[derive(Clone)]
 pub struct Archive {
     s3_client: aws_sdk_s3::Client,
     bucket_name: String,
@@ -37,6 +39,10 @@ pub enum ArchiveError {
     Contended {
         path: String,
     },
+    /// The key's storage class cannot be read back, so this path cannot verify it; raw ticks go through `raw`.
+    Unverifiable {
+        path: String,
+    },
     /// Read back different bytes than were written.
     ReadBackMismatch {
         path: String,
@@ -55,6 +61,12 @@ impl std::fmt::Display for ArchiveError {
                 write!(
                     formatter,
                     "{path} was written by someone else first; read it again"
+                )
+            }
+            Self::Unverifiable { path } => {
+                write!(
+                    formatter,
+                    "{path} lands in Deep Archive, which cannot be read back"
                 )
             }
             Self::ReadBackMismatch {
@@ -112,6 +124,10 @@ impl Archive {
         condition: Condition<'_>,
     ) -> Result<(), ArchiveError> {
         let path = key.path();
+        match key.storage_class() {
+            StorageClass::Standard => {}
+            StorageClass::DeepArchive => return Err(ArchiveError::Unverifiable { path }),
+        }
         let request = self
             .s3_client
             .put_object()
@@ -290,6 +306,29 @@ mod tests {
     use crate::common::storage::{Origin, Provider};
     use crate::common::time::SessionDate;
     use crate::ingest::massive::Massive;
+
+    #[tokio::test]
+    async fn test_a_deep_archive_key_is_refused_before_any_request() {
+        let configuration = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let archive = Archive {
+            s3_client: aws_sdk_s3::Client::from_conf(configuration),
+            bucket_name: "unused".to_string(),
+        };
+        let key = Key::RawQuotes {
+            provider: Provider::Massive,
+            session: SessionDate::from_date(NaiveDate::from_ymd_opt(2021, 8, 23).unwrap()),
+        };
+        assert_eq!(
+            archive.put(&key, vec![1]).await,
+            Err(ArchiveError::Unverifiable {
+                path: "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz"
+                    .to_string()
+            })
+        );
+    }
 
     /// The first real object of the new archive: the key the archiver would own for this session anyway.
     #[tokio::test]
