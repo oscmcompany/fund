@@ -6,10 +6,13 @@ use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use bytes::Bytes;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
+use serde::Deserialize;
 
-use super::{VariableRefusal, variable};
-use crate::common::market::record::BarInterval;
+use super::massive::{alpaca_symbol, is_exchange_test_ticker};
+use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
+use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
@@ -267,6 +270,142 @@ impl FlatFiles {
     }
 }
 
+/// One session's bars from a flat bar file, with every row that did not become one: each row is exactly one of a bar, a
+/// test ticker or a refusal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlatFileBars {
+    bars: Vec<Bar>,
+    test_tickers: Vec<String>,
+    refused: Vec<RefusedRow>,
+}
+
+impl FlatFileBars {
+    /// In symbol, then timestamp, order.
+    pub fn bars(&self) -> &[Bar] {
+        &self.bars
+    }
+
+    pub fn test_tickers(&self) -> &[String] {
+        &self.test_tickers
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
+}
+
+/// Why a flat bar file was not read at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseRefusal {
+    /// Only bar files parse into bars.
+    NotBars { dataset: FlatFileDataset },
+    /// A gzip or CSV error, with the line it stopped on where the reader knows it.
+    Malformed { line: Option<u64>, reason: String },
+}
+
+impl std::fmt::Display for ParseRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBars { dataset } => write!(formatter, "{dataset} is not a bar file"),
+            Self::Malformed { line, reason } => {
+                write!(formatter, "malformed at line {line:?}: {reason}")
+            }
+        }
+    }
+}
+
+/// A flat bar file's row, which carries no volume-weighted price, so its bars carry no dollar volume.
+#[derive(Deserialize)]
+struct BarRow {
+    ticker: String,
+    volume: f64,
+    open: f64,
+    close: f64,
+    high: f64,
+    low: f64,
+    /// Nanoseconds since the epoch: the minute's start, or midnight Eastern for a daily row.
+    window_start: i64,
+    transactions: Option<u64>,
+}
+
+impl FlatFileDataset {
+    /// Reads `gzipped`, this dataset's file for `session`, into bars in our notation; exchange test tickers are set
+    /// aside and every other row that cannot become a bar is refused with its cause.
+    pub fn parse_bars(
+        self,
+        gzipped: &[u8],
+        session: SessionDate,
+    ) -> Result<FlatFileBars, ParseRefusal> {
+        let interval = match self {
+            Self::DailyBars => BarInterval::OneDay,
+            Self::MinuteBars => BarInterval::OneMinute,
+            Self::Quotes | Self::Trades => return Err(ParseRefusal::NotBars { dataset: self }),
+        };
+        let mut reader = csv::Reader::from_reader(flate2::read::GzDecoder::new(gzipped));
+        let mut test_tickers = Vec::new();
+        // Keyed by symbol and instant, so two tickers the notation map sends to one symbol keep neither.
+        let mut accepted: Accepted<(Symbol, DateTime<Utc>)> = Accepted::new();
+        for row in reader.deserialize::<BarRow>() {
+            let row = row.map_err(|error| ParseRefusal::Malformed {
+                line: error.position().map(csv::Position::line),
+                reason: error.to_string(),
+            })?;
+            if is_exchange_test_ticker(&row.ticker) {
+                test_tickers.push(row.ticker);
+                continue;
+            }
+            match flat_file_bar(&row, interval, session) {
+                Ok(bar) => accepted.offer((bar.symbol().clone(), bar.timestamp()), row.ticker, bar),
+                Err(cause) => accepted.refuse(row.ticker, cause),
+            }
+        }
+        let (bars, refused) = accepted.finish();
+        Ok(FlatFileBars {
+            bars,
+            test_tickers,
+            refused,
+        })
+    }
+}
+
+fn flat_file_bar(
+    row: &BarRow,
+    interval: BarInterval,
+    session: SessionDate,
+) -> Result<Bar, RowRefusal> {
+    let symbol = alpaca_symbol(&row.ticker).map_err(RowRefusal::Symbol)?;
+    let start = DateTime::from_timestamp_nanos(row.window_start);
+    if SessionDate::at(start) != session {
+        return Err(RowRefusal::Session {
+            timestamp: row.window_start.to_string(),
+        });
+    }
+    // A daily bar is stamped at the close, as every daily bar in the archive is.
+    let timestamp = match interval {
+        BarInterval::OneDay => session.regular_close(),
+        BarInterval::OneMinute | BarInterval::FiveMinute => start,
+    };
+    let price = |dollars: f64| Price::from_dollars(dollars).map_err(RowRefusal::Price);
+    let prices = Ohlc::new(
+        price(row.open)?,
+        price(row.high)?,
+        price(row.low)?,
+        price(row.close)?,
+    )
+    .map_err(RowRefusal::Prices)?;
+    let volume = Shares::from_float(row.volume).map_err(RowRefusal::Shares)?;
+    Bar::new(
+        symbol,
+        interval,
+        timestamp,
+        prices,
+        volume,
+        row.transactions.map(TradeCount::new),
+        None,
+    )
+    .map_err(RowRefusal::Bar)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +447,126 @@ mod tests {
             assert_eq!(dataset.key(session()).path(), ours);
             assert_eq!(dataset.legacy_path(session()), legacy);
         }
+    }
+
+    fn gzipped(text: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn october_second() -> SessionDate {
+        SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap())
+    }
+
+    /// Rows copied from Massive's `day_aggs_v1` file for 2026-10-02.
+    const DAILY: &str = "ticker,volume,open,close,high,low,window_start,transactions
+AAPL,33278552.153126,333.260000,333.690000,334.540000,330.610000,1790913600000000000,628334
+BApA,1733619.463400,60.550000,60.040000,60.770000,59.550000,1790913600000000000,1344
+BCATrw,89401.000000,0.005500,0.007500,0.007500,0.005000,1790913600000000000,101
+BRK.B,4193461.418487,500.100000,502.650000,503.620000,499.010000,1790913600000000000,102058
+DCOMp,10461.533600,16.780000,16.820000,16.870000,16.700100,1790913600000000000,79
+NE.WS.A,364.000000,16.000000,15.580000,16.000000,15.580000,1790913600000000000,7
+NMCOr,1223988.000000,0.022500,0.030000,0.034000,0.022500,1790913600000000000,2420
+ZZZTA,6944.000000,4974.800000,5500.000000,5500.000000,4974.800000,1790913600000000000,942
+";
+
+    #[test]
+    fn test_a_daily_file_maps_notation_and_accounts_for_every_row() {
+        let parsed = FlatFileDataset::DailyBars
+            .parse_bars(&gzipped(DAILY), october_second())
+            .unwrap();
+        let symbols: Vec<&str> = parsed
+            .bars()
+            .iter()
+            .map(|bar| bar.symbol().as_str())
+            .collect();
+        assert_eq!(symbols, ["AAPL", "BA.PRA", "BRK.B", "NMCO.RT"]);
+        assert_eq!(parsed.test_tickers(), ["ZZZTA"]);
+        let refused: Vec<&str> = parsed.refused().iter().map(RefusedRow::ticker).collect();
+        // The same three the grouped daily refuses: no rule maps them and `Symbol` takes one suffix.
+        assert_eq!(refused, ["BCATrw", "DCOMp", "NE.WS.A"]);
+        let apple = &parsed.bars()[0];
+        assert_eq!(apple.timestamp().to_rfc3339(), "2026-10-02T20:00:00+00:00");
+        assert_eq!(apple.prices().close().ticks(), 333_690_000);
+        assert_eq!(apple.volume().units(), 33_278_552_153_126);
+        assert_eq!(apple.trade_count().map(TradeCount::count), Some(628_334));
+        assert_eq!(apple.dollar_volume(), None);
+    }
+
+    #[test]
+    fn test_a_minute_file_keeps_each_minute_at_its_start() {
+        let minute = "ticker,volume,open,close,high,low,window_start,transactions
+AAPL,13809.484049,331.050000,331.170000,331.501900,330.880000,1790928000000000000,801
+AAPL,7171.021026,331.330000,331.310000,331.590000,330.550000,1790928060000000000,452
+BApA,250.116310,60.550000,60.550000,60.550000,60.550000,1790947800000000000,12
+";
+        let parsed = FlatFileDataset::MinuteBars
+            .parse_bars(&gzipped(minute), october_second())
+            .unwrap();
+        let stamped: Vec<(String, String)> = parsed
+            .bars()
+            .iter()
+            .map(|bar| {
+                (
+                    bar.symbol().as_str().to_string(),
+                    bar.timestamp().to_rfc3339(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            stamped,
+            [
+                ("AAPL".to_string(), "2026-10-02T08:00:00+00:00".to_string()),
+                ("AAPL".to_string(), "2026-10-02T08:01:00+00:00".to_string()),
+                (
+                    "BA.PRA".to_string(),
+                    "2026-10-02T13:30:00+00:00".to_string()
+                ),
+            ]
+        );
+        assert!(parsed.refused().is_empty());
+    }
+
+    #[test]
+    fn test_a_row_for_another_session_or_claimed_twice_is_refused() {
+        let rows = "ticker,volume,open,close,high,low,window_start,transactions
+AAPL,1.0,1.0,1.0,1.0,1.0,1790913600000000000,1
+AAPL,2.0,2.0,2.0,2.0,2.0,1790913600000000000,1
+MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
+";
+        let parsed = FlatFileDataset::DailyBars
+            .parse_bars(&gzipped(rows), october_second())
+            .unwrap();
+        assert!(parsed.bars().is_empty());
+        let causes: Vec<(&str, &'static str)> = parsed
+            .refused()
+            .iter()
+            .map(|row| (row.ticker(), row.cause().into()))
+            .collect();
+        assert_eq!(
+            causes,
+            [
+                ("AAPL", "duplicate"),
+                ("AAPL", "duplicate"),
+                ("MSFT", "session")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_only_bar_files_parse_and_a_broken_file_names_its_line() {
+        assert_eq!(
+            FlatFileDataset::Quotes.parse_bars(&gzipped(DAILY), october_second()),
+            Err(ParseRefusal::NotBars {
+                dataset: FlatFileDataset::Quotes
+            })
+        );
+        let broken = format!("{DAILY}AAPL,not-a-number,1,1,1,1,1790913600000000000,1\n");
+        assert!(matches!(
+            FlatFileDataset::DailyBars.parse_bars(&gzipped(&broken), october_second()),
+            Err(ParseRefusal::Malformed { line: Some(10), .. })
+        ));
     }
 }

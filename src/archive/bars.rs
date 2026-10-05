@@ -21,6 +21,9 @@ use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
+/// The metadata name a file's fetch time is written under, in Parquet and in S3 alike.
+pub(crate) const FETCHED_AT: &str = "fund.fetched_at";
+
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
 
@@ -103,7 +106,7 @@ impl Provenance {
     pub(crate) fn entries(&self) -> Vec<(&'static str, Option<String>)> {
         vec![
             ("fund.subscription", Some(self.subscription.to_string())),
-            ("fund.fetched_at", Some(self.fetched_at.to_rfc3339())),
+            (FETCHED_AT, Some(self.fetched_at.to_rfc3339())),
             ("fund.run_id", Some(self.run_id.to_string())),
             (
                 "fund.commit",
@@ -313,11 +316,9 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
                 name: "fund.subscription",
             }
         })?,
-        fetched_at: required("fund.fetched_at")?
+        fetched_at: required(FETCHED_AT)?
             .parse()
-            .map_err(|_| DecodeRefusal::Metadata {
-                name: "fund.fetched_at",
-            })?,
+            .map_err(|_| DecodeRefusal::Metadata { name: FETCHED_AT })?,
         run_id: RunId::new(required("fund.run_id")?.parse().map_err(|_| {
             DecodeRefusal::Metadata {
                 name: "fund.run_id",
