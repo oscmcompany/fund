@@ -31,7 +31,7 @@ use crate::common::parameter::{Parameter, ParameterRefusal, at_most, resolve};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 use crate::ingest::alpaca::{
-    Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
+    Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, TickAnswer, invalid_symbol,
 };
 use crate::ingest::massive::Massive;
 use crate::ingest::{FetchError, refused_by_cause};
@@ -622,8 +622,8 @@ fn tick_provenance(journal: &Journal) -> Provenance {
 }
 
 /// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` as its symbol
-/// finishes. A symbol Alpaca names invalid or answers with no rows is returned as unanswered rather than failing the
-/// session; any other failure fails it.
+/// finishes. A symbol Alpaca names invalid, or answers with no row filed under it, is returned as unanswered rather
+/// than failing the session; any other failure fails it.
 async fn per_symbol<Fetch, Pending, Row>(
     symbols: &[Symbol],
     concurrency: NonZeroUsize,
@@ -632,7 +632,7 @@ async fn per_symbol<Fetch, Pending, Row>(
 ) -> Result<BTreeMap<Symbol, Unanswered>, FetchError>
 where
     Fetch: Fn(Symbol) -> Pending,
-    Pending: Future<Output = Result<Vec<Row>, FetchError>> + Send + 'static,
+    Pending: Future<Output = Result<TickAnswer<Row>, FetchError>> + Send + 'static,
     Row: Send + 'static,
 {
     let mut pending = symbols.iter().cloned();
@@ -652,10 +652,12 @@ where
                 let (symbol, answer) =
                     joined.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
                 match answer {
-                    Ok(rows) if rows.is_empty() => {
-                        unanswered.insert(symbol, Unanswered::Missing);
+                    Ok(answer) => {
+                        if !answer.answered {
+                            unanswered.insert(symbol, Unanswered::Missing);
+                        }
+                        answer.outcomes.into_iter().for_each(&mut each);
                     }
-                    Ok(rows) => rows.into_iter().for_each(&mut each),
                     Err(FetchError::Refused { status: 400, body })
                         if invalid_symbol(&body).as_deref() == Some(symbol.as_str()) =>
                     {
@@ -909,8 +911,15 @@ mod tests {
             size(2),
             |symbol| async move {
                 match symbol.as_str() {
-                    "AAA" => Ok(vec![1, 2]),
-                    "BBB" => Ok(vec![]),
+                    "AAA" => Ok(TickAnswer {
+                        outcomes: vec![1, 2],
+                        answered: true,
+                    }),
+                    // Only rows filed under another ticker: the symbol asked for did not answer.
+                    "BBB" => Ok(TickAnswer {
+                        outcomes: vec![3],
+                        answered: false,
+                    }),
                     _ => Err(FetchError::Refused {
                         status: 400,
                         body: format!(r#"{{"message":"invalid symbol: {symbol}"}}"#),
@@ -921,7 +930,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(rows, [1, 2]);
+        assert_eq!(rows, [1, 2, 3]);
         assert_eq!(
             unanswered,
             BTreeMap::from([

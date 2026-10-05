@@ -340,6 +340,23 @@ pub enum AlpacaTradeOutcome {
     Refused(RefusedRow),
 }
 
+/// One symbol's ticks, with whether any row came filed under the symbol asked for, which rows filed under another
+/// ticker do not show.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TickAnswer<Outcome> {
+    pub outcomes: Vec<Outcome>,
+    pub answered: bool,
+}
+
+impl<Outcome> Default for TickAnswer<Outcome> {
+    fn default() -> Self {
+        Self {
+            outcomes: Vec::new(),
+            answered: false,
+        }
+    }
+}
+
 /// Stands in for a condition element longer than one letter, which no condition spells, so the print reads as
 /// unresolved rather than being dropped.
 const UNSPELLABLE: char = '\u{FFFD}';
@@ -350,14 +367,16 @@ impl Alpaca {
         &self,
         symbol: &Symbol,
         session: SessionDate,
-    ) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
-        let mut outcomes = Vec::new();
+    ) -> Result<TickAnswer<AlpacaQuoteOutcome>, FetchError> {
+        let mut answer = TickAnswer::default();
         self.tick_pages(QUOTES_URL, symbol, session, |body| {
-            outcomes.extend(quote_page(symbol, &body)?);
+            let (outcomes, answered) = quote_page(symbol, &body)?;
+            answer.outcomes.extend(outcomes);
+            answer.answered |= answered;
             Ok(())
         })
         .await?;
-        Ok(outcomes)
+        Ok(answer)
     }
 
     /// Every SIP trade for `symbol` over the whole Eastern day of `session`, resolved as of that session.
@@ -365,14 +384,16 @@ impl Alpaca {
         &self,
         symbol: &Symbol,
         session: SessionDate,
-    ) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
-        let mut outcomes = Vec::new();
+    ) -> Result<TickAnswer<AlpacaTradeOutcome>, FetchError> {
+        let mut answer = TickAnswer::default();
         self.tick_pages(TRADES_URL, symbol, session, |body| {
-            outcomes.extend(trade_page(symbol, &body)?);
+            let (outcomes, answered) = trade_page(symbol, &body)?;
+            answer.outcomes.extend(outcomes);
+            answer.answered |= answered;
             Ok(())
         })
         .await?;
-        Ok(outcomes)
+        Ok(answer)
     }
 
     async fn tick_pages(
@@ -420,12 +441,14 @@ impl Alpaca {
 }
 
 /// One page of `symbol`'s quotes, refusing any row filed under a ticker that was not asked for.
-fn quote_page(symbol: &Symbol, body: &[u8]) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
+fn quote_page(symbol: &Symbol, body: &[u8]) -> Result<(Vec<AlpacaQuoteOutcome>, bool), FetchError> {
     let page: QuotesPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
         reason: error.to_string(),
     })?;
     let mut outcomes = Vec::new();
+    let mut answered = false;
     for (ticker, rows) in page.quotes.unwrap_or_default() {
+        answered |= ticker == symbol.as_str() && !rows.is_empty();
         for row in rows {
             outcomes.push(match ticker == symbol.as_str() {
                 true => quote_outcome(symbol, &row),
@@ -436,7 +459,7 @@ fn quote_page(symbol: &Symbol, body: &[u8]) -> Result<Vec<AlpacaQuoteOutcome>, F
             });
         }
     }
-    Ok(outcomes)
+    Ok((outcomes, answered))
 }
 
 fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
@@ -469,12 +492,14 @@ fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
 }
 
 /// One page of `symbol`'s trades, refusing any row filed under a ticker that was not asked for.
-fn trade_page(symbol: &Symbol, body: &[u8]) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
+fn trade_page(symbol: &Symbol, body: &[u8]) -> Result<(Vec<AlpacaTradeOutcome>, bool), FetchError> {
     let page: TradesPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
         reason: error.to_string(),
     })?;
     let mut outcomes = Vec::new();
+    let mut answered = false;
     for (ticker, rows) in page.trades.unwrap_or_default() {
+        answered |= ticker == symbol.as_str() && !rows.is_empty();
         for row in rows {
             outcomes.push(match ticker == symbol.as_str() {
                 true => trade_outcome(symbol, &row),
@@ -485,7 +510,7 @@ fn trade_page(symbol: &Symbol, body: &[u8]) -> Result<Vec<AlpacaTradeOutcome>, F
             });
         }
     }
-    Ok(outcomes)
+    Ok((outcomes, answered))
 }
 
 fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
@@ -1075,7 +1100,8 @@ mod tests {
     #[test]
     fn test_alpaca_quotes_keep_the_top_of_book_in_shares() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let outcomes = quote_page(&symbol, QUOTES_PAGE.as_bytes()).unwrap();
+        let (outcomes, answered) = quote_page(&symbol, QUOTES_PAGE.as_bytes()).unwrap();
+        assert!(answered);
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             AlpacaQuoteOutcome::Quote(quote) => {
@@ -1096,7 +1122,8 @@ mod tests {
     #[test]
     fn test_alpaca_trades_carry_their_tape_letters_and_corrections() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let outcomes = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
+        let (outcomes, answered) = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
+        assert!(answered);
         let summary: Vec<String> = outcomes
             .iter()
             .map(|outcome| match outcome {
@@ -1132,11 +1159,13 @@ mod tests {
             ticker: "AAPL".to_string(),
             cause: RowRefusal::Unrequested,
         });
+        // Rows filed only under another ticker refuse each row and leave the symbol unanswered.
         assert_eq!(
             quote_page(&symbol, QUOTES_PAGE.as_bytes()).unwrap(),
-            [unrequested.clone(), unrequested]
+            (vec![unrequested.clone(), unrequested], false)
         );
-        let trades = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
+        let (trades, answered) = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
+        assert!(!answered);
         assert_eq!(trades.len(), 4);
         assert!(trades.iter().all(|outcome| matches!(
             outcome,
@@ -1147,7 +1176,7 @@ mod tests {
         )));
         assert_eq!(
             quote_page(&symbol, br#"{"next_page_token": null, "quotes": null}"#).unwrap(),
-            []
+            (vec![], false)
         );
     }
 }
