@@ -43,7 +43,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Exact float parsing, so a journaled reading reads back as the value written.
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 strum = { version = "0.28", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 uuid = { version = "1.26.1", features = ["v4", "serde"] }

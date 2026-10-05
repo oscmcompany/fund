@@ -5,6 +5,7 @@ pub mod bars;
 pub mod journal;
 pub mod logs;
 pub mod parquet;
+pub mod raw;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
@@ -13,6 +14,7 @@ use crate::common::storage::Key;
 use crate::ingest::VariableRefusal;
 
 /// One S3 bucket the fund writes: the shared market data or a profile's records.
+#[derive(Clone)]
 pub struct Archive {
     s3_client: aws_sdk_s3::Client,
     bucket_name: String,

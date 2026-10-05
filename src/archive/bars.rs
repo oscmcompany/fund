@@ -46,6 +46,7 @@ const DOLLAR_VOLUME_TYPE: DataType = DataType::Decimal128(38, 12);
 #[strum(serialize_all = "snake_case")]
 pub enum Subscription {
     AlgoTraderPlus,
+    StocksAdvanced,
     StocksStarter,
 }
 
@@ -53,7 +54,7 @@ impl Subscription {
     pub fn provider(self) -> Provider {
         match self {
             Self::AlgoTraderPlus => Provider::Alpaca,
-            Self::StocksStarter => Provider::Massive,
+            Self::StocksAdvanced | Self::StocksStarter => Provider::Massive,
         }
     }
 }
@@ -96,6 +97,21 @@ impl Provenance {
 
     pub fn commit(&self) -> Option<&Commit> {
         self.commit.as_ref()
+    }
+
+    /// The named values a file's metadata carries, shared by Parquet's key-value metadata and S3's object metadata.
+    pub(crate) fn entries(&self) -> Vec<(&'static str, Option<String>)> {
+        vec![
+            ("fund.subscription", Some(self.subscription.to_string())),
+            ("fund.fetched_at", Some(self.fetched_at.to_rfc3339())),
+            ("fund.run_id", Some(self.run_id.to_string())),
+            (
+                "fund.commit",
+                self.commit
+                    .as_ref()
+                    .map(|commit| commit.as_str().to_string()),
+            ),
+        ]
     }
 }
 
@@ -277,22 +293,11 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
 }
 
 fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
-    let entry = |name: &str, value: Option<String>| KeyValue::new(name.to_string(), value);
-    vec![
-        entry(
-            "fund.subscription",
-            Some(provenance.subscription.to_string()),
-        ),
-        entry("fund.fetched_at", Some(provenance.fetched_at.to_rfc3339())),
-        entry("fund.run_id", Some(provenance.run_id.to_string())),
-        entry(
-            "fund.commit",
-            provenance
-                .commit
-                .as_ref()
-                .map(|commit| commit.as_str().to_string()),
-        ),
-    ]
+    provenance
+        .entries()
+        .into_iter()
+        .map(|(name, value)| KeyValue::new(name.to_string(), value))
+        .collect()
 }
 
 /// The bars and provenance a file written by `encode` under `key` holds, each row rebuilt through the domain's own
