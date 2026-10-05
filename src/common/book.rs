@@ -26,8 +26,9 @@ impl Cash {
         self.0 as f64 / (PRICE_SCALE as f64 * SHARE_SCALE as f64)
     }
 
+    /// Only a fill's notional or cost, which is at most the notional: under 10^13 ticks × `u64::MAX` units.
     fn of(amount: DollarVolume) -> Self {
-        Self(i128::try_from(amount.units()).expect("a dollar volume fits i128"))
+        Self(i128::try_from(amount.units()).expect("a fill's amount fits i128"))
     }
 
     fn negated(self) -> Self {
@@ -76,6 +77,15 @@ pub struct Fill {
     cost: DollarVolume,
 }
 
+/// Why a fill was refused: its cost exceeds what it trades, the bound that keeps a fill's cash exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillRefusal {
+    CostBeyondNotional {
+        cost: DollarVolume,
+        notional: DollarVolume,
+    },
+}
+
 impl Fill {
     pub fn new(
         filled_against: DateTime<Utc>,
@@ -84,15 +94,19 @@ impl Fill {
         shares: Shares,
         price: Price,
         cost: DollarVolume,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, FillRefusal> {
+        let notional = DollarVolume::of(price, shares);
+        if cost > notional {
+            return Err(FillRefusal::CostBeyondNotional { cost, notional });
+        }
+        Ok(Self {
             filled_against,
             symbol,
             side,
             shares,
             price,
             cost,
-        }
+        })
     }
 
     pub fn filled_against(&self) -> DateTime<Utc> {
@@ -140,9 +154,9 @@ pub struct Book {
 
 impl Book {
     /// A book holding only `cash`, the opening a replay starts from.
-    pub fn funded(cash: DollarVolume) -> Self {
+    pub fn funded(cash: Cash) -> Self {
         Self {
-            cash: Cash::of(cash),
+            cash,
             positions: BTreeMap::new(),
         }
     }
@@ -238,6 +252,7 @@ mod tests {
             Price::from_ticks(ticks).unwrap(),
             DollarVolume::from_units(cost),
         )
+        .unwrap()
     }
 
     fn arbitrary_fill() -> impl Strategy<Value = Fill> {
@@ -246,22 +261,25 @@ mod tests {
             prop::bool::ANY,
             1..10_000u64,
             1..1_000_000_000i64,
-            0..1_000_000_000_000u128,
+            0..=100u128,
         )
-            .prop_map(|(raw, buy, shares, ticks, cost)| {
+            .prop_map(|(raw, buy, shares, ticks, percent)| {
                 let side = if buy { Side::Buy } else { Side::Sell };
-                fill(raw, side, shares, ticks, cost)
+                let notional = DollarVolume::of(
+                    Price::from_ticks(ticks).unwrap(),
+                    Shares::whole(shares).unwrap(),
+                );
+                fill(raw, side, shares, ticks, notional.units() * percent / 100)
             })
     }
 
     fn arbitrary_book() -> impl Strategy<Value = Book> {
         (
-            0..1_000_000_000_000_000u128,
+            0..1_000_000_000_000_000i128,
             prop::collection::vec(arbitrary_fill(), 0..6),
         )
             .prop_map(|(cash, fills)| {
-                Book::funded(DollarVolume::from_units(cash))
-                    .combine(concatenate(fills.iter().map(Book::of)))
+                Book::funded(Cash(cash)).combine(concatenate(fills.iter().map(Book::of)))
             })
     }
 
@@ -280,12 +298,38 @@ mod tests {
     /// A round trip at one price drops the position and leaves exactly its two costs spent.
     #[test]
     fn test_a_round_trip_at_one_price_costs_exactly_its_charges() {
-        let book = Book::funded(DollarVolume::from_units(1_000))
+        let book = Book::funded(Cash(1_000))
             .combine(Book::of(&fill("AAPL", Side::Buy, 3, 5_000_000, 11)))
             .combine(Book::of(&fill("AAPL", Side::Sell, 3, 5_000_000, 13)));
         assert_eq!(book.positions().keys().count(), 0);
         assert_eq!(book.cash(), Cash::from_units(1_000 - 24));
-        assert_eq!(book, Book::funded(DollarVolume::from_units(976)));
+        assert_eq!(book, Book::funded(Cash(976)));
+    }
+
+    /// A cost past the notional is refused, so a fill's cash stays within what a `Cash` holds.
+    #[test]
+    fn test_a_fill_costing_more_than_it_trades_is_refused() {
+        let price = Price::from_ticks(2).unwrap();
+        let shares = Shares::from_units(3);
+        let at = "2026-09-25T13:30:00Z".parse().unwrap();
+        let fill = |cost| {
+            Fill::new(
+                at,
+                symbol("AAPL"),
+                Side::Buy,
+                shares,
+                price,
+                DollarVolume::from_units(cost),
+            )
+        };
+        assert!(fill(6).is_ok());
+        assert_eq!(
+            fill(7),
+            Err(FillRefusal::CostBeyondNotional {
+                cost: DollarVolume::from_units(7),
+                notional: DollarVolume::from_units(6),
+            })
+        );
     }
 
     #[test]
@@ -352,7 +396,8 @@ mod tests {
                 fill.shares(),
                 fill.price(),
                 fill.cost(),
-            );
+            )
+            .unwrap();
             let both = Book::of(&fill).combine(Book::of(&opposite));
             prop_assert!(both.positions().is_empty());
             prop_assert_eq!(both.cash(), Cash::of(fill.cost()).combine(Cash::of(fill.cost())).negated());

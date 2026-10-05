@@ -104,6 +104,7 @@ mod tests {
             Price::from_ticks(ticks).unwrap(),
             DollarVolume::default(),
         )
+        .unwrap()
     }
 
     fn arbitrary_holdings() -> impl prop::strategy::Strategy<Value = BTreeMap<Symbol, Shares>> {
@@ -116,14 +117,17 @@ mod tests {
 
     fn holding(holdings: &BTreeMap<Symbol, Shares>) -> Book {
         concatenate(holdings.iter().map(|(symbol, shares)| {
-            Book::of(&Fill::new(
-                "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap(),
-                symbol.clone(),
-                Side::Buy,
-                *shares,
-                Price::from_ticks(1).unwrap(),
-                DollarVolume::default(),
-            ))
+            Book::of(
+                &Fill::new(
+                    "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    symbol.clone(),
+                    Side::Buy,
+                    *shares,
+                    Price::from_ticks(1).unwrap(),
+                    DollarVolume::default(),
+                )
+                .unwrap(),
+            )
         }))
     }
 

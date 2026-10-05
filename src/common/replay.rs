@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
-use crate::common::market::DollarVolume;
 use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::state::{MarketEvent, MarketState};
+use crate::common::market::{DollarVolume, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::strategy::{Order, Strategy, orders};
 
@@ -26,12 +26,14 @@ pub struct FillModel {
 }
 
 impl FillModel {
-    /// Refused for a style whose cost turns on a fill rate the archive does not measure.
+    /// Refused for a style whose cost turns on a fill rate the archive does not measure, or a spread charging more
+    /// than the whole notional per crossing.
     pub fn new(style: FillStyle, quoted_spread: BasisPoints) -> Result<Self, CostRefusal> {
         let round_trip = CostModel::new(style, NonZeroU32::MIN).cost(quoted_spread)?;
         // A round trip crosses twice; rounded up so the grid never flatters a strategy.
         let rate = (round_trip.value() / 2.0 * (RATE_SCALE / 10_000) as f64).ceil();
-        if rate >= u64::MAX as f64 {
+        // Past the whole notional a crossing would cost more than it trades, and the charge could leave `Cash`.
+        if rate > RATE_SCALE as f64 {
             return Err(CostRefusal::Unrepresentable {
                 quoted_spread,
                 names: NonZeroU32::MIN,
@@ -53,13 +55,12 @@ impl FillModel {
         self.quoted_spread
     }
 
-    /// The charge on `notional`, rounded up so rounding never flatters a strategy.
+    /// The charge on `notional`, rounded up so rounding never flatters a strategy; never more than the notional.
     pub fn charge(self, notional: DollarVolume) -> DollarVolume {
-        let scaled = notional
-            .units()
-            .checked_mul(u128::from(self.rate))
-            .expect("a charge fits u128");
-        DollarVolume::from_units(scaled.div_ceil(RATE_SCALE))
+        // Divided first, so a notional near the top of its range charges without overflowing.
+        let (whole, part) = (notional.units() / RATE_SCALE, notional.units() % RATE_SCALE);
+        let rate = u128::from(self.rate);
+        DollarVolume::from_units(whole * rate + (part * rate).div_ceil(RATE_SCALE))
     }
 }
 
@@ -99,7 +100,7 @@ impl Unfilled {
 /// The strategy, its fill model and the interval it decides on: what acts on a replay.
 pub struct Replayer<S> {
     strategy: S,
-    fills: FillModel,
+    fill_model: FillModel,
     decision: BarInterval,
 }
 
@@ -119,6 +120,12 @@ pub struct Replay {
 /// Why a stretch of bars was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayRefusal {
+    /// Two different bars of one series end at the same instant.
+    Conflicting {
+        symbol: Symbol,
+        interval: BarInterval,
+        ends: DateTime<Utc>,
+    },
     /// A bar ends at or before the latest instant already replayed.
     OutOfOrder {
         ends: DateTime<Utc>,
@@ -173,16 +180,16 @@ impl Replay {
 }
 
 impl<S: Strategy> Replayer<S> {
-    pub fn new(strategy: S, fills: FillModel, decision: BarInterval) -> Self {
+    pub fn new(strategy: S, fill_model: FillModel, decision: BarInterval) -> Self {
         Self {
             strategy,
-            fills,
+            fill_model,
             decision,
         }
     }
 
-    pub fn fills(&self) -> FillModel {
-        self.fills
+    pub fn fill_model(&self) -> FillModel {
+        self.fill_model
     }
 
     pub fn decision(&self) -> BarInterval {
@@ -196,9 +203,27 @@ impl<S: Strategy> Replayer<S> {
         replay: Replay,
         bars: impl IntoIterator<Item = Bar>,
     ) -> Result<Replay, ReplayRefusal> {
-        let mut stretch: BTreeMap<DateTime<Utc>, Vec<Bar>> = BTreeMap::new();
+        // Keyed per series and instant, so a repeated bar counts once and a conflicting one cannot pick the fill.
+        let mut distinct: BTreeMap<(DateTime<Utc>, Symbol, BarInterval), Bar> = BTreeMap::new();
         for bar in bars {
-            stretch.entry(bar.ends()).or_default().push(bar);
+            let key = (bar.ends(), bar.symbol().clone(), bar.interval());
+            match distinct.get(&key) {
+                Some(kept) if kept != &bar => {
+                    return Err(ReplayRefusal::Conflicting {
+                        symbol: key.1,
+                        interval: key.2,
+                        ends: key.0,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    distinct.insert(key, bar);
+                }
+            }
+        }
+        let mut stretch: BTreeMap<DateTime<Utc>, Vec<Bar>> = BTreeMap::new();
+        for ((ends, _, _), bar) in distinct {
+            stretch.entry(ends).or_default().push(bar);
         }
         if let (Some(reached), Some(&ends)) = (replay.reached, stretch.keys().next())
             && ends <= reached
@@ -264,7 +289,7 @@ impl<S: Strategy> Replayer<S> {
         };
         let price = bar.prices().open();
         let notional = DollarVolume::of(price, order.shares());
-        let cost = self.fills.charge(notional);
+        let cost = self.fill_model.charge(notional);
         match order.side() {
             Side::Buy => {
                 let needed = notional.plus(cost);
@@ -286,7 +311,8 @@ impl<S: Strategy> Replayer<S> {
             order.shares(),
             price,
             cost,
-        ))
+        )
+        .expect("a charge is at most its notional"))
     }
 }
 
@@ -298,7 +324,7 @@ mod tests {
 
     use super::*;
     use crate::common::market::record::Ohlc;
-    use crate::common::market::{Price, Shares, Symbol};
+    use crate::common::market::{Price, Shares};
     use crate::common::strategy::Strategy;
     use crate::common::strategy::Target;
     use crate::common::time::SessionDate;
@@ -338,6 +364,10 @@ mod tests {
 
     fn dollars(units: u128) -> DollarVolume {
         DollarVolume::from_units(units * 1_000_000_000_000)
+    }
+
+    fn cash(whole: i128) -> Cash {
+        Cash::from_units(whole * 1_000_000_000_000)
     }
 
     fn day(day: i64) -> DateTime<Utc> {
@@ -422,7 +452,7 @@ mod tests {
     fn test_a_decision_fills_at_the_next_open() {
         let replay = replayer(Hold(vec![("AAPL", 1)]))
             .act(
-                Replay::open(Book::funded(dollars(100))),
+                Replay::open(Book::funded(cash(100))),
                 [
                     daily("AAPL", 0, 10_000_000, 11_000_000),
                     daily("AAPL", 1, 12_000_000, 13_000_000),
@@ -460,7 +490,7 @@ mod tests {
         };
         let replay = Replayer::new(Hold(vec![("AAPL", 1)]), free(), BarInterval::OneMinute)
             .act(
-                Replay::open(Book::funded(dollars(100))),
+                Replay::open(Book::funded(cash(100))),
                 [
                     minute(0, 10_000_000),
                     minute(1, 11_000_000),
@@ -492,7 +522,7 @@ mod tests {
         );
         let replay = replayer(Hold(vec![("AAPL", 1)]))
             .act(
-                Replay::open(Book::funded(dollars(100))),
+                Replay::open(Book::funded(cash(100))),
                 [
                     daily("AAPL", 0, 10_000_000, 10_000_000),
                     minute,
@@ -513,7 +543,7 @@ mod tests {
     fn test_an_order_without_a_bar_or_cash_goes_unfilled_with_its_cause() {
         let replay = replayer(Hold(vec![("AAPL", 1), ("MSFT", 50)]))
             .act(
-                Replay::open(Book::funded(dollars(100))),
+                Replay::open(Book::funded(cash(100))),
                 [
                     daily("AAPL", 0, 10_000_000, 10_000_000),
                     daily("MSFT", 0, 10_000_000, 10_000_000),
@@ -557,7 +587,7 @@ mod tests {
     fn test_a_buy_of_exactly_the_cash_held_fills() {
         let replay = replayer(Hold(vec![("AAPL", 10)]))
             .act(
-                Replay::open(Book::funded(dollars(100))),
+                Replay::open(Book::funded(cash(100))),
                 [
                     daily("AAPL", 0, 10_000_000, 10_000_000),
                     daily("AAPL", 1, 10_000_000, 10_000_000),
@@ -566,6 +596,68 @@ mod tests {
             .unwrap();
         assert_eq!(replay.fills().len(), 1);
         assert_eq!(replay.book().cash(), Cash::empty());
+    }
+
+    /// Repeated identical bars count once; two different bars of one series at one instant are refused.
+    #[test]
+    fn test_conflicting_bars_are_refused_and_repeats_count_once() {
+        let replayer = replayer(Hold(vec![("AAPL", 1)]));
+        let opening = Replay::open(Book::funded(cash(100)));
+        let once = replayer
+            .act(
+                opening.clone(),
+                [
+                    daily("AAPL", 0, 1_000_000, 1_000_000),
+                    daily("AAPL", 1, 1_000_000, 1_000_000),
+                ],
+            )
+            .unwrap();
+        let twice = replayer
+            .act(
+                opening.clone(),
+                [
+                    daily("AAPL", 0, 1_000_000, 1_000_000),
+                    daily("AAPL", 1, 1_000_000, 1_000_000),
+                    daily("AAPL", 1, 1_000_000, 1_000_000),
+                ],
+            )
+            .unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(
+            replayer.act(
+                opening,
+                [
+                    daily("AAPL", 1, 2_000_000, 1_000_000),
+                    daily("AAPL", 1, 1_000_000, 1_000_000)
+                ]
+            ),
+            Err(ReplayRefusal::Conflicting {
+                symbol: symbol("AAPL"),
+                interval: BarInterval::OneDay,
+                ends: day(1),
+            })
+        );
+    }
+
+    /// A notional near the top of its range charges without overflowing, and a spread past the notional is refused.
+    #[test]
+    fn test_a_charge_is_bounded_by_its_notional() {
+        let whole =
+            FillModel::new(FillStyle::Aggressive, BasisPoints::new(20_000.0).unwrap()).unwrap();
+        let notional = DollarVolume::from_units(u128::MAX / 2);
+        assert_eq!(whole.charge(notional), notional);
+        let model = FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap();
+        assert_eq!(
+            model.charge(notional),
+            DollarVolume::from_units((u128::MAX / 2).div_ceil(2_000))
+        );
+        assert_eq!(
+            FillModel::new(FillStyle::Aggressive, BasisPoints::new(20_000.1).unwrap()),
+            Err(CostRefusal::Unrepresentable {
+                quoted_spread: BasisPoints::new(20_000.1).unwrap(),
+                names: NonZeroU32::MIN,
+            })
+        );
     }
 
     #[test]
@@ -602,7 +694,8 @@ mod tests {
     }
 
     proptest! {
-        /// Replaying a stream in two consecutive stretches equals replaying it whole, and no bars change nothing.
+        /// Replaying a stream in two consecutive stretches, or with every bar repeated, equals replaying it whole, and no
+        /// bars change nothing.
         #[test]
         fn property_replaying_in_stretches_equals_replaying_whole(
             bars in arbitrary_stream(12),
@@ -614,12 +707,14 @@ mod tests {
                 FillModel::new(FillStyle::Aggressive, BasisPoints::new(spread).unwrap()).unwrap(),
                 BarInterval::OneDay,
             );
-            let opening = Replay::open(Book::funded(dollars(1_000)));
+            let opening = Replay::open(Book::funded(cash(1_000)));
             let (before, after): (Vec<_>, Vec<_>) =
                 bars.iter().cloned().partition(|bar| bar.ends() <= day(split));
             let stretched = replayer
                 .act(replayer.act(opening.clone(), before).unwrap(), after)
                 .unwrap();
+            let repeated = bars.iter().chain(&bars).cloned().collect::<Vec<_>>();
+            prop_assert_eq!(&replayer.act(opening.clone(), repeated).unwrap(), &stretched);
             let whole = replayer.act(opening.clone(), bars).unwrap();
             prop_assert_eq!(&stretched, &whole);
             prop_assert_eq!(replayer.act(whole.clone(), []).unwrap(), whole);
@@ -636,7 +731,7 @@ mod tests {
                 FillModel::new(FillStyle::Aggressive, BasisPoints::new(spread).unwrap()).unwrap(),
                 BarInterval::OneDay,
             );
-            let opening = Book::funded(dollars(1_000));
+            let opening = Book::funded(cash(1_000));
             let replay = replayer.act(Replay::open(opening.clone()), bars).unwrap();
             prop_assert_eq!(
                 replay.book(),
