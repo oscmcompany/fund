@@ -8,13 +8,16 @@ use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
+use crate::common::market::trade_bars::{Print, Tape};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::{TradingCalendar, TradingSession};
 
 const BARS_URL: &str = "https://data.alpaca.markets/v2/stocks/bars";
+const QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes";
+const TRADES_URL: &str = "https://data.alpaca.markets/v2/stocks/trades";
 
 /// The trading API, which serves the calendar; paper and live keys each work only against their own.
 const PAPER_TRADING_URL: &str = "https://paper-api.alpaca.markets";
@@ -268,6 +271,250 @@ impl Alpaca {
             .await
         })
         .await
+    }
+}
+
+#[derive(Deserialize)]
+struct QuotesPage {
+    /// `null` on a page with no quotes.
+    quotes: Option<BTreeMap<String, Vec<AlpacaQuote>>>,
+}
+
+#[derive(Deserialize)]
+struct AlpacaQuote {
+    #[serde(rename = "t")]
+    timestamp: DateTime<Utc>,
+    #[serde(rename = "bp")]
+    bid_price: f64,
+    #[serde(rename = "bs")]
+    bid_size: f64,
+    #[serde(rename = "ap")]
+    ask_price: f64,
+    #[serde(rename = "as")]
+    ask_size: f64,
+}
+
+#[derive(Deserialize)]
+struct TradesPage {
+    /// `null` on a page with no trades.
+    trades: Option<BTreeMap<String, Vec<AlpacaTrade>>>,
+}
+
+#[derive(Deserialize)]
+struct AlpacaTrade {
+    #[serde(rename = "t")]
+    timestamp: DateTime<Utc>,
+    #[serde(rename = "p")]
+    price: f64,
+    #[serde(rename = "s")]
+    size: f64,
+    /// The tape's condition letters, one per element.
+    #[serde(rename = "c", default)]
+    conditions: Vec<String>,
+    /// The tape letter: `A` and `B` report under CTA's letters, `C` under UTP's.
+    #[serde(rename = "z")]
+    tape: String,
+    /// Present on a print later corrected or canceled, whatever its value.
+    #[serde(rename = "u")]
+    update: Option<String>,
+}
+
+/// What one Alpaca quote became.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlpacaQuoteOutcome {
+    Quote(Quote),
+    /// A side with no price, which is no top of book.
+    OneSided,
+    Refused(RefusedRow),
+}
+
+/// What one Alpaca trade became.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlpacaTradeOutcome {
+    Print {
+        print: Print,
+        tape: Tape,
+        letters: Vec<char>,
+        corrected: bool,
+    },
+    Refused(RefusedRow),
+}
+
+/// Stands in for a condition element longer than one letter, which no condition spells, so the print reads as
+/// unresolved rather than being dropped.
+const UNSPELLABLE: char = '\u{FFFD}';
+
+impl Alpaca {
+    /// Every SIP quote for `symbol` over the whole Eastern day of `session`, resolved as of that session.
+    pub async fn quotes(
+        &self,
+        symbol: &Symbol,
+        session: SessionDate,
+    ) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
+        let pages = self.tick_pages(QUOTES_URL, symbol, session).await?;
+        let mut outcomes = Vec::new();
+        for body in pages {
+            let page: QuotesPage =
+                serde_json::from_slice(&body).map_err(|error| FetchError::Malformed {
+                    reason: error.to_string(),
+                })?;
+            for row in page
+                .quotes
+                .unwrap_or_default()
+                .remove(symbol.as_str())
+                .unwrap_or_default()
+            {
+                outcomes.push(quote_outcome(symbol, &row));
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Every SIP trade for `symbol` over the whole Eastern day of `session`, resolved as of that session.
+    pub async fn trades(
+        &self,
+        symbol: &Symbol,
+        session: SessionDate,
+    ) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
+        let pages = self.tick_pages(TRADES_URL, symbol, session).await?;
+        let mut outcomes = Vec::new();
+        for body in pages {
+            let page: TradesPage =
+                serde_json::from_slice(&body).map_err(|error| FetchError::Malformed {
+                    reason: error.to_string(),
+                })?;
+            for row in page
+                .trades
+                .unwrap_or_default()
+                .remove(symbol.as_str())
+                .unwrap_or_default()
+            {
+                outcomes.push(trade_outcome(symbol, &row));
+            }
+        }
+        Ok(outcomes)
+    }
+
+    async fn tick_pages(
+        &self,
+        url: &str,
+        symbol: &Symbol,
+        session: SessionDate,
+    ) -> Result<Vec<Vec<u8>>, FetchError> {
+        let (start, end) = session.bounds();
+        // The endpoint's end is inclusive, so the next session's first nanosecond is excluded.
+        let end = end - TimeDelta::nanoseconds(1);
+        let as_of = session.to_string();
+        let (start, end) = (start.to_rfc3339(), end.to_rfc3339());
+        let (start, end, as_of) = (&start, &end, &as_of);
+        paginate(|page_token| async move {
+            with_retries(|| {
+                let mut query = vec![
+                    ("symbols", symbol.as_str()),
+                    ("start", start.as_str()),
+                    ("end", end.as_str()),
+                    ("feed", "sip"),
+                    ("asof", as_of.as_str()),
+                    ("sort", "asc"),
+                    ("limit", PAGE_LIMIT),
+                ];
+                if let Some(token) = page_token.as_deref() {
+                    query.push(("page_token", token));
+                }
+                send(
+                    self.http_client
+                        .get(url)
+                        .header("APCA-API-KEY-ID", &self.key_id)
+                        .header("APCA-API-SECRET-KEY", &self.secret)
+                        .query(&query),
+                )
+            })
+            .await
+        })
+        .await
+    }
+}
+
+fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
+    if row.bid_price <= 0.0 || row.ask_price <= 0.0 {
+        return AlpacaQuoteOutcome::OneSided;
+    }
+    let refused = |cause| {
+        AlpacaQuoteOutcome::Refused(RefusedRow {
+            ticker: symbol.as_str().to_string(),
+            cause,
+        })
+    };
+    let parts = (|| {
+        Ok::<_, RowRefusal>((
+            Price::from_dollars(row.bid_price).map_err(RowRefusal::Price)?,
+            Price::from_dollars(row.ask_price).map_err(RowRefusal::Price)?,
+            Shares::from_float(row.bid_size).map_err(RowRefusal::Shares)?,
+            Shares::from_float(row.ask_size).map_err(RowRefusal::Shares)?,
+        ))
+    })();
+    match parts {
+        Ok((bid, ask, bid_size, ask_size)) => {
+            match Quote::new(symbol.clone(), row.timestamp, bid, ask, bid_size, ask_size) {
+                Ok(quote) => AlpacaQuoteOutcome::Quote(quote),
+                Err(cause) => refused(RowRefusal::Quote(cause)),
+            }
+        }
+        Err(cause) => refused(cause),
+    }
+}
+
+fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
+    let refused = |cause| {
+        AlpacaTradeOutcome::Refused(RefusedRow {
+            ticker: symbol.as_str().to_string(),
+            cause,
+        })
+    };
+    let tape = match row.tape.as_str() {
+        "A" | "B" => Tape::ConsolidatedTape,
+        "C" => Tape::UnlistedTrading,
+        _ => {
+            return refused(RowRefusal::Tape {
+                raw: row.tape.clone(),
+            });
+        }
+    };
+    let letters = row
+        .conditions
+        .iter()
+        .map(|element| {
+            let mut characters = element.chars();
+            match (characters.next(), characters.next()) {
+                (Some(letter), None) => letter,
+                (None, _) | (Some(_), Some(_)) => UNSPELLABLE,
+            }
+        })
+        .collect();
+    let price = match Price::from_dollars(row.price) {
+        Ok(price) => price,
+        Err(cause) => return refused(RowRefusal::Price(cause)),
+    };
+    let size = match Shares::from_float(row.size) {
+        Ok(size) => size,
+        Err(cause) => return refused(RowRefusal::Shares(cause)),
+    };
+    let print = match size.is_zero() {
+        true => Print::Unsized {
+            symbol: symbol.clone(),
+            timestamp: row.timestamp,
+            price,
+        },
+        false => match Trade::new(symbol.clone(), row.timestamp, price, size) {
+            Ok(trade) => Print::Trade(trade),
+            Err(cause) => return refused(RowRefusal::Trade(cause)),
+        },
+    };
+    AlpacaTradeOutcome::Print {
+        print,
+        tape,
+        letters,
+        corrected: row.update.is_some(),
     }
 }
 
@@ -783,5 +1030,69 @@ mod tests {
         assert!(per_symbol["AAPL"] > 390, "{per_symbol:?}");
         assert_eq!(batch.missing, symbols(&["ZTST"]));
         assert!(batch.refused.is_empty(), "{:?}", batch.refused);
+    }
+
+    /// Rows from Alpaca's SIP quotes and trades for AAPL and PFE on 2026-10-02, probed with the production key.
+    const QUOTES_PAGE: &str = r#"{"next_page_token": null, "quotes": {"AAPL": [{"ap": 333.67, "as": 200, "ax": "Q", "bp": 333.65, "bs": 1520, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.001719242Z", "z": "C"}, {"ap": 0, "as": 0, "ax": "Q", "bp": 333.65, "bs": 100, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.0018Z", "z": "C"}]}}"#;
+    const TRADES_PAGE: &str = r#"{"next_page_token": null, "trades": {"AAPL": [{"c": ["@", "6", "X"], "i": 1, "p": 333.69, "s": 6224093, "t": "2026-10-02T20:00:00.118Z", "x": "Q", "z": "C"}, {"c": ["@", "T", "P"], "i": 335045, "p": 333.69, "s": 819560, "t": "2026-10-02T21:49:13.402977462Z", "u": "canceled", "x": "D", "z": "C"}, {"c": [" ", "9"], "i": 7, "p": 27.81, "s": 0, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "A"}, {"c": ["@"], "i": 8, "p": 1.0, "s": 1, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "E"}]}}"#;
+
+    #[test]
+    fn test_alpaca_quotes_keep_the_top_of_book_in_shares() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let page: QuotesPage = serde_json::from_str(QUOTES_PAGE).unwrap();
+        let outcomes: Vec<AlpacaQuoteOutcome> = page.quotes.unwrap()["AAPL"]
+            .iter()
+            .map(|row| quote_outcome(&symbol, row))
+            .collect();
+        match &outcomes[0] {
+            AlpacaQuoteOutcome::Quote(quote) => {
+                assert_eq!(quote.bid().ticks(), 333_650_000);
+                assert_eq!(quote.bid_size().units(), 1_520_000_000);
+                assert_eq!(
+                    quote.timestamp().to_rfc3339(),
+                    "2026-10-02T19:59:58.001719242+00:00"
+                );
+            }
+            other @ (AlpacaQuoteOutcome::OneSided | AlpacaQuoteOutcome::Refused(_)) => {
+                panic!("{other:?}")
+            }
+        }
+        assert_eq!(outcomes[1], AlpacaQuoteOutcome::OneSided);
+    }
+
+    #[test]
+    fn test_alpaca_trades_carry_their_tape_letters_and_corrections() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let page: TradesPage = serde_json::from_str(TRADES_PAGE).unwrap();
+        let outcomes: Vec<AlpacaTradeOutcome> = page.trades.unwrap()["AAPL"]
+            .iter()
+            .map(|row| trade_outcome(&symbol, row))
+            .collect();
+        let summary: Vec<String> = outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                AlpacaTradeOutcome::Print {
+                    print,
+                    tape,
+                    letters,
+                    corrected,
+                } => format!(
+                    "{tape:?} {letters:?} corrected={corrected} unsized={}",
+                    matches!(print, Print::Unsized { .. })
+                ),
+                AlpacaTradeOutcome::Refused(row) => {
+                    format!("refused {}", <&'static str>::from(row.cause()))
+                }
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "UnlistedTrading ['@', '6', 'X'] corrected=false unsized=false",
+                "UnlistedTrading ['@', 'T', 'P'] corrected=true unsized=false",
+                "ConsolidatedTape [' ', '9'] corrected=false unsized=true",
+                "refused tape",
+            ]
+        );
     }
 }
