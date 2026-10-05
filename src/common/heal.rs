@@ -12,7 +12,8 @@ use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 
 /// One series the archiver keeps whole, in the order a run works them: the daily bars first, since they are the
-/// one-minute leg's symbol list.
+/// other legs' symbol list. A tick leg writes one-minute, five-minute and daily bars, and is held by its daily file,
+/// which it writes last.
 #[derive(
     Debug,
     Clone,
@@ -34,19 +35,38 @@ use crate::common::time::calendar::TradingCalendar;
 pub enum Leg {
     MassiveDailyBars,
     AlpacaMinuteBars,
+    AlpacaQuotes,
+    AlpacaTrades,
 }
 
 impl Leg {
+    /// The key whose presence means the session is held.
     pub fn key(self, session: SessionDate) -> Key {
-        let (provider, interval) = match self {
-            Self::MassiveDailyBars => (Provider::Massive, BarInterval::OneDay),
-            Self::AlpacaMinuteBars => (Provider::Alpaca, BarInterval::OneMinute),
-        };
-        Key::Bars {
-            provider,
-            origin: Origin::Vendor,
-            interval,
-            session,
+        match self {
+            Self::MassiveDailyBars => Key::Bars {
+                provider: Provider::Massive,
+                origin: Origin::Vendor,
+                interval: BarInterval::OneDay,
+                session,
+            },
+            Self::AlpacaMinuteBars => Key::Bars {
+                provider: Provider::Alpaca,
+                origin: Origin::Vendor,
+                interval: BarInterval::OneMinute,
+                session,
+            },
+            Self::AlpacaQuotes => Key::Quotes {
+                provider: Provider::Alpaca,
+                origin: Origin::Derived,
+                interval: BarInterval::OneDay,
+                session,
+            },
+            Self::AlpacaTrades => Key::Trades {
+                provider: Provider::Alpaca,
+                origin: Origin::Derived,
+                interval: BarInterval::OneDay,
+                session,
+            },
         }
     }
 }
@@ -322,6 +342,8 @@ mod tests {
             [
                 "data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/",
                 "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/",
+                "data/equity/stage=parsed/quotes/provider=alpaca/origin=derived/interval=one_day/",
+                "data/equity/stage=parsed/trades/provider=alpaca/origin=derived/interval=one_day/",
             ]
         );
     }

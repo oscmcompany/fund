@@ -42,31 +42,49 @@ pub struct StandingQuote {
     ask_size: Shares,
 }
 
+/// Why a standing quote or a bar's sums were refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteSumsRefusal {
+    Crossed {
+        bid: Price,
+        ask: Price,
+    },
+    /// The narrowest spread is wider than the widest.
+    Inverted {
+        narrowest: Spread,
+        widest: Spread,
+    },
+}
+
 impl StandingQuote {
+    /// A quote whose bid is not above its ask, as `Quote` guarantees for one read from a vendor.
     pub fn new(
         since: DateTime<Utc>,
         bid: Price,
         ask: Price,
         bid_size: Shares,
         ask_size: Shares,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, QuoteSumsRefusal> {
+        if bid > ask {
+            return Err(QuoteSumsRefusal::Crossed { bid, ask });
+        }
+        Ok(Self {
             since,
             bid,
             ask,
             bid_size,
             ask_size,
-        }
+        })
     }
 
     fn of(quote: &Quote) -> Self {
-        Self::new(
-            quote.timestamp(),
-            quote.bid(),
-            quote.ask(),
-            quote.bid_size(),
-            quote.ask_size(),
-        )
+        Self {
+            since: quote.timestamp(),
+            bid: quote.bid(),
+            ask: quote.ask(),
+            bid_size: quote.bid_size(),
+            ask_size: quote.ask_size(),
+        }
     }
 
     /// When the quote began, which may precede the bar it closes.
@@ -113,13 +131,14 @@ impl QuoteSums {
         let spread = Spread::of(quote.bid, quote.ask);
         let midpoint_doubled = u128::from(quote.bid.ticks().unsigned_abs())
             + u128::from(quote.ask.ticks().unsigned_abs());
-        let relative = u128::from(spread.0) * 2 * RELATIVE_SPREAD_SCALE / midpoint_doubled;
         let time = u128::from(nanoseconds);
         Self {
             quote_count: 0,
             covered_nanoseconds: nanoseconds,
             spread_time: u128::from(spread.0) * time,
-            relative_spread_time: relative * time,
+            // Weighted before dividing, so a tight spread keeps its precision; the one floor loses under a unit.
+            relative_spread_time: u128::from(spread.0) * 2 * RELATIVE_SPREAD_SCALE * time
+                / midpoint_doubled,
             bid_size_time: u128::from(quote.bid_size.units()) * time,
             ask_size_time: u128::from(quote.ask_size.units()) * time,
             narrowest: spread,
@@ -135,14 +154,17 @@ impl QuoteSums {
         narrowest: Spread,
         widest: Spread,
         closing: StandingQuote,
-    ) -> Self {
+    ) -> Result<Self, QuoteSumsRefusal> {
+        if narrowest > widest {
+            return Err(QuoteSumsRefusal::Inverted { narrowest, widest });
+        }
         let [
             spread_time,
             relative_spread_time,
             bid_size_time,
             ask_size_time,
         ] = time_weighted;
-        Self {
+        Ok(Self {
             quote_count,
             covered_nanoseconds,
             spread_time,
@@ -152,7 +174,7 @@ impl QuoteSums {
             narrowest,
             widest,
             closing,
-        }
+        })
     }
 
     fn combine(self, other: Self) -> Self {
@@ -523,8 +545,8 @@ mod tests {
             assert_eq!(bar.sums().covered_nanoseconds(), MINUTE);
             assert_eq!(bar.sums().quote_count(), 0);
             assert_eq!(bar.sums().spread_time(), 20_000 * u128::from(MINUTE));
-            // 0.02 over a 100.01 midpoint is 1.99980 basis points, held in hundredths.
-            assert_eq!(bar.sums().relative_spread_time(), 199 * u128::from(MINUTE));
+            // 0.02 over a 100.01 midpoint is 1.99980 basis points, 199.98 hundredths, kept to the nanosecond.
+            assert_eq!(bar.sums().relative_spread_time(), 11_998_800_119_988);
             assert_eq!(bar.sums().bid_size_time(), 3_000_000 * u128::from(MINUTE));
         }
         assert_eq!(bars[0].timestamp(), instant("2026-10-02T13:30:00Z"));
@@ -560,6 +582,63 @@ mod tests {
     }
 
     #[test]
+    fn test_a_penny_on_a_thousand_dollars_keeps_its_relative_spread() {
+        let mut fold = session();
+        fold.push(&quote(
+            "BRK.A",
+            "2026-10-02T13:30:00Z",
+            1_000.00,
+            1_000.01,
+            1,
+            1,
+        ));
+        let (bars, _) = fold.finish();
+        // 0.01 over a 1,000.005 midpoint is 0.0999995 basis points: 9.99995 hundredths, not the 9 a floor leaves.
+        assert_eq!(bars[0].sums().relative_spread_time(), 599_997_000_014);
+    }
+
+    #[test]
+    fn test_a_crossed_quote_or_inverted_spreads_are_refused() {
+        let price = |dollars| Price::from_dollars(dollars).unwrap();
+        let at = instant("2026-10-02T13:30:00Z");
+        assert_eq!(
+            StandingQuote::new(
+                at,
+                price(10.01),
+                price(10.00),
+                Shares::from_units(1),
+                Shares::from_units(1)
+            ),
+            Err(QuoteSumsRefusal::Crossed {
+                bid: price(10.01),
+                ask: price(10.00)
+            })
+        );
+        let closing = StandingQuote::new(
+            at,
+            price(10.00),
+            price(10.01),
+            Shares::from_units(1),
+            Shares::from_units(1),
+        )
+        .unwrap();
+        assert_eq!(
+            QuoteSums::new(
+                1,
+                1,
+                [0; 4],
+                Spread::from_ticks(2),
+                Spread::from_ticks(1),
+                closing
+            ),
+            Err(QuoteSumsRefusal::Inverted {
+                narrowest: Spread::from_ticks(2),
+                widest: Spread::from_ticks(1)
+            })
+        );
+    }
+
+    #[test]
     fn test_nothing_after_the_close_is_counted() {
         let mut fold = session();
         fold.push(&quote("AAPL", "2026-10-02T20:00:00Z", 100.00, 100.02, 1, 1));
@@ -585,7 +664,8 @@ mod tests {
                     ask,
                     Shares::from_units(7),
                     Shares::from_units(9),
-                );
+                )
+                .unwrap();
                 let mut sums = QuoteSums::standing(&quote, covered);
                 sums.quote_count = count;
                 sums

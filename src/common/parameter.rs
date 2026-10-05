@@ -38,6 +38,8 @@ pub enum Parameter {
     MinuteBatchSymbols,
     /// One-minute bars requests in flight at once.
     MinuteConcurrency,
+    /// Symbols whose quotes or trades are paged at once.
+    TickConcurrency,
 }
 
 impl Parameter {
@@ -152,6 +154,7 @@ mod tests {
                 "FUND_LOG_DIRECTORY",
                 "FUND_MINUTE_BATCH_SYMBOLS",
                 "FUND_MINUTE_CONCURRENCY",
+                "FUND_TICK_CONCURRENCY",
             ]
         );
     }

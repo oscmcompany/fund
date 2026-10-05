@@ -71,6 +71,10 @@ pub enum RowRefusal {
     Bar(BarRefusal),
     Quote(QuoteRefusal),
     Trade(TradeRefusal),
+    /// A tape letter other than A, B or C.
+    Tape {
+        raw: String,
+    },
     /// A condition field holding something other than comma-separated codes.
     Conditions {
         raw: String,

@@ -9,7 +9,9 @@ use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::security_details::SecurityType;
-use crate::common::market::trade_bars::{TradeConditions, UpdateRules};
+use crate::common::market::trade_bars::{
+    Condition, TradeConditions, UpdateRules, condition_letter,
+};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
 
@@ -205,6 +207,12 @@ struct ConditionRow {
     #[serde(rename = "type")]
     kind: String,
     update_rules: Option<ConditionUpdateRules>,
+    /// The letter each tape spells the condition with, keyed by the vendor's name for the plan.
+    #[serde(default)]
+    sip_mapping: BTreeMap<String, String>,
+    /// Kept for history and no longer printed.
+    #[serde(default)]
+    legacy: bool,
 }
 
 #[derive(Deserialize)]
@@ -241,7 +249,20 @@ fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
                     consolidated.updates_high_low,
                     consolidated.updates_open_close,
                 );
-                if rules.insert(row.id, rule).is_some() {
+                let letter = |plan: &str| -> Result<Option<char>, FetchError> {
+                    match row.sip_mapping.get(plan) {
+                        None => Ok(None),
+                        Some(spelled) => match condition_letter(spelled) {
+                            Some(letter) => Ok(Some(letter)),
+                            None => Err(malformed(format!(
+                                "condition {} spells {plan} as `{spelled}`",
+                                row.id
+                            ))),
+                        },
+                    }
+                };
+                let condition = Condition::new(rule, letter("CTA")?, letter("UTP")?, row.legacy);
+                if rules.insert(row.id, condition).is_some() {
                     return Err(malformed(format!("condition {} is listed twice", row.id)));
                 }
             }
@@ -515,21 +536,28 @@ mod tests {
         }
     }
 
-    /// Rows trimmed from the live conditions listing of 2026-10-05: two sale conditions, the trade-through exempt
-    /// flag, and a quote condition that must be left out.
-    const CONDITIONS: &str = r#"{"results": [{"id": 10, "type": "sale_condition", "name": "Derivatively Priced", "asset_class": "stocks", "sip_mapping": {"CTA": "4", "UTP": "4"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": false, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": false, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 37, "type": "sale_condition", "name": "Odd Lot Trade", "asset_class": "stocks", "sip_mapping": {"CTA": "I", "UTP": "I", "FINRA_TDDS": "I"}, "update_rules": {"consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}, "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 41, "type": "trade_thru_exempt", "name": "Trade Thru Exempt", "asset_class": "stocks", "sip_mapping": {"CTA": "1", "UTP": "X"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 41, "type": "settlement_condition", "name": "Cash Only Settlement", "asset_class": "stocks", "sip_mapping": {"CTA": "A"}, "data_types": ["bbo", "nbbo"]}, {"id": 1, "type": "quote_condition", "name": "Regular Two-Sided Open", "asset_class": "stocks", "sip_mapping": {"CTA": "R", "UTP": "R"}, "data_types": ["bbo", "nbbo"]}], "status": "OK", "request_id": "x", "count": 5}"#;
+    /// Rows trimmed from the live conditions listing of 2026-10-05: the retired CAP election, two sale conditions, the
+    /// trade-through exempt flag, and a quote condition that must be left out.
+    const CONDITIONS: &str = r#"{"results": [{"id": 6, "type": "sale_condition", "name": "CAP Election", "asset_class": "stocks", "sip_mapping": {"CTA": "I"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}}, "data_types": ["trade"], "legacy": true}, {"id": 10, "type": "sale_condition", "name": "Derivatively Priced", "asset_class": "stocks", "sip_mapping": {"CTA": "4", "UTP": "4"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": false, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": false, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 37, "type": "sale_condition", "name": "Odd Lot Trade", "asset_class": "stocks", "sip_mapping": {"CTA": "I", "UTP": "I", "FINRA_TDDS": "I"}, "update_rules": {"consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}, "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 41, "type": "trade_thru_exempt", "name": "Trade Thru Exempt", "asset_class": "stocks", "sip_mapping": {"CTA": "1", "UTP": "X"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 41, "type": "settlement_condition", "name": "Cash Only Settlement", "asset_class": "stocks", "sip_mapping": {"CTA": "A"}, "data_types": ["bbo", "nbbo"]}, {"id": 1, "type": "quote_condition", "name": "Regular Two-Sided Open", "asset_class": "stocks", "sip_mapping": {"CTA": "R", "UTP": "R"}, "data_types": ["bbo", "nbbo"]}], "status": "OK", "request_id": "x", "count": 5}"#;
 
     #[test]
     fn test_conditions_keep_the_trade_kinds_with_their_consolidated_rules() {
         let conditions = parse_trade_conditions(CONDITIONS.as_bytes()).unwrap();
-        let codes: Vec<u16> = conditions.rules().keys().copied().collect();
-        assert_eq!(codes, [10, 37, 41]);
-        assert_eq!(conditions.rules()[&10], UpdateRules::new(true, true, false));
+        let codes: Vec<u16> = conditions.conditions().keys().copied().collect();
+        assert_eq!(codes, [6, 10, 37, 41]);
+        let condition = |code: u16| conditions.conditions()[&code];
+        assert_eq!(condition(10).rules(), UpdateRules::new(true, true, false));
+        assert_eq!(condition(37).rules(), UpdateRules::new(true, false, false));
+        assert_eq!(condition(41).rules(), UpdateRules::new(true, true, true));
         assert_eq!(
-            conditions.rules()[&37],
-            UpdateRules::new(true, false, false)
+            (
+                condition(41).consolidated_tape(),
+                condition(41).unlisted_trading()
+            ),
+            (Some('1'), Some('X'))
         );
-        assert_eq!(conditions.rules()[&41], UpdateRules::new(true, true, true));
+        assert!(!condition(37).retired());
+        assert!(condition(6).retired());
     }
 
     #[test]

@@ -982,6 +982,8 @@ enum FoldFailure {
     Archive(ArchiveError),
     Interrupted(String),
     Empty,
+    /// An earlier run wrote different bars under the key, which this run will not replace.
+    Held(String),
 }
 
 impl std::fmt::Display for FoldFailure {
@@ -992,6 +994,7 @@ impl std::fmt::Display for FoldFailure {
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Interrupted(reason) => write!(formatter, "the fold did not finish: {reason}"),
             Self::Empty => write!(formatter, "nothing the fold could keep fell in the session"),
+            Self::Held(path) => write!(formatter, "{path} already holds different bars"),
         }
     }
 }
@@ -1180,7 +1183,7 @@ async fn fold_quotes_one(
             QuoteRowOutcome::Quote(quote) => fold.push(&quote),
             QuoteRowOutcome::TestTicker => rows.test_tickers += 1,
             QuoteRowOutcome::OneSided => rows.one_sided += 1,
-            QuoteRowOutcome::Refused(row) => rows.refused.push(row),
+            QuoteRowOutcome::Refused(row) => count_cause(&mut rows.refused, &row),
         })
         .map_err(FoldFailure::Parse)?;
         let (minutes, counts) = fold.finish();
@@ -1209,10 +1212,10 @@ async fn fold_quotes_one(
     for (key, bars) in files {
         let body = quote_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
-        archive
-            .create(&key, body)
-            .await
-            .map_err(FoldFailure::Archive)?;
+        create_or_confirm(archive, &key, body, |held| {
+            quote_bars::decode(&key, held).map(|(held, _)| held == bars)
+        })
+        .await?;
     }
     tracing::info!(
         session = %session,
@@ -1222,11 +1225,49 @@ async fn fold_quotes_one(
         out_of_order = counts.out_of_order(),
         one_sided = rows.one_sided,
         test_tickers = rows.test_tickers,
-        refused = rows.refused.len(),
-        refused_by_cause = ?refused_by_cause(&rows.refused),
+        refused = rows.refused.values().sum::<u64>(),
+        refused_by_cause = ?rows.refused,
         "Wrote quote bars"
     );
     Ok(())
+}
+
+/// Creates `key`, or, when an interrupted run already wrote it, accepts it only if it holds the same bars, so a
+/// rerun finishes a session's missing files without replacing what it cannot tell is identical.
+async fn create_or_confirm<Refusal: std::fmt::Debug>(
+    archive: &Archive,
+    key: &Key,
+    body: Vec<u8>,
+    same_bars: impl FnOnce(Vec<u8>) -> Result<bool, Refusal>,
+) -> Result<(), FoldFailure> {
+    match archive.create(key, body).await {
+        Ok(()) => Ok(()),
+        Err(ArchiveError::Contended { path }) => {
+            let held = archive
+                .get(key)
+                .await
+                .map_err(FoldFailure::Archive)?
+                .ok_or_else(|| {
+                    FoldFailure::Archive(ArchiveError::Contended { path: path.clone() })
+                })?;
+            match same_bars(held) {
+                Ok(true) => {
+                    tracing::info!(path, "Kept bars an earlier run wrote identically");
+                    Ok(())
+                }
+                Ok(false) => Err(FoldFailure::Held(path)),
+                Err(refusal) => Err(FoldFailure::Encode(format!(
+                    "{path} held but unreadable: {refusal:?}"
+                ))),
+            }
+        }
+        Err(error) => Err(FoldFailure::Archive(error)),
+    }
+}
+
+/// Counts `row` under the name of its cause.
+fn count_cause(counts: &mut BTreeMap<&'static str, u64>, row: &RefusedRow) {
+    *counts.entry(row.cause().into()).or_insert(0) += 1;
 }
 
 /// Rows of a quote file that did not become a quote, by what they were.
@@ -1234,16 +1275,8 @@ async fn fold_quotes_one(
 struct QuoteRowCounts {
     test_tickers: u64,
     one_sided: u64,
-    refused: Vec<RefusedRow>,
-}
-
-/// The conditions table's key for a snapshot taken on `as_of`.
-fn conditions_key(as_of: SessionDate) -> Key {
-    Key::Reference {
-        provider: Provider::Massive,
-        table: ReferenceTable::Conditions,
-        as_of,
-    }
+    /// Counted by cause rather than kept, since a session refuses tens of thousands of rows.
+    refused: BTreeMap<&'static str, u64>,
 }
 
 /// Fetches Massive's condition table and writes it as today's snapshot.
@@ -1261,7 +1294,7 @@ async fn fetch_conditions(
             return ExitCode::FAILURE;
         }
     };
-    let key = conditions_key(SessionDate::at(fetched_at));
+    let key = reference::conditions_key(SessionDate::at(fetched_at));
     let provenance = Provenance::new(Subscription::StocksStarter, fetched_at, run_id, commit);
     let written = reference::encode_conditions(&key, &conditions, &provenance)
         .map_err(|refusal| format!("{refusal:?}"))
@@ -1271,7 +1304,7 @@ async fn fetch_conditions(
             Ok(()) => {
                 tracing::info!(
                     path = key.path(),
-                    codes = conditions.rules().len(),
+                    codes = conditions.conditions().len(),
                     "Wrote the conditions table"
                 );
                 ExitCode::SUCCESS
@@ -1286,27 +1319,6 @@ async fn fetch_conditions(
             ExitCode::FAILURE
         }
     }
-}
-
-/// The newest conditions snapshot the archive holds.
-async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), String> {
-    let series = conditions_key(SessionDate::from_date(NaiveDate::MIN)).series();
-    let latest = archive
-        .list(&series)
-        .await
-        .map_err(|error| error.to_string())?
-        .iter()
-        .filter_map(|path| Key::parse(path).ok())
-        .max_by_key(Key::session)
-        .ok_or_else(|| format!("no conditions table under {series}"))?;
-    let bytes = archive
-        .get(&latest)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("{} vanished", latest.path()))?;
-    let (conditions, _) =
-        reference::decode_conditions(&latest, bytes).map_err(|refusal| format!("{refusal:?}"))?;
-    Ok((latest, conditions))
 }
 
 /// Trade bars at every interval for a session, minutes first, keyed where each is written.
@@ -1336,7 +1348,7 @@ async fn fold_trades(
     run_id: RunId,
     commit: Option<Commit>,
 ) -> ExitCode {
-    let (conditions_key, conditions) = match latest_conditions(archive).await {
+    let (conditions_key, conditions) = match reference::latest_conditions(archive).await {
         Ok(latest) => latest,
         Err(reason) => {
             tracing::error!(reason, "Conditions table not read");
@@ -1345,7 +1357,7 @@ async fn fold_trades(
     };
     tracing::info!(
         conditions = conditions_key.path(),
-        codes = conditions.rules().len(),
+        codes = conditions.conditions().len(),
         "Read the conditions table"
     );
     let calendar = match alpaca.calendar(first, last).await {
@@ -1392,7 +1404,7 @@ async fn fold_trades_one(
     let folded = tokio::task::spawn_blocking(move || {
         let mut fold = TradeFold::new(session, conditions);
         let mut test_tickers = 0_u64;
-        let mut refused = Vec::new();
+        let mut refused = BTreeMap::new();
         read_trades(stream, |outcome| match outcome {
             TradeRowOutcome::Print {
                 print,
@@ -1400,7 +1412,7 @@ async fn fold_trades_one(
                 corrected,
             } => fold.push(&print, &conditions, corrected),
             TradeRowOutcome::TestTicker => test_tickers += 1,
-            TradeRowOutcome::Refused(row) => refused.push(row),
+            TradeRowOutcome::Refused(row) => count_cause(&mut refused, &row),
         })
         .map_err(FoldFailure::Parse)?;
         let (minutes, counts) = fold.finish();
@@ -1429,10 +1441,10 @@ async fn fold_trades_one(
     for (key, bars) in files {
         let body = trade_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
-        archive
-            .create(&key, body)
-            .await
-            .map_err(FoldFailure::Archive)?;
+        create_or_confirm(archive, &key, body, |held| {
+            trade_bars::decode(&key, held).map(|(held, _)| held == bars)
+        })
+        .await?;
     }
     tracing::info!(
         session = %session,
@@ -1445,8 +1457,8 @@ async fn fold_trades_one(
         unsized_prints = counts.unsized_prints(),
         unresolved = counts.unresolved(),
         test_tickers,
-        refused = refused.len(),
-        refused_by_cause = ?refused_by_cause(&refused),
+        refused = refused.values().sum::<u64>(),
+        refused_by_cause = ?refused,
         "Wrote trade bars"
     );
     Ok(())
@@ -1835,6 +1847,12 @@ mod tests {
         assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
         let parsing = ["parse", "daily_bars", "2021-08-24", "2021-08-23", "4"].map(String::from);
         assert!(parse(&parsing).is_none());
+        let folding = |first: &str, last: &str, concurrency: &str| {
+            parse(&["fold-quotes", first, last, concurrency].map(String::from))
+        };
+        assert!(folding("2021-08-23", "2021-08-23", "9").is_some());
+        assert!(folding("2021-08-24", "2021-08-23", "9").is_none());
+        assert!(folding("2021-08-23", "2021-08-24", "0").is_none());
     }
 
     #[test]
