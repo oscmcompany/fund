@@ -67,7 +67,8 @@ pub enum CostRefusal {
         style: FillStyle,
         quoted_spread: BasisPoints,
     },
-    /// The charge overflowed what a basis-point reading holds.
+    /// The charge overflowed what a basis-point reading holds, or a fill model's crossing would cost more than its
+    /// notional.
     Unrepresentable {
         quoted_spread: BasisPoints,
         names: NonZeroU32,

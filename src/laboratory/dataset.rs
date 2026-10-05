@@ -211,7 +211,7 @@ fn admit(session: SessionDate, bars: Vec<Bar>) -> Result<Vec<Bar>, DatasetError>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use chrono::NaiveDate;
 
     use super::*;
@@ -229,7 +229,7 @@ mod tests {
     }
 
     /// Sessions 0, 1 and 3 read by `run` with one, two and three bars, and session 2 missing.
-    fn dataset(run: RunId) -> Dataset {
+    pub(crate) fn dataset(run: RunId) -> Dataset {
         let (open, close) = (
             chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
             chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
