@@ -736,18 +736,55 @@ async fn delete_legacy(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
         tracing::warn!(%dataset, comparison = ?comparison, count = sessions.len(), sessions = listed(sessions), "Legacy copies kept");
     }
     let deleted = outcomes.values().filter(|outcome| outcome.is_ok()).count();
+    // A sidecar rewritten after its data file went would never be listed by session again, so orphans are swept here.
+    let orphans = match orphan_sidecars(&archive, dataset).await {
+        Ok(orphans) => orphans,
+        Err(error) => {
+            tracing::error!(%error, "Archive not listed for orphan sidecars");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut orphans_left = 0;
+    for orphan in &orphans {
+        if let Err(error) = archive.delete_legacy_at(orphan, None).await {
+            orphans_left += 1;
+            tracing::error!(path = orphan, %error, "Orphan sidecar not deleted");
+        }
+    }
     tracing::info!(
         %dataset,
         deleted,
         kept = outcomes.len() - deleted,
+        orphan_sidecars = orphans.len(),
+        orphans_left,
         panicked,
         "Finished a legacy delete"
     );
-    if deleted == outcomes.len() && panicked == 0 {
+    if deleted == outcomes.len() && panicked == 0 && orphans_left == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Sidecars under the dataset's legacy prefix whose data file is gone.
+async fn orphan_sidecars(
+    archive: &Archive,
+    dataset: FlatFileDataset,
+) -> Result<Vec<String>, ArchiveError> {
+    let paths: BTreeSet<String> = archive
+        .list(&dataset.legacy_prefix())
+        .await?
+        .into_iter()
+        .collect();
+    Ok(paths
+        .iter()
+        .filter(|path| {
+            path.strip_suffix(".provenance.json")
+                .is_some_and(|data| !paths.contains(data))
+        })
+        .cloned()
+        .collect())
 }
 
 /// Whether a legacy copy compared so may be deleted: only one proven byte for byte equal.
