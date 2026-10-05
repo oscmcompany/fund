@@ -79,6 +79,10 @@ enum Command {
         concurrency: usize,
     },
     FetchConditions,
+    /// Deletes the objects at paths that each parse as a key.
+    Delete {
+        keys: Vec<Key>,
+    },
     RollUp {
         first: SessionDate,
         last: SessionDate,
@@ -119,6 +123,14 @@ fn parse(arguments: &[String]) -> Option<Command> {
             })
         }
         [command] if command == "fetch-conditions" => Some(Command::FetchConditions),
+        [command, paths @ ..] if command == "delete" && !paths.is_empty() => {
+            Some(Command::Delete {
+                keys: paths
+                    .iter()
+                    .map(|path| Key::parse(path).ok())
+                    .collect::<Option<_>>()?,
+            })
+        }
         [command, first, last, concurrency] if command == "roll-up" => Some(Command::RollUp {
             first: date(first)?,
             last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
@@ -167,7 +179,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -220,6 +232,23 @@ async fn main() -> ExitCode {
                 last,
                 concurrency,
             } => roll_up(archive, first, last, concurrency).await,
+            Command::Delete { keys } => {
+                let mut failed = 0;
+                for key in &keys {
+                    match archive.delete(key).await {
+                        Ok(()) => tracing::info!(path = key.path(), "Deleted an object"),
+                        Err(error) => {
+                            failed += 1;
+                            tracing::error!(%error, "Object not deleted");
+                        }
+                    }
+                }
+                if failed == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
             Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
                 Ok(massive) => fetch_conditions(&archive, &massive, run_id, commit).await,
                 Err(refusal) => {
@@ -1685,6 +1714,16 @@ mod tests {
         .filter(|comparison| deletable(*comparison))
         .collect();
         assert_eq!(allowed, [Comparison::Equal]);
+    }
+
+    #[test]
+    fn test_a_delete_names_only_paths_that_parse_as_keys() {
+        let key = "data/equity/stage=parsed/trades/provider=massive/origin=derived/interval=one_day/year=2021/month=08/day=23/data.parquet";
+        assert!(parse(&["delete".to_string(), key.to_string()]).is_some());
+        let legacy =
+            "data/derived/equity/trades/interval=one_day/year=2021/month=08/day=23/data.parquet";
+        assert!(parse(&["delete".to_string(), key.to_string(), legacy.to_string()]).is_none());
+        assert!(parse(&["delete".to_string()]).is_none());
     }
 
     #[test]

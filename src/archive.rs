@@ -171,6 +171,22 @@ impl Archive {
         }
     }
 
+    /// Deletes the object under `key`; deleting one already gone succeeds, as S3 answers it.
+    pub async fn delete(&self, key: &Key) -> Result<(), ArchiveError> {
+        let path = key.path();
+        self.s3_client
+            .delete_object()
+            .bucket(&self.bucket_name)
+            .key(&path)
+            .send()
+            .await
+            .map_err(|error| ArchiveError::Delete {
+                path,
+                reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
+            })?;
+        Ok(())
+    }
+
     /// Every path under `prefix`, across as many pages as S3 answers with.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, ArchiveError> {
         let mut pages = self
