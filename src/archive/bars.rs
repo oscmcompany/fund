@@ -308,29 +308,7 @@ fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
     let (provider, interval, session) = bars_key(key).ok_or(DecodeRefusal::NotABarsKey)?;
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
-    let value = |name: &'static str| parquet::value(&entries, name);
-    let required = |name: &'static str| value(name).ok_or(DecodeRefusal::Metadata { name });
-    let provenance = Provenance {
-        subscription: required("fund.subscription")?.parse().map_err(|_| {
-            DecodeRefusal::Metadata {
-                name: "fund.subscription",
-            }
-        })?,
-        fetched_at: required(FETCHED_AT)?
-            .parse()
-            .map_err(|_| DecodeRefusal::Metadata { name: FETCHED_AT })?,
-        run_id: RunId::new(required("fund.run_id")?.parse().map_err(|_| {
-            DecodeRefusal::Metadata {
-                name: "fund.run_id",
-            }
-        })?),
-        commit: value("fund.commit")
-            .map(|raw| Commit::new(&raw))
-            .transpose()
-            .map_err(|_| DecodeRefusal::Metadata {
-                name: "fund.commit",
-            })?,
-    };
+    let provenance = provenance_from(&entries).map_err(|name| DecodeRefusal::Metadata { name })?;
     if provenance.subscription.provider() != provider {
         return Err(DecodeRefusal::Provider {
             subscription: provenance.subscription,
@@ -400,6 +378,27 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
         }
     }
     Ok((bars, provenance))
+}
+
+/// The provenance `Provenance::entries` wrote, or the name of the first entry absent or unreadable.
+pub(crate) fn provenance_from(entries: &[KeyValue]) -> Result<Provenance, &'static str> {
+    let value = |name: &'static str| parquet::value(entries, name);
+    let required = |name: &'static str| value(name).ok_or(name);
+    Ok(Provenance {
+        subscription: required("fund.subscription")?
+            .parse()
+            .map_err(|_| "fund.subscription")?,
+        fetched_at: required(FETCHED_AT)?.parse().map_err(|_| FETCHED_AT)?,
+        run_id: RunId::new(
+            required("fund.run_id")?
+                .parse()
+                .map_err(|_| "fund.run_id")?,
+        ),
+        commit: value("fund.commit")
+            .map(|raw| Commit::new(&raw))
+            .transpose()
+            .map_err(|_| "fund.commit")?,
+    })
 }
 
 fn downcast<T: 'static>(column: &ArrayRef) -> Result<&T, DecodeRefusal> {

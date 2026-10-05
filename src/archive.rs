@@ -5,6 +5,7 @@ pub mod bars;
 pub mod journal;
 pub mod logs;
 pub mod parquet;
+pub mod quote_bars;
 pub mod raw;
 
 use aws_sdk_s3::primitives::ByteStream;
