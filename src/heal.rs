@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use crate::archive::Archive;
 use crate::archive::bars::{Provenance, Subscription, decode, encode};
-use crate::archive::reference::latest_conditions;
+use crate::archive::reference::{conditions_key, encode_conditions, latest_conditions};
 use crate::archive::{quote_bars, trade_bars};
 use crate::common::heal::{Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, window};
 use crate::common::journal::{
@@ -25,7 +25,7 @@ use crate::common::journal::{
 use crate::common::market::Symbol;
 use crate::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use crate::common::market::record::{Bar, BarInterval};
-use crate::common::market::trade_bars::{TradeFold, TradeRollup};
+use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, resolve};
 use crate::common::storage::Key;
@@ -463,7 +463,7 @@ async fn write_quotes(
     let mut fold = QuoteFold::new(open, close).map_err(|refusal| format!("{refusal:?}"))?;
     let mut refused = Vec::new();
     let mut one_sided = 0_u64;
-    let invalid = per_symbol(
+    let unanswered = per_symbol(
         &symbols,
         parameters.tick_concurrency,
         |symbol| {
@@ -510,10 +510,7 @@ async fn write_quotes(
         session,
         u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
         refused_by_cause(&refused),
-        invalid
-            .into_iter()
-            .map(|symbol| (symbol, Unanswered::Invalid))
-            .collect(),
+        unanswered,
     ))
 }
 
@@ -525,10 +522,10 @@ async fn write_trades(
     journal: &Journal,
 ) -> Result<PartitionWritten, String> {
     let symbols = symbol_list(clients, session).await?;
-    let (_, conditions) = latest_conditions(&clients.archive).await?;
+    let conditions = trade_conditions(clients, journal).await?;
     let mut fold = TradeFold::new(session, conditions);
     let mut refused = Vec::new();
-    let invalid = per_symbol(
+    let unanswered = per_symbol(
         &symbols,
         parameters.tick_concurrency,
         |symbol| {
@@ -579,11 +576,40 @@ async fn write_trades(
         session,
         u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
         refused_by_cause(&refused),
-        invalid
-            .into_iter()
-            .map(|symbol| (symbol, Unanswered::Invalid))
-            .collect(),
+        unanswered,
     ))
+}
+
+/// The newest conditions snapshot, or, when none reads under this build's layout, today's fetched from Massive and
+/// written first, so the trade leg never waits on an operator.
+async fn trade_conditions(clients: &Clients, journal: &Journal) -> Result<TradeConditions, String> {
+    match latest_conditions(&clients.archive).await {
+        Ok((_, conditions)) => Ok(conditions),
+        Err(reason) => {
+            tracing::warn!(reason, "No readable conditions snapshot; fetching today's");
+            let fetched_at = Utc::now();
+            let conditions = clients
+                .massive
+                .trade_conditions()
+                .await
+                .map_err(|error| error.to_string())?;
+            let key = conditions_key(SessionDate::at(fetched_at));
+            let provenance = Provenance::new(
+                Subscription::StocksStarter,
+                fetched_at,
+                journal.run_id(),
+                journal.commit().cloned(),
+            );
+            let body = encode_conditions(&key, &conditions, &provenance)
+                .map_err(|refusal| format!("{refusal:?}"))?;
+            clients
+                .archive
+                .put(&key, body)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(conditions)
+        }
+    }
 }
 
 fn tick_provenance(journal: &Journal) -> Provenance {
@@ -596,13 +622,14 @@ fn tick_provenance(journal: &Journal) -> Provenance {
 }
 
 /// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` as its symbol
-/// finishes; a symbol Alpaca names invalid is returned rather than failing the session, and any other failure fails it.
+/// finishes. A symbol Alpaca names invalid or answers with no rows is returned as unanswered rather than failing the
+/// session; any other failure fails it.
 async fn per_symbol<Fetch, Pending, Row>(
     symbols: &[Symbol],
     concurrency: NonZeroUsize,
     fetch: Fetch,
     mut each: impl FnMut(Row),
-) -> Result<Vec<Symbol>, FetchError>
+) -> Result<BTreeMap<Symbol, Unanswered>, FetchError>
 where
     Fetch: Fn(Symbol) -> Pending,
     Pending: Future<Output = Result<Vec<Row>, FetchError>> + Send + 'static,
@@ -610,7 +637,7 @@ where
 {
     let mut pending = symbols.iter().cloned();
     let mut in_flight = JoinSet::new();
-    let mut invalid = Vec::new();
+    let mut unanswered = BTreeMap::new();
     loop {
         while in_flight.len() < concurrency.get() {
             let Some(symbol) = pending.next() else {
@@ -620,16 +647,19 @@ where
             in_flight.spawn(async move { (symbol, answer.await) });
         }
         match in_flight.join_next().await {
-            None => return Ok(invalid),
+            None => return Ok(unanswered),
             Some(joined) => {
                 let (symbol, answer) =
                     joined.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
                 match answer {
+                    Ok(rows) if rows.is_empty() => {
+                        unanswered.insert(symbol, Unanswered::Missing);
+                    }
                     Ok(rows) => rows.into_iter().for_each(&mut each),
                     Err(FetchError::Refused { status: 400, body })
                         if invalid_symbol(&body).as_deref() == Some(symbol.as_str()) =>
                     {
-                        invalid.push(symbol);
+                        unanswered.insert(symbol, Unanswered::Invalid);
                     }
                     Err(error) => return Err(error),
                 }
@@ -865,6 +895,40 @@ mod tests {
         drop(first);
         assert!(lock(&directory).is_ok());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_empty_or_invalid_symbol_is_unanswered_and_the_rest_fold() {
+        let symbols: Vec<Symbol> = ["AAA", "BBB", "CCC"]
+            .iter()
+            .map(|name| Symbol::new(name).unwrap())
+            .collect();
+        let mut rows = Vec::new();
+        let unanswered = per_symbol(
+            &symbols,
+            size(2),
+            |symbol| async move {
+                match symbol.as_str() {
+                    "AAA" => Ok(vec![1, 2]),
+                    "BBB" => Ok(vec![]),
+                    _ => Err(FetchError::Refused {
+                        status: 400,
+                        body: format!(r#"{{"message":"invalid symbol: {symbol}"}}"#),
+                    }),
+                }
+            },
+            |row: i32| rows.push(row),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, [1, 2]);
+        assert_eq!(
+            unanswered,
+            BTreeMap::from([
+                (Symbol::new("BBB").unwrap(), Unanswered::Missing),
+                (Symbol::new("CCC").unwrap(), Unanswered::Invalid),
+            ])
+        );
     }
 
     #[tokio::test]

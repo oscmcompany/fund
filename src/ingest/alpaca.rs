@@ -351,11 +351,12 @@ impl Alpaca {
         symbol: &Symbol,
         session: SessionDate,
     ) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
-        let pages = self.tick_pages(QUOTES_URL, symbol, session).await?;
         let mut outcomes = Vec::new();
-        for body in pages {
+        self.tick_pages(QUOTES_URL, symbol, session, |body| {
             outcomes.extend(quote_page(symbol, &body)?);
-        }
+            Ok(())
+        })
+        .await?;
         Ok(outcomes)
     }
 
@@ -365,11 +366,12 @@ impl Alpaca {
         symbol: &Symbol,
         session: SessionDate,
     ) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
-        let pages = self.tick_pages(TRADES_URL, symbol, session).await?;
         let mut outcomes = Vec::new();
-        for body in pages {
+        self.tick_pages(TRADES_URL, symbol, session, |body| {
             outcomes.extend(trade_page(symbol, &body)?);
-        }
+            Ok(())
+        })
+        .await?;
         Ok(outcomes)
     }
 
@@ -378,37 +380,41 @@ impl Alpaca {
         url: &str,
         symbol: &Symbol,
         session: SessionDate,
-    ) -> Result<Vec<Vec<u8>>, FetchError> {
+        on_page: impl FnMut(Vec<u8>) -> Result<(), FetchError>,
+    ) -> Result<(), FetchError> {
         let (start, end) = session.bounds();
         // The endpoint's end is inclusive, so the next session's first nanosecond is excluded.
         let end = end - TimeDelta::nanoseconds(1);
         let as_of = session.to_string();
         let (start, end) = (start.to_rfc3339(), end.to_rfc3339());
         let (start, end, as_of) = (&start, &end, &as_of);
-        paginate(|page_token| async move {
-            with_retries(|| {
-                let mut query = vec![
-                    ("symbols", symbol.as_str()),
-                    ("start", start.as_str()),
-                    ("end", end.as_str()),
-                    ("feed", "sip"),
-                    ("asof", as_of.as_str()),
-                    ("sort", "asc"),
-                    ("limit", PAGE_LIMIT),
-                ];
-                if let Some(token) = page_token.as_deref() {
-                    query.push(("page_token", token));
-                }
-                send(
-                    self.http_client
-                        .get(url)
-                        .header("APCA-API-KEY-ID", &self.key_id)
-                        .header("APCA-API-SECRET-KEY", &self.secret)
-                        .query(&query),
-                )
-            })
-            .await
-        })
+        paginate_each(
+            |page_token| async move {
+                with_retries(|| {
+                    let mut query = vec![
+                        ("symbols", symbol.as_str()),
+                        ("start", start.as_str()),
+                        ("end", end.as_str()),
+                        ("feed", "sip"),
+                        ("asof", as_of.as_str()),
+                        ("sort", "asc"),
+                        ("limit", PAGE_LIMIT),
+                    ];
+                    if let Some(token) = page_token.as_deref() {
+                        query.push(("page_token", token));
+                    }
+                    send(
+                        self.http_client
+                            .get(url)
+                            .header("APCA-API-KEY-ID", &self.key_id)
+                            .header("APCA-API-SECRET-KEY", &self.secret)
+                            .query(&query),
+                    )
+                })
+                .await
+            },
+            on_page,
+        )
         .await
     }
 }
@@ -591,20 +597,37 @@ where
 
 /// Follows `next_page_token` until it is null. A token seen before means the pages cycle, which would otherwise
 /// request forever while holding every page, so it is refused.
-async fn paginate<Fetch, Pending>(mut fetch_page: Fetch) -> Result<Vec<Vec<u8>>, FetchError>
+async fn paginate<Fetch, Pending>(fetch_page: Fetch) -> Result<Vec<Vec<u8>>, FetchError>
 where
     Fetch: FnMut(Option<String>) -> Pending,
     Pending: std::future::Future<Output = Result<Vec<u8>, FetchError>>,
 {
     let mut pages = Vec::new();
+    paginate_each(fetch_page, |body| {
+        pages.push(body);
+        Ok(())
+    })
+    .await?;
+    Ok(pages)
+}
+
+/// `paginate`, handing each page to `on_page` as it arrives so no page outlives its turn.
+async fn paginate_each<Fetch, Pending>(
+    mut fetch_page: Fetch,
+    mut on_page: impl FnMut(Vec<u8>) -> Result<(), FetchError>,
+) -> Result<(), FetchError>
+where
+    Fetch: FnMut(Option<String>) -> Pending,
+    Pending: std::future::Future<Output = Result<Vec<u8>, FetchError>>,
+{
     let mut seen = BTreeSet::new();
     let mut token = None;
     loop {
         let body = fetch_page(token).await?;
         let next = next_page_token(&body)?;
-        pages.push(body);
+        on_page(body)?;
         match next {
-            None => return Ok(pages),
+            None => return Ok(()),
             Some(next) if !seen.insert(next.clone()) => {
                 return Err(FetchError::Malformed {
                     reason: format!("page token {next} repeated"),
