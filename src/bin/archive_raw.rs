@@ -51,7 +51,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
         [command, dataset, first, last, concurrency] if command == "copy" => Some(Command::Copy {
             dataset: dataset.parse().ok()?,
             first: date(first)?,
-            last: date(last)?,
+            last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
             concurrency: concurrency
                 .parse()
                 .ok()
@@ -314,6 +314,11 @@ async fn verify(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
                 .expect("the semaphore is never closed");
             let new = archive.stored(&dataset.key(session)).await;
             let legacy = archive.stored_at(dataset.legacy_path(session)).await;
+            for (copy, read) in [("new", &new), ("legacy", &legacy)] {
+                if let Err(error) = read {
+                    tracing::error!(session = %session, copy, %error, "Copy metadata not read");
+                }
+            }
             (session, compare(new, legacy))
         });
     }
@@ -384,11 +389,11 @@ fn compare(
         (Ok(None), Ok(None)) => Comparison::Unreadable,
         (Ok(Some(_)), Ok(None)) => Comparison::NewOnly,
         (Ok(None), Ok(Some(_))) => Comparison::LegacyOnly,
+        (Ok(Some(new)), Ok(Some(legacy))) if new.length() != legacy.length() => Comparison::Differ,
         (Ok(Some(new)), Ok(Some(legacy))) => match (new.checksum(), legacy.checksum()) {
-            _ if new.length() != legacy.length() => Comparison::Differ,
             (Some(new), Some(legacy)) if new == legacy => Comparison::Equal,
             (Some(_), Some(_)) => Comparison::Differ,
-            (None, _) | (_, None) => Comparison::Unchecksummed,
+            (None, Some(_)) | (Some(_), None) | (None, None) => Comparison::Unchecksummed,
         },
     }
 }
@@ -454,6 +459,17 @@ mod tests {
         for (new, legacy, expected) in cases {
             assert_eq!(compare(new, legacy), expected);
         }
+    }
+
+    #[test]
+    fn test_a_copy_whose_last_session_precedes_its_first_is_bad_usage() {
+        let arguments = |first: &str, last: &str| {
+            ["copy", "quotes", first, last, "4"]
+                .map(String::from)
+                .to_vec()
+        };
+        assert!(parse(&arguments("2021-08-23", "2021-08-23")).is_some());
+        assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
     }
 
     #[test]
