@@ -1,5 +1,6 @@
-//! A strategy that knows nothing: each decision holds each symbol of its universe on a seeded coin flip, so any
-//! return it earns beyond its costs is the replay's own bias.
+//! A strategy that knows nothing: each decision holds each symbol of its universe on a seeded coin flip. Over flat
+//! prices it loses exactly its costs; over moving prices it earns its exposure, so compare it with holding its expected
+//! position.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,7 +51,7 @@ impl Strategy for Noise {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, NaiveDate, Utc};
-    use proptest::prelude::{any, prop, prop_assert, prop_assert_eq, proptest};
+    use proptest::prelude::{any, prop, prop_assert_eq, proptest};
     use proptest::strategy::Strategy as _;
 
     use super::*;
@@ -108,22 +109,27 @@ mod tests {
         .unwrap()
     }
 
-    /// Daily bars of the three symbols over `days` days at arbitrary prices.
-    fn arbitrary_stream(days: usize) -> impl prop::strategy::Strategy<Value = Vec<Bar>> {
-        prop::collection::vec(prop::collection::vec(1..500_000_000i64, 3), days).prop_map(
-            |sessions| {
-                sessions
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(index, prices)| {
-                        ["AAPL", "MSFT", "SPY"]
-                            .into_iter()
-                            .zip(prices)
-                            .map(move |(raw, ticks)| daily(raw, index as i64, ticks))
-                    })
-                    .collect()
-            },
+    /// Daily bars at arbitrary prices over a stream of any length, with sessions skipped and any of the three symbols
+    /// missing from any session.
+    fn arbitrary_stream() -> impl prop::strategy::Strategy<Value = Vec<Bar>> {
+        prop::collection::vec(
+            (
+                1..4i64,
+                prop::collection::vec(prop::option::of(1..500_000_000i64), 3),
+            ),
+            0..25,
         )
+        .prop_map(|sessions| {
+            let mut index = 0;
+            let mut bars = Vec::new();
+            for (gap, prices) in sessions {
+                index += gap;
+                for (raw, ticks) in ["AAPL", "MSFT", "SPY"].into_iter().zip(prices) {
+                    bars.extend(ticks.map(|ticks| daily(raw, index, ticks)));
+                }
+            }
+            bars
+        })
     }
 
     fn costs(replay: &Replay) -> Cash {
@@ -171,6 +177,28 @@ mod tests {
         assert!(seeds.len() > 1);
     }
 
+    /// The flat-price law is not vacuous: a seed over a whole stream trades and pays, and still ends exactly.
+    #[test]
+    fn test_noise_over_flat_prices_trades_and_pays() {
+        let flat = Price::from_ticks(1_000_000).unwrap();
+        let bars = (0..20)
+            .flat_map(|index| ["AAPL", "MSFT", "SPY"].map(|raw| daily(raw, index, flat.ticks())));
+        let opening = Cash::from_units(1_000_000 * 1_000_000_000_000);
+        let replay = Replayer::new(
+            noise(3),
+            FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap(),
+            BarInterval::OneDay,
+        )
+        .act(Replay::open(Book::funded(opening)), bars)
+        .unwrap();
+        assert!(replay.fills().len() > 5, "{}", replay.fills().len());
+        assert!(costs(&replay) < Cash::empty());
+        assert_eq!(
+            replay.book().value(|_| Some(flat)),
+            Ok(opening.combine(costs(&replay)))
+        );
+    }
+
     /// The control can fail: over a stream where every price doubles, noise's gross return is not zero.
     #[test]
     fn test_noise_over_moving_prices_earns_more_than_its_costs() {
@@ -194,7 +222,7 @@ mod tests {
         /// Where no price moves, noise ends at its opening less exactly its costs, whatever the seed and spread.
         #[test]
         fn property_noise_over_flat_prices_loses_exactly_its_costs(
-            bars in arbitrary_stream(15),
+            bars in arbitrary_stream(),
             seed in any::<u64>(),
             spread in 0.0..100.0f64,
             ticks in 1..500_000_000i64,
@@ -209,7 +237,6 @@ mod tests {
             .act(Replay::open(Book::funded(opening)), bars.iter().map(|bar| bar.at_price(flat)))
             .unwrap()
             .finish();
-            prop_assert!(!replay.fills().is_empty());
             prop_assert_eq!(replay.book().value(|_| Some(flat)), Ok(opening.combine(costs(&replay))));
         }
     }
