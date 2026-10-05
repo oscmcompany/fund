@@ -345,7 +345,9 @@ mod tests {
     use crate::archive::bars::Subscription;
     use crate::common::journal::RunId;
     use crate::common::market::record::Trade;
-    use crate::common::market::trade_bars::{Print, TradeConditions, TradeFold, UpdateRules};
+    use crate::common::market::trade_bars::{
+        Condition, Print, TradeConditions, TradeFold, UpdateRules,
+    };
     use crate::common::storage::Origin;
 
     #[test]
@@ -359,7 +361,10 @@ mod tests {
         };
         let mut fold = TradeFold::new(
             session,
-            TradeConditions::new(BTreeMap::from([(37, UpdateRules::new(true, false, false))])),
+            TradeConditions::new(BTreeMap::from([(
+                37,
+                Condition::new(UpdateRules::new(true, false, false), None, None, false),
+            )])),
         );
         for (at, dollars, shares, codes) in [
             ("2026-10-02T13:30:01.000000123Z", 100.01, 300.0, vec![]),

@@ -39,44 +39,179 @@ impl UpdateRules {
     pub fn open_close(&self) -> bool {
         self.open_close
     }
+
+    /// The updates both rules allow.
+    fn and(self, other: Self) -> Self {
+        Self::new(
+            self.volume && other.volume,
+            self.high_low && other.high_low,
+            self.open_close && other.open_close,
+        )
+    }
 }
 
-/// The vendor's sale conditions by code, with the rules each imposes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TradeConditions(BTreeMap<u16, UpdateRules>);
+/// The consolidated tape a print was reported on, which decides how its condition letters read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tape {
+    /// Tapes A and B, NYSE and other listings, under the Consolidated Tape Association's letters.
+    ConsolidatedTape,
+    /// Tape C, Nasdaq listings, under the Unlisted Trading Privileges plan's letters.
+    UnlistedTrading,
+}
 
-/// What a print's conditions let it update; a code the table does not hold leaves the print unresolved.
+impl Tape {
+    /// The letter that marks a regular sale, which carries no condition of its own.
+    fn regular_sale(self) -> char {
+        match self {
+            Self::ConsolidatedTape => ' ',
+            Self::UnlistedTrading => '@',
+        }
+    }
+}
+
+/// One sale condition: the rules it imposes and the letter each tape spells it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Condition {
+    rules: UpdateRules,
+    consolidated_tape: Option<char>,
+    unlisted_trading: Option<char>,
+    /// The vendor keeps the code for history; a current print spelled with its letter means the current condition.
+    retired: bool,
+}
+
+impl Condition {
+    pub fn new(
+        rules: UpdateRules,
+        consolidated_tape: Option<char>,
+        unlisted_trading: Option<char>,
+        retired: bool,
+    ) -> Self {
+        Self {
+            rules,
+            consolidated_tape,
+            unlisted_trading,
+            retired,
+        }
+    }
+
+    pub fn rules(&self) -> UpdateRules {
+        self.rules
+    }
+
+    pub fn consolidated_tape(&self) -> Option<char> {
+        self.consolidated_tape
+    }
+
+    pub fn unlisted_trading(&self) -> Option<char> {
+        self.unlisted_trading
+    }
+
+    pub fn retired(&self) -> bool {
+        self.retired
+    }
+
+    fn letter(&self, tape: Tape) -> Option<char> {
+        match tape {
+            Tape::ConsolidatedTape => self.consolidated_tape,
+            Tape::UnlistedTrading => self.unlisted_trading,
+        }
+    }
+}
+
+/// The vendor's sale conditions by code, with each tape letter's rules indexed from them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeConditions {
+    conditions: BTreeMap<u16, Condition>,
+    /// Derived from `conditions` at construction: the rules a current condition's letter imposes on each tape, or
+    /// `None` where two current conditions share the letter and disagree.
+    letters: BTreeMap<(Tape, char), Option<UpdateRules>>,
+}
+
+/// What a print's conditions let it update; a condition the table cannot place leaves the print unresolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eligibility {
     /// Every condition is known; a print updates what all of them allow.
     Resolved(UpdateRules),
-    /// A condition the table does not hold: the print still counts toward volume, as the legacy fold counted it, but
-    /// sets no price, since nothing says it may.
-    Unresolved { code: u16 },
+    /// A condition the table does not place: the print still counts toward volume, as the legacy fold counted it,
+    /// but sets no price, since nothing says it may.
+    Unresolved(Unplaced),
+}
+
+/// Why a print's condition could not be placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unplaced {
+    UnknownCode {
+        code: u16,
+    },
+    UnknownLetter {
+        tape: Tape,
+        letter: char,
+    },
+    /// Two current conditions share the letter with different rules.
+    AmbiguousLetter {
+        tape: Tape,
+        letter: char,
+    },
 }
 
 impl TradeConditions {
-    pub fn new(rules: BTreeMap<u16, UpdateRules>) -> Self {
-        Self(rules)
+    pub fn new(conditions: BTreeMap<u16, Condition>) -> Self {
+        let mut letters: BTreeMap<(Tape, char), Option<UpdateRules>> = BTreeMap::new();
+        for condition in conditions.values().filter(|condition| !condition.retired) {
+            for tape in [Tape::ConsolidatedTape, Tape::UnlistedTrading] {
+                if let Some(letter) = condition.letter(tape) {
+                    let entry = letters
+                        .entry((tape, letter))
+                        .or_insert(Some(condition.rules));
+                    if *entry != Some(condition.rules) {
+                        *entry = None;
+                    }
+                }
+            }
+        }
+        Self {
+            conditions,
+            letters,
+        }
     }
 
-    pub fn rules(&self) -> &BTreeMap<u16, UpdateRules> {
-        &self.0
+    pub fn conditions(&self) -> &BTreeMap<u16, Condition> {
+        &self.conditions
     }
 
-    /// The rules a print with `codes` falls under: each update allowed only if every code allows it.
+    /// The rules a print with numeric `codes` falls under: each update allowed only if every code allows it.
     pub fn eligibility(&self, codes: &[u16]) -> Eligibility {
         let mut allowed = UpdateRules::new(true, true, true);
         for code in codes {
-            match self.0.get(code) {
-                Some(rules) => {
-                    allowed = UpdateRules::new(
-                        allowed.volume && rules.volume,
-                        allowed.high_low && rules.high_low,
-                        allowed.open_close && rules.open_close,
-                    );
+            match self.conditions.get(code) {
+                Some(condition) => allowed = allowed.and(condition.rules),
+                None => return Eligibility::Unresolved(Unplaced::UnknownCode { code: *code }),
+            }
+        }
+        Eligibility::Resolved(allowed)
+    }
+
+    /// The rules a print reported on `tape` with condition `letters` falls under; the regular-sale letter adds none.
+    pub fn eligibility_of_letters(&self, tape: Tape, letters: &[char]) -> Eligibility {
+        let mut allowed = UpdateRules::new(true, true, true);
+        for letter in letters
+            .iter()
+            .filter(|letter| **letter != tape.regular_sale())
+        {
+            match self.letters.get(&(tape, *letter)) {
+                Some(Some(rules)) => allowed = allowed.and(*rules),
+                Some(None) => {
+                    return Eligibility::Unresolved(Unplaced::AmbiguousLetter {
+                        tape,
+                        letter: *letter,
+                    });
                 }
-                None => return Eligibility::Unresolved { code: *code },
+                None => {
+                    return Eligibility::Unresolved(Unplaced::UnknownLetter {
+                        tape,
+                        letter: *letter,
+                    });
+                }
             }
         }
         Eligibility::Resolved(allowed)
@@ -478,8 +613,20 @@ impl TradeFold {
         }
     }
 
-    /// Folds one print carrying the vendor's condition `codes`, unless it is another session's or was corrected.
+    /// Folds one print carrying the vendor's numeric condition `codes`.
     pub fn push(&mut self, print: &Print, codes: &[u16], corrected: bool) {
+        let eligibility = self.conditions.eligibility(codes);
+        self.push_eligible(print, eligibility, corrected);
+    }
+
+    /// Folds one print reported on `tape` with condition `letters`, as Alpaca spells them.
+    pub fn push_lettered(&mut self, print: &Print, tape: Tape, letters: &[char], corrected: bool) {
+        let eligibility = self.conditions.eligibility_of_letters(tape, letters);
+        self.push_eligible(print, eligibility, corrected);
+    }
+
+    /// Folds one print under `eligibility`, unless it is another session's or was corrected.
+    fn push_eligible(&mut self, print: &Print, eligibility: Eligibility, corrected: bool) {
         if SessionDate::at(print.timestamp()) != self.session {
             self.counts.other_session += 1;
             return;
@@ -488,9 +635,9 @@ impl TradeFold {
             self.counts.corrected += 1;
             return;
         }
-        let allowed = match self.conditions.eligibility(codes) {
+        let allowed = match eligibility {
             Eligibility::Resolved(allowed) => allowed,
-            Eligibility::Unresolved { .. } => {
+            Eligibility::Unresolved(_) => {
                 self.counts.unresolved += 1;
                 UpdateRules::new(true, false, false)
             }
@@ -541,9 +688,18 @@ mod tests {
     /// 2026-10-05.
     fn conditions() -> TradeConditions {
         TradeConditions::new(BTreeMap::from([
-            (10, UpdateRules::new(true, true, false)),
-            (15, UpdateRules::new(false, false, false)),
-            (37, UpdateRules::new(true, false, false)),
+            (
+                10,
+                Condition::new(UpdateRules::new(true, true, false), None, None, false),
+            ),
+            (
+                15,
+                Condition::new(UpdateRules::new(false, false, false), None, None, false),
+            ),
+            (
+                37,
+                Condition::new(UpdateRules::new(true, false, false), None, None, false),
+            ),
         ]))
     }
 
@@ -595,8 +751,14 @@ mod tests {
     fn test_the_closing_cross_after_four_sets_the_close_and_after_hours_adds_volume_only() {
         // The closing print's code sets everything and lands after 16:00 Eastern; Form T only adds volume.
         let conditions = TradeConditions::new(BTreeMap::from([
-            (8, UpdateRules::new(true, true, true)),
-            (12, UpdateRules::new(true, false, false)),
+            (
+                8,
+                Condition::new(UpdateRules::new(true, true, true), None, None, false),
+            ),
+            (
+                12,
+                Condition::new(UpdateRules::new(true, false, false), None, None, false),
+            ),
         ]));
         let mut fold = TradeFold::new(october_second(), conditions);
         fold.push(&trade("2026-10-02T19:59:59Z", 100.00, 100.0), &[], false);
@@ -618,8 +780,10 @@ mod tests {
     #[test]
     fn test_the_unsized_corrected_close_sets_the_close_and_no_volume() {
         // Code 38 as Massive's table gives it: no volume, but the high, low, open and close.
-        let conditions =
-            TradeConditions::new(BTreeMap::from([(38, UpdateRules::new(false, true, true))]));
+        let conditions = TradeConditions::new(BTreeMap::from([(
+            38,
+            Condition::new(UpdateRules::new(false, true, true), None, None, false),
+        )]));
         let mut fold = TradeFold::new(october_second(), conditions);
         fold.push(&trade("2026-10-02T19:59:55Z", 87.67, 100.0), &[], false);
         let corrected_close = Print::Unsized {
@@ -640,6 +804,57 @@ mod tests {
         assert_eq!(sums.totals().count().count(), 1);
         assert_eq!(sums.totals().volume().units(), 100_000_000);
         assert_eq!(counts.unsized_prints(), 1);
+    }
+
+    #[test]
+    fn test_a_letter_reads_as_the_current_condition_it_spells() {
+        // As Massive lists them: CTA "I" is the retired CAP election (6) and the odd lot (37); "K" is rules 155 and 127.
+        let everything = UpdateRules::new(true, true, true);
+        let conditions = TradeConditions::new(BTreeMap::from([
+            (6, Condition::new(everything, Some('I'), None, true)),
+            (
+                37,
+                Condition::new(
+                    UpdateRules::new(true, false, false),
+                    Some('I'),
+                    Some('I'),
+                    false,
+                ),
+            ),
+            (23, Condition::new(everything, Some('K'), None, false)),
+            (24, Condition::new(everything, Some('K'), None, false)),
+            (9, Condition::new(everything, None, Some('X'), false)),
+            (
+                41,
+                Condition::new(UpdateRules::new(true, false, true), None, Some('X'), false),
+            ),
+        ]));
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::ConsolidatedTape, &[' ', 'I']),
+            Eligibility::Resolved(UpdateRules::new(true, false, false))
+        );
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::ConsolidatedTape, &['K']),
+            Eligibility::Resolved(everything)
+        );
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::UnlistedTrading, &['@']),
+            Eligibility::Resolved(everything)
+        );
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::UnlistedTrading, &['X']),
+            Eligibility::Unresolved(Unplaced::AmbiguousLetter {
+                tape: Tape::UnlistedTrading,
+                letter: 'X'
+            })
+        );
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::ConsolidatedTape, &['Z']),
+            Eligibility::Unresolved(Unplaced::UnknownLetter {
+                tape: Tape::ConsolidatedTape,
+                letter: 'Z'
+            })
+        );
     }
 
     #[test]

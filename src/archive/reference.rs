@@ -16,12 +16,15 @@ use super::parquet;
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
-use crate::common::market::trade_bars::{TradeConditions, UpdateRules};
+use crate::common::market::trade_bars::{Condition, TradeConditions, UpdateRules};
 use crate::common::market::{Dollars, Shares, Symbol};
 use crate::common::storage::{Key, Provider, ReferenceTable};
 
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
+
+/// The conditions layout, which gained each condition's tape letters and retired flag after its first snapshot.
+const CONDITIONS_LAYOUT_VERSION: &str = "2";
 
 const SHARES_TYPE: DataType = DataType::Decimal128(20, 6);
 /// Dollars in millionths up to `u64::MAX`, twenty digits.
@@ -100,6 +103,9 @@ fn conditions_schema() -> Schema {
         Field::new("updates_volume", DataType::Boolean, false),
         Field::new("updates_high_low", DataType::Boolean, false),
         Field::new("updates_open_close", DataType::Boolean, false),
+        Field::new("consolidated_tape_letter", DataType::Utf8, true),
+        Field::new("unlisted_trading_letter", DataType::Utf8, true),
+        Field::new("retired", DataType::Boolean, false),
     ])
 }
 
@@ -117,19 +123,30 @@ pub fn encode_conditions(
         });
     }
     let mut codes = UInt16Builder::new();
-    let mut flags: [BooleanBuilder; 3] = std::array::from_fn(|_| BooleanBuilder::new());
-    for (code, rules) in conditions.rules() {
+    let mut flags: [BooleanBuilder; 4] = std::array::from_fn(|_| BooleanBuilder::new());
+    let mut letters: [StringBuilder; 2] = std::array::from_fn(|_| StringBuilder::new());
+    for (code, condition) in conditions.conditions() {
+        let rules = condition.rules();
         codes.append_value(*code);
-        for (builder, flag) in
-            flags
-                .iter_mut()
-                .zip([rules.volume(), rules.high_low(), rules.open_close()])
-        {
+        for (builder, flag) in flags.iter_mut().zip([
+            rules.volume(),
+            rules.high_low(),
+            rules.open_close(),
+            condition.retired(),
+        ]) {
             builder.append_value(flag);
         }
+        for (builder, letter) in letters
+            .iter_mut()
+            .zip([condition.consolidated_tape(), condition.unlisted_trading()])
+        {
+            builder.append_option(letter.map(String::from));
+        }
     }
-    let [volume, high_low, open_close] =
+    let [volume, high_low, open_close, retired] =
         flags.map(|mut builder| Arc::new(builder.finish()) as ArrayRef);
+    let [consolidated_tape, unlisted_trading] =
+        letters.map(|mut builder| Arc::new(builder.finish()) as ArrayRef);
     let metadata = provenance
         .entries()
         .into_iter()
@@ -137,8 +154,16 @@ pub fn encode_conditions(
         .collect();
     parquet::write(
         conditions_schema(),
-        vec![Arc::new(codes.finish()), volume, high_low, open_close],
-        LAYOUT_VERSION,
+        vec![
+            Arc::new(codes.finish()),
+            volume,
+            high_low,
+            open_close,
+            consolidated_tape,
+            unlisted_trading,
+            retired,
+        ],
+        CONDITIONS_LAYOUT_VERSION,
         metadata,
     )
     .map_err(|reason| ReferenceRefusal::Parquet { reason })
@@ -150,7 +175,7 @@ pub fn decode_conditions(
     bytes: Vec<u8>,
 ) -> Result<(TradeConditions, Provenance), ReferenceRefusal> {
     let provider = table_provider(key, ReferenceTable::Conditions)?;
-    let (batches, entries) = parquet::read(bytes, &conditions_schema(), LAYOUT_VERSION)?;
+    let (batches, entries) = parquet::read(bytes, &conditions_schema(), CONDITIONS_LAYOUT_VERSION)?;
     let provenance =
         provenance_from(&entries).map_err(|name| ReferenceRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
@@ -166,13 +191,36 @@ pub fn decode_conditions(
             parquet::downcast::<BooleanArray>(batch.column(1))?,
             parquet::downcast::<BooleanArray>(batch.column(2))?,
             parquet::downcast::<BooleanArray>(batch.column(3))?,
+            parquet::downcast::<BooleanArray>(batch.column(6))?,
+        ];
+        let letters = [
+            parquet::downcast::<StringArray>(batch.column(4))?,
+            parquet::downcast::<StringArray>(batch.column(5))?,
         ];
         for row in 0..batch.num_rows() {
             let code = codes.value(row);
-            let rule = UpdateRules::new(
-                flags[0].value(row),
-                flags[1].value(row),
-                flags[2].value(row),
+            let letter = |array: &StringArray| match array.is_valid(row) {
+                false => Ok(None),
+                true => {
+                    let mut characters = array.value(row).chars();
+                    match (characters.next(), characters.next()) {
+                        (Some(letter), None) => Ok(Some(letter)),
+                        (None, _) | (Some(_), Some(_)) => Err(ReferenceRefusal::Row {
+                            index: row,
+                            reason: format!("condition {code} letter `{}`", array.value(row)),
+                        }),
+                    }
+                }
+            };
+            let rule = Condition::new(
+                UpdateRules::new(
+                    flags[0].value(row),
+                    flags[1].value(row),
+                    flags[2].value(row),
+                ),
+                letter(letters[0])?,
+                letter(letters[1])?,
+                flags[3].value(row),
             );
             if rules.insert(code, rule).is_some() {
                 return Err(ReferenceRefusal::Duplicate { code });
@@ -355,9 +403,18 @@ mod tests {
     #[test]
     fn test_conditions_read_back_exactly_and_only_from_their_table() {
         let conditions = TradeConditions::new(BTreeMap::from([
-            (10, UpdateRules::new(true, true, false)),
-            (15, UpdateRules::new(false, false, false)),
-            (37, UpdateRules::new(true, false, false)),
+            (
+                10,
+                Condition::new(UpdateRules::new(true, true, false), None, None, false),
+            ),
+            (
+                15,
+                Condition::new(UpdateRules::new(false, false, false), None, None, false),
+            ),
+            (
+                37,
+                Condition::new(UpdateRules::new(true, false, false), None, None, false),
+            ),
         ]));
         let provenance = Provenance::new(
             Subscription::StocksStarter,

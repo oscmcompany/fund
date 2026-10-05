@@ -9,7 +9,7 @@ use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::security_details::SecurityType;
-use crate::common::market::trade_bars::{TradeConditions, UpdateRules};
+use crate::common::market::trade_bars::{Condition, TradeConditions, UpdateRules};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
 
@@ -205,6 +205,12 @@ struct ConditionRow {
     #[serde(rename = "type")]
     kind: String,
     update_rules: Option<ConditionUpdateRules>,
+    /// The letter each tape spells the condition with, keyed by the vendor's name for the plan.
+    #[serde(default)]
+    sip_mapping: BTreeMap<String, String>,
+    /// Kept for history and no longer printed.
+    #[serde(default)]
+    legacy: bool,
 }
 
 #[derive(Deserialize)]
@@ -241,7 +247,24 @@ fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
                     consolidated.updates_high_low,
                     consolidated.updates_open_close,
                 );
-                if rules.insert(row.id, rule).is_some() {
+                let letter = |plan: &str| -> Result<Option<char>, FetchError> {
+                    match row
+                        .sip_mapping
+                        .get(plan)
+                        .map(|spelled| spelled.chars().collect::<Vec<_>>())
+                    {
+                        None => Ok(None),
+                        Some(letters) => match letters.as_slice() {
+                            [letter] => Ok(Some(*letter)),
+                            _ => Err(malformed(format!(
+                                "condition {} spells {plan} as {letters:?}",
+                                row.id
+                            ))),
+                        },
+                    }
+                };
+                let condition = Condition::new(rule, letter("CTA")?, letter("UTP")?, row.legacy);
+                if rules.insert(row.id, condition).is_some() {
                     return Err(malformed(format!("condition {} is listed twice", row.id)));
                 }
             }
@@ -522,14 +545,20 @@ mod tests {
     #[test]
     fn test_conditions_keep_the_trade_kinds_with_their_consolidated_rules() {
         let conditions = parse_trade_conditions(CONDITIONS.as_bytes()).unwrap();
-        let codes: Vec<u16> = conditions.rules().keys().copied().collect();
+        let codes: Vec<u16> = conditions.conditions().keys().copied().collect();
         assert_eq!(codes, [10, 37, 41]);
-        assert_eq!(conditions.rules()[&10], UpdateRules::new(true, true, false));
+        let condition = |code: u16| conditions.conditions()[&code];
+        assert_eq!(condition(10).rules(), UpdateRules::new(true, true, false));
+        assert_eq!(condition(37).rules(), UpdateRules::new(true, false, false));
+        assert_eq!(condition(41).rules(), UpdateRules::new(true, true, true));
         assert_eq!(
-            conditions.rules()[&37],
-            UpdateRules::new(true, false, false)
+            (
+                condition(41).consolidated_tape(),
+                condition(41).unlisted_trading()
+            ),
+            (Some('1'), Some('X'))
         );
-        assert_eq!(conditions.rules()[&41], UpdateRules::new(true, true, true));
+        assert!(!condition(37).retired());
     }
 
     #[test]

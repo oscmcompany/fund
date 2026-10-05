@@ -1271,7 +1271,7 @@ async fn fetch_conditions(
             Ok(()) => {
                 tracing::info!(
                     path = key.path(),
-                    codes = conditions.rules().len(),
+                    codes = conditions.conditions().len(),
                     "Wrote the conditions table"
                 );
                 ExitCode::SUCCESS
@@ -1345,7 +1345,7 @@ async fn fold_trades(
     };
     tracing::info!(
         conditions = conditions_key.path(),
-        codes = conditions.rules().len(),
+        codes = conditions.conditions().len(),
         "Read the conditions table"
     );
     let calendar = match alpaca.calendar(first, last).await {
