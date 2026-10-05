@@ -12,6 +12,7 @@ use serde::Deserialize;
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
+use crate::common::market::trade_bars::Print;
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
@@ -563,8 +564,8 @@ struct TradeRow {
 /// What one trade row became.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TradeRowOutcome {
-    Trade {
-        trade: Trade,
+    Print {
+        print: Print,
         conditions: Vec<u16>,
         corrected: bool,
     },
@@ -623,13 +624,23 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
         Err(cause) => return refused(RowRefusal::Shares(cause)),
     };
     let timestamp = DateTime::from_timestamp_nanos(row.sip_timestamp);
-    match Trade::new(symbol, timestamp, price, size) {
-        Ok(trade) => TradeRowOutcome::Trade {
-            trade,
-            conditions,
-            corrected: row.correction.is_some_and(|correction| correction != 0),
+    let corrected = row.correction.is_some_and(|correction| correction != 0);
+    // A price published with no shares, such as the corrected consolidated close, is a print but not a trade.
+    let print = match size.is_zero() {
+        true => Print::Unsized {
+            symbol,
+            timestamp,
+            price,
         },
-        Err(cause) => refused(RowRefusal::Trade(cause)),
+        false => match Trade::new(symbol, timestamp, price, size) {
+            Ok(trade) => Print::Trade(trade),
+            Err(cause) => return refused(RowRefusal::Trade(cause)),
+        },
+    };
+    TradeRowOutcome::Print {
+        print,
+        conditions,
+        corrected,
     }
 }
 
@@ -844,8 +855,8 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
         read_trades(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
         assert_eq!(outcomes.len(), 4);
         match &outcomes[0] {
-            TradeRowOutcome::Trade {
-                trade,
+            TradeRowOutcome::Print {
+                print: Print::Trade(trade),
                 conditions,
                 corrected,
             } => {
@@ -854,21 +865,24 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
                 assert_eq!(conditions, &[12, 37]);
                 assert!(!corrected);
             }
-            other @ (TradeRowOutcome::TestTicker | TradeRowOutcome::Refused(_)) => {
-                panic!("{other:?}")
-            }
+            other @ (TradeRowOutcome::Print { .. }
+            | TradeRowOutcome::TestTicker
+            | TradeRowOutcome::Refused(_)) => panic!("{other:?}"),
         }
         assert!(matches!(
             &outcomes[1],
-            TradeRowOutcome::Trade { conditions, corrected: true, .. } if conditions.is_empty()
+            TradeRowOutcome::Print { conditions, corrected: true, .. } if conditions.is_empty()
         ));
-        let causes: Vec<&'static str> = outcomes[2..]
-            .iter()
-            .map(|outcome| match outcome {
-                TradeRowOutcome::Refused(row) => row.cause().into(),
-                TradeRowOutcome::Trade { .. } | TradeRowOutcome::TestTicker => "kept",
-            })
-            .collect();
-        assert_eq!(causes, ["conditions", "trade"]);
+        assert!(matches!(
+            &outcomes[2],
+            TradeRowOutcome::Refused(row) if <&'static str>::from(row.cause()) == "conditions"
+        ));
+        assert!(matches!(
+            &outcomes[3],
+            TradeRowOutcome::Print {
+                print: Print::Unsized { .. },
+                ..
+            }
+        ));
     }
 }

@@ -83,6 +83,41 @@ impl TradeConditions {
     }
 }
 
+/// One print as the fold sees it: a trade, or a price published with no shares, as the corrected consolidated close
+/// is after the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Print {
+    Trade(Trade),
+    Unsized {
+        symbol: Symbol,
+        timestamp: DateTime<Utc>,
+        price: Price,
+    },
+}
+
+impl Print {
+    pub fn symbol(&self) -> &Symbol {
+        match self {
+            Self::Trade(trade) => trade.symbol(),
+            Self::Unsized { symbol, .. } => symbol,
+        }
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Self::Trade(trade) => trade.timestamp(),
+            Self::Unsized { timestamp, .. } => *timestamp,
+        }
+    }
+
+    pub fn price(&self) -> Price {
+        match self {
+            Self::Trade(trade) => trade.price(),
+            Self::Unsized { price, .. } => *price,
+        }
+    }
+}
+
 /// The earliest and latest prices a bar's eligible prints set; equal instants break on price so the combine is
 /// commutative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +131,10 @@ impl OpenClose {
         Self { open, close }
     }
 
-    fn of(trade: &Trade) -> Self {
+    fn of(print: &Print) -> Self {
         Self::new(
-            (trade.timestamp(), trade.price()),
-            (trade.timestamp(), trade.price()),
+            (print.timestamp(), print.price()),
+            (print.timestamp(), print.price()),
         )
     }
 
@@ -142,10 +177,10 @@ impl HighLow {
         Ok(Self { high, low })
     }
 
-    fn of(trade: &Trade) -> Self {
+    fn of(print: &Print) -> Self {
         Self {
-            high: trade.price(),
-            low: trade.price(),
+            high: print.price(),
+            low: print.price(),
         }
     }
 
@@ -187,16 +222,16 @@ impl TradeSums {
         }
     }
 
-    /// The sums one print contributes under the updates it is allowed.
-    fn of(trade: &Trade, allowed: UpdateRules) -> Self {
+    /// The sums one print contributes under the updates it is allowed; a print with no shares adds no totals.
+    fn of(print: &Print, allowed: UpdateRules) -> Self {
+        let totals = match print {
+            Print::Trade(trade) if allowed.volume => TradeTotals::of(trade),
+            Print::Trade(_) | Print::Unsized { .. } => TradeTotals::empty(),
+        };
         Self {
-            totals: if allowed.volume {
-                TradeTotals::of(trade)
-            } else {
-                TradeTotals::empty()
-            },
-            open_close: allowed.open_close.then(|| OpenClose::of(trade)),
-            high_low: allowed.high_low.then(|| HighLow::of(trade)),
+            totals,
+            open_close: allowed.open_close.then(|| OpenClose::of(print)),
+            high_low: allowed.high_low.then(|| HighLow::of(print)),
         }
     }
 
@@ -327,13 +362,13 @@ impl TradeRollup {
         Ok(Self(BTreeMap::from([(key, bar.sums)])))
     }
 
-    fn print(trade: &Trade, allowed: UpdateRules) -> Self {
+    fn print(print: &Print, allowed: UpdateRules) -> Self {
         let key = (
-            trade.symbol().clone(),
+            print.symbol().clone(),
             BarInterval::OneMinute,
-            bucket(trade.timestamp(), BarInterval::OneMinute),
+            bucket(print.timestamp(), BarInterval::OneMinute),
         );
-        Self(BTreeMap::from([(key, TradeSums::of(trade, allowed))]))
+        Self(BTreeMap::from([(key, TradeSums::of(print, allowed))]))
     }
 
     /// Every bar built, ordered by symbol, interval and timestamp.
@@ -376,6 +411,8 @@ pub struct TradeFoldCounts {
     /// Marked as corrected by the vendor, which leaves them out entirely.
     corrected: u64,
     volume_ineligible: u64,
+    /// Published with no shares, which may set prices and never volume.
+    unsized_prints: u64,
     unresolved: u64,
 }
 
@@ -394,6 +431,10 @@ impl TradeFoldCounts {
 
     pub fn volume_ineligible(&self) -> u64 {
         self.volume_ineligible
+    }
+
+    pub fn unsized_prints(&self) -> u64 {
+        self.unsized_prints
     }
 
     pub fn unresolved(&self) -> u64 {
@@ -421,8 +462,8 @@ impl TradeFold {
     }
 
     /// Folds one print carrying the vendor's condition `codes`, unless it is another session's or was corrected.
-    pub fn push(&mut self, trade: &Trade, codes: &[u16], corrected: bool) {
-        if SessionDate::at(trade.timestamp()) != self.session {
+    pub fn push(&mut self, print: &Print, codes: &[u16], corrected: bool) {
+        if SessionDate::at(print.timestamp()) != self.session {
             self.counts.other_session += 1;
             return;
         }
@@ -437,12 +478,14 @@ impl TradeFold {
                 UpdateRules::new(true, false, false)
             }
         };
-        if !allowed.volume {
-            self.counts.volume_ineligible += 1;
+        match print {
+            Print::Trade(_) if !allowed.volume => self.counts.volume_ineligible += 1,
+            Print::Unsized { .. } => self.counts.unsized_prints += 1,
+            Print::Trade(_) => {}
         }
         self.counts.folded += 1;
         let minutes = std::mem::take(&mut self.minutes);
-        self.minutes = minutes.combine(TradeRollup::print(trade, allowed));
+        self.minutes = minutes.combine(TradeRollup::print(print, allowed));
     }
 
     /// The one-minute bars and what the fold did with every print.
@@ -463,7 +506,11 @@ mod tests {
         text.parse().unwrap()
     }
 
-    fn trade(at: &str, dollars: f64, shares: f64) -> Trade {
+    fn trade(at: &str, dollars: f64, shares: f64) -> Print {
+        Print::Trade(trade_record(at, dollars, shares))
+    }
+
+    fn trade_record(at: &str, dollars: f64, shares: f64) -> Trade {
         Trade::new(
             Symbol::new("AAPL").unwrap(),
             instant(at),
@@ -552,6 +599,33 @@ mod tests {
     }
 
     #[test]
+    fn test_the_unsized_corrected_close_sets_the_close_and_no_volume() {
+        // Code 38 as Massive's table gives it: no volume, but the high, low, open and close.
+        let conditions =
+            TradeConditions::new(BTreeMap::from([(38, UpdateRules::new(false, true, true))]));
+        let mut fold = TradeFold::new(october_second(), conditions);
+        fold.push(&trade("2026-10-02T19:59:55Z", 87.67, 100.0), &[], false);
+        let corrected_close = Print::Unsized {
+            symbol: Symbol::new("AAPL").unwrap(),
+            timestamp: instant("2026-10-02T20:10:00.003861Z"),
+            price: Price::from_dollars(87.68).unwrap(),
+        };
+        fold.push(&corrected_close, &[38], false);
+        let (minutes, counts) = fold.finish();
+        let daily = concatenate(
+            minutes
+                .iter()
+                .map(|bar| TradeRollup::of(bar, BarInterval::OneDay).unwrap()),
+        )
+        .into_bars();
+        let sums = daily[0].sums();
+        assert_eq!(sums.open_close().unwrap().close().1.ticks(), 87_680_000);
+        assert_eq!(sums.totals().count().count(), 1);
+        assert_eq!(sums.totals().volume().units(), 100_000_000);
+        assert_eq!(counts.unsized_prints(), 1);
+    }
+
+    #[test]
     fn test_an_unknown_condition_counts_volume_and_sets_no_price() {
         let mut fold = session();
         fold.push(&trade("2026-10-02T13:30:01Z", 100.00, 50.0), &[99], false);
@@ -579,7 +653,10 @@ mod tests {
                     Shares::from_units(units),
                 )
                 .unwrap();
-                TradeRollup::print(&trade, UpdateRules::new(volume, high_low, open_close))
+                TradeRollup::print(
+                    &Print::Trade(trade),
+                    UpdateRules::new(volume, high_low, open_close),
+                )
             })
     }
 

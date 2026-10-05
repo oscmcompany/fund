@@ -1382,11 +1382,11 @@ async fn fold_trades_one(
         let mut test_tickers = 0_u64;
         let mut refused = Vec::new();
         read_trades(stream, |outcome| match outcome {
-            TradeRowOutcome::Trade {
-                trade,
+            TradeRowOutcome::Print {
+                print,
                 conditions,
                 corrected,
-            } => fold.push(&trade, &conditions, corrected),
+            } => fold.push(&print, &conditions, corrected),
             TradeRowOutcome::TestTicker => test_tickers += 1,
             TradeRowOutcome::Refused(row) => refused.push(row),
         })
@@ -1430,6 +1430,7 @@ async fn fold_trades_one(
         other_session = counts.other_session(),
         corrected = counts.corrected(),
         volume_ineligible = counts.volume_ineligible(),
+        unsized_prints = counts.unsized_prints(),
         unresolved = counts.unresolved(),
         test_tickers,
         refused = refused.len(),
