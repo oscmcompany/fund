@@ -982,6 +982,8 @@ enum FoldFailure {
     Archive(ArchiveError),
     Interrupted(String),
     Empty,
+    /// An earlier run wrote different bars under the key, which this run will not replace.
+    Held(String),
 }
 
 impl std::fmt::Display for FoldFailure {
@@ -992,6 +994,7 @@ impl std::fmt::Display for FoldFailure {
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Interrupted(reason) => write!(formatter, "the fold did not finish: {reason}"),
             Self::Empty => write!(formatter, "nothing the fold could keep fell in the session"),
+            Self::Held(path) => write!(formatter, "{path} already holds different bars"),
         }
     }
 }
@@ -1209,10 +1212,10 @@ async fn fold_quotes_one(
     for (key, bars) in files {
         let body = quote_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
-        archive
-            .create(&key, body)
-            .await
-            .map_err(FoldFailure::Archive)?;
+        create_or_confirm(archive, &key, body, |held| {
+            quote_bars::decode(&key, held).map(|(held, _)| held == bars)
+        })
+        .await?;
     }
     tracing::info!(
         session = %session,
@@ -1227,6 +1230,39 @@ async fn fold_quotes_one(
         "Wrote quote bars"
     );
     Ok(())
+}
+
+/// Creates `key`, or, when an interrupted run already wrote it, accepts it only if it holds the same bars, so a
+/// rerun finishes a session's missing files without replacing what it cannot tell is identical.
+async fn create_or_confirm<Refusal: std::fmt::Debug>(
+    archive: &Archive,
+    key: &Key,
+    body: Vec<u8>,
+    same_bars: impl FnOnce(Vec<u8>) -> Result<bool, Refusal>,
+) -> Result<(), FoldFailure> {
+    match archive.create(key, body).await {
+        Ok(()) => Ok(()),
+        Err(ArchiveError::Contended { path }) => {
+            let held = archive
+                .get(key)
+                .await
+                .map_err(FoldFailure::Archive)?
+                .ok_or_else(|| {
+                    FoldFailure::Archive(ArchiveError::Contended { path: path.clone() })
+                })?;
+            match same_bars(held) {
+                Ok(true) => {
+                    tracing::info!(path, "Kept bars an earlier run wrote identically");
+                    Ok(())
+                }
+                Ok(false) => Err(FoldFailure::Held(path)),
+                Err(refusal) => Err(FoldFailure::Encode(format!(
+                    "{path} held but unreadable: {refusal:?}"
+                ))),
+            }
+        }
+        Err(error) => Err(FoldFailure::Archive(error)),
+    }
 }
 
 /// Rows of a quote file that did not become a quote, by what they were.
@@ -1399,10 +1435,10 @@ async fn fold_trades_one(
     for (key, bars) in files {
         let body = trade_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
-        archive
-            .create(&key, body)
-            .await
-            .map_err(FoldFailure::Archive)?;
+        create_or_confirm(archive, &key, body, |held| {
+            trade_bars::decode(&key, held).map(|(held, _)| held == bars)
+        })
+        .await?;
     }
     tracing::info!(
         session = %session,

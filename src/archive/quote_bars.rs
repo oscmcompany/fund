@@ -318,7 +318,8 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<QuoteBar>, Provenance), 
                 price(prices[3])?,
                 size(sizes[0])?,
                 size(sizes[1])?,
-            );
+            )
+            .map_err(|error| refused(format!("{error:?}")))?;
             let sums = QuoteSums::new(
                 quote_counts.value(row),
                 covered.value(row),
@@ -331,7 +332,8 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<QuoteBar>, Provenance), 
                 spread(prices[0])?,
                 spread(prices[1])?,
                 closing,
-            );
+            )
+            .map_err(|error| refused(format!("{error:?}")))?;
             let bar = QuoteBar::new(symbol, interval, timestamp, sums)
                 .map_err(|error| refused(format!("{error:?}")))?;
             bars.push(bar);
@@ -443,5 +445,89 @@ mod tests {
             encode(&bars_key, &bars(), &provenance()),
             Err(EncodeRefusal::NotAQuotesKey)
         );
+    }
+
+    /// A valid bar of `interval` in session 2026-10-02, its bucket chosen by `slot`.
+    fn any_bar(interval: BarInterval) -> impl proptest::strategy::Strategy<Value = QuoteBar> {
+        use proptest::prelude::*;
+        (
+            "[A-Z]{1,4}",
+            0_i64..78,
+            1_i64..2_000_000,
+            0_i64..50_000,
+            0_u64..1_000,
+            any::<[u64; 4]>(),
+            0_i64..86_400_000_000_000,
+        )
+            .prop_map(move |(symbol, slot, bid, spread, count, sums, since)| {
+                let open: DateTime<chrono::Utc> = "2026-10-02T13:30:00Z".parse().unwrap();
+                let (timestamp, longest) = match interval {
+                    BarInterval::OneMinute => {
+                        (open + chrono::TimeDelta::minutes(slot), 60_000_000_000)
+                    }
+                    BarInterval::FiveMinute => {
+                        (open + chrono::TimeDelta::minutes(5 * slot), 300_000_000_000)
+                    }
+                    BarInterval::OneDay => (session().regular_close(), 23_400_000_000_000),
+                };
+                let bid = Price::from_ticks(bid).unwrap();
+                let ask = Price::from_ticks(bid.ticks() + spread).unwrap();
+                let closing = StandingQuote::new(
+                    session().midnight() + chrono::TimeDelta::nanoseconds(since),
+                    bid,
+                    ask,
+                    Shares::from_units(sums[2]),
+                    Shares::from_units(sums[3]),
+                )
+                .unwrap();
+                let narrowest = Spread::from_ticks(u64::try_from(spread).unwrap() / 2);
+                let widest = Spread::from_ticks(u64::try_from(spread).unwrap());
+                let quote_sums = QuoteSums::new(
+                    count,
+                    // A twelfth of the interval, so up to twelve combined into one bucket still fit it.
+                    1 + sums[0] % (longest / 12),
+                    sums.map(u128::from),
+                    narrowest,
+                    widest,
+                    closing,
+                )
+                .unwrap();
+                QuoteBar::new(
+                    Symbol::new(&symbol).unwrap(),
+                    interval,
+                    timestamp,
+                    quote_sums,
+                )
+                .unwrap()
+            })
+    }
+
+    proptest::proptest! {
+        /// Every interval's bars read back as written, ordered by symbol and timestamp, with their provenance.
+        #[test]
+        fn property_quote_bars_round_trip(
+            interval in proptest::sample::select(vec![BarInterval::OneMinute, BarInterval::FiveMinute, BarInterval::OneDay]),
+            bars in proptest::collection::vec(any_bar(BarInterval::OneMinute), 0..12),
+        ) {
+            let bars: Vec<QuoteBar> = match interval {
+                BarInterval::OneMinute => bars,
+                BarInterval::FiveMinute | BarInterval::OneDay => bars
+                    .iter()
+                    .map(|bar| crate::common::market::quote_bars::QuoteRollup::of(bar, interval).unwrap())
+                    .fold(<crate::common::market::quote_bars::QuoteRollup as crate::common::monoid::Monoid>::empty(), crate::common::monoid::Monoid::combine)
+                    .into_bars(),
+            };
+            let mut unique: Vec<QuoteBar> = Vec::new();
+            for bar in bars {
+                if !unique.iter().any(|kept| kept.symbol() == bar.symbol() && kept.timestamp() == bar.timestamp()) {
+                    unique.push(bar);
+                }
+            }
+            let key = Key::Quotes { provider: Provider::Massive, origin: Origin::Derived, interval, session: session() };
+            let (read, read_provenance) = decode(&key, encode(&key, &unique, &provenance()).unwrap()).unwrap();
+            unique.sort_by(|left, right| (left.symbol(), left.timestamp()).cmp(&(right.symbol(), right.timestamp())));
+            proptest::prop_assert_eq!(read, unique);
+            proptest::prop_assert_eq!(read_provenance, provenance());
+        }
     }
 }

@@ -444,4 +444,61 @@ mod tests {
             Err(DecodeRefusal::Row { index: 0, reason }) if reason.contains("partly null")
         ));
     }
+
+    proptest::proptest! {
+        /// Bars at any interval, with or without either price pair, read back exactly as written and in order.
+        #[test]
+        fn property_trade_bars_round_trip(
+            interval in proptest::sample::select(vec![BarInterval::OneMinute, BarInterval::FiveMinute, BarInterval::OneDay]),
+            rows in proptest::collection::btree_map(
+                ("[A-Z]{1,4}", 0_i64..78),
+                (
+                    proptest::prelude::any::<(u32, u32, u64)>(),
+                    proptest::option::of((1_i64..2_000_000, 0_i64..5_000, 0_i64..3_600_000_000_000)),
+                    proptest::option::of((1_i64..2_000_000, 0_i64..5_000)),
+                ),
+                0..12,
+            ),
+        ) {
+            let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
+            let open: DateTime<Utc> = "2026-10-02T13:30:00Z".parse().unwrap();
+            let bars: Vec<TradeBar> = rows
+                .iter()
+                .filter_map(|((symbol, slot), ((count, volume, dollars), open_close, high_low))| {
+                    let timestamp = match interval {
+                        BarInterval::OneMinute => open + chrono::TimeDelta::minutes(*slot),
+                        BarInterval::FiveMinute => open + chrono::TimeDelta::minutes(5 * slot),
+                        BarInterval::OneDay if *slot == 0 => session.regular_close(),
+                        BarInterval::OneDay => return None,
+                    };
+                    let price = |ticks| Price::from_ticks(ticks).unwrap();
+                    let open_close = open_close.map(|(ticks, step, span)| {
+                        let first = open + chrono::TimeDelta::nanoseconds(span / 2);
+                        OpenClose::new(
+                            (first, price(ticks)),
+                            (first + chrono::TimeDelta::nanoseconds(span / 2), price(ticks + step)),
+                        )
+                        .unwrap()
+                    });
+                    let high_low = high_low.map(|(ticks, step)| HighLow::new(price(ticks + step), price(ticks)).unwrap());
+                    let totals = TradeTotals::new(
+                        TradeCount::new(u64::from(*count)),
+                        Shares::from_units(u64::from(*volume)),
+                        DollarVolume::from_units(u128::from(*dollars)),
+                    );
+                    Some(TradeBar::new(Symbol::new(symbol).unwrap(), interval, timestamp, TradeSums::new(totals, open_close, high_low)).unwrap())
+                })
+                .collect();
+            let key = Key::Trades { provider: Provider::Massive, origin: Origin::Derived, interval, session };
+            let provenance = Provenance::new(
+                Subscription::StocksAdvanced,
+                "2026-10-03T07:00:00Z".parse().unwrap(),
+                RunId::new(Uuid::from_u128(5)),
+                None,
+            );
+            let (read, read_provenance) = decode(&key, encode(&key, &bars, &provenance).unwrap()).unwrap();
+            proptest::prop_assert_eq!(read, bars);
+            proptest::prop_assert_eq!(read_provenance, provenance);
+        }
+    }
 }

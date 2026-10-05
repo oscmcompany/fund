@@ -360,6 +360,7 @@ pub fn decode_security_details(
         });
     }
     let mut details = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for batch in batches {
         let strings = |index: usize| parquet::downcast::<StringArray>(batch.column(index));
         let decimals = |index: usize| parquet::downcast::<Decimal128Array>(batch.column(index));
@@ -398,6 +399,9 @@ pub fn decode_security_details(
                 .map_err(|error| refused(format!("{error:?}")))?;
             let central_index_key = optional(central_index_keys.is_valid(row))
                 .map(|()| CentralIndexKey::new(central_index_keys.value(row)));
+            if !seen.insert(symbol.clone()) {
+                return Err(ReferenceRefusal::DuplicateSymbol { symbol });
+            }
             details.push(SecurityDetails::new(
                 symbol,
                 security_type,
@@ -527,5 +531,94 @@ mod tests {
                 symbol: Symbol::new("AAA").unwrap()
             })
         );
+    }
+
+    fn snapshot_provenance() -> Provenance {
+        Provenance::new(
+            Subscription::StocksStarter,
+            "2026-09-24T14:31:43Z".parse().unwrap(),
+            RunId::new(Uuid::from_u128(4)),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_a_file_listing_a_symbol_twice_is_refused_on_read() {
+        let rows = || {
+            let mut builder = StringBuilder::new();
+            builder.append_value("AAA");
+            builder.append_value("AAA");
+            Arc::new(builder.finish()) as ArrayRef
+        };
+        let nulls = |data_type: DataType| arrow_array::new_null_array(&data_type, 2);
+        let written = parquet::write(
+            security_details_schema(),
+            vec![
+                rows(),
+                nulls(DataType::Utf8),
+                nulls(DataType::UInt16),
+                nulls(DataType::Utf8),
+                nulls(SHARES_TYPE),
+                nulls(DOLLARS_TYPE),
+                nulls(DataType::Utf8),
+                nulls(DataType::UInt64),
+            ],
+            LAYOUT_VERSION,
+            snapshot_provenance()
+                .entries()
+                .into_iter()
+                .map(|(name, value)| {
+                    ::parquet::file::metadata::KeyValue::new(name.to_string(), value)
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_security_details(&key(ReferenceTable::SecurityDetails), written),
+            Err(ReferenceRefusal::DuplicateSymbol {
+                symbol: Symbol::new("AAA").unwrap()
+            })
+        );
+    }
+
+    proptest::proptest! {
+        /// A snapshot of unique symbols reads back exactly, every absence kept, in symbol order.
+        #[test]
+        fn property_security_details_round_trip(
+            rows in proptest::collection::btree_map(
+                "[A-Z]{1,5}",
+                (
+                    proptest::option::of(proptest::sample::select(<SecurityType as strum::IntoEnumIterator>::iter().collect::<Vec<_>>())),
+                    proptest::option::of(100_u16..10_000),
+                    proptest::option::of("[A-Z ]{1,30}"),
+                    proptest::option::of(proptest::prelude::any::<u64>()),
+                    proptest::option::of(proptest::prelude::any::<u64>()),
+                    proptest::option::of(proptest::sample::select(vec!["XNAS", "XNYS", "ARCX", "BATS", "XASE"])),
+                    proptest::option::of(proptest::prelude::any::<u64>()),
+                ),
+                0..20,
+            ),
+        ) {
+            let details: Vec<SecurityDetails> = rows
+                .iter()
+                .map(|(symbol, (kind, code, description, shares, capitalization, exchange, central_index_key))| {
+                    SecurityDetails::new(
+                        Symbol::new(symbol).unwrap(),
+                        *kind,
+                        code.map(|code| IndustryCode::new(&format!("{code:04}")).unwrap()),
+                        description.clone(),
+                        shares.map(Shares::from_units),
+                        capitalization.map(Dollars::from_millionths),
+                        exchange.map(|code| MarketIdentifierCode::new(code).unwrap()),
+                        central_index_key.map(CentralIndexKey::new),
+                    )
+                })
+                .collect();
+            let key = key(ReferenceTable::SecurityDetails);
+            let written = encode_security_details(&key, &details, &snapshot_provenance()).unwrap();
+            let (read, provenance) = decode_security_details(&key, written).unwrap();
+            proptest::prop_assert_eq!(read, details);
+            proptest::prop_assert_eq!(provenance, snapshot_provenance());
+        }
     }
 }
