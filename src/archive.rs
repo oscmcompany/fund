@@ -7,6 +7,7 @@ pub mod logs;
 pub mod parquet;
 pub mod quote_bars;
 pub mod raw;
+pub mod reference;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};

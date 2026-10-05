@@ -1,11 +1,14 @@
 //! Massive's grouped daily bars: every ticker that traded on a session, which is also the session's symbol list.
 
+use std::collections::BTreeMap;
+
 use chrono::DateTime;
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::trade_bars::{TradeConditions, UpdateRules};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
 
@@ -93,6 +96,21 @@ impl Massive {
         })
     }
 
+    /// The sale conditions a stock print can carry, with the consolidated tape's update rules for each.
+    pub async fn trade_conditions(&self) -> Result<TradeConditions, FetchError> {
+        let url = format!("{}/v3/reference/conditions", self.base_url);
+        let body = with_retries(|| {
+            send(
+                self.http_client
+                    .get(&url)
+                    .bearer_auth(&self.api_key)
+                    .query(&[("asset_class", "stocks"), ("limit", "1000")]),
+            )
+        })
+        .await?;
+        parse_trade_conditions(&body)
+    }
+
     /// Unadjusted daily bars for every exchange-listed ticker that traded on `session`.
     pub async fn grouped_daily(&self, session: SessionDate) -> Result<DailyBars, FetchError> {
         let url = format!(
@@ -171,6 +189,65 @@ fn daily_bar(row: &GroupedRow, session: SessionDate) -> Result<Bar, RowRefusal> 
         dollar_volume,
     )
     .map_err(RowRefusal::Bar)
+}
+
+#[derive(Deserialize)]
+struct ConditionsResponse {
+    results: Vec<ConditionRow>,
+    /// Present only when the listing continues past this page.
+    next_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConditionRow {
+    id: u16,
+    #[serde(rename = "type")]
+    kind: String,
+    update_rules: Option<ConditionUpdateRules>,
+}
+
+#[derive(Deserialize)]
+struct ConditionUpdateRules {
+    consolidated: ConditionRules,
+}
+
+#[derive(Deserialize)]
+struct ConditionRules {
+    updates_volume: bool,
+    updates_high_low: bool,
+    updates_open_close: bool,
+}
+
+/// The sale and trade-through-exempt conditions, the two kinds a print's `conditions` holds; a sale condition
+/// without rules, or a listing that continues, refuses the whole table, since a missing code would read as unknown.
+fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
+    let malformed = |reason: String| FetchError::Malformed { reason };
+    let response: ConditionsResponse =
+        serde_json::from_slice(body).map_err(|error| malformed(error.to_string()))?;
+    if let Some(next) = response.next_url {
+        return Err(malformed(format!("the listing continues at {next}")));
+    }
+    let mut rules = BTreeMap::new();
+    for row in response.results {
+        match row.kind.as_str() {
+            "sale_condition" | "trade_thru_exempt" => {
+                let consolidated = row
+                    .update_rules
+                    .ok_or_else(|| malformed(format!("condition {} has no update rules", row.id)))?
+                    .consolidated;
+                let rule = UpdateRules::new(
+                    consolidated.updates_volume,
+                    consolidated.updates_high_low,
+                    consolidated.updates_open_close,
+                );
+                if rules.insert(row.id, rule).is_some() {
+                    return Err(malformed(format!("condition {} is listed twice", row.id)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(TradeConditions::new(rules))
 }
 
 /// Massive's ticker in Alpaca's notation, which `Symbol` holds: preferred `BCpC` is `BC.PRC`, warrant `ABCw` is
@@ -415,5 +492,22 @@ mod tests {
                 row.cause
             );
         }
+    }
+
+    /// Rows trimmed from the live conditions listing of 2026-10-05: two sale conditions, the trade-through exempt
+    /// flag, and a quote condition that must be left out.
+    const CONDITIONS: &str = r#"{"results": [{"id": 10, "type": "sale_condition", "name": "Derivatively Priced", "asset_class": "stocks", "sip_mapping": {"CTA": "4", "UTP": "4"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": false, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": false, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 37, "type": "sale_condition", "name": "Odd Lot Trade", "asset_class": "stocks", "sip_mapping": {"CTA": "I", "UTP": "I", "FINRA_TDDS": "I"}, "update_rules": {"consolidated": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}, "market_center": {"updates_high_low": false, "updates_open_close": false, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 41, "type": "trade_thru_exempt", "name": "Trade Thru Exempt", "asset_class": "stocks", "sip_mapping": {"CTA": "1", "UTP": "X"}, "update_rules": {"consolidated": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}, "market_center": {"updates_high_low": true, "updates_open_close": true, "updates_volume": true}}, "data_types": ["trade"]}, {"id": 41, "type": "settlement_condition", "name": "Cash Only Settlement", "asset_class": "stocks", "sip_mapping": {"CTA": "A"}, "data_types": ["bbo", "nbbo"]}, {"id": 1, "type": "quote_condition", "name": "Regular Two-Sided Open", "asset_class": "stocks", "sip_mapping": {"CTA": "R", "UTP": "R"}, "data_types": ["bbo", "nbbo"]}], "status": "OK", "request_id": "x", "count": 5}"#;
+
+    #[test]
+    fn test_conditions_keep_the_trade_kinds_with_their_consolidated_rules() {
+        let conditions = parse_trade_conditions(CONDITIONS.as_bytes()).unwrap();
+        let codes: Vec<u16> = conditions.rules().keys().copied().collect();
+        assert_eq!(codes, [10, 37, 41]);
+        assert_eq!(conditions.rules()[&10], UpdateRules::new(true, true, false));
+        assert_eq!(
+            conditions.rules()[&37],
+            UpdateRules::new(true, false, false)
+        );
+        assert_eq!(conditions.rules()[&41], UpdateRules::new(true, true, true));
     }
 }

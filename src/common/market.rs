@@ -5,6 +5,7 @@ pub mod aggregate;
 pub mod quote_bars;
 pub mod record;
 pub mod state;
+pub mod trade_bars;
 
 use crate::common::monoid::Monoid;
 
