@@ -52,6 +52,14 @@ impl TradingSession {
     pub fn close(&self) -> NaiveTime {
         self.close
     }
+
+    /// The regular session as the UTC instants `[open, close)`.
+    pub fn hours(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        (
+            super::eastern_instant(self.date.date(), self.open),
+            super::eastern_instant(self.date.date(), self.close),
+        )
+    }
 }
 
 /// Where an instant falls relative to the published session on its Eastern date.
@@ -339,6 +347,14 @@ mod tests {
             .map(TradingSession::date)
             .collect();
         assert_eq!(dates, vec![date(2026, 11, 27)]);
+    }
+
+    #[test]
+    fn test_a_half_day_closes_at_one_eastern_in_utc() {
+        let half_day = calendar().session(date(2026, 11, 27)).copied().unwrap();
+        let (open, close) = half_day.hours();
+        assert_eq!(open.to_rfc3339(), "2026-11-27T14:30:00+00:00");
+        assert_eq!(close.to_rfc3339(), "2026-11-27T18:00:00+00:00");
     }
 
     #[test]

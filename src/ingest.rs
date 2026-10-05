@@ -10,7 +10,7 @@ pub use retry::FetchError;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal};
+use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal, QuoteRefusal};
 use crate::common::market::{DollarVolumeRefusal, PriceRefusal, SharesRefusal, SymbolRefusal};
 
 /// Why an environment variable a client needs was not used.
@@ -69,6 +69,7 @@ pub enum RowRefusal {
     Shares(SharesRefusal),
     DollarVolume(DollarVolumeRefusal),
     Bar(BarRefusal),
+    Quote(QuoteRefusal),
     /// Answered for a symbol that was not asked for, as when a vendor normalizes a name into another security's.
     Unrequested,
     /// One of several rows claiming the same record; none is kept, since nothing says which is true.

@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
@@ -406,6 +406,147 @@ fn flat_file_bar(
     .map_err(RowRefusal::Bar)
 }
 
+/// Bytes per ranged read when a file is streamed rather than copied.
+const STREAM_CHUNK: u64 = 16 * 1024 * 1024;
+
+/// A file's bytes in order as a blocking `Read`, with up to `ahead` ranged reads in flight on the runtime; read it
+/// from a blocking thread.
+pub struct FlatFileStream {
+    chunks: tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<Result<Bytes, FlatFileError>>>,
+    runtime: tokio::runtime::Handle,
+    current: Bytes,
+}
+
+impl FlatFiles {
+    pub fn stream(
+        &self,
+        dataset: FlatFileDataset,
+        listed: &Listed,
+        ahead: usize,
+    ) -> FlatFileStream {
+        let (sender, chunks) = tokio::sync::mpsc::channel(ahead.max(1));
+        let flat_files = self.clone();
+        let listed = listed.clone();
+        tokio::spawn(async move {
+            let mut start = 0;
+            while start < listed.length {
+                let length = STREAM_CHUNK.min(listed.length - start);
+                let (flat_files, listed_chunk) = (flat_files.clone(), listed.clone());
+                let fetch = tokio::spawn(async move {
+                    flat_files
+                        .range(dataset, &listed_chunk, start, length)
+                        .await
+                });
+                // A closed receiver means the reader stopped early, so nothing more is wanted.
+                if sender.send(fetch).await.is_err() {
+                    return;
+                }
+                start += length;
+            }
+        });
+        FlatFileStream {
+            chunks,
+            runtime: tokio::runtime::Handle::current(),
+            current: Bytes::new(),
+        }
+    }
+}
+
+impl std::io::Read for FlatFileStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        while self.current.is_empty() {
+            let Some(fetch) = self.chunks.blocking_recv() else {
+                return Ok(0);
+            };
+            self.current = self
+                .runtime
+                .block_on(fetch)
+                .map_err(std::io::Error::other)?
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        let count = buffer.len().min(self.current.len());
+        buffer[..count].copy_from_slice(&self.current.split_to(count));
+        Ok(count)
+    }
+}
+
+/// A flat quote file's row; only the consolidated tape's timestamp and the top of book are read.
+#[derive(Deserialize)]
+struct QuoteRow {
+    ticker: String,
+    bid_price: f64,
+    bid_size: f64,
+    ask_price: f64,
+    ask_size: f64,
+    /// Nanoseconds since the epoch at which the SIP published the quote.
+    sip_timestamp: i64,
+}
+
+/// What one quote row became.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuoteRowOutcome {
+    Quote(Quote),
+    TestTicker,
+    /// A side with no price, which is no top of book; the quote standing before it keeps standing.
+    OneSided,
+    Refused(RefusedRow),
+}
+
+/// Reads a gzipped flat quote file from `gzipped`, handing each row's outcome to `each` in file order.
+pub fn read_quotes(
+    gzipped: impl std::io::Read,
+    mut each: impl FnMut(QuoteRowOutcome),
+) -> Result<(), ParseRefusal> {
+    let mut reader = csv::Reader::from_reader(flate2::read::GzDecoder::new(gzipped));
+    for row in reader.deserialize::<QuoteRow>() {
+        let row = row.map_err(|error| ParseRefusal::Malformed {
+            line: error.position().map(csv::Position::line),
+            reason: error.to_string(),
+        })?;
+        each(quote_outcome(row));
+    }
+    Ok(())
+}
+
+fn quote_outcome(row: QuoteRow) -> QuoteRowOutcome {
+    if is_exchange_test_ticker(&row.ticker) {
+        return QuoteRowOutcome::TestTicker;
+    }
+    if row.bid_price <= 0.0 || row.ask_price <= 0.0 {
+        return QuoteRowOutcome::OneSided;
+    }
+    let refused = |cause: RowRefusal| {
+        QuoteRowOutcome::Refused(RefusedRow {
+            ticker: row.ticker.clone(),
+            cause,
+        })
+    };
+    let symbol = match alpaca_symbol(&row.ticker) {
+        Ok(symbol) => symbol,
+        Err(cause) => return refused(RowRefusal::Symbol(cause)),
+    };
+    let price = |dollars: f64| Price::from_dollars(dollars).map_err(RowRefusal::Price);
+    let size = |shares: f64| Shares::from_float(shares).map_err(RowRefusal::Shares);
+    let parts = (|| {
+        Ok::<_, RowRefusal>((
+            price(row.bid_price)?,
+            price(row.ask_price)?,
+            size(row.bid_size)?,
+            size(row.ask_size)?,
+        ))
+    })();
+    match parts {
+        Ok((bid, ask, bid_size, ask_size)) => {
+            let timestamp = DateTime::from_timestamp_nanos(row.sip_timestamp);
+            match Quote::new(symbol, timestamp, bid, ask, bid_size, ask_size) {
+                Ok(quote) => QuoteRowOutcome::Quote(quote),
+                Err(cause) => refused(RowRefusal::Quote(cause)),
+            }
+        }
+        Err(cause) => refused(cause),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +709,39 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
             FlatFileDataset::DailyBars.parse_bars(&gzipped(&broken), october_second()),
             Err(ParseRefusal::Malformed { line: Some(10), .. })
         ));
+    }
+
+    #[test]
+    fn test_each_quote_row_is_a_quote_a_test_ticker_one_sided_or_refused() {
+        // The header and first rows of Massive's quotes for 2021-08-23 and 2026-09-18, plus a crossed and a test row.
+        let rows = "ticker,ask_exchange,ask_price,ask_size,bid_exchange,bid_price,bid_size,conditions,indicators,participant_timestamp,sequence_number,sip_timestamp,tape,trf_timestamp
+A,8,180.0,100,11,164.28,100,\"1,81\",,1629716400001245000,79497,1629716400044243200,1,0
+A,12,0.0,0,12,0.0,0,\"1,81\",,1789715092739044279,172,1789715092739508637,1,0
+BApA,11,60.10,200,8,60.20,100,\"1,81\",,1629716446119912192,81265,1629716446119946496,1,0
+ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,1629716446119946496,1,0
+";
+        let mut outcomes = Vec::new();
+        read_quotes(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        match &outcomes[0] {
+            QuoteRowOutcome::Quote(quote) => {
+                assert_eq!(quote.symbol().as_str(), "A");
+                assert_eq!(quote.bid().ticks(), 164_280_000);
+                assert_eq!(quote.ask_size().units(), 100_000_000);
+                assert_eq!(
+                    quote.timestamp().to_rfc3339(),
+                    "2021-08-23T11:00:00.044243200+00:00"
+                );
+            }
+            other @ (QuoteRowOutcome::TestTicker
+            | QuoteRowOutcome::OneSided
+            | QuoteRowOutcome::Refused(_)) => panic!("{other:?}"),
+        }
+        assert_eq!(outcomes[1], QuoteRowOutcome::OneSided);
+        assert!(matches!(
+            &outcomes[2],
+            QuoteRowOutcome::Refused(row) if row.ticker() == "BApA"
+        ));
+        assert_eq!(outcomes[3], QuoteRowOutcome::TestTicker);
     }
 }
