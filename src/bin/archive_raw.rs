@@ -12,11 +12,14 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 use uuid::Uuid;
 
+use fund::archive::bars;
 use fund::archive::bars::{EncodeRefusal, Provenance, Subscription, encode};
+use fund::archive::legacy_reference::{LEGACY_SNAPSHOT_ROOT, read_legacy_snapshot};
 use fund::archive::raw::{CopyError, Stored};
 use fund::archive::{Archive, ArchiveError};
 use fund::archive::{quote_bars, reference, trade_bars};
 use fund::common::journal::{Commit, RunId};
+use fund::common::market::aggregate::BarRollup;
 use fund::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
@@ -77,6 +80,16 @@ enum Command {
         concurrency: usize,
     },
     FetchConditions,
+    PortSecurityDetails,
+    /// Deletes the objects at paths that each parse as a key.
+    Delete {
+        keys: Vec<Key>,
+    },
+    RollUp {
+        first: SessionDate,
+        last: SessionDate,
+        concurrency: usize,
+    },
     FoldTrades {
         first: SessionDate,
         last: SessionDate,
@@ -112,6 +125,23 @@ fn parse(arguments: &[String]) -> Option<Command> {
             })
         }
         [command] if command == "fetch-conditions" => Some(Command::FetchConditions),
+        [command] if command == "port-security-details" => Some(Command::PortSecurityDetails),
+        [command, paths @ ..] if command == "delete" && !paths.is_empty() => {
+            Some(Command::Delete {
+                keys: paths
+                    .iter()
+                    .map(|path| Key::parse(path).ok())
+                    .collect::<Option<_>>()?,
+            })
+        }
+        [command, first, last, concurrency] if command == "roll-up" => Some(Command::RollUp {
+            first: date(first)?,
+            last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+            concurrency: concurrency
+                .parse()
+                .ok()
+                .filter(|count: &usize| *count > 0)?,
+        }),
         [command, first, last, concurrency] if command == "fold-trades" => {
             Some(Command::FoldTrades {
                 first: date(first)?,
@@ -152,7 +182,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | fold-trades <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | port-security-details | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -200,6 +230,29 @@ async fn main() -> ExitCode {
             }
             Command::Verify { dataset } => verify(archive, dataset).await,
             Command::DeleteLegacy { dataset } => delete_legacy(archive, dataset).await,
+            Command::RollUp {
+                first,
+                last,
+                concurrency,
+            } => roll_up(archive, first, last, concurrency).await,
+            Command::Delete { keys } => {
+                let mut failed = 0;
+                for key in &keys {
+                    match archive.delete(key).await {
+                        Ok(()) => tracing::info!(path = key.path(), "Deleted an object"),
+                        Err(error) => {
+                            failed += 1;
+                            tracing::error!(%error, "Object not deleted");
+                        }
+                    }
+                }
+                if failed == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Command::PortSecurityDetails => port_security_details(&archive, run_id, commit).await,
             Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
                 Ok(massive) => fetch_conditions(&archive, &massive, run_id, commit).await,
                 Err(refusal) => {
@@ -1399,6 +1452,291 @@ async fn fold_trades_one(
     Ok(())
 }
 
+/// Massive's bars at `interval` and `origin` for a session.
+fn massive_bars_key(origin: Origin, interval: BarInterval, session: SessionDate) -> Key {
+    Key::Bars {
+        provider: Provider::Massive,
+        origin,
+        interval,
+        session,
+    }
+}
+
+/// Why a session's minutes were not rolled up.
+#[derive(Debug)]
+enum RollUpFailure {
+    Archive(ArchiveError),
+    Missing,
+    Decode(String),
+    Encode(String),
+}
+
+impl std::fmt::Display for RollUpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Missing => write!(formatter, "the minute bars are gone"),
+            Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal}"),
+            Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal}"),
+        }
+    }
+}
+
+/// Writes derived five-minute bars for each session whose Massive minute bars are held and five-minute bars are not.
+async fn roll_up(
+    archive: Archive,
+    first: SessionDate,
+    last: SessionDate,
+    concurrency: usize,
+) -> ExitCode {
+    let sessions = |origin, interval| {
+        let archive = archive.clone();
+        async move {
+            archive
+                .list(&massive_bars_key(origin, interval, first).series())
+                .await
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| Key::parse(path).ok())
+                        .map(|key| key.session())
+                        .filter(|session| (first..=last).contains(session))
+                        .collect::<BTreeSet<SessionDate>>()
+                })
+        }
+    };
+    let (minutes, rolled) = match (
+        sessions(Origin::Vendor, BarInterval::OneMinute).await,
+        sessions(Origin::Derived, BarInterval::FiveMinute).await,
+    ) {
+        (Ok(minutes), Ok(rolled)) => (minutes, rolled),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::error!(%error, "Archive not listed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let owed: Vec<SessionDate> = minutes.difference(&rolled).copied().collect();
+    tracing::info!(
+        %first,
+        %last,
+        minute_sessions = minutes.len(),
+        already_rolled = minutes.len() - owed.len(),
+        owed = owed.len(),
+        owed_first = ?owed.first().map(ToString::to_string),
+        owed_last = ?owed.last().map(ToString::to_string),
+        "Planned a five-minute roll-up"
+    );
+    let mut tasks = JoinSet::new();
+    let mut outcomes = BTreeMap::new();
+    let mut panicked = 0;
+    for session in owed {
+        while tasks.len() >= concurrency {
+            if let Some(joined) = tasks.join_next().await {
+                record(joined, &mut outcomes, &mut panicked);
+            }
+        }
+        let archive = archive.clone();
+        tasks.spawn(
+            async move {
+                let outcome = roll_up_one(&archive, session).await;
+                match &outcome {
+                    Ok(bars) => tracing::info!(session = %session, bars, "Rolled up a session"),
+                    Err(failure) => {
+                        tracing::error!(session = %session, %failure, "Session not rolled up")
+                    }
+                }
+                (session, outcome)
+            }
+            .in_current_span(),
+        );
+    }
+    while let Some(joined) = tasks.join_next().await {
+        record(joined, &mut outcomes, &mut panicked);
+    }
+    let failed: Vec<SessionDate> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_err())
+        .map(|(session, _)| *session)
+        .collect();
+    tracing::info!(
+        written = outcomes.len() - failed.len(),
+        failed = failed.len(),
+        failed_sessions = listed(&failed),
+        panicked,
+        "Finished a five-minute roll-up"
+    );
+    if failed.is_empty() && panicked == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Rolls one session's minute bars up to five-minute bars under the minutes' own provenance.
+async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, RollUpFailure> {
+    let minute_key = massive_bars_key(Origin::Vendor, BarInterval::OneMinute, session);
+    let bytes = archive
+        .get(&minute_key)
+        .await
+        .map_err(RollUpFailure::Archive)?
+        .ok_or(RollUpFailure::Missing)?;
+    let key = massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session);
+    let encoded_key = key.clone();
+    let (count, body) = tokio::task::spawn_blocking(move || {
+        let (minutes, provenance) = bars::decode(&minute_key, bytes)
+            .map_err(|refusal| RollUpFailure::Decode(format!("{refusal:?}")))?;
+        let five_minutes = concatenate(minutes.iter().map(|bar| {
+            BarRollup::of(bar, BarInterval::FiveMinute).expect("minutes roll up to five minutes")
+        }))
+        .into_bars();
+        let body = bars::encode(&encoded_key, &five_minutes, &provenance)
+            .map_err(|refusal| RollUpFailure::Encode(format!("{refusal:?}")))?;
+        Ok::<_, RollUpFailure>((five_minutes.len(), body))
+    })
+    .await
+    .map_err(|error| RollUpFailure::Decode(error.to_string()))??;
+    archive
+        .create(&key, body)
+        .await
+        .map_err(RollUpFailure::Archive)?;
+    Ok(count)
+}
+
+/// The legacy sidecar's record of when its file was written, the nearest the legacy archiver kept to a fetch time.
+#[derive(serde::Deserialize)]
+struct LegacySidecar {
+    written_at: DateTime<Utc>,
+}
+
+/// The date a legacy snapshot's path names.
+fn legacy_snapshot_date(path: &str) -> Option<SessionDate> {
+    let value = |name: &str| {
+        path.split('/')
+            .find_map(|segment| segment.strip_prefix(name)?.strip_prefix('='))
+    };
+    NaiveDate::from_ymd_opt(
+        value("year")?.parse().ok()?,
+        value("month")?.parse().ok()?,
+        value("day")?.parse().ok()?,
+    )
+    .map(SessionDate::from_date)
+}
+
+/// Writes each legacy security snapshot under its `security_details` key, once.
+async fn port_security_details(
+    archive: &Archive,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> ExitCode {
+    let paths: Vec<String> = match archive.list(LEGACY_SNAPSHOT_ROOT).await {
+        Ok(paths) => paths
+            .into_iter()
+            .filter(|path| path.ends_with("/data.parquet"))
+            .collect(),
+        Err(error) => {
+            tracing::error!(%error, "Archive not listed");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(snapshots = paths.len(), "Planned a security details port");
+    let mut failed = 0;
+    for path in &paths {
+        match port_snapshot(archive, path, run_id, commit.clone()).await {
+            Ok(()) => {}
+            Err(reason) => {
+                failed += 1;
+                tracing::error!(path, reason, "Snapshot not ported");
+            }
+        }
+    }
+    tracing::info!(
+        snapshots = paths.len(),
+        failed,
+        "Finished a security details port"
+    );
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+async fn port_snapshot(
+    archive: &Archive,
+    path: &str,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> Result<(), String> {
+    let read = |path: String| async move {
+        archive
+            .get_legacy_at(&path)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{path} is gone"))
+    };
+    if let Some(as_of) = legacy_snapshot_date(path) {
+        let key = Key::Reference {
+            provider: Provider::Massive,
+            table: ReferenceTable::SecurityDetails,
+            as_of,
+        };
+        if archive
+            .stored(&key)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            tracing::info!(path = key.path(), "Snapshot already ported");
+            return Ok(());
+        }
+    }
+    let sidecar: LegacySidecar =
+        serde_json::from_slice(&read(format!("{path}.provenance.json")).await?)
+            .map_err(|error| error.to_string())?;
+    let snapshot = read_legacy_snapshot(read(path.to_string()).await?)?;
+    let key = Key::Reference {
+        provider: Provider::Massive,
+        table: ReferenceTable::SecurityDetails,
+        as_of: snapshot.as_of,
+    };
+    let provenance = Provenance::new(
+        Subscription::StocksStarter,
+        sidecar.written_at,
+        run_id,
+        commit,
+    );
+    let body = reference::encode_security_details(&key, &snapshot.details, &provenance)
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    archive
+        .create(&key, body)
+        .await
+        .map_err(|error| error.to_string())?;
+    let reasons: BTreeMap<&str, usize> =
+        snapshot
+            .refused
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, row| {
+                *counts
+                    .entry(
+                        row.reason
+                            .split_once(':')
+                            .map_or(row.reason.as_str(), |(head, _)| head),
+                    )
+                    .or_insert(0) += 1;
+                counts
+            });
+    tracing::info!(
+        path = key.path(),
+        as_of = %snapshot.as_of,
+        written = snapshot.details.len(),
+        refused = snapshot.refused.len(),
+        refused_by_reason = ?reasons,
+        refused_tickers = snapshot.refused.iter().take(LISTED_SESSIONS).map(|row| row.ticker.as_str()).collect::<Vec<_>>().join(","),
+        "Ported a security snapshot"
+    );
+    Ok(())
+}
+
 fn compare(
     new: Result<Option<Stored>, ArchiveError>,
     legacy: Result<Option<Stored>, ArchiveError>,
@@ -1513,6 +1851,16 @@ mod tests {
         .filter(|comparison| deletable(*comparison))
         .collect();
         assert_eq!(allowed, [Comparison::Equal]);
+    }
+
+    #[test]
+    fn test_a_delete_names_only_paths_that_parse_as_keys() {
+        let key = "data/equity/stage=parsed/trades/provider=massive/origin=derived/interval=one_day/year=2021/month=08/day=23/data.parquet";
+        assert!(parse(&["delete".to_string(), key.to_string()]).is_some());
+        let legacy =
+            "data/derived/equity/trades/interval=one_day/year=2021/month=08/day=23/data.parquet";
+        assert!(parse(&["delete".to_string(), key.to_string(), legacy.to_string()]).is_none());
+        assert!(parse(&["delete".to_string()]).is_none());
     }
 
     #[test]

@@ -69,9 +69,8 @@ pub enum Origin {
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum ReferenceTable {
-    Classification,
     Conditions,
-    SecIndustryCodes,
+    SecurityDetails,
 }
 
 /// The S3 storage class an object is written in.
@@ -536,10 +535,10 @@ mod tests {
             (
                 Key::Reference {
                     provider: Provider::Massive,
-                    table: ReferenceTable::SecIndustryCodes,
+                    table: ReferenceTable::SecurityDetails,
                     as_of: session(),
                 },
-                "data/equity/stage=parsed/reference/provider=massive/table=sec_industry_codes/as_of=2026-08-03/data.parquet",
+                "data/equity/stage=parsed/reference/provider=massive/table=security_details/as_of=2026-08-03/data.parquet",
             ),
             (
                 Key::RawBars {

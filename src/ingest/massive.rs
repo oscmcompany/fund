@@ -8,6 +8,7 @@ use serde::Deserialize;
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::security_details::SecurityType;
 use crate::common::market::trade_bars::{TradeConditions, UpdateRules};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
@@ -248,6 +249,26 @@ fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
         }
     }
     Ok(TradeConditions::new(rules))
+}
+
+/// Massive's security type code in our terms; `None` for a code no variant names.
+pub fn security_type(code: &str) -> Option<SecurityType> {
+    match code {
+        "CS" => Some(SecurityType::CommonStock),
+        "ETF" => Some(SecurityType::ExchangeTradedFund),
+        "WARRANT" => Some(SecurityType::Warrant),
+        "ADRC" => Some(SecurityType::DepositaryReceipt),
+        "FUND" => Some(SecurityType::Fund),
+        "UNIT" => Some(SecurityType::Unit),
+        "SP" => Some(SecurityType::StructuredProduct),
+        "PFD" => Some(SecurityType::PreferredStock),
+        "ETS" => Some(SecurityType::ExchangeTradedSecurity),
+        "ETN" => Some(SecurityType::ExchangeTradedNote),
+        "ETV" => Some(SecurityType::ExchangeTradedVehicle),
+        "RIGHT" => Some(SecurityType::Right),
+        "INDEX" => Some(SecurityType::Index),
+        _ => None,
+    }
 }
 
 /// Massive's ticker in Alpaca's notation, which `Symbol` holds: preferred `BCpC` is `BC.PRC`, warrant `ABCw` is
@@ -509,5 +530,20 @@ mod tests {
             UpdateRules::new(true, false, false)
         );
         assert_eq!(conditions.rules()[&41], UpdateRules::new(true, true, true));
+    }
+
+    #[test]
+    fn test_every_security_type_code_seen_maps_to_one_of_ours() {
+        // The thirteen codes the legacy snapshots hold, 2021-08-23 to 2026-10-01.
+        let codes = [
+            "CS", "ETF", "WARRANT", "ADRC", "FUND", "UNIT", "SP", "PFD", "ETS", "ETN", "ETV",
+            "RIGHT", "INDEX",
+        ];
+        let mapped: std::collections::BTreeSet<_> = codes
+            .iter()
+            .filter_map(|code| security_type(code))
+            .collect();
+        assert_eq!(mapped.len(), 13);
+        assert_eq!(security_type("OS"), None);
     }
 }

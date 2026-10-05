@@ -18,6 +18,9 @@ use super::{Archive, ArchiveError, Tag};
 use crate::common::storage::{Key, StorageClass};
 use crate::ingest::flat_files::{FlatFileDataset, FlatFileError, FlatFiles, Listed};
 
+/// The legacy archiver's roots, the only objects `get_legacy_at` reads.
+const LEGACY_READABLE_ROOTS: [&str; 2] = ["data/derived/", "data/raw/"];
+
 /// The legacy archiver's raw copies, the only objects `delete_legacy_at` may remove.
 const LEGACY_RAW_ROOT: &str = "data/raw/massive/equity/";
 
@@ -274,6 +277,23 @@ impl Archive {
     /// What is stored under `key`, read from its metadata alone, so a Deep Archive object needs no restore.
     pub async fn stored(&self, key: &Key) -> Result<Option<Stored>, ArchiveError> {
         self.stored_at(key.path()).await
+    }
+
+    /// The legacy object at `path`, read only under the legacy roots; archive task A6 deletes this with them.
+    pub async fn get_legacy_at(&self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
+        if !LEGACY_READABLE_ROOTS
+            .iter()
+            .any(|root| path.starts_with(root))
+        {
+            return Err(ArchiveError::Get {
+                path: path.to_string(),
+                reason: format!("only objects under {LEGACY_READABLE_ROOTS:?} are read here"),
+            });
+        }
+        Ok(self
+            .get_tagged_at(path.to_string())
+            .await?
+            .map(|(bytes, _)| bytes))
     }
 
     /// Deletes the legacy raw object at `path`, only while it is still the version `tag` names when one is given;
