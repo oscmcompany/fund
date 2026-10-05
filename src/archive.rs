@@ -35,6 +35,10 @@ pub enum ArchiveError {
         prefix: String,
         reason: String,
     },
+    Delete {
+        path: String,
+        reason: String,
+    },
     /// A create found the key already written, or a replace found it changed since it was read.
     Contended {
         path: String,
@@ -57,6 +61,7 @@ impl std::fmt::Display for ArchiveError {
             Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
             Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
             Self::List { prefix, reason } => write!(formatter, "listing {prefix} failed: {reason}"),
+            Self::Delete { path, reason } => write!(formatter, "deleting {path} failed: {reason}"),
             Self::Contended { path } => {
                 write!(
                     formatter,
@@ -283,6 +288,11 @@ impl Archive {
 pub struct Tag(String);
 
 impl Tag {
+    /// The entity tag S3 answered for a version.
+    pub fn new(raw: &str) -> Self {
+        Self(raw.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

@@ -1,6 +1,6 @@
 //! Massive's flat files into the raw stage: `copy` fetches each session not held, `verify` compares it with the legacy
-//! copy by checksum, and `parse` writes held raw bar files as vendor bars; `main` logs the arguments each takes.
-//! Exits 0 when everything succeeded, 1 when not, 2 on bad usage.
+//! copy by checksum, `parse` writes held raw bar files as vendor bars, and `delete-legacy` deletes each legacy copy proven
+//! equal; `main` logs the arguments each takes. Exits 0 when everything succeeded, 1 when not, 2 on bad usage.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -54,6 +54,9 @@ enum Command {
         last: SessionDate,
         concurrency: usize,
     },
+    DeleteLegacy {
+        dataset: FlatFileDataset,
+    },
 }
 
 fn parse(arguments: &[String]) -> Option<Command> {
@@ -83,6 +86,9 @@ fn parse(arguments: &[String]) -> Option<Command> {
                     .filter(|count: &usize| *count > 0)?,
             })
         }
+        [command, dataset] if command == "delete-legacy" => Some(Command::DeleteLegacy {
+            dataset: dataset.parse().ok()?,
+        }),
         [command, dataset] if command == "verify" => Some(Command::Verify {
             dataset: dataset.parse().ok()?,
         }),
@@ -100,7 +106,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -147,6 +153,7 @@ async fn main() -> ExitCode {
                 .await
             }
             Command::Verify { dataset } => verify(archive, dataset).await,
+            Command::DeleteLegacy { dataset } => delete_legacy(archive, dataset).await,
             Command::Parse {
                 dataset,
                 first,
@@ -649,6 +656,149 @@ async fn verify(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
     }
 }
 
+/// Deletes each legacy raw copy, with its sidecar, whose checksum equals the new copy's when read just before.
+async fn delete_legacy(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
+    let legacy_paths = match archive.list(&dataset.legacy_prefix()).await {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::error!(%error, "Archive not listed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sessions: BTreeSet<SessionDate> = legacy_paths
+        .iter()
+        .filter_map(|path| legacy_session(dataset, path))
+        .collect();
+    tracing::info!(
+        %dataset,
+        legacy = sessions.len(),
+        first = ?sessions.first().map(ToString::to_string),
+        last = ?sessions.last().map(ToString::to_string),
+        "Planned a legacy delete"
+    );
+    let permits = Arc::new(Semaphore::new(VERIFY_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    for session in sessions {
+        let archive = archive.clone();
+        let permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("the semaphore is never closed");
+            let path = dataset.legacy_path(session);
+            let new = archive.stored(&dataset.key(session)).await;
+            let legacy = archive.stored_at(path.clone()).await;
+            for (copy, read) in [("new", &new), ("legacy", &legacy)] {
+                if let Err(error) = read {
+                    tracing::error!(session = %session, copy, %error, "Copy metadata not read");
+                }
+            }
+            let compared_tag = match &legacy {
+                Ok(Some(stored)) => Some(stored.tag().clone()),
+                Ok(None) | Err(_) => None,
+            };
+            let comparison = compare(new, legacy);
+            let deleted = match (deletable(comparison), compared_tag) {
+                (true, Some(tag)) => {
+                    let sidecar = format!("{path}.provenance.json");
+                    // The sidecar goes first so a failure leaves the data file listed for a rerun, and the data file
+                    // goes only while it is still the version just compared.
+                    let removed = match archive.delete_legacy_at(&sidecar, None).await {
+                        Ok(()) => archive.delete_legacy_at(&path, Some(&tag)).await,
+                        Err(error) => Err(error),
+                    };
+                    match removed {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            tracing::error!(session = %session, %error, "Legacy copy not deleted");
+                            Err(comparison)
+                        }
+                    }
+                }
+                (true, None) | (false, Some(_)) | (false, None) => Err(comparison),
+            };
+            (session, deleted)
+        });
+    }
+    let mut outcomes = BTreeMap::new();
+    let mut panicked = 0;
+    while let Some(joined) = tasks.join_next().await {
+        record(joined, &mut outcomes, &mut panicked);
+    }
+    let mut kept: BTreeMap<Comparison, Vec<SessionDate>> = BTreeMap::new();
+    for (session, outcome) in &outcomes {
+        if let Err(comparison) = outcome {
+            kept.entry(*comparison).or_default().push(*session);
+        }
+    }
+    for (comparison, sessions) in &kept {
+        tracing::warn!(%dataset, comparison = ?comparison, count = sessions.len(), sessions = listed(sessions), "Legacy copies kept");
+    }
+    let deleted = outcomes.values().filter(|outcome| outcome.is_ok()).count();
+    // A sidecar rewritten after its data file went would never be listed by session again, so orphans are swept here.
+    let orphans = match orphan_sidecars(&archive, dataset).await {
+        Ok(orphans) => orphans,
+        Err(error) => {
+            tracing::error!(%error, "Archive not listed for orphan sidecars");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut orphans_left = 0;
+    for orphan in &orphans {
+        if let Err(error) = archive.delete_legacy_at(orphan, None).await {
+            orphans_left += 1;
+            tracing::error!(path = orphan, %error, "Orphan sidecar not deleted");
+        }
+    }
+    tracing::info!(
+        %dataset,
+        deleted,
+        kept = outcomes.len() - deleted,
+        orphan_sidecars = orphans.len(),
+        orphans_left,
+        panicked,
+        "Finished a legacy delete"
+    );
+    if deleted == outcomes.len() && panicked == 0 && orphans_left == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Sidecars under the dataset's legacy prefix whose data file is gone.
+async fn orphan_sidecars(
+    archive: &Archive,
+    dataset: FlatFileDataset,
+) -> Result<Vec<String>, ArchiveError> {
+    let paths: BTreeSet<String> = archive
+        .list(&dataset.legacy_prefix())
+        .await?
+        .into_iter()
+        .collect();
+    Ok(paths
+        .iter()
+        .filter(|path| {
+            path.strip_suffix(".provenance.json")
+                .is_some_and(|data| !paths.contains(data))
+        })
+        .cloned()
+        .collect())
+}
+
+/// Whether a legacy copy compared so may be deleted: only one proven byte for byte equal.
+fn deletable(comparison: Comparison) -> bool {
+    match comparison {
+        Comparison::Equal => true,
+        Comparison::Differ
+        | Comparison::Unchecksummed
+        | Comparison::NewOnly
+        | Comparison::LegacyOnly
+        | Comparison::Unreadable => false,
+    }
+}
+
 fn compare(
     new: Result<Option<Stored>, ArchiveError>,
     legacy: Result<Option<Stored>, ArchiveError>,
@@ -684,9 +834,15 @@ fn legacy_session(dataset: FlatFileDataset, path: &str) -> Option<SessionDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fund::archive::Tag;
 
     fn stored(length: u64, checksum: Option<&str>) -> Result<Option<Stored>, ArchiveError> {
-        Ok(Some(Stored::new(length, checksum.map(String::from), None)))
+        Ok(Some(Stored::new(
+            length,
+            checksum.map(String::from),
+            None,
+            Tag::new("\"etag\""),
+        )))
     }
 
     #[test]
@@ -741,6 +897,22 @@ mod tests {
         assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
         let parsing = ["parse", "daily_bars", "2021-08-24", "2021-08-23", "4"].map(String::from);
         assert!(parse(&parsing).is_none());
+    }
+
+    #[test]
+    fn test_only_an_equal_copy_may_be_deleted() {
+        let allowed: Vec<Comparison> = [
+            Comparison::Equal,
+            Comparison::Differ,
+            Comparison::Unchecksummed,
+            Comparison::NewOnly,
+            Comparison::LegacyOnly,
+            Comparison::Unreadable,
+        ]
+        .into_iter()
+        .filter(|comparison| deletable(*comparison))
+        .collect();
+        assert_eq!(allowed, [Comparison::Equal]);
     }
 
     #[test]
