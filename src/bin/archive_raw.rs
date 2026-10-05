@@ -1183,7 +1183,7 @@ async fn fold_quotes_one(
             QuoteRowOutcome::Quote(quote) => fold.push(&quote),
             QuoteRowOutcome::TestTicker => rows.test_tickers += 1,
             QuoteRowOutcome::OneSided => rows.one_sided += 1,
-            QuoteRowOutcome::Refused(row) => rows.refused.push(row),
+            QuoteRowOutcome::Refused(row) => count_cause(&mut rows.refused, &row),
         })
         .map_err(FoldFailure::Parse)?;
         let (minutes, counts) = fold.finish();
@@ -1225,8 +1225,8 @@ async fn fold_quotes_one(
         out_of_order = counts.out_of_order(),
         one_sided = rows.one_sided,
         test_tickers = rows.test_tickers,
-        refused = rows.refused.len(),
-        refused_by_cause = ?refused_by_cause(&rows.refused),
+        refused = rows.refused.values().sum::<u64>(),
+        refused_by_cause = ?rows.refused,
         "Wrote quote bars"
     );
     Ok(())
@@ -1265,12 +1265,18 @@ async fn create_or_confirm<Refusal: std::fmt::Debug>(
     }
 }
 
+/// Counts `row` under the name of its cause.
+fn count_cause(counts: &mut BTreeMap<&'static str, u64>, row: &RefusedRow) {
+    *counts.entry(row.cause().into()).or_insert(0) += 1;
+}
+
 /// Rows of a quote file that did not become a quote, by what they were.
 #[derive(Default)]
 struct QuoteRowCounts {
     test_tickers: u64,
     one_sided: u64,
-    refused: Vec<RefusedRow>,
+    /// Counted by cause rather than kept, since a session refuses tens of thousands of rows.
+    refused: BTreeMap<&'static str, u64>,
 }
 
 /// Fetches Massive's condition table and writes it as today's snapshot.
@@ -1398,7 +1404,7 @@ async fn fold_trades_one(
     let folded = tokio::task::spawn_blocking(move || {
         let mut fold = TradeFold::new(session, conditions);
         let mut test_tickers = 0_u64;
-        let mut refused = Vec::new();
+        let mut refused = BTreeMap::new();
         read_trades(stream, |outcome| match outcome {
             TradeRowOutcome::Print {
                 print,
@@ -1406,7 +1412,7 @@ async fn fold_trades_one(
                 corrected,
             } => fold.push(&print, &conditions, corrected),
             TradeRowOutcome::TestTicker => test_tickers += 1,
-            TradeRowOutcome::Refused(row) => refused.push(row),
+            TradeRowOutcome::Refused(row) => count_cause(&mut refused, &row),
         })
         .map_err(FoldFailure::Parse)?;
         let (minutes, counts) = fold.finish();
@@ -1451,8 +1457,8 @@ async fn fold_trades_one(
         unsized_prints = counts.unsized_prints(),
         unresolved = counts.unresolved(),
         test_tickers,
-        refused = refused.len(),
-        refused_by_cause = ?refused_by_cause(&refused),
+        refused = refused.values().sum::<u64>(),
+        refused_by_cause = ?refused,
         "Wrote trade bars"
     );
     Ok(())
@@ -1841,6 +1847,12 @@ mod tests {
         assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
         let parsing = ["parse", "daily_bars", "2021-08-24", "2021-08-23", "4"].map(String::from);
         assert!(parse(&parsing).is_none());
+        let folding = |first: &str, last: &str, concurrency: &str| {
+            parse(&["fold-quotes", first, last, concurrency].map(String::from))
+        };
+        assert!(folding("2021-08-23", "2021-08-23", "9").is_some());
+        assert!(folding("2021-08-24", "2021-08-23", "9").is_none());
+        assert!(folding("2021-08-23", "2021-08-24", "0").is_none());
     }
 
     #[test]
