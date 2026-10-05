@@ -1158,7 +1158,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
- "syn 2.0.119",
+ "syn 3.0.6",
  "tokio",
  "tracing",
  "tracing-subscriber",
