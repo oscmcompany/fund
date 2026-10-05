@@ -3,15 +3,18 @@
 use std::collections::BTreeMap;
 
 use crate::archive::bars::{DecodeRefusal, decode};
-use crate::archive::{Archive, ArchiveError};
+use crate::archive::{Archive, ArchiveError, Tag};
 use crate::common::heal::Leg;
 use crate::common::journal::RunId;
-use crate::common::laboratory::dataset::{Contamination, Fingerprint, FingerprintRefusal};
+use crate::common::laboratory::dataset::{
+    Contamination, DatasetLeg, Fingerprint, FingerprintRefusal,
+};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 use crate::laboratory::Study;
+use crate::laboratory::legacy::{self, LegacyRefusal};
 
 /// Bars by session and the fingerprint of the partitions they came from.
 #[derive(Debug)]
@@ -55,6 +58,11 @@ pub enum DatasetError {
         session: SessionDate,
         refusal: DecodeRefusal,
     },
+    /// A legacy partition that did not decode; archive task A6 deletes it with the legacy reader.
+    LegacyDecode {
+        session: SessionDate,
+        refusal: LegacyRefusal,
+    },
     /// A partition that holds no bars is a defect in the archive, not a gap, so it is refused rather than read.
     EmptyPartition {
         session: SessionDate,
@@ -76,6 +84,12 @@ impl std::fmt::Display for DatasetError {
                     "the partition for {session} did not decode: {refusal:?}"
                 )
             }
+            Self::LegacyDecode { session, refusal } => {
+                write!(
+                    formatter,
+                    "the legacy partition for {session} did not decode: {refusal:?}"
+                )
+            }
         }
     }
 }
@@ -91,24 +105,34 @@ pub async fn daily_bars(
     last: SessionDate,
     study: &mut Study,
 ) -> Result<Dataset, DatasetError> {
-    let leg = Leg::MassiveDailyBars;
+    load(
+        DatasetLeg::MassiveDailyBars,
+        archive,
+        calendar,
+        first,
+        last,
+        study,
+    )
+    .await
+}
+
+/// `leg`'s bars for every trading session from `first` to `last`, journaled to `study` before it is returned.
+pub(crate) async fn load(
+    leg: DatasetLeg,
+    archive: &Archive,
+    calendar: &TradingCalendar,
+    first: SessionDate,
+    last: SessionDate,
+    study: &mut Study,
+) -> Result<Dataset, DatasetError> {
     // Taken empty first, so the window is checked before any read and its missing sessions are the ones to read.
     let owed = Fingerprint::new(leg, first, last, calendar, BTreeMap::new())
         .map_err(DatasetError::Window)?;
     let (mut bars, mut tags) = (BTreeMap::new(), BTreeMap::new());
     for session in owed.missing() {
-        let key = leg.key(*session);
-        let Some((body, tag)) = archive
-            .get_tagged(&key)
-            .await
-            .map_err(DatasetError::Archive)?
-        else {
+        let Some((read, tag)) = partition(archive, leg, *session).await? else {
             continue;
         };
-        let (read, _) = decode(&key, body).map_err(|refusal| DatasetError::Decode {
-            session: *session,
-            refusal,
-        })?;
         bars.insert(*session, admit(*session, read)?);
         tags.insert(*session, tag.as_str().to_string());
     }
@@ -122,6 +146,42 @@ pub async fn daily_bars(
     })
 }
 
+/// `leg`'s bars for `session` with the tag of the version read, or `None` when it has no partition.
+async fn partition(
+    archive: &Archive,
+    leg: DatasetLeg,
+    session: SessionDate,
+) -> Result<Option<(Vec<Bar>, Tag)>, DatasetError> {
+    match leg {
+        DatasetLeg::MassiveDailyBars => {
+            let key = Leg::MassiveDailyBars.key(session);
+            let Some((body, tag)) = archive
+                .get_tagged(&key)
+                .await
+                .map_err(DatasetError::Archive)?
+            else {
+                return Ok(None);
+            };
+            let (bars, _) =
+                decode(&key, body).map_err(|refusal| DatasetError::Decode { session, refusal })?;
+            Ok(Some((bars, tag)))
+        }
+        // Archive task A6 deletes this arm with the legacy reader.
+        DatasetLeg::LegacyDailyBars => {
+            let Some((body, tag)) = archive
+                .get_tagged_at(legacy::path(session))
+                .await
+                .map_err(DatasetError::Archive)?
+            else {
+                return Ok(None);
+            };
+            let bars = legacy::decode(session, body)
+                .map_err(|refusal| DatasetError::LegacyDecode { session, refusal })?;
+            Ok(Some((bars, tag)))
+        }
+    }
+}
+
 /// Every partition `fingerprint` read that has since been rewritten or removed, each tag looked up now.
 pub async fn lineage(
     archive: &Archive,
@@ -129,7 +189,14 @@ pub async fn lineage(
 ) -> Result<Vec<Contamination>, ArchiveError> {
     let mut current = BTreeMap::new();
     for session in fingerprint.partitions().keys() {
-        if let Some(tag) = archive.tag(&fingerprint.leg().key(*session)).await? {
+        let tag = match fingerprint.leg() {
+            DatasetLeg::MassiveDailyBars => {
+                archive.tag(&Leg::MassiveDailyBars.key(*session)).await?
+            }
+            // Archive task A6 deletes this arm with the legacy reader.
+            DatasetLeg::LegacyDailyBars => archive.tag_at(legacy::path(*session)).await?,
+        };
+        if let Some(tag) = tag {
             current.insert(*session, tag.as_str().to_string());
         }
     }
@@ -195,7 +262,7 @@ mod tests {
         Dataset {
             bars: [bars(0, 1), bars(1, 2), bars(3, 3)].into(),
             fingerprint: Fingerprint::new(
-                Leg::MassiveDailyBars,
+                DatasetLeg::MassiveDailyBars,
                 session(0),
                 session(3),
                 &calendar,

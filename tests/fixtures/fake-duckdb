@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Stands in for `duckdb` in tests/test_check_views.rs, answering as the file the test names in `FAKE_DUCKDB_ANSWERS`.
+source "$FAKE_DUCKDB_ANSWERS"

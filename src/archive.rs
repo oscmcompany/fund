@@ -178,7 +178,11 @@ impl Archive {
 
     /// The tag of the version under `key` now, without reading it; `None` when the object is gone.
     pub async fn tag(&self, key: &Key) -> Result<Option<Tag>, ArchiveError> {
-        let path = key.path();
+        self.tag_at(key.path()).await
+    }
+
+    /// `tag` by raw path, for the legacy `data/derived/` objects no `Key` names; archive task A6 folds it back.
+    pub(crate) async fn tag_at(&self, path: String) -> Result<Option<Tag>, ArchiveError> {
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
             reason,
@@ -210,7 +214,14 @@ impl Archive {
 
     /// The object under `key` with the tag of the version read, which a `replace` must still match.
     pub async fn get_tagged(&self, key: &Key) -> Result<Option<(Vec<u8>, Tag)>, ArchiveError> {
-        let path = key.path();
+        self.get_tagged_at(key.path()).await
+    }
+
+    /// `get_tagged` by raw path, for the legacy `data/derived/` objects no `Key` names; archive task A6 folds it back.
+    pub(crate) async fn get_tagged_at(
+        &self,
+        path: String,
+    ) -> Result<Option<(Vec<u8>, Tag)>, ArchiveError> {
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
             reason,

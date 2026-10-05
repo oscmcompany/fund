@@ -2,6 +2,7 @@
 //! experiment it reports, then merges the journal into the records bucket.
 
 pub mod dataset;
+pub mod legacy;
 
 use std::io;
 use std::num::NonZeroU32;
