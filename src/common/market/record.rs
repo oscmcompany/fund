@@ -164,6 +164,23 @@ impl Bar {
         }
     }
 
+    /// This bar with every price set to `price` and its dollar volume to match, keeping the series, instant, volume
+    /// and trade count: the input a replay control runs on, where no price moves.
+    pub fn at_price(&self, price: Price) -> Self {
+        Self {
+            prices: Ohlc {
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+            },
+            dollar_volume: self
+                .dollar_volume
+                .map(|_| DollarVolume::of(price, self.volume)),
+            ..self.clone()
+        }
+    }
+
     pub fn prices(&self) -> Ohlc {
         self.prices
     }
@@ -409,6 +426,51 @@ mod tests {
                 "{interval}"
             );
         }
+    }
+
+    /// Repricing keeps everything but the prices, and repricing twice is repricing once to the last price.
+    #[test]
+    fn test_a_repriced_bar_keeps_its_series_and_volume() {
+        let original = Bar::new(
+            Symbol::new("AAPL").unwrap(),
+            BarInterval::OneMinute,
+            instant("2026-07-31T14:31:00Z"),
+            prices(),
+            Shares::whole(100).unwrap(),
+            Some(TradeCount::new(7)),
+            Some(DollarVolume::of(price(10.0), Shares::whole(100).unwrap())),
+        )
+        .unwrap();
+        let repriced = original.at_price(price(2.0));
+        assert_eq!(
+            repriced.prices(),
+            Ohlc::new(price(2.0), price(2.0), price(2.0), price(2.0)).unwrap()
+        );
+        assert_eq!(repriced.volume_weighted_average_price(), Some(2.0));
+        assert_eq!(
+            (
+                repriced.symbol(),
+                repriced.interval(),
+                repriced.timestamp(),
+                repriced.volume(),
+                repriced.trade_count()
+            ),
+            (
+                original.symbol(),
+                original.interval(),
+                original.timestamp(),
+                original.volume(),
+                original.trade_count()
+            )
+        );
+        assert_eq!(original.at_price(price(5.0)).at_price(price(2.0)), repriced);
+        assert_eq!(
+            bar(BarInterval::OneMinute, "2026-07-31T14:31:00Z")
+                .unwrap()
+                .at_price(price(2.0))
+                .dollar_volume(),
+            None
+        );
     }
 
     #[test]

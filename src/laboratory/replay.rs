@@ -112,7 +112,8 @@ pub fn replay<S: Strategy>(
     Ok(replay)
 }
 
-/// Counts, dollars traded and paid, and turnover; the final mark's return only when that mark was priced.
+/// Counts, dollars traded and paid, and turnover; the final mark's return net and gross of costs only when that mark
+/// was priced, every fill having landed before it.
 fn outputs(replay: &Replay, opening: Cash) -> Result<Outputs, ExperimentRefusal> {
     let sum = |amounts: Vec<DollarVolume>| {
         amounts
@@ -134,7 +135,13 @@ fn outputs(replay: &Replay, opening: Cash) -> Result<Outputs, ExperimentRefusal>
         Some((_, Ok(last))) => {
             // The gain is taken in exact units first, so only the ratio rounds.
             let gain = last.units() - opening.units();
-            outputs.metric("net_return", gain as f64 / opening.units() as f64)
+            let paid = i128::try_from(costs.units()).expect("costs fit i128");
+            outputs
+                .metric("net_return", gain as f64 / opening.units() as f64)?
+                .metric(
+                    "gross_return",
+                    (gain + paid) as f64 / opening.units() as f64,
+                )
         }
         Some((_, Err(_))) | None => Ok(outputs),
     }
@@ -230,6 +237,7 @@ mod tests {
             [
                 ("costs_dollars", 0.005),
                 ("fills", 1.0),
+                ("gross_return", 0.01),
                 ("marks", 3.0),
                 ("marks_unpriced", 0.0),
                 ("net_return", 0.00995),
