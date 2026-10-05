@@ -288,6 +288,11 @@ impl Archive {
 pub struct Tag(String);
 
 impl Tag {
+    /// The entity tag S3 answered for a version.
+    pub fn new(raw: &str) -> Self {
+        Self(raw.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

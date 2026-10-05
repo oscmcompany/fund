@@ -687,16 +687,25 @@ async fn delete_legacy(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
                 .await
                 .expect("the semaphore is never closed");
             let path = dataset.legacy_path(session);
-            let comparison = compare(
-                archive.stored(&dataset.key(session)).await,
-                archive.stored_at(path.clone()).await,
-            );
-            let deleted = match comparison {
-                Comparison::Equal => {
+            let new = archive.stored(&dataset.key(session)).await;
+            let legacy = archive.stored_at(path.clone()).await;
+            for (copy, read) in [("new", &new), ("legacy", &legacy)] {
+                if let Err(error) = read {
+                    tracing::error!(session = %session, copy, %error, "Copy metadata not read");
+                }
+            }
+            let compared_tag = match &legacy {
+                Ok(Some(stored)) => Some(stored.tag().clone()),
+                Ok(None) | Err(_) => None,
+            };
+            let comparison = compare(new, legacy);
+            let deleted = match (deletable(comparison), compared_tag) {
+                (true, Some(tag)) => {
                     let sidecar = format!("{path}.provenance.json");
-                    // The sidecar goes first so a failure leaves the data file listed for a rerun.
-                    let removed = match archive.delete_legacy_at(&sidecar).await {
-                        Ok(()) => archive.delete_legacy_at(&path).await,
+                    // The sidecar goes first so a failure leaves the data file listed for a rerun, and the data file
+                    // goes only while it is still the version just compared.
+                    let removed = match archive.delete_legacy_at(&sidecar, None).await {
+                        Ok(()) => archive.delete_legacy_at(&path, Some(&tag)).await,
                         Err(error) => Err(error),
                     };
                     match removed {
@@ -707,11 +716,7 @@ async fn delete_legacy(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
                         }
                     }
                 }
-                Comparison::Differ
-                | Comparison::Unchecksummed
-                | Comparison::NewOnly
-                | Comparison::LegacyOnly
-                | Comparison::Unreadable => Err(comparison),
+                (true, None) | (false, Some(_)) | (false, None) => Err(comparison),
             };
             (session, deleted)
         });
@@ -742,6 +747,18 @@ async fn delete_legacy(archive: Archive, dataset: FlatFileDataset) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Whether a legacy copy compared so may be deleted: only one proven byte for byte equal.
+fn deletable(comparison: Comparison) -> bool {
+    match comparison {
+        Comparison::Equal => true,
+        Comparison::Differ
+        | Comparison::Unchecksummed
+        | Comparison::NewOnly
+        | Comparison::LegacyOnly
+        | Comparison::Unreadable => false,
     }
 }
 
@@ -780,9 +797,15 @@ fn legacy_session(dataset: FlatFileDataset, path: &str) -> Option<SessionDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fund::archive::Tag;
 
     fn stored(length: u64, checksum: Option<&str>) -> Result<Option<Stored>, ArchiveError> {
-        Ok(Some(Stored::new(length, checksum.map(String::from), None)))
+        Ok(Some(Stored::new(
+            length,
+            checksum.map(String::from),
+            None,
+            Tag::new("\"etag\""),
+        )))
     }
 
     #[test]
@@ -837,6 +860,22 @@ mod tests {
         assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
         let parsing = ["parse", "daily_bars", "2021-08-24", "2021-08-23", "4"].map(String::from);
         assert!(parse(&parsing).is_none());
+    }
+
+    #[test]
+    fn test_only_an_equal_copy_may_be_deleted() {
+        let allowed: Vec<Comparison> = [
+            Comparison::Equal,
+            Comparison::Differ,
+            Comparison::Unchecksummed,
+            Comparison::NewOnly,
+            Comparison::LegacyOnly,
+            Comparison::Unreadable,
+        ]
+        .into_iter()
+        .filter(|comparison| deletable(*comparison))
+        .collect();
+        assert_eq!(allowed, [Comparison::Equal]);
     }
 
     #[test]

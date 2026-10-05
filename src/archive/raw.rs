@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::bars::{FETCHED_AT, Provenance};
-use super::{Archive, ArchiveError};
+use super::{Archive, ArchiveError, Tag};
 use crate::common::storage::{Key, StorageClass};
 use crate::ingest::flat_files::{FlatFileDataset, FlatFileError, FlatFiles, Listed};
 
@@ -34,15 +34,27 @@ pub struct Stored {
     checksum: Option<String>,
     /// When the vendor's bytes were fetched, from the object's metadata; `None` on a copy that never recorded it.
     fetched_at: Option<DateTime<Utc>>,
+    /// The version read, which a conditional delete must still match.
+    tag: Tag,
 }
 
 impl Stored {
-    pub fn new(length: u64, checksum: Option<String>, fetched_at: Option<DateTime<Utc>>) -> Self {
+    pub fn new(
+        length: u64,
+        checksum: Option<String>,
+        fetched_at: Option<DateTime<Utc>>,
+        tag: Tag,
+    ) -> Self {
         Self {
             length,
             checksum,
             fetched_at,
+            tag,
         }
+    }
+
+    pub fn tag(&self) -> &Tag {
+        &self.tag
     }
 
     pub fn fetched_at(&self) -> Option<DateTime<Utc>> {
@@ -264,8 +276,13 @@ impl Archive {
         self.stored_at(key.path()).await
     }
 
-    /// Deletes the legacy raw object at `path`; archive task A6 deletes this with the last of them.
-    pub async fn delete_legacy_at(&self, path: &str) -> Result<(), ArchiveError> {
+    /// Deletes the legacy raw object at `path`, only while it is still the version `tag` names when one is given;
+    /// archive task A6 deletes this with the last of them.
+    pub async fn delete_legacy_at(
+        &self,
+        path: &str,
+        tag: Option<&Tag>,
+    ) -> Result<(), ArchiveError> {
         if !path.starts_with(LEGACY_RAW_ROOT) {
             return Err(ArchiveError::Delete {
                 path: path.to_string(),
@@ -276,6 +293,7 @@ impl Archive {
             .delete_object()
             .bucket(&self.bucket_name)
             .key(path)
+            .set_if_match(tag.map(|tag| tag.as_str().to_string()))
             .send()
             .await
             .map_err(|error| ArchiveError::Delete {
@@ -307,7 +325,13 @@ impl Archive {
                     .ok_or_else(|| failed("no length".to_string()))?;
                 let full_object = response.checksum_type() == Some(&ChecksumType::FullObject);
                 let fetched_at = fetched_at(response.metadata()).map_err(failed)?;
+                let tag = Tag::new(
+                    response
+                        .e_tag()
+                        .ok_or_else(|| failed("no entity tag".to_string()))?,
+                );
                 Ok(Some(Stored {
+                    tag,
                     length,
                     checksum: response
                         .checksum_crc64_nvme()
@@ -478,7 +502,7 @@ mod tests {
         let path =
             "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz";
         assert_eq!(
-            archive.delete_legacy_at(path).await,
+            archive.delete_legacy_at(path, None).await,
             Err(ArchiveError::Delete {
                 path: path.to_string(),
                 reason: "only objects under data/raw/massive/equity/ may be deleted here"
