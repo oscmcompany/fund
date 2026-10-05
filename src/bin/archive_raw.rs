@@ -12,11 +12,13 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 use uuid::Uuid;
 
+use fund::archive::bars;
 use fund::archive::bars::{EncodeRefusal, Provenance, Subscription, encode};
 use fund::archive::raw::{CopyError, Stored};
 use fund::archive::{Archive, ArchiveError};
 use fund::archive::{quote_bars, reference, trade_bars};
 use fund::common::journal::{Commit, RunId};
+use fund::common::market::aggregate::BarRollup;
 use fund::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
@@ -77,6 +79,11 @@ enum Command {
         concurrency: usize,
     },
     FetchConditions,
+    RollUp {
+        first: SessionDate,
+        last: SessionDate,
+        concurrency: usize,
+    },
     FoldTrades {
         first: SessionDate,
         last: SessionDate,
@@ -112,6 +119,14 @@ fn parse(arguments: &[String]) -> Option<Command> {
             })
         }
         [command] if command == "fetch-conditions" => Some(Command::FetchConditions),
+        [command, first, last, concurrency] if command == "roll-up" => Some(Command::RollUp {
+            first: date(first)?,
+            last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+            concurrency: concurrency
+                .parse()
+                .ok()
+                .filter(|count: &usize| *count > 0)?,
+        }),
         [command, first, last, concurrency] if command == "fold-trades" => {
             Some(Command::FoldTrades {
                 first: date(first)?,
@@ -152,7 +167,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | fold-trades <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -200,6 +215,11 @@ async fn main() -> ExitCode {
             }
             Command::Verify { dataset } => verify(archive, dataset).await,
             Command::DeleteLegacy { dataset } => delete_legacy(archive, dataset).await,
+            Command::RollUp {
+                first,
+                last,
+                concurrency,
+            } => roll_up(archive, first, last, concurrency).await,
             Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
                 Ok(massive) => fetch_conditions(&archive, &massive, run_id, commit).await,
                 Err(refusal) => {
@@ -1397,6 +1417,158 @@ async fn fold_trades_one(
         "Wrote trade bars"
     );
     Ok(())
+}
+
+/// Massive's bars at `interval` and `origin` for a session.
+fn massive_bars_key(origin: Origin, interval: BarInterval, session: SessionDate) -> Key {
+    Key::Bars {
+        provider: Provider::Massive,
+        origin,
+        interval,
+        session,
+    }
+}
+
+/// Why a session's minutes were not rolled up.
+#[derive(Debug)]
+enum RollUpFailure {
+    Archive(ArchiveError),
+    Missing,
+    Decode(String),
+    Encode(String),
+}
+
+impl std::fmt::Display for RollUpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Missing => write!(formatter, "the minute bars are gone"),
+            Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal}"),
+            Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal}"),
+        }
+    }
+}
+
+/// Writes derived five-minute bars for each session whose Massive minute bars are held and five-minute bars are not.
+async fn roll_up(
+    archive: Archive,
+    first: SessionDate,
+    last: SessionDate,
+    concurrency: usize,
+) -> ExitCode {
+    let sessions = |origin, interval| {
+        let archive = archive.clone();
+        async move {
+            archive
+                .list(&massive_bars_key(origin, interval, first).series())
+                .await
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| Key::parse(path).ok())
+                        .map(|key| key.session())
+                        .filter(|session| (first..=last).contains(session))
+                        .collect::<BTreeSet<SessionDate>>()
+                })
+        }
+    };
+    let (minutes, rolled) = match (
+        sessions(Origin::Vendor, BarInterval::OneMinute).await,
+        sessions(Origin::Derived, BarInterval::FiveMinute).await,
+    ) {
+        (Ok(minutes), Ok(rolled)) => (minutes, rolled),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::error!(%error, "Archive not listed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let owed: Vec<SessionDate> = minutes.difference(&rolled).copied().collect();
+    tracing::info!(
+        %first,
+        %last,
+        minute_sessions = minutes.len(),
+        already_rolled = minutes.len() - owed.len(),
+        owed = owed.len(),
+        owed_first = ?owed.first().map(ToString::to_string),
+        owed_last = ?owed.last().map(ToString::to_string),
+        "Planned a five-minute roll-up"
+    );
+    let mut tasks = JoinSet::new();
+    let mut outcomes = BTreeMap::new();
+    let mut panicked = 0;
+    for session in owed {
+        while tasks.len() >= concurrency {
+            if let Some(joined) = tasks.join_next().await {
+                record(joined, &mut outcomes, &mut panicked);
+            }
+        }
+        let archive = archive.clone();
+        tasks.spawn(
+            async move {
+                let outcome = roll_up_one(&archive, session).await;
+                match &outcome {
+                    Ok(bars) => tracing::info!(session = %session, bars, "Rolled up a session"),
+                    Err(failure) => {
+                        tracing::error!(session = %session, %failure, "Session not rolled up")
+                    }
+                }
+                (session, outcome)
+            }
+            .in_current_span(),
+        );
+    }
+    while let Some(joined) = tasks.join_next().await {
+        record(joined, &mut outcomes, &mut panicked);
+    }
+    let failed: Vec<SessionDate> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_err())
+        .map(|(session, _)| *session)
+        .collect();
+    tracing::info!(
+        written = outcomes.len() - failed.len(),
+        failed = failed.len(),
+        failed_sessions = listed(&failed),
+        panicked,
+        "Finished a five-minute roll-up"
+    );
+    if failed.is_empty() && panicked == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Rolls one session's minute bars up to five-minute bars under the minutes' own provenance.
+async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, RollUpFailure> {
+    let minute_key = massive_bars_key(Origin::Vendor, BarInterval::OneMinute, session);
+    let bytes = archive
+        .get(&minute_key)
+        .await
+        .map_err(RollUpFailure::Archive)?
+        .ok_or(RollUpFailure::Missing)?;
+    let key = massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session);
+    let (count, body) = tokio::task::spawn_blocking(move || {
+        let (minutes, provenance) = bars::decode(&minute_key, bytes)
+            .map_err(|refusal| RollUpFailure::Decode(format!("{refusal:?}")))?;
+        let five_minutes = concatenate(minutes.iter().map(|bar| {
+            BarRollup::of(bar, BarInterval::FiveMinute).expect("minutes roll up to five minutes")
+        }))
+        .into_bars();
+        let body = bars::encode(&key, &five_minutes, &provenance)
+            .map_err(|refusal| RollUpFailure::Encode(format!("{refusal:?}")))?;
+        Ok::<_, RollUpFailure>((five_minutes.len(), body))
+    })
+    .await
+    .map_err(|error| RollUpFailure::Decode(error.to_string()))??;
+    archive
+        .create(
+            &massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session),
+            body,
+        )
+        .await
+        .map_err(RollUpFailure::Archive)?;
+    Ok(count)
 }
 
 fn compare(
