@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use fund::archive::bars;
 use fund::archive::bars::{EncodeRefusal, Provenance, Subscription, encode};
+use fund::archive::legacy_reference::{LEGACY_SNAPSHOT_ROOT, read_legacy_snapshot};
 use fund::archive::raw::{CopyError, Stored};
 use fund::archive::{Archive, ArchiveError};
 use fund::archive::{quote_bars, reference, trade_bars};
@@ -79,6 +80,7 @@ enum Command {
         concurrency: usize,
     },
     FetchConditions,
+    PortSecurityDetails,
     /// Deletes the objects at paths that each parse as a key.
     Delete {
         keys: Vec<Key>,
@@ -123,6 +125,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
             })
         }
         [command] if command == "fetch-conditions" => Some(Command::FetchConditions),
+        [command] if command == "port-security-details" => Some(Command::PortSecurityDetails),
         [command, paths @ ..] if command == "delete" && !paths.is_empty() => {
             Some(Command::Delete {
                 keys: paths
@@ -179,7 +182,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | port-security-details | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -249,6 +252,7 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+            Command::PortSecurityDetails => port_security_details(&archive, run_id, commit).await,
             Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
                 Ok(massive) => fetch_conditions(&archive, &massive, run_id, commit).await,
                 Err(refusal) => {
@@ -1598,6 +1602,107 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
         .await
         .map_err(RollUpFailure::Archive)?;
     Ok(count)
+}
+
+/// The legacy sidecar's record of when its file was written, the nearest the legacy archiver kept to a fetch time.
+#[derive(serde::Deserialize)]
+struct LegacySidecar {
+    written_at: DateTime<Utc>,
+}
+
+/// Writes each legacy security snapshot under its `security_details` key, once.
+async fn port_security_details(
+    archive: &Archive,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> ExitCode {
+    let paths: Vec<String> = match archive.list(LEGACY_SNAPSHOT_ROOT).await {
+        Ok(paths) => paths
+            .into_iter()
+            .filter(|path| path.ends_with("/data.parquet"))
+            .collect(),
+        Err(error) => {
+            tracing::error!(%error, "Archive not listed");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(snapshots = paths.len(), "Planned a security details port");
+    let mut failed = 0;
+    for path in &paths {
+        match port_snapshot(archive, path, run_id, commit.clone()).await {
+            Ok(()) => {}
+            Err(reason) => {
+                failed += 1;
+                tracing::error!(path, reason, "Snapshot not ported");
+            }
+        }
+    }
+    tracing::info!(
+        snapshots = paths.len(),
+        failed,
+        "Finished a security details port"
+    );
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+async fn port_snapshot(
+    archive: &Archive,
+    path: &str,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> Result<(), String> {
+    let read = |path: String| async move {
+        archive
+            .get_legacy_at(&path)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{path} is gone"))
+    };
+    let sidecar: LegacySidecar =
+        serde_json::from_slice(&read(format!("{path}.provenance.json")).await?)
+            .map_err(|error| error.to_string())?;
+    let snapshot = read_legacy_snapshot(read(path.to_string()).await?)?;
+    let key = Key::Reference {
+        provider: Provider::Massive,
+        table: ReferenceTable::SecurityDetails,
+        as_of: snapshot.as_of,
+    };
+    let provenance = Provenance::new(
+        Subscription::StocksStarter,
+        sidecar.written_at,
+        run_id,
+        commit,
+    );
+    let body = reference::encode_security_details(&key, &snapshot.details, &provenance)
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    archive
+        .create(&key, body)
+        .await
+        .map_err(|error| error.to_string())?;
+    let reasons: BTreeMap<&str, usize> =
+        snapshot
+            .refused
+            .iter()
+            .fold(BTreeMap::new(), |mut counts, row| {
+                *counts
+                    .entry(row.reason.split(':').next().unwrap_or_default())
+                    .or_insert(0) += 1;
+                counts
+            });
+    tracing::info!(
+        path = key.path(),
+        as_of = %snapshot.as_of,
+        written = snapshot.details.len(),
+        refused = snapshot.refused.len(),
+        refused_by_reason = ?reasons,
+        refused_tickers = snapshot.refused.iter().take(LISTED_SESSIONS).map(|row| row.ticker.as_str()).collect::<Vec<_>>().join(","),
+        "Ported a security snapshot"
+    );
+    Ok(())
 }
 
 fn compare(

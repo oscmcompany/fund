@@ -4,6 +4,7 @@
 pub mod aggregate;
 pub mod quote_bars;
 pub mod record;
+pub mod security_details;
 pub mod state;
 pub mod trade_bars;
 
