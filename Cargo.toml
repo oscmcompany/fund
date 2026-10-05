@@ -27,6 +27,9 @@ chrono = { version = "0.4.44", default-features = false, features = [
   "std",
 ] }
 chrono-tz = "0.10"
+# Reads the vendor's raw flat files, which are gzipped CSV.
+csv = "1.4.0"
+flate2 = "1.1"
 # `zstd` reads only the legacy archiver's files; archive task A6 removes it with the legacy reader.
 parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",

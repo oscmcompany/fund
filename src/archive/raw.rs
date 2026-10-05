@@ -1,6 +1,7 @@
 //! Vendor files copied into the archive byte for byte, in parts fetched and uploaded in parallel so no file is ever
 //! held whole, under a full-object CRC64 that S3 computes and any later copy of the same bytes must match.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,10 +9,11 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, ChecksumType, CompletedMultipartUpload, CompletedPart,
 };
+use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::bars::Provenance;
+use super::bars::{FETCHED_AT, Provenance};
 use super::{Archive, ArchiveError};
 use crate::common::storage::{Key, StorageClass};
 use crate::ingest::flat_files::{FlatFileDataset, FlatFileError, FlatFiles, Listed};
@@ -27,11 +29,21 @@ const PART_ATTEMPTS: u32 = 5;
 pub struct Stored {
     length: u64,
     checksum: Option<String>,
+    /// When the vendor's bytes were fetched, from the object's metadata; `None` on a copy that never recorded it.
+    fetched_at: Option<DateTime<Utc>>,
 }
 
 impl Stored {
-    pub fn new(length: u64, checksum: Option<String>) -> Self {
-        Self { length, checksum }
+    pub fn new(length: u64, checksum: Option<String>, fetched_at: Option<DateTime<Utc>>) -> Self {
+        Self {
+            length,
+            checksum,
+            fetched_at,
+        }
+    }
+
+    pub fn fetched_at(&self) -> Option<DateTime<Utc>> {
+        self.fetched_at
     }
 
     pub fn length(&self) -> u64 {
@@ -270,12 +282,14 @@ impl Archive {
                     .and_then(|length| u64::try_from(length).ok())
                     .ok_or_else(|| failed("no length".to_string()))?;
                 let full_object = response.checksum_type() == Some(&ChecksumType::FullObject);
+                let fetched_at = fetched_at(response.metadata()).map_err(failed)?;
                 Ok(Some(Stored {
                     length,
                     checksum: response
                         .checksum_crc64_nvme()
                         .filter(|_| full_object)
                         .map(String::from),
+                    fetched_at,
                 }))
             }
             Err(error)
@@ -290,6 +304,18 @@ impl Archive {
             )),
         }
     }
+}
+
+/// The fetch time an object's metadata records, refusing a stamp that is present but unreadable.
+fn fetched_at(metadata: Option<&HashMap<String, String>>) -> Result<Option<DateTime<Utc>>, String> {
+    metadata
+        .and_then(|metadata| metadata.get(FETCHED_AT))
+        .map(|raw| {
+            DateTime::parse_from_rfc3339(raw)
+                .map(|instant| instant.with_timezone(&Utc))
+                .map_err(|error| format!("{FETCHED_AT} {raw:?} unreadable: {error}"))
+        })
+        .transpose()
 }
 
 /// The part number, first byte and length of each part a file of `length` bytes is uploaded in, numbered from one.
@@ -384,6 +410,19 @@ mod tests {
     use super::*;
 
     const MEBIBYTE: u64 = 1024 * 1024;
+
+    #[test]
+    fn test_a_fetch_stamp_is_read_absent_or_refused_never_dropped() {
+        let stamped = |raw: &str| HashMap::from([(FETCHED_AT.to_string(), raw.to_string())]);
+        assert_eq!(
+            fetched_at(Some(&stamped("2026-10-02T20:00:00-04:00")))
+                .map(|instant| instant.map(|instant| instant.to_rfc3339())),
+            Ok(Some("2026-10-03T00:00:00+00:00".to_string()))
+        );
+        assert_eq!(fetched_at(None), Ok(None));
+        assert_eq!(fetched_at(Some(&HashMap::new())), Ok(None));
+        assert!(fetched_at(Some(&stamped("yesterday"))).is_err());
+    }
 
     #[test]
     fn test_parts_cover_every_byte_once_numbered_from_one() {
