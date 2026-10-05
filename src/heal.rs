@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use strum::IntoEnumIterator;
+use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -31,7 +32,7 @@ use crate::common::parameter::{Parameter, ParameterRefusal, at_most, resolve};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 use crate::ingest::alpaca::{
-    Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, TickAnswer, invalid_symbol,
+    Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
 };
 use crate::ingest::massive::Massive;
 use crate::ingest::{FetchError, refused_by_cause};
@@ -466,9 +467,9 @@ async fn write_quotes(
     let unanswered = per_symbol(
         &symbols,
         parameters.tick_concurrency,
-        |symbol| {
+        |symbol, pages| {
             let alpaca = Arc::clone(&clients.alpaca);
-            async move { alpaca.quotes(&symbol, session).await }
+            async move { alpaca.quotes(&symbol, session, &pages).await }
         },
         |outcome| match outcome {
             AlpacaQuoteOutcome::Quote(quote) => fold.push(&quote),
@@ -528,9 +529,9 @@ async fn write_trades(
     let unanswered = per_symbol(
         &symbols,
         parameters.tick_concurrency,
-        |symbol| {
+        |symbol, pages| {
             let alpaca = Arc::clone(&clients.alpaca);
-            async move { alpaca.trades(&symbol, session).await }
+            async move { alpaca.trades(&symbol, session, &pages).await }
         },
         |outcome| match outcome {
             AlpacaTradeOutcome::Print {
@@ -621,9 +622,9 @@ fn tick_provenance(journal: &Journal) -> Provenance {
     )
 }
 
-/// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` as its symbol
-/// finishes. A symbol Alpaca names invalid, or answers with no row filed under it, is returned as unanswered rather
-/// than failing the session; any other failure fails it.
+/// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` a page at a time as
+/// pages arrive, in order within a symbol but interleaved across symbols. A symbol Alpaca names invalid, or answers
+/// with no row filed under it, is returned as unanswered rather than failing the session; any other failure fails it.
 async fn per_symbol<Fetch, Pending, Row>(
     symbols: &[Symbol],
     concurrency: NonZeroUsize,
@@ -631,10 +632,11 @@ async fn per_symbol<Fetch, Pending, Row>(
     mut each: impl FnMut(Row),
 ) -> Result<BTreeMap<Symbol, Unanswered>, FetchError>
 where
-    Fetch: Fn(Symbol) -> Pending,
-    Pending: Future<Output = Result<TickAnswer<Row>, FetchError>> + Send + 'static,
+    Fetch: Fn(Symbol, Sender<Vec<Row>>) -> Pending,
+    Pending: Future<Output = Result<bool, FetchError>> + Send + 'static,
     Row: Send + 'static,
 {
+    let (sender, mut pages) = mpsc::channel(concurrency.get());
     let mut pending = symbols.iter().cloned();
     let mut in_flight = JoinSet::new();
     let mut unanswered = BTreeMap::new();
@@ -643,20 +645,25 @@ where
             let Some(symbol) = pending.next() else {
                 break;
             };
-            let answer = fetch(symbol.clone());
+            let answer = fetch(symbol.clone(), sender.clone());
             in_flight.spawn(async move { (symbol, answer.await) });
         }
-        match in_flight.join_next().await {
-            None => return Ok(unanswered),
-            Some(joined) => {
+        if in_flight.is_empty() {
+            drop(sender);
+            while let Some(page) = pages.recv().await {
+                page.into_iter().for_each(&mut each);
+            }
+            return Ok(unanswered);
+        }
+        tokio::select! {
+            Some(page) = pages.recv() => page.into_iter().for_each(&mut each),
+            Some(joined) = in_flight.join_next() => {
                 let (symbol, answer) =
                     joined.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
                 match answer {
-                    Ok(answer) => {
-                        if !answer.answered {
-                            unanswered.insert(symbol, Unanswered::Missing);
-                        }
-                        answer.outcomes.into_iter().for_each(&mut each);
+                    Ok(true) => {}
+                    Ok(false) => {
+                        unanswered.insert(symbol, Unanswered::Missing);
                     }
                     Err(FetchError::Refused { status: 400, body })
                         if invalid_symbol(&body).as_deref() == Some(symbol.as_str()) =>
@@ -909,17 +916,19 @@ mod tests {
         let unanswered = per_symbol(
             &symbols,
             size(2),
-            |symbol| async move {
+            |symbol, pages| async move {
                 match symbol.as_str() {
-                    "AAA" => Ok(TickAnswer {
-                        outcomes: vec![1, 2],
-                        answered: true,
-                    }),
+                    "AAA" => {
+                        for page in [vec![1, 2], vec![3]] {
+                            pages.send(page).await.unwrap();
+                        }
+                        Ok(true)
+                    }
                     // Only rows filed under another ticker: the symbol asked for did not answer.
-                    "BBB" => Ok(TickAnswer {
-                        outcomes: vec![3],
-                        answered: false,
-                    }),
+                    "BBB" => {
+                        pages.send(vec![4]).await.unwrap();
+                        Ok(false)
+                    }
                     _ => Err(FetchError::Refused {
                         status: 400,
                         body: format!(r#"{{"message":"invalid symbol: {symbol}"}}"#),
@@ -930,7 +939,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(rows, [1, 2, 3]);
+        rows.sort();
+        assert_eq!(rows, [1, 2, 3, 4]);
         assert_eq!(
             unanswered,
             BTreeMap::from([
@@ -938,6 +948,30 @@ mod tests {
                 (Symbol::new("CCC").unwrap(), Unanswered::Invalid),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn test_pages_fold_while_their_symbol_is_still_fetching() {
+        let symbols = [Symbol::new("AAA").unwrap()];
+        let mut rows = Vec::new();
+        // One page fits the channel, so the fetch finishes only if pages are folded as they arrive.
+        let answer = per_symbol(
+            &symbols,
+            size(1),
+            |_, pages| async move {
+                for page in 0..5 {
+                    pages.send(vec![page]).await.unwrap();
+                }
+                Ok(true)
+            },
+            |row: i32| rows.push(row),
+        );
+        let unanswered = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the fold drains pages while the fetch runs")
+            .unwrap();
+        assert_eq!(rows, [0, 1, 2, 3, 4]);
+        assert!(unanswered.is_empty());
     }
 
     #[tokio::test]

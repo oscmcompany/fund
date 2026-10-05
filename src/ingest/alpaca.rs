@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use serde::Deserialize;
+use tokio::sync::mpsc::Sender;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
@@ -340,103 +341,86 @@ pub enum AlpacaTradeOutcome {
     Refused(RefusedRow),
 }
 
-/// One symbol's ticks, with whether any row came filed under the symbol asked for, which rows filed under another
-/// ticker do not show.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TickAnswer<Outcome> {
-    pub outcomes: Vec<Outcome>,
-    pub answered: bool,
-}
-
-impl<Outcome> Default for TickAnswer<Outcome> {
-    fn default() -> Self {
-        Self {
-            outcomes: Vec::new(),
-            answered: false,
-        }
-    }
-}
-
 /// Stands in for a condition element longer than one letter, which no condition spells, so the print reads as
 /// unresolved rather than being dropped.
 const UNSPELLABLE: char = '\u{FFFD}';
 
+/// Reads one page of a symbol's ticks into outcomes, with whether any row came filed under that symbol.
+type PageParser<Outcome> = fn(&Symbol, &[u8]) -> Result<(Vec<Outcome>, bool), FetchError>;
+
 impl Alpaca {
-    /// Every SIP quote for `symbol` over the whole Eastern day of `session`, resolved as of that session.
+    /// Sends every SIP quote for `symbol` over the whole Eastern day of `session`, resolved as of that session, a
+    /// page at a time; answers whether any row came filed under the symbol asked for, which rows filed under another
+    /// ticker do not show.
     pub async fn quotes(
         &self,
         symbol: &Symbol,
         session: SessionDate,
-    ) -> Result<TickAnswer<AlpacaQuoteOutcome>, FetchError> {
-        let mut answer = TickAnswer::default();
-        self.tick_pages(QUOTES_URL, symbol, session, |body| {
-            let (outcomes, answered) = quote_page(symbol, &body)?;
-            answer.outcomes.extend(outcomes);
-            answer.answered |= answered;
-            Ok(())
-        })
-        .await?;
-        Ok(answer)
+        pages: &Sender<Vec<AlpacaQuoteOutcome>>,
+    ) -> Result<bool, FetchError> {
+        self.tick_pages(QUOTES_URL, symbol, session, quote_page, pages)
+            .await
     }
 
-    /// Every SIP trade for `symbol` over the whole Eastern day of `session`, resolved as of that session.
+    /// `quotes`, for SIP trades.
     pub async fn trades(
         &self,
         symbol: &Symbol,
         session: SessionDate,
-    ) -> Result<TickAnswer<AlpacaTradeOutcome>, FetchError> {
-        let mut answer = TickAnswer::default();
-        self.tick_pages(TRADES_URL, symbol, session, |body| {
-            let (outcomes, answered) = trade_page(symbol, &body)?;
-            answer.outcomes.extend(outcomes);
-            answer.answered |= answered;
-            Ok(())
-        })
-        .await?;
-        Ok(answer)
+        pages: &Sender<Vec<AlpacaTradeOutcome>>,
+    ) -> Result<bool, FetchError> {
+        self.tick_pages(TRADES_URL, symbol, session, trade_page, pages)
+            .await
     }
 
-    async fn tick_pages(
+    async fn tick_pages<Outcome>(
         &self,
         url: &str,
         symbol: &Symbol,
         session: SessionDate,
-        on_page: impl FnMut(Vec<u8>) -> Result<(), FetchError>,
-    ) -> Result<(), FetchError> {
+        parse: PageParser<Outcome>,
+        pages: &Sender<Vec<Outcome>>,
+    ) -> Result<bool, FetchError> {
         let (start, end) = session.bounds();
         // The endpoint's end is inclusive, so the next session's first nanosecond is excluded.
         let end = end - TimeDelta::nanoseconds(1);
         let as_of = session.to_string();
         let (start, end) = (start.to_rfc3339(), end.to_rfc3339());
-        let (start, end, as_of) = (&start, &end, &as_of);
-        paginate_each(
-            |page_token| async move {
-                with_retries(|| {
-                    let mut query = vec![
-                        ("symbols", symbol.as_str()),
-                        ("start", start.as_str()),
-                        ("end", end.as_str()),
-                        ("feed", "sip"),
-                        ("asof", as_of.as_str()),
-                        ("sort", "asc"),
-                        ("limit", PAGE_LIMIT),
-                    ];
-                    if let Some(token) = page_token.as_deref() {
-                        query.push(("page_token", token));
-                    }
-                    send(
-                        self.http_client
-                            .get(url)
-                            .header("APCA-API-KEY-ID", &self.key_id)
-                            .header("APCA-API-SECRET-KEY", &self.secret)
-                            .query(&query),
-                    )
-                })
-                .await
-            },
-            on_page,
-        )
-        .await
+        let mut tokens = PageTokens::default();
+        let mut token: Option<String> = None;
+        let mut answered = false;
+        loop {
+            let body = with_retries(|| {
+                let mut query = vec![
+                    ("symbols", symbol.as_str()),
+                    ("start", start.as_str()),
+                    ("end", end.as_str()),
+                    ("feed", "sip"),
+                    ("asof", as_of.as_str()),
+                    ("sort", "asc"),
+                    ("limit", PAGE_LIMIT),
+                ];
+                if let Some(token) = token.as_deref() {
+                    query.push(("page_token", token));
+                }
+                send(
+                    self.http_client
+                        .get(url)
+                        .header("APCA-API-KEY-ID", &self.key_id)
+                        .header("APCA-API-SECRET-KEY", &self.secret)
+                        .query(&query),
+                )
+            })
+            .await?;
+            let next = tokens.next(&body)?;
+            let (outcomes, page_answered) = parse(symbol, &body)?;
+            answered |= page_answered;
+            // A closed channel means nothing folds these pages, so fetching more is wasted.
+            match (pages.send(outcomes).await, next) {
+                (Err(_), _) | (Ok(()), None) => return Ok(answered),
+                (Ok(()), Some(next)) => token = Some(next),
+            }
+        }
     }
 }
 
@@ -620,45 +604,41 @@ where
     Ok((Vec::new(), requested, invalid))
 }
 
-/// Follows `next_page_token` until it is null. A token seen before means the pages cycle, which would otherwise
-/// request forever while holding every page, so it is refused.
-async fn paginate<Fetch, Pending>(fetch_page: Fetch) -> Result<Vec<Vec<u8>>, FetchError>
+/// Follows `next_page_token` until it is null.
+async fn paginate<Fetch, Pending>(mut fetch_page: Fetch) -> Result<Vec<Vec<u8>>, FetchError>
 where
     Fetch: FnMut(Option<String>) -> Pending,
     Pending: std::future::Future<Output = Result<Vec<u8>, FetchError>>,
 {
+    let mut tokens = PageTokens::default();
     let mut pages = Vec::new();
-    paginate_each(fetch_page, |body| {
-        pages.push(body);
-        Ok(())
-    })
-    .await?;
-    Ok(pages)
-}
-
-/// `paginate`, handing each page to `on_page` as it arrives so no page outlives its turn.
-async fn paginate_each<Fetch, Pending>(
-    mut fetch_page: Fetch,
-    mut on_page: impl FnMut(Vec<u8>) -> Result<(), FetchError>,
-) -> Result<(), FetchError>
-where
-    Fetch: FnMut(Option<String>) -> Pending,
-    Pending: std::future::Future<Output = Result<Vec<u8>, FetchError>>,
-{
-    let mut seen = BTreeSet::new();
     let mut token = None;
     loop {
         let body = fetch_page(token).await?;
-        let next = next_page_token(&body)?;
-        on_page(body)?;
+        let next = tokens.next(&body)?;
+        pages.push(body);
         match next {
-            None => return Ok(()),
-            Some(next) if !seen.insert(next.clone()) => {
-                return Err(FetchError::Malformed {
-                    reason: format!("page token {next} repeated"),
-                });
-            }
+            None => return Ok(pages),
             Some(next) => token = Some(next),
+        }
+    }
+}
+
+/// The page tokens seen so far. A token seen before means the pages cycle, which would otherwise request forever, so
+/// it is refused.
+#[derive(Default)]
+struct PageTokens {
+    seen: BTreeSet<String>,
+}
+
+impl PageTokens {
+    /// The token `body` names for the next page, `None` on the last.
+    fn next(&mut self, body: &[u8]) -> Result<Option<String>, FetchError> {
+        match next_page_token(body)? {
+            Some(next) if !self.seen.insert(next.clone()) => Err(FetchError::Malformed {
+                reason: format!("page token {next} repeated"),
+            }),
+            next => Ok(next),
         }
     }
 }
