@@ -5,9 +5,9 @@ use arrow_array::{Array, Float64Array, LargeStringArray, RecordBatch};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::common::market::security_details::{
-    IndustryCode, MarketIdentifierCode, SecurityDetails,
+    CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails,
 };
-use crate::common::market::{Dollars, Shares, Symbol};
+use crate::common::market::{Dollars, DollarsRefusal, Shares, Symbol};
 use crate::common::time::SessionDate;
 use crate::ingest::massive::security_type;
 
@@ -27,6 +27,11 @@ pub struct LegacySnapshot {
     pub as_of: SessionDate,
     pub details: Vec<SecurityDetails>,
     pub refused: Vec<RefusedSnapshotRow>,
+}
+
+/// The vendor's capitalization, its own float product a few hundred-millionths off the cent, rounded to the cent.
+fn capitalization_to_the_cent(dollars: f64) -> Result<Dollars, DollarsRefusal> {
+    Dollars::from_float((dollars * 100.0).round() / 100.0)
 }
 
 /// A text cell, `None` where the legacy file holds a null.
@@ -98,9 +103,8 @@ pub fn read_legacy_snapshot(bytes: Vec<u8>) -> Result<LegacySnapshot, String> {
                         .map(Shares::from_float)
                         .transpose()
                         .map_err(|error| format!("shares outstanding: {error:?}"))?,
-                    // The vendor's capitalization is its own float product, a few hundred-millionths off the cent.
                     float(capitalizations)
-                        .map(|dollars| Dollars::from_float((dollars * 100.0).round() / 100.0))
+                        .map(capitalization_to_the_cent)
                         .transpose()
                         .map_err(|error| format!("market capitalization: {error:?}"))?,
                     text(exchanges)
@@ -110,6 +114,7 @@ pub fn read_legacy_snapshot(bytes: Vec<u8>) -> Result<LegacySnapshot, String> {
                     text(central_index_keys)
                         .map(|raw| {
                             raw.parse::<u64>()
+                                .map(CentralIndexKey::new)
                                 .map_err(|_| format!("central index key `{raw}`"))
                         })
                         .transpose()?,
@@ -130,4 +135,19 @@ pub fn read_legacy_snapshot(bytes: Vec<u8>) -> Result<LegacySnapshot, String> {
         details,
         refused,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_capitalization_off_the_cent_rounds_onto_it() {
+        assert!(Dollars::from_float(1_234.567_891_2).is_err());
+        assert_eq!(
+            capitalization_to_the_cent(1_234.567_891_2).map(Dollars::millionths),
+            Ok(1_234_570_000)
+        );
+        assert!(capitalization_to_the_cent(-1.0).is_err());
+    }
 }

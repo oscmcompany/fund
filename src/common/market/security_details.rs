@@ -92,6 +92,20 @@ impl MarketIdentifierCode {
     }
 }
 
+/// The SEC's Central Index Key, the filer identity that survives a rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CentralIndexKey(u64);
+
+impl CentralIndexKey {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// One symbol's details on a snapshot date.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityDetails {
@@ -103,8 +117,7 @@ pub struct SecurityDetails {
     shares_outstanding: Option<Shares>,
     market_capitalization: Option<Dollars>,
     primary_exchange: Option<MarketIdentifierCode>,
-    /// The SEC's Central Index Key, the filer identity that survives a rename.
-    central_index_key: Option<u64>,
+    central_index_key: Option<CentralIndexKey>,
 }
 
 impl SecurityDetails {
@@ -117,7 +130,7 @@ impl SecurityDetails {
         shares_outstanding: Option<Shares>,
         market_capitalization: Option<Dollars>,
         primary_exchange: Option<MarketIdentifierCode>,
-        central_index_key: Option<u64>,
+        central_index_key: Option<CentralIndexKey>,
     ) -> Self {
         Self {
             symbol,
@@ -159,7 +172,7 @@ impl SecurityDetails {
         self.primary_exchange.as_ref()
     }
 
-    pub fn central_index_key(&self) -> Option<u64> {
+    pub fn central_index_key(&self) -> Option<CentralIndexKey> {
         self.central_index_key
     }
 }

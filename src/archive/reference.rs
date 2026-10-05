@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 use super::bars::{Provenance, provenance_from};
 use super::parquet;
 use crate::common::market::security_details::{
-    IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
+    CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
 use crate::common::market::trade_bars::{TradeConditions, UpdateRules};
 use crate::common::market::{Dollars, Shares, Symbol};
@@ -240,7 +240,7 @@ pub fn encode_security_details(
                 .map(|dollars| i128::from(dollars.millionths())),
         );
         exchanges.append_option(row.primary_exchange().map(MarketIdentifierCode::as_str));
-        central_index_keys.append_option(row.central_index_key());
+        central_index_keys.append_option(row.central_index_key().map(CentralIndexKey::value));
     }
     let metadata = provenance
         .entries()
@@ -317,8 +317,8 @@ pub fn decode_security_details(
                 .map(|()| MarketIdentifierCode::new(exchanges.value(row)))
                 .transpose()
                 .map_err(|error| refused(format!("{error:?}")))?;
-            let central_index_key =
-                optional(central_index_keys.is_valid(row)).map(|()| central_index_keys.value(row));
+            let central_index_key = optional(central_index_keys.is_valid(row))
+                .map(|()| CentralIndexKey::new(central_index_keys.value(row)));
             details.push(SecurityDetails::new(
                 symbol,
                 security_type,
@@ -401,7 +401,7 @@ mod tests {
                 Some(Shares::whole(303_000_000).unwrap()),
                 Some(Dollars::from_float(51_340_135_490.0).unwrap()),
                 Some(MarketIdentifierCode::new("XNYS").unwrap()),
-                Some(1_090_872),
+                Some(CentralIndexKey::new(1_090_872)),
             ),
         ];
         let provenance = Provenance::new(

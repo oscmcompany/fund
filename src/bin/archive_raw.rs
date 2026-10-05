@@ -1581,6 +1581,7 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
         .map_err(RollUpFailure::Archive)?
         .ok_or(RollUpFailure::Missing)?;
     let key = massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session);
+    let encoded_key = key.clone();
     let (count, body) = tokio::task::spawn_blocking(move || {
         let (minutes, provenance) = bars::decode(&minute_key, bytes)
             .map_err(|refusal| RollUpFailure::Decode(format!("{refusal:?}")))?;
@@ -1588,17 +1589,14 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
             BarRollup::of(bar, BarInterval::FiveMinute).expect("minutes roll up to five minutes")
         }))
         .into_bars();
-        let body = bars::encode(&key, &five_minutes, &provenance)
+        let body = bars::encode(&encoded_key, &five_minutes, &provenance)
             .map_err(|refusal| RollUpFailure::Encode(format!("{refusal:?}")))?;
         Ok::<_, RollUpFailure>((five_minutes.len(), body))
     })
     .await
     .map_err(|error| RollUpFailure::Decode(error.to_string()))??;
     archive
-        .create(
-            &massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session),
-            body,
-        )
+        .create(&key, body)
         .await
         .map_err(RollUpFailure::Archive)?;
     Ok(count)
@@ -1719,7 +1717,11 @@ async fn port_snapshot(
             .iter()
             .fold(BTreeMap::new(), |mut counts, row| {
                 *counts
-                    .entry(row.reason.split(':').next().unwrap_or_default())
+                    .entry(
+                        row.reason
+                            .split_once(':')
+                            .map_or(row.reason.as_str(), |(head, _)| head),
+                    )
                     .or_insert(0) += 1;
                 counts
             });
