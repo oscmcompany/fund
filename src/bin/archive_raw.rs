@@ -1610,6 +1610,20 @@ struct LegacySidecar {
     written_at: DateTime<Utc>,
 }
 
+/// The date a legacy snapshot's path names.
+fn legacy_snapshot_date(path: &str) -> Option<SessionDate> {
+    let value = |name: &str| {
+        path.split('/')
+            .find_map(|segment| segment.strip_prefix(name)?.strip_prefix('='))
+    };
+    NaiveDate::from_ymd_opt(
+        value("year")?.parse().ok()?,
+        value("month")?.parse().ok()?,
+        value("day")?.parse().ok()?,
+    )
+    .map(SessionDate::from_date)
+}
+
 /// Writes each legacy security snapshot under its `security_details` key, once.
 async fn port_security_details(
     archive: &Archive,
@@ -1662,6 +1676,22 @@ async fn port_snapshot(
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("{path} is gone"))
     };
+    if let Some(as_of) = legacy_snapshot_date(path) {
+        let key = Key::Reference {
+            provider: Provider::Massive,
+            table: ReferenceTable::SecurityDetails,
+            as_of,
+        };
+        if archive
+            .stored(&key)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            tracing::info!(path = key.path(), "Snapshot already ported");
+            return Ok(());
+        }
+    }
     let sidecar: LegacySidecar =
         serde_json::from_slice(&read(format!("{path}.provenance.json")).await?)
             .map_err(|error| error.to_string())?;

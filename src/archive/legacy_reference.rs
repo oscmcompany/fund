@@ -98,8 +98,9 @@ pub fn read_legacy_snapshot(bytes: Vec<u8>) -> Result<LegacySnapshot, String> {
                         .map(Shares::from_float)
                         .transpose()
                         .map_err(|error| format!("shares outstanding: {error:?}"))?,
+                    // The vendor's capitalization is its own float product, a few hundred-millionths off the cent.
                     float(capitalizations)
-                        .map(Dollars::from_float)
+                        .map(|dollars| Dollars::from_float((dollars * 100.0).round() / 100.0))
                         .transpose()
                         .map_err(|error| format!("market capitalization: {error:?}"))?,
                     text(exchanges)
