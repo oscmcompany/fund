@@ -240,7 +240,12 @@ impl Shares {
     }
 
     pub fn plus(self, other: Self) -> Self {
-        Self(self.0.checked_add(other.0).expect("share count fits u64"))
+        self.checked_plus(other).expect("share count fits u64")
+    }
+
+    /// The sum, `None` when it passes what a `u64` of millionths holds.
+    pub fn checked_plus(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
     }
 
     /// The count in shares, for presentation only: sums belong on `units`.

@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 use super::record::{Bar, BarInterval};
 use super::{Price, Shares, Symbol};
-use crate::common::monoid::{Monoid, concatenate};
+use crate::common::monoid::Monoid;
 use crate::common::time::calendar::{SessionPhase, TradingCalendar};
 
 /// The latest bars a state keeps for each symbol and interval, so a `VolumeDepth` reads at most this many.
@@ -46,10 +46,13 @@ impl VolumeDepth {
     }
 }
 
-/// Why a rolling volume was refused: the series holds fewer bars than the depth, `held` of them.
+/// Why a rolling volume was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollingVolumeRefusal {
+    /// The series holds fewer bars than the depth, `held` of them.
     ShortOfDepth { held: usize },
+    /// The latest `depth` volumes sum past what `Shares` holds.
+    BeyondRange { depth: usize },
 }
 
 /// What one bar leaves in the state; ordered so a repeated timestamp keeps the greater and the combine commutes.
@@ -114,13 +117,14 @@ impl MarketState {
         if held < depth.get() {
             return Err(RollingVolumeRefusal::ShortOfDepth { held });
         }
-        Ok(concatenate(
-            bars.into_iter()
-                .flat_map(BTreeMap::values)
-                .rev()
-                .take(depth.get())
-                .map(|retained| retained.volume),
-        ))
+        bars.into_iter()
+            .flat_map(BTreeMap::values)
+            .rev()
+            .take(depth.get())
+            .try_fold(Shares::empty(), |total, retained| {
+                total.checked_plus(retained.volume)
+            })
+            .ok_or(RollingVolumeRefusal::BeyondRange { depth: depth.get() })
     }
 
     /// Where the clock falls in `calendar`'s sessions, `None` before any clock event.
@@ -166,7 +170,7 @@ mod tests {
 
     use super::*;
     use crate::common::market::record::Ohlc;
-    use crate::common::monoid::laws;
+    use crate::common::monoid::{concatenate, laws};
     use crate::common::time::SessionDate;
     use crate::common::time::calendar::TradingSession;
 
@@ -280,6 +284,37 @@ mod tests {
         );
     }
 
+    /// Volumes whose sum passes the share count's range are refused, not summed into a panic.
+    #[test]
+    fn test_a_rolling_volume_past_the_range_is_refused() {
+        let bar = |minute: i64, units: u64| {
+            let price = Price::from_ticks(1_000_000).unwrap();
+            MarketEvent::Bar(
+                Bar::new(
+                    symbol("AAPL"),
+                    BarInterval::OneMinute,
+                    "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap()
+                        + TimeDelta::minutes(minute),
+                    Ohlc::new(price, price, price, price).unwrap(),
+                    Shares::from_units(units),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let state = fold([bar(0, u64::MAX), bar(1, 1)]);
+        let aapl = symbol("AAPL");
+        assert_eq!(
+            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(2)),
+            Err(RollingVolumeRefusal::BeyondRange { depth: 2 })
+        );
+        assert_eq!(
+            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(1)),
+            Ok(Shares::from_units(1))
+        );
+    }
+
     /// Minute and daily bars of one symbol are separate series.
     #[test]
     fn test_each_interval_is_its_own_series() {
@@ -360,6 +395,28 @@ mod tests {
         ]
     }
 
+    /// One series' bars at 120 or more distinct minutes out of 200, so any two of them overlap by at least 40.
+    fn full_history() -> impl Strategy<Value = Vec<MarketEvent>> {
+        prop::sample::subsequence((0_i64..200).collect::<Vec<_>>(), 120..200).prop_flat_map(
+            |minutes| {
+                let count = minutes.len();
+                (
+                    Just(minutes),
+                    prop::collection::vec((1_i64..4, 0_u64..1_000), count),
+                )
+                    .prop_map(|(minutes, values)| {
+                        minutes
+                            .into_iter()
+                            .zip(values)
+                            .map(|(minute, (close, volume))| {
+                                MarketEvent::Bar(minute_bar("AAPL", minute, close, volume))
+                            })
+                            .collect()
+                    })
+            },
+        )
+    }
+
     fn any_state() -> impl Strategy<Value = MarketState> {
         prop::collection::vec(any_event(), 0..80).prop_map(fold)
     }
@@ -381,6 +438,35 @@ mod tests {
         ) {
             let states = |events: Vec<MarketEvent>| events.into_iter().map(MarketState::of).collect();
             laws::check_any_order(states(events), states(shuffled))?;
+        }
+
+        /// Two chunks each holding a full series, at least 40 of their minutes shared, combine in either order to
+        /// the state of the whole stream, which holds exactly the latest minutes.
+        #[test]
+        fn property_full_histories_combine_to_the_whole(
+            head in full_history(),
+            tail in full_history(),
+        ) {
+            let aapl = (symbol("AAPL"), BarInterval::OneMinute);
+            let mut latest: Vec<DateTime<Utc>> = head
+                .iter()
+                .chain(&tail)
+                .map(|event| match event {
+                    MarketEvent::Bar(bar) => bar.timestamp(),
+                    MarketEvent::Clock(instant) => *instant,
+                })
+                .collect();
+            latest.sort();
+            latest.dedup();
+            let latest = latest.split_off(latest.len() - RETAINED_BARS);
+            let whole = fold(head.iter().chain(&tail).cloned());
+            prop_assert_eq!(whole.series[&aapl].keys().copied().collect::<Vec<_>>(), latest);
+            let (head, tail) = (fold(head), fold(tail));
+            for chunk in [&head, &tail] {
+                prop_assert_eq!(chunk.series[&aapl].len(), RETAINED_BARS);
+            }
+            prop_assert_eq!(head.clone().combine(tail.clone()), whole.clone());
+            prop_assert_eq!(tail.combine(head), whole);
         }
 
         /// Folding a stream one event at a time, as the live loop does, equals folding any two halves apart and
