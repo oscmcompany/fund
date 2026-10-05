@@ -31,3 +31,7 @@ data/*
 
 # LLVM coverage raw files
 *.profraw
+
+# Test tool output: proptest failure seeds and cargo-mutants reports
+proptest-regressions/
+mutants.out*/
