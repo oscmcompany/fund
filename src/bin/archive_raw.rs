@@ -13,20 +13,23 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use fund::archive::bars::{EncodeRefusal, Provenance, Subscription, encode};
-use fund::archive::quote_bars;
 use fund::archive::raw::{CopyError, Stored};
 use fund::archive::{Archive, ArchiveError};
+use fund::archive::{quote_bars, reference, trade_bars};
 use fund::common::journal::{Commit, RunId};
 use fund::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use fund::common::market::record::BarInterval;
+use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use fund::common::monoid::concatenate;
-use fund::common::storage::{Key, Origin, Provider};
+use fund::common::storage::{Key, Origin, Provider, ReferenceTable};
 use fund::common::time::SessionDate;
 use fund::ingest::RefusedRow;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::flat_files::{
-    FlatFileDataset, FlatFileStream, FlatFiles, ParseRefusal, QuoteRowOutcome, read_quotes,
+    FlatFileDataset, FlatFileStream, FlatFiles, ParseRefusal, QuoteRowOutcome, TradeRowOutcome,
+    read_quotes, read_trades,
 };
+use fund::ingest::massive::Massive;
 use fund::ingest::refused_by_cause;
 use fund::journal::built_commit;
 
@@ -72,6 +75,12 @@ enum Command {
         last: SessionDate,
         concurrency: usize,
     },
+    FetchConditions,
+    FoldTrades {
+        first: SessionDate,
+        last: SessionDate,
+        concurrency: usize,
+    },
 }
 
 fn parse(arguments: &[String]) -> Option<Command> {
@@ -93,6 +102,17 @@ fn parse(arguments: &[String]) -> Option<Command> {
         [command, dataset, first, last, concurrency] if command == "parse" => {
             Some(Command::Parse {
                 dataset: dataset.parse().ok()?,
+                first: date(first)?,
+                last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+                concurrency: concurrency
+                    .parse()
+                    .ok()
+                    .filter(|count: &usize| *count > 0)?,
+            })
+        }
+        [command] if command == "fetch-conditions" => Some(Command::FetchConditions),
+        [command, first, last, concurrency] if command == "fold-trades" => {
+            Some(Command::FoldTrades {
                 first: date(first)?,
                 last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
                 concurrency: concurrency
@@ -131,7 +151,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | fold-trades <first> <last> <concurrency>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -179,6 +199,41 @@ async fn main() -> ExitCode {
             }
             Command::Verify { dataset } => verify(archive, dataset).await,
             Command::DeleteLegacy { dataset } => delete_legacy(archive, dataset).await,
+            Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
+                Ok(massive) => fetch_conditions(&archive, &massive, run_id, commit).await,
+                Err(refusal) => {
+                    tracing::error!(%refusal, "Client configuration refused");
+                    ExitCode::from(REFUSED_TO_START)
+                }
+            },
+            Command::FoldTrades {
+                first,
+                last,
+                concurrency,
+            } => {
+                let clients = (
+                    FlatFiles::from_environment(),
+                    Alpaca::from_environment(reqwest::Client::new()),
+                );
+                let (flat_files, alpaca) = match clients {
+                    (Ok(flat_files), Ok(alpaca)) => (flat_files, alpaca),
+                    (Err(refusal), _) | (_, Err(refusal)) => {
+                        tracing::error!(%refusal, "Client configuration refused");
+                        return ExitCode::from(REFUSED_TO_START);
+                    }
+                };
+                fold_trades(
+                    &archive,
+                    &flat_files,
+                    &alpaca,
+                    first,
+                    last,
+                    concurrency,
+                    run_id,
+                    commit,
+                )
+                .await
+            }
             Command::FoldQuotes {
                 first,
                 last,
@@ -871,7 +926,7 @@ fn quote_keys(session: SessionDate) -> [Key; 3] {
 #[derive(Debug)]
 enum FoldFailure {
     Parse(ParseRefusal),
-    Encode(quote_bars::EncodeRefusal),
+    Encode(String),
     Archive(ArchiveError),
     Interrupted(String),
     Empty,
@@ -881,10 +936,10 @@ impl std::fmt::Display for FoldFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse(refusal) => write!(formatter, "{refusal}"),
-            Self::Encode(refusal) => write!(formatter, "{refusal:?}"),
+            Self::Encode(refusal) => write!(formatter, "{refusal}"),
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Interrupted(reason) => write!(formatter, "the fold did not finish: {reason}"),
-            Self::Empty => write!(formatter, "no quote stood during the session"),
+            Self::Empty => write!(formatter, "nothing fell in the session's hours"),
         }
     }
 }
@@ -1061,7 +1116,8 @@ async fn fold_one(
     ];
     let symbols = files[2].1.len();
     for (key, bars) in files {
-        let body = quote_bars::encode(&key, &bars, provenance).map_err(FoldFailure::Encode)?;
+        let body = quote_bars::encode(&key, &bars, provenance)
+            .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
         archive
             .create(&key, body)
             .await
@@ -1088,6 +1144,306 @@ struct QuoteRowCounts {
     test_tickers: u64,
     one_sided: u64,
     refused: Vec<RefusedRow>,
+}
+
+/// The conditions table's key for a snapshot taken on `as_of`.
+fn conditions_key(as_of: SessionDate) -> Key {
+    Key::Reference {
+        provider: Provider::Massive,
+        table: ReferenceTable::Conditions,
+        as_of,
+    }
+}
+
+/// Fetches Massive's condition table and writes it as today's snapshot.
+async fn fetch_conditions(
+    archive: &Archive,
+    massive: &Massive,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> ExitCode {
+    let fetched_at = Utc::now();
+    let conditions = match massive.trade_conditions().await {
+        Ok(conditions) => conditions,
+        Err(error) => {
+            tracing::error!(%error, "Conditions not fetched");
+            return ExitCode::FAILURE;
+        }
+    };
+    let key = conditions_key(SessionDate::at(fetched_at));
+    let provenance = Provenance::new(Subscription::StocksStarter, fetched_at, run_id, commit);
+    let written = reference::encode_conditions(&key, &conditions, &provenance)
+        .map_err(|refusal| format!("{refusal:?}"))
+        .map(|body| archive.create(&key, body));
+    match written {
+        Ok(write) => match write.await {
+            Ok(()) => {
+                tracing::info!(
+                    path = key.path(),
+                    codes = conditions.rules().len(),
+                    "Wrote the conditions table"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                tracing::error!(%error, "Conditions table not written");
+                ExitCode::FAILURE
+            }
+        },
+        Err(refusal) => {
+            tracing::error!(refusal, "Conditions table not encoded");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The newest conditions snapshot the archive holds.
+async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), String> {
+    let series = conditions_key(SessionDate::from_date(NaiveDate::MIN)).series();
+    let latest = archive
+        .list(&series)
+        .await
+        .map_err(|error| error.to_string())?
+        .iter()
+        .filter_map(|path| Key::parse(path).ok())
+        .max_by_key(Key::session)
+        .ok_or_else(|| format!("no conditions table under {series}"))?;
+    let bytes = archive
+        .get(&latest)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("{} vanished", latest.path()))?;
+    let (conditions, _) =
+        reference::decode_conditions(&latest, bytes).map_err(|refusal| format!("{refusal:?}"))?;
+    Ok((latest, conditions))
+}
+
+/// Trade bars at every interval for a session, minutes first, keyed where each is written.
+fn trade_keys(session: SessionDate) -> [Key; 3] {
+    [
+        BarInterval::OneMinute,
+        BarInterval::FiveMinute,
+        BarInterval::OneDay,
+    ]
+    .map(|interval| Key::Trades {
+        provider: Provider::Massive,
+        origin: Origin::Derived,
+        interval,
+        session,
+    })
+}
+
+/// Streams each listed trade file not yet folded from Massive and writes its one-minute, five-minute and daily bars.
+#[allow(clippy::too_many_arguments)]
+async fn fold_trades(
+    archive: &Archive,
+    flat_files: &FlatFiles,
+    alpaca: &Alpaca,
+    first: SessionDate,
+    last: SessionDate,
+    concurrency: usize,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> ExitCode {
+    let (conditions_path, conditions) = match latest_conditions(archive).await {
+        Ok((key, conditions)) => (key.path(), conditions),
+        Err(reason) => {
+            tracing::error!(reason, "Conditions table not read");
+            return ExitCode::FAILURE;
+        }
+    };
+    let calendar = match alpaca.calendar(first, last).await {
+        Ok(calendar) => calendar,
+        Err(error) => {
+            tracing::error!(%error, "Calendar not fetched");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (listing, written) = match (
+        flat_files.listing(FlatFileDataset::Trades).await,
+        archive.list(&trade_keys(first)[2].series()).await,
+    ) {
+        (Ok(listing), Ok(written)) => (listing, written),
+        (Err(error), _) => {
+            tracing::error!(%error, "Flat files not listed");
+            return ExitCode::FAILURE;
+        }
+        (_, Err(error)) => {
+            tracing::error!(%error, "Archive not listed");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The daily file is written last, so a session holding it holds all three.
+    let done: BTreeSet<SessionDate> = written
+        .iter()
+        .filter_map(|path| Key::parse(path).ok())
+        .map(|key| key.session())
+        .collect();
+    let offered: Vec<_> = listing
+        .into_iter()
+        .filter(|listed| (first..=last).contains(&listed.session()))
+        .collect();
+    let untraded: Vec<SessionDate> = offered
+        .iter()
+        .map(|listed| listed.session())
+        .filter(|session| !calendar.is_trading_day(*session))
+        .collect();
+    let owed: Vec<_> = offered
+        .iter()
+        .filter(|listed| {
+            calendar.is_trading_day(listed.session()) && !done.contains(&listed.session())
+        })
+        .cloned()
+        .collect();
+    tracing::info!(
+        %first,
+        %last,
+        conditions = conditions_path,
+        codes = conditions.rules().len(),
+        offered = offered.len(),
+        already_folded = offered.len() - owed.len() - untraded.len(),
+        not_trading_days = listed(&untraded),
+        owed = owed.len(),
+        owed_bytes = owed.iter().map(|listed| listed.length()).sum::<u64>(),
+        concurrency,
+        "Planned a trade fold"
+    );
+    let mut tasks = JoinSet::new();
+    let mut outcomes = BTreeMap::new();
+    let mut panicked = 0;
+    for listed_file in owed {
+        while tasks.len() >= concurrency {
+            if let Some(joined) = tasks.join_next().await {
+                record(joined, &mut outcomes, &mut panicked);
+            }
+        }
+        let session = listed_file.session();
+        let hours = calendar
+            .session(session)
+            .map(|trading| trading.hours())
+            .expect("owed sessions are trading days");
+        let archive = archive.clone();
+        let conditions = conditions.clone();
+        let stream = flat_files.stream(FlatFileDataset::Trades, &listed_file, STREAM_AHEAD);
+        let provenance = Provenance::new(
+            Subscription::StocksAdvanced,
+            Utc::now(),
+            run_id,
+            commit.clone(),
+        );
+        tasks.spawn(
+            async move {
+                let started = tokio::time::Instant::now();
+                let outcome =
+                    fold_trades_one(&archive, stream, session, hours, conditions, &provenance)
+                        .await;
+                match &outcome {
+                    Ok(()) => tracing::info!(
+                        session = %session,
+                        seconds = started.elapsed().as_secs_f64(),
+                        "Folded a trade file"
+                    ),
+                    Err(failure) => {
+                        tracing::error!(session = %session, %failure, "Trade file not folded")
+                    }
+                }
+                (session, outcome)
+            }
+            .in_current_span(),
+        );
+    }
+    while let Some(joined) = tasks.join_next().await {
+        record(joined, &mut outcomes, &mut panicked);
+    }
+    let failed: Vec<SessionDate> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_err())
+        .map(|(session, _)| *session)
+        .collect();
+    tracing::info!(
+        written = outcomes.len() - failed.len(),
+        failed = failed.len(),
+        failed_sessions = listed(&failed),
+        panicked,
+        "Finished a trade fold"
+    );
+    if failed.is_empty() && panicked == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Folds one streamed trade file and creates its three files, the daily last.
+async fn fold_trades_one(
+    archive: &Archive,
+    stream: FlatFileStream,
+    session: SessionDate,
+    (open, close): (DateTime<Utc>, DateTime<Utc>),
+    conditions: TradeConditions,
+    provenance: &Provenance,
+) -> Result<(), FoldFailure> {
+    let folded = tokio::task::spawn_blocking(move || {
+        let mut fold = TradeFold::new(open, close, conditions)
+            .expect("a trading session closes after it opens");
+        let mut test_tickers = 0_u64;
+        let mut refused = Vec::new();
+        read_trades(stream, |outcome| match outcome {
+            TradeRowOutcome::Trade {
+                trade,
+                conditions,
+                corrected,
+            } => fold.push(&trade, &conditions, corrected),
+            TradeRowOutcome::TestTicker => test_tickers += 1,
+            TradeRowOutcome::Refused(row) => refused.push(row),
+        })
+        .map_err(FoldFailure::Parse)?;
+        let (minutes, counts) = fold.finish();
+        Ok::<_, FoldFailure>((minutes, counts, test_tickers, refused))
+    })
+    .await
+    .map_err(|error| FoldFailure::Interrupted(error.to_string()))??;
+    let (minutes, counts, test_tickers, refused) = folded;
+    if minutes.is_empty() {
+        return Err(FoldFailure::Empty);
+    }
+    let [minute_key, five_minute_key, daily_key] = trade_keys(session);
+    let rollup =
+        |interval| {
+            concatenate(minutes.iter().map(|bar| {
+                TradeRollup::of(bar, interval).expect("minutes roll up to coarser bars")
+            }))
+            .into_bars()
+        };
+    let files = [
+        (minute_key, minutes.clone()),
+        (five_minute_key, rollup(BarInterval::FiveMinute)),
+        (daily_key, rollup(BarInterval::OneDay)),
+    ];
+    let symbols = files[2].1.len();
+    for (key, bars) in files {
+        let body = trade_bars::encode(&key, &bars, provenance)
+            .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
+        archive
+            .create(&key, body)
+            .await
+            .map_err(FoldFailure::Archive)?;
+    }
+    tracing::info!(
+        session = %session,
+        symbols,
+        minute_bars = minutes.len(),
+        folded = counts.folded(),
+        outside_hours = counts.outside_hours(),
+        corrected = counts.corrected(),
+        volume_ineligible = counts.volume_ineligible(),
+        unresolved = counts.unresolved(),
+        test_tickers,
+        refused = refused.len(),
+        refused_by_cause = ?refused_by_cause(&refused),
+        "Wrote trade bars"
+    );
+    Ok(())
 }
 
 fn compare(

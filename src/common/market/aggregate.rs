@@ -18,6 +18,15 @@ pub struct TradeTotals {
 }
 
 impl TradeTotals {
+    /// Totals read back from storage, where each was summed exactly when written.
+    pub fn new(count: TradeCount, volume: Shares, dollar_volume: DollarVolume) -> Self {
+        Self {
+            count,
+            volume,
+            dollar_volume,
+        }
+    }
+
     pub fn of(trade: &Trade) -> Self {
         Self {
             count: TradeCount::new(1),

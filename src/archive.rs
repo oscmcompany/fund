@@ -8,6 +8,7 @@ pub mod parquet;
 pub mod quote_bars;
 pub mod raw;
 pub mod reference;
+pub mod trade_bars;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
