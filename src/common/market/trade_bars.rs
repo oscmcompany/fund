@@ -69,6 +69,15 @@ impl Tape {
     }
 }
 
+/// The condition letter `spelled` holds, or `None` unless it is exactly one character.
+pub fn condition_letter(spelled: &str) -> Option<char> {
+    let mut characters = spelled.chars();
+    match (characters.next(), characters.next()) {
+        (Some(letter), None) => Some(letter),
+        (None, _) | (Some(_), Some(_)) => None,
+    }
+}
+
 /// One sale condition: the rules it imposes and the letter each tape spells it with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Condition {

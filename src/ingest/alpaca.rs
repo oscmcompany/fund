@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
-use crate::common::market::trade_bars::{Print, Tape};
+use crate::common::market::trade_bars::{Print, Tape, condition_letter};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
@@ -354,18 +354,7 @@ impl Alpaca {
         let pages = self.tick_pages(QUOTES_URL, symbol, session).await?;
         let mut outcomes = Vec::new();
         for body in pages {
-            let page: QuotesPage =
-                serde_json::from_slice(&body).map_err(|error| FetchError::Malformed {
-                    reason: error.to_string(),
-                })?;
-            for row in page
-                .quotes
-                .unwrap_or_default()
-                .remove(symbol.as_str())
-                .unwrap_or_default()
-            {
-                outcomes.push(quote_outcome(symbol, &row));
-            }
+            outcomes.extend(quote_page(symbol, &body)?);
         }
         Ok(outcomes)
     }
@@ -379,18 +368,7 @@ impl Alpaca {
         let pages = self.tick_pages(TRADES_URL, symbol, session).await?;
         let mut outcomes = Vec::new();
         for body in pages {
-            let page: TradesPage =
-                serde_json::from_slice(&body).map_err(|error| FetchError::Malformed {
-                    reason: error.to_string(),
-                })?;
-            for row in page
-                .trades
-                .unwrap_or_default()
-                .remove(symbol.as_str())
-                .unwrap_or_default()
-            {
-                outcomes.push(trade_outcome(symbol, &row));
-            }
+            outcomes.extend(trade_page(symbol, &body)?);
         }
         Ok(outcomes)
     }
@@ -435,8 +413,28 @@ impl Alpaca {
     }
 }
 
+/// One page of `symbol`'s quotes, refusing any row filed under a ticker that was not asked for.
+fn quote_page(symbol: &Symbol, body: &[u8]) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
+    let page: QuotesPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
+        reason: error.to_string(),
+    })?;
+    let mut outcomes = Vec::new();
+    for (ticker, rows) in page.quotes.unwrap_or_default() {
+        for row in rows {
+            outcomes.push(match ticker == symbol.as_str() {
+                true => quote_outcome(symbol, &row),
+                false => AlpacaQuoteOutcome::Refused(RefusedRow {
+                    ticker: ticker.clone(),
+                    cause: RowRefusal::Unrequested,
+                }),
+            });
+        }
+    }
+    Ok(outcomes)
+}
+
 fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
-    if row.bid_price <= 0.0 || row.ask_price <= 0.0 {
+    if row.bid_price == 0.0 || row.ask_price == 0.0 {
         return AlpacaQuoteOutcome::OneSided;
     }
     let refused = |cause| {
@@ -464,6 +462,26 @@ fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
     }
 }
 
+/// One page of `symbol`'s trades, refusing any row filed under a ticker that was not asked for.
+fn trade_page(symbol: &Symbol, body: &[u8]) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
+    let page: TradesPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
+        reason: error.to_string(),
+    })?;
+    let mut outcomes = Vec::new();
+    for (ticker, rows) in page.trades.unwrap_or_default() {
+        for row in rows {
+            outcomes.push(match ticker == symbol.as_str() {
+                true => trade_outcome(symbol, &row),
+                false => AlpacaTradeOutcome::Refused(RefusedRow {
+                    ticker: ticker.clone(),
+                    cause: RowRefusal::Unrequested,
+                }),
+            });
+        }
+    }
+    Ok(outcomes)
+}
+
 fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
     let refused = |cause| {
         AlpacaTradeOutcome::Refused(RefusedRow {
@@ -483,13 +501,7 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
     let letters = row
         .conditions
         .iter()
-        .map(|element| {
-            let mut characters = element.chars();
-            match (characters.next(), characters.next()) {
-                (Some(letter), None) => letter,
-                (None, _) | (Some(_), Some(_)) => UNSPELLABLE,
-            }
-        })
+        .map(|element| condition_letter(element).unwrap_or(UNSPELLABLE))
         .collect();
     let price = match Price::from_dollars(row.price) {
         Ok(price) => price,
@@ -1032,18 +1044,16 @@ mod tests {
         assert!(batch.refused.is_empty(), "{:?}", batch.refused);
     }
 
-    /// Rows from Alpaca's SIP quotes and trades for AAPL and PFE on 2026-10-02, probed with the production key.
+    /// Rows from Alpaca's SIP quotes and trades for AAPL and PFE on 2026-10-02, probed with the production key and
+    /// filed under AAPL; the last trade's tape `E` is invented to exercise the refusal.
     const QUOTES_PAGE: &str = r#"{"next_page_token": null, "quotes": {"AAPL": [{"ap": 333.67, "as": 200, "ax": "Q", "bp": 333.65, "bs": 1520, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.001719242Z", "z": "C"}, {"ap": 0, "as": 0, "ax": "Q", "bp": 333.65, "bs": 100, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.0018Z", "z": "C"}]}}"#;
     const TRADES_PAGE: &str = r#"{"next_page_token": null, "trades": {"AAPL": [{"c": ["@", "6", "X"], "i": 1, "p": 333.69, "s": 6224093, "t": "2026-10-02T20:00:00.118Z", "x": "Q", "z": "C"}, {"c": ["@", "T", "P"], "i": 335045, "p": 333.69, "s": 819560, "t": "2026-10-02T21:49:13.402977462Z", "u": "canceled", "x": "D", "z": "C"}, {"c": [" ", "9"], "i": 7, "p": 27.81, "s": 0, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "A"}, {"c": ["@"], "i": 8, "p": 1.0, "s": 1, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "E"}]}}"#;
 
     #[test]
     fn test_alpaca_quotes_keep_the_top_of_book_in_shares() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let page: QuotesPage = serde_json::from_str(QUOTES_PAGE).unwrap();
-        let outcomes: Vec<AlpacaQuoteOutcome> = page.quotes.unwrap()["AAPL"]
-            .iter()
-            .map(|row| quote_outcome(&symbol, row))
-            .collect();
+        let outcomes = quote_page(&symbol, QUOTES_PAGE.as_bytes()).unwrap();
+        assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             AlpacaQuoteOutcome::Quote(quote) => {
                 assert_eq!(quote.bid().ticks(), 333_650_000);
@@ -1063,11 +1073,7 @@ mod tests {
     #[test]
     fn test_alpaca_trades_carry_their_tape_letters_and_corrections() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let page: TradesPage = serde_json::from_str(TRADES_PAGE).unwrap();
-        let outcomes: Vec<AlpacaTradeOutcome> = page.trades.unwrap()["AAPL"]
-            .iter()
-            .map(|row| trade_outcome(&symbol, row))
-            .collect();
+        let outcomes = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
         let summary: Vec<String> = outcomes
             .iter()
             .map(|outcome| match outcome {
@@ -1093,6 +1099,32 @@ mod tests {
                 "ConsolidatedTape [' ', '9'] corrected=false unsized=true",
                 "refused tape",
             ]
+        );
+    }
+
+    #[test]
+    fn test_alpaca_ticks_filed_under_another_ticker_are_refused_not_dropped() {
+        let symbol = Symbol::new("PFE").unwrap();
+        let unrequested = AlpacaQuoteOutcome::Refused(RefusedRow {
+            ticker: "AAPL".to_string(),
+            cause: RowRefusal::Unrequested,
+        });
+        assert_eq!(
+            quote_page(&symbol, QUOTES_PAGE.as_bytes()).unwrap(),
+            [unrequested.clone(), unrequested]
+        );
+        let trades = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
+        assert_eq!(trades.len(), 4);
+        assert!(trades.iter().all(|outcome| matches!(
+            outcome,
+            AlpacaTradeOutcome::Refused(RefusedRow {
+                cause: RowRefusal::Unrequested,
+                ..
+            })
+        )));
+        assert_eq!(
+            quote_page(&symbol, br#"{"next_page_token": null, "quotes": null}"#).unwrap(),
+            []
         );
     }
 }

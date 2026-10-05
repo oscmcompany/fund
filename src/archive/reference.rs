@@ -16,7 +16,9 @@ use super::{Archive, parquet};
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
-use crate::common::market::trade_bars::{Condition, TradeConditions, UpdateRules};
+use crate::common::market::trade_bars::{
+    Condition, TradeConditions, UpdateRules, condition_letter,
+};
 use crate::common::market::{Dollars, Shares, Symbol};
 use crate::common::storage::{Key, Provider, ReferenceTable};
 use crate::common::time::SessionDate;
@@ -203,16 +205,13 @@ pub fn decode_conditions(
             let code = codes.value(row);
             let letter = |array: &StringArray| match array.is_valid(row) {
                 false => Ok(None),
-                true => {
-                    let mut characters = array.value(row).chars();
-                    match (characters.next(), characters.next()) {
-                        (Some(letter), None) => Ok(Some(letter)),
-                        (None, _) | (Some(_), Some(_)) => Err(ReferenceRefusal::Row {
-                            index: row,
-                            reason: format!("condition {code} letter `{}`", array.value(row)),
-                        }),
-                    }
-                }
+                true => match condition_letter(array.value(row)) {
+                    Some(letter) => Ok(Some(letter)),
+                    None => Err(ReferenceRefusal::Row {
+                        index: row,
+                        reason: format!("condition {code} letter `{}`", array.value(row)),
+                    }),
+                },
             };
             let rule = Condition::new(
                 UpdateRules::new(
@@ -436,12 +435,26 @@ mod tests {
     fn test_conditions_read_back_exactly_and_only_from_their_table() {
         let conditions = TradeConditions::new(BTreeMap::from([
             (
+                6,
+                Condition::new(UpdateRules::new(true, false, false), Some('I'), None, true),
+            ),
+            (
                 10,
-                Condition::new(UpdateRules::new(true, true, false), None, None, false),
+                Condition::new(
+                    UpdateRules::new(true, true, false),
+                    Some('4'),
+                    Some('X'),
+                    false,
+                ),
             ),
             (
                 15,
-                Condition::new(UpdateRules::new(false, false, false), None, None, false),
+                Condition::new(
+                    UpdateRules::new(false, false, false),
+                    None,
+                    Some('W'),
+                    false,
+                ),
             ),
             (
                 37,

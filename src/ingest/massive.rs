@@ -9,7 +9,9 @@ use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::security_details::SecurityType;
-use crate::common::market::trade_bars::{Condition, TradeConditions, UpdateRules};
+use crate::common::market::trade_bars::{
+    Condition, TradeConditions, UpdateRules, condition_letter,
+};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
 use crate::common::time::SessionDate;
 
@@ -248,16 +250,12 @@ fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
                     consolidated.updates_open_close,
                 );
                 let letter = |plan: &str| -> Result<Option<char>, FetchError> {
-                    match row
-                        .sip_mapping
-                        .get(plan)
-                        .map(|spelled| spelled.chars().collect::<Vec<_>>())
-                    {
+                    match row.sip_mapping.get(plan) {
                         None => Ok(None),
-                        Some(letters) => match letters.as_slice() {
-                            [letter] => Ok(Some(*letter)),
-                            _ => Err(malformed(format!(
-                                "condition {} spells {plan} as {letters:?}",
+                        Some(spelled) => match condition_letter(spelled) {
+                            Some(letter) => Ok(Some(letter)),
+                            None => Err(malformed(format!(
+                                "condition {} spells {plan} as `{spelled}`",
                                 row.id
                             ))),
                         },
