@@ -126,16 +126,33 @@ pub struct OpenClose {
     close: (DateTime<Utc>, Price),
 }
 
+/// Why an open and close were refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCloseRefusal {
+    /// The open orders after the close, by instant and then price.
+    Inverted {
+        open: (DateTime<Utc>, Price),
+        close: (DateTime<Utc>, Price),
+    },
+}
+
 impl OpenClose {
-    pub fn new(open: (DateTime<Utc>, Price), close: (DateTime<Utc>, Price)) -> Self {
-        Self { open, close }
+    pub fn new(
+        open: (DateTime<Utc>, Price),
+        close: (DateTime<Utc>, Price),
+    ) -> Result<Self, OpenCloseRefusal> {
+        if open > close {
+            return Err(OpenCloseRefusal::Inverted { open, close });
+        }
+        Ok(Self { open, close })
     }
 
     fn of(print: &Print) -> Self {
-        Self::new(
-            (print.timestamp(), print.price()),
-            (print.timestamp(), print.price()),
-        )
+        let point = (print.timestamp(), print.price());
+        Self {
+            open: point,
+            close: point,
+        }
     }
 
     fn combine(self, other: Self) -> Self {
@@ -265,7 +282,7 @@ fn either<T>(left: Option<T>, right: Option<T>, combine: fn(T, T) -> T) -> Optio
     }
 }
 
-/// One symbol's trade bar; it exists only for an interval some print in the session's hours fell in.
+/// One symbol's trade bar; it exists only for an interval some folded print of the session fell in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradeBar {
     symbol: Symbol,
@@ -636,6 +653,23 @@ mod tests {
         assert_eq!(bars[0].sums().totals().volume().units(), 50_000_000);
         assert_eq!(bars[0].sums().open_close(), None);
         assert_eq!((counts.unresolved(), counts.other_session()), (1, 1));
+    }
+
+    #[test]
+    fn test_an_open_after_its_close_is_refused() {
+        let price = Price::from_dollars(100.00).unwrap();
+        let (early, late) = (
+            instant("2026-10-02T13:30:00Z"),
+            instant("2026-10-02T13:30:01Z"),
+        );
+        assert!(OpenClose::new((early, price), (late, price)).is_ok());
+        assert_eq!(
+            OpenClose::new((late, price), (early, price)),
+            Err(OpenCloseRefusal::Inverted {
+                open: (late, price),
+                close: (early, price)
+            })
+        );
     }
 
     fn any_rollup() -> impl Strategy<Value = TradeRollup> {

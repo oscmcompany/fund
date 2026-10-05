@@ -291,25 +291,36 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<TradeBar>, Provenance), 
                     .map(DollarVolume::from_units)
                     .map_err(|error| refused(error.to_string()))?,
             );
-            let open_close = match opened_at.is_valid(row) {
-                true => Some(OpenClose::new(
-                    (
-                        DateTime::from_timestamp_nanos(opened_at.value(row)),
-                        price(open)?,
-                    ),
-                    (
-                        DateTime::from_timestamp_nanos(closed_at.value(row)),
-                        price(close)?,
-                    ),
-                )),
-                false => None,
+            // A pair is whole or absent; a null read as a value would be a price or instant no print set.
+            let open_close = match (
+                opened_at.is_valid(row),
+                open.is_valid(row),
+                closed_at.is_valid(row),
+                close.is_valid(row),
+            ) {
+                (true, true, true, true) => Some(
+                    OpenClose::new(
+                        (
+                            DateTime::from_timestamp_nanos(opened_at.value(row)),
+                            price(open)?,
+                        ),
+                        (
+                            DateTime::from_timestamp_nanos(closed_at.value(row)),
+                            price(close)?,
+                        ),
+                    )
+                    .map_err(|error| refused(format!("{error:?}")))?,
+                ),
+                (false, false, false, false) => None,
+                partial => return Err(refused(format!("open and close partly null: {partial:?}"))),
             };
-            let high_low = match high.is_valid(row) {
-                true => Some(
+            let high_low = match (high.is_valid(row), low.is_valid(row)) {
+                (true, true) => Some(
                     HighLow::new(price(high)?, price(low)?)
                         .map_err(|error| refused(format!("{error:?}")))?,
                 ),
-                false => None,
+                (false, false) => None,
+                partial => return Err(refused(format!("high and low partly null: {partial:?}"))),
             };
             let bar = TradeBar::new(
                 symbol,
@@ -376,5 +387,56 @@ mod tests {
         assert_eq!(read, written);
         assert_eq!(read[1].sums().open_close(), None);
         assert_eq!(read_provenance, provenance);
+    }
+
+    #[test]
+    fn test_an_open_without_its_close_is_refused() {
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
+        let key = Key::Trades {
+            provider: Provider::Massive,
+            origin: Origin::Derived,
+            interval: BarInterval::OneMinute,
+            session,
+        };
+        let provenance = Provenance::new(
+            Subscription::StocksAdvanced,
+            "2026-10-03T07:00:00Z".parse().unwrap(),
+            RunId::new(Uuid::from_u128(5)),
+            None,
+        );
+        let opened = "2026-10-02T13:30:01Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap()
+            .timestamp_nanos_opt();
+        let price = |ticks: Option<i128>| {
+            Arc::new(Decimal128Array::from(vec![ticks]).with_data_type(PRICE_TYPE)) as ArrayRef
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["AAPL"])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_790_947_800_000_000]).with_timezone("UTC"),
+            ),
+            Arc::new(UInt64Array::from(vec![1])),
+            Arc::new(Decimal128Array::from(vec![1_000_000]).with_data_type(SHARES_TYPE)),
+            Arc::new(
+                Decimal128Array::from(vec![100_000_000_000_000]).with_data_type(DOLLAR_VOLUME_TYPE),
+            ),
+            Arc::new(TimestampNanosecondArray::from(vec![opened]).with_timezone("UTC")),
+            price(Some(100_000_000)),
+            Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+            price(Some(100_000_000)),
+            price(None),
+            price(None),
+        ];
+        let metadata = provenance
+            .entries()
+            .into_iter()
+            .map(|(name, value)| ::parquet::file::metadata::KeyValue::new(name.to_string(), value))
+            .collect();
+        let bytes = parquet::write(schema(), columns, LAYOUT_VERSION, metadata).unwrap();
+        assert!(matches!(
+            decode(&key, bytes),
+            Err(DecodeRefusal::Row { index: 0, reason }) if reason.contains("partly null")
+        ));
     }
 }

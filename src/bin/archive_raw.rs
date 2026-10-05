@@ -23,6 +23,7 @@ use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use fund::common::monoid::concatenate;
 use fund::common::storage::{Key, Origin, Provider, ReferenceTable};
 use fund::common::time::SessionDate;
+use fund::common::time::calendar::TradingCalendar;
 use fund::ingest::RefusedRow;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::flat_files::{
@@ -45,7 +46,7 @@ const HEAL_DAILY_BARS_FROM: NaiveDate = match NaiveDate::from_ymd_opt(2026, 9, 2
 /// Sessions named in one log line; the count beside them says how many there are.
 const LISTED_SESSIONS: usize = 50;
 
-/// Ranged reads in flight per streamed file; sixteen-mebibyte ranges make this the bytes held ahead of the parser.
+/// Ranged reads queued ahead of the parser per streamed file; at sixteen mebibytes each, roughly the bytes held ahead of it.
 const STREAM_AHEAD: usize = 8;
 
 /// Metadata reads in flight during a verify.
@@ -211,16 +212,8 @@ async fn main() -> ExitCode {
                 last,
                 concurrency,
             } => {
-                let clients = (
-                    FlatFiles::from_environment(),
-                    Alpaca::from_environment(reqwest::Client::new()),
-                );
-                let (flat_files, alpaca) = match clients {
-                    (Ok(flat_files), Ok(alpaca)) => (flat_files, alpaca),
-                    (Err(refusal), _) | (_, Err(refusal)) => {
-                        tracing::error!(%refusal, "Client configuration refused");
-                        return ExitCode::from(REFUSED_TO_START);
-                    }
+                let Some((flat_files, alpaca)) = fold_clients() else {
+                    return ExitCode::from(REFUSED_TO_START);
                 };
                 fold_trades(
                     &archive,
@@ -239,16 +232,8 @@ async fn main() -> ExitCode {
                 last,
                 concurrency,
             } => {
-                let clients = (
-                    FlatFiles::from_environment(),
-                    Alpaca::from_environment(reqwest::Client::new()),
-                );
-                let (flat_files, alpaca) = match clients {
-                    (Ok(flat_files), Ok(alpaca)) => (flat_files, alpaca),
-                    (Err(refusal), _) | (_, Err(refusal)) => {
-                        tracing::error!(%refusal, "Client configuration refused");
-                        return ExitCode::from(REFUSED_TO_START);
-                    }
+                let Some((flat_files, alpaca)) = fold_clients() else {
+                    return ExitCode::from(REFUSED_TO_START);
                 };
                 fold_quotes(
                     &archive,
@@ -922,7 +907,21 @@ fn quote_keys(session: SessionDate) -> [Key; 3] {
     })
 }
 
-/// Why a session's quotes were not folded and written.
+/// The flat files to stream and the calendar to plan by, or `None` once the refusal is logged.
+fn fold_clients() -> Option<(FlatFiles, Alpaca)> {
+    match (
+        FlatFiles::from_environment(),
+        Alpaca::from_environment(reqwest::Client::new()),
+    ) {
+        (Ok(flat_files), Ok(alpaca)) => Some((flat_files, alpaca)),
+        (Err(refusal), _) | (_, Err(refusal)) => {
+            tracing::error!(%refusal, "Client configuration refused");
+            None
+        }
+    }
+}
+
+/// Why a session's quotes or trades were not folded and written.
 #[derive(Debug)]
 enum FoldFailure {
     Parse(ParseRefusal),
@@ -939,33 +938,33 @@ impl std::fmt::Display for FoldFailure {
             Self::Encode(refusal) => write!(formatter, "{refusal}"),
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Interrupted(reason) => write!(formatter, "the fold did not finish: {reason}"),
-            Self::Empty => write!(formatter, "nothing fell in the session's hours"),
+            Self::Empty => write!(formatter, "nothing the fold could keep fell in the session"),
         }
     }
 }
 
-/// Streams each listed quote file not yet folded from Massive and writes its one-minute, five-minute and daily bars.
+/// Streams each listed `dataset` file of a trading session in `[first, last]` whose daily file under `daily` is not
+/// yet written, and hands it to `fold`; `noun` names the bars in the log.
 #[allow(clippy::too_many_arguments)]
-async fn fold_quotes(
+async fn fold_sessions<Fold, Folding>(
     archive: &Archive,
     flat_files: &FlatFiles,
-    alpaca: &Alpaca,
+    calendar: &TradingCalendar,
+    dataset: FlatFileDataset,
+    daily: Key,
     first: SessionDate,
     last: SessionDate,
     concurrency: usize,
-    run_id: RunId,
-    commit: Option<Commit>,
-) -> ExitCode {
-    let calendar = match alpaca.calendar(first, last).await {
-        Ok(calendar) => calendar,
-        Err(error) => {
-            tracing::error!(%error, "Calendar not fetched");
-            return ExitCode::FAILURE;
-        }
-    };
+    noun: &'static str,
+    mut fold: Fold,
+) -> ExitCode
+where
+    Fold: FnMut(SessionDate, FlatFileStream) -> Folding,
+    Folding: Future<Output = Result<(), FoldFailure>> + Send + 'static,
+{
     let (listing, written) = match (
-        flat_files.listing(FlatFileDataset::Quotes).await,
-        archive.list(&quote_keys(first)[2].series()).await,
+        flat_files.listing(dataset).await,
+        archive.list(&daily.series()).await,
     ) {
         (Ok(listing), Ok(written)) => (listing, written),
         (Err(error), _) => {
@@ -1008,7 +1007,7 @@ async fn fold_quotes(
         owed = owed.len(),
         owed_bytes = owed.iter().map(|listed| listed.length()).sum::<u64>(),
         concurrency,
-        "Planned a quote fold"
+        "Planned a {noun} fold"
     );
     let mut tasks = JoinSet::new();
     let mut outcomes = BTreeMap::new();
@@ -1020,30 +1019,22 @@ async fn fold_quotes(
             }
         }
         let session = listed_file.session();
-        let hours = calendar
-            .session(session)
-            .map(|trading| trading.hours())
-            .expect("owed sessions are trading days");
-        let archive = archive.clone();
-        let stream = flat_files.stream(FlatFileDataset::Quotes, &listed_file, STREAM_AHEAD);
-        let provenance = Provenance::new(
-            Subscription::StocksAdvanced,
-            Utc::now(),
-            run_id,
-            commit.clone(),
+        let folding = fold(
+            session,
+            flat_files.stream(dataset, &listed_file, STREAM_AHEAD),
         );
         tasks.spawn(
             async move {
                 let started = tokio::time::Instant::now();
-                let outcome = fold_one(&archive, stream, session, hours, &provenance).await;
+                let outcome = folding.await;
                 match &outcome {
                     Ok(()) => tracing::info!(
                         session = %session,
                         seconds = started.elapsed().as_secs_f64(),
-                        "Folded a quote file"
+                        "Folded a {noun} file"
                     ),
                     Err(failure) => {
-                        tracing::error!(session = %session, %failure, "Quote file not folded")
+                        tracing::error!(session = %session, %failure, bars = noun, "File not folded")
                     }
                 }
                 (session, outcome)
@@ -1064,7 +1055,7 @@ async fn fold_quotes(
         failed = failed.len(),
         failed_sessions = listed(&failed),
         panicked,
-        "Finished a quote fold"
+        "Finished a {noun} fold"
     );
     if failed.is_empty() && panicked == 0 {
         ExitCode::SUCCESS
@@ -1073,8 +1064,55 @@ async fn fold_quotes(
     }
 }
 
+/// Streams each listed quote file not yet folded from Massive and writes its one-minute, five-minute and daily bars.
+#[allow(clippy::too_many_arguments)]
+async fn fold_quotes(
+    archive: &Archive,
+    flat_files: &FlatFiles,
+    alpaca: &Alpaca,
+    first: SessionDate,
+    last: SessionDate,
+    concurrency: usize,
+    run_id: RunId,
+    commit: Option<Commit>,
+) -> ExitCode {
+    let calendar = match alpaca.calendar(first, last).await {
+        Ok(calendar) => calendar,
+        Err(error) => {
+            tracing::error!(%error, "Calendar not fetched");
+            return ExitCode::FAILURE;
+        }
+    };
+    let [_, _, daily] = quote_keys(first);
+    fold_sessions(
+        archive,
+        flat_files,
+        &calendar,
+        FlatFileDataset::Quotes,
+        daily,
+        first,
+        last,
+        concurrency,
+        "quote",
+        |session, stream| {
+            let hours = calendar
+                .session(session)
+                .map(|trading| trading.hours())
+                .expect("owed sessions are trading days");
+            let archive = archive.clone();
+            let provenance = Provenance::new(
+                Subscription::StocksAdvanced,
+                Utc::now(),
+                run_id,
+                commit.clone(),
+            );
+            async move { fold_quotes_one(&archive, stream, session, hours, &provenance).await }
+        },
+    )
+    .await
+}
 /// Folds one streamed quote file and creates its three files, the daily last.
-async fn fold_one(
+async fn fold_quotes_one(
     archive: &Archive,
     stream: FlatFileStream,
     session: SessionDate,
@@ -1245,13 +1283,18 @@ async fn fold_trades(
     run_id: RunId,
     commit: Option<Commit>,
 ) -> ExitCode {
-    let (conditions_path, conditions) = match latest_conditions(archive).await {
-        Ok((key, conditions)) => (key.path(), conditions),
+    let (conditions_key, conditions) = match latest_conditions(archive).await {
+        Ok(latest) => latest,
         Err(reason) => {
             tracing::error!(reason, "Conditions table not read");
             return ExitCode::FAILURE;
         }
     };
+    tracing::info!(
+        conditions = conditions_key.path(),
+        codes = conditions.rules().len(),
+        "Read the conditions table"
+    );
     let calendar = match alpaca.calendar(first, last).await {
         Ok(calendar) => calendar,
         Err(error) => {
@@ -1259,114 +1302,30 @@ async fn fold_trades(
             return ExitCode::FAILURE;
         }
     };
-    let (listing, written) = match (
-        flat_files.listing(FlatFileDataset::Trades).await,
-        archive.list(&trade_keys(first)[2].series()).await,
-    ) {
-        (Ok(listing), Ok(written)) => (listing, written),
-        (Err(error), _) => {
-            tracing::error!(%error, "Flat files not listed");
-            return ExitCode::FAILURE;
-        }
-        (_, Err(error)) => {
-            tracing::error!(%error, "Archive not listed");
-            return ExitCode::FAILURE;
-        }
-    };
-    // The daily file is written last, so a session holding it holds all three.
-    let done: BTreeSet<SessionDate> = written
-        .iter()
-        .filter_map(|path| Key::parse(path).ok())
-        .map(|key| key.session())
-        .collect();
-    let offered: Vec<_> = listing
-        .into_iter()
-        .filter(|listed| (first..=last).contains(&listed.session()))
-        .collect();
-    let untraded: Vec<SessionDate> = offered
-        .iter()
-        .map(|listed| listed.session())
-        .filter(|session| !calendar.is_trading_day(*session))
-        .collect();
-    let owed: Vec<_> = offered
-        .iter()
-        .filter(|listed| {
-            calendar.is_trading_day(listed.session()) && !done.contains(&listed.session())
-        })
-        .cloned()
-        .collect();
-    tracing::info!(
-        %first,
-        %last,
-        conditions = conditions_path,
-        codes = conditions.rules().len(),
-        offered = offered.len(),
-        already_folded = offered.len() - owed.len() - untraded.len(),
-        not_trading_days = listed(&untraded),
-        owed = owed.len(),
-        owed_bytes = owed.iter().map(|listed| listed.length()).sum::<u64>(),
+    let [_, _, daily] = trade_keys(first);
+    fold_sessions(
+        archive,
+        flat_files,
+        &calendar,
+        FlatFileDataset::Trades,
+        daily,
+        first,
+        last,
         concurrency,
-        "Planned a trade fold"
-    );
-    let mut tasks = JoinSet::new();
-    let mut outcomes = BTreeMap::new();
-    let mut panicked = 0;
-    for listed_file in owed {
-        while tasks.len() >= concurrency {
-            if let Some(joined) = tasks.join_next().await {
-                record(joined, &mut outcomes, &mut panicked);
-            }
-        }
-        let session = listed_file.session();
-        let archive = archive.clone();
-        let conditions = conditions.clone();
-        let stream = flat_files.stream(FlatFileDataset::Trades, &listed_file, STREAM_AHEAD);
-        let provenance = Provenance::new(
-            Subscription::StocksAdvanced,
-            Utc::now(),
-            run_id,
-            commit.clone(),
-        );
-        tasks.spawn(
-            async move {
-                let started = tokio::time::Instant::now();
-                let outcome =
-                    fold_trades_one(&archive, stream, session, conditions, &provenance).await;
-                match &outcome {
-                    Ok(()) => tracing::info!(
-                        session = %session,
-                        seconds = started.elapsed().as_secs_f64(),
-                        "Folded a trade file"
-                    ),
-                    Err(failure) => {
-                        tracing::error!(session = %session, %failure, "Trade file not folded")
-                    }
-                }
-                (session, outcome)
-            }
-            .in_current_span(),
-        );
-    }
-    while let Some(joined) = tasks.join_next().await {
-        record(joined, &mut outcomes, &mut panicked);
-    }
-    let failed: Vec<SessionDate> = outcomes
-        .iter()
-        .filter(|(_, outcome)| outcome.is_err())
-        .map(|(session, _)| *session)
-        .collect();
-    tracing::info!(
-        written = outcomes.len() - failed.len(),
-        failed = failed.len(),
-        failed_sessions = listed(&failed),
-        panicked,
-        "Finished a trade fold"
-    );
-    if failed.is_empty() && panicked == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+        "trade",
+        |session, stream| {
+            let archive = archive.clone();
+            let conditions = conditions.clone();
+            let provenance = Provenance::new(
+                Subscription::StocksAdvanced,
+                Utc::now(),
+                run_id,
+                commit.clone(),
+            );
+            async move { fold_trades_one(&archive, stream, session, conditions, &provenance).await }
+        },
+    )
+    .await
 }
 
 /// Folds one streamed trade file and creates its three files, the daily last.

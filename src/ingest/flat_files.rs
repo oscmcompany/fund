@@ -407,11 +407,14 @@ fn flat_file_bar(
     .map_err(RowRefusal::Bar)
 }
 
+/// Attempts at one streamed range, each a fresh request, before the stream fails.
+const RANGE_ATTEMPTS: u32 = 5;
+
 /// Bytes per ranged read when a file is streamed rather than copied.
 const STREAM_CHUNK: u64 = 16 * 1024 * 1024;
 
-/// A file's bytes in order as a blocking `Read`, with up to `ahead` ranged reads in flight on the runtime; read it
-/// from a blocking thread.
+/// A file's bytes in order as a blocking `Read`, with `ahead` ranged reads queued past the one being read and one
+/// more waiting for room; read it from a blocking thread.
 pub struct FlatFileStream {
     chunks: tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<Result<Bytes, FlatFileError>>>,
     runtime: tokio::runtime::Handle,
@@ -434,9 +437,24 @@ impl FlatFiles {
                 let length = STREAM_CHUNK.min(listed.length - start);
                 let (flat_files, listed_chunk) = (flat_files.clone(), listed.clone());
                 let fetch = tokio::spawn(async move {
-                    flat_files
-                        .range(dataset, &listed_chunk, start, length)
-                        .await
+                    // A body that breaks partway is not retried by the client, and losing it loses the whole file.
+                    let mut attempt = 1;
+                    loop {
+                        match flat_files
+                            .range(dataset, &listed_chunk, start, length)
+                            .await
+                        {
+                            Err(error) if attempt < RANGE_ATTEMPTS => {
+                                tracing::warn!(%error, attempt, start, "Retrying a streamed range");
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    2_u64.pow(attempt),
+                                ))
+                                .await;
+                                attempt += 1;
+                            }
+                            outcome => return outcome,
+                        }
+                    }
                 });
                 // A closed receiver means the reader stopped early, so nothing more is wanted.
                 if sender.send(fetch).await.is_err() {

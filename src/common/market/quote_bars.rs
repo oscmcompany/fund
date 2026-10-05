@@ -18,8 +18,8 @@ pub const RELATIVE_SPREAD_SCALE: u128 = 1_000_000;
 pub struct Spread(u64);
 
 impl Spread {
-    pub fn of(bid: Price, ask: Price) -> Self {
-        // `Quote` refuses a crossed book, so the ask is never below the bid.
+    /// Private so only a `Quote`'s sides reach it: `Quote` refuses a crossed book, so the ask is never below the bid.
+    fn of(bid: Price, ask: Price) -> Self {
         Self(ask.ticks().abs_diff(bid.ticks()))
     }
 
@@ -111,7 +111,8 @@ impl QuoteSums {
     /// The sums of `quote` standing for `nanoseconds`, counting no quote; the fold adds counts by minute.
     fn standing(quote: &StandingQuote, nanoseconds: u64) -> Self {
         let spread = Spread::of(quote.bid, quote.ask);
-        let midpoint_doubled = (quote.bid.ticks() + quote.ask.ticks()) as u128;
+        let midpoint_doubled = u128::from(quote.bid.ticks().unsigned_abs())
+            + u128::from(quote.ask.ticks().unsigned_abs());
         let relative = u128::from(spread.0) * 2 * RELATIVE_SPREAD_SCALE / midpoint_doubled;
         let time = u128::from(nanoseconds);
         Self {
@@ -230,7 +231,7 @@ pub enum QuoteBarRefusal {
 }
 
 impl QuoteBar {
-    /// A bar on its interval's grid, covered for some time and no longer than one session.
+    /// A bar on its interval's grid, covered for some time and for no longer than its interval, a day for a daily bar.
     pub fn new(
         symbol: Symbol,
         interval: BarInterval,
@@ -243,15 +244,13 @@ impl QuoteBar {
                 timestamp,
             });
         }
-        let longest = match interval {
-            BarInterval::OneMinute => TimeDelta::minutes(1),
-            BarInterval::FiveMinute => TimeDelta::minutes(5),
-            BarInterval::OneDay => TimeDelta::hours(24),
+        let longest: u64 = match interval {
+            BarInterval::OneMinute => 60_000_000_000,
+            BarInterval::FiveMinute => 300_000_000_000,
+            BarInterval::OneDay => 86_400_000_000_000,
         };
         let covered = sums.covered_nanoseconds;
-        if covered == 0
-            || i128::from(covered) > i128::from(longest.num_nanoseconds().unwrap_or(i64::MAX))
-        {
+        if covered == 0 || covered > longest {
             return Err(QuoteBarRefusal::Coverage {
                 covered_nanoseconds: covered,
             });
