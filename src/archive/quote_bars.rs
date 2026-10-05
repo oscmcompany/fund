@@ -38,7 +38,7 @@ pub enum EncodeRefusal {
         provenance: Provenance,
         key: Provider,
     },
-    /// A bar whose interval or session is not the key's, or that repeats another's symbol and timestamp.
+    /// A bar whose interval or session is not the key's.
     OutsideKey {
         symbol: Symbol,
         timestamp: DateTime<chrono::Utc>,

@@ -11,7 +11,8 @@ use serde::Deserialize;
 
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
+use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
+use crate::common::market::trade_bars::Print;
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
@@ -406,11 +407,14 @@ fn flat_file_bar(
     .map_err(RowRefusal::Bar)
 }
 
+/// Attempts at one streamed range, each a fresh request, before the stream fails.
+const RANGE_ATTEMPTS: u32 = 5;
+
 /// Bytes per ranged read when a file is streamed rather than copied.
 const STREAM_CHUNK: u64 = 16 * 1024 * 1024;
 
-/// A file's bytes in order as a blocking `Read`, with up to `ahead` ranged reads in flight on the runtime; read it
-/// from a blocking thread.
+/// A file's bytes in order as a blocking `Read`, with `ahead` ranged reads queued past the one being read and one
+/// more waiting for room; read it from a blocking thread.
 pub struct FlatFileStream {
     chunks: tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<Result<Bytes, FlatFileError>>>,
     runtime: tokio::runtime::Handle,
@@ -433,9 +437,24 @@ impl FlatFiles {
                 let length = STREAM_CHUNK.min(listed.length - start);
                 let (flat_files, listed_chunk) = (flat_files.clone(), listed.clone());
                 let fetch = tokio::spawn(async move {
-                    flat_files
-                        .range(dataset, &listed_chunk, start, length)
-                        .await
+                    // A body that breaks partway is not retried by the client, and losing it loses the whole file.
+                    let mut attempt = 1;
+                    loop {
+                        match flat_files
+                            .range(dataset, &listed_chunk, start, length)
+                            .await
+                        {
+                            Err(error) if attempt < RANGE_ATTEMPTS => {
+                                tracing::warn!(%error, attempt, start, "Retrying a streamed range");
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    2_u64.pow(attempt),
+                                ))
+                                .await;
+                                attempt += 1;
+                            }
+                            outcome => return outcome,
+                        }
+                    }
                 });
                 // A closed receiver means the reader stopped early, so nothing more is wanted.
                 if sender.send(fetch).await.is_err() {
@@ -544,6 +563,102 @@ fn quote_outcome(row: QuoteRow) -> QuoteRowOutcome {
             }
         }
         Err(cause) => refused(cause),
+    }
+}
+
+/// A flat trade file's row; the condition codes come comma-joined in one field.
+#[derive(Deserialize)]
+struct TradeRow {
+    ticker: String,
+    conditions: String,
+    /// Zero or blank for an uncorrected print.
+    correction: Option<u32>,
+    price: f64,
+    size: f64,
+    /// Nanoseconds since the epoch at which the SIP published the print.
+    sip_timestamp: i64,
+}
+
+/// What one trade row became.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TradeRowOutcome {
+    Print {
+        print: Print,
+        conditions: Vec<u16>,
+        corrected: bool,
+    },
+    TestTicker,
+    Refused(RefusedRow),
+}
+
+/// Reads a gzipped flat trade file from `gzipped`, handing each row's outcome to `each` in file order.
+pub fn read_trades(
+    gzipped: impl std::io::Read,
+    mut each: impl FnMut(TradeRowOutcome),
+) -> Result<(), ParseRefusal> {
+    let mut reader = csv::Reader::from_reader(flate2::read::GzDecoder::new(gzipped));
+    for row in reader.deserialize::<TradeRow>() {
+        let row = row.map_err(|error| ParseRefusal::Malformed {
+            line: error.position().map(csv::Position::line),
+            reason: error.to_string(),
+        })?;
+        each(trade_outcome(row));
+    }
+    Ok(())
+}
+
+fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
+    if is_exchange_test_ticker(&row.ticker) {
+        return TradeRowOutcome::TestTicker;
+    }
+    let refused = |cause: RowRefusal| {
+        TradeRowOutcome::Refused(RefusedRow {
+            ticker: row.ticker.clone(),
+            cause,
+        })
+    };
+    let conditions: Result<Vec<u16>, _> = row
+        .conditions
+        .split(',')
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(str::parse)
+        .collect();
+    let Ok(conditions) = conditions else {
+        return refused(RowRefusal::Conditions {
+            raw: row.conditions.clone(),
+        });
+    };
+    let symbol = match alpaca_symbol(&row.ticker) {
+        Ok(symbol) => symbol,
+        Err(cause) => return refused(RowRefusal::Symbol(cause)),
+    };
+    let price = match Price::from_dollars(row.price) {
+        Ok(price) => price,
+        Err(cause) => return refused(RowRefusal::Price(cause)),
+    };
+    let size = match Shares::from_float(row.size) {
+        Ok(size) => size,
+        Err(cause) => return refused(RowRefusal::Shares(cause)),
+    };
+    let timestamp = DateTime::from_timestamp_nanos(row.sip_timestamp);
+    let corrected = row.correction.is_some_and(|correction| correction != 0);
+    // A price published with no shares, such as the corrected consolidated close, is a print but not a trade.
+    let print = match size.is_zero() {
+        true => Print::Unsized {
+            symbol,
+            timestamp,
+            price,
+        },
+        false => match Trade::new(symbol, timestamp, price, size) {
+            Ok(trade) => Print::Trade(trade),
+            Err(cause) => return refused(RowRefusal::Trade(cause)),
+        },
+    };
+    TradeRowOutcome::Print {
+        print,
+        conditions,
+        corrected,
     }
 }
 
@@ -743,5 +858,49 @@ ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,16297164461199464
             QuoteRowOutcome::Refused(row) if row.ticker() == "BApA"
         ));
         assert_eq!(outcomes[3], QuoteRowOutcome::TestTicker);
+    }
+
+    #[test]
+    fn test_each_trade_row_carries_its_conditions_and_correction() {
+        // The header and first rows of Massive's trades for 2026-09-18, a corrected copy, and two refusals.
+        let rows = "ticker,conditions,correction,exchange,id,participant_timestamp,price,sequence_number,sip_timestamp,size,tape,trf_id,trf_timestamp
+A,\"12,37\",0,4,71675222901845,1789718400814766587,157.350000,3372,1789718400831008119,10.000000,1,202,1789718400830651291
+A,,1,4,71675225257543,1789706368198846000,156.340000,3610,1789718406372522227,0.001500,1,202,1789718406372164990
+A,\"12,x\",0,4,71675225257544,1789706368198859000,156.340000,3611,1789718406372684563,0.711800,1,202,1789718406372327693
+A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1,202,1789718406372327693
+";
+        let mut outcomes = Vec::new();
+        read_trades(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        match &outcomes[0] {
+            TradeRowOutcome::Print {
+                print: Print::Trade(trade),
+                conditions,
+                corrected,
+            } => {
+                assert_eq!(trade.price().ticks(), 157_350_000);
+                assert_eq!(trade.size().units(), 10_000_000);
+                assert_eq!(conditions, &[12, 37]);
+                assert!(!corrected);
+            }
+            other @ (TradeRowOutcome::Print { .. }
+            | TradeRowOutcome::TestTicker
+            | TradeRowOutcome::Refused(_)) => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            &outcomes[1],
+            TradeRowOutcome::Print { conditions, corrected: true, .. } if conditions.is_empty()
+        ));
+        assert!(matches!(
+            &outcomes[2],
+            TradeRowOutcome::Refused(row) if <&'static str>::from(row.cause()) == "conditions"
+        ));
+        assert!(matches!(
+            &outcomes[3],
+            TradeRowOutcome::Print {
+                print: Print::Unsized { .. },
+                ..
+            }
+        ));
     }
 }
