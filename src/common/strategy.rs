@@ -1,6 +1,8 @@
 //! A strategy as an arrow from what is known, the market state and the book, to the holdings it wants, and the
 //! orders that close the gap between a book and a target.
 
+pub mod noise;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
