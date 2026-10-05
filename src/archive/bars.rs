@@ -171,6 +171,9 @@ fn bars_key(key: &Key) -> Option<(Provider, BarInterval, SessionDate)> {
         Key::Quotes { .. }
         | Key::Trades { .. }
         | Key::Reference { .. }
+        | Key::RawBars { .. }
+        | Key::RawQuotes { .. }
+        | Key::RawTrades { .. }
         | Key::Journal { .. }
         | Key::Logs { .. } => None,
     }
@@ -427,7 +430,7 @@ mod tests {
     fn minute_key() -> Key {
         Key::Bars {
             provider: Provider::Alpaca,
-            origin: Origin::Fetched,
+            origin: Origin::Vendor,
             interval: BarInterval::OneMinute,
             session: session(),
         }
@@ -684,7 +687,7 @@ mod tests {
         .unwrap();
         let next_day = Key::Bars {
             provider: Provider::Alpaca,
-            origin: Origin::Fetched,
+            origin: Origin::Vendor,
             interval: BarInterval::OneMinute,
             session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()),
         };
@@ -694,7 +697,7 @@ mod tests {
         ));
         let massive = Key::Bars {
             provider: Provider::Massive,
-            origin: Origin::Fetched,
+            origin: Origin::Vendor,
             interval: BarInterval::OneMinute,
             session: session(),
         };

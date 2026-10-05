@@ -44,7 +44,7 @@ impl Leg {
         };
         Key::Bars {
             provider,
-            origin: Origin::Fetched,
+            origin: Origin::Vendor,
             interval,
             session,
         }
@@ -262,12 +262,12 @@ mod tests {
     #[test]
     fn test_a_listing_holds_only_its_own_series() {
         let paths = [
-            "data/equity/bars/provider=massive/origin=fetched/interval=one_day/year=2026/month=09/day=28/data.parquet",
-            "data/equity/bars/provider=massive/origin=fetched/interval=one_day/year=2026/month=09/day=29/data.parquet",
+            "data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/year=2026/month=09/day=28/data.parquet",
+            "data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/year=2026/month=09/day=29/data.parquet",
             // Another provider's daily bars and a derived series are not this leg's.
-            "data/equity/bars/provider=alpaca/origin=fetched/interval=one_day/year=2026/month=09/day=30/data.parquet",
-            "data/equity/bars/provider=massive/origin=derived/interval=one_day/year=2026/month=10/day=01/data.parquet",
-            "data/equity/bars/provider=massive/origin=fetched/interval=one_day/year=2026/month=10/day=02/data.parquet.tmp",
+            "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_day/year=2026/month=09/day=30/data.parquet",
+            "data/equity/stage=parsed/bars/provider=massive/origin=derived/interval=one_day/year=2026/month=10/day=01/data.parquet",
+            "data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/year=2026/month=10/day=02/data.parquet.tmp",
         ]
         .map(String::from);
         let held = Held::of(Leg::MassiveDailyBars, paths.clone());
@@ -320,8 +320,8 @@ mod tests {
         assert_eq!(
             series,
             [
-                "data/equity/bars/provider=massive/origin=fetched/interval=one_day/",
-                "data/equity/bars/provider=alpaca/origin=fetched/interval=one_minute/",
+                "data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/",
+                "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/",
             ]
         );
     }
