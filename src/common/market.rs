@@ -3,6 +3,9 @@
 
 pub mod aggregate;
 pub mod record;
+pub mod state;
+
+use crate::common::monoid::Monoid;
 
 /// Millionths of a dollar per dollar: consolidated prints reach six decimals (midpoint and average-price trades), so
 /// every stored price is an integer scaled by this.
@@ -237,12 +240,27 @@ impl Shares {
     }
 
     pub fn plus(self, other: Self) -> Self {
-        Self(self.0.checked_add(other.0).expect("share count fits u64"))
+        self.checked_plus(other).expect("share count fits u64")
+    }
+
+    /// The sum, `None` when it passes what a `u64` of millionths holds.
+    pub fn checked_plus(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
     }
 
     /// The count in shares, for presentation only: sums belong on `units`.
     pub fn shares(self) -> f64 {
         self.0 as f64 / SHARE_SCALE as f64
+    }
+}
+
+impl Monoid for Shares {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(self, other: Self) -> Self {
+        self.plus(other)
     }
 }
 
@@ -273,6 +291,16 @@ impl TradeCount {
 
     pub fn plus(self, other: Self) -> Self {
         Self(self.0.checked_add(other.0).expect("trade count fits u64"))
+    }
+}
+
+impl Monoid for TradeCount {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(self, other: Self) -> Self {
+        self.plus(other)
     }
 }
 
@@ -346,6 +374,16 @@ impl DollarVolume {
             0 => None,
             units => Some(self.0 as f64 / PRICE_SCALE as f64 / units as f64),
         }
+    }
+}
+
+impl Monoid for DollarVolume {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(self, other: Self) -> Self {
+        self.plus(other)
     }
 }
 
@@ -480,6 +518,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::common::monoid::laws;
 
     #[test]
     fn test_dollars_are_exact_millionths() {
@@ -688,6 +727,27 @@ mod tests {
         fn property_a_price_survives_its_presentation_float(ticks in 1..=MAXIMUM_PRICE_TICKS) {
             let price = Price::from_ticks(ticks).unwrap();
             prop_assert_eq!(Price::from_dollars(price.dollars()), Ok(price));
+        }
+    }
+
+    proptest! {
+        /// Bounded to a third of the range, so no sum of three overflows into the panic the laws do not cover.
+        #[test]
+        fn property_shares_are_a_commutative_monoid(units in prop::array::uniform3(0_u64..u64::MAX / 3)) {
+            let [first, second, third] = units.map(Shares::from_units);
+            laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_trade_counts_are_a_commutative_monoid(counts in prop::array::uniform3(0_u64..u64::MAX / 3)) {
+            let [first, second, third] = counts.map(TradeCount::new);
+            laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_dollar_volumes_are_a_commutative_monoid(units in prop::array::uniform3(0_u128..u128::MAX / 3)) {
+            let [first, second, third] = units.map(DollarVolume::from_units);
+            laws::check(first, second, third)?;
         }
     }
 
