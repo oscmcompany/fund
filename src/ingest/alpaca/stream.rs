@@ -2,11 +2,14 @@
 //! conversions as the REST history, so a live print or quote and an archived one become the same record.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
+use strum::IntoEnumIterator;
 use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -19,6 +22,28 @@ use crate::ingest::{RefusedRow, RowRefusal};
 
 /// The SIP feed, the same for paper and live keys.
 const STREAM_URL: &str = "wss://stream.data.alpaca.markets/v2/sip";
+
+/// How long opening may take, from the connect to the confirmed subscription; reads after it wait on the market.
+const OPENING_WINDOW: Duration = Duration::from_secs(30);
+
+/// A channel a symbol is subscribed on, named as Alpaca's subscription names it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum Channel {
+    Trades,
+    Quotes,
+    Statuses,
+}
 
 /// The tape's own identifier for a print, which a correction or cancel names and a REST read returns too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
@@ -37,7 +62,7 @@ pub enum StreamMessage {
         statuses: Vec<Symbol>,
     },
     Trade {
-        id: Option<TradeId>,
+        id: TradeId,
         outcome: AlpacaTradeOutcome,
     },
     Quote(AlpacaQuoteOutcome),
@@ -49,6 +74,11 @@ pub enum StreamMessage {
     /// A kind this client has not seen a real payload of, kept whole rather than guessed at.
     Unrecognized {
         kind: String,
+        raw: String,
+    },
+    /// One element of a frame that did not read, kept whole; the frame's other messages still arrive.
+    Malformed {
+        reason: String,
         raw: String,
     },
 }
@@ -64,9 +94,13 @@ pub enum StreamError {
     Malformed {
         reason: String,
     },
-    /// Alpaca confirmed a subscription missing these symbols from its trades, quotes or statuses.
+    /// Alpaca confirmed a subscription leaving each of these symbols off the channel named beside it.
     Unconfirmed {
-        missing: Vec<Symbol>,
+        missing: Vec<(Symbol, Channel)>,
+    },
+    /// Opening outlasted its window while awaiting this step.
+    TimedOut {
+        awaiting: &'static str,
     },
     /// The socket closed before Alpaca confirmed what was asked of it.
     Closed {
@@ -85,11 +119,16 @@ impl std::fmt::Display for StreamError {
                 write!(formatter, "the stream sent an unreadable frame: {reason}")
             }
             Self::Unconfirmed { missing } => {
-                let names: Vec<&str> = missing.iter().map(Symbol::as_str).collect();
+                let names: Vec<String> = missing
+                    .iter()
+                    .map(|(symbol, channel)| format!("{} {channel}", symbol.as_str()))
+                    .collect();
+                write!(formatter, "the stream did not confirm {}", names.join(", "))
+            }
+            Self::TimedOut { awaiting } => {
                 write!(
                     formatter,
-                    "the stream left {} unsubscribed",
-                    names.join(", ")
+                    "the stream did not open in time awaiting {awaiting}"
                 )
             }
             Self::Closed { awaiting } => write!(formatter, "the stream closed awaiting {awaiting}"),
@@ -123,33 +162,58 @@ pub struct MarketStream {
 
 impl MarketStream {
     /// Connects, authenticates and subscribes `symbols`' trades, quotes and statuses, returning once Alpaca confirms
-    /// the subscription; corrections and cancels come with the trades unasked.
+    /// the subscription on every channel; corrections and cancels come with the trades unasked. Refused if opening
+    /// outlasts `OPENING_WINDOW`.
     pub async fn open(alpaca: &Alpaca, symbols: &[Symbol]) -> Result<Self, StreamError> {
-        let (socket, _) = tokio_tungstenite::connect_async(STREAM_URL)
+        Self::open_at(
+            STREAM_URL,
+            &alpaca.key_id,
+            &alpaca.secret,
+            symbols,
+            OPENING_WINDOW,
+        )
+        .await
+    }
+
+    async fn open_at(
+        url: &str,
+        key_id: &str,
+        secret: &str,
+        symbols: &[Symbol],
+        window: Duration,
+    ) -> Result<Self, StreamError> {
+        let deadline = Instant::now() + window;
+        let (socket, _) = timeout_at(deadline, tokio_tungstenite::connect_async(url))
             .await
+            .map_err(|_| StreamError::TimedOut {
+                awaiting: "the socket",
+            })?
             .map_err(|error| StreamError::Socket(error.to_string()))?;
         let mut stream = Self {
             socket,
             pending: VecDeque::new(),
         };
         stream
-            .awaiting("the connection", |message| {
+            .awaiting(deadline, "the connection", |message| {
                 matches!(message, StreamMessage::Connected)
             })
             .await?;
-        let authenticate =
-            serde_json::json!({"action": "auth", "key": alpaca.key_id, "secret": alpaca.secret});
-        stream.send(&authenticate).await?;
+        let authenticate = serde_json::json!({"action": "auth", "key": key_id, "secret": secret});
         stream
-            .awaiting("authentication", |message| {
+            .send(deadline, "authentication", &authenticate)
+            .await?;
+        stream
+            .awaiting(deadline, "authentication", |message| {
                 matches!(message, StreamMessage::Authenticated)
             })
             .await?;
         let names: Vec<&str> = symbols.iter().map(Symbol::as_str).collect();
         let subscribe = serde_json::json!({"action": "subscribe", "trades": names, "quotes": names, "statuses": names});
-        stream.send(&subscribe).await?;
+        stream
+            .send(deadline, "the subscription", &subscribe)
+            .await?;
         let confirmed = stream
-            .awaiting("the subscription", |message| {
+            .awaiting(deadline, "the subscription", |message| {
                 matches!(message, StreamMessage::Subscribed { .. })
             })
             .await?;
@@ -182,21 +246,34 @@ impl MarketStream {
         }
     }
 
-    async fn send(&mut self, request: &Value) -> Result<(), StreamError> {
-        self.socket
-            .send(Message::Text(request.to_string().into()))
-            .await
-            .map_err(|error| StreamError::Socket(error.to_string()))
+    /// Sends `request` by `deadline`, naming the step it serves if it is late.
+    async fn send(
+        &mut self,
+        deadline: Instant,
+        step: &'static str,
+        request: &Value,
+    ) -> Result<(), StreamError> {
+        timeout_at(
+            deadline,
+            self.socket.send(Message::Text(request.to_string().into())),
+        )
+        .await
+        .map_err(|_| StreamError::TimedOut { awaiting: step })?
+        .map_err(|error| StreamError::Socket(error.to_string()))
     }
 
-    /// Reads until `confirms` accepts a message, refusing on Alpaca's error and on a close.
+    /// Reads until `confirms` accepts a message, refusing on Alpaca's error, on a close and at `deadline`.
     async fn awaiting(
         &mut self,
+        deadline: Instant,
         what: &'static str,
         confirms: impl Fn(&StreamMessage) -> bool,
     ) -> Result<StreamMessage, StreamError> {
         loop {
-            match self.next().await {
+            let next = timeout_at(deadline, self.next())
+                .await
+                .map_err(|_| StreamError::TimedOut { awaiting: what })?;
+            match next {
                 None => return Err(StreamError::Closed { awaiting: what }),
                 Some(Err(error)) => return Err(error),
                 Some(Ok(StreamMessage::Refused { code, message })) => {
@@ -212,103 +289,111 @@ impl MarketStream {
     }
 }
 
-/// The asked-for symbols a confirmation leaves out of any of its trades, quotes or statuses.
-fn unconfirmed(asked: &[Symbol], confirmed: &StreamMessage) -> Vec<Symbol> {
-    match confirmed {
-        StreamMessage::Subscribed {
-            trades,
-            quotes,
-            statuses,
-        } => asked
-            .iter()
-            .filter(|symbol| {
-                ![trades, quotes, statuses]
-                    .iter()
-                    .all(|listed| listed.contains(symbol))
-            })
-            .cloned()
-            .collect(),
-        StreamMessage::Connected
-        | StreamMessage::Authenticated
-        | StreamMessage::Trade { .. }
-        | StreamMessage::Quote(_)
-        | StreamMessage::Refused { .. }
-        | StreamMessage::Unrecognized { .. } => asked.to_vec(),
-    }
+/// Each asked-for symbol a confirmation leaves off a channel, with that channel.
+fn unconfirmed(asked: &[Symbol], confirmed: &StreamMessage) -> Vec<(Symbol, Channel)> {
+    let listed = |channel: Channel| -> &[Symbol] {
+        match (confirmed, channel) {
+            (StreamMessage::Subscribed { trades, .. }, Channel::Trades) => trades,
+            (StreamMessage::Subscribed { quotes, .. }, Channel::Quotes) => quotes,
+            (StreamMessage::Subscribed { statuses, .. }, Channel::Statuses) => statuses,
+            (
+                StreamMessage::Connected
+                | StreamMessage::Authenticated
+                | StreamMessage::Trade { .. }
+                | StreamMessage::Quote(_)
+                | StreamMessage::Refused { .. }
+                | StreamMessage::Unrecognized { .. }
+                | StreamMessage::Malformed { .. },
+                Channel::Trades | Channel::Quotes | Channel::Statuses,
+            ) => &[],
+        }
+    };
+    asked
+        .iter()
+        .flat_map(|symbol| Channel::iter().map(move |channel| (symbol, channel)))
+        .filter(|(symbol, channel)| !listed(*channel).contains(symbol))
+        .map(|(symbol, channel)| (symbol.clone(), channel))
+        .collect()
 }
 
-/// One frame, a JSON array of messages each tagged by its `T`; an element with no `T` makes the frame malformed.
+/// One frame, a JSON array of messages each tagged by its `T`; only a frame that is no array is refused whole, so
+/// one bad element never costs the others.
 fn messages(text: &str) -> Result<Vec<StreamMessage>, StreamError> {
-    let malformed = |reason: String| StreamError::Malformed { reason };
     let elements: Vec<Value> =
-        serde_json::from_str(text).map_err(|error| malformed(error.to_string()))?;
-    elements
+        serde_json::from_str(text).map_err(|error| StreamError::Malformed {
+            reason: error.to_string(),
+        })?;
+    Ok(elements
         .into_iter()
         .map(|element| {
-            let kind = element
-                .get("T")
-                .and_then(Value::as_str)
-                .ok_or_else(|| malformed(format!("no `T` in {element}")))?
-                .to_string();
-            let read = |element: Value| element.to_string();
-            Ok(match kind.as_str() {
-                "success" => match element.get("msg").and_then(Value::as_str) {
-                    Some("connected") => StreamMessage::Connected,
-                    Some("authenticated") => StreamMessage::Authenticated,
-                    Some(_) | None => StreamMessage::Unrecognized {
-                        raw: read(element),
-                        kind,
-                    },
-                },
-                "subscription" => {
-                    let payload: SubscriptionPayload = serde_json::from_value(element)
-                        .map_err(|error| malformed(error.to_string()))?;
-                    StreamMessage::Subscribed {
-                        trades: payload.trades,
-                        quotes: payload.quotes,
-                        statuses: payload.statuses,
-                    }
-                }
-                "error" => {
-                    let payload: ErrorPayload = serde_json::from_value(element)
-                        .map_err(|error| malformed(error.to_string()))?;
-                    StreamMessage::Refused {
-                        code: payload.code,
-                        message: payload.msg,
-                    }
-                }
-                "t" => {
-                    let id = element
-                        .get("i")
-                        .cloned()
-                        .map(serde_json::from_value::<TradeId>)
-                        .transpose()
-                        .map_err(|error| malformed(error.to_string()))?;
-                    let outcome = match symbol(&element) {
-                        Ok(symbol) => {
-                            let row: AlpacaTrade = serde_json::from_value(element)
-                                .map_err(|error| malformed(error.to_string()))?;
-                            trade_outcome(&symbol, &row)
-                        }
-                        Err(refused) => AlpacaTradeOutcome::Refused(refused),
-                    };
-                    StreamMessage::Trade { id, outcome }
-                }
-                "q" => StreamMessage::Quote(match symbol(&element) {
-                    Ok(symbol) => {
-                        let row: AlpacaQuote = serde_json::from_value(element)
-                            .map_err(|error| malformed(error.to_string()))?;
-                        quote_outcome(&symbol, &row)
-                    }
-                    Err(refused) => AlpacaQuoteOutcome::Refused(refused),
-                }),
-                _ => StreamMessage::Unrecognized {
-                    raw: read(element),
-                    kind,
-                },
+            message(&element).unwrap_or_else(|reason| StreamMessage::Malformed {
+                reason,
+                raw: element.to_string(),
             })
         })
-        .collect()
+        .collect())
+}
+
+/// One element as a message, or why it did not read.
+fn message(element: &Value) -> Result<StreamMessage, String> {
+    let kind = element
+        .get("T")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "no `T`".to_string())?
+        .to_string();
+    let unreadable = |error: serde_json::Error| error.to_string();
+    Ok(match kind.as_str() {
+        "success" => match element.get("msg").and_then(Value::as_str) {
+            Some("connected") => StreamMessage::Connected,
+            Some("authenticated") => StreamMessage::Authenticated,
+            Some(_) | None => StreamMessage::Unrecognized {
+                raw: element.to_string(),
+                kind,
+            },
+        },
+        "subscription" => {
+            let payload: SubscriptionPayload =
+                Deserialize::deserialize(element).map_err(unreadable)?;
+            StreamMessage::Subscribed {
+                trades: payload.trades,
+                quotes: payload.quotes,
+                statuses: payload.statuses,
+            }
+        }
+        "error" => {
+            let payload: ErrorPayload = Deserialize::deserialize(element).map_err(unreadable)?;
+            StreamMessage::Refused {
+                code: payload.code,
+                message: payload.msg,
+            }
+        }
+        "t" => {
+            // A correction or cancel names its print by this id, so a trade without one cannot be followed.
+            let id = element
+                .get("i")
+                .ok_or_else(|| "a trade with no `i`".to_string())?;
+            let id = TradeId::deserialize(id).map_err(unreadable)?;
+            let outcome = match symbol(element) {
+                Ok(symbol) => {
+                    let row: AlpacaTrade = Deserialize::deserialize(element).map_err(unreadable)?;
+                    trade_outcome(&symbol, &row)
+                }
+                Err(refused) => AlpacaTradeOutcome::Refused(refused),
+            };
+            StreamMessage::Trade { id, outcome }
+        }
+        "q" => StreamMessage::Quote(match symbol(element) {
+            Ok(symbol) => {
+                let row: AlpacaQuote = Deserialize::deserialize(element).map_err(unreadable)?;
+                quote_outcome(&symbol, &row)
+            }
+            Err(refused) => AlpacaQuoteOutcome::Refused(refused),
+        }),
+        _ => StreamMessage::Unrecognized {
+            raw: element.to_string(),
+            kind,
+        },
+    })
 }
 
 /// The message's `S`, refused as a row when it is no symbol this system reads.
@@ -388,7 +473,7 @@ mod tests {
                         corrected,
                     },
             } => {
-                assert_eq!(*id, Some(TradeId(52_983_625_699_126)));
+                assert_eq!(*id, TradeId(52_983_625_699_126));
                 assert_eq!(*tape, Tape::ConsolidatedTape);
                 assert_eq!(*letters, [' ', 'F', 'T', 'I']);
                 assert!(!corrected);
@@ -417,7 +502,8 @@ mod tests {
             | StreamMessage::Subscribed { .. }
             | StreamMessage::Quote(_)
             | StreamMessage::Refused { .. }
-            | StreamMessage::Unrecognized { .. }) => panic!("{other:?}"),
+            | StreamMessage::Unrecognized { .. }
+            | StreamMessage::Malformed { .. }) => panic!("{other:?}"),
         }
         assert_eq!(read[1], quote(779.8, 480, "2026-10-06T22:35:56.179976636Z"));
         assert_eq!(
@@ -426,7 +512,7 @@ mod tests {
         );
     }
 
-    /// A confirmation leaving a symbol out of any channel leaves it unconfirmed.
+    /// A confirmation leaving a symbol off a channel names the symbol and the channel.
     #[test]
     fn test_a_partial_subscription_names_what_it_left_out() {
         let (aapl, spy) = (Symbol::new("AAPL").unwrap(), Symbol::new("SPY").unwrap());
@@ -438,18 +524,23 @@ mod tests {
         let only_spy = std::slice::from_ref(&spy);
         assert_eq!(
             unconfirmed(&[aapl.clone(), spy.clone()], &confirmed),
-            [aapl]
+            [(aapl, Channel::Quotes)]
         );
-        assert_eq!(unconfirmed(only_spy, &confirmed), Vec::<Symbol>::new());
+        assert_eq!(unconfirmed(only_spy, &confirmed), []);
         assert_eq!(
             unconfirmed(only_spy, &StreamMessage::Authenticated),
-            only_spy
+            [
+                (spy.clone(), Channel::Trades),
+                (spy.clone(), Channel::Quotes),
+                (spy, Channel::Statuses)
+            ]
         );
     }
 
-    /// A kind with no captured payload is kept whole, never dropped or guessed at; the kind here is invented.
+    /// A kind with no captured payload is kept whole, never guessed at, and the kind here is invented; an element that
+    /// does not read is kept whole as malformed while the rest of its frame still arrives.
     #[test]
-    fn test_an_unseen_kind_is_kept_whole() {
+    fn test_an_unseen_or_unreadable_element_is_kept_whole_beside_the_rest() {
         assert_eq!(
             messages(r#"[{"T":"zz","S":"SPY"}]"#).unwrap(),
             [StreamMessage::Unrecognized {
@@ -461,25 +552,63 @@ mod tests {
             messages("not json"),
             Err(StreamError::Malformed { .. })
         ));
-        assert!(matches!(
-            messages(r#"[{"S":"SPY"}]"#),
-            Err(StreamError::Malformed { .. })
-        ));
+        let frame = r#"[{"S":"SPY"},{"T":"t","S":"SPY","i":"x","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"t","S":"SPY","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"success","msg":"connected"}]"#;
+        let read = messages(frame).unwrap();
+        let reasons: Vec<&str> = read
+            .iter()
+            .filter_map(|message| match message {
+                StreamMessage::Malformed { reason, .. } => Some(reason.as_str()),
+                StreamMessage::Connected
+                | StreamMessage::Authenticated
+                | StreamMessage::Subscribed { .. }
+                | StreamMessage::Trade { .. }
+                | StreamMessage::Quote(_)
+                | StreamMessage::Refused { .. }
+                | StreamMessage::Unrecognized { .. } => None,
+            })
+            .collect();
+        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons[0], "no `T`");
+        assert_eq!(reasons[2], "a trade with no `i`");
+        assert_eq!(read[3], StreamMessage::Connected);
         assert!(matches!(
             messages(
-                r#"[{"T":"t","S":"SPY","i":"x","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"}]"#
-            ),
-            Err(StreamError::Malformed { .. })
-        ));
-        assert!(matches!(
-            messages(r#"[{"T":"t","S":"spy!","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"}]"#)
-                .unwrap()
-                .as_slice(),
+                r#"[{"T":"t","S":"spy!","i":1,"p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"}]"#
+            )
+            .unwrap()
+            .as_slice(),
             [StreamMessage::Trade {
                 outcome: AlpacaTradeOutcome::Refused(_),
                 ..
             }]
         ));
+    }
+
+    /// A server that accepts the socket and then says nothing times opening out at the first step it awaits.
+    #[tokio::test]
+    async fn test_a_silent_server_times_opening_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _held = tokio_tungstenite::accept_async(socket).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let opened = MarketStream::open_at(
+            &format!("ws://{address}"),
+            "key",
+            "secret",
+            &[Symbol::new("SPY").unwrap()],
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(matches!(
+            opened,
+            Err(StreamError::TimedOut {
+                awaiting: "the connection"
+            })
+        ));
+        server.abort();
     }
 
     /// Opens the SIP stream for SPY and reads until a trade or quote arrives; run while SPY trades, regular or
