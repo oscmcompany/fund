@@ -54,15 +54,16 @@ impl BrokerOrder {
 pub enum Cancel {
     /// Alpaca accepted the request; the order may still fill before it takes effect, so read it back.
     Requested,
-    /// The order had already closed, however it ended.
-    AlreadyClosed,
+    /// Alpaca refused it as past canceling: closed, or a cancel already pending, so read it back.
+    NotCancelable,
 }
 
 #[derive(Debug)]
 pub enum BrokerError {
     /// The keys trade live; this client refuses them.
     NotPaper,
-    /// A submission that got no answer, so the order may or may not exist; read it back by its client order id.
+    /// A submission whose answer was lost or unreadable, so the order may or may not exist; read it back by its
+    /// client order id.
     Unanswered {
         cause: String,
     },
@@ -190,15 +191,10 @@ impl PaperAccount {
         broker_order(&body)
     }
 
-    /// Asks Alpaca to cancel `id`; a 422 means the order had already closed.
+    /// Asks Alpaca to cancel `id`; a 422 means the order is past canceling, which is not proof it has closed.
     pub async fn cancel(&self, id: &BrokerOrderId) -> Result<Cancel, BrokerError> {
         let path = format!("/v2/orders/{}", id.0);
-        let outcome = with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await;
-        match outcome {
-            Ok(_) => Ok(Cancel::Requested),
-            Err(FetchError::Refused { status: 422, .. }) => Ok(Cancel::AlreadyClosed),
-            Err(error) => Err(error.into()),
-        }
+        canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
     }
 
     async fn get(&self, path: &str) -> Result<Vec<u8>, BrokerError> {
@@ -206,12 +202,24 @@ impl PaperAccount {
     }
 }
 
-/// A submission's one attempt as an order, or as `Unanswered` when it may have landed unseen.
+/// A submission's one attempt as an order, or as `Unanswered` when it may have landed unseen, which includes an
+/// accepted order whose body does not read.
 fn submitted(outcome: Outcome) -> Result<BrokerOrder, BrokerError> {
     match outcome {
-        Outcome::Body(body) => broker_order(&body),
+        Outcome::Body(body) => broker_order(&body).map_err(|error| BrokerError::Unanswered {
+            cause: format!("accepted, then unreadable: {error}"),
+        }),
         Outcome::Transient(cause) => Err(BrokerError::Unanswered { cause }),
         Outcome::Refused { status, body } => Err(FetchError::Refused { status, body }.into()),
+    }
+}
+
+/// A cancel's answer, a 422 being Alpaca's refusal of an order past canceling.
+fn canceled(outcome: Result<Vec<u8>, FetchError>) -> Result<Cancel, BrokerError> {
+    match outcome {
+        Ok(_) => Ok(Cancel::Requested),
+        Err(FetchError::Refused { status: 422, .. }) => Ok(Cancel::NotCancelable),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -288,10 +296,11 @@ fn order_status(status: &str) -> Result<OrderStatus, BrokerError> {
         | "calculated"
         | "stopped"
         | "suspended"
-        | "held" => Ok(OrderStatus::Open),
+        | "held"
+        | "done_for_day" => Ok(OrderStatus::Open),
         "filled" => Ok(OrderStatus::Closed(OrderEnding::Filled)),
         "canceled" => Ok(OrderStatus::Closed(OrderEnding::Canceled)),
-        "expired" | "done_for_day" => Ok(OrderStatus::Closed(OrderEnding::Expired)),
+        "expired" => Ok(OrderStatus::Closed(OrderEnding::Expired)),
         "rejected" => Ok(OrderStatus::Closed(OrderEnding::Rejected)),
         unknown => Err(BrokerError::UnknownStatus {
             status: unknown.to_string(),
@@ -428,13 +437,41 @@ mod tests {
         ));
     }
 
-    /// The account and an empty positions list as the paper account returned them on 2026-10-05.
+    /// Long whole, long fractional and short positions as the paper account returned them on 2026-10-06, trimmed to
+    /// the fields read and two beside.
+    const POSITIONS: &str = r#"[{"symbol":"AAPL","qty":"1","side":"long","asset_class":"us_equity"},{"symbol":"F","qty":"-1","side":"short","asset_class":"us_equity"},{"symbol":"SPY","qty":"0.5","side":"long","asset_class":"us_equity"}]"#;
+
+    /// The account and its positions as the paper account returned them, empty on 2026-10-05 and held on 2026-10-06.
     #[test]
     fn test_the_book_reads_as_the_paper_account_sends_it() {
         let account = br#"{"status":"ACTIVE","cash":"19752.73","currency":"USD","equity":"19752.73","buying_power":"79010.92"}"#;
         assert_eq!(
             book(account, b"[]").unwrap(),
             Book::reported(Cash::from_units(19_752_730_000_000_000), [])
+        );
+        let held = br#"{"status":"ACTIVE","cash":"19041.14","currency":"USD"}"#;
+        let book_held = book(held, POSITIONS.as_bytes()).unwrap();
+        assert_eq!(
+            book_held
+                .positions()
+                .keys()
+                .map(Symbol::as_str)
+                .collect::<Vec<_>>(),
+            ["AAPL", "F", "SPY"]
+        );
+        assert_eq!(
+            book_held,
+            Book::reported(
+                Cash::from_units(19_041_140_000_000_000),
+                [
+                    (
+                        Symbol::new("AAPL").unwrap(),
+                        Position::from_units(1_000_000)
+                    ),
+                    (Symbol::new("F").unwrap(), Position::from_units(-1_000_000)),
+                    (Symbol::new("SPY").unwrap(), Position::from_units(500_000)),
+                ]
+            )
         );
         assert!(book(b"", b"[]").is_err());
         assert!(book(account, b"").is_err());
@@ -470,7 +507,6 @@ mod tests {
                 ("filled", OrderStatus::Closed(OrderEnding::Filled)),
                 ("canceled", OrderStatus::Closed(OrderEnding::Canceled)),
                 ("expired", OrderStatus::Closed(OrderEnding::Expired)),
-                ("done_for_day", OrderStatus::Closed(OrderEnding::Expired)),
                 ("rejected", OrderStatus::Closed(OrderEnding::Rejected)),
             ]
         );
@@ -531,6 +567,31 @@ mod tests {
                 .id(),
             &BrokerOrderId("cfdd3ad8-5f57-44fe-9066-4adbf6bcd221".to_string())
         );
+        for unreadable in [
+            &b""[..],
+            &CANCELED.replace("canceled", "replaced").into_bytes(),
+        ] {
+            assert!(matches!(
+                submitted(Outcome::Body(unreadable.to_vec())),
+                Err(BrokerError::Unanswered { cause }) if cause.starts_with("accepted, then unreadable")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_a_cancel_past_canceling_is_told_apart_from_a_failure() {
+        let refused = |status| {
+            canceled(Err(FetchError::Refused {
+                status,
+                body: String::new(),
+            }))
+        };
+        assert_eq!(canceled(Ok(Vec::new())).unwrap(), Cancel::Requested);
+        assert_eq!(refused(422).unwrap(), Cancel::NotCancelable);
+        assert!(matches!(
+            refused(404),
+            Err(BrokerError::Fetch(FetchError::Refused { status: 404, .. }))
+        ));
     }
 
     proptest! {
