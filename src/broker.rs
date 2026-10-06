@@ -5,6 +5,7 @@ pub mod alpaca;
 use std::collections::BTreeMap;
 
 use crate::broker::alpaca::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
+use crate::common::book::Book;
 use crate::common::guard::Tradability;
 use crate::common::market::Symbol;
 use crate::common::order::{ClientOrderId, OrderRequest};
@@ -34,4 +35,7 @@ pub trait Broker {
         &self,
         symbols: &[Symbol],
     ) -> impl Future<Output = Result<BTreeMap<Symbol, Tradability>, BrokerError>> + Send;
+
+    /// The account's cash and positions as a book, the authority a journal's fills are reconciled against.
+    fn book(&self) -> impl Future<Output = Result<Book, BrokerError>> + Send;
 }

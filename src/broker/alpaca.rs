@@ -167,20 +167,20 @@ impl PaperAccount {
         }
     }
 
-    /// The account's cash and positions as a book.
-    pub async fn book(&self) -> Result<Book, BrokerError> {
-        book(
-            &self.get("/v2/account").await?,
-            &self.get("/v2/positions").await?,
-        )
-    }
-
     async fn get(&self, path: &str) -> Result<Vec<u8>, BrokerError> {
         Ok(with_retries(|| send(self.alpaca.trading(Method::GET, path))).await?)
     }
 }
 
 impl Broker for PaperAccount {
+    /// The account's cash and positions as a book.
+    async fn book(&self) -> Result<Book, BrokerError> {
+        book(
+            &self.get("/v2/account").await?,
+            &self.get("/v2/positions").await?,
+        )
+    }
+
     /// Sends `request` once as a market order for the day. Never retried: a lost response is answered by reading the
     /// order back by its client order id, and a resend under the same id is refused by Alpaca as a duplicate.
     async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {

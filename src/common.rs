@@ -9,6 +9,7 @@ pub mod market;
 pub mod monoid;
 pub mod order;
 pub mod parameter;
+pub mod reconcile;
 pub mod replay;
 pub mod risk;
 pub mod storage;

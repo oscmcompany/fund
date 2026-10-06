@@ -4,13 +4,30 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::monoid::Monoid;
 
 /// A signed amount of money in `DollarVolume` units, ticks × millionths of a share, so a fill's cash is exact.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+// Written as a decimal string, since serde's buffer for a tagged journal record cannot hold an i128.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Cash(i128);
+
+impl TryFrom<String> for Cash {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        raw.parse().map(Self)
+    }
+}
+
+impl From<Cash> for String {
+    fn from(value: Cash) -> Self {
+        value.0.to_string()
+    }
+}
 
 impl Cash {
     pub fn from_units(units: i128) -> Self {
@@ -47,8 +64,24 @@ impl Monoid for Cash {
 }
 
 /// A signed holding in millionths of a share; signed so fills form a group, though targets are long-only today.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+// Written as a decimal string, since serde's buffer for a tagged journal record cannot hold an i128.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Position(i128);
+
+impl TryFrom<String> for Position {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        raw.parse().map(Self)
+    }
+}
+
+impl From<Position> for String {
+    fn from(value: Position) -> Self {
+        value.0.to_string()
+    }
+}
 
 impl Position {
     pub fn from_units(units: i128) -> Self {

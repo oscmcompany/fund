@@ -212,7 +212,8 @@ mod tests {
                     | Observation::OrderRefused(_)
                     | Observation::OrderUnresolved(_)
                     | Observation::OrderGuarded(_)
-                    | Observation::TradabilityUnread(_) => None,
+                    | Observation::TradabilityUnread(_)
+                    | Observation::BookReconciled(_) => None,
                 },
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
