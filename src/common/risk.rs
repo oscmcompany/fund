@@ -13,6 +13,9 @@ use crate::common::time::calendar::SessionPhase;
 /// The grid a gross cut's scale is taken on; flooring onto it keeps a cut target inside the limit.
 const SCALE_GRID: u128 = 100_000_000;
 
+/// The largest dollar limit, in cash units, whose gross scale `limit * SCALE_GRID` still fits u128.
+const MAXIMUM_LIMIT: u128 = u128::MAX / SCALE_GRID;
+
 /// The fund's limits on what a target may hold and when, each required and none defaulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -33,8 +36,18 @@ pub enum Limit {
 /// Why limits were refused, naming the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitsRefusal {
-    NotPositive { limit: Limit, value: Cash },
-    NegativeWindow { flat_before_close: TimeDelta },
+    NotPositive {
+        limit: Limit,
+        value: Cash,
+    },
+    /// Past `MAXIMUM_LIMIT`, the most a gross limit can be and still scale a target; held to every dollar limit.
+    BeyondRange {
+        limit: Limit,
+        value: Cash,
+    },
+    NegativeWindow {
+        flat_before_close: TimeDelta,
+    },
 }
 
 impl Limits {
@@ -53,6 +66,9 @@ impl Limits {
         ] {
             if value.units() <= 0 {
                 return Err(LimitsRefusal::NotPositive { limit, value });
+            }
+            if value.units().cast_unsigned() > MAXIMUM_LIMIT {
+                return Err(LimitsRefusal::BeyondRange { limit, value });
             }
         }
         if flat_before_close < TimeDelta::zero() {
@@ -120,7 +136,12 @@ pub fn risk(
     if !trading {
         return Ok(flat(Cut::OutsideTradingWindow { phase }));
     }
-    let loss = Cash::from_units(opening.units() - book.value(&price)?.units());
+    let loss = Cash::from_units(
+        opening
+            .units()
+            .checked_sub(book.value(&price)?.units())
+            .expect("cash fits i128"),
+    );
     if loss >= limits.daily_loss {
         return Ok(flat(Cut::LossLimit { loss }));
     }
@@ -141,7 +162,9 @@ pub fn risk(
                 kept,
             });
         }
-        worth += ticks * u128::from(kept.units());
+        worth = worth
+            .checked_add(ticks * u128::from(kept.units()))
+            .expect("a target's worth fits u128");
         holdings.insert(symbol.clone(), (kept, ticks));
     }
     let gross = units(limits.gross);
@@ -157,7 +180,7 @@ pub fn risk(
     // Flooring the scale and each holding keeps the cut target's worth at or under the limit.
     let scale = gross
         .checked_mul(SCALE_GRID)
-        .expect("a gross limit on the grid fits u128")
+        .expect("a gross limit within MAXIMUM_LIMIT fits u128 on the grid")
         / worth;
     cuts.push(Cut::Gross {
         wanted: Cash::from_units(i128::try_from(worth).expect("a target's worth fits i128")),
@@ -284,6 +307,47 @@ mod tests {
             })
         );
         assert!(Limits::new(dollars(1), dollars(1), dollars(1), TimeDelta::zero()).is_ok());
+    }
+
+    /// A limit past `u128::MAX / SCALE_GRID` units is refused, and the largest accepted scales the largest target at
+    /// the highest price without overflowing.
+    #[test]
+    fn test_limits_past_what_gross_scaling_can_hold_are_refused() {
+        let window = TimeDelta::minutes(15);
+        let beyond = Cash::from_units(10_i128.pow(31));
+        assert_eq!(
+            Limits::new(beyond, beyond, beyond, window),
+            Err(LimitsRefusal::BeyondRange {
+                limit: Limit::Gross,
+                value: beyond
+            })
+        );
+        let largest = Cash::from_units(3_402_823_669_209_384_634_633_746_074_317);
+        assert!(matches!(
+            Limits::new(
+                largest,
+                Cash::from_units(largest.units() + 1),
+                largest,
+                window
+            ),
+            Err(LimitsRefusal::BeyondRange {
+                limit: Limit::PerName,
+                ..
+            })
+        ));
+        let limits = Limits::new(largest, largest, largest, window).unwrap();
+        let price = prices(&[("SPY", 10_000_000_000_000), ("AAPL", 10_000_000_000_000)]);
+        let wanted = target(&[("SPY", u64::MAX), ("AAPL", u64::MAX)]);
+        let restrained = risk(
+            &limits,
+            open(),
+            largest,
+            &Book::funded(largest),
+            &price,
+            wanted,
+        )
+        .unwrap();
+        assert!(matches!(restrained.cuts().last(), Some(Cut::Gross { .. })));
     }
 
     /// Flat unless the session is open with more than fifteen minutes left; exactly fifteen is already flat.
