@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::common::guard::OrderGuarded;
+use crate::common::guard::{OrderGuarded, TradabilityUnread};
 use crate::common::heal::{Leg, SessionOutcome};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
@@ -187,6 +187,7 @@ pub enum Observation {
     OrderRefused(OrderRefused),
     OrderUnresolved(OrderUnresolved),
     OrderGuarded(OrderGuarded),
+    TradabilityUnread(TradabilityUnread),
 }
 
 impl Observation {
@@ -564,7 +565,7 @@ mod tests {
     #[test]
     fn test_the_order_records_encode_to_their_wire_format() {
         use crate::common::book::Book;
-        use crate::common::guard::{Tradability, guard};
+        use crate::common::guard::{Tradability, TradabilityUnread, guard};
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
             ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
@@ -615,6 +616,7 @@ mod tests {
                 ),
             )),
             Observation::OrderGuarded(guarded),
+            Observation::TradabilityUnread(TradabilityUnread::new("timed out".to_string())),
         ];
         let payloads: Vec<String> = observations
             .iter()
@@ -637,6 +639,7 @@ mod tests {
                     r#"{{"event_type":"order_unresolved","payload":{{{id},"cause":"cancel failed","executed":{{"shares":500000,"average_price":12400000}}}}}}"#
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
+                r#"{"event_type":"tradability_unread","payload":{"cause":"timed out"}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {

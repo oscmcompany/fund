@@ -23,8 +23,21 @@ pub enum Tradability {
 }
 
 /// Why the guard held an order back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum GuardCause {
     Untradable,
     Unlisted,
@@ -46,6 +59,18 @@ pub struct OrderGuarded {
 impl OrderGuarded {
     pub fn cause(&self) -> GuardCause {
         self.cause
+    }
+}
+
+/// A tradability read that failed, journaled with its cause once before every order it leaves unvouched is held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradabilityUnread {
+    cause: String,
+}
+
+impl TradabilityUnread {
+    pub fn new(cause: String) -> Self {
+        Self { cause }
     }
 }
 
@@ -171,6 +196,22 @@ mod tests {
                 .map(|held| (held.symbol.as_str(), held.cause()))
                 .collect();
             assert_eq!(causes, held, "{units}");
+        }
+    }
+
+    /// Names agree between strum and serde for every cause.
+    #[test]
+    fn test_guard_causes_read_back_as_written() {
+        use strum::IntoEnumIterator;
+
+        let causes: Vec<&str> = GuardCause::iter().map(Into::into).collect();
+        assert_eq!(causes, ["untradable", "unlisted", "fractional", "unread"]);
+        for cause in GuardCause::iter() {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{cause}\"")
+            );
+            assert_eq!(cause.to_string().parse(), Ok(cause));
         }
     }
 
