@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::broker::Broker;
 use crate::broker::alpaca::BrokerError;
-use crate::common::book::{Book, Cash, Fill};
+use crate::common::book::{Book, Fill};
 use crate::common::guard::{GuardCause, TradabilityUnread, guard};
 use crate::common::journal::Observation;
 use crate::common::market::{Shares, Symbol};
@@ -17,7 +17,7 @@ use crate::common::order::{
     ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest, OrderState,
     OrderSubmitted, OrderUnresolved,
 };
-use crate::common::reconcile::{BookReconciled, reconcile};
+use crate::common::reconcile::{Allowance, BookReconciled, reconcile};
 use crate::common::strategy::{Target, orders};
 use crate::ingest::FetchError;
 use crate::journal::Journal;
@@ -156,15 +156,16 @@ pub struct Reconciliation {
     pub book: Book,
 }
 
-/// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge closes
-/// every short and every position the journal expected none of, keeping the rest at the broker's count; the caller
-/// refuses further trading on a divergence.
+/// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge tries
+/// to close every short and every position the journal expected none of, keeping the rest at the broker's count; the
+/// book returned is the broker's after those attempts. A close can be held, refused, partial or unresolved, so the
+/// caller checks `closing` before trading from that book, and refuses further trading on any divergence.
 pub async fn reconcile_and_close(
     broker: &impl Broker,
     journal: &mut Journal,
     next_sequence: &mut u32,
     expected: &Book,
-    allowance: Cash,
+    allowance: Allowance,
     patience: Patience,
 ) -> Result<Reconciliation, ReconcileFailed> {
     let reported = broker.book().await.map_err(ReconcileFailed::Unread)?;
@@ -304,7 +305,7 @@ mod tests {
 
     use super::*;
     use crate::broker::alpaca::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
-    use crate::common::book::{Position, Side};
+    use crate::common::book::{Cash, Position, Side};
     use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::{Price, Shares, Symbol};
@@ -880,7 +881,7 @@ mod tests {
             &mut journal,
             &mut next_sequence,
             expected,
-            Cash::from_units(0),
+            Allowance::NONE,
             PATIENT,
         )
         .await

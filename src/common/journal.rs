@@ -574,7 +574,7 @@ mod tests {
             ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
             OrderRequest, OrderState, OrderStatus, OrderUnresolved,
         };
-        use crate::common::reconcile::reconcile;
+        use crate::common::reconcile::{reconcile, rounding_allowance};
         use crate::common::strategy::{Target, orders};
 
         let id = ClientOrderId::new(RunId::new(Uuid::from_u128(2)), 7);
@@ -630,7 +630,7 @@ mod tests {
                         Position::from_units(-2_000_000),
                     )],
                 ),
-                Cash::from_units(10),
+                rounding_allowance(&[]),
             )),
         ];
         let payloads: Vec<String> = observations
@@ -655,7 +655,7 @@ mod tests {
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":"timed out"}}"#.to_string(),
-                r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"10","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
+                r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {
