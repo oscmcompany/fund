@@ -70,9 +70,15 @@ impl std::fmt::Display for ClientOrderId {
 
 /// Where the broker says an order stands, collapsed to what a caller acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reported {
+pub enum OrderStatus {
     /// Accepted, queued or partly filled: the broker still has it.
     Open,
+    Closed(OrderEnding),
+}
+
+/// How a closed order ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderEnding {
     Filled,
     Canceled,
     /// Ended by its time in force, or done for the day.
@@ -80,23 +86,14 @@ pub enum Reported {
     Rejected,
 }
 
-/// How a closed order ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ending {
-    Filled,
-    Canceled,
-    Expired,
-    Rejected,
-}
-
 /// What has executed: the shares and the broker's average price over them, never zero shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Execution {
+pub struct OrderExecution {
     shares: Shares,
     average_price: Price,
 }
 
-impl Execution {
+impl OrderExecution {
     /// `None` for zero shares, which is no execution rather than one of nothing.
     pub fn new(shares: Shares, average_price: Price) -> Option<Self> {
         (!shares.is_zero()).then_some(Self {
@@ -117,15 +114,15 @@ impl Execution {
 /// One reading of an order at the broker; `executed` is `None` while nothing has filled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderReport {
-    reported: Reported,
-    executed: Option<Execution>,
+    status: OrderStatus,
+    executed: Option<OrderExecution>,
     at: DateTime<Utc>,
 }
 
 impl OrderReport {
-    pub fn new(reported: Reported, executed: Option<Execution>, at: DateTime<Utc>) -> Self {
+    pub fn new(status: OrderStatus, executed: Option<OrderExecution>, at: DateTime<Utc>) -> Self {
         Self {
-            reported,
+            status,
             executed,
             at,
         }
@@ -140,12 +137,12 @@ pub struct OrderState(Stage);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Working {
-        executed: Option<Execution>,
+        executed: Option<OrderExecution>,
     },
     /// Closed at `at`; a canceled, expired or rejected order may still have executed part of itself.
     Closed {
-        ending: Ending,
-        executed: Option<Execution>,
+        ending: OrderEnding,
+        executed: Option<OrderExecution>,
         at: DateTime<Utc>,
     },
 }
@@ -161,8 +158,8 @@ pub enum OrderRefusal {
     FilledShort { ordered: Shares, reported: Shares },
     /// A closed order was reported differently afterwards: how it closed, beside the report that disagreed.
     ChangedAfterClosing {
-        ending: Ending,
-        executed: Option<Execution>,
+        ending: OrderEnding,
+        executed: Option<OrderExecution>,
         report: OrderReport,
     },
 }
@@ -173,14 +170,14 @@ impl OrderState {
         Self(Stage::Working { executed: None })
     }
 
-    pub fn executed(self) -> Option<Execution> {
+    pub fn executed(self) -> Option<OrderExecution> {
         match self.0 {
             Stage::Working { executed } | Stage::Closed { executed, .. } => executed,
         }
     }
 
     /// How and when the order closed, `None` while it is working.
-    pub fn closed(self) -> Option<(Ending, DateTime<Utc>)> {
+    pub fn closed(self) -> Option<(OrderEnding, DateTime<Utc>)> {
         match self.0 {
             Stage::Working { .. } => None,
             Stage::Closed { ending, at, .. } => Some((ending, at)),
@@ -190,20 +187,21 @@ impl OrderState {
     /// The state after `report` on `order`; a repeated report of a closed order changes nothing, its time included.
     pub fn observe(self, order: &Order, report: OrderReport) -> Result<Self, OrderRefusal> {
         let ordered = order.shares();
-        let held = self.executed().map_or(Shares::default(), Execution::shares);
-        let reported = report.executed.map_or(Shares::default(), Execution::shares);
+        let held = self
+            .executed()
+            .map_or(Shares::default(), OrderExecution::shares);
+        let reported = report
+            .executed
+            .map_or(Shares::default(), OrderExecution::shares);
         if reported > ordered {
             return Err(OrderRefusal::Overfilled { ordered, reported });
         }
-        let ending = match report.reported {
-            Reported::Open => None,
-            Reported::Filled if reported != ordered => {
+        let ending = match report.status {
+            OrderStatus::Open => None,
+            OrderStatus::Closed(OrderEnding::Filled) if reported != ordered => {
                 return Err(OrderRefusal::FilledShort { ordered, reported });
             }
-            Reported::Filled => Some(Ending::Filled),
-            Reported::Canceled => Some(Ending::Canceled),
-            Reported::Expired => Some(Ending::Expired),
-            Reported::Rejected => Some(Ending::Rejected),
+            OrderStatus::Closed(ending) => Some(ending),
         };
         match (self.0, ending) {
             (
@@ -314,12 +312,12 @@ mod tests {
         Shares::whole(count).unwrap()
     }
 
-    fn executed(count: u64, ticks: i64) -> Option<Execution> {
-        Execution::new(whole(count), Price::from_ticks(ticks).unwrap())
+    fn executed(count: u64, ticks: i64) -> Option<OrderExecution> {
+        OrderExecution::new(whole(count), Price::from_ticks(ticks).unwrap())
     }
 
-    fn report(reported: Reported, execution: Option<Execution>, minute: i64) -> OrderReport {
-        OrderReport::new(reported, execution, instant(minute))
+    fn report(status: OrderStatus, execution: Option<OrderExecution>, minute: i64) -> OrderReport {
+        OrderReport::new(status, execution, instant(minute))
     }
 
     /// A buy of `count` AAPL shares from an empty book.
@@ -371,13 +369,17 @@ mod tests {
         let state = observe_all(
             &order,
             &[
-                report(Reported::Open, None, 0),
-                report(Reported::Open, executed(4, 2_000_000), 1),
-                report(Reported::Filled, executed(10, 2_100_000), 2),
+                report(OrderStatus::Open, None, 0),
+                report(OrderStatus::Open, executed(4, 2_000_000), 1),
+                report(
+                    OrderStatus::Closed(OrderEnding::Filled),
+                    executed(10, 2_100_000),
+                    2,
+                ),
             ],
         )
         .unwrap();
-        assert_eq!(state.closed(), Some((Ending::Filled, instant(2))));
+        assert_eq!(state.closed(), Some((OrderEnding::Filled, instant(2))));
         assert_eq!(OrderState::submitted().closed(), None);
         let fill = state.fill(&order).unwrap();
         assert_eq!(
@@ -405,19 +407,31 @@ mod tests {
         let order = buy(10);
         let partial = observe_all(
             &order,
-            &[report(Reported::Canceled, executed(3, 2_000_000), 5)],
+            &[report(
+                OrderStatus::Closed(OrderEnding::Canceled),
+                executed(3, 2_000_000),
+                5,
+            )],
         )
         .unwrap();
         assert_eq!(
             partial.fill(&order).map(|fill| fill.shares()),
             Some(whole(3))
         );
-        let none = observe_all(&order, &[report(Reported::Rejected, None, 5)]).unwrap();
+        let none = observe_all(
+            &order,
+            &[report(OrderStatus::Closed(OrderEnding::Rejected), None, 5)],
+        )
+        .unwrap();
         assert_eq!(none.fill(&order), None);
         let reread = partial
             .observe(
                 &order,
-                report(Reported::Canceled, executed(3, 2_000_000), 9),
+                report(
+                    OrderStatus::Closed(OrderEnding::Canceled),
+                    executed(3, 2_000_000),
+                    9,
+                ),
             )
             .unwrap();
         assert_eq!(
@@ -431,14 +445,21 @@ mod tests {
         let order = buy(10);
         let ordered = whole(10);
         assert_eq!(
-            observe_all(&order, &[report(Reported::Open, executed(11, 1), 0)]),
+            observe_all(&order, &[report(OrderStatus::Open, executed(11, 1), 0)]),
             Err(OrderRefusal::Overfilled {
                 ordered,
                 reported: whole(11)
             })
         );
         assert_eq!(
-            observe_all(&order, &[report(Reported::Filled, executed(9, 1), 0)]),
+            observe_all(
+                &order,
+                &[report(
+                    OrderStatus::Closed(OrderEnding::Filled),
+                    executed(9, 1),
+                    0
+                )]
+            ),
             Err(OrderRefusal::FilledShort {
                 ordered,
                 reported: whole(9)
@@ -448,8 +469,8 @@ mod tests {
             observe_all(
                 &order,
                 &[
-                    report(Reported::Open, executed(5, 1), 0),
-                    report(Reported::Open, executed(4, 1), 1)
+                    report(OrderStatus::Open, executed(5, 1), 0),
+                    report(OrderStatus::Open, executed(4, 1), 1)
                 ]
             ),
             Err(OrderRefusal::ExecutionShrank {
@@ -461,28 +482,40 @@ mod tests {
             observe_all(
                 &order,
                 &[
-                    report(Reported::Canceled, executed(2, 1), 0),
-                    report(Reported::Open, None, 1)
+                    report(
+                        OrderStatus::Closed(OrderEnding::Canceled),
+                        executed(2, 1),
+                        0
+                    ),
+                    report(OrderStatus::Open, None, 1)
                 ]
             ),
             Err(OrderRefusal::ChangedAfterClosing {
-                ending: Ending::Canceled,
+                ending: OrderEnding::Canceled,
                 executed: executed(2, 1),
-                report: report(Reported::Open, None, 1)
+                report: report(OrderStatus::Open, None, 1)
             })
         );
         assert_eq!(
             observe_all(
                 &order,
                 &[
-                    report(Reported::Canceled, None, 0),
-                    report(Reported::Canceled, executed(1, 1), 1)
+                    report(OrderStatus::Closed(OrderEnding::Canceled), None, 0),
+                    report(
+                        OrderStatus::Closed(OrderEnding::Canceled),
+                        executed(1, 1),
+                        1
+                    )
                 ]
             ),
             Err(OrderRefusal::ChangedAfterClosing {
-                ending: Ending::Canceled,
+                ending: OrderEnding::Canceled,
                 executed: None,
-                report: report(Reported::Canceled, executed(1, 1), 1)
+                report: report(
+                    OrderStatus::Closed(OrderEnding::Canceled),
+                    executed(1, 1),
+                    1
+                )
             })
         );
     }
@@ -493,7 +526,11 @@ mod tests {
         let order = buy(10);
         let filled = observe_all(
             &order,
-            &[report(Reported::Filled, executed(10, 3_000_000), 0)],
+            &[report(
+                OrderStatus::Closed(OrderEnding::Filled),
+                executed(10, 3_000_000),
+                0,
+            )],
         )
         .unwrap();
         let opening = Cash::from_units(100 * 1_000_000_000_000);
@@ -514,10 +551,10 @@ mod tests {
             1..1_000u64,
             prop::collection::vec(0..=100u64, 0..6),
             prop::sample::select(vec![
-                Reported::Filled,
-                Reported::Canceled,
-                Reported::Expired,
-                Reported::Rejected,
+                OrderEnding::Filled,
+                OrderEnding::Canceled,
+                OrderEnding::Expired,
+                OrderEnding::Rejected,
             ]),
             0..=100u64,
             1..1_000_000_000i64,
@@ -525,25 +562,28 @@ mod tests {
             .prop_map(|(ordered, mut percents, closing, closing_percent, ticks)| {
                 percents.sort_unstable();
                 let at = |percent: u64| {
-                    Execution::new(
+                    OrderExecution::new(
                         whole(ordered * percent / 100),
                         Price::from_ticks(ticks).unwrap(),
                     )
                 };
                 let last = percents.last().copied().unwrap_or(0);
                 let closing_percent = match closing {
-                    Reported::Filled => 100,
-                    Reported::Open
-                    | Reported::Canceled
-                    | Reported::Expired
-                    | Reported::Rejected => closing_percent.max(last),
+                    OrderEnding::Filled => 100,
+                    OrderEnding::Canceled | OrderEnding::Expired | OrderEnding::Rejected => {
+                        closing_percent.max(last)
+                    }
                 };
                 let mut reports: Vec<OrderReport> = percents
                     .iter()
                     .enumerate()
-                    .map(|(minute, percent)| report(Reported::Open, at(*percent), minute as i64))
+                    .map(|(minute, percent)| report(OrderStatus::Open, at(*percent), minute as i64))
                     .collect();
-                reports.push(report(closing, at(closing_percent), 10));
+                reports.push(report(
+                    OrderStatus::Closed(closing),
+                    at(closing_percent),
+                    10,
+                ));
                 (buy(ordered), reports)
             })
     }
