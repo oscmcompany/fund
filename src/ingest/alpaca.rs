@@ -1,6 +1,8 @@
 //! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session, and its
 //! published trading calendar.
 
+pub mod stream;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
