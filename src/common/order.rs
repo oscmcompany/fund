@@ -2,11 +2,12 @@
 //! those reports fold into, which ends at most once and yields the fill the book takes.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::common::book::Fill;
+use crate::common::book::{Fill, Side};
 use crate::common::journal::RunId;
-use crate::common::market::{DollarVolume, Price, Shares};
+use crate::common::market::{DollarVolume, Price, Shares, Symbol};
 use crate::common::strategy::Order;
 
 /// Alpaca's limit, measured against the paper account on 2026-09-25: 128 characters accepted, 129 refused.
@@ -16,7 +17,8 @@ const CLIENT_ORDER_ID_PREFIX: &str = "fund";
 
 /// The identifier an order is sent under: the run that sent it and its place in that run, so the broker's order
 /// history names the journal that explains each order and a resubmission is refused as a duplicate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct ClientOrderId {
     run: RunId,
     sequence: u32,
@@ -58,6 +60,21 @@ impl ClientOrderId {
     }
 }
 
+impl TryFrom<String> for ClientOrderId {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+            .ok_or_else(|| format!("`{raw}` is not a client order id this system writes"))
+    }
+}
+
+impl From<ClientOrderId> for String {
+    fn from(id: ClientOrderId) -> Self {
+        id.to_string()
+    }
+}
+
 impl std::fmt::Display for ClientOrderId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -77,7 +94,21 @@ pub enum OrderStatus {
 }
 
 /// How a closed order ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum OrderEnding {
     Filled,
     Canceled,
@@ -87,10 +118,25 @@ pub enum OrderEnding {
 }
 
 /// What has executed: the shares and the broker's average price over them, never zero shares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "OrderExecutionFields")]
 pub struct OrderExecution {
     shares: Shares,
     average_price: Price,
+}
+
+#[derive(Deserialize)]
+struct OrderExecutionFields {
+    shares: Shares,
+    average_price: Price,
+}
+
+impl TryFrom<OrderExecutionFields> for OrderExecution {
+    type Error = &'static str;
+
+    fn try_from(fields: OrderExecutionFields) -> Result<Self, Self::Error> {
+        Self::new(fields.shares, fields.average_price).ok_or("an execution of no shares")
+    }
 }
 
 impl OrderExecution {
@@ -267,6 +313,92 @@ impl OrderState {
     }
 }
 
+/// An order about to be sent to the broker under `client_order_id`, journaled before the send so a crash between the
+/// two leaves the order on record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderSubmitted {
+    client_order_id: ClientOrderId,
+    symbol: Symbol,
+    side: Side,
+    shares: Shares,
+}
+
+impl OrderSubmitted {
+    pub fn of(request: &OrderRequest) -> Self {
+        Self {
+            client_order_id: request.client_order_id,
+            symbol: request.order.symbol().clone(),
+            side: request.order.side(),
+            shares: request.order.shares(),
+        }
+    }
+}
+
+/// An order closed at the broker at `closed_at`, having executed `executed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderClosed {
+    client_order_id: ClientOrderId,
+    ending: Ending,
+    executed: Option<Execution>,
+    closed_at: DateTime<Utc>,
+}
+
+impl OrderClosed {
+    /// `None` for a state still working.
+    pub fn of(client_order_id: ClientOrderId, state: OrderState) -> Option<Self> {
+        match state {
+            OrderState::Working { .. } => None,
+            OrderState::Closed {
+                ending,
+                executed,
+                at,
+            } => Some(Self {
+                client_order_id,
+                ending,
+                executed,
+                closed_at: at,
+            }),
+        }
+    }
+}
+
+/// An order the broker refused outright, with its status and the body it sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderRefused {
+    client_order_id: ClientOrderId,
+    status: u16,
+    body: String,
+}
+
+impl OrderRefused {
+    pub fn new(client_order_id: ClientOrderId, status: u16, body: String) -> Self {
+        Self {
+            client_order_id,
+            status,
+            body,
+        }
+    }
+}
+
+/// An order whose end could not be established, with why and the last execution read; it may still be working at
+/// the broker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderUnresolved {
+    client_order_id: ClientOrderId,
+    cause: String,
+    executed: Option<Execution>,
+}
+
+impl OrderUnresolved {
+    pub fn new(client_order_id: ClientOrderId, cause: String, executed: Option<Execution>) -> Self {
+        Self {
+            client_order_id,
+            cause,
+            executed,
+        }
+    }
+}
+
 /// An order as sent: what to trade and the identifier it goes under, filled at market for the day.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRequest {
@@ -339,6 +471,31 @@ mod tests {
             .try_fold(OrderState::submitted(), |state, report| {
                 state.observe(order, *report)
             })
+    }
+
+    /// Names agree between strum and serde, and a zero execution or a foreign client order id does not deserialize.
+    #[test]
+    fn test_the_journaled_order_values_read_back_as_written() {
+        use strum::IntoEnumIterator;
+
+        let endings: Vec<&str> = Ending::iter().map(Into::into).collect();
+        assert_eq!(endings, ["filled", "canceled", "expired", "rejected"]);
+        let sides: Vec<&str> = Side::iter().map(Into::into).collect();
+        assert_eq!(sides, ["buy", "sell"]);
+        for ending in Ending::iter() {
+            assert_eq!(
+                serde_json::to_string(&ending).unwrap(),
+                format!("\"{ending}\"")
+            );
+            assert_eq!(ending.to_string().parse(), Ok(ending));
+        }
+        for side in Side::iter() {
+            assert_eq!(serde_json::to_string(&side).unwrap(), format!("\"{side}\""));
+            assert_eq!(side.to_string().parse(), Ok(side));
+        }
+        assert!(serde_json::from_str::<Execution>(r#"{"shares":0,"average_price":1}"#).is_err());
+        assert!(serde_json::from_str::<Execution>(r#"{"shares":1,"average_price":0}"#).is_err());
+        assert!(serde_json::from_str::<ClientOrderId>(r#""c_7885f50f""#).is_err());
     }
 
     #[test]

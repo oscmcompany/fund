@@ -206,7 +206,11 @@ mod tests {
                     Observation::ConfigurationResolved(_)
                     | Observation::PartitionWritten(_)
                     | Observation::HealFinished(_)
-                    | Observation::DatasetRead(_) => None,
+                    | Observation::DatasetRead(_)
+                    | Observation::OrderSubmitted(_)
+                    | Observation::OrderClosed(_)
+                    | Observation::OrderRefused(_)
+                    | Observation::OrderUnresolved(_) => None,
                 },
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })

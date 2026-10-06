@@ -109,8 +109,25 @@ impl std::fmt::Display for Symbol {
 }
 
 /// A positive price held as a whole number of ticks, `PRICE_SCALE` ticks to the dollar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "i64", into = "i64")]
 pub struct Price(i64);
+
+impl TryFrom<i64> for Price {
+    type Error = String;
+
+    fn try_from(ticks: i64) -> Result<Self, Self::Error> {
+        Self::from_ticks(ticks).map_err(|refusal| format!("{refusal:?}"))
+    }
+}
+
+impl From<Price> for i64 {
+    fn from(price: Price) -> Self {
+        price.0
+    }
+}
 
 /// Why a price was refused.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,7 +198,20 @@ pub const SHARE_SCALE: u64 = 1_000_000;
 
 /// A number of shares held in millionths, `SHARE_SCALE` to the share, where zero is a measurement: an empty book
 /// side or a bar nobody traded in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct Shares(u64);
 
 /// Why a share count was refused.
