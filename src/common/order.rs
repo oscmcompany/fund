@@ -338,27 +338,21 @@ impl OrderSubmitted {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderClosed {
     client_order_id: ClientOrderId,
-    ending: Ending,
-    executed: Option<Execution>,
+    ending: OrderEnding,
+    executed: Option<OrderExecution>,
     closed_at: DateTime<Utc>,
 }
 
 impl OrderClosed {
     /// `None` for a state still working.
     pub fn of(client_order_id: ClientOrderId, state: OrderState) -> Option<Self> {
-        match state {
-            OrderState::Working { .. } => None,
-            OrderState::Closed {
-                ending,
-                executed,
-                at,
-            } => Some(Self {
-                client_order_id,
-                ending,
-                executed,
-                closed_at: at,
-            }),
-        }
+        let (ending, closed_at) = state.closed()?;
+        Some(Self {
+            client_order_id,
+            ending,
+            executed: state.executed(),
+            closed_at,
+        })
     }
 }
 
@@ -386,11 +380,15 @@ impl OrderRefused {
 pub struct OrderUnresolved {
     client_order_id: ClientOrderId,
     cause: String,
-    executed: Option<Execution>,
+    executed: Option<OrderExecution>,
 }
 
 impl OrderUnresolved {
-    pub fn new(client_order_id: ClientOrderId, cause: String, executed: Option<Execution>) -> Self {
+    pub fn new(
+        client_order_id: ClientOrderId,
+        cause: String,
+        executed: Option<OrderExecution>,
+    ) -> Self {
         Self {
             client_order_id,
             cause,
@@ -478,11 +476,11 @@ mod tests {
     fn test_the_journaled_order_values_read_back_as_written() {
         use strum::IntoEnumIterator;
 
-        let endings: Vec<&str> = Ending::iter().map(Into::into).collect();
+        let endings: Vec<&str> = OrderEnding::iter().map(Into::into).collect();
         assert_eq!(endings, ["filled", "canceled", "expired", "rejected"]);
         let sides: Vec<&str> = Side::iter().map(Into::into).collect();
         assert_eq!(sides, ["buy", "sell"]);
-        for ending in Ending::iter() {
+        for ending in OrderEnding::iter() {
             assert_eq!(
                 serde_json::to_string(&ending).unwrap(),
                 format!("\"{ending}\"")
@@ -493,8 +491,12 @@ mod tests {
             assert_eq!(serde_json::to_string(&side).unwrap(), format!("\"{side}\""));
             assert_eq!(side.to_string().parse(), Ok(side));
         }
-        assert!(serde_json::from_str::<Execution>(r#"{"shares":0,"average_price":1}"#).is_err());
-        assert!(serde_json::from_str::<Execution>(r#"{"shares":1,"average_price":0}"#).is_err());
+        assert!(
+            serde_json::from_str::<OrderExecution>(r#"{"shares":0,"average_price":1}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<OrderExecution>(r#"{"shares":1,"average_price":0}"#).is_err()
+        );
         assert!(serde_json::from_str::<ClientOrderId>(r#""c_7885f50f""#).is_err());
     }
 

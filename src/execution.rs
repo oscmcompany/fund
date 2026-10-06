@@ -10,8 +10,8 @@ use crate::broker::alpaca::{BrokerError, PaperAccount};
 use crate::common::book::{Book, Fill};
 use crate::common::journal::Observation;
 use crate::common::order::{
-    ClientOrderId, Execution, OrderClosed, OrderRefused, OrderRequest, OrderState, OrderSubmitted,
-    OrderUnresolved,
+    ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest, OrderState,
+    OrderSubmitted, OrderUnresolved,
 };
 use crate::common::strategy::{Target, orders};
 use crate::ingest::FetchError;
@@ -57,13 +57,13 @@ impl Waiting {
     }
 }
 
-/// How each order ended: closed (its fill, if it executed), refused by the broker, or unresolved with the last
+/// What became of each order: closed (its fill, if it executed), refused by the broker, or unresolved with the last
 /// execution read before its end was lost.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Executed {
+pub enum OrderOutcome {
     Closed(Option<Fill>),
     Refused,
-    Unresolved(Option<Execution>),
+    Unresolved(Option<OrderExecution>),
 }
 
 /// Sends the orders that take `book` to `target`, one at a time, sells first, journaling each under the journal's
@@ -75,8 +75,8 @@ pub async fn execute(
     book: &Book,
     target: &Target,
     patience: Patience,
-) -> std::io::Result<Vec<Executed>> {
-    let mut executed = Vec::new();
+) -> std::io::Result<Vec<OrderOutcome>> {
+    let mut outcomes = Vec::new();
     for order in orders(book, target) {
         let sequence = *next_sequence;
         *next_sequence = sequence
@@ -89,22 +89,22 @@ pub async fn execute(
         )?;
         let (observation, outcome) = follow(account, &request, patience).await;
         journal.append(Utc::now(), observation)?;
-        executed.push(outcome);
+        outcomes.push(outcome);
     }
-    Ok(executed)
+    Ok(outcomes)
 }
 
-/// Submits one order and follows it to its close, returning what to journal and how it ended.
+/// Submits one order and follows it to its close, returning what to journal and its outcome.
 async fn follow(
     account: &PaperAccount,
     request: &OrderRequest,
     patience: Patience,
-) -> (Observation, Executed) {
+) -> (Observation, OrderOutcome) {
     let id = request.client_order_id();
-    let unresolved = |cause: String, executed: Option<Execution>| {
+    let unresolved = |cause: String, executed: Option<OrderExecution>| {
         (
             Observation::OrderUnresolved(OrderUnresolved::new(id, cause, executed)),
-            Executed::Unresolved(executed),
+            OrderOutcome::Unresolved(executed),
         )
     };
     let submitted = match account.submit(request).await {
@@ -112,7 +112,7 @@ async fn follow(
         Err(BrokerError::Fetch(FetchError::Refused { status, body })) => {
             return (
                 Observation::OrderRefused(OrderRefused::new(id, status, body)),
-                Executed::Refused,
+                OrderOutcome::Refused,
             );
         }
         // Anything short of a refusal may have landed, so the order is read back by its id rather than resent.
@@ -134,7 +134,7 @@ async fn follow(
     };
     let started = Instant::now();
     let mut waiting = Waiting::BeforeCancel;
-    while let OrderState::Working { .. } = state {
+    while state.closed().is_none() {
         let action;
         (action, waiting) = match waiting.next(started.elapsed() >= patience.open_for) {
             Some(next) => next,
@@ -167,7 +167,7 @@ async fn follow(
     let closed = OrderClosed::of(id, state).expect("the loop leaves only a closed order");
     (
         Observation::OrderClosed(closed),
-        Executed::Closed(state.fill(order)),
+        OrderOutcome::Closed(state.fill(order)),
     )
 }
 
@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::{Shares, Symbol};
-    use crate::common::order::Ending;
+    use crate::common::order::OrderEnding;
     use crate::ingest::alpaca::Alpaca;
 
     /// An open order is read until its patience runs out, canceled once, then read exactly `READS_AFTER_CANCEL` more
@@ -228,7 +228,7 @@ mod tests {
             open_for: Duration::from_secs(2),
         };
         let mut next_sequence = 0;
-        let executed = execute(
+        let outcomes = execute(
             &account,
             &mut journal,
             &mut next_sequence,
@@ -240,8 +240,8 @@ mod tests {
         .unwrap();
         assert_eq!(next_sequence, 1);
         assert_eq!(
-            executed,
-            [Executed::Closed(None)],
+            outcomes,
+            [OrderOutcome::Closed(None)],
             "run while the market is closed"
         );
         let file = std::fs::read_dir(&directory)
@@ -279,7 +279,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::to_value(&closed).unwrap()["ending"],
-            Ending::Canceled.to_string()
+            OrderEnding::Canceled.to_string()
         );
         assert_eq!(account.book().await.unwrap(), before);
         std::fs::remove_dir_all(&directory).unwrap();

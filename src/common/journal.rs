@@ -564,25 +564,30 @@ mod tests {
         use crate::common::book::Book;
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
-            ClientOrderId, Execution, OrderClosed, OrderRefused, OrderRequest, OrderState,
-            OrderUnresolved,
+            ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
+            OrderRequest, OrderState, OrderStatus, OrderUnresolved,
         };
         use crate::common::strategy::{Target, orders};
 
         let id = ClientOrderId::new(RunId::new(Uuid::from_u128(2)), 7);
-        let closed = OrderState::Closed {
-            ending: crate::common::order::Ending::Canceled,
-            executed: Execution::new(
-                Shares::whole(3).unwrap(),
-                Price::from_ticks(12_500_000).unwrap(),
-            ),
-            at: "2026-10-06T14:00:00Z".parse().unwrap(),
-        };
         let target = Target::new(BTreeMap::from([(
             Symbol::new("SPY").unwrap(),
-            Shares::whole(2).unwrap(),
+            Shares::whole(5).unwrap(),
         )]));
         let order = orders(&Book::default(), &target).remove(0);
+        let closed = OrderState::submitted()
+            .observe(
+                &order,
+                OrderReport::new(
+                    OrderStatus::Closed(OrderEnding::Canceled),
+                    OrderExecution::new(
+                        Shares::whole(3).unwrap(),
+                        Price::from_ticks(12_500_000).unwrap(),
+                    ),
+                    "2026-10-06T14:00:00Z".parse().unwrap(),
+                ),
+            )
+            .unwrap();
         let observations = [
             Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id))),
             Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
@@ -594,7 +599,7 @@ mod tests {
             Observation::OrderUnresolved(OrderUnresolved::new(
                 id,
                 "cancel failed".to_string(),
-                Execution::new(
+                OrderExecution::new(
                     Shares::from_units(500_000),
                     Price::from_ticks(12_400_000).unwrap(),
                 ),
@@ -609,7 +614,7 @@ mod tests {
             payloads,
             [
                 format!(
-                    r#"{{"event_type":"order_submitted","payload":{{{id},"symbol":"SPY","side":"buy","shares":2000000}}}}"#
+                    r#"{{"event_type":"order_submitted","payload":{{{id},"symbol":"SPY","side":"buy","shares":5000000}}}}"#
                 ),
                 format!(
                     r#"{{"event_type":"order_closed","payload":{{{id},"ending":"canceled","executed":{{"shares":3000000,"average_price":12500000}},"closed_at":"2026-10-06T14:00:00Z"}}}}"#
