@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, Position, Side};
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
-use crate::common::order::{ClientOrderId, Execution, OrderReport, OrderRequest, Reported};
+use crate::common::order::{
+    ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest, OrderStatus,
+};
 use crate::ingest::FetchError;
 use crate::ingest::alpaca::Alpaca;
 use crate::ingest::retry::{Outcome, send, with_retries};
@@ -241,7 +243,7 @@ fn book(account: &[u8], positions: &[u8]) -> Result<Book, BrokerError> {
 
 fn broker_order(body: &[u8]) -> Result<BrokerOrder, BrokerError> {
     let payload: OrderPayload = parse(body)?;
-    let reported = reported(&payload.status)?;
+    let status = order_status(&payload.status)?;
     let filled = decimal(&payload.filled_qty, SHARE_DIGITS, "filled_qty")?;
     let filled = u64::try_from(filled).map_err(|_| BrokerError::Malformed {
         field: "filled_qty",
@@ -264,17 +266,17 @@ fn broker_order(body: &[u8]) -> Result<BrokerOrder, BrokerError> {
                     field: "filled_avg_price",
                     raw: raw.clone(),
                 })?;
-            Execution::new(Shares::from_units(filled), price)
+            OrderExecution::new(Shares::from_units(filled), price)
         }
     };
     Ok(BrokerOrder {
         id: payload.id,
-        report: OrderReport::new(reported, executed, payload.updated_at),
+        report: OrderReport::new(status, executed, payload.updated_at),
     })
 }
 
 /// Alpaca's statuses, collapsed; `replaced` and anything unlisted is refused, since this client never replaces.
-fn reported(status: &str) -> Result<Reported, BrokerError> {
+fn order_status(status: &str) -> Result<OrderStatus, BrokerError> {
     match status {
         "new"
         | "accepted"
@@ -286,11 +288,11 @@ fn reported(status: &str) -> Result<Reported, BrokerError> {
         | "calculated"
         | "stopped"
         | "suspended"
-        | "held" => Ok(Reported::Open),
-        "filled" => Ok(Reported::Filled),
-        "canceled" => Ok(Reported::Canceled),
-        "expired" | "done_for_day" => Ok(Reported::Expired),
-        "rejected" => Ok(Reported::Rejected),
+        | "held" => Ok(OrderStatus::Open),
+        "filled" => Ok(OrderStatus::Closed(OrderEnding::Filled)),
+        "canceled" => Ok(OrderStatus::Closed(OrderEnding::Canceled)),
+        "expired" | "done_for_day" => Ok(OrderStatus::Closed(OrderEnding::Expired)),
+        "rejected" => Ok(OrderStatus::Closed(OrderEnding::Rejected)),
         unknown => Err(BrokerError::UnknownStatus {
             status: unknown.to_string(),
         }),
@@ -396,7 +398,7 @@ mod tests {
         assert_eq!(
             canceled.report(),
             OrderReport::new(
-                Reported::Canceled,
+                OrderStatus::Closed(OrderEnding::Canceled),
                 None,
                 "2026-09-25T14:59:42.110148Z".parse().unwrap()
             )
@@ -405,8 +407,8 @@ mod tests {
         assert_eq!(
             filled.report(),
             OrderReport::new(
-                Reported::Filled,
-                Execution::new(
+                OrderStatus::Closed(OrderEnding::Filled),
+                OrderExecution::new(
                     Shares::whole(26).unwrap(),
                     Price::from_ticks(37_890_000).unwrap()
                 ),
@@ -440,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_every_status_maps_or_is_refused() {
-        let mapped: Vec<(&str, Reported)> = [
+        let mapped: Vec<(&str, OrderStatus)> = [
             "new",
             "accepted",
             "pending_new",
@@ -459,21 +461,21 @@ mod tests {
             "rejected",
         ]
         .into_iter()
-        .map(|status| (status, reported(status).unwrap()))
-        .filter(|(_, reported)| *reported != Reported::Open)
+        .map(|status| (status, order_status(status).unwrap()))
+        .filter(|(_, status)| *status != OrderStatus::Open)
         .collect();
         assert_eq!(
             mapped,
             [
-                ("filled", Reported::Filled),
-                ("canceled", Reported::Canceled),
-                ("expired", Reported::Expired),
-                ("done_for_day", Reported::Expired),
-                ("rejected", Reported::Rejected),
+                ("filled", OrderStatus::Closed(OrderEnding::Filled)),
+                ("canceled", OrderStatus::Closed(OrderEnding::Canceled)),
+                ("expired", OrderStatus::Closed(OrderEnding::Expired)),
+                ("done_for_day", OrderStatus::Closed(OrderEnding::Expired)),
+                ("rejected", OrderStatus::Closed(OrderEnding::Rejected)),
             ]
         );
         assert!(
-            matches!(reported("replaced"), Err(BrokerError::UnknownStatus { status }) if status == "replaced")
+            matches!(order_status("replaced"), Err(BrokerError::UnknownStatus { status }) if status == "replaced")
         );
     }
 
@@ -573,14 +575,12 @@ mod tests {
         let cancel = account.cancel(read.id()).await.unwrap();
         let mut last = account.order(id).await.unwrap();
         for _ in 0..20 {
-            match last.report().reported() {
-                Reported::Open => {
+            match last.report().status() {
+                OrderStatus::Open => {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     last = account.order(id).await.unwrap();
                 }
-                Reported::Filled | Reported::Canceled | Reported::Expired | Reported::Rejected => {
-                    break;
-                }
+                OrderStatus::Closed(_) => break,
             }
         }
         let state = [submitted.report(), read.report(), last.report()]
@@ -590,12 +590,9 @@ mod tests {
             })
             .unwrap();
         println!("cancel {cancel:?}, closed as {state:?}");
-        match state {
-            OrderState::Closed { executed: None, .. } => {}
-            OrderState::Closed {
-                executed: Some(_), ..
-            }
-            | OrderState::Working { .. } => {
+        match (state.closed(), state.executed()) {
+            (Some(_), None) => {}
+            (Some(_), Some(_)) | (None, _) => {
                 panic!(
                     "the order did not close unfilled: {state:?}; flatten SPY on the paper account by hand"
                 )

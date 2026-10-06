@@ -128,8 +128,8 @@ impl OrderReport {
         }
     }
 
-    pub fn reported(self) -> Reported {
-        self.reported
+    pub fn status(self) -> OrderStatus {
+        self.status
     }
 }
 
