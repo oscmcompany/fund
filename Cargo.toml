@@ -30,6 +30,10 @@ chrono-tz = "0.10"
 # Reads the vendor's raw flat files, which are gzipped CSV.
 csv = "1.4.0"
 flate2 = "1.1"
+futures-util = { version = "0.3.34", default-features = false, features = [
+  "sink",
+  "std",
+] }
 # `zstd` reads only the legacy archiver's files; archive task A6 removes it with the legacy reader.
 parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",
@@ -51,6 +55,10 @@ tokio = { version = "1.53.1", features = [
   "rt-multi-thread",
   "sync",
   "time",
+] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
+  "connect",
+  "rustls-tls-webpki-roots",
 ] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
