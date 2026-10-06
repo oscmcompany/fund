@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::common::guard::OrderGuarded;
 use crate::common::heal::{Leg, SessionOutcome};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
@@ -185,6 +186,7 @@ pub enum Observation {
     OrderClosed(OrderClosed),
     OrderRefused(OrderRefused),
     OrderUnresolved(OrderUnresolved),
+    OrderGuarded(OrderGuarded),
 }
 
 impl Observation {
@@ -562,6 +564,7 @@ mod tests {
     #[test]
     fn test_the_order_records_encode_to_their_wire_format() {
         use crate::common::book::Book;
+        use crate::common::guard::{Tradability, guard};
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
             ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
@@ -588,6 +591,13 @@ mod tests {
                 ),
             )
             .unwrap();
+        let fraction = Target::new(BTreeMap::from([(
+            Symbol::new("VWDRY").unwrap(),
+            Shares::from_units(1_500_000),
+        )]));
+        let whole_only =
+            BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]);
+        let guarded = guard(orders(&Book::default(), &fraction), &whole_only).held()[0].clone();
         let observations = [
             Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id))),
             Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
@@ -604,6 +614,7 @@ mod tests {
                     Price::from_ticks(12_400_000).unwrap(),
                 ),
             )),
+            Observation::OrderGuarded(guarded),
         ];
         let payloads: Vec<String> = observations
             .iter()
@@ -625,6 +636,7 @@ mod tests {
                 format!(
                     r#"{{"event_type":"order_unresolved","payload":{{{id},"cause":"cancel failed","executed":{{"shares":500000,"average_price":12400000}}}}}}"#
                 ),
+                r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {
