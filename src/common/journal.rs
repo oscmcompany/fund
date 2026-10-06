@@ -14,6 +14,7 @@ use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
 use crate::common::order::{OrderClosed, OrderRefused, OrderSubmitted, OrderUnresolved};
 use crate::common::parameter::Parameter;
+use crate::common::reconcile::BookReconciled;
 use crate::common::time::SessionDate;
 
 /// Stamped on every record this build writes; it only goes up, and a reader maps old versions forward.
@@ -188,6 +189,7 @@ pub enum Observation {
     OrderUnresolved(OrderUnresolved),
     OrderGuarded(OrderGuarded),
     TradabilityUnread(TradabilityUnread),
+    BookReconciled(BookReconciled),
 }
 
 impl Observation {
@@ -565,12 +567,14 @@ mod tests {
     #[test]
     fn test_the_order_records_encode_to_their_wire_format() {
         use crate::common::book::Book;
+        use crate::common::book::{Cash, Position};
         use crate::common::guard::{Tradability, TradabilityUnread, guard};
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
             ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
             OrderRequest, OrderState, OrderStatus, OrderUnresolved,
         };
+        use crate::common::reconcile::reconcile;
         use crate::common::strategy::{Target, orders};
 
         let id = ClientOrderId::new(RunId::new(Uuid::from_u128(2)), 7);
@@ -617,6 +621,17 @@ mod tests {
             )),
             Observation::OrderGuarded(guarded),
             Observation::TradabilityUnread(TradabilityUnread::new("timed out".to_string())),
+            Observation::BookReconciled(reconcile(
+                &Book::reported(Cash::from_units(1_000), []),
+                &Book::reported(
+                    Cash::from_units(-5),
+                    [(
+                        Symbol::new("SPY").unwrap(),
+                        Position::from_units(-2_000_000),
+                    )],
+                ),
+                Cash::from_units(10),
+            )),
         ];
         let payloads: Vec<String> = observations
             .iter()
@@ -640,6 +655,7 @@ mod tests {
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":"timed out"}}"#.to_string(),
+                r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"10","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {

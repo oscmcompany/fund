@@ -9,14 +9,15 @@ use tokio::time::Instant;
 
 use crate::broker::Broker;
 use crate::broker::alpaca::BrokerError;
-use crate::common::book::{Book, Fill};
+use crate::common::book::{Book, Cash, Fill};
 use crate::common::guard::{GuardCause, TradabilityUnread, guard};
 use crate::common::journal::Observation;
-use crate::common::market::Symbol;
+use crate::common::market::{Shares, Symbol};
 use crate::common::order::{
     ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest, OrderState,
     OrderSubmitted, OrderUnresolved,
 };
+use crate::common::reconcile::{BookReconciled, reconcile};
 use crate::common::strategy::{Target, orders};
 use crate::ingest::FetchError;
 use crate::journal::Journal;
@@ -139,6 +140,74 @@ pub async fn execute(
     Ok(outcomes)
 }
 
+/// Why reconciliation stopped: the broker's book could not be read, or the journal refused a write.
+#[derive(Debug)]
+pub enum ReconcileFailed {
+    Unread(BrokerError),
+    Journal(JournalFailed),
+}
+
+/// What reconciliation found, the orders that closed what the journal did not expect, and the broker's book after
+/// them, which is the book to trade from.
+#[derive(Debug)]
+pub struct Reconciliation {
+    pub reading: BookReconciled,
+    pub closing: Vec<OrderOutcome>,
+    pub book: Book,
+}
+
+/// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge closes
+/// every short and every position the journal expected none of, keeping the rest at the broker's count; the caller
+/// refuses further trading on a divergence.
+pub async fn reconcile_and_close(
+    broker: &impl Broker,
+    journal: &mut Journal,
+    next_sequence: &mut u32,
+    expected: &Book,
+    allowance: Cash,
+    patience: Patience,
+) -> Result<Reconciliation, ReconcileFailed> {
+    let reported = broker.book().await.map_err(ReconcileFailed::Unread)?;
+    let reading = reconcile(expected, &reported, allowance);
+    journal
+        .append(Utc::now(), Observation::BookReconciled(reading.clone()))
+        .map_err(|error| {
+            ReconcileFailed::Journal(JournalFailed {
+                outcomes: Vec::new(),
+                error,
+            })
+        })?;
+    if reading.agrees() {
+        return Ok(Reconciliation {
+            reading,
+            closing: Vec::new(),
+            book: reported,
+        });
+    }
+    // Kept only where the journal expected a holding and the broker reports a long one; a short is never ours.
+    let kept = Target::new(
+        reported
+            .positions()
+            .iter()
+            .filter(|(symbol, _)| expected.position(symbol).units() != 0)
+            .filter_map(|(symbol, position)| {
+                u64::try_from(position.units())
+                    .ok()
+                    .map(|units| (symbol.clone(), Shares::from_units(units)))
+            })
+            .collect(),
+    );
+    let closing = execute(broker, journal, next_sequence, &reported, &kept, patience)
+        .await
+        .map_err(ReconcileFailed::Journal)?;
+    let book = broker.book().await.map_err(ReconcileFailed::Unread)?;
+    Ok(Reconciliation {
+        reading,
+        closing,
+        book,
+    })
+}
+
 /// Submits one order and follows it to its close, returning what to journal and its outcome. Once the order is found,
 /// a failed read, failed cancel or refused report spends its patience, so it is canceled and read back.
 async fn follow(
@@ -235,6 +304,7 @@ mod tests {
 
     use super::*;
     use crate::broker::alpaca::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
+    use crate::common::book::{Position, Side};
     use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::{Price, Shares, Symbol};
@@ -259,6 +329,8 @@ mod tests {
         /// The tradability reported, every symbol tradable in any amount when `None`.
         readings: Option<BTreeMap<Symbol, Tradability>>,
         tradability_fails: bool,
+        /// The books reported, the last repeating.
+        books: Mutex<VecDeque<Book>>,
         calls: Mutex<Vec<&'static str>>,
     }
 
@@ -271,6 +343,7 @@ mod tests {
                 submit_takes: Duration::ZERO,
                 readings: None,
                 tradability_fails: false,
+                books: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -340,6 +413,16 @@ mod tests {
                 })),
                 false => Ok(Cancel::Requested),
             }
+        }
+
+        async fn book(&self) -> Result<Book, BrokerError> {
+            self.calls.lock().unwrap().push("book");
+            let mut books = self.books.lock().unwrap();
+            Ok(match books.len() {
+                0 => panic!("the script has no book"),
+                1 => books[0].clone(),
+                _ => books.pop_front().unwrap(),
+            })
         }
 
         async fn tradability(
@@ -706,6 +789,107 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    fn holding(cash: i128, positions: &[(&str, i128)]) -> Book {
+        Book::reported(
+            Cash::from_units(cash),
+            positions
+                .iter()
+                .map(|(raw, units)| (Symbol::new(raw).unwrap(), Position::from_units(*units))),
+        )
+    }
+
+    /// Books that agree are journaled as reconciled and nothing is sent.
+    #[tokio::test(start_paused = true)]
+    async fn test_agreeing_books_are_journaled_and_left_alone() {
+        let broker = Scripted::new(&[], &[]);
+        let book = holding(1_000, &[("SPY", 1_000_000)]);
+        *broker.books.lock().unwrap() = VecDeque::from([book.clone()]);
+        let (reconciliation, events) = reconciling(&broker, &book).await;
+        assert!(reconciliation.reading.agrees());
+        assert!(reconciliation.closing.is_empty());
+        assert_eq!(reconciliation.book, book);
+        assert_eq!(broker.calls(), ["book"]);
+        assert_eq!(events, ["book_reconciled"]);
+    }
+
+    /// The broker holds AAPL the journal never bought, a QQQ short where it expected a long, and more SPY than it
+    /// expected: AAPL is sold, QQQ bought back, SPY kept at the broker's count, and the book returned is the broker's
+    /// after the close.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_divergence_closes_what_the_journal_did_not_expect() {
+        let broker = Scripted::new(&[Answer::Stands(FILLED, 1), Answer::Stands(FILLED, 1)], &[]);
+        let expected = holding(1_000, &[("QQQ", 1_000_000), ("SPY", 1_000_000)]);
+        let reported = holding(
+            1_000,
+            &[("AAPL", 1_000_000), ("QQQ", -1_000_000), ("SPY", 2_000_000)],
+        );
+        let after = holding(1_100, &[("SPY", 2_000_000)]);
+        *broker.books.lock().unwrap() = VecDeque::from([reported, after.clone()]);
+        let (reconciliation, events) = reconciling(&broker, &expected).await;
+        assert!(!reconciliation.reading.agrees());
+        let gaps: Vec<&str> = reconciliation
+            .reading
+            .gaps()
+            .iter()
+            .map(|gap| gap.symbol().as_str())
+            .collect();
+        assert_eq!(gaps, ["AAPL", "QQQ", "SPY"]);
+        let closed: Vec<(&str, Side, u64)> = reconciliation
+            .closing
+            .iter()
+            .filter_map(|outcome| match outcome {
+                OrderOutcome::Closed(Some(fill)) => {
+                    Some((fill.symbol().as_str(), fill.side(), fill.shares().units()))
+                }
+                OrderOutcome::Closed(None)
+                | OrderOutcome::Guarded(_)
+                | OrderOutcome::Refused
+                | OrderOutcome::Unresolved(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            [
+                ("AAPL", Side::Sell, 1_000_000),
+                ("QQQ", Side::Buy, 1_000_000)
+            ]
+        );
+        assert_eq!(reconciliation.book, after);
+        assert_eq!(broker.calls(), ["book", "submit", "submit", "book"]);
+        assert_eq!(
+            events,
+            [
+                "book_reconciled",
+                "order_submitted",
+                "order_closed",
+                "order_submitted",
+                "order_closed"
+            ]
+        );
+    }
+
+    async fn reconciling(
+        broker: &Scripted,
+        expected: &Book,
+    ) -> (Reconciliation, Vec<&'static str>) {
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let mut next_sequence = 0;
+        let reconciliation = reconcile_and_close(
+            broker,
+            &mut journal,
+            &mut next_sequence,
+            expected,
+            Cash::from_units(0),
+            PATIENT,
+        )
+        .await
+        .unwrap();
+        let events = journaled(&directory);
+        std::fs::remove_dir_all(&directory).unwrap();
+        (reconciliation, events)
+    }
+
     /// A journal that cannot record a submission stops the run before anything is sent.
     #[tokio::test(start_paused = true)]
     async fn test_a_journal_that_refuses_a_write_stops_the_run_before_sending() {
@@ -788,7 +972,8 @@ mod tests {
                     | Observation::OrderRefused(_)
                     | Observation::OrderUnresolved(_)
                     | Observation::OrderGuarded(_)
-                    | Observation::TradabilityUnread(_) => None,
+                    | Observation::TradabilityUnread(_)
+                    | Observation::BookReconciled(_) => None,
                 },
                 ReadLine::Unreadable { .. } => None,
             })
