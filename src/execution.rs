@@ -1,6 +1,7 @@
 //! Takes a book to a target at a broker: each order is submitted, followed to its close, canceled when it outlives its
 //! patience, and journaled, and the fills of the orders that closed are handed back for the book.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -9,7 +10,9 @@ use tokio::time::Instant;
 use crate::broker::Broker;
 use crate::broker::alpaca::BrokerError;
 use crate::common::book::{Book, Fill};
+use crate::common::guard::{GuardCause, TradabilityUnread, guard};
 use crate::common::journal::Observation;
+use crate::common::market::Symbol;
 use crate::common::order::{
     ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest, OrderState,
     OrderSubmitted, OrderUnresolved,
@@ -58,10 +61,11 @@ impl Waiting {
     }
 }
 
-/// What became of each order: closed (its fill, if it executed), refused by the broker, or unresolved with the last
-/// execution read before its end was lost.
+/// What became of each order: held back by the guard, closed (its fill, if it executed), refused by the broker, or
+/// unresolved with the last execution read before its end was lost.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderOutcome {
+    Guarded(GuardCause),
     Closed(Option<Fill>),
     Refused,
     Unresolved(Option<OrderExecution>),
@@ -75,9 +79,10 @@ pub struct JournalFailed {
     pub error: std::io::Error,
 }
 
-/// Sends the orders that take `book` to `target`, one at a time, sells first, journaling each under the journal's
-/// run, and stops after an unresolved order so none overlaps it; `next_sequence` is advanced past every id drawn, so a
-/// later call on the same counter cannot repeat one.
+/// Sends the orders that take `book` to `target` that the broker's tradability vouches for, one at a time, sells
+/// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
+/// overlaps it; `next_sequence` is advanced past every id drawn, so a later call on the same counter cannot repeat one.
+/// A failed tradability read is journaled with its cause and vouches for nothing, so every order is held as unread.
 pub async fn execute(
     broker: &impl Broker,
     journal: &mut Journal,
@@ -87,7 +92,26 @@ pub async fn execute(
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailed> {
     let mut outcomes = Vec::new();
-    for order in orders(book, target) {
+    let orders = orders(book, target);
+    let symbols: Vec<Symbol> = orders.iter().map(|order| order.symbol().clone()).collect();
+    let tradability = match broker.tradability(&symbols).await {
+        Ok(tradability) => tradability,
+        Err(error) => {
+            let unread = TradabilityUnread::new(error.to_string());
+            if let Err(error) = journal.append(Utc::now(), Observation::TradabilityUnread(unread)) {
+                return Err(JournalFailed { outcomes, error });
+            }
+            BTreeMap::new()
+        }
+    };
+    let guarded = guard(orders, &tradability);
+    for held in guarded.held() {
+        outcomes.push(OrderOutcome::Guarded(held.cause()));
+        if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held.clone())) {
+            return Err(JournalFailed { outcomes, error });
+        }
+    }
+    for order in guarded.passed().iter().cloned() {
         let sequence = *next_sequence;
         *next_sequence = sequence
             .checked_add(1)
@@ -101,7 +125,7 @@ pub async fn execute(
         }
         let (observation, outcome) = follow(broker, &request, patience).await;
         let stop = match outcome {
-            OrderOutcome::Closed(_) | OrderOutcome::Refused => false,
+            OrderOutcome::Guarded(_) | OrderOutcome::Closed(_) | OrderOutcome::Refused => false,
             OrderOutcome::Unresolved(_) => true,
         };
         outcomes.push(outcome);
@@ -211,6 +235,7 @@ mod tests {
 
     use super::*;
     use crate::broker::alpaca::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
+    use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::{Price, Shares, Symbol};
     use crate::common::order::{OrderEnding, OrderReport, OrderStatus};
@@ -231,6 +256,9 @@ mod tests {
         reads: Mutex<VecDeque<Answer>>,
         cancel_fails: bool,
         submit_takes: Duration,
+        /// The tradability reported, every symbol tradable in any amount when `None`.
+        readings: Option<BTreeMap<Symbol, Tradability>>,
+        tradability_fails: bool,
         calls: Mutex<Vec<&'static str>>,
     }
 
@@ -241,12 +269,20 @@ mod tests {
                 reads: Mutex::new(reads.iter().copied().collect()),
                 cancel_fails: false,
                 submit_takes: Duration::ZERO,
+                readings: None,
+                tradability_fails: false,
                 calls: Mutex::new(Vec::new()),
             }
         }
 
+        /// The order calls made, leaving out the tradability read that precedes them.
         fn calls(&self) -> Vec<&'static str> {
-            self.calls.lock().unwrap().clone()
+            let calls = self.calls.lock().unwrap();
+            calls
+                .iter()
+                .copied()
+                .filter(|call| *call != "tradability")
+                .collect()
         }
 
         fn answer(answer: Answer) -> Result<BrokerOrder, BrokerError> {
@@ -304,6 +340,28 @@ mod tests {
                 })),
                 false => Ok(Cancel::Requested),
             }
+        }
+
+        async fn tradability(
+            &self,
+            symbols: &[Symbol],
+        ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
+            self.calls.lock().unwrap().push("tradability");
+            if self.tradability_fails {
+                return Err(BrokerError::Fetch(FetchError::Exhausted {
+                    attempts: 3,
+                    last: "timed out".to_string(),
+                }));
+            }
+            let reading = |symbol: &Symbol| {
+                self.readings
+                    .as_ref()
+                    .map_or(Tradability::Fractionable, |readings| readings[symbol])
+            };
+            Ok(symbols
+                .iter()
+                .map(|symbol| (symbol.clone(), reading(symbol)))
+                .collect())
         }
     }
 
@@ -377,7 +435,7 @@ mod tests {
             OrderOutcome::Closed(fill) => {
                 fill.as_ref().map(|fill| fill.shares().units() / 1_000_000)
             }
-            OrderOutcome::Refused | OrderOutcome::Unresolved(_) => None,
+            OrderOutcome::Guarded(_) | OrderOutcome::Refused | OrderOutcome::Unresolved(_) => None,
         }
     }
 
@@ -573,6 +631,81 @@ mod tests {
         assert_eq!(events, ["order_submitted", "order_unresolved"]);
     }
 
+    /// The guard's holds are journaled before any order goes out, and only the vouched-for order is sent.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_guarded_order_is_journaled_and_never_sent() {
+        let broker = Scripted::new(&[Answer::Stands(FILLED, 1)], &[]);
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let mut broker = broker;
+        broker.readings = Some(BTreeMap::from([
+            (Symbol::new("AAPL").unwrap(), Tradability::Untradable),
+            (Symbol::new("SPY").unwrap(), Tradability::Fractionable),
+        ]));
+        let mut next_sequence = 0;
+        let outcomes = execute(
+            &broker,
+            &mut journal,
+            &mut next_sequence,
+            &Book::default(),
+            &buying(&["AAPL", "SPY"], 1),
+            PATIENT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0], OrderOutcome::Guarded(GuardCause::Untradable));
+        assert_eq!(shares_filled(&outcomes[1]), Some(1));
+        assert_eq!(broker.calls(), ["submit"]);
+        assert_eq!(next_sequence, 1);
+        assert_eq!(
+            journaled(&directory),
+            ["order_guarded", "order_submitted", "order_closed"]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A tradability read that fails vouches for nothing, so every order is held as unread and none is sent.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_tradability_read_holds_every_order() {
+        let mut broker = Scripted::new(&[], &[]);
+        broker.tradability_fails = true;
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let mut next_sequence = 0;
+        let outcomes = execute(
+            &broker,
+            &mut journal,
+            &mut next_sequence,
+            &Book::default(),
+            &buying(&["AAPL", "SPY"], 1),
+            PATIENT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcomes,
+            [
+                OrderOutcome::Guarded(GuardCause::Unread),
+                OrderOutcome::Guarded(GuardCause::Unread)
+            ]
+        );
+        assert_eq!(broker.calls(), Vec::<&str>::new());
+        assert_eq!(
+            journaled(&directory),
+            ["tradability_unread", "order_guarded", "order_guarded"]
+        );
+        let unread = match &journal_lines(&directory)[0] {
+            ReadLine::Read(record) => serde_json::to_value(record.observation()).unwrap(),
+            ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
+        };
+        assert_eq!(
+            unread["payload"]["cause"],
+            "still failing after 3 attempts: timed out"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A journal that cannot record a submission stops the run before anything is sent.
     #[tokio::test(start_paused = true)]
     async fn test_a_journal_that_refuses_a_write_stops_the_run_before_sending() {
@@ -653,7 +786,9 @@ mod tests {
                     | Observation::ExperimentRan(_)
                     | Observation::OrderSubmitted(_)
                     | Observation::OrderRefused(_)
-                    | Observation::OrderUnresolved(_) => None,
+                    | Observation::OrderUnresolved(_)
+                    | Observation::OrderGuarded(_)
+                    | Observation::TradabilityUnread(_) => None,
                 },
                 ReadLine::Unreadable { .. } => None,
             })

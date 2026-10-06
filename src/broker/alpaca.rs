@@ -1,12 +1,15 @@
 //! Alpaca's paper trading API: the account and positions as a `Book`, and orders submitted, read back by their client
 //! order id and canceled. Refused for keys that trade live, so nothing here can reach real money.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::Broker;
 use crate::common::book::{Book, Cash, Position, Side};
+use crate::common::guard::Tradability;
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::order::{
     ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest, OrderStatus,
@@ -129,6 +132,13 @@ struct PositionPayload {
 }
 
 #[derive(Deserialize)]
+struct AssetPayload {
+    status: String,
+    tradable: bool,
+    fractionable: bool,
+}
+
+#[derive(Deserialize)]
 struct OrderPayload {
     id: BrokerOrderId,
     status: String,
@@ -217,6 +227,20 @@ impl Broker for PaperAccount {
         let path = format!("/v2/orders/{}", id.0);
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
     }
+
+    /// What Alpaca reports of each symbol's trading, one asset read apiece.
+    async fn tradability(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
+        let mut readings = BTreeMap::new();
+        for symbol in symbols {
+            let path = format!("/v2/assets/{}", symbol.as_str());
+            let outcome = with_retries(|| send(self.alpaca.trading(Method::GET, &path))).await;
+            readings.insert(symbol.clone(), asset(outcome)?);
+        }
+        Ok(readings)
+    }
 }
 
 /// A submission's one attempt as an order, or as `Unanswered` when it may have landed unseen, which includes an
@@ -237,6 +261,31 @@ fn canceled(outcome: Result<Vec<u8>, FetchError>) -> Result<Cancel, BrokerError>
         Ok(_) => Ok(Cancel::Requested),
         Err(FetchError::Refused { status: 422, .. }) => Ok(Cancel::NotCancelable),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// An asset read as a reading; a 404 is Alpaca's answer for a symbol it does not list.
+fn asset(outcome: Result<Vec<u8>, FetchError>) -> Result<Tradability, BrokerError> {
+    let body = match outcome {
+        Ok(body) => body,
+        Err(FetchError::Refused { status: 404, .. }) => return Ok(Tradability::Unlisted),
+        Err(error) => return Err(error.into()),
+    };
+    let payload: AssetPayload = parse(&body)?;
+    match (
+        payload.status.as_str(),
+        payload.tradable,
+        payload.fractionable,
+    ) {
+        ("active", true, true) => Ok(Tradability::Fractionable),
+        ("active", true, false) => Ok(Tradability::WholeSharesOnly),
+        ("active", false, true | false) | ("inactive", true | false, true | false) => {
+            Ok(Tradability::Untradable)
+        }
+        (status, true | false, true | false) => Err(BrokerError::Malformed {
+            field: "status",
+            raw: status.to_string(),
+        }),
     }
 }
 
@@ -530,6 +579,52 @@ mod tests {
         assert!(
             matches!(order_status("replaced"), Err(BrokerError::UnknownStatus { status }) if status == "replaced")
         );
+    }
+
+    /// Assets as the paper account returned them on 2026-10-06, trimmed to the fields read and two beside, and its
+    /// 404 for a symbol it does not list.
+    #[test]
+    fn test_assets_read_as_the_paper_account_sends_them() {
+        let read = |body: &str| asset(Ok(body.as_bytes().to_vec())).unwrap();
+        assert_eq!(
+            read(
+                r#"{"symbol":"SPY","status":"active","tradable":true,"fractionable":true,"shortable":true}"#
+            ),
+            Tradability::Fractionable
+        );
+        assert_eq!(
+            read(
+                r#"{"symbol":"VWDRY","status":"active","tradable":true,"fractionable":false,"shortable":true}"#
+            ),
+            Tradability::WholeSharesOnly
+        );
+        assert_eq!(
+            read(
+                r#"{"symbol":"SSUNF","status":"active","tradable":false,"fractionable":false,"shortable":false}"#
+            ),
+            Tradability::Untradable
+        );
+        assert_eq!(
+            read(
+                r#"{"symbol":"DDG","status":"inactive","tradable":false,"fractionable":true,"shortable":false}"#
+            ),
+            Tradability::Untradable
+        );
+        let refused = |status| {
+            asset(Err(FetchError::Refused {
+                status,
+                body: r#"{"code":40410000,"message":"asset not found for NOSUCHSYM"}"#.to_string(),
+            }))
+        };
+        assert_eq!(refused(404).unwrap(), Tradability::Unlisted);
+        assert!(matches!(
+            refused(403),
+            Err(BrokerError::Fetch(FetchError::Refused { status: 403, .. }))
+        ));
+        assert!(matches!(
+            asset(Ok(br#"{"status":"delisted","tradable":false,"fractionable":false}"#.to_vec())),
+            Err(BrokerError::Malformed { field: "status", raw }) if raw == "delisted"
+        ));
     }
 
     #[test]

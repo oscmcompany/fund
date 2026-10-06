@@ -1,6 +1,7 @@
 //! Pure domain code shared by every host.
 
 pub mod book;
+pub mod guard;
 pub mod heal;
 pub mod journal;
 pub mod laboratory;
