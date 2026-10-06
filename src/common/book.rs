@@ -51,6 +51,10 @@ impl Monoid for Cash {
 pub struct Position(i128);
 
 impl Position {
+    pub fn from_units(units: i128) -> Self {
+        Self(units)
+    }
+
     pub fn units(self) -> i128 {
         self.0
     }
@@ -66,7 +70,8 @@ pub enum Side {
     Sell,
 }
 
-/// One execution: `shares` of `symbol` at `price`, against the bar stamped `filled_against`, charged `cost`.
+/// One execution: `shares` of `symbol` at `price`, charged `cost`, stamped `filled_against`: the bar it filled at in a
+/// replay, or the broker's closing report of the order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fill {
     filled_against: DateTime<Utc>,
@@ -159,6 +164,23 @@ impl Book {
             cash,
             positions: BTreeMap::new(),
         }
+    }
+
+    /// The book a broker reports holding, combined from one book per position, so a symbol reported twice is summed
+    /// and a zero position is dropped like any other book's.
+    pub fn reported(cash: Cash, positions: impl IntoIterator<Item = (Symbol, Position)>) -> Self {
+        positions.into_iter().fold(
+            Self {
+                cash,
+                positions: BTreeMap::new(),
+            },
+            |book, (symbol, position)| {
+                book.combine(Self {
+                    cash: Cash::empty(),
+                    positions: BTreeMap::from([(symbol, position)]),
+                })
+            },
+        )
     }
 
     /// The change one fill makes, so a book after fills is `funded(cash)` combined with each fill's `of`.
@@ -330,6 +352,25 @@ mod tests {
                 notional: DollarVolume::from_units(6),
             })
         );
+    }
+
+    #[test]
+    fn test_a_reported_book_sums_repeats_and_drops_zeros() {
+        let book = Book::reported(
+            Cash::from_units(5),
+            [
+                (symbol("AAPL"), Position::from_units(2)),
+                (symbol("AAPL"), Position::from_units(3)),
+                (symbol("MSFT"), Position::from_units(0)),
+            ],
+        );
+        let positions: Vec<_> = book
+            .positions()
+            .iter()
+            .map(|(symbol, position)| (symbol.as_str(), position.units()))
+            .collect();
+        assert_eq!(positions, [("AAPL", 5)]);
+        assert_eq!(book.cash(), Cash::from_units(5));
     }
 
     #[test]
