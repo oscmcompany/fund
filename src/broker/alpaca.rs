@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
+use crate::broker::Broker;
 use crate::common::book::{Book, Cash, Position, Side};
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::order::{
@@ -32,11 +33,25 @@ pub struct PaperAccount {
 #[serde(transparent)]
 pub struct BrokerOrderId(String);
 
+#[cfg(test)]
+impl BrokerOrderId {
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+}
+
 /// An order as Alpaca reports it: its id there and where it stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerOrder {
     id: BrokerOrderId,
     report: OrderReport,
+}
+
+#[cfg(test)]
+impl BrokerOrder {
+    pub fn new(id: BrokerOrderId, report: OrderReport) -> Self {
+        Self { id, report }
+    }
 }
 
 impl BrokerOrder {
@@ -150,9 +165,15 @@ impl PaperAccount {
         )
     }
 
+    async fn get(&self, path: &str) -> Result<Vec<u8>, BrokerError> {
+        Ok(with_retries(|| send(self.alpaca.trading(Method::GET, path))).await?)
+    }
+}
+
+impl Broker for PaperAccount {
     /// Sends `request` once as a market order for the day. Never retried: a lost response is answered by reading the
     /// order back by its client order id, and a resend under the same id is refused by Alpaca as a duplicate.
-    pub async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
+    async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
         let order = request.order();
         let body = OrderBody {
             symbol: order.symbol().as_str(),
@@ -178,7 +199,7 @@ impl PaperAccount {
     }
 
     /// The order sent under `id`, read through transient failures.
-    pub async fn order(&self, id: ClientOrderId) -> Result<BrokerOrder, BrokerError> {
+    async fn order(&self, id: ClientOrderId) -> Result<BrokerOrder, BrokerError> {
         let raw = id.to_string();
         let body = with_retries(|| {
             send(
@@ -192,13 +213,9 @@ impl PaperAccount {
     }
 
     /// Asks Alpaca to cancel `id`; a 422 means the order is past canceling, which is not proof it has closed.
-    pub async fn cancel(&self, id: &BrokerOrderId) -> Result<Cancel, BrokerError> {
+    async fn cancel(&self, id: &BrokerOrderId) -> Result<Cancel, BrokerError> {
         let path = format!("/v2/orders/{}", id.0);
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
-    }
-
-    async fn get(&self, path: &str) -> Result<Vec<u8>, BrokerError> {
-        Ok(with_retries(|| send(self.alpaca.trading(Method::GET, path))).await?)
     }
 }
 

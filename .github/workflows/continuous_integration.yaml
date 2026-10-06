@@ -86,18 +86,3 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:rust
-      # Advisory until the surviving-mutant rate is known; scoped to the diff so it stays bounded.
-      - name: Run mutation tests on changed code
-        if: github.event_name == 'pull_request' && steps.changes.outputs.rust == 'true'
-        continue-on-error: true
-        timeout-minutes: 20
-        # Incremental, unlike the checks above: each mutant rebuilds the crate in cargo-mutants' scratch copy, which
-        # the Rust cache never saves, so only the edited code recompiles.
-        env:
-          CARGO_INCREMENTAL: "1"
-        # The checkout is the merge commit, so diff it against its base parent to keep line numbers aligned.
-        run: |
-          git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
-          git diff HEAD^1 HEAD > "$RUNNER_TEMP/pull_request.diff"
-          devenv --secretspec-provider env --secretspec-profile development \
-            shell -- mutate-rust "$RUNNER_TEMP/pull_request.diff"

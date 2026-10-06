@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod broker;
 pub mod common;
+pub mod execution;
 pub mod heal;
 pub mod ingest;
 pub mod journal;

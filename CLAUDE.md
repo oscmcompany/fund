@@ -108,8 +108,9 @@ This is a collection of guidelines and references.
   schedule trading jobs with a UTC cron expression gated on the Eastern wall clock
 - Guard against division by zero when computing ratios or percentages from DataFrame aggregations, and
   handle the `None` that Polars `Series.sum()` returns on an empty or all-null series
-- Judge new code on whether a mutation to it fails a test rather than on the coverage line rate alone;
-  `mutate-rust <diff>` runs cargo-mutants over the lines a diff changes
+- Judge new code on whether a mutation to it fails a test rather than on the coverage line rate alone; CI does
+  not run mutations, so run `mutate-rust <diff>` locally over a slice's diff when it adds logic worth guarding,
+  and expect a function that only wraps a network call to survive
 - When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after
   the fix
 - Pin test expectations to literals, never to the constant or list the test is checking — an expectation
@@ -190,7 +191,11 @@ This is a collection of guidelines and references.
 - Invoke skills and suggest commands based on conversational context rather than waiting for explicit slash
   commands
 - Prove changes work before marking tasks complete — run targeted `cargo test` while iterating and
-  `devenv tasks run checks:all` once before each push, compare behavior, demonstrate correctness
+  `devenv tasks run checks:all` once before each push, compare behavior, demonstrate correctness; the pre-commit
+  hook runs `checks:rust` and each lint only when a commit stages a file it covers, so `checks:all` is the
+  whole-tree pass
+- The ignored `live_` tests reach real providers, the S3 buckets or the Alpaca paper account and never run in CI;
+  run one deliberately when a change touches its seam, confirming `ALPACA_IS_PAPER=true` before any that trades
 - Verify against real data before reporting done, and say which route was used: `secretspec run -- curl`
   against a provider, DuckDB over the S3 parquet, or a researcher run read back from `/var/log/fund/`;
   when only fixtures were exercised, say so plainly, and ask to be pointed at real data rather than

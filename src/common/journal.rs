@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::common::heal::{Leg, SessionOutcome};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
+use crate::common::order::{OrderClosed, OrderRefused, OrderSubmitted, OrderUnresolved};
 use crate::common::parameter::Parameter;
 use crate::common::time::SessionDate;
 
@@ -180,6 +181,10 @@ pub enum Observation {
     HealFinished(HealFinished),
     DatasetRead(Box<DatasetRead>),
     ExperimentRan(Box<ExperimentRan>),
+    OrderSubmitted(OrderSubmitted),
+    OrderClosed(OrderClosed),
+    OrderRefused(OrderRefused),
+    OrderUnresolved(OrderUnresolved),
 }
 
 impl Observation {
@@ -551,6 +556,83 @@ mod tests {
                 )
             )
         );
+    }
+
+    /// The order records as the trader writes them, pinned so a rename shows up as a changed wire format.
+    #[test]
+    fn test_the_order_records_encode_to_their_wire_format() {
+        use crate::common::book::Book;
+        use crate::common::market::{Price, Shares};
+        use crate::common::order::{
+            ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
+            OrderRequest, OrderState, OrderStatus, OrderUnresolved,
+        };
+        use crate::common::strategy::{Target, orders};
+
+        let id = ClientOrderId::new(RunId::new(Uuid::from_u128(2)), 7);
+        let target = Target::new(BTreeMap::from([(
+            Symbol::new("SPY").unwrap(),
+            Shares::whole(5).unwrap(),
+        )]));
+        let order = orders(&Book::default(), &target).remove(0);
+        let closed = OrderState::submitted()
+            .observe(
+                &order,
+                OrderReport::new(
+                    OrderStatus::Closed(OrderEnding::Canceled),
+                    OrderExecution::new(
+                        Shares::whole(3).unwrap(),
+                        Price::from_ticks(12_500_000).unwrap(),
+                    ),
+                    "2026-10-06T14:00:00Z".parse().unwrap(),
+                ),
+            )
+            .unwrap();
+        let observations = [
+            Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id))),
+            Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
+            Observation::OrderRefused(OrderRefused::new(
+                id,
+                403,
+                "insufficient buying power".to_string(),
+            )),
+            Observation::OrderUnresolved(OrderUnresolved::new(
+                id,
+                "cancel failed".to_string(),
+                OrderExecution::new(
+                    Shares::from_units(500_000),
+                    Price::from_ticks(12_400_000).unwrap(),
+                ),
+            )),
+        ];
+        let payloads: Vec<String> = observations
+            .iter()
+            .map(|observation| serde_json::to_string(observation).unwrap())
+            .collect();
+        let id = r#""client_order_id":"fund:00000000-0000-0000-0000-000000000002:7""#;
+        assert_eq!(
+            payloads,
+            [
+                format!(
+                    r#"{{"event_type":"order_submitted","payload":{{{id},"symbol":"SPY","side":"buy","shares":5000000}}}}"#
+                ),
+                format!(
+                    r#"{{"event_type":"order_closed","payload":{{{id},"ending":"canceled","executed":{{"shares":3000000,"average_price":12500000}},"closed_at":"2026-10-06T14:00:00Z"}}}}"#
+                ),
+                format!(
+                    r#"{{"event_type":"order_refused","payload":{{{id},"status":403,"body":"insufficient buying power"}}}}"#
+                ),
+                format!(
+                    r#"{{"event_type":"order_unresolved","payload":{{{id},"cause":"cancel failed","executed":{{"shares":500000,"average_price":12400000}}}}}}"#
+                ),
+            ]
+        );
+        for (observation, payload) in observations.iter().zip(&payloads) {
+            assert_eq!(
+                &serde_json::from_str::<Observation>(payload).unwrap(),
+                observation
+            );
+        }
     }
 
     #[test]
