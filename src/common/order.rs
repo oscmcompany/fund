@@ -127,6 +127,10 @@ impl OrderReport {
             at,
         }
     }
+
+    pub fn status(self) -> OrderStatus {
+        self.status
+    }
 }
 
 /// Where an order stands, folded from its reports in the order they were read; only `submitted` and `observe` make

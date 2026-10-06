@@ -195,6 +195,31 @@ impl Alpaca {
         })
     }
 
+    /// A client with no keys whose paper flag reads `is_paper`, for tests that never send a request.
+    #[cfg(test)]
+    pub(crate) fn unkeyed(is_paper: &str) -> Self {
+        Self {
+            http_client: reqwest::Client::new(),
+            key_id: String::new(),
+            secret: String::new(),
+            trading_url: trading_url(is_paper.to_string())
+                .expect("a test passes a valid paper flag"),
+        }
+    }
+
+    /// Whether the keys trade against the paper account.
+    pub(crate) fn is_paper(&self) -> bool {
+        self.trading_url == PAPER_TRADING_URL
+    }
+
+    /// A request to the trading API at `path`, carrying the keys.
+    pub(crate) fn trading(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.http_client
+            .request(method, format!("{}{path}", self.trading_url))
+            .header("APCA-API-KEY-ID", &self.key_id)
+            .header("APCA-API-SECRET-KEY", &self.secret)
+    }
+
     /// The published sessions over `[first, last]`. A row that does not read refuses the whole calendar, since
     /// dropping it would turn a trading day into a holiday that no heal ever owes.
     pub async fn calendar(

@@ -4,7 +4,7 @@
 pub mod alpaca;
 pub mod flat_files;
 pub mod massive;
-mod retry;
+pub(crate) mod retry;
 
 pub use retry::FetchError;
 
