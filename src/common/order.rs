@@ -132,9 +132,13 @@ impl OrderReport {
     }
 }
 
-/// Where an order stands, folded from its reports in the order they were read.
+/// Where an order stands, folded from its reports in the order they were read; only `submitted` and `observe` make
+/// one, so a filled order holds every share of the order it observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderState {
+pub struct OrderState(Stage);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
     Working {
         executed: Option<Execution>,
     },
@@ -155,19 +159,31 @@ pub enum OrderRefusal {
     Overfilled { ordered: Shares, reported: Shares },
     /// The broker reported the order filled short of what was ordered.
     FilledShort { ordered: Shares, reported: Shares },
-    /// A closed order was reported differently afterwards.
-    ChangedAfterClosing { ending: Ending, reported: Reported },
+    /// A closed order was reported differently afterwards: how it closed, beside the report that disagreed.
+    ChangedAfterClosing {
+        ending: Ending,
+        executed: Option<Execution>,
+        report: OrderReport,
+    },
 }
 
 impl OrderState {
     /// A submitted order before any report.
     pub fn submitted() -> Self {
-        Self::Working { executed: None }
+        Self(Stage::Working { executed: None })
     }
 
     pub fn executed(self) -> Option<Execution> {
-        match self {
-            Self::Working { executed } | Self::Closed { executed, .. } => executed,
+        match self.0 {
+            Stage::Working { executed } | Stage::Closed { executed, .. } => executed,
+        }
+    }
+
+    /// How and when the order closed, `None` while it is working.
+    pub fn closed(self) -> Option<(Ending, DateTime<Utc>)> {
+        match self.0 {
+            Stage::Working { .. } => None,
+            Stage::Closed { ending, at, .. } => Some((ending, at)),
         }
     }
 
@@ -189,32 +205,38 @@ impl OrderState {
             Reported::Expired => Some(Ending::Expired),
             Reported::Rejected => Some(Ending::Rejected),
         };
-        match (self, ending) {
+        match (self.0, ending) {
             (
-                Self::Closed {
+                Stage::Closed {
                     ending: closed,
                     executed,
                     ..
                 },
                 Some(ending),
             ) if ending == closed && report.executed == executed => Ok(self),
-            (Self::Closed { ending: closed, .. }, Some(_) | None) => {
-                Err(OrderRefusal::ChangedAfterClosing {
+            (
+                Stage::Closed {
                     ending: closed,
-                    reported: report.reported,
-                })
-            }
-            (Self::Working { .. }, Some(_) | None) if reported < held => {
+                    executed,
+                    ..
+                },
+                Some(_) | None,
+            ) => Err(OrderRefusal::ChangedAfterClosing {
+                ending: closed,
+                executed,
+                report,
+            }),
+            (Stage::Working { .. }, Some(_) | None) if reported < held => {
                 Err(OrderRefusal::ExecutionShrank { held, reported })
             }
-            (Self::Working { .. }, None) => Ok(Self::Working {
+            (Stage::Working { .. }, None) => Ok(Self(Stage::Working {
                 executed: report.executed,
-            }),
-            (Self::Working { .. }, Some(ending)) => Ok(Self::Closed {
+            })),
+            (Stage::Working { .. }, Some(ending)) => Ok(Self(Stage::Closed {
                 ending,
                 executed: report.executed,
                 at: report.at,
-            }),
+            })),
         }
     }
 
@@ -222,9 +244,9 @@ impl OrderState {
     /// the spread is in the price; the regulatory fees on a sale are not modeled and reach only the broker's cash.
     /// `None` while working or when nothing executed.
     pub fn fill(self, order: &Order) -> Option<Fill> {
-        match self {
-            Self::Working { .. } | Self::Closed { executed: None, .. } => None,
-            Self::Closed {
+        match self.0 {
+            Stage::Working { .. } | Stage::Closed { executed: None, .. } => None,
+            Stage::Closed {
                 executed: Some(execution),
                 at,
                 ..
@@ -338,11 +360,8 @@ mod tests {
             assert_eq!(ClientOrderId::parse(foreign), None, "{foreign}");
         }
         let longest = ClientOrderId::new(run, u32::MAX).to_string();
-        assert!(
-            longest.len() <= CLIENT_ORDER_ID_MAXIMUM_LENGTH,
-            "{}",
-            longest.len()
-        );
+        assert_eq!(CLIENT_ORDER_ID_MAXIMUM_LENGTH, 128);
+        assert_eq!(longest.len(), 52);
     }
 
     /// Partly filled, then filled: the fill takes every share at the broker's average, at the closing report's time.
@@ -358,6 +377,8 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(state.closed(), Some((Ending::Filled, instant(2))));
+        assert_eq!(OrderState::submitted().closed(), None);
         let fill = state.fill(&order).unwrap();
         assert_eq!(
             (
@@ -440,13 +461,14 @@ mod tests {
             observe_all(
                 &order,
                 &[
-                    report(Reported::Canceled, None, 0),
+                    report(Reported::Canceled, executed(2, 1), 0),
                     report(Reported::Open, None, 1)
                 ]
             ),
             Err(OrderRefusal::ChangedAfterClosing {
                 ending: Ending::Canceled,
-                reported: Reported::Open
+                executed: executed(2, 1),
+                report: report(Reported::Open, None, 1)
             })
         );
         assert_eq!(
@@ -459,7 +481,8 @@ mod tests {
             ),
             Err(OrderRefusal::ChangedAfterClosing {
                 ending: Ending::Canceled,
-                reported: Reported::Canceled
+                executed: None,
+                report: report(Reported::Canceled, executed(1, 1), 1)
             })
         );
     }
@@ -532,11 +555,7 @@ mod tests {
         fn property_reports_close_once_and_repeat_harmlessly((order, reports) in arbitrary_reports()) {
             let closed = observe_all(&order, &reports).unwrap();
             let last = *reports.last().unwrap();
-            let closed_at = match closed {
-                OrderState::Closed { at, .. } => Some(at),
-                OrderState::Working { .. } => None,
-            };
-            prop_assert_eq!(closed_at, Some(last.at));
+            prop_assert_eq!(closed.closed().map(|(_, at)| at), Some(last.at));
             prop_assert_eq!(closed.executed(), last.executed);
             prop_assert_eq!(closed.observe(&order, last), Ok(closed));
             for (index, latest) in reports.iter().enumerate() {
