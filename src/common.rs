@@ -9,6 +9,7 @@ pub mod monoid;
 pub mod order;
 pub mod parameter;
 pub mod replay;
+pub mod risk;
 pub mod storage;
 pub mod strategy;
 pub mod time;
