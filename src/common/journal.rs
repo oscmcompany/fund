@@ -630,6 +630,17 @@ mod tests {
             BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]);
         let guarded =
             guard(orders(&Book::default(), &fraction), &whole_only, |_| None).held()[0].clone();
+        let sliver = Target::new(BTreeMap::from([(
+            Symbol::new("DIA").unwrap(),
+            Shares::from_units(19),
+        )]));
+        let fractionable =
+            BTreeMap::from([(Symbol::new("DIA").unwrap(), Tradability::Fractionable)]);
+        let below = guard(orders(&Book::default(), &sliver), &fractionable, |_| {
+            Price::from_ticks(470_000_000).ok()
+        })
+        .held()[0]
+            .clone();
         let observations = [
             Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id))),
             Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
@@ -647,6 +658,7 @@ mod tests {
                 ),
             )),
             Observation::OrderGuarded(guarded),
+            Observation::OrderGuarded(below),
             Observation::TradabilityUnread(TradabilityUnread::new("timed out".to_string())),
             Observation::BookReconciled(reconcile(
                 &Book::reported(Cash::from_units(1_000), []),
@@ -716,6 +728,7 @@ mod tests {
                     r#"{{"event_type":"order_unresolved","payload":{{{id},"cause":"cancel failed","executed":{{"shares":500000,"average_price":12400000}}}}}}"#
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
+                r#"{"event_type":"order_guarded","payload":{"symbol":"DIA","side":"buy","shares":19,"cause":{"below_minimum":{"price":470000000}}}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":"timed out"}}"#.to_string(),
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),

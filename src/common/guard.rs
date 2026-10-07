@@ -29,17 +29,7 @@ pub enum Tradability {
 
 /// Why the guard held an order back.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    strum::Display,
-    strum::EnumString,
-    strum::IntoStaticStr,
-    strum::EnumIter,
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::IntoStaticStr,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -50,8 +40,10 @@ pub enum GuardCause {
     Fractional,
     /// No reading of the symbol was taken, so nothing vouches for it.
     Unread,
-    /// A fractional buy worth less than the broker's minimum at the symbol's price.
-    BelowMinimum,
+    /// A fractional buy worth less than the broker's minimum at `price`, the price it was valued at.
+    BelowMinimum {
+        price: Price,
+    },
 }
 
 /// An order the guard held back, journaled so the gap between a target and the book it reached is explained.
@@ -111,19 +103,23 @@ pub fn guard(
     };
     for order in orders {
         let whole = order.shares().units() % SHARE_SCALE == 0;
-        let cause = match (tradability.get(order.symbol()), whole) {
-            (Some(Tradability::Fractionable), false) if below_minimum(&order, &price) => {
-                GuardCause::BelowMinimum
+        let cause = match (
+            tradability.get(order.symbol()),
+            whole,
+            below_minimum(&order, &price),
+        ) {
+            (Some(Tradability::Fractionable), false, Some(price)) => {
+                GuardCause::BelowMinimum { price }
             }
-            (Some(Tradability::Fractionable), true | false)
-            | (Some(Tradability::WholeSharesOnly), true) => {
+            (Some(Tradability::Fractionable), true | false, _)
+            | (Some(Tradability::WholeSharesOnly), true, _) => {
                 guarded.passed.push(order);
                 continue;
             }
-            (Some(Tradability::WholeSharesOnly), false) => GuardCause::Fractional,
-            (Some(Tradability::Untradable), true | false) => GuardCause::Untradable,
-            (Some(Tradability::Unlisted), true | false) => GuardCause::Unlisted,
-            (None, true | false) => GuardCause::Unread,
+            (Some(Tradability::WholeSharesOnly), false, _) => GuardCause::Fractional,
+            (Some(Tradability::Untradable), true | false, _) => GuardCause::Untradable,
+            (Some(Tradability::Unlisted), true | false, _) => GuardCause::Unlisted,
+            (None, true | false, _) => GuardCause::Unread,
         };
         guarded.held.push(OrderGuarded {
             symbol: order.symbol().clone(),
@@ -135,12 +131,12 @@ pub fn guard(
     guarded
 }
 
-/// Whether `order` is a buy worth less than the broker's minimum at its symbol's known price.
-fn below_minimum(order: &Order, price: impl Fn(&Symbol) -> Option<Price>) -> bool {
+/// The symbol's known price when `order` is a buy worth less than the broker's minimum at it.
+fn below_minimum(order: &Order, price: impl Fn(&Symbol) -> Option<Price>) -> Option<Price> {
     match order.side() {
         Side::Buy => price(order.symbol())
-            .is_some_and(|price| DollarVolume::of(price, order.shares()) < LEAST_FRACTIONAL_BUY),
-        Side::Sell => false,
+            .filter(|price| DollarVolume::of(*price, order.shares()) < LEAST_FRACTIONAL_BUY),
+        Side::Sell => None,
     }
 }
 
@@ -226,11 +222,26 @@ mod tests {
     /// Names agree between strum and serde for every cause.
     #[test]
     fn test_guard_causes_read_back_as_written() {
-        use strum::IntoEnumIterator;
-
-        let causes: Vec<&str> = GuardCause::iter().map(Into::into).collect();
+        // Without `EnumIter` the list below is by hand, so a new cause must first break this match.
+        let _listed = |cause: GuardCause| match cause {
+            GuardCause::Untradable
+            | GuardCause::Unlisted
+            | GuardCause::Fractional
+            | GuardCause::Unread
+            | GuardCause::BelowMinimum { .. } => (),
+        };
+        let causes = [
+            GuardCause::Untradable,
+            GuardCause::Unlisted,
+            GuardCause::Fractional,
+            GuardCause::Unread,
+            GuardCause::BelowMinimum {
+                price: Price::from_ticks(12_500_000).unwrap(),
+            },
+        ];
+        let names: Vec<&str> = causes.iter().map(Into::into).collect();
         assert_eq!(
-            causes,
+            names,
             [
                 "untradable",
                 "unlisted",
@@ -239,12 +250,22 @@ mod tests {
                 "below_minimum"
             ]
         );
-        for cause in GuardCause::iter() {
-            assert_eq!(
-                serde_json::to_string(&cause).unwrap(),
-                format!("\"{cause}\"")
-            );
-            assert_eq!(cause.to_string().parse(), Ok(cause));
+        let written: Vec<String> = causes
+            .iter()
+            .map(|cause| serde_json::to_string(cause).unwrap())
+            .collect();
+        assert_eq!(
+            written,
+            [
+                r#""untradable""#,
+                r#""unlisted""#,
+                r#""fractional""#,
+                r#""unread""#,
+                r#"{"below_minimum":{"price":12500000}}"#,
+            ]
+        );
+        for (cause, json) in causes.iter().zip(&written) {
+            assert_eq!(&serde_json::from_str::<GuardCause>(json).unwrap(), cause);
         }
     }
 
@@ -262,7 +283,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let buy = |units| buys(&[("F", units)]).remove(0);
-        assert_eq!(held(buy(99_999), &price), [GuardCause::BelowMinimum]);
+        assert_eq!(
+            held(buy(99_999), &price),
+            [GuardCause::BelowMinimum {
+                price: Price::from_ticks(10_000_000).unwrap()
+            }]
+        );
         assert_eq!(held(buy(100_000), &price), []);
         assert_eq!(held(buy(99_999), &|_| None), []);
         let cheap = |_: &Symbol| Some(Price::from_ticks(500_000).unwrap());
