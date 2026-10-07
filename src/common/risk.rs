@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, ValuationRefusal};
 use crate::common::market::{Price, Shares, Symbol};
@@ -84,7 +85,7 @@ impl Limits {
 }
 
 /// A target after risk, with every cut that changed it, in the order they applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Restrained {
     target: Target,
     cuts: Vec<Cut>,
@@ -100,8 +101,45 @@ impl Restrained {
     }
 }
 
+/// A decision as journaled: the strategy's target and what risk made of it, or why risk could not price it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetDecided {
+    /// The end of the decision bar decided at; a bar missed by a late call has no record of its own.
+    bar: DateTime<Utc>,
+    wanted: Target,
+    #[serde(flatten)]
+    decision: Decision,
+}
+
+/// Risk's answer as journaled, keyed `restrained` or `refused` beside the wanted target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Decision {
+    Restrained(Restrained),
+    Refused(ValuationRefusal),
+}
+
+impl TargetDecided {
+    pub fn new(
+        bar: DateTime<Utc>,
+        wanted: Target,
+        restrained: Result<Restrained, ValuationRefusal>,
+    ) -> Self {
+        let decision = match restrained {
+            Ok(restrained) => Decision::Restrained(restrained),
+            Err(refusal) => Decision::Refused(refusal),
+        };
+        Self {
+            bar,
+            wanted,
+            decision,
+        }
+    }
+}
+
 /// One way risk lowered a target, with the reading that forced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Cut {
     /// Flat, as the session is not open with more than the window left before its close.
     OutsideTradingWindow { phase: SessionPhase },

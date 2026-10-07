@@ -18,8 +18,21 @@ pub trait Strategy {
 }
 
 /// The holdings a strategy wants, long-only; a symbol absent from it is wanted at zero.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "BTreeMap<Symbol, Shares>", into = "BTreeMap<Symbol, Shares>")]
 pub struct Target(BTreeMap<Symbol, Shares>);
+
+impl From<BTreeMap<Symbol, Shares>> for Target {
+    fn from(holdings: BTreeMap<Symbol, Shares>) -> Self {
+        Self::new(holdings)
+    }
+}
+
+impl From<Target> for BTreeMap<Symbol, Shares> {
+    fn from(target: Target) -> Self {
+        target.0
+    }
+}
 
 impl Target {
     /// Zero holdings are dropped, so equal wants are equal targets.

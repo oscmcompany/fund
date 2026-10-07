@@ -189,7 +189,7 @@ pub enum FeedEvent {
     Reopened {
         attempts: u32,
     },
-    /// REST trades since `since` were read, `fresh` of them not already handed out.
+    /// REST trades since `since` were read and the `fresh` ones not already handed out precede this event.
     Backfilled {
         since: DateTime<Utc>,
         fresh: usize,
@@ -382,11 +382,12 @@ impl<Source: TapeSource> Feed<Source> {
                     ),
                 };
                 (self.failed_backfills, self.retry_at) = (0, None);
+                let count = fresh.len();
+                self.pending.extend(fresh);
                 self.pending.push_back(FeedEvent::Backfilled {
                     since,
-                    fresh: fresh.len(),
+                    fresh: count,
                 });
-                self.pending.extend(fresh);
             }
             Err(error) => {
                 self.failed_backfills += 1;
@@ -645,8 +646,8 @@ mod tests {
                 FeedEvent::Message(print(2, 10)),
                 lost("the stream closed"),
                 FeedEvent::Reopened { attempts: 1 },
-                backfilled(at(8), 1),
                 FeedEvent::Message(print(3, 20)),
+                backfilled(at(8), 1),
                 FeedEvent::Message(print(4, 30)),
             ]
         );
@@ -669,8 +670,8 @@ mod tests {
             take(&mut feed, 5).await,
             [
                 lost("the stream's socket failed: refused"),
-                backfilled(at(-60), 1),
                 FeedEvent::Message(print(1, 0)),
+                backfilled(at(-60), 1),
                 FeedEvent::Reopened { attempts: 2 },
                 backfilled(at(-2), 0),
             ]
@@ -707,8 +708,8 @@ mod tests {
                     cause: "malformed payload: timed out".to_string()
                 },
                 FeedEvent::Message(print(5, 300)),
-                backfilled(at(-2), 1),
                 FeedEvent::Message(print(2, 100)),
+                backfilled(at(-2), 1),
             ]
         );
     }
@@ -749,9 +750,9 @@ mod tests {
                 FeedEvent::Message(refused()),
                 lost("the stream closed"),
                 FeedEvent::Reopened { attempts: 1 },
-                backfilled(at(-2), 2),
                 FeedEvent::Message(print_at("AAPL", 1, at(1200))),
                 FeedEvent::Message(print(2, 5)),
+                backfilled(at(-2), 2),
             ]
         );
         let repeated = tokio::time::timeout(Duration::from_secs(60), feed.next()).await;
@@ -780,8 +781,8 @@ mod tests {
                 backfilled(at(-60), 0),
                 lost("the stream closed"),
                 FeedEvent::Reopened { attempts: 2 },
-                backfilled(at(-60), 1),
                 FeedEvent::Message(print(1, 0)),
+                backfilled(at(-60), 1),
             ]
         );
     }

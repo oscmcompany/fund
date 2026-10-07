@@ -63,17 +63,40 @@ impl TradingSession {
 }
 
 /// Where an instant falls relative to the published session on its Eastern date.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
     /// No session is published for the date, which covers both a holiday and a date outside the range.
     NoPublishedSession,
     BeforeOpen {
+        #[serde(with = "nanoseconds")]
         until_open: TimeDelta,
     },
     Open {
+        #[serde(with = "nanoseconds")]
         until_close: TimeDelta,
     },
     AfterClose,
+}
+
+/// A duration as whole nanoseconds, so a journaled phase reads back exactly.
+mod nanoseconds {
+    use chrono::TimeDelta;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        duration: &TimeDelta,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let nanoseconds = duration
+            .num_nanoseconds()
+            .ok_or_else(|| serde::ser::Error::custom("a duration past 292 years"))?;
+        serializer.serialize_i64(nanoseconds)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TimeDelta, D::Error> {
+        i64::deserialize(deserializer).map(TimeDelta::nanoseconds)
+    }
 }
 
 /// Why a calendar was refused.
