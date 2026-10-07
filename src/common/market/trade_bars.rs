@@ -483,6 +483,15 @@ impl TradeBar {
     }
 }
 
+/// When the bar starting at `timestamp` ends; a daily bar is stamped at its close, so it ends where it is stamped.
+fn ends(timestamp: DateTime<Utc>, interval: BarInterval) -> DateTime<Utc> {
+    match interval {
+        BarInterval::OneMinute => timestamp + TimeDelta::minutes(1),
+        BarInterval::FiveMinute => timestamp + TimeDelta::minutes(5),
+        BarInterval::OneDay => timestamp,
+    }
+}
+
 /// The bucket an instant falls in at `interval`; a daily bucket is its session's close.
 fn bucket(instant: DateTime<Utc>, interval: BarInterval) -> DateTime<Utc> {
     let minute = instant
@@ -532,6 +541,15 @@ impl TradeRollup {
         Self(BTreeMap::from([(key, TradeSums::of(print, allowed))]))
     }
 
+    /// Takes out every bar that has ended by `through`, leaving the rest.
+    fn split_through(&mut self, through: DateTime<Utc>) -> Self {
+        let (ended, open) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|((_, interval, timestamp), _)| ends(*timestamp, *interval) <= through);
+        self.0 = open;
+        Self(ended)
+    }
+
     /// Every bar built, ordered by symbol, interval and timestamp.
     pub fn into_bars(self) -> Vec<TradeBar> {
         self.0
@@ -575,6 +593,8 @@ pub struct TradeFoldCounts {
     /// Published with no shares, which may set prices and never volume.
     unsized_prints: u64,
     unresolved: u64,
+    /// Arrived for a minute already handed out by `drain_through`, so left out to keep handed-out bars final.
+    late: u64,
 }
 
 impl TradeFoldCounts {
@@ -601,6 +621,10 @@ impl TradeFoldCounts {
     pub fn unresolved(&self) -> u64 {
         self.unresolved
     }
+
+    pub fn late(&self) -> u64 {
+        self.late
+    }
 }
 
 /// One session's prints folded into one-minute trade bars over its whole Eastern day; the condition rules, not the
@@ -609,6 +633,8 @@ pub struct TradeFold {
     session: SessionDate,
     conditions: TradeConditions,
     minutes: TradeRollup,
+    /// The instant through which bars have been handed out, once any have.
+    drained_through: Option<DateTime<Utc>>,
     counts: TradeFoldCounts,
 }
 
@@ -618,6 +644,7 @@ impl TradeFold {
             session,
             conditions,
             minutes: TradeRollup::empty(),
+            drained_through: None,
             counts: TradeFoldCounts::default(),
         }
     }
@@ -644,6 +671,17 @@ impl TradeFold {
             self.counts.corrected += 1;
             return;
         }
+        let minute_ends = ends(
+            bucket(print.timestamp(), BarInterval::OneMinute),
+            BarInterval::OneMinute,
+        );
+        if self
+            .drained_through
+            .is_some_and(|drained| minute_ends <= drained)
+        {
+            self.counts.late += 1;
+            return;
+        }
         let allowed = match eligibility {
             Eligibility::Resolved(allowed) => allowed,
             Eligibility::Unresolved(_) => {
@@ -661,7 +699,17 @@ impl TradeFold {
         self.minutes = minutes.combine(TradeRollup::print(print, allowed));
     }
 
-    /// The one-minute bars and what the fold did with every print.
+    /// The one-minute bars that have ended by `through`, each handed out once; bars handed out minute by minute and
+    /// then by `finish` are the bars folding the same prints whole would give, when no print arrives late.
+    pub fn drain_through(&mut self, through: DateTime<Utc>) -> Vec<TradeBar> {
+        self.drained_through = Some(
+            self.drained_through
+                .map_or(through, |drained| drained.max(through)),
+        );
+        self.minutes.split_through(through).into_bars()
+    }
+
+    /// The one-minute bars not yet handed out and what the fold did with every print.
     pub fn finish(self) -> (Vec<TradeBar>, TradeFoldCounts) {
         (self.minutes.into_bars(), self.counts)
     }
@@ -918,7 +966,89 @@ mod tests {
             })
     }
 
+    /// A five-minute bar from 13:30 ends at 13:35: split off only once that instant is reached.
+    #[test]
+    fn test_a_five_minute_bar_ends_five_minutes_after_it_starts() {
+        let mut fold = session();
+        fold.push(&trade("2026-10-02T13:31:10Z", 100.00, 100.0), &[], false);
+        let minute = fold
+            .drain_through(instant("2026-10-02T13:32:00Z"))
+            .remove(0);
+        let mut five = TradeRollup::of(&minute, BarInterval::FiveMinute).unwrap();
+        assert_eq!(
+            five.split_through(instant("2026-10-02T13:34:59Z")),
+            TradeRollup::empty()
+        );
+        let ended = five
+            .split_through(instant("2026-10-02T13:35:00Z"))
+            .into_bars();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].timestamp(), instant("2026-10-02T13:30:00Z"));
+    }
+
+    /// Draining hands out the closed minute once; a print for it arriving afterwards is counted late and left out,
+    /// one stamped exactly at its end belongs to the next minute, and the open minute stays for `finish`.
+    #[test]
+    fn test_a_print_for_a_minute_already_handed_out_is_late() {
+        let mut fold = session();
+        fold.push(&trade("2026-10-02T13:30:01Z", 100.00, 100.0), &[], false);
+        fold.push(&trade("2026-10-02T13:31:05Z", 101.00, 100.0), &[], false);
+        assert_eq!(fold.drain_through(instant("2026-10-02T13:30:59Z")), []);
+        let drained = fold.drain_through(instant("2026-10-02T13:31:00Z"));
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].timestamp(), instant("2026-10-02T13:30:00Z"));
+        fold.push(&trade("2026-10-02T13:30:30Z", 99.00, 100.0), &[], false);
+        fold.push(&trade("2026-10-02T13:31:00Z", 102.00, 100.0), &[], false);
+        assert_eq!(fold.drain_through(instant("2026-10-02T13:31:00Z")), []);
+        let (rest, counts) = fold.finish();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].timestamp(), instant("2026-10-02T13:31:00Z"));
+        assert_eq!((counts.folded(), counts.late()), (3, 1));
+    }
+
     proptest! {
+        /// Bars handed out minute by minute as the clock passes them, then by `finish`, are the bars folding the same
+        /// prints whole gives, whatever the drain points, when prints arrive in time order.
+        #[test]
+        fn property_draining_minute_by_minute_equals_folding_whole(
+            offsets in prop::collection::vec(0..600i64, 0..40),
+            drains in prop::collection::btree_set(0..40usize, 0..10),
+            codes in prop::collection::vec(prop::sample::select(vec![0u16, 10, 15, 37]), 40),
+        ) {
+            let mut offsets = offsets;
+            offsets.sort_unstable();
+            let open = instant("2026-10-02T13:30:00Z");
+            let prints: Vec<(Print, Vec<u16>)> = offsets
+                .iter()
+                .zip(&codes)
+                .map(|(offset, code)| {
+                    let at = open + TimeDelta::seconds(*offset);
+                    let codes = match code { 0 => vec![], code => vec![*code] };
+                    (Print::Trade(Trade::new(
+                        Symbol::new("AAPL").unwrap(),
+                        at,
+                        Price::from_ticks(100_000_000 + offset).unwrap(),
+                        Shares::whole(100).unwrap(),
+                    ).unwrap()), codes)
+                })
+                .collect();
+            let mut whole = session();
+            let mut live = session();
+            let mut handed_out = Vec::new();
+            for (index, (print, codes)) in prints.iter().enumerate() {
+                if drains.contains(&index) {
+                    handed_out.extend(live.drain_through(bucket(print.timestamp(), BarInterval::OneMinute)));
+                }
+                whole.push(print, codes, false);
+                live.push(print, codes, false);
+            }
+            let (rest, counts) = live.finish();
+            handed_out.extend(rest);
+            handed_out.sort_by_key(TradeBar::timestamp);
+            prop_assert_eq!(counts.late(), 0);
+            prop_assert_eq!(handed_out, whole.finish().0);
+        }
+
         #[test]
         fn property_trade_rollups_are_a_commutative_monoid(
             first in any_rollup(),
