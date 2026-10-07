@@ -1,7 +1,7 @@
 //! One trading session: the tape's prints folded into minute bars, the market state those bars build, and at each
 //! decision bar the strategy's target taken through risk, the guard and the broker, then reconciled, all journaled.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
@@ -75,10 +75,13 @@ pub struct SessionSettings {
     stale_after: TimeDelta,
 }
 
+/// The least staleness a session accepts, since a bar is folded only after its minute ends.
+const LEAST_STALENESS: TimeDelta = TimeDelta::minutes(1);
+
 /// Why settings were refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRefusal {
-    NegativeStaleness { stale_after: TimeDelta },
+    StalenessUnderAMinute { stale_after: TimeDelta },
 }
 
 impl SessionSettings {
@@ -88,8 +91,8 @@ impl SessionSettings {
         patience: Patience,
         stale_after: TimeDelta,
     ) -> Result<Self, SettingsRefusal> {
-        if stale_after < TimeDelta::zero() {
-            return Err(SettingsRefusal::NegativeStaleness { stale_after });
+        if stale_after < LEAST_STALENESS {
+            return Err(SettingsRefusal::StalenessUnderAMinute { stale_after });
         }
         Ok(Self {
             decision,
@@ -355,6 +358,25 @@ pub fn warm(bars: impl IntoIterator<Item = TradeBar>, symbols: &BTreeSet<Symbol>
             .filter(|bar| symbols.contains(bar.symbol()))
             .map(|bar| MarketState::of(MarketEvent::Trades(bar))),
     )
+}
+
+/// Each symbol's latest close among `bars`, however many bars without one follow it.
+pub fn last_closes(bars: &[TradeBar]) -> BTreeMap<Symbol, Price> {
+    let mut closes = BTreeMap::new();
+    for bar in bars {
+        if let Some((at, price)) = bar.sums().open_close().map(|prices| prices.close()) {
+            closes
+                .entry(bar.symbol().clone())
+                .and_modify(|latest: &mut (DateTime<Utc>, Price)| {
+                    *latest = (*latest).max((at, price))
+                })
+                .or_insert((at, price));
+        }
+    }
+    closes
+        .into_iter()
+        .map(|(symbol, (_, price))| (symbol, price))
+        .collect()
 }
 
 /// The end of the latest decision bar ended by `instant`, which is at or before it.
@@ -836,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_negative_staleness_is_refused() {
+    fn test_a_staleness_under_a_minute_is_refused() {
         let limits = Limits::new(
             Cash::from_units(DOLLAR),
             Cash::from_units(DOLLAR),
@@ -848,15 +870,21 @@ mod tests {
             poll: Duration::from_secs(1),
             open_for: Duration::from_secs(1),
         };
-        assert!(matches!(
+        let settings = |seconds| {
             SessionSettings::new(
                 DecisionInterval::OneMinute,
                 limits,
                 patience,
-                TimeDelta::seconds(-1)
-            ),
-            Err(SettingsRefusal::NegativeStaleness { .. })
-        ));
+                TimeDelta::seconds(seconds),
+            )
+        };
+        assert_eq!(
+            settings(59).map(|_| ()),
+            Err(SettingsRefusal::StalenessUnderAMinute {
+                stale_after: TimeDelta::seconds(59)
+            })
+        );
+        assert!(settings(60).is_ok());
     }
 
     fn closing(raw: &str, minute: &str, ticks: i64) -> TradeBar {
@@ -904,5 +932,34 @@ mod tests {
         for interval in DecisionInterval::iter() {
             assert_eq!(interval.to_string().parse(), Ok(interval));
         }
+    }
+
+    /// After-hours minutes carry volume but no close, so more than the retained bars of them push the close out of a
+    /// warmed state; the closes read off the bars keep it.
+    #[test]
+    fn test_a_close_survives_the_closeless_minutes_after_it() {
+        let mut bars = vec![closing("SPY", "19:59:00", 7), closing("SPY", "19:58:00", 5)];
+        let mut minute = at("20:00:00");
+        for _ in 0..=crate::common::market::state::RETAINED_BARS {
+            bars.push(
+                TradeBar::new(
+                    spy(),
+                    BarInterval::OneMinute,
+                    minute,
+                    TradeSums::new(TradeTotals::default(), None, None),
+                )
+                .unwrap(),
+            );
+            minute += TimeDelta::minutes(1);
+        }
+        let symbols = BTreeSet::from([spy()]);
+        assert_eq!(
+            warm(bars.clone(), &symbols).last_price(&spy(), BarInterval::OneMinute),
+            None
+        );
+        assert_eq!(
+            last_closes(&bars),
+            BTreeMap::from([(spy(), Price::from_ticks(7).unwrap())])
+        );
     }
 }

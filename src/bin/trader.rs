@@ -2,7 +2,7 @@
 //! the open, then folds the tape and trades each decision bar until the close. Exits 0 when the session ran to the close
 //! or found none, and every record shipped; 1 when it halted, stopped or did not ship; 2 when it could not start.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -23,9 +23,9 @@ use fund::archive::trade_bars::decode;
 use fund::broker::Broker;
 use fund::broker::alpaca::PaperAccount;
 use fund::common::journal::{Commit, Observation, RunId, SessionOpened};
-use fund::common::market::Symbol;
 use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
+use fund::common::market::{Price, Symbol};
 use fund::common::storage::{Host, Key, Origin, Provider, Service};
 use fund::common::time::SessionDate;
 use fund::common::time::calendar::TradingCalendar;
@@ -36,7 +36,7 @@ use fund::journal::{Journal, built_commit, lock};
 use fund::parameter::log_directory_from_environment;
 use fund::records::{log_file_name, ship, shipped_filter};
 use fund::trader::parameters::Parameters;
-use fund::trader::{Session, warm};
+use fund::trader::{Session, last_closes, warm};
 use uuid::Uuid;
 
 const SERVICE: &str = "trader";
@@ -149,6 +149,10 @@ async fn main() -> ExitCode {
                 tracing::error!("Session halted");
                 ExitCode::FAILURE
             }
+            Ok(Ran::HeldAtTheClose { positions }) => {
+                tracing::error!(positions, "Positions held at the close");
+                ExitCode::FAILURE
+            }
             Err(Stopped::BeforeTheOpen(reason)) => {
                 tracing::error!(reason, "Session did not start");
                 ExitCode::from(REFUSED_TO_START)
@@ -190,8 +194,13 @@ async fn main() -> ExitCode {
 /// How a session ended without error.
 enum Ran {
     NoSession,
+    /// Ran to the close and the account held nothing there.
     ToTheClose,
     Halted,
+    /// Ran to the close but the account still held positions, as when a tape gap kept the session from going flat.
+    HeldAtTheClose {
+        positions: usize,
+    },
 }
 
 /// Why a session stopped, before any order could be sent or after.
@@ -239,11 +248,11 @@ async fn trade(
         .chain(book.positions().keys())
         .cloned()
         .collect();
-    let previous = previous_bars(archive, &calendar, today, &symbols)
+    let (previous, closes) = previous_bars(archive, &calendar, today, &symbols)
         .await
         .map_err(refused)?;
     let opening = book
-        .value(|symbol| previous.last_price(symbol, BarInterval::OneMinute))
+        .value(|symbol| closes.get(symbol).copied())
         .map_err(|refusal| refused(format!("{refusal:?}")))?;
     journal
         .append(
@@ -284,14 +293,22 @@ async fn trade(
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let ran = loop {
         tokio::select! {
-            Some(event) = events.recv() => {
-                report(&event);
-                session.observe(&event);
-            }
+            event = events.recv() => match event {
+                Some(event) => {
+                    report(&event);
+                    session.observe(&event);
+                }
+                // The feed never ends, so a closed channel means its task panicked.
+                None => break Err(Stopped::Trading("the feed task ended".to_string())),
+            },
             _ = ticks.tick() => {
                 let now = Utc::now();
                 if now >= close {
-                    break Ok(Ran::ToTheClose);
+                    break match broker.book().await {
+                        Ok(held) if held.positions().is_empty() => Ok(Ran::ToTheClose),
+                        Ok(held) => Ok(Ran::HeldAtTheClose { positions: held.positions().len() }),
+                        Err(error) => Err(Stopped::Trading(error.to_string())),
+                    };
                 }
                 if let Err(error) = session.advance(now, &broker, journal).await {
                     break Err(Stopped::Trading(format!("{error:?}")));
@@ -306,13 +323,14 @@ async fn trade(
     ran
 }
 
-/// The previous session's one-minute trade bars of `symbols` as the archive derived them, folded into a state.
+/// The previous session's one-minute trade bars of `symbols` as the archive derived them, folded into a state, with each
+/// symbol's last close among them.
 async fn previous_bars(
     archive: &Archive,
     calendar: &TradingCalendar,
     today: SessionDate,
     symbols: &BTreeSet<Symbol>,
-) -> Result<MarketState, String> {
+) -> Result<(MarketState, BTreeMap<Symbol, Price>), String> {
     let previous = calendar
         .previous_trading_day(today)
         .ok_or_else(|| format!("no trading day in the {CALENDAR_DAYS_BACK} days before {today}"))?;
@@ -328,7 +346,12 @@ async fn previous_bars(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("{} is not archived", key.path()))?;
     let (bars, _) = decode(&key, bytes).map_err(|refusal| format!("{refusal:?}"))?;
-    Ok(warm(bars, symbols))
+    let bars: Vec<_> = bars
+        .into_iter()
+        .filter(|bar| symbols.contains(bar.symbol()))
+        .collect();
+    let closes = last_closes(&bars);
+    Ok((warm(bars, symbols), closes))
 }
 
 /// Logs what the feed reports of its own gaps and of messages it could not read, which the journal does not hold.

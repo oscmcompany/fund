@@ -18,7 +18,7 @@ use crate::common::risk::{Limits, LimitsRefusal};
 use crate::common::strategy::noise::Noise;
 use crate::execution::Patience;
 use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
-use crate::trader::{DecisionInterval, SessionSettings};
+use crate::trader::{DecisionInterval, SessionSettings, SettingsRefusal};
 
 const DEFAULT_DECISION_INTERVAL: DecisionInterval = DecisionInterval::FiveMinute;
 const DEFAULT_STALE_AFTER_SECONDS: u64 = 120;
@@ -68,6 +68,7 @@ impl Display for Universe {
 pub enum ParametersRefusal {
     Parameter(ParameterRefusal),
     Limits(LimitsRefusal),
+    Settings(SettingsRefusal),
 }
 
 impl From<ParameterRefusal> for ParametersRefusal {
@@ -81,6 +82,7 @@ impl Display for ParametersRefusal {
         match self {
             Self::Parameter(refusal) => write!(formatter, "{refusal}"),
             Self::Limits(refusal) => write!(formatter, "the limits are refused: {refusal:?}"),
+            Self::Settings(refusal) => write!(formatter, "the settings are refused: {refusal:?}"),
         }
     }
 }
@@ -168,7 +170,7 @@ impl Parameters {
             },
             TimeDelta::seconds(i64::try_from(stale_after).expect("at most an hour of seconds")),
         )
-        .expect("an unsigned staleness is never negative");
+        .map_err(ParametersRefusal::Settings)?;
         let parameters = Self {
             strategy: Noise::new(
                 universe.symbols().clone(),
@@ -343,6 +345,20 @@ mod tests {
                 value: "391".to_string(),
                 most: "390".to_string(),
             }))
+        );
+    }
+
+    #[test]
+    fn test_a_staleness_under_a_minute_is_refused_by_the_settings() {
+        let mut values = REQUIRED.to_vec();
+        values.push((Parameter::StaleAfterSeconds, "59"));
+        assert_eq!(
+            Parameters::resolved(&supplied(&values)).map(|_| ()),
+            Err(ParametersRefusal::Settings(
+                SettingsRefusal::StalenessUnderAMinute {
+                    stale_after: TimeDelta::seconds(59)
+                }
+            ))
         );
     }
 }
