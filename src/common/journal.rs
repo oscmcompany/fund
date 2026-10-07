@@ -13,6 +13,7 @@ use crate::common::guard::{OrderGuarded, TradabilityUnread};
 use crate::common::heal::{Leg, SessionOutcome};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
+use crate::common::market::trade_bars::BarBuilt;
 use crate::common::order::{OrderClosed, OrderRefused, OrderSubmitted, OrderUnresolved};
 use crate::common::parameter::Parameter;
 use crate::common::reconcile::BookReconciled;
@@ -194,6 +195,7 @@ pub enum Observation {
     BookReconciled(BookReconciled),
     TargetDecided(TargetDecided),
     SessionOpened(SessionOpened),
+    BarBuilt(BarBuilt),
 }
 
 impl Observation {

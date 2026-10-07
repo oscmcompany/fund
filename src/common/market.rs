@@ -310,7 +310,20 @@ impl std::fmt::Display for Shares {
 }
 
 /// A number of trades, kept apart from `Shares` so the two counts cannot be swapped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct TradeCount(u64);
 
 impl TradeCount {
@@ -345,8 +358,36 @@ impl std::fmt::Display for TradeCount {
 
 /// A sum of price × shares, held in ticks × millionths of a share: `PRICE_SCALE × SHARE_SCALE` to the dollar.
 /// Unsigned, since a positive price times a share count cannot be negative.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// Written as a decimal string, since serde's buffer for a tagged journal record cannot hold a u128.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
 pub struct DollarVolume(u128);
+
+impl TryFrom<String> for DollarVolume {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        raw.parse().map(Self)
+    }
+}
+
+impl From<DollarVolume> for String {
+    fn from(value: DollarVolume) -> Self {
+        value.0.to_string()
+    }
+}
 
 /// Why a vendor's average price was not turned into a dollar volume.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -781,6 +822,13 @@ mod tests {
         fn property_dollar_volumes_are_a_commutative_monoid(units in prop::array::uniform3(0_u128..u128::MAX / 3)) {
             let [first, second, third] = units.map(DollarVolume::from_units);
             laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_a_dollar_volume_round_trips_through_its_decimal_string(units in any::<u128>()) {
+            let written = serde_json::to_string(&DollarVolume::from_units(units)).unwrap();
+            prop_assert_eq!(&written, &format!("\"{units}\""));
+            prop_assert_eq!(serde_json::from_str::<DollarVolume>(&written).unwrap(), DollarVolume::from_units(units));
         }
     }
 

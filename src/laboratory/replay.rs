@@ -215,7 +215,8 @@ mod tests {
                     | Observation::TradabilityUnread(_)
                     | Observation::BookReconciled(_)
                     | Observation::TargetDecided(_)
-                    | Observation::SessionOpened(_) => None,
+                    | Observation::SessionOpened(_)
+                    | Observation::BarBuilt(_) => None,
                 },
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
