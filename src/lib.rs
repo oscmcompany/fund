@@ -9,3 +9,4 @@ pub mod ingest;
 pub mod journal;
 pub mod laboratory;
 pub mod records;
+pub mod trader;

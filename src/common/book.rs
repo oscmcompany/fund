@@ -194,7 +194,8 @@ impl Fill {
 }
 
 /// Why a book could not be marked: it holds a symbol with no price.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ValuationRefusal {
     Unpriced { symbol: Symbol },
 }

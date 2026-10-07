@@ -124,10 +124,19 @@ impl MarketState {
 
     /// The close of the series' latest priced bar, `None` when no retained bar of it has a close.
     pub fn last_price(&self, symbol: &Symbol, interval: BarInterval) -> Option<Price> {
+        self.last_close(symbol, interval).map(|(_, price)| price)
+    }
+
+    /// `last_price` with the timestamp of the bar that set it, so a caller can judge how old it is.
+    pub fn last_close(
+        &self,
+        symbol: &Symbol,
+        interval: BarInterval,
+    ) -> Option<(DateTime<Utc>, Price)> {
         self.bars(symbol, interval)?
-            .values()
+            .iter()
             .rev()
-            .find_map(|retained| retained.close)
+            .find_map(|(timestamp, retained)| retained.close.map(|close| (*timestamp, close)))
     }
 
     /// The volume of the series' latest `depth` bars, refused until that many are held.
