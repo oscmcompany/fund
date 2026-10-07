@@ -42,6 +42,17 @@ FROM read_parquet(
     hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
 );
 
+-- The one-minute trade bars the archive derives from Alpaca's SIP trades over the whole Eastern day, built by the same
+-- fold the trader runs live.
+CREATE OR REPLACE VIEW alpaca_trade_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/trades/provider=alpaca/origin=derived/interval=one_minute/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
 -- Every host's journal, one row per line; `payload` is JSON text for `json_extract`.
 CREATE OR REPLACE VIEW journal AS
 SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
@@ -92,4 +103,83 @@ FROM (
         hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
     )
     WHERE event_type = 'experiment_ran'
+);
+
+-- Each minute bar a trader run built live against the archive's for the same symbol and minute, over the names the run
+-- watched from its first journaled bar to its last: `presence` says which side holds the bar and each `*_difference` is
+-- trader minus archive in the archive's units, `NULL` where either side lacks the value.
+CREATE OR REPLACE VIEW bar_seam AS
+SELECT * FROM (
+    WITH trader_journal AS (
+        SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+        FROM read_parquet(
+            's3://' || getvariable('records_bucket')
+                || '/records/journal/producer=trader/year=*/month=*/day=*/data.parquet',
+            hive_partitioning = true,
+            hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+        )
+    ),
+    trader AS (
+        SELECT
+            session,
+            run_id,
+            payload ->> '$.symbol' AS symbol,
+            CAST(payload ->> '$.timestamp' AS TIMESTAMPTZ) AS timestamp,
+            CAST(payload ->> '$.trade_count' AS UBIGINT) AS trade_count,
+            CAST(payload ->> '$.volume' AS DECIMAL(38, 0)) * 0.000001 AS volume,
+            CAST(payload ->> '$.dollar_volume' AS DECIMAL(38, 0)) * 0.000000000001 AS dollar_volume,
+            CAST(payload ->> '$.opened_at' AS TIMESTAMPTZ) AS opened_at,
+            CAST(payload ->> '$.open' AS DECIMAL(18, 0)) * 0.000001 AS open,
+            CAST(payload ->> '$.closed_at' AS TIMESTAMPTZ) AS closed_at,
+            CAST(payload ->> '$.close' AS DECIMAL(18, 0)) * 0.000001 AS close,
+            CAST(payload ->> '$.high' AS DECIMAL(18, 0)) * 0.000001 AS high,
+            CAST(payload ->> '$.low' AS DECIMAL(18, 0)) * 0.000001 AS low
+        FROM trader_journal
+        WHERE event_type = 'bar_built'
+    ),
+    runs AS (
+        SELECT run_id, session, min(timestamp) AS first, max(timestamp) AS last FROM trader GROUP BY run_id, session
+    ),
+    -- The configured universe plus any held name the run built a bar for.
+    watched AS (
+        SELECT run_id, unnest(string_split(payload ->> '$.parameters.universe.value', ',')) AS symbol
+        FROM trader_journal
+        WHERE event_type = 'configuration_resolved'
+        UNION
+        SELECT run_id, symbol FROM trader
+    ),
+    archive AS (
+        SELECT runs.run_id, bars.*
+        FROM read_parquet(
+            's3://' || getvariable('market_data_bucket')
+                || '/data/equity/stage=parsed/trades/provider=alpaca/origin=derived/interval=one_minute/year=*/month=*/day=*/data.parquet',
+            hive_partitioning = true,
+            hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+        ) AS bars
+        JOIN runs ON runs.session = make_date(bars.year, bars.month, bars.day)
+        JOIN watched ON watched.run_id = runs.run_id AND watched.symbol = bars.symbol
+        WHERE bars.timestamp BETWEEN runs.first AND runs.last
+    )
+    SELECT
+        coalesce(trader.run_id, archive.run_id) AS run_id,
+        coalesce(trader.session, make_date(archive.year, archive.month, archive.day)) AS session,
+        coalesce(trader.symbol, archive.symbol) AS symbol,
+        coalesce(trader.timestamp, archive.timestamp) AS timestamp,
+        CASE
+            WHEN archive.symbol IS NULL THEN 'trader_only'
+            WHEN trader.symbol IS NULL THEN 'archive_only'
+            ELSE 'both'
+        END AS presence,
+        CAST(trader.trade_count AS BIGINT) - CAST(archive.trade_count AS BIGINT) AS trade_count_difference,
+        trader.volume - archive.volume AS volume_difference,
+        trader.dollar_volume - archive.dollar_volume AS dollar_volume_difference,
+        trader.opened_at - archive.opened_at AS opened_at_difference,
+        trader.open - archive.open AS open_difference,
+        trader.closed_at - archive.closed_at AS closed_at_difference,
+        trader.close - archive.close AS close_difference,
+        trader.high - archive.high AS high_difference,
+        trader.low - archive.low AS low_difference
+    FROM trader
+    FULL OUTER JOIN archive
+        ON archive.run_id = trader.run_id AND archive.symbol = trader.symbol AND archive.timestamp = trader.timestamp
 );
