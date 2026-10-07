@@ -262,6 +262,15 @@ impl Print {
     }
 }
 
+/// Whether a print still stands once the tape's corrections and cancels are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Correction {
+    /// Never corrected, or the record that replaces a corrected print.
+    Stands,
+    /// An original later corrected or canceled, or a cancel's own record, which the fold leaves out entirely.
+    Withdrawn,
+}
+
 /// The earliest and latest prices a bar's eligible prints set; equal instants break on price so the combine is
 /// commutative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,8 +587,8 @@ pub struct TradeFoldCounts {
     folded: u64,
     /// Stamped for another session's Eastern date.
     other_session: u64,
-    /// Marked as corrected by the vendor, which leaves them out entirely.
-    corrected: u64,
+    /// Withdrawn by a later correction or cancel.
+    withdrawn: u64,
     volume_ineligible: u64,
     /// Published with no shares, which may set prices and never volume.
     unsized_prints: u64,
@@ -598,8 +607,8 @@ impl TradeFoldCounts {
         self.other_session
     }
 
-    pub fn corrected(&self) -> u64 {
-        self.corrected
+    pub fn withdrawn(&self) -> u64 {
+        self.withdrawn
     }
 
     pub fn volume_ineligible(&self) -> u64 {
@@ -642,26 +651,35 @@ impl TradeFold {
     }
 
     /// Folds one print carrying the vendor's numeric condition `codes`.
-    pub fn push(&mut self, print: &Print, codes: &[u16], corrected: bool) {
+    pub fn push(&mut self, print: &Print, codes: &[u16], correction: Correction) {
         let eligibility = self.conditions.eligibility(codes);
-        self.push_eligible(print, eligibility, corrected);
+        self.push_eligible(print, eligibility, correction);
     }
 
     /// Folds one print reported on `tape` with condition `letters`, as Alpaca spells them.
-    pub fn push_lettered(&mut self, print: &Print, tape: Tape, letters: &[char], corrected: bool) {
+    pub fn push_lettered(
+        &mut self,
+        print: &Print,
+        tape: Tape,
+        letters: &[char],
+        correction: Correction,
+    ) {
         let eligibility = self.conditions.eligibility_of_letters(tape, letters);
-        self.push_eligible(print, eligibility, corrected);
+        self.push_eligible(print, eligibility, correction);
     }
 
-    /// Folds one print under `eligibility`, unless it is another session's or was corrected.
-    fn push_eligible(&mut self, print: &Print, eligibility: Eligibility, corrected: bool) {
+    /// Folds one print under `eligibility`, unless it is another session's or was withdrawn.
+    fn push_eligible(&mut self, print: &Print, eligibility: Eligibility, correction: Correction) {
         if SessionDate::at(print.timestamp()) != self.session {
             self.counts.other_session += 1;
             return;
         }
-        if corrected {
-            self.counts.corrected += 1;
-            return;
+        match correction {
+            Correction::Stands => {}
+            Correction::Withdrawn => {
+                self.counts.withdrawn += 1;
+                return;
+            }
         }
         let minute_ends =
             BarInterval::OneMinute.ends(bucket(print.timestamp(), BarInterval::OneMinute));
@@ -761,12 +779,36 @@ mod tests {
     #[test]
     fn test_each_price_comes_only_from_prints_allowed_to_set_it() {
         let mut fold = session();
-        fold.push(&trade("2026-10-02T13:30:01Z", 100.00, 50.0), &[37], false);
-        fold.push(&trade("2026-10-02T13:30:02Z", 101.00, 200.0), &[], false);
-        fold.push(&trade("2026-10-02T13:30:03Z", 99.00, 100.0), &[10], false);
-        fold.push(&trade("2026-10-02T13:30:04Z", 150.00, 900.0), &[15], false);
-        fold.push(&trade("2026-10-02T13:30:05Z", 100.50, 10.0), &[], true);
-        fold.push(&trade("2026-10-02T13:31:00Z", 100.25, 0.5), &[37], false);
+        fold.push(
+            &trade("2026-10-02T13:30:01Z", 100.00, 50.0),
+            &[37],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T13:30:02Z", 101.00, 200.0),
+            &[],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T13:30:03Z", 99.00, 100.0),
+            &[10],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T13:30:04Z", 150.00, 900.0),
+            &[15],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T13:30:05Z", 100.50, 10.0),
+            &[],
+            Correction::Withdrawn,
+        );
+        fold.push(
+            &trade("2026-10-02T13:31:00Z", 100.25, 0.5),
+            &[37],
+            Correction::Stands,
+        );
         let (bars, counts) = fold.finish();
         assert_eq!(bars.len(), 2);
         let first = bars[0].sums();
@@ -787,7 +829,7 @@ mod tests {
         assert_eq!(
             (
                 counts.folded(),
-                counts.corrected(),
+                counts.withdrawn(),
                 counts.volume_ineligible()
             ),
             (5, 1, 1)
@@ -808,9 +850,21 @@ mod tests {
             ),
         ]));
         let mut fold = TradeFold::new(october_second(), conditions);
-        fold.push(&trade("2026-10-02T19:59:59Z", 100.00, 100.0), &[], false);
-        fold.push(&trade("2026-10-02T20:02:10Z", 100.05, 7_000.0), &[8], false);
-        fold.push(&trade("2026-10-02T21:30:00Z", 101.00, 50.0), &[12], false);
+        fold.push(
+            &trade("2026-10-02T19:59:59Z", 100.00, 100.0),
+            &[],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T20:02:10Z", 100.05, 7_000.0),
+            &[8],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T21:30:00Z", 101.00, 50.0),
+            &[12],
+            Correction::Stands,
+        );
         let minutes = fold.finish().0;
         let daily = concatenate(
             minutes
@@ -832,13 +886,17 @@ mod tests {
             Condition::new(UpdateRules::new(false, true, true), None, None, false),
         )]));
         let mut fold = TradeFold::new(october_second(), conditions);
-        fold.push(&trade("2026-10-02T19:59:55Z", 87.67, 100.0), &[], false);
+        fold.push(
+            &trade("2026-10-02T19:59:55Z", 87.67, 100.0),
+            &[],
+            Correction::Stands,
+        );
         let corrected_close = Print::Unsized {
             symbol: Symbol::new("AAPL").unwrap(),
             timestamp: instant("2026-10-02T20:10:00.003861Z"),
             price: Price::from_dollars(87.68).unwrap(),
         };
-        fold.push(&corrected_close, &[38], false);
+        fold.push(&corrected_close, &[38], Correction::Stands);
         let (minutes, counts) = fold.finish();
         let daily = concatenate(
             minutes
@@ -907,9 +965,17 @@ mod tests {
     #[test]
     fn test_an_unknown_condition_counts_volume_and_sets_no_price() {
         let mut fold = session();
-        fold.push(&trade("2026-10-02T13:30:01Z", 100.00, 50.0), &[99], false);
+        fold.push(
+            &trade("2026-10-02T13:30:01Z", 100.00, 50.0),
+            &[99],
+            Correction::Stands,
+        );
         // 00:30 Eastern on the next day is another session's.
-        fold.push(&trade("2026-10-03T04:30:00Z", 100.00, 50.0), &[], false);
+        fold.push(
+            &trade("2026-10-03T04:30:00Z", 100.00, 50.0),
+            &[],
+            Correction::Stands,
+        );
         let (bars, counts) = fold.finish();
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].sums().totals().volume().units(), 50_000_000);
@@ -960,7 +1026,11 @@ mod tests {
     #[test]
     fn test_a_five_minute_bar_ends_five_minutes_after_it_starts() {
         let mut fold = session();
-        fold.push(&trade("2026-10-02T13:31:10Z", 100.00, 100.0), &[], false);
+        fold.push(
+            &trade("2026-10-02T13:31:10Z", 100.00, 100.0),
+            &[],
+            Correction::Stands,
+        );
         let minute = fold
             .drain_through(instant("2026-10-02T13:32:00Z"))
             .remove(0);
@@ -981,14 +1051,30 @@ mod tests {
     #[test]
     fn test_a_print_for_a_minute_already_handed_out_is_late() {
         let mut fold = session();
-        fold.push(&trade("2026-10-02T13:30:01Z", 100.00, 100.0), &[], false);
-        fold.push(&trade("2026-10-02T13:31:05Z", 101.00, 100.0), &[], false);
+        fold.push(
+            &trade("2026-10-02T13:30:01Z", 100.00, 100.0),
+            &[],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T13:31:05Z", 101.00, 100.0),
+            &[],
+            Correction::Stands,
+        );
         assert_eq!(fold.drain_through(instant("2026-10-02T13:30:59Z")), []);
         let drained = fold.drain_through(instant("2026-10-02T13:31:00Z"));
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].timestamp(), instant("2026-10-02T13:30:00Z"));
-        fold.push(&trade("2026-10-02T13:30:30Z", 99.00, 100.0), &[], false);
-        fold.push(&trade("2026-10-02T13:31:00Z", 102.00, 100.0), &[], false);
+        fold.push(
+            &trade("2026-10-02T13:30:30Z", 99.00, 100.0),
+            &[],
+            Correction::Stands,
+        );
+        fold.push(
+            &trade("2026-10-02T13:31:00Z", 102.00, 100.0),
+            &[],
+            Correction::Stands,
+        );
         assert_eq!(fold.drain_through(instant("2026-10-02T13:31:00Z")), []);
         let (rest, counts) = fold.finish();
         assert_eq!(rest.len(), 1);
@@ -1029,8 +1115,8 @@ mod tests {
                 if drains.contains(&index) {
                     handed_out.extend(live.drain_through(bucket(print.timestamp(), BarInterval::OneMinute)));
                 }
-                whole.push(print, codes, false);
-                live.push(print, codes, false);
+                whole.push(print, codes, Correction::Stands);
+                live.push(print, codes, Correction::Stands);
             }
             let (rest, counts) = live.finish();
             handed_out.extend(rest);

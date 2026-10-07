@@ -12,7 +12,7 @@ use serde::Deserialize;
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
-use crate::common::market::trade_bars::Print;
+use crate::common::market::trade_bars::{Correction, Print};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
@@ -571,7 +571,7 @@ fn quote_outcome(row: QuoteRow) -> QuoteRowOutcome {
 struct TradeRow {
     ticker: String,
     conditions: String,
-    /// Zero or blank for an uncorrected print.
+    /// The SIP's correction indicator, zero or blank for a regular print.
     correction: Option<u32>,
     price: f64,
     size: f64,
@@ -585,7 +585,7 @@ pub enum TradeRowOutcome {
     Print {
         print: Print,
         conditions: Vec<u16>,
-        corrected: bool,
+        correction: Correction,
     },
     TestTicker,
     Refused(RefusedRow),
@@ -642,7 +642,7 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
         Err(cause) => return refused(RowRefusal::Shares(cause)),
     };
     let timestamp = DateTime::from_timestamp_nanos(row.sip_timestamp);
-    let corrected = row.correction.is_some_and(|correction| correction != 0);
+    let correction = correction(row.correction);
     // A price published with no shares, such as the corrected consolidated close, is a print but not a trade.
     let print = match size.is_zero() {
         true => Print::Unsized {
@@ -658,7 +658,16 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
     TradeRowOutcome::Print {
         print,
         conditions,
-        corrected,
+        correction,
+    }
+}
+
+/// Reads the SIP's correction indicator: 12 is the record that replaces a corrected print; 1 marks an original later
+/// corrected, 8 one later canceled and 10 the cancel's own record, and every other nonzero code is withdrawn too.
+fn correction(indicator: Option<u32>) -> Correction {
+    match indicator {
+        None | Some(0) | Some(12) => Correction::Stands,
+        Some(_) => Correction::Withdrawn,
     }
 }
 
@@ -876,12 +885,12 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
             TradeRowOutcome::Print {
                 print: Print::Trade(trade),
                 conditions,
-                corrected,
+                correction,
             } => {
                 assert_eq!(trade.price().ticks(), 157_350_000);
                 assert_eq!(trade.size().units(), 10_000_000);
                 assert_eq!(conditions, &[12, 37]);
-                assert!(!corrected);
+                assert_eq!(correction, &Correction::Stands);
             }
             other @ (TradeRowOutcome::Print { .. }
             | TradeRowOutcome::TestTicker
@@ -889,7 +898,8 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
         }
         assert!(matches!(
             &outcomes[1],
-            TradeRowOutcome::Print { conditions, corrected: true, .. } if conditions.is_empty()
+            TradeRowOutcome::Print { conditions, correction: Correction::Withdrawn, .. }
+                if conditions.is_empty()
         ));
         assert!(matches!(
             &outcomes[2],
@@ -902,5 +912,39 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_a_correction_record_stands_and_what_it_replaces_or_cancels_is_withdrawn() {
+        // GRAB's 1,500,000-share print on 2025-11-04 and the record that replaced it, trimmed from Massive's file.
+        let rows = "ticker,conditions,correction,exchange,id,participant_timestamp,price,sequence_number,sip_timestamp,size,tape,trf_id,trf_timestamp
+GRAB,\"53,32,35,41\",1,4,1,1762272164704000000,5.900000,1,1762272164704409379,1500000,3,202,1762272164704000000
+GRAB,\"53,35,41\",12,4,2,1762287697649000000,5.900000,2,1762287697649651762,1500000,3,202,1762287697649000000
+";
+        let mut outcomes = Vec::new();
+        read_trades(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
+        let corrections: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                TradeRowOutcome::Print { correction, .. } => *correction,
+                other @ (TradeRowOutcome::TestTicker | TradeRowOutcome::Refused(_)) => {
+                    panic!("{other:?}")
+                }
+            })
+            .collect();
+        assert_eq!(corrections, [Correction::Withdrawn, Correction::Stands]);
+        let read = [None, Some(0), Some(1), Some(8), Some(10), Some(12), Some(7)].map(correction);
+        assert_eq!(
+            read,
+            [
+                Correction::Stands,
+                Correction::Stands,
+                Correction::Withdrawn,
+                Correction::Withdrawn,
+                Correction::Withdrawn,
+                Correction::Stands,
+                Correction::Withdrawn,
+            ]
+        );
     }
 }

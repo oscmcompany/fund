@@ -13,7 +13,7 @@ use tokio::sync::mpsc::Sender;
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
-use crate::common::market::trade_bars::{Print, Tape, condition_letter};
+use crate::common::market::trade_bars::{Correction, Print, Tape, condition_letter};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
@@ -343,7 +343,7 @@ struct AlpacaTrade {
     /// The tape letter: `A` and `B` report under CTA's letters, `C` under UTP's.
     #[serde(rename = "z")]
     tape: String,
-    /// Present on a print later corrected or canceled, whatever its value.
+    /// The print's correction status, absent on a regular print.
     #[serde(rename = "u")]
     update: Option<String>,
 }
@@ -364,7 +364,7 @@ pub enum AlpacaTradeOutcome {
         print: Print,
         tape: Tape,
         letters: Vec<char>,
-        corrected: bool,
+        correction: Correction,
     },
     Refused(RefusedRow),
 }
@@ -569,7 +569,16 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
         print,
         tape,
         letters,
-        corrected: row.update.is_some(),
+        correction: correction(row.update.as_deref()),
+    }
+}
+
+/// Reads Alpaca's update label: `incorrect` marks the record that replaces a corrected print, the one that stands, while
+/// `corrected` marks the original it replaced and `canceled` a print withdrawn; an unknown label is withdrawn too.
+fn correction(update: Option<&str>) -> Correction {
+    match update {
+        None | Some("incorrect") => Correction::Stands,
+        Some(_) => Correction::Withdrawn,
     }
 }
 
@@ -1128,6 +1137,28 @@ mod tests {
     }
 
     #[test]
+    fn test_the_correction_record_stands_and_what_it_replaces_or_cancels_is_withdrawn() {
+        let read = [
+            None,
+            Some("incorrect"),
+            Some("corrected"),
+            Some("canceled"),
+            Some("unheard"),
+        ]
+        .map(correction);
+        assert_eq!(
+            read,
+            [
+                Correction::Stands,
+                Correction::Stands,
+                Correction::Withdrawn,
+                Correction::Withdrawn,
+                Correction::Withdrawn,
+            ]
+        );
+    }
+
+    #[test]
     fn test_alpaca_trades_carry_their_tape_letters_and_corrections() {
         let symbol = Symbol::new("AAPL").unwrap();
         let (outcomes, answered) = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
@@ -1139,9 +1170,9 @@ mod tests {
                     print,
                     tape,
                     letters,
-                    corrected,
+                    correction,
                 } => format!(
-                    "{tape:?} {letters:?} corrected={corrected} unsized={}",
+                    "{tape:?} {letters:?} {correction:?} unsized={}",
                     matches!(print, Print::Unsized { .. })
                 ),
                 AlpacaTradeOutcome::Refused(row) => {
@@ -1152,9 +1183,9 @@ mod tests {
         assert_eq!(
             summary,
             [
-                "UnlistedTrading ['@', '6', 'X'] corrected=false unsized=false",
-                "UnlistedTrading ['@', 'T', 'P'] corrected=true unsized=false",
-                "ConsolidatedTape [' ', '9'] corrected=false unsized=true",
+                "UnlistedTrading ['@', '6', 'X'] Stands unsized=false",
+                "UnlistedTrading ['@', 'T', 'P'] Withdrawn unsized=false",
+                "ConsolidatedTape [' ', '9'] Stands unsized=true",
                 "refused tape",
             ]
         );

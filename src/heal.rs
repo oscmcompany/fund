@@ -538,8 +538,8 @@ async fn write_trades(
                 print,
                 tape,
                 letters,
-                corrected,
-            } => fold.push_lettered(&print, tape, &letters, corrected),
+                correction,
+            } => fold.push_lettered(&print, tape, &letters, correction),
             AlpacaTradeOutcome::Refused(row) => refused.push(row),
         },
     )
@@ -571,7 +571,7 @@ async fn write_trades(
             .await
             .map_err(|error| error.to_string())?;
     }
-    tracing::info!(%session, folded = counts.folded(), corrected = counts.corrected(), unresolved = counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
+    tracing::info!(%session, folded = counts.folded(), withdrawn = counts.withdrawn(), unresolved = counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
     Ok(PartitionWritten::new(
         Leg::AlpacaTrades,
         session,

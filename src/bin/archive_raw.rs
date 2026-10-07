@@ -94,7 +94,17 @@ enum Command {
         first: SessionDate,
         last: SessionDate,
         concurrency: usize,
+        writing: Writing,
     },
+}
+
+/// How a trade fold writes a session's bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writing {
+    /// Creates them, keeping identical bars an earlier run wrote and refusing different ones.
+    Create,
+    /// Overwrites them, leaving out sessions already folded at or after `since`. Temporary: archive task A6.
+    Replace { since: DateTime<Utc> },
 }
 
 fn parse(arguments: &[String]) -> Option<Command> {
@@ -150,6 +160,20 @@ fn parse(arguments: &[String]) -> Option<Command> {
                     .parse()
                     .ok()
                     .filter(|count: &usize| *count > 0)?,
+                writing: Writing::Create,
+            })
+        }
+        [command, first, last, concurrency, since] if command == "refold-trades" => {
+            Some(Command::FoldTrades {
+                first: date(first)?,
+                last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+                concurrency: concurrency
+                    .parse()
+                    .ok()
+                    .filter(|count: &usize| *count > 0)?,
+                writing: Writing::Replace {
+                    since: since.parse().ok()?,
+                },
             })
         }
         [command, first, last, concurrency] if command == "fold-quotes" => {
@@ -182,7 +206,7 @@ async fn main() -> ExitCode {
     let Some(command) = parse(&arguments) else {
         tracing::error!(
             ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | port-security-details | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
+            "Usage: copy <dataset> <first> <last> <concurrency> | verify <dataset> | parse <dataset> <first> <last> <concurrency> | delete-legacy <dataset> | fold-quotes <first> <last> <concurrency> | fetch-conditions | port-security-details | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency> | refold-trades <first> <last> <concurrency> <since>"
         );
         return ExitCode::from(REFUSED_TO_START);
     };
@@ -264,6 +288,7 @@ async fn main() -> ExitCode {
                 first,
                 last,
                 concurrency,
+                writing,
             } => {
                 let Some((flat_files, alpaca)) = fold_clients() else {
                     return ExitCode::from(REFUSED_TO_START);
@@ -275,6 +300,7 @@ async fn main() -> ExitCode {
                     first,
                     last,
                     concurrency,
+                    writing,
                     run_id,
                     commit,
                 )
@@ -999,8 +1025,16 @@ impl std::fmt::Display for FoldFailure {
     }
 }
 
-/// Streams each listed `dataset` file of a trading session in `[first, last]` whose daily file under `daily` is not
-/// yet written, and hands it to `fold`; `noun` names the bars in the log.
+/// Which sessions a fold leaves alone.
+enum Done {
+    /// Those whose daily file is written.
+    Held,
+    /// Those a refold has already rewritten.
+    Refolded(BTreeSet<SessionDate>),
+}
+
+/// Streams each listed `dataset` file of a trading session in `[first, last]` that `done` does not cover, and hands it
+/// to `fold`; `daily` names the series whose written files mark a session held, and `noun` names the bars in the log.
 #[allow(clippy::too_many_arguments)]
 async fn fold_sessions<Fold, Folding>(
     archive: &Archive,
@@ -1008,6 +1042,7 @@ async fn fold_sessions<Fold, Folding>(
     calendar: &TradingCalendar,
     dataset: FlatFileDataset,
     daily: Key,
+    done: Done,
     first: SessionDate,
     last: SessionDate,
     concurrency: usize,
@@ -1032,12 +1067,15 @@ where
             return ExitCode::FAILURE;
         }
     };
-    // The daily file is written last, so a session holding it holds all three.
-    let done: BTreeSet<SessionDate> = written
-        .iter()
-        .filter_map(|path| Key::parse(path).ok())
-        .map(|key| key.session())
-        .collect();
+    let done: BTreeSet<SessionDate> = match done {
+        // The daily file is written last, so a session holding it holds all three.
+        Done::Held => written
+            .iter()
+            .filter_map(|path| Key::parse(path).ok())
+            .map(|key| key.session())
+            .collect(),
+        Done::Refolded(sessions) => sessions,
+    };
     let offered: Vec<_> = listing
         .into_iter()
         .filter(|listed| (first..=last).contains(&listed.session()))
@@ -1146,6 +1184,7 @@ async fn fold_quotes(
         &calendar,
         FlatFileDataset::Quotes,
         daily,
+        Done::Held,
         first,
         last,
         concurrency,
@@ -1345,6 +1384,7 @@ async fn fold_trades(
     first: SessionDate,
     last: SessionDate,
     concurrency: usize,
+    writing: Writing,
     run_id: RunId,
     commit: Option<Commit>,
 ) -> ExitCode {
@@ -1368,12 +1408,25 @@ async fn fold_trades(
         }
     };
     let [_, _, daily] = trade_keys(first);
+    let done = match writing {
+        Writing::Create => Done::Held,
+        Writing::Replace { since } => {
+            match refolded_since(archive, &daily, first, last, since).await {
+                Ok(refolded) => Done::Refolded(refolded),
+                Err(reason) => {
+                    tracing::error!(reason, "Refolded sessions not read");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
     fold_sessions(
         archive,
         flat_files,
         &calendar,
         FlatFileDataset::Trades,
         daily,
+        done,
         first,
         last,
         concurrency,
@@ -1387,19 +1440,22 @@ async fn fold_trades(
                 run_id,
                 commit.clone(),
             );
-            async move { fold_trades_one(&archive, stream, session, conditions, &provenance).await }
+            async move {
+                fold_trades_one(&archive, stream, session, conditions, &provenance, writing).await
+            }
         },
     )
     .await
 }
 
-/// Folds one streamed trade file and creates its three files, the daily last.
+/// Folds one streamed trade file and writes its three files as `writing` says, the daily last.
 async fn fold_trades_one(
     archive: &Archive,
     stream: FlatFileStream,
     session: SessionDate,
     conditions: TradeConditions,
     provenance: &Provenance,
+    writing: Writing,
 ) -> Result<(), FoldFailure> {
     let folded = tokio::task::spawn_blocking(move || {
         let mut fold = TradeFold::new(session, conditions);
@@ -1409,8 +1465,8 @@ async fn fold_trades_one(
             TradeRowOutcome::Print {
                 print,
                 conditions,
-                corrected,
-            } => fold.push(&print, &conditions, corrected),
+                correction,
+            } => fold.push(&print, &conditions, correction),
             TradeRowOutcome::TestTicker => test_tickers += 1,
             TradeRowOutcome::Refused(row) => count_cause(&mut refused, &row),
         })
@@ -1441,10 +1497,18 @@ async fn fold_trades_one(
     for (key, bars) in files {
         let body = trade_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
-        create_or_confirm(archive, &key, body, |held| {
-            trade_bars::decode(&key, held).map(|(held, _)| held == bars)
-        })
-        .await?;
+        match writing {
+            Writing::Create => {
+                create_or_confirm(archive, &key, body, |held| {
+                    trade_bars::decode(&key, held).map(|(held, _)| held == bars)
+                })
+                .await?
+            }
+            Writing::Replace { .. } => archive
+                .put(&key, body)
+                .await
+                .map_err(FoldFailure::Archive)?,
+        }
     }
     tracing::info!(
         session = %session,
@@ -1452,7 +1516,7 @@ async fn fold_trades_one(
         minute_bars = minutes.len(),
         folded = counts.folded(),
         other_session = counts.other_session(),
-        corrected = counts.corrected(),
+        withdrawn = counts.withdrawn(),
         volume_ineligible = counts.volume_ineligible(),
         unsized_prints = counts.unsized_prints(),
         unresolved = counts.unresolved(),
@@ -1462,6 +1526,50 @@ async fn fold_trades_one(
         "Wrote trade bars"
     );
     Ok(())
+}
+
+/// The sessions in `[first, last]` whose daily trade bars were folded at or after `since`, read from each file's
+/// provenance so a refold that stopped resumes where it left off. Temporary: archive task A6.
+async fn refolded_since(
+    archive: &Archive,
+    daily: &Key,
+    first: SessionDate,
+    last: SessionDate,
+    since: DateTime<Utc>,
+) -> Result<BTreeSet<SessionDate>, String> {
+    let written = archive
+        .list(&daily.series())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut folded_at = Vec::new();
+    for key in written
+        .iter()
+        .filter_map(|path| Key::parse(path).ok())
+        .filter(|key| (first..=last).contains(&key.session()))
+    {
+        let body = archive
+            .get(&key)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{} listed but gone", key.path()))?;
+        let (_, provenance) = trade_bars::decode(&key, body)
+            .map_err(|refusal| format!("{}: {refusal:?}", key.path()))?;
+        folded_at.push((key.session(), provenance.fetched_at()));
+    }
+    Ok(folded_since(&folded_at, since))
+}
+
+/// The sessions whose daily file was folded at or after `since`; the daily file is written last, so a session whose
+/// refold stopped partway still carries its old instant and is folded again.
+fn folded_since(
+    folded_at: &[(SessionDate, DateTime<Utc>)],
+    since: DateTime<Utc>,
+) -> BTreeSet<SessionDate> {
+    folded_at
+        .iter()
+        .filter(|(_, at)| *at >= since)
+        .map(|(session, _)| *session)
+        .collect()
 }
 
 /// Massive's bars at `interval` and `origin` for a session.
@@ -1869,6 +1977,53 @@ mod tests {
         .filter(|comparison| deletable(*comparison))
         .collect();
         assert_eq!(allowed, [Comparison::Equal]);
+    }
+
+    #[test]
+    fn test_a_refold_resumes_past_sessions_folded_at_or_after_its_start() {
+        let session =
+            |day: u32| SessionDate::from_date(NaiveDate::from_ymd_opt(2025, 11, day).unwrap());
+        let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        let since = instant("2026-10-08T00:00:00Z");
+        let folded_at = [
+            (session(3), instant("2026-10-06T18:00:00Z")),
+            (session(4), instant("2026-10-08T00:00:00Z")),
+            (session(5), instant("2026-10-08T02:30:00Z")),
+            // A refold that stopped after the minute files leaves the daily file's earlier instant.
+            (session(6), instant("2026-10-07T23:59:59.999999999Z")),
+        ];
+        assert_eq!(
+            folded_since(&folded_at, since),
+            BTreeSet::from([session(4), session(5)])
+        );
+        let [minute, five_minute, daily] = trade_keys(session(4));
+        let intervals = [minute, five_minute, daily].map(|key| match key {
+            Key::Trades { interval, .. } => interval,
+            other @ (Key::Bars { .. }
+            | Key::Quotes { .. }
+            | Key::Reference { .. }
+            | Key::RawBars { .. }
+            | Key::RawQuotes { .. }
+            | Key::RawTrades { .. }
+            | Key::Journal { .. }
+            | Key::Logs { .. }) => panic!("{other:?}"),
+        });
+        assert_eq!(
+            intervals,
+            [
+                BarInterval::OneMinute,
+                BarInterval::FiveMinute,
+                BarInterval::OneDay
+            ]
+        );
+        let refold = |since: &str| {
+            parse(&["refold-trades", "2021-08-23", "2026-12-31", "8", since].map(String::from))
+        };
+        assert!(matches!(
+            refold("2026-10-08T00:00:00Z"),
+            Some(Command::FoldTrades { writing: Writing::Replace { since: parsed }, .. }) if parsed == since
+        ));
+        assert!(refold("yesterday").is_none());
     }
 
     #[test]
