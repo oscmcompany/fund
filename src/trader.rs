@@ -195,10 +195,10 @@ impl<S: Strategy> Session<S> {
                         print,
                         tape,
                         letters,
-                        corrected,
+                        correction,
                     },
                 ..
-            }) => self.fold.push_lettered(print, *tape, letters, *corrected),
+            }) => self.fold.push_lettered(print, *tape, letters, *correction),
             FeedEvent::Message(
                 StreamMessage::Trade {
                     outcome: AlpacaTradeOutcome::Refused(_),
@@ -366,7 +366,7 @@ mod tests {
     use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::record::Trade;
-    use crate::common::market::trade_bars::{Print, Tape};
+    use crate::common::market::trade_bars::{Correction, Print, Tape};
     use crate::common::market::{DollarVolume, Shares};
     use crate::common::order::{
         ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest, OrderStatus,
@@ -540,7 +540,7 @@ mod tests {
                 print: Print::Trade(trade),
                 tape: Tape::ConsolidatedTape,
                 letters: vec![' '],
-                corrected: false,
+                correction: Correction::Stands,
             },
         })
     }

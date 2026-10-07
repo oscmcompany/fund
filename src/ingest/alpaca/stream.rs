@@ -435,7 +435,7 @@ fn symbol(element: &Value) -> Result<Symbol, RefusedRow> {
 mod tests {
     use super::*;
     use crate::common::market::record::Quote;
-    use crate::common::market::trade_bars::{Print, Tape};
+    use crate::common::market::trade_bars::{Correction, Print, Tape};
     use crate::common::market::{Price, Shares};
 
     /// The control frames as the SIP stream sent them on 2026-10-06, and its answer to a malformed request.
@@ -496,7 +496,7 @@ mod tests {
                         print,
                         tape,
                         letters,
-                        corrected,
+                        correction,
                     },
             } => {
                 assert_eq!(
@@ -508,7 +508,7 @@ mod tests {
                 );
                 assert_eq!(*tape, Tape::ConsolidatedTape);
                 assert_eq!(*letters, [' ', 'F', 'T', 'I']);
-                assert!(!corrected);
+                assert_eq!(*correction, Correction::Stands);
                 match print {
                     Print::Trade(trade) => {
                         assert_eq!(

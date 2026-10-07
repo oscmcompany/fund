@@ -411,7 +411,7 @@ mod tests {
 
     use super::*;
     use crate::common::market::record::Trade;
-    use crate::common::market::trade_bars::{Print, Tape};
+    use crate::common::market::trade_bars::{Correction, Print, Tape};
     use crate::common::market::{Price, Shares};
 
     /// A page of AAPL trades as the REST history returned it for 2026-10-06 19:59:59, trimmed to three rows.
@@ -444,7 +444,7 @@ mod tests {
                 print: Print::Trade(trade),
                 tape: Tape::ConsolidatedTape,
                 letters: vec![' '],
-                corrected: false,
+                correction: Correction::Stands,
             },
         }
     }

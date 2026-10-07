@@ -346,7 +346,7 @@ mod tests {
     use crate::common::journal::RunId;
     use crate::common::market::record::Trade;
     use crate::common::market::trade_bars::{
-        Condition, Print, TradeConditions, TradeFold, UpdateRules,
+        Condition, Correction, Print, TradeConditions, TradeFold, UpdateRules,
     };
     use crate::common::storage::Origin;
 
@@ -377,7 +377,7 @@ mod tests {
                 Shares::from_float(shares).unwrap(),
             )
             .unwrap();
-            fold.push(&Print::Trade(trade), &codes, false);
+            fold.push(&Print::Trade(trade), &codes, Correction::Stands);
         }
         let (written, _) = fold.finish();
         let provenance = Provenance::new(
