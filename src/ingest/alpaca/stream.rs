@@ -45,10 +45,39 @@ pub enum Channel {
     Statuses,
 }
 
-/// The tape's own identifier for a print, which a correction or cancel names and a REST read returns too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-#[serde(transparent)]
-pub struct TradeId(u64);
+/// A print's identity on the tape: the reporting exchange and its number there, which a correction or cancel names
+/// and a REST read returns too; numbers repeat across exchanges, so the exchange is part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TradeId {
+    exchange: char,
+    number: u64,
+}
+
+impl TradeId {
+    /// Orders before every real identity, so a range of seen prints can start at an instant.
+    pub(crate) const LEAST: Self = Self {
+        exchange: '\0',
+        number: 0,
+    };
+
+    /// Reads `x` and `i` from a trade element, as the stream and the REST history both spell them.
+    pub(crate) fn read(element: &Value) -> Result<Self, String> {
+        let exchange = element
+            .get("x")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "a trade with no `x`".to_string())?;
+        let mut letters = exchange.chars();
+        let (Some(exchange), None) = (letters.next(), letters.next()) else {
+            return Err(format!("an exchange `{exchange}` that is not one letter"));
+        };
+        let number = element
+            .get("i")
+            .ok_or_else(|| "a trade with no `i`".to_string())?
+            .as_u64()
+            .ok_or_else(|| format!("an `i` that is no unsigned integer: {}", element["i"]))?;
+        Ok(Self { exchange, number })
+    }
+}
 
 /// One message off the stream, in the order Alpaca sent it.
 #[derive(Debug, Clone, PartialEq)]
@@ -369,10 +398,7 @@ fn message(element: &Value) -> Result<StreamMessage, String> {
         }
         "t" => {
             // A correction or cancel names its print by this id, so a trade without one cannot be followed.
-            let id = element
-                .get("i")
-                .ok_or_else(|| "a trade with no `i`".to_string())?;
-            let id = TradeId::deserialize(id).map_err(unreadable)?;
+            let id = TradeId::read(element)?;
             let outcome = match symbol(element) {
                 Ok(symbol) => {
                     let row: AlpacaTrade = Deserialize::deserialize(element).map_err(unreadable)?;
@@ -473,7 +499,13 @@ mod tests {
                         corrected,
                     },
             } => {
-                assert_eq!(*id, TradeId(52_983_625_699_126));
+                assert_eq!(
+                    *id,
+                    TradeId {
+                        exchange: 'P',
+                        number: 52_983_625_699_126
+                    }
+                );
                 assert_eq!(*tape, Tape::ConsolidatedTape);
                 assert_eq!(*letters, [' ', 'F', 'T', 'I']);
                 assert!(!corrected);
@@ -552,7 +584,7 @@ mod tests {
             messages("not json"),
             Err(StreamError::Malformed { .. })
         ));
-        let frame = r#"[{"S":"SPY"},{"T":"t","S":"SPY","i":"x","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"t","S":"SPY","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"success","msg":"connected"}]"#;
+        let frame = r#"[{"S":"SPY"},{"T":"t","S":"SPY","x":"P","i":"x","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"t","S":"SPY","x":"P","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"success","msg":"connected"}]"#;
         let read = messages(frame).unwrap();
         let reasons: Vec<&str> = read
             .iter()
@@ -573,7 +605,7 @@ mod tests {
         assert_eq!(read[3], StreamMessage::Connected);
         assert!(matches!(
             messages(
-                r#"[{"T":"t","S":"spy!","i":1,"p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"}]"#
+                r#"[{"T":"t","S":"spy!","x":"P","i":1,"p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"}]"#
             )
             .unwrap()
             .as_slice(),
