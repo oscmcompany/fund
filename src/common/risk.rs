@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, ValuationRefusal};
@@ -104,6 +104,8 @@ impl Restrained {
 /// A decision as journaled: the strategy's target and what risk made of it, or why risk could not price it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetDecided {
+    /// The end of the decision bar decided at; a bar missed by a late call has no record of its own.
+    bar: DateTime<Utc>,
     wanted: Target,
     #[serde(flatten)]
     decision: Decision,
@@ -118,12 +120,20 @@ enum Decision {
 }
 
 impl TargetDecided {
-    pub fn new(wanted: Target, restrained: Result<Restrained, ValuationRefusal>) -> Self {
+    pub fn new(
+        bar: DateTime<Utc>,
+        wanted: Target,
+        restrained: Result<Restrained, ValuationRefusal>,
+    ) -> Self {
         let decision = match restrained {
             Ok(restrained) => Decision::Restrained(restrained),
             Err(refusal) => Decision::Refused(refusal),
         };
-        Self { wanted, decision }
+        Self {
+            bar,
+            wanted,
+            decision,
+        }
     }
 }
 

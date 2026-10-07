@@ -35,6 +35,13 @@ pub enum DecisionInterval {
 }
 
 impl DecisionInterval {
+    fn length(self) -> TimeDelta {
+        match self {
+            Self::OneMinute => TimeDelta::minutes(1),
+            Self::FiveMinute => TimeDelta::minutes(5),
+        }
+    }
+
     fn bar_interval(self) -> BarInterval {
         match self {
             Self::OneMinute => BarInterval::OneMinute,
@@ -99,8 +106,39 @@ pub struct Session<S: Strategy> {
     fills: Vec<Fill>,
     next_decision: DateTime<Utc>,
     next_sequence: u32,
-    /// Set once a reconciliation diverges; the session then decides nothing more.
+    /// Whether the tape is whole: draining and deciding wait out a gap until a backfill after a reopen covers it.
+    tape: Tape,
+    /// Set once a reconciliation diverges, an order is left unresolved or a step fails; the session then decides
+    /// nothing more.
     halted: bool,
+}
+
+/// Where the feed stands, so bars are drained only from a whole tape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tape {
+    Whole,
+    /// The stream was lost; prints may be missing until a reopen and a backfill behind it.
+    Interrupted,
+    /// The stream is open but the tape has a gap before it, at startup or after a reopen; the next backfill closes it.
+    Reopened,
+}
+
+impl Tape {
+    fn after(self, event: &FeedEvent) -> Self {
+        match (self, event) {
+            (Self::Whole | Self::Interrupted | Self::Reopened, FeedEvent::Lost { .. }) => {
+                Self::Interrupted
+            }
+            (Self::Interrupted | Self::Reopened, FeedEvent::Reopened { .. }) => Self::Reopened,
+            (Self::Reopened, FeedEvent::Backfilled { .. }) => Self::Whole,
+            (Self::Whole, FeedEvent::Reopened { .. })
+            | (Self::Whole | Self::Interrupted, FeedEvent::Backfilled { .. })
+            | (
+                Self::Whole | Self::Interrupted | Self::Reopened,
+                FeedEvent::BackfillFailed { .. } | FeedEvent::Message(_),
+            ) => self,
+        }
+    }
 }
 
 impl<S: Strategy> Session<S> {
@@ -132,6 +170,8 @@ impl<S: Strategy> Session<S> {
             opening,
             fills: Vec::new(),
             next_sequence: 0,
+            // The feed's first backfill, from where the tape is wanted, makes it whole.
+            tape: Tape::Reopened,
             halted: false,
         }
     }
@@ -144,8 +184,10 @@ impl<S: Strategy> Session<S> {
         self.halted
     }
 
-    /// Folds one feed event in; only a print changes the session, and the fold decides what it may set.
+    /// Folds one feed event in: a print goes to the fold, which decides what it may set, and the feed's own events say
+    /// whether the tape is whole.
     pub fn observe(&mut self, event: &FeedEvent) {
+        self.tape = self.tape.after(event);
         match event {
             FeedEvent::Message(StreamMessage::Trade {
                 outcome:
@@ -178,21 +220,27 @@ impl<S: Strategy> Session<S> {
     }
 
     /// Folds in every minute settled by `now`, and once a decision bar has settled, trades the book toward the
-    /// strategy's target within the limits and reconciles it with the broker's.
+    /// strategy's target within the limits and reconciles it with the broker's. While the tape has a gap nothing is
+    /// drained or decided, and a late call decides once, for the latest settled bar, rather than for each it passed.
     pub async fn advance(
         &mut self,
         now: DateTime<Utc>,
         broker: &impl Broker,
         journal: &mut Journal,
     ) -> Result<(), SessionError> {
+        self.fold_in(MarketEvent::Clock(now));
+        match self.tape {
+            Tape::Whole => {}
+            Tape::Interrupted | Tape::Reopened => return Ok(()),
+        }
         let settled = now - SETTLING;
         for bar in self.fold.drain_through(settled) {
             self.fold_in(MarketEvent::Trades(bar));
         }
-        self.fold_in(MarketEvent::Clock(now));
         if self.halted || settled < self.next_decision {
             return Ok(());
         }
+        let bar = decision_before(settled, self.settings.decision);
         self.next_decision = decision_after(settled, self.settings.decision);
         let wanted = self.strategy.decide(&self.state, &self.book);
         let phase = self.calendar.phase_at(now);
@@ -204,8 +252,9 @@ impl<S: Strategy> Session<S> {
             |symbol| self.fresh_price(symbol, now),
             wanted.clone(),
         );
-        let decided = TargetDecided::new(wanted, restrained.clone());
+        let decided = TargetDecided::new(bar, wanted, restrained.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
+            self.halted = true;
             return Err(SessionError::Journal(JournalFailed {
                 outcomes: Vec::new(),
                 error,
@@ -216,7 +265,7 @@ impl<S: Strategy> Session<S> {
             // An unpriced exposure cannot be capped, so the book is left as it stands until the price returns.
             Err(_) => return Ok(()),
         };
-        let outcomes = execute(
+        let executed = execute(
             broker,
             journal,
             &mut self.next_sequence,
@@ -224,21 +273,18 @@ impl<S: Strategy> Session<S> {
             restrained.target(),
             self.settings.patience,
         )
-        .await
-        .map_err(SessionError::Journal)?;
-        for outcome in outcomes {
-            match outcome {
-                OrderOutcome::Closed(Some(fill)) => {
-                    self.book = std::mem::take(&mut self.book).combine(Book::of(&fill));
-                    self.fills.push(fill);
-                }
-                OrderOutcome::Closed(None)
-                | OrderOutcome::Guarded(_)
-                | OrderOutcome::Refused
-                | OrderOutcome::Unresolved(_) => {}
+        .await;
+        let outcomes = match executed {
+            Ok(outcomes) => outcomes,
+            Err(failed) => {
+                // The orders already followed are real, so their fills reach the book before the session halts.
+                self.take(&failed.outcomes);
+                self.halted = true;
+                return Err(SessionError::Journal(failed));
             }
-        }
-        let reconciliation = reconcile_and_close(
+        };
+        self.take(&outcomes);
+        let reconciliation = match reconcile_and_close(
             broker,
             journal,
             &mut self.next_sequence,
@@ -247,11 +293,32 @@ impl<S: Strategy> Session<S> {
             self.settings.patience,
         )
         .await
-        .map_err(SessionError::Reconcile)?;
-        self.halted = !reconciliation.reading.agrees();
+        {
+            Ok(reconciliation) => reconciliation,
+            Err(failed) => {
+                self.halted = true;
+                return Err(SessionError::Reconcile(failed));
+            }
+        };
+        self.halted |= !reconciliation.reading.agrees();
         self.book = reconciliation.book;
         self.fills.clear();
         Ok(())
+    }
+
+    /// Folds each closed order's fill into the book, halting on an order left unresolved, which may still be open at
+    /// the broker and would overlap the next decision's orders.
+    fn take(&mut self, outcomes: &[OrderOutcome]) {
+        for outcome in outcomes {
+            match outcome {
+                OrderOutcome::Closed(Some(fill)) => {
+                    self.book = std::mem::take(&mut self.book).combine(Book::of(fill));
+                    self.fills.push(fill.clone());
+                }
+                OrderOutcome::Unresolved(_) => self.halted = true,
+                OrderOutcome::Closed(None) | OrderOutcome::Guarded(_) | OrderOutcome::Refused => {}
+            }
+        }
     }
 
     fn fold_in(&mut self, event: MarketEvent) {
@@ -259,11 +326,16 @@ impl<S: Strategy> Session<S> {
         self.state = state.combine(MarketState::of(event));
     }
 
-    /// The symbol's last one-minute close, unless it is older than the settings allow.
+    /// The symbol's last one-minute close, unless the print that set it is older than the settings allow.
     fn fresh_price(&self, symbol: &Symbol, now: DateTime<Utc>) -> Option<Price> {
         let (at, price) = self.state.last_close(symbol, BarInterval::OneMinute)?;
         (now - at <= self.settings.stale_after).then_some(price)
     }
+}
+
+/// The end of the latest decision bar ended by `instant`, which is at or before it.
+fn decision_before(instant: DateTime<Utc>, interval: DecisionInterval) -> DateTime<Utc> {
+    decision_after(instant, interval) - interval.length()
 }
 
 /// The end of the decision bar containing `instant`, which is after it: a five-minute bar ends on the next multiple of
@@ -322,9 +394,11 @@ mod tests {
         }
     }
 
-    /// A broker that fills every order at once at `ticks`, keeping its own book, which `skew` moves off the session's.
+    /// A broker that fills every order at once at `ticks`, keeping its own book, which starts wherever a test puts it.
     struct Filling {
         ticks: i64,
+        /// Whether orders fill; when they do not, each stays open and its cancel never takes.
+        fills: bool,
         book: Mutex<Book>,
         last: Mutex<Option<BrokerOrder>>,
     }
@@ -333,6 +407,7 @@ mod tests {
         fn new(ticks: i64, book: Book) -> Self {
             Self {
                 ticks,
+                fills: true,
                 book: Mutex::new(book),
                 last: Mutex::new(None),
             }
@@ -343,6 +418,14 @@ mod tests {
         async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
             let order = request.order();
             let price = Price::from_ticks(self.ticks).unwrap();
+            if !self.fills {
+                let open = BrokerOrder::new(
+                    BrokerOrderId::new("broker-1".to_string()),
+                    OrderReport::new(OrderStatus::Open, None, at("14:05:02")),
+                );
+                *self.last.lock().unwrap() = Some(open.clone());
+                return Ok(open);
+            }
             let fill = Fill::new(
                 at("14:05:02"),
                 order.symbol().clone(),
@@ -424,7 +507,7 @@ mod tests {
         let settings =
             SessionSettings::new(DecisionInterval::FiveMinute, limits, patience, stale_after)
                 .unwrap();
-        Session::new(
+        let mut session = Session::new(
             OneShare,
             settings,
             calendar,
@@ -434,7 +517,12 @@ mod tests {
             funded,
             dollars(10_000),
             at("14:00:00"),
-        )
+        );
+        session.observe(&FeedEvent::Backfilled {
+            since: at("13:59:00"),
+            fresh: 0,
+        });
+        session
     }
 
     /// A one-share SPY print at `when` for `ticks`, a regular sale on the consolidated tape.
@@ -574,8 +662,136 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// Freshness reads the closing print's own time: a close three seconds old is fresh under a one-minute limit.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_close_is_as_old_as_its_print() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(1), funded);
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:04:59", 701_000_000));
+        session
+            .advance(at("14:05:02"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(session.book().position(&spy()).units(), 1_000_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// From a lost stream until a backfill after its reopen, nothing is drained or decided; then the session catches
+    /// up and decides on the whole tape.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_gap_in_the_tape_holds_the_session_until_backfilled() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        session.observe(&FeedEvent::Lost {
+            cause: "the stream closed".to_string(),
+        });
+        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .advance(at("14:05:02"), &broker, &mut journal)
+            .await
+            .unwrap();
+        session.observe(&FeedEvent::Reopened { attempts: 1 });
+        session
+            .advance(at("14:05:03"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(journaled(&directory), Vec::<&str>::new());
+        session.observe(&FeedEvent::Backfilled {
+            since: at("14:04:00"),
+            fresh: 0,
+        });
+        session
+            .advance(at("14:05:04"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(journaled(&directory)[0], "target_decided");
+        assert_eq!(session.book().position(&spy()).units(), 1_000_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// An order left unresolved may still be open at the broker, so the session halts rather than send another.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_unresolved_order_halts_the_session() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let mut broker = Filling::new(701_000_000, funded.clone());
+        broker.fills = false;
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .advance(at("14:05:02"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert!(session.halted());
+        assert!(journaled(&directory).contains(&"order_unresolved"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Nothing is drained or decided before the feed's startup backfill arrives.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_session_waits_for_the_startup_backfill() {
+        let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let started = session(TimeDelta::minutes(5), funded.clone());
+        let mut session = Session::new(
+            OneShare,
+            started.settings,
+            started.calendar,
+            date,
+            TradeConditions::new(BTreeMap::new()),
+            MarketState::default(),
+            funded,
+            Cash::from_units(10_000 * DOLLAR),
+            at("14:00:00"),
+        );
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .advance(at("14:05:02"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(journaled(&directory), Vec::<&str>::new());
+        session.observe(&FeedEvent::Backfilled {
+            since: at("14:00:00"),
+            fresh: 0,
+        });
+        session
+            .advance(at("14:05:03"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(journaled(&directory)[0], "target_decided");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A journal that refuses the decision halts the session as well as failing the call.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_step_halts_the_session() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        std::fs::remove_dir_all(&directory).unwrap();
+        session.observe(&print(1, "14:04:30", 701_000_000));
+        let failed = session.advance(at("14:05:02"), &broker, &mut journal).await;
+        assert!(matches!(failed, Err(SessionError::Journal(_))));
+        assert!(session.halted());
+    }
+
     #[test]
     fn test_a_decision_bar_ends_on_its_next_boundary() {
+        assert_eq!(
+            decision_before(at("14:05:00"), DecisionInterval::FiveMinute),
+            at("14:05:00")
+        );
+        assert_eq!(
+            decision_before(at("14:09:59"), DecisionInterval::FiveMinute),
+            at("14:05:00")
+        );
         assert_eq!(
             decision_after(at("14:03:20"), DecisionInterval::FiveMinute),
             at("14:05:00")

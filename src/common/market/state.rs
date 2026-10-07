@@ -61,8 +61,9 @@ pub enum RollingVolumeRefusal {
 /// What one bar leaves in the state; ordered so a repeated timestamp keeps the greater and the combine commutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Retained {
+    /// The close and the instant it was set: the closing print's for a trade bar, the bar's end for a vendor bar;
     /// `None` for a trade bar no print was allowed to price, such as a minute of odd lots.
-    close: Option<Price>,
+    close: Option<(DateTime<Utc>, Price)>,
     volume: Shares,
 }
 
@@ -87,7 +88,7 @@ impl MarketState {
                 bar.interval(),
                 bar.timestamp(),
                 Retained {
-                    close: Some(bar.prices().close()),
+                    close: Some((bar.ends(), bar.prices().close())),
                     volume: bar.volume(),
                 },
             ),
@@ -96,7 +97,7 @@ impl MarketState {
                 bar.interval(),
                 bar.timestamp(),
                 Retained {
-                    close: bar.sums().open_close().map(|prices| prices.close().1),
+                    close: bar.sums().open_close().map(|prices| prices.close()),
                     volume: bar.sums().totals().volume(),
                 },
             ),
@@ -127,16 +128,17 @@ impl MarketState {
         self.last_close(symbol, interval).map(|(_, price)| price)
     }
 
-    /// `last_price` with the timestamp of the bar that set it, so a caller can judge how old it is.
+    /// `last_price` with the instant it was set, so a caller can judge how old it is: the closing print's for a trade
+    /// bar, the bar's end for a vendor bar.
     pub fn last_close(
         &self,
         symbol: &Symbol,
         interval: BarInterval,
     ) -> Option<(DateTime<Utc>, Price)> {
         self.bars(symbol, interval)?
-            .iter()
+            .values()
             .rev()
-            .find_map(|(timestamp, retained)| retained.close.map(|close| (*timestamp, close)))
+            .find_map(|retained| retained.close)
     }
 
     /// The volume of the series' latest `depth` bars, refused until that many are held.
