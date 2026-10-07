@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// How the fake `duckdb` answers one view.
+#[derive(Clone, Copy)]
 enum Answer {
     Rows(u64),
     Error(&'static str),
@@ -64,10 +65,12 @@ fn real(answers: &[(&str, Answer)], profile: &str) -> (i32, String) {
     check(&root().join("check-views"), answers, profile)
 }
 
+/// The archive's bar views, the derived trade bars answering as the vendor minute bars do.
 fn bars(daily: Answer, minute: Answer) -> Vec<(&'static str, Answer)> {
     vec![
         ("massive_daily_bars", daily),
         ("alpaca_minute_bars", minute),
+        ("alpaca_trade_bars", minute),
     ]
 }
 
@@ -86,6 +89,7 @@ fn test_every_view_in_views_sql_is_checked() {
         ("journal", Answer::Rows(2)),
         ("logs", Answer::Rows(3)),
         ("experiments", Answer::Rows(1)),
+        ("bar_seam", Answer::Rows(0)),
     ]);
     let (status, output) = real(&answers, "");
     assert_eq!(
@@ -93,9 +97,11 @@ fn test_every_view_in_views_sql_is_checked() {
         [
             "massive_daily_bars",
             "alpaca_minute_bars",
+            "alpaca_trade_bars",
             "journal",
             "logs",
-            "experiments"
+            "experiments",
+            "bar_seam"
         ]
     );
     assert_eq!(status, 0, "{output}");
@@ -124,25 +130,33 @@ fn test_a_view_that_does_not_create_fails() {
     );
 }
 
+/// A developer's paper trader may or may not have shipped, so its logs and the seam pass either way.
 #[test]
-fn test_a_dormant_view_is_empty_in_every_development_profile() {
+fn test_trader_records_are_optional_in_every_development_profile() {
     for profile in ["development", "development/john.forstmeier"] {
         let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), profile);
         assert_eq!(status, 0, "{profile}: {output}");
-        assert!(output.contains("logs: dormant\n"), "{profile}: {output}");
+        assert!(
+            output.contains("logs: optional, nothing written\n"),
+            "{profile}: {output}"
+        );
+        assert!(
+            output.contains("bar_seam: optional, nothing written\n"),
+            "{profile}: {output}"
+        );
+        let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
+        answers.extend([("logs", Answer::Rows(4)), ("bar_seam", Answer::Rows(9))]);
+        let (status, output) = real(&answers, profile);
+        assert_eq!(status, 0, "{profile}: {output}");
+        assert!(
+            output.contains("logs: optional, 4 rows\n"),
+            "{profile}: {output}"
+        );
+        assert!(
+            output.contains("bar_seam: optional, 9 rows\n"),
+            "{profile}: {output}"
+        );
     }
-}
-
-#[test]
-fn test_a_dormant_view_that_reads_rows_fails() {
-    let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
-    answers.push(("logs", Answer::Rows(4)));
-    let (status, output) = real(&answers, "development");
-    assert_eq!(status, 3, "{output}");
-    assert!(
-        output.contains("logs: dormant but reads 4 rows"),
-        "{output}"
-    );
 }
 
 /// A developer's studies may or may not have shipped, so their journal and experiments pass either way.
@@ -210,6 +224,7 @@ fn test_every_live_view_out_of_reach_is_a_check_not_made() {
         ("journal", Answer::Error(OUT_OF_REACH)),
         ("logs", Answer::Error(OUT_OF_REACH)),
         ("experiments", Answer::Error(OUT_OF_REACH)),
+        ("bar_seam", Answer::Error(OUT_OF_REACH)),
     ]);
     let (status, output) = real(&answers, "production");
     assert_eq!(status, 1, "{output}");
