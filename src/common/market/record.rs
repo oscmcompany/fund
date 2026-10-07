@@ -29,6 +29,17 @@ pub enum BarInterval {
     OneDay,
 }
 
+impl BarInterval {
+    /// When a bar stamped `timestamp` ends: an intraday bar is stamped at its start and a daily bar at its close.
+    pub fn ends(self, timestamp: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Self::OneMinute => timestamp + TimeDelta::minutes(1),
+            Self::FiveMinute => timestamp + TimeDelta::minutes(5),
+            Self::OneDay => timestamp,
+        }
+    }
+}
+
 /// Open, high, low and close, with the open and close inside `[low, high]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ohlc {
@@ -157,11 +168,7 @@ impl Bar {
 
     /// The instant the bar's period ends: an intraday bar is stamped at its start and a daily bar at its close.
     pub fn ends(&self) -> DateTime<Utc> {
-        match self.interval {
-            BarInterval::OneMinute => self.timestamp + TimeDelta::minutes(1),
-            BarInterval::FiveMinute => self.timestamp + TimeDelta::minutes(5),
-            BarInterval::OneDay => self.timestamp,
-        }
+        self.interval.ends(self.timestamp)
     }
 
     /// This bar with every price set to `price` and its dollar volume to match, keeping the series, instant, volume

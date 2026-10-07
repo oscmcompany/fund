@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 use chrono::{DateTime, Utc};
 
 use super::record::{Bar, BarInterval};
+use super::trade_bars::TradeBar;
 use super::{Price, Shares, Symbol};
 use crate::common::monoid::Monoid;
 use crate::common::time::calendar::{SessionPhase, TradingCalendar};
@@ -18,6 +19,8 @@ pub const RETAINED_BARS: usize = 100;
 #[derive(Debug, Clone, PartialEq)]
 pub enum MarketEvent {
     Bar(Bar),
+    /// A bar built from the tape's prints, as the archive derives them and the trader builds them live.
+    Trades(TradeBar),
     Clock(DateTime<Utc>),
 }
 
@@ -58,7 +61,8 @@ pub enum RollingVolumeRefusal {
 /// What one bar leaves in the state; ordered so a repeated timestamp keeps the greater and the combine commutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Retained {
-    close: Price,
+    /// `None` for a trade bar no print was allowed to price, such as a minute of odd lots.
+    close: Option<Price>,
     volume: Shares,
 }
 
@@ -78,19 +82,39 @@ impl MarketState {
                 clock: Some(instant),
                 series: BTreeMap::new(),
             },
-            MarketEvent::Bar(bar) => {
-                let retained = Retained {
-                    close: bar.prices().close(),
+            MarketEvent::Bar(bar) => Self::retaining(
+                bar.symbol(),
+                bar.interval(),
+                bar.timestamp(),
+                Retained {
+                    close: Some(bar.prices().close()),
                     volume: bar.volume(),
-                };
-                Self {
-                    clock: None,
-                    series: BTreeMap::from([(
-                        (bar.symbol().clone(), bar.interval()),
-                        BTreeMap::from([(bar.timestamp(), retained)]),
-                    )]),
-                }
-            }
+                },
+            ),
+            MarketEvent::Trades(bar) => Self::retaining(
+                bar.symbol(),
+                bar.interval(),
+                bar.timestamp(),
+                Retained {
+                    close: bar.sums().open_close().map(|prices| prices.close().1),
+                    volume: bar.sums().totals().volume(),
+                },
+            ),
+        }
+    }
+
+    fn retaining(
+        symbol: &Symbol,
+        interval: BarInterval,
+        timestamp: DateTime<Utc>,
+        retained: Retained,
+    ) -> Self {
+        Self {
+            clock: None,
+            series: BTreeMap::from([(
+                (symbol.clone(), interval),
+                BTreeMap::from([(timestamp, retained)]),
+            )]),
         }
     }
 
@@ -98,11 +122,12 @@ impl MarketState {
         self.clock
     }
 
-    /// The close of the series' latest bar, `None` when no bar of it has been seen.
+    /// The close of the series' latest priced bar, `None` when no retained bar of it has a close.
     pub fn last_price(&self, symbol: &Symbol, interval: BarInterval) -> Option<Price> {
         self.bars(symbol, interval)?
-            .last_key_value()
-            .map(|(_, retained)| retained.close)
+            .values()
+            .rev()
+            .find_map(|retained| retained.close)
     }
 
     /// The volume of the series' latest `depth` bars, refused until that many are held.
@@ -169,7 +194,10 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::Ohlc;
+    use crate::common::market::trade_bars::{OpenClose, TradeSums};
+    use crate::common::market::{DollarVolume, TradeCount};
     use crate::common::monoid::{concatenate, laws};
     use crate::common::time::SessionDate;
     use crate::common::time::calendar::TradingSession;
@@ -193,6 +221,28 @@ mod tests {
             Shares::whole(volume).unwrap(),
             None,
             None,
+        )
+        .unwrap()
+    }
+
+    /// A one-minute trade bar `minute` minutes after the 13:30 UTC open, priced at `close` when one is given.
+    fn minute_trade_bar(raw: &str, minute: i64, close: Option<i64>, volume: u64) -> TradeBar {
+        let at =
+            "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute);
+        let open_close = close.map(|ticks| {
+            let price = Price::from_ticks(ticks).unwrap();
+            OpenClose::new((at, price), (at, price)).unwrap()
+        });
+        let totals = TradeTotals::new(
+            TradeCount::new(1),
+            Shares::whole(volume).unwrap(),
+            DollarVolume::default(),
+        );
+        TradeBar::new(
+            symbol(raw),
+            BarInterval::OneMinute,
+            at,
+            TradeSums::new(totals, open_close, None),
         )
         .unwrap()
     }
@@ -315,6 +365,27 @@ mod tests {
         );
     }
 
+    /// A minute of trades with no print allowed to price it adds volume and leaves the last price where the last
+    /// priced minute set it.
+    #[test]
+    fn test_a_trade_bar_with_no_close_adds_volume_and_keeps_the_last_price() {
+        let state = fold([
+            MarketEvent::Trades(minute_trade_bar("AAPL", 0, Some(150_000_000), 100)),
+            MarketEvent::Trades(minute_trade_bar("AAPL", 1, None, 30)),
+        ]);
+        let aapl = symbol("AAPL");
+        assert_eq!(
+            state.last_price(&aapl, BarInterval::OneMinute),
+            Some(Price::from_ticks(150_000_000).unwrap())
+        );
+        assert_eq!(
+            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(2)),
+            Ok(Shares::whole(130).unwrap())
+        );
+        let unpriced = MarketState::of(MarketEvent::Trades(minute_trade_bar("AAPL", 1, None, 30)));
+        assert_eq!(unpriced.last_price(&aapl, BarInterval::OneMinute), None);
+    }
+
     /// Minute and daily bars of one symbol are separate series.
     #[test]
     fn test_each_interval_is_its_own_series() {
@@ -383,12 +454,14 @@ mod tests {
         );
     }
 
-    /// Bars for two symbols at both intervals, with timestamps dense enough to repeat and, for minutes, to pass the
-    /// retained count, interleaved with clock reports.
+    /// Bars and trade bars, priced or not, for two symbols at both intervals, with timestamps dense enough to repeat
+    /// and, for minutes, to pass the retained count, interleaved with clock reports.
     fn any_event() -> impl Strategy<Value = MarketEvent> {
         prop_oneof![
             6 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..130, 1_i64..4, 0_u64..1_000)
                 .prop_map(|(raw, minute, close, volume)| MarketEvent::Bar(minute_bar(raw, minute, close, volume))),
+            3 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..130, prop::option::of(1_i64..4), 0_u64..1_000)
+                .prop_map(|(raw, minute, close, volume)| MarketEvent::Trades(minute_trade_bar(raw, minute, close, volume))),
             2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_u64..1_000)
                 .prop_map(|(raw, day, close, volume)| MarketEvent::Bar(daily_bar(raw, day, close, volume))),
             1 => (0_i64..1_000).prop_map(|minute| MarketEvent::Clock(session().regular_close() + TimeDelta::minutes(minute))),
@@ -453,6 +526,7 @@ mod tests {
                 .chain(&tail)
                 .map(|event| match event {
                     MarketEvent::Bar(bar) => bar.timestamp(),
+                    MarketEvent::Trades(bar) => bar.timestamp(),
                     MarketEvent::Clock(instant) => *instant,
                 })
                 .collect();
