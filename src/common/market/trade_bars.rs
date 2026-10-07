@@ -483,15 +483,6 @@ impl TradeBar {
     }
 }
 
-/// When the bar starting at `timestamp` ends; a daily bar is stamped at its close, so it ends where it is stamped.
-fn ends(timestamp: DateTime<Utc>, interval: BarInterval) -> DateTime<Utc> {
-    match interval {
-        BarInterval::OneMinute => timestamp + TimeDelta::minutes(1),
-        BarInterval::FiveMinute => timestamp + TimeDelta::minutes(5),
-        BarInterval::OneDay => timestamp,
-    }
-}
-
 /// The bucket an instant falls in at `interval`; a daily bucket is its session's close.
 fn bucket(instant: DateTime<Utc>, interval: BarInterval) -> DateTime<Utc> {
     let minute = instant
@@ -545,7 +536,7 @@ impl TradeRollup {
     fn split_through(&mut self, through: DateTime<Utc>) -> Self {
         let (ended, open) = std::mem::take(&mut self.0)
             .into_iter()
-            .partition(|((_, interval, timestamp), _)| ends(*timestamp, *interval) <= through);
+            .partition(|((_, interval, timestamp), _)| interval.ends(*timestamp) <= through);
         self.0 = open;
         Self(ended)
     }
@@ -593,7 +584,8 @@ pub struct TradeFoldCounts {
     /// Published with no shares, which may set prices and never volume.
     unsized_prints: u64,
     unresolved: u64,
-    /// Arrived for a minute already handed out by `drain_through`, so left out to keep handed-out bars final.
+    /// Arrived for a minute ending by the cutoff `drain_through` set, whether or not that minute held a bar, and left out so
+    /// a bar handed out never changes.
     late: u64,
 }
 
@@ -633,7 +625,7 @@ pub struct TradeFold {
     session: SessionDate,
     conditions: TradeConditions,
     minutes: TradeRollup,
-    /// The instant through which bars have been handed out, once any have.
+    /// The cutoff the latest `drain_through` set: every minute ending by it is closed to further prints.
     drained_through: Option<DateTime<Utc>>,
     counts: TradeFoldCounts,
 }
@@ -671,10 +663,8 @@ impl TradeFold {
             self.counts.corrected += 1;
             return;
         }
-        let minute_ends = ends(
-            bucket(print.timestamp(), BarInterval::OneMinute),
-            BarInterval::OneMinute,
-        );
+        let minute_ends =
+            BarInterval::OneMinute.ends(bucket(print.timestamp(), BarInterval::OneMinute));
         if self
             .drained_through
             .is_some_and(|drained| minute_ends <= drained)

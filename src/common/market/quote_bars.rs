@@ -473,7 +473,7 @@ impl QuoteFold {
         let until = until.min(self.close);
         while from < until {
             let minute = bucket(from, BarInterval::OneMinute);
-            let end = (minute + TimeDelta::minutes(1)).min(until);
+            let end = BarInterval::OneMinute.ends(minute).min(until);
             let nanoseconds = (end - from)
                 .num_nanoseconds()
                 .and_then(|nanoseconds| u64::try_from(nanoseconds).ok())
