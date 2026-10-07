@@ -7,7 +7,7 @@ use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
 use super::aggregate::TradeTotals;
 use super::record::{BarInterval, Trade};
-use super::{Price, Symbol};
+use super::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
 
@@ -489,6 +489,46 @@ impl TradeBar {
 
     pub fn sums(&self) -> &TradeSums {
         &self.sums
+    }
+}
+
+/// A bar the trader built from the tape, journaled as `bar_built` with the archive's trade bar columns so a session's
+/// bars can be diffed against the archive's for the same minutes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BarBuilt {
+    symbol: Symbol,
+    interval: BarInterval,
+    timestamp: DateTime<Utc>,
+    trade_count: TradeCount,
+    volume: Shares,
+    dollar_volume: DollarVolume,
+    opened_at: Option<DateTime<Utc>>,
+    open: Option<Price>,
+    closed_at: Option<DateTime<Utc>>,
+    close: Option<Price>,
+    high: Option<Price>,
+    low: Option<Price>,
+}
+
+impl BarBuilt {
+    pub fn of(bar: &TradeBar) -> Self {
+        let totals = bar.sums.totals;
+        let open_close = bar.sums.open_close;
+        let high_low = bar.sums.high_low;
+        Self {
+            symbol: bar.symbol.clone(),
+            interval: bar.interval,
+            timestamp: bar.timestamp,
+            trade_count: totals.count(),
+            volume: totals.volume(),
+            dollar_volume: totals.dollar_volume(),
+            opened_at: open_close.map(|prices| prices.open.0),
+            open: open_close.map(|prices| prices.open.1),
+            closed_at: open_close.map(|prices| prices.close.0),
+            close: open_close.map(|prices| prices.close.1),
+            high: high_low.map(|prices| prices.high()),
+            low: high_low.map(|prices| prices.low()),
+        }
     }
 }
 

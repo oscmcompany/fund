@@ -10,7 +10,7 @@ use crate::common::book::{Book, Cash, Fill};
 use crate::common::journal::Observation;
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState};
-use crate::common::market::trade_bars::{TradeBar, TradeConditions, TradeFold};
+use crate::common::market::trade_bars::{BarBuilt, TradeBar, TradeConditions, TradeFold};
 use crate::common::market::{Price, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::reconcile::rounding_allowance;
@@ -253,6 +253,13 @@ impl<S: Strategy> Session<S> {
         }
         let settled = now - SETTLING;
         for bar in self.fold.drain_through(settled) {
+            if let Err(error) = journal.append(now, Observation::BarBuilt(BarBuilt::of(&bar))) {
+                self.halted = true;
+                return Err(SessionError::Journal(JournalFailed {
+                    outcomes: Vec::new(),
+                    error,
+                }));
+            }
             self.fold_in(MarketEvent::Trades(bar));
         }
         if self.halted || settled < self.next_decision {
@@ -643,13 +650,13 @@ mod tests {
             .advance(at("14:03:00"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory), Vec::<&str>::new());
+        assert_eq!(journaled(&directory), ["bar_built"]);
         session.observe(&print(2, "14:04:30", 701_000_000));
         session
             .advance(at("14:05:01"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory), Vec::<&str>::new());
+        assert_eq!(journaled(&directory), ["bar_built"]);
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
@@ -657,6 +664,8 @@ mod tests {
         assert_eq!(
             journaled(&directory),
             [
+                "bar_built",
+                "bar_built",
                 "target_decided",
                 "order_submitted",
                 "order_closed",
@@ -673,7 +682,7 @@ mod tests {
             .advance(at("14:09:00"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory).len(), 4);
+        assert_eq!(journaled(&directory).len(), 6);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -690,7 +699,7 @@ mod tests {
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory), ["target_decided"]);
+        assert_eq!(journaled(&directory), ["bar_built", "target_decided"]);
         assert_eq!(session.book(), &funded);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -709,13 +718,19 @@ mod tests {
             .await
             .unwrap();
         assert!(session.halted());
-        let decided = journaled(&directory).len();
+        let decisions = |directory| {
+            journaled(directory)
+                .into_iter()
+                .filter(|event_type| *event_type == "target_decided")
+                .count()
+        };
+        assert_eq!(decisions(&directory), 1);
         session.observe(&print(2, "14:09:30", 701_000_000));
         session
             .advance(at("14:10:02"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory).len(), decided);
+        assert_eq!(decisions(&directory), 1);
         assert_eq!(
             session.book().cash(),
             Cash::from_units(9_000 * DOLLAR - 701 * DOLLAR)
@@ -769,7 +784,7 @@ mod tests {
             .advance(at("14:05:04"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory)[0], "target_decided");
+        assert_eq!(journaled(&directory)[..2], ["bar_built", "target_decided"]);
         assert_eq!(session.book().position(&spy()).units(), 1_000_000);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -825,11 +840,11 @@ mod tests {
             .advance(at("14:05:03"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory)[0], "target_decided");
+        assert_eq!(journaled(&directory)[..2], ["bar_built", "target_decided"]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A journal that refuses the decision halts the session as well as failing the call.
+    /// A journal that refuses a built bar halts the session as well as failing the call.
     #[tokio::test(start_paused = true)]
     async fn test_a_failed_step_halts_the_session() {
         let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
@@ -841,6 +856,31 @@ mod tests {
         let failed = session.advance(at("14:05:02"), &broker, &mut journal).await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
         assert!(session.halted());
+    }
+
+    /// A journal that refuses the decision itself, with every bar already journaled, halts the session too.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_decision_halts_the_session() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut refusing, gone) = journal();
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:01:10", 701_000_000));
+        session
+            .advance(at("14:03:00"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(journaled(&directory), ["bar_built"]);
+        std::fs::remove_dir_all(&gone).unwrap();
+        let failed = session
+            .advance(at("14:05:02"), &broker, &mut refusing)
+            .await;
+        assert!(matches!(failed, Err(SessionError::Journal(_))));
+        assert!(session.halted());
+        assert_eq!(session.next_decision, at("14:10:00"));
+        assert_eq!(session.book().position(&spy()).units(), 0);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -992,10 +1032,65 @@ mod tests {
             .unwrap();
         assert_eq!(
             journaled(&directory),
-            ["target_decided", "order_guarded", "book_reconciled"]
+            [
+                "bar_built",
+                "target_decided",
+                "order_guarded",
+                "book_reconciled"
+            ]
         );
         assert_eq!(session.book(), &funded);
         assert!(!session.halted());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Each settled minute is journaled as the bar the fold built, before anything decides on it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_settled_minute_is_journaled_as_built() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:01:10", 700_000_000));
+        session.observe(&print(2, "14:01:40", 702_000_000));
+        session
+            .advance(at("14:03:00"), &broker, &mut journal)
+            .await
+            .unwrap();
+        let payloads: Vec<serde_json::Value> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()["payload"].clone()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            payloads,
+            [serde_json::json!({
+                "symbol": "SPY",
+                "interval": "one_minute",
+                "timestamp": "2026-10-07T14:01:00Z",
+                "trade_count": 2,
+                "volume": 2_000_000,
+                "dollar_volume": "1402000000000000",
+                "opened_at": "2026-10-07T14:01:10Z",
+                "open": 700_000_000,
+                "closed_at": "2026-10-07T14:01:40Z",
+                "close": 702_000_000,
+                "high": 702_000_000,
+                "low": 700_000_000,
+            })]
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
