@@ -1,13 +1,18 @@
 //! The hard pre-trade check between orders and the broker: an order goes out only in a symbol the broker reports
-//! tradable, and in whole shares where it trades no fraction; anything it cannot vouch for is refused with its cause.
+//! tradable, in whole shares where it trades no fraction, and as a fractional buy only when it meets the broker's
+//! minimum; anything it cannot vouch for is refused with its cause.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::common::book::Side;
-use crate::common::market::{SHARE_SCALE, Shares, Symbol};
+use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::strategy::Order;
+
+/// The least a fractional buy may be worth, one dollar, under which Alpaca refuses it; a fractional sell has no floor.
+const LEAST_FRACTIONAL_BUY: DollarVolume =
+    DollarVolume::from_units(PRICE_SCALE.unsigned_abs() as u128 * SHARE_SCALE as u128);
 
 /// What the broker reports of a symbol's trading, read before orders go out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +50,8 @@ pub enum GuardCause {
     Fractional,
     /// No reading of the symbol was taken, so nothing vouches for it.
     Unread,
+    /// A fractional buy worth less than the broker's minimum at the symbol's price.
+    BelowMinimum,
 }
 
 /// An order the guard held back, journaled so the gap between a target and the book it reached is explained.
@@ -91,8 +98,13 @@ impl Guarded {
     }
 }
 
-/// Lets each order through only when `tradability` vouches for its symbol and size.
-pub fn guard(orders: Vec<Order>, tradability: &BTreeMap<Symbol, Tradability>) -> Guarded {
+/// Lets each order through only when `tradability` vouches for its symbol and size. A fractional buy is held under the
+/// minimum at `price`; one without a price goes out for the broker to judge.
+pub fn guard(
+    orders: Vec<Order>,
+    tradability: &BTreeMap<Symbol, Tradability>,
+    price: impl Fn(&Symbol) -> Option<Price>,
+) -> Guarded {
     let mut guarded = Guarded {
         passed: Vec::new(),
         held: Vec::new(),
@@ -100,6 +112,9 @@ pub fn guard(orders: Vec<Order>, tradability: &BTreeMap<Symbol, Tradability>) ->
     for order in orders {
         let whole = order.shares().units() % SHARE_SCALE == 0;
         let cause = match (tradability.get(order.symbol()), whole) {
+            (Some(Tradability::Fractionable), false) if below_minimum(&order, &price) => {
+                GuardCause::BelowMinimum
+            }
             (Some(Tradability::Fractionable), true | false)
             | (Some(Tradability::WholeSharesOnly), true) => {
                 guarded.passed.push(order);
@@ -118,6 +133,15 @@ pub fn guard(orders: Vec<Order>, tradability: &BTreeMap<Symbol, Tradability>) ->
         });
     }
     guarded
+}
+
+/// Whether `order` is a buy worth less than the broker's minimum at its symbol's known price.
+fn below_minimum(order: &Order, price: impl Fn(&Symbol) -> Option<Price>) -> bool {
+    match order.side() {
+        Side::Buy => price(order.symbol())
+            .is_some_and(|price| DollarVolume::of(price, order.shares()) < LEAST_FRACTIONAL_BUY),
+        Side::Sell => false,
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +207,7 @@ mod tests {
                 ("ZZZZ", units),
                 ("QQQ", units),
             ]);
-            let guarded = guard(orders, &tradability);
+            let guarded = guard(orders, &tradability, |_| None);
             let symbols: Vec<&str> = guarded
                 .passed()
                 .iter()
@@ -205,7 +229,16 @@ mod tests {
         use strum::IntoEnumIterator;
 
         let causes: Vec<&str> = GuardCause::iter().map(Into::into).collect();
-        assert_eq!(causes, ["untradable", "unlisted", "fractional", "unread"]);
+        assert_eq!(
+            causes,
+            [
+                "untradable",
+                "unlisted",
+                "fractional",
+                "unread",
+                "below_minimum"
+            ]
+        );
         for cause in GuardCause::iter() {
             assert_eq!(
                 serde_json::to_string(&cause).unwrap(),
@@ -213,6 +246,45 @@ mod tests {
             );
             assert_eq!(cause.to_string().parse(), Ok(cause));
         }
+    }
+
+    /// A fractional buy is held below a dollar at its price and passes at one; a sell, a whole share and an unpriced
+    /// buy pass whatever they are worth.
+    #[test]
+    fn test_a_fractional_buy_under_a_dollar_is_held() {
+        let fractionable = BTreeMap::from([(symbol("F"), Tradability::Fractionable)]);
+        let price = |_: &Symbol| Some(Price::from_ticks(10_000_000).unwrap());
+        let held = |order: Order, price: &dyn Fn(&Symbol) -> Option<Price>| {
+            guard(vec![order], &fractionable, price)
+                .held()
+                .iter()
+                .map(OrderGuarded::cause)
+                .collect::<Vec<_>>()
+        };
+        let buy = |units| buys(&[("F", units)]).remove(0);
+        assert_eq!(held(buy(99_999), &price), [GuardCause::BelowMinimum]);
+        assert_eq!(held(buy(100_000), &price), []);
+        assert_eq!(held(buy(99_999), &|_| None), []);
+        let cheap = |_: &Symbol| Some(Price::from_ticks(500_000).unwrap());
+        assert_eq!(held(buy(1_000_000), &cheap), []);
+        let book = Book::of(
+            &crate::common::book::Fill::new(
+                "2026-10-07T18:00:00Z".parse().unwrap(),
+                symbol("F"),
+                Side::Buy,
+                Shares::from_units(150_000),
+                Price::from_ticks(10_000_000).unwrap(),
+                DollarVolume::from_units(0),
+            )
+            .unwrap(),
+        );
+        let sell = orders(
+            &book,
+            &Target::new(BTreeMap::from([(symbol("F"), Shares::from_units(100_000))])),
+        )
+        .remove(0);
+        assert_eq!(sell.side(), Side::Sell);
+        assert_eq!(held(sell, &price), []);
     }
 
     proptest! {
@@ -241,7 +313,7 @@ mod tests {
                 .map(|(raw, reading)| (symbol(raw), reading))
                 .collect();
             let orders = buys(&wanted);
-            let guarded = guard(orders.clone(), &tradability);
+            let guarded = guard(orders.clone(), &tradability, |_| None);
             let mut sorted: Vec<&Symbol> = guarded
                 .passed()
                 .iter()

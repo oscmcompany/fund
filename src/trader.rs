@@ -283,12 +283,20 @@ impl<S: Strategy> Session<S> {
             // An unpriced exposure cannot be capped, so the book is left as it stands until the price returns.
             Err(_) => return Ok(()),
         };
+        let prices: BTreeMap<Symbol, Price> = self
+            .book
+            .positions()
+            .keys()
+            .chain(restrained.target().holdings().keys())
+            .filter_map(|symbol| Some((symbol.clone(), self.fresh_price(symbol, now)?)))
+            .collect();
         let executed = execute(
             broker,
             journal,
             &mut self.next_sequence,
             &self.book,
             restrained.target(),
+            &prices,
             self.settings.patience,
         )
         .await;
@@ -308,6 +316,7 @@ impl<S: Strategy> Session<S> {
             &mut self.next_sequence,
             &self.book,
             rounding_allowance(&self.fills),
+            &prices,
             self.settings.patience,
         )
         .await
@@ -525,6 +534,11 @@ mod tests {
     }
 
     fn session(stale_after: TimeDelta, funded: Book) -> Session<OneShare> {
+        session_capped(stale_after, funded, 5_000 * DOLLAR)
+    }
+
+    /// `session` with each name capped at `per_name` cash units.
+    fn session_capped(stale_after: TimeDelta, funded: Book, per_name: i128) -> Session<OneShare> {
         let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
         let calendar = TradingCalendar::new(
             vec![
@@ -542,7 +556,7 @@ mod tests {
         let dollars = |count: i128| Cash::from_units(count * DOLLAR);
         let limits = Limits::new(
             dollars(10_000),
-            dollars(5_000),
+            Cash::from_units(per_name),
             dollars(1_000),
             TimeDelta::minutes(15),
         )
@@ -961,5 +975,27 @@ mod tests {
             last_closes(&bars),
             BTreeMap::from([(spy(), Price::from_ticks(7).unwrap())])
         );
+    }
+
+    /// A per-name cap that trims a share to a sliver leaves a buy under the broker's dollar minimum, which the guard
+    /// holds rather than sending, as a cent cap on DIA did on paper.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_buy_trimmed_under_the_minimum_is_held() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session_capped(TimeDelta::minutes(5), funded.clone(), DOLLAR / 100);
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .advance(at("14:05:02"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(
+            journaled(&directory),
+            ["target_decided", "order_guarded", "book_reconciled"]
+        );
+        assert_eq!(session.book(), &funded);
+        assert!(!session.halted());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

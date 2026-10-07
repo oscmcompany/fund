@@ -628,7 +628,8 @@ mod tests {
         )]));
         let whole_only =
             BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]);
-        let guarded = guard(orders(&Book::default(), &fraction), &whole_only).held()[0].clone();
+        let guarded =
+            guard(orders(&Book::default(), &fraction), &whole_only, |_| None).held()[0].clone();
         let observations = [
             Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id))),
             Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
