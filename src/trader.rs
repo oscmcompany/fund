@@ -844,7 +844,7 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A journal that refuses the decision halts the session as well as failing the call.
+    /// A journal that refuses a built bar halts the session as well as failing the call.
     #[tokio::test(start_paused = true)]
     async fn test_a_failed_step_halts_the_session() {
         let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
@@ -856,6 +856,31 @@ mod tests {
         let failed = session.advance(at("14:05:02"), &broker, &mut journal).await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
         assert!(session.halted());
+    }
+
+    /// A journal that refuses the decision itself, with every bar already journaled, halts the session too.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_decision_halts_the_session() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut refusing, gone) = journal();
+        let (mut journal, directory) = journal();
+        session.observe(&print(1, "14:01:10", 701_000_000));
+        session
+            .advance(at("14:03:00"), &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(journaled(&directory), ["bar_built"]);
+        std::fs::remove_dir_all(&gone).unwrap();
+        let failed = session
+            .advance(at("14:05:02"), &broker, &mut refusing)
+            .await;
+        assert!(matches!(failed, Err(SessionError::Journal(_))));
+        assert!(session.halted());
+        assert_eq!(session.next_decision, at("14:10:00"));
+        assert_eq!(session.book().position(&spy()).units(), 0);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
