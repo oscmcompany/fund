@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
+use crate::common::market::{
+    DollarVolume, Dollars, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol,
+};
 use crate::common::monoid::Monoid;
 
 /// A signed amount of money in `DollarVolume` units, ticks × millionths of a share, so a fill's cash is exact.
@@ -50,6 +52,12 @@ impl Cash {
 
     fn negated(self) -> Self {
         Self(-self.0)
+    }
+}
+
+impl From<Dollars> for Cash {
+    fn from(dollars: Dollars) -> Self {
+        Self(i128::from(dollars.millionths()) * i128::from(SHARE_SCALE))
     }
 }
 
@@ -426,6 +434,12 @@ mod tests {
     #[test]
     fn test_cash_presents_in_dollars() {
         assert_eq!(Cash::from_units(-1_500_000_000_000).dollars(), -1.5);
+    }
+
+    #[test]
+    fn test_dollars_become_cash_in_its_units() {
+        let dollars: Dollars = "1.5".parse().unwrap();
+        assert_eq!(Cash::from(dollars), Cash::from_units(1_500_000_000_000));
     }
 
     #[test]

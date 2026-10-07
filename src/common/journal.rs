@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::common::book::{Book, Cash, Position};
 use crate::common::guard::{OrderGuarded, TradabilityUnread};
 use crate::common::heal::{Leg, SessionOutcome};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
@@ -192,6 +193,7 @@ pub enum Observation {
     TradabilityUnread(TradabilityUnread),
     BookReconciled(BookReconciled),
     TargetDecided(TargetDecided),
+    SessionOpened(SessionOpened),
 }
 
 impl Observation {
@@ -214,6 +216,27 @@ impl ConfigurationResolved {
 
     pub fn parameters(&self) -> &BTreeMap<Parameter, ResolvedParameter> {
         &self.parameters
+    }
+}
+
+/// The book a trading session started from, as the broker reported it, and its worth at the previous session's closes,
+/// from which the session's loss is measured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOpened {
+    session: SessionDate,
+    cash: Cash,
+    positions: BTreeMap<Symbol, Position>,
+    opening: Cash,
+}
+
+impl SessionOpened {
+    pub fn new(session: SessionDate, book: &Book, opening: Cash) -> Self {
+        Self {
+            session,
+            cash: book.cash(),
+            positions: book.positions().clone(),
+            opening,
+        }
     }
 }
 
@@ -568,8 +591,7 @@ mod tests {
     /// The order records as the trader writes them, pinned so a rename shows up as a changed wire format.
     #[test]
     fn test_the_order_records_encode_to_their_wire_format() {
-        use crate::common::book::Book;
-        use crate::common::book::{Cash, Position, ValuationRefusal};
+        use crate::common::book::{Book, Cash, Position, ValuationRefusal};
         use crate::common::guard::{Tradability, TradabilityUnread, guard};
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
@@ -663,6 +685,14 @@ mod tests {
                     symbol: Symbol::new("SPY").unwrap(),
                 }),
             )),
+            Observation::SessionOpened(SessionOpened::new(
+                SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap()),
+                &Book::reported(
+                    Cash::from_units(-7),
+                    [(Symbol::new("SPY").unwrap(), Position::from_units(2_000_000))],
+                ),
+                Cash::from_units(9),
+            )),
         ];
         let payloads: Vec<String> = observations
             .iter()
@@ -689,6 +719,7 @@ mod tests {
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#.to_string(),
+                r#"{"event_type":"session_opened","payload":{"session":"2026-10-07","cash":"-7","positions":{"SPY":"2000000"},"opening":"9"}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {
