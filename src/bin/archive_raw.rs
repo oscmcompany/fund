@@ -1541,7 +1541,7 @@ async fn refolded_since(
         .list(&daily.series())
         .await
         .map_err(|error| error.to_string())?;
-    let mut refolded = BTreeSet::new();
+    let mut folded_at = Vec::new();
     for key in written
         .iter()
         .filter_map(|path| Key::parse(path).ok())
@@ -1554,11 +1554,22 @@ async fn refolded_since(
             .ok_or_else(|| format!("{} listed but gone", key.path()))?;
         let (_, provenance) = trade_bars::decode(&key, body)
             .map_err(|refusal| format!("{}: {refusal:?}", key.path()))?;
-        if provenance.fetched_at() >= since {
-            refolded.insert(key.session());
-        }
+        folded_at.push((key.session(), provenance.fetched_at()));
     }
-    Ok(refolded)
+    Ok(folded_since(&folded_at, since))
+}
+
+/// The sessions whose daily file was folded at or after `since`; the daily file is written last, so a session whose
+/// refold stopped partway still carries its old instant and is folded again.
+fn folded_since(
+    folded_at: &[(SessionDate, DateTime<Utc>)],
+    since: DateTime<Utc>,
+) -> BTreeSet<SessionDate> {
+    folded_at
+        .iter()
+        .filter(|(_, at)| *at >= since)
+        .map(|(session, _)| *session)
+        .collect()
 }
 
 /// Massive's bars at `interval` and `origin` for a session.
@@ -1966,6 +1977,53 @@ mod tests {
         .filter(|comparison| deletable(*comparison))
         .collect();
         assert_eq!(allowed, [Comparison::Equal]);
+    }
+
+    #[test]
+    fn test_a_refold_resumes_past_sessions_folded_at_or_after_its_start() {
+        let session =
+            |day: u32| SessionDate::from_date(NaiveDate::from_ymd_opt(2025, 11, day).unwrap());
+        let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        let since = instant("2026-10-08T00:00:00Z");
+        let folded_at = [
+            (session(3), instant("2026-10-06T18:00:00Z")),
+            (session(4), instant("2026-10-08T00:00:00Z")),
+            (session(5), instant("2026-10-08T02:30:00Z")),
+            // A refold that stopped after the minute files leaves the daily file's earlier instant.
+            (session(6), instant("2026-10-07T23:59:59.999999999Z")),
+        ];
+        assert_eq!(
+            folded_since(&folded_at, since),
+            BTreeSet::from([session(4), session(5)])
+        );
+        let [minute, five_minute, daily] = trade_keys(session(4));
+        let intervals = [minute, five_minute, daily].map(|key| match key {
+            Key::Trades { interval, .. } => interval,
+            other @ (Key::Bars { .. }
+            | Key::Quotes { .. }
+            | Key::Reference { .. }
+            | Key::RawBars { .. }
+            | Key::RawQuotes { .. }
+            | Key::RawTrades { .. }
+            | Key::Journal { .. }
+            | Key::Logs { .. }) => panic!("{other:?}"),
+        });
+        assert_eq!(
+            intervals,
+            [
+                BarInterval::OneMinute,
+                BarInterval::FiveMinute,
+                BarInterval::OneDay
+            ]
+        );
+        let refold = |since: &str| {
+            parse(&["refold-trades", "2021-08-23", "2026-12-31", "8", since].map(String::from))
+        };
+        assert!(matches!(
+            refold("2026-10-08T00:00:00Z"),
+            Some(Command::FoldTrades { writing: Writing::Replace { since: parsed }, .. }) if parsed == since
+        ));
+        assert!(refold("yesterday").is_none());
     }
 
     #[test]
