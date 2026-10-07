@@ -2,7 +2,6 @@
 //! time, with each partition journaled once it has been read back.
 
 use std::collections::BTreeMap;
-use std::env::VarError;
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
@@ -28,7 +27,7 @@ use crate::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use crate::common::monoid::{Monoid, concatenate};
-use crate::common::parameter::{Parameter, ParameterRefusal, at_most, resolve};
+use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 use crate::ingest::alpaca::{
@@ -37,11 +36,10 @@ use crate::ingest::alpaca::{
 use crate::ingest::massive::Massive;
 use crate::ingest::{FetchError, refused_by_cause};
 use crate::journal::Journal;
+use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
 
 const DEFAULT_LOOKBACK_SESSIONS: NonZeroUsize = NonZeroUsize::new(5).expect("5 is not zero");
 const DEFAULT_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(240).expect("240 is not zero");
-const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
-const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 /// A whole-market session measured 2026-09-30 at about 33 s with these two.
 const DEFAULT_MINUTE_BATCH_SYMBOLS: NonZeroUsize = NonZeroUsize::new(200).expect("200 is not zero");
 const DEFAULT_MINUTE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
@@ -126,97 +124,12 @@ impl Parameters {
         Ok((parameters, ConfigurationResolved::new(resolved)))
     }
 
-    /// Only the log directory, resolved on its own so a refusal of any other parameter still reaches the log file.
-    pub fn log_directory_from_environment() -> Result<PathBuf, ParameterRefusal> {
-        let (parameter, supplied) = (
-            Parameter::LogDirectory,
-            environment_variable(Parameter::LogDirectory)?,
-        );
-        record(
-            (parameter, supplied),
-            DEFAULT_LOG_DIRECTORY.to_string(),
-            &mut BTreeMap::new(),
-        )
-        .map(PathBuf::from)
-    }
-
     pub fn journal_directory(&self) -> &PathBuf {
         &self.journal_directory
     }
 
     pub fn log_directory(&self) -> &PathBuf {
         &self.log_directory
-    }
-}
-
-fn environment_variable(parameter: Parameter) -> Result<Option<String>, ParameterRefusal> {
-    match std::env::var(parameter.variable()) {
-        Ok(raw) => Ok(Some(raw)),
-        Err(VarError::NotPresent) => Ok(None),
-        Err(VarError::NotUnicode(raw)) => Err(ParameterRefusal::Unparsable {
-            parameter,
-            raw: raw.to_string_lossy().into_owned(),
-            reason: "not unicode".to_string(),
-        }),
-    }
-}
-
-/// Parses one parameter's supplied value, keeping what the journal records for it.
-fn record<Value>(
-    (parameter, supplied): (Parameter, Option<String>),
-    default: Value,
-    resolved: &mut BTreeMap<Parameter, crate::common::journal::ResolvedParameter>,
-) -> Result<Value, ParameterRefusal>
-where
-    Value: std::str::FromStr + std::fmt::Display,
-    Value::Err: std::fmt::Display,
-{
-    let (value, parameter_resolved) = resolve(parameter, supplied.as_deref(), default)?;
-    resolved.insert(parameter, parameter_resolved);
-    Ok(value)
-}
-
-/// Why a run did not start: another holds the lock, or the lock could not be taken at all.
-#[derive(Debug)]
-pub enum LockRefusal {
-    Held {
-        path: PathBuf,
-    },
-    Unavailable {
-        path: PathBuf,
-        error: std::io::Error,
-    },
-}
-
-impl std::fmt::Display for LockRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Held { path } => write!(formatter, "another run holds {}", path.display()),
-            Self::Unavailable { path, error } => {
-                write!(formatter, "locking {} failed: {error}", path.display())
-            }
-        }
-    }
-}
-
-/// Takes the lock every run must hold, so two runs never write the same sessions at once; the operating system
-/// releases it when the returned file closes, including when the process dies.
-pub fn lock(directory: &std::path::Path) -> Result<std::fs::File, LockRefusal> {
-    let path = directory.join("heal.lock");
-    let unavailable = |error| LockRefusal::Unavailable {
-        path: path.clone(),
-        error,
-    };
-    let file = std::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(unavailable)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(LockRefusal::Held { path }),
-        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
     }
 }
 
@@ -893,17 +806,6 @@ mod tests {
                 .checked_add(Duration::from_secs(1_440 * 60))
                 .is_some()
         );
-    }
-
-    #[test]
-    fn test_a_second_run_is_refused_until_the_first_releases_the_lock() {
-        let directory = std::env::temp_dir().join(format!("fund-heal-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let first = lock(&directory).unwrap();
-        assert!(matches!(lock(&directory), Err(LockRefusal::Held { .. })));
-        drop(first);
-        assert!(lock(&directory).is_ok());
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[tokio::test]

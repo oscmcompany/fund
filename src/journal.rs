@@ -7,6 +7,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use crate::common::journal::{Commit, Observation, ReadLine, Record, RunId, UnreadableCause, read};
+use crate::common::storage::Service;
 use crate::common::time::SessionDate;
 use chrono::{DateTime, Utc};
 
@@ -168,6 +169,45 @@ fn sync_parent(path: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+/// Why a run did not start: another holds the lock, or the lock could not be taken at all.
+#[derive(Debug)]
+pub enum LockRefusal {
+    Held { path: PathBuf },
+    Unavailable { path: PathBuf, error: io::Error },
+}
+
+impl std::fmt::Display for LockRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held { path } => write!(formatter, "another run holds {}", path.display()),
+            Self::Unavailable { path, error } => {
+                write!(formatter, "locking {} failed: {error}", path.display())
+            }
+        }
+    }
+}
+
+/// Takes the lock each run of `service` must hold, so two runs never act at once; the operating system releases it
+/// when the returned file closes, including when the process dies.
+pub fn lock(directory: &Path, service: &Service) -> Result<File, LockRefusal> {
+    let path = directory.join(format!("{}.lock", service.as_str()));
+    let unavailable = |error| LockRefusal::Unavailable {
+        path: path.clone(),
+        error,
+    };
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(unavailable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(LockRefusal::Held { path }),
+        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
+    }
+}
+
 /// The file one session's records live in.
 pub fn file_name(session: SessionDate) -> String {
     format!("session-{}.jsonl", session.date())
@@ -190,6 +230,26 @@ mod tests {
 
     fn observation() -> Observation {
         Observation::ConfigurationResolved(ConfigurationResolved::new(BTreeMap::new()))
+    }
+
+    #[test]
+    fn test_a_second_run_is_refused_until_the_first_releases_the_lock() {
+        let directory = std::env::temp_dir().join(format!("fund-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (nightly, trader) = (
+            Service::new("archive_nightly").unwrap(),
+            Service::new("trader").unwrap(),
+        );
+        let first = lock(&directory, &nightly).unwrap();
+        assert!(matches!(
+            lock(&directory, &nightly),
+            Err(LockRefusal::Held { .. })
+        ));
+        let other = lock(&directory, &trader).unwrap();
+        drop(first);
+        assert!(lock(&directory, &nightly).is_ok());
+        drop(other);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

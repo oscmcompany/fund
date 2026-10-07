@@ -18,10 +18,11 @@ use fund::common::heal::is_complete;
 use fund::common::journal::{Commit, Observation, RunId};
 use fund::common::storage::{Host, Service};
 use fund::common::time::SessionDate;
-use fund::heal::{Clients, Parameters, lock, run};
+use fund::heal::{Clients, Parameters, run};
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::massive::Massive;
-use fund::journal::{Journal, built_commit};
+use fund::journal::{Journal, built_commit, lock};
+use fund::parameter::log_directory_from_environment;
 use fund::records::{log_file_name, ship, shipped_filter};
 use uuid::Uuid;
 
@@ -33,7 +34,7 @@ async fn main() -> ExitCode {
     let today = SessionDate::at(Utc::now());
     let service = Service::new(SERVICE).expect("the service name is one path segment");
     let resolved = Parameters::from_environment();
-    let log_file = Parameters::log_directory_from_environment().map(|directory| {
+    let log_file = log_directory_from_environment().map(|directory| {
         std::fs::create_dir_all(&directory).and_then(|()| {
             File::options()
                 .create(true)
@@ -91,7 +92,7 @@ async fn main() -> ExitCode {
             }
         };
         // Held until the process exits.
-        let _lock = match lock(parameters.journal_directory()) {
+        let _lock = match lock(parameters.journal_directory(), &service) {
             Ok(file) => file,
             Err(refusal) => {
                 tracing::error!(%refusal, "Another run is under way or the lock is unavailable");

@@ -1,5 +1,6 @@
 //! Every parameter a binary reads, named by one enum so a journaled name cannot drift from the parameter it names.
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::str::FromStr;
 
@@ -40,6 +41,27 @@ pub enum Parameter {
     MinuteConcurrency,
     /// Symbols whose quotes or trades are paged at once.
     TickConcurrency,
+    /// The symbols the trader trades, comma-separated.
+    Universe,
+    /// How often the trader decides: `one_minute` or `five_minute`.
+    DecisionInterval,
+    /// Whole shares the noise strategy holds of each symbol it draws.
+    NoiseShares,
+    NoiseSeed,
+    /// Dollars the trader may hold across every name at once.
+    GrossLimit,
+    /// Dollars the trader may hold in any one name.
+    PerNameLimit,
+    /// Dollars the trader may lose in a session before it goes flat.
+    DailyLossLimit,
+    /// Minutes before the close from which the trader holds nothing.
+    FlatBeforeCloseMinutes,
+    /// Seconds a price may age before the trader treats its symbol as unpriced.
+    StaleAfterSeconds,
+    /// Milliseconds between reads of an open order.
+    OrderPollMilliseconds,
+    /// Seconds an order may stay open before it is canceled.
+    OrderOpenSeconds,
 }
 
 impl Parameter {
@@ -52,6 +74,8 @@ impl Parameter {
 /// Why a supplied value was not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterRefusal {
+    /// Not supplied, and the parameter has no default.
+    Missing { parameter: Parameter },
     Unparsable {
         parameter: Parameter,
         raw: String,
@@ -68,6 +92,13 @@ pub enum ParameterRefusal {
 impl Display for ParameterRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Missing { parameter } => {
+                write!(
+                    formatter,
+                    "{} is not set and has no default",
+                    parameter.variable()
+                )
+            }
             Self::Unparsable {
                 parameter,
                 raw,
@@ -102,19 +133,23 @@ where
 {
     let (value, source) = match supplied {
         None => (default, ParameterSource::Default),
-        Some(raw) => {
-            let value = raw
-                .parse()
-                .map_err(|error: Value::Err| ParameterRefusal::Unparsable {
-                    parameter,
-                    raw: raw.to_string(),
-                    reason: error.to_string(),
-                })?;
-            (value, ParameterSource::Environment)
-        }
+        Some(raw) => (parse(parameter, raw)?, ParameterSource::Environment),
     };
     let resolved = ResolvedParameter::new(value.to_string(), source);
     Ok((value, resolved))
+}
+
+fn parse<Value>(parameter: Parameter, raw: &str) -> Result<Value, ParameterRefusal>
+where
+    Value: FromStr,
+    Value::Err: Display,
+{
+    raw.parse()
+        .map_err(|error: Value::Err| ParameterRefusal::Unparsable {
+            parameter,
+            raw: raw.to_string(),
+            reason: error.to_string(),
+        })
 }
 
 /// `value` when it is no more than `most`.
@@ -132,6 +167,41 @@ pub fn at_most<Value: PartialOrd + Display>(
             most: most.to_string(),
         })
     }
+}
+
+/// Parses one parameter's supplied value, or `default` when none was supplied, keeping what the journal records for it.
+pub fn record<Value>(
+    (parameter, supplied): (Parameter, Option<String>),
+    default: Value,
+    resolved: &mut BTreeMap<Parameter, ResolvedParameter>,
+) -> Result<Value, ParameterRefusal>
+where
+    Value: FromStr + Display,
+    Value::Err: Display,
+{
+    let (value, parameter_resolved) = resolve(parameter, supplied.as_deref(), default)?;
+    resolved.insert(parameter, parameter_resolved);
+    Ok(value)
+}
+
+/// `record` for a parameter with no default, refused when it was not supplied.
+pub fn record_required<Value>(
+    (parameter, supplied): (Parameter, Option<String>),
+    resolved: &mut BTreeMap<Parameter, ResolvedParameter>,
+) -> Result<Value, ParameterRefusal>
+where
+    Value: FromStr + Display,
+    Value::Err: Display,
+{
+    let Some(raw) = supplied else {
+        return Err(ParameterRefusal::Missing { parameter });
+    };
+    let value: Value = parse(parameter, &raw)?;
+    resolved.insert(
+        parameter,
+        ResolvedParameter::new(value.to_string(), ParameterSource::Environment),
+    );
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -155,6 +225,17 @@ mod tests {
                 "FUND_MINUTE_BATCH_SYMBOLS",
                 "FUND_MINUTE_CONCURRENCY",
                 "FUND_TICK_CONCURRENCY",
+                "FUND_UNIVERSE",
+                "FUND_DECISION_INTERVAL",
+                "FUND_NOISE_SHARES",
+                "FUND_NOISE_SEED",
+                "FUND_GROSS_LIMIT",
+                "FUND_PER_NAME_LIMIT",
+                "FUND_DAILY_LOSS_LIMIT",
+                "FUND_FLAT_BEFORE_CLOSE_MINUTES",
+                "FUND_STALE_AFTER_SECONDS",
+                "FUND_ORDER_POLL_MILLISECONDS",
+                "FUND_ORDER_OPEN_SECONDS",
             ]
         );
     }
@@ -212,5 +293,42 @@ mod tests {
                 other => panic!("{raw}: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_a_required_value_is_refused_when_absent_and_journaled_as_parsed() {
+        let mut resolved = BTreeMap::new();
+        assert_eq!(
+            record_required::<u64>((Parameter::NoiseSeed, None), &mut resolved),
+            Err(ParameterRefusal::Missing {
+                parameter: Parameter::NoiseSeed
+            })
+        );
+        assert!(resolved.is_empty());
+        assert_eq!(
+            ParameterRefusal::Missing {
+                parameter: Parameter::NoiseSeed
+            }
+            .to_string(),
+            "FUND_NOISE_SEED is not set and has no default"
+        );
+        assert_eq!(
+            record_required::<u64>(
+                (Parameter::NoiseSeed, Some("07".to_string())),
+                &mut resolved
+            ),
+            Ok(7)
+        );
+        assert_eq!(
+            resolved,
+            BTreeMap::from([(
+                Parameter::NoiseSeed,
+                ResolvedParameter::new("7".to_string(), ParameterSource::Environment)
+            )])
+        );
+        assert!(matches!(
+            record_required::<u64>((Parameter::NoiseSeed, Some("seven".to_string())), &mut resolved),
+            Err(ParameterRefusal::Unparsable { raw, .. }) if raw == "seven"
+        ));
     }
 }
