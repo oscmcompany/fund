@@ -388,7 +388,7 @@ impl DollarVolume {
     }
 
     /// A dollar volume read back from its stored integer.
-    pub fn from_units(units: u128) -> Self {
+    pub const fn from_units(units: u128) -> Self {
         Self(units)
     }
 

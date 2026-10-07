@@ -12,7 +12,7 @@ use crate::broker::alpaca::BrokerError;
 use crate::common::book::{Book, Fill};
 use crate::common::guard::{GuardCause, TradabilityUnread, guard};
 use crate::common::journal::Observation;
-use crate::common::market::{Shares, Symbol};
+use crate::common::market::{Price, Shares, Symbol};
 use crate::common::order::{
     ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest, OrderState,
     OrderSubmitted, OrderUnresolved,
@@ -80,7 +80,7 @@ pub struct JournalFailed {
     pub error: std::io::Error,
 }
 
-/// Sends the orders that take `book` to `target` that the broker's tradability vouches for, one at a time, sells
+/// Sends the orders that take `book` to `target` that the guard passes at `prices`, one at a time, sells
 /// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
 /// overlaps it; `next_sequence` is advanced past every id drawn, so a later call on the same counter cannot repeat one.
 /// A failed tradability read is journaled with its cause and vouches for nothing, so every order is held as unread.
@@ -90,6 +90,7 @@ pub async fn execute(
     next_sequence: &mut u32,
     book: &Book,
     target: &Target,
+    prices: &BTreeMap<Symbol, Price>,
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailed> {
     let mut outcomes = Vec::new();
@@ -105,7 +106,7 @@ pub async fn execute(
             BTreeMap::new()
         }
     };
-    let guarded = guard(orders, &tradability);
+    let guarded = guard(orders, &tradability, |symbol| prices.get(symbol).copied());
     for held in guarded.held() {
         outcomes.push(OrderOutcome::Guarded(held.cause()));
         if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held.clone())) {
@@ -166,6 +167,7 @@ pub async fn reconcile_and_close(
     next_sequence: &mut u32,
     expected: &Book,
     allowance: Allowance,
+    prices: &BTreeMap<Symbol, Price>,
     patience: Patience,
 ) -> Result<Reconciliation, ReconcileFailed> {
     let reported = broker.book().await.map_err(ReconcileFailed::Unread)?;
@@ -198,9 +200,17 @@ pub async fn reconcile_and_close(
             })
             .collect(),
     );
-    let closing = execute(broker, journal, next_sequence, &reported, &kept, patience)
-        .await
-        .map_err(ReconcileFailed::Journal)?;
+    let closing = execute(
+        broker,
+        journal,
+        next_sequence,
+        &reported,
+        &kept,
+        prices,
+        patience,
+    )
+    .await
+    .map_err(ReconcileFailed::Journal)?;
     let book = broker.book().await.map_err(ReconcileFailed::Unread)?;
     Ok(Reconciliation {
         reading,
@@ -483,6 +493,7 @@ mod tests {
             &mut next_sequence,
             &Book::default(),
             target,
+            &BTreeMap::new(),
             patience,
         )
         .await
@@ -733,6 +744,7 @@ mod tests {
             &mut next_sequence,
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
+            &BTreeMap::new(),
             PATIENT,
         )
         .await
@@ -763,6 +775,7 @@ mod tests {
             &mut next_sequence,
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
+            &BTreeMap::new(),
             PATIENT,
         )
         .await
@@ -882,6 +895,7 @@ mod tests {
             &mut next_sequence,
             expected,
             Allowance::NONE,
+            &BTreeMap::new(),
             PATIENT,
         )
         .await
@@ -905,6 +919,7 @@ mod tests {
             &mut next_sequence,
             &Book::default(),
             &buying(&["SPY"], 1),
+            &BTreeMap::new(),
             PATIENT,
         )
         .await
@@ -948,6 +963,7 @@ mod tests {
             &mut next_sequence,
             &before,
             &target,
+            &BTreeMap::new(),
             patience,
         )
         .await
