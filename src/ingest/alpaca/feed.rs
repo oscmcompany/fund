@@ -7,10 +7,13 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::time::{Instant, timeout_at};
 
 use crate::common::market::Symbol;
 use crate::ingest::alpaca::stream::{MarketStream, StreamError, StreamMessage, TradeId};
-use crate::ingest::alpaca::{Alpaca, AlpacaTrade, AlpacaTradeOutcome, TRADES_URL, trade_outcome};
+use crate::ingest::alpaca::{
+    Alpaca, AlpacaTrade, AlpacaTradeOutcome, PageTokens, TRADES_URL, trade_outcome,
+};
 use crate::ingest::retry::{FetchError, send, with_retries};
 use crate::ingest::{RefusedRow, RowRefusal};
 
@@ -70,6 +73,7 @@ impl TapeSource for Alpaca {
         let names: Vec<&str> = symbols.iter().map(Symbol::as_str).collect();
         let (names, start) = (names.join(","), since.to_rfc3339());
         let mut trades = Vec::new();
+        let mut tokens = PageTokens::default();
         let mut token: Option<String> = None;
         loop {
             let body = with_retries(|| {
@@ -92,8 +96,8 @@ impl TapeSource for Alpaca {
                 )
             })
             .await?;
-            let (page, next) = recent_trades(&body)?;
-            trades.extend(page);
+            let next = tokens.next(&body)?;
+            trades.extend(recent_trades(&body, symbols)?);
             match next {
                 Some(next) => token = Some(next),
                 None => return Ok(trades),
@@ -106,12 +110,11 @@ impl TapeSource for Alpaca {
 struct RecentTradesPage {
     /// `null` on a page with no trades.
     trades: Option<BTreeMap<String, Vec<Value>>>,
-    next_page_token: Option<String>,
 }
 
-/// One page of trades for several symbols, with the token for the next page; a row with no readable identity makes
-/// the page malformed, since a backfilled print that cannot be matched to the stream's could be handed out twice.
-fn recent_trades(body: &[u8]) -> Result<(Vec<IdentifiedTrade>, Option<String>), FetchError> {
+/// One page of trades for `requested`, a row filed under any other ticker refused; a row with no readable identity
+/// makes the page malformed, since a backfilled print that cannot be matched to the stream's could be handed out twice.
+fn recent_trades(body: &[u8], requested: &[Symbol]) -> Result<Vec<IdentifiedTrade>, FetchError> {
     let malformed = |reason: String| FetchError::Malformed { reason };
     let page: RecentTradesPage =
         serde_json::from_slice(body).map_err(|error| malformed(error.to_string()))?;
@@ -120,6 +123,12 @@ fn recent_trades(body: &[u8]) -> Result<(Vec<IdentifiedTrade>, Option<String>), 
         for row in rows {
             let id = TradeId::read(&row).map_err(malformed)?;
             let outcome = match Symbol::new(&ticker) {
+                Ok(symbol) if !requested.contains(&symbol) => {
+                    AlpacaTradeOutcome::Refused(RefusedRow {
+                        ticker: ticker.clone(),
+                        cause: RowRefusal::Unrequested,
+                    })
+                }
                 Ok(symbol) => {
                     let row: AlpacaTrade = serde_json::from_value(row)
                         .map_err(|error| malformed(error.to_string()))?;
@@ -133,7 +142,7 @@ fn recent_trades(body: &[u8]) -> Result<(Vec<IdentifiedTrade>, Option<String>), 
             trades.push((id, outcome));
         }
     }
-    Ok((trades, page.next_page_token))
+    Ok(trades)
 }
 
 /// A print across routes: its ticker and its identity on the tape, which numbers repeat across symbols on one exchange.
@@ -185,7 +194,7 @@ pub enum FeedEvent {
         since: DateTime<Utc>,
         fresh: usize,
     },
-    /// A backfill failed; the gap stays open until the next one.
+    /// A backfill failed; the gap stays open and is retried with backoff, even while the stream is up.
     BackfillFailed {
         cause: String,
     },
@@ -197,54 +206,79 @@ pub struct Feed<Source: TapeSource> {
     symbols: Vec<Symbol>,
     stream: Option<Source::Stream>,
     seen: Seen,
-    /// The latest print handed out, from which a backfill starts.
+    /// Where the tape is wanted from, which anchors a loss before any print is handed out.
+    from: DateTime<Utc>,
+    /// The latest print handed out by either route.
     latest: Option<DateTime<Utc>>,
+    /// The latest print the stream delivered, which bounds what it may yet repeat, so forgetting keys off it.
+    latest_streamed: Option<DateTime<Utc>>,
+    /// Where the stretch the stream has not covered begins, until a backfill closes it.
+    gap: Option<DateTime<Utc>>,
     /// Opens since the stream last delivered a message, so one that opens and closes at once still backs off.
     attempts: u32,
+    /// Backfills failed since the last that succeeded, and when the next may run.
+    failed_backfills: u32,
+    retry_at: Option<Instant>,
     pending: VecDeque<FeedEvent>,
 }
 
 impl<Source: TapeSource> Feed<Source> {
-    /// A feed that opens its stream on the first `next`.
-    pub fn new(source: Source, symbols: Vec<Symbol>) -> Self {
+    /// A feed wanting the tape from `from` on; its first `next` opens the stream and backfills from `from`.
+    pub fn new(source: Source, symbols: Vec<Symbol>, from: DateTime<Utc>) -> Self {
         Self {
             source,
             symbols,
             stream: None,
             seen: Seen::default(),
+            from,
             latest: None,
+            latest_streamed: None,
+            gap: Some(from),
             attempts: 0,
+            failed_backfills: 0,
+            retry_at: None,
             pending: VecDeque::new(),
         }
     }
 
-    /// The next event; the feed never ends, and while the stream is down it keeps trying to reopen it, backfilling
-    /// from REST between attempts.
+    /// The next event; the feed never ends. While the stream is down it keeps trying to reopen it, backfilling from
+    /// REST between attempts, and while a gap stays open it retries the backfill between the stream's messages.
     pub async fn next(&mut self) -> FeedEvent {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return event;
             }
-            match self.stream.as_mut() {
-                Some(stream) => match stream.next().await {
-                    Some(Ok(message)) => {
-                        self.attempts = 0;
-                        let admitted = self.admitted(message);
-                        self.forget();
-                        if let Some(event) = admitted {
-                            return event;
-                        }
+            let Some(stream) = self.stream.as_mut() else {
+                self.reopen().await;
+                continue;
+            };
+            let read = match (self.gap, self.retry_at) {
+                (Some(_), Some(retry_at)) => match timeout_at(retry_at, stream.next()).await {
+                    Ok(read) => read,
+                    Err(_) => {
+                        self.backfill().await;
+                        continue;
                     }
-                    Some(Err(error)) => return self.lost(error.to_string()),
-                    None => return self.lost("the stream closed".to_string()),
                 },
-                None => self.reopen().await,
+                (None, Some(_) | None) | (Some(_), None) => stream.next().await,
+            };
+            match read {
+                Some(Ok(message)) => {
+                    self.attempts = 0;
+                    let admitted = self.admitted(message, true);
+                    self.forget();
+                    if let Some(event) = admitted {
+                        return event;
+                    }
+                }
+                Some(Err(error)) => return self.lost(error.to_string()),
+                None => return self.lost("the stream closed".to_string()),
             }
         }
     }
 
     /// The message to hand out, or `None` for a print or refusal already handed out.
-    fn admitted(&mut self, message: StreamMessage) -> Option<FeedEvent> {
+    fn admitted(&mut self, message: StreamMessage, streamed: bool) -> Option<FeedEvent> {
         match &message {
             StreamMessage::Trade {
                 id,
@@ -258,6 +292,10 @@ impl<Source: TapeSource> Feed<Source> {
                     return None;
                 }
                 self.latest = Some(self.latest.map_or(at, |latest| latest.max(at)));
+                if streamed {
+                    self.latest_streamed =
+                        Some(self.latest_streamed.map_or(at, |latest| latest.max(at)));
+                }
             }
             StreamMessage::Trade {
                 id,
@@ -280,19 +318,25 @@ impl<Source: TapeSource> Feed<Source> {
         Some(FeedEvent::Message(message))
     }
 
+    /// Forgets prints well behind the latest the stream delivered; REST running ahead never moves this, so a print
+    /// the reopened stream has yet to repeat is still remembered.
     fn forget(&mut self) {
-        if let Some(latest) = self.latest {
+        if let Some(latest) = self.latest_streamed {
             self.seen.forget_before(latest - REMEMBERED);
         }
     }
 
     fn lost(&mut self, cause: String) -> FeedEvent {
         self.stream = None;
+        let start = self
+            .latest
+            .map_or(self.from, |latest| latest - BACKFILL_MARGIN);
+        self.gap = Some(self.gap.map_or(start, |gap| gap.min(start)));
         FeedEvent::Lost { cause }
     }
 
-    /// One attempt to reopen, then a backfill whether or not it held: after a reopen it closes the gap, and while
-    /// the stream stays down it carries the tape.
+    /// One attempt to reopen, then a backfill over any open gap whether or not it held: after a reopen it closes the
+    /// gap, and while the stream stays down it carries the tape.
     async fn reopen(&mut self) {
         if self.attempts > 0 {
             tokio::time::sleep(backoff(self.attempts)).await;
@@ -314,30 +358,43 @@ impl<Source: TapeSource> Feed<Source> {
         self.backfill().await;
     }
 
-    /// Reads REST trades from just before the latest print handed out and queues the ones not yet handed out.
+    /// Reads REST trades from the gap's start and queues the ones not yet handed out. The gap closes once a backfill
+    /// succeeds with the stream up; with it down, the gap moves up to the latest print and stays open.
     async fn backfill(&mut self) {
-        let Some(latest) = self.latest else {
+        let Some(since) = self.gap else {
             return;
         };
-        let since = latest - BACKFILL_MARGIN;
         match self.source.trades_since(&self.symbols, since).await {
             Ok(trades) => {
                 let mut fresh = Vec::new();
                 for (id, outcome) in trades {
-                    if let Some(event) = self.admitted(StreamMessage::Trade { id, outcome }) {
+                    if let Some(event) = self.admitted(StreamMessage::Trade { id, outcome }, false)
+                    {
                         fresh.push(event);
                     }
                 }
                 self.forget();
+                self.gap = match self.stream {
+                    Some(_) => None,
+                    None => Some(
+                        self.latest
+                            .map_or(since, |latest| (latest - BACKFILL_MARGIN).max(since)),
+                    ),
+                };
+                (self.failed_backfills, self.retry_at) = (0, None);
                 self.pending.push_back(FeedEvent::Backfilled {
                     since,
                     fresh: fresh.len(),
                 });
                 self.pending.extend(fresh);
             }
-            Err(error) => self.pending.push_back(FeedEvent::BackfillFailed {
-                cause: error.to_string(),
-            }),
+            Err(error) => {
+                self.failed_backfills += 1;
+                self.retry_at = Some(Instant::now() + backoff(self.failed_backfills));
+                self.pending.push_back(FeedEvent::BackfillFailed {
+                    cause: error.to_string(),
+                });
+            }
         }
     }
 }
@@ -404,13 +461,11 @@ mod tests {
         }
     }
 
+    /// The page's rows read with their identities, and a repeated page token is refused rather than followed forever.
     #[test]
     fn test_a_rest_page_reads_with_each_trades_identity() {
-        let (trades, next) = recent_trades(PAGE.as_bytes()).unwrap();
-        assert_eq!(
-            next.as_deref(),
-            Some("QUFQTHwxNzkxMzE2Nzk5MDAyNDE5OTE2fFF8MTE1MDk2")
-        );
+        let aapl = [Symbol::new("AAPL").unwrap()];
+        let trades = recent_trades(PAGE.as_bytes(), &aapl).unwrap();
         let ids: Vec<TradeId> = trades.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, [id("Q", 115_093), id("Q", 115_094), id("Q", 115_095)]);
         assert!(
@@ -420,13 +475,22 @@ mod tests {
         );
         let unidentified = PAGE.replace(r#""i":115094,"#, "");
         assert!(matches!(
-            recent_trades(unidentified.as_bytes()),
+            recent_trades(unidentified.as_bytes(), &aapl),
             Err(FetchError::Malformed { .. })
         ));
         assert_eq!(
-            recent_trades(br#"{"trades":null,"next_page_token":null}"#).unwrap(),
-            (vec![], None)
+            recent_trades(br#"{"trades":null,"next_page_token":null}"#, &aapl).unwrap(),
+            vec![]
         );
+        let mut tokens = PageTokens::default();
+        assert_eq!(
+            tokens.next(PAGE.as_bytes()).unwrap().as_deref(),
+            Some("QUFQTHwxNzkxMzE2Nzk5MDAyNDE5OTE2fFF8MTE1MDk2")
+        );
+        assert!(matches!(
+            tokens.next(PAGE.as_bytes()),
+            Err(FetchError::Malformed { .. })
+        ));
     }
 
     /// The same number on two exchanges or two symbols is two prints, the same identity at another instant is one,
@@ -455,18 +519,32 @@ mod tests {
         assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30]);
     }
 
+    /// What one scripted open does: fail, or hand out a stream that closes or stays open once its messages run out.
+    enum ScriptedOpen {
+        Fails(&'static str),
+        Closes(Vec<StreamMessage>),
+        StaysOpen(Vec<StreamMessage>),
+    }
+
     /// Opens hand out scripted streams in turn, and each backfill the next scripted page.
     struct Scripted {
-        opens: Mutex<VecDeque<Result<Vec<StreamMessage>, &'static str>>>,
+        opens: Mutex<VecDeque<ScriptedOpen>>,
         backfills: Mutex<VecDeque<Result<Vec<StreamMessage>, &'static str>>>,
         asked_since: Mutex<Vec<DateTime<Utc>>>,
     }
 
-    struct ScriptedStream(VecDeque<StreamMessage>);
+    struct ScriptedStream {
+        messages: VecDeque<StreamMessage>,
+        closes: bool,
+    }
 
     impl TapeStream for ScriptedStream {
         async fn next(&mut self) -> Option<Result<StreamMessage, StreamError>> {
-            self.0.pop_front().map(Ok)
+            match (self.messages.pop_front(), self.closes) {
+                (Some(message), true | false) => Some(Ok(message)),
+                (None, true) => None,
+                (None, false) => std::future::pending().await,
+            }
         }
     }
 
@@ -474,15 +552,22 @@ mod tests {
         type Stream = ScriptedStream;
 
         async fn open(&self, _: &[Symbol]) -> Result<ScriptedStream, StreamError> {
-            match self
+            let open = self
                 .opens
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("the script has an open")
-            {
-                Ok(messages) => Ok(ScriptedStream(messages.into())),
-                Err(cause) => Err(StreamError::Socket(cause.to_string())),
+                .expect("the script has an open");
+            match open {
+                ScriptedOpen::Fails(cause) => Err(StreamError::Socket(cause.to_string())),
+                ScriptedOpen::Closes(messages) => Ok(ScriptedStream {
+                    messages: messages.into(),
+                    closes: true,
+                }),
+                ScriptedOpen::StaysOpen(messages) => Ok(ScriptedStream {
+                    messages: messages.into(),
+                    closes: false,
+                }),
             }
         }
 
@@ -507,8 +592,9 @@ mod tests {
         }
     }
 
+    /// A feed wanting the tape from a minute before 14:00.
     fn feed(
-        opens: Vec<Result<Vec<StreamMessage>, &'static str>>,
+        opens: Vec<ScriptedOpen>,
         backfills: Vec<Result<Vec<StreamMessage>, &'static str>>,
     ) -> Feed<Scripted> {
         Feed::new(
@@ -518,6 +604,7 @@ mod tests {
                 asked_since: Mutex::new(Vec::new()),
             },
             vec![Symbol::new("SPY").unwrap()],
+            at(-60),
         )
     }
 
@@ -529,78 +616,107 @@ mod tests {
         events
     }
 
-    /// The stream drops after two prints; it reopens, and the backfill from two seconds before the last print hands
-    /// out only the print the stream never delivered.
+    fn lost(cause: &str) -> FeedEvent {
+        FeedEvent::Lost {
+            cause: cause.to_string(),
+        }
+    }
+
+    fn backfilled(since: DateTime<Utc>, fresh: usize) -> FeedEvent {
+        FeedEvent::Backfilled { since, fresh }
+    }
+
+    /// The first open backfills from the instant the tape is wanted; the stream then drops after two prints, reopens,
+    /// and the backfill from two seconds before the last print hands out only the print the stream never delivered.
     #[tokio::test(start_paused = true)]
     async fn test_a_dropped_stream_reopens_and_backfills_only_what_it_missed() {
         let mut feed = feed(
-            vec![Ok(vec![print(1, 0), print(2, 10)]), Ok(vec![print(4, 30)])],
-            vec![Ok(vec![print(2, 10), print(3, 20)])],
+            vec![
+                ScriptedOpen::Closes(vec![print(1, 0), print(2, 10)]),
+                ScriptedOpen::StaysOpen(vec![print(4, 30)]),
+            ],
+            vec![Ok(vec![]), Ok(vec![print(2, 10), print(3, 20)])],
         );
-        let events = take(&mut feed, 7).await;
         assert_eq!(
-            events,
+            take(&mut feed, 8).await,
             [
+                backfilled(at(-60), 0),
                 FeedEvent::Message(print(1, 0)),
                 FeedEvent::Message(print(2, 10)),
-                FeedEvent::Lost {
-                    cause: "the stream closed".to_string()
-                },
+                lost("the stream closed"),
                 FeedEvent::Reopened { attempts: 1 },
-                FeedEvent::Backfilled {
-                    since: at(8),
-                    fresh: 1
-                },
+                backfilled(at(8), 1),
                 FeedEvent::Message(print(3, 20)),
                 FeedEvent::Message(print(4, 30)),
             ]
         );
-        assert_eq!(*feed.source.asked_since.lock().unwrap(), [at(8)]);
+        assert_eq!(*feed.source.asked_since.lock().unwrap(), [at(-60), at(8)]);
     }
 
-    /// While the stream will not reopen, each attempt backfills from REST, so prints keep arriving, and a print the
-    /// reopened stream repeats is not handed out twice.
+    /// Before the stream ever delivers, REST carries the tape from the instant it is wanted, and the gap moves up to
+    /// the latest print while the stream stays down.
     #[tokio::test(start_paused = true)]
-    async fn test_rest_carries_the_tape_while_the_stream_stays_down() {
+    async fn test_rest_carries_the_tape_from_the_start_while_the_stream_is_down() {
         let mut feed = feed(
             vec![
-                Ok(vec![print(1, 0)]),
-                Err("refused"),
-                Ok(vec![print(2, 10), print(3, 20)]),
+                ScriptedOpen::Fails("refused"),
+                ScriptedOpen::StaysOpen(vec![print(1, 0)]),
             ],
-            vec![Ok(vec![print(2, 10)]), Err("timed out")],
+            vec![Ok(vec![print(1, 0)]), Ok(vec![])],
         );
         let started = tokio::time::Instant::now();
-        let events = take(&mut feed, 8).await;
         assert_eq!(
-            events,
+            take(&mut feed, 5).await,
             [
+                lost("the stream's socket failed: refused"),
+                backfilled(at(-60), 1),
                 FeedEvent::Message(print(1, 0)),
-                FeedEvent::Lost {
-                    cause: "the stream closed".to_string()
-                },
-                FeedEvent::Lost {
-                    cause: "the stream's socket failed: refused".to_string()
-                },
-                FeedEvent::Backfilled {
-                    since: at(-2),
-                    fresh: 1
-                },
-                FeedEvent::Message(print(2, 10)),
                 FeedEvent::Reopened { attempts: 2 },
-                FeedEvent::BackfillFailed {
-                    cause: "malformed payload: timed out".to_string()
-                },
-                FeedEvent::Message(print(3, 20)),
+                backfilled(at(-2), 0),
             ]
         );
         assert_eq!(started.elapsed(), Duration::from_secs(1));
+        let repeated = tokio::time::timeout(Duration::from_secs(60), feed.next()).await;
+        assert!(
+            repeated.is_err(),
+            "the reopened stream's copy of print 1 was handed out again"
+        );
     }
 
-    /// REST pages symbol by symbol, so an AAPL print twenty minutes on precedes the SPY print the stream already handed
-    /// out; the SPY copy is still recognised, and so is a refusal the backfill reads twice.
+    /// A backfill that fails after a reopen keeps the gap: it is retried with backoff while the stream is up, from the
+    /// gap's start, not from prints the stream has delivered since.
     #[tokio::test(start_paused = true)]
-    async fn test_a_backfill_running_ahead_on_one_symbol_forgets_nothing_it_rereads() {
+    async fn test_a_failed_backfill_is_retried_from_the_gap_while_the_stream_is_up() {
+        let mut feed = feed(
+            vec![
+                ScriptedOpen::Closes(vec![print(1, 0)]),
+                ScriptedOpen::StaysOpen(vec![print(5, 300)]),
+            ],
+            vec![Ok(vec![]), Err("timed out"), Ok(vec![print(2, 100)])],
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3600), take(&mut feed, 8))
+                .await
+                .expect("the failed gap is retried within the hour"),
+            [
+                backfilled(at(-60), 0),
+                FeedEvent::Message(print(1, 0)),
+                lost("the stream closed"),
+                FeedEvent::Reopened { attempts: 1 },
+                FeedEvent::BackfillFailed {
+                    cause: "malformed payload: timed out".to_string()
+                },
+                FeedEvent::Message(print(5, 300)),
+                backfilled(at(-2), 1),
+                FeedEvent::Message(print(2, 100)),
+            ]
+        );
+    }
+
+    /// REST pages symbol by symbol and can run far ahead of the reopened stream, which may yet repeat what REST read;
+    /// forgetting keys off the stream, so neither the SPY copy nor a refusal read twice is handed out again.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_backfill_running_ahead_forgets_nothing_the_stream_may_repeat() {
         let refused = || StreamMessage::Trade {
             id: id("P", 9),
             outcome: AlpacaTradeOutcome::Refused(RefusedRow {
@@ -611,28 +727,61 @@ mod tests {
             }),
         };
         let mut feed = feed(
-            vec![Ok(vec![print(1, 0), refused()]), Ok(vec![])],
-            vec![Ok(vec![
-                print_at("AAPL", 1, at(1200)),
-                print(1, 0),
-                refused(),
-            ])],
+            vec![
+                ScriptedOpen::Closes(vec![print(1, 0), refused()]),
+                ScriptedOpen::StaysOpen(vec![print(2, 5)]),
+            ],
+            vec![
+                Ok(vec![]),
+                Ok(vec![
+                    print_at("AAPL", 1, at(1200)),
+                    print(1, 0),
+                    refused(),
+                    print(2, 5),
+                ]),
+            ],
         );
-        let events = take(&mut feed, 6).await;
         assert_eq!(
-            events,
+            take(&mut feed, 8).await,
             [
+                backfilled(at(-60), 0),
                 FeedEvent::Message(print(1, 0)),
                 FeedEvent::Message(refused()),
-                FeedEvent::Lost {
-                    cause: "the stream closed".to_string()
-                },
+                lost("the stream closed"),
                 FeedEvent::Reopened { attempts: 1 },
-                FeedEvent::Backfilled {
-                    since: at(-2),
-                    fresh: 1
-                },
+                backfilled(at(-2), 2),
                 FeedEvent::Message(print_at("AAPL", 1, at(1200))),
+                FeedEvent::Message(print(2, 5)),
+            ]
+        );
+        let repeated = tokio::time::timeout(Duration::from_secs(60), feed.next()).await;
+        assert!(
+            repeated.is_err(),
+            "the stream's copy of print 2 was handed out again"
+        );
+    }
+
+    /// A stream lost before any print anchors no gap of its own, so the reopen backfills again from the instant the
+    /// tape is wanted rather than skipping the stretch it was down.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_loss_before_any_print_backfills_from_the_start() {
+        let mut feed = feed(
+            vec![
+                ScriptedOpen::Closes(vec![]),
+                ScriptedOpen::StaysOpen(vec![]),
+            ],
+            vec![Ok(vec![]), Ok(vec![print(1, 0)])],
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(60), take(&mut feed, 5))
+                .await
+                .expect("the reopen backfills"),
+            [
+                backfilled(at(-60), 0),
+                lost("the stream closed"),
+                FeedEvent::Reopened { attempts: 2 },
+                backfilled(at(-60), 1),
+                FeedEvent::Message(print(1, 0)),
             ]
         );
     }
@@ -642,15 +791,15 @@ mod tests {
     async fn test_a_stream_that_closes_on_opening_backs_off() {
         let mut feed = feed(
             vec![
-                Ok(vec![print(1, 0)]),
-                Ok(vec![]),
-                Ok(vec![]),
-                Ok(vec![print(2, 10)]),
+                ScriptedOpen::Closes(vec![print(1, 0)]),
+                ScriptedOpen::Closes(vec![]),
+                ScriptedOpen::Closes(vec![]),
+                ScriptedOpen::StaysOpen(vec![print(2, 10)]),
             ],
-            vec![Ok(vec![]), Ok(vec![]), Ok(vec![])],
+            vec![Ok(vec![]), Ok(vec![]), Ok(vec![]), Ok(vec![])],
         );
         let started = tokio::time::Instant::now();
-        let events = take(&mut feed, 11).await;
+        let events = take(&mut feed, 12).await;
         let reopened: Vec<&FeedEvent> = events
             .iter()
             .filter(|event| matches!(event, FeedEvent::Reopened { .. }))
@@ -663,8 +812,19 @@ mod tests {
                 &FeedEvent::Reopened { attempts: 3 }
             ]
         );
-        assert_eq!(events[10], FeedEvent::Message(print(2, 10)));
+        assert_eq!(events[11], FeedEvent::Message(print(2, 10)));
         assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    /// A row filed under a ticker the request did not name is refused, never handed out as a print.
+    #[test]
+    fn test_a_row_for_an_unrequested_ticker_is_refused() {
+        let trades = recent_trades(PAGE.as_bytes(), &[Symbol::new("SPY").unwrap()]).unwrap();
+        assert_eq!(trades.len(), 3);
+        assert!(trades.iter().all(|(_, outcome)| matches!(
+            outcome,
+            AlpacaTradeOutcome::Refused(row) if *row.cause() == RowRefusal::Unrequested
+        )));
     }
 
     /// Reads the last ten minutes of SPY and AAPL trades from the REST history; every print has its own identity.
