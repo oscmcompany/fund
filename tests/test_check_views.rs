@@ -1,8 +1,15 @@
 //! What `check-views` reports, run whole against a scripted `duckdb` in place of S3: the script is the contract, so
-//! only the binary it shells out to is replaced.
+//! only the binary it shells out to is replaced. Also that every series `views.sql` reads is one `Key` writes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use chrono::NaiveDate;
+use fund::common::heal::Leg;
+use fund::common::market::record::BarInterval;
+use fund::common::storage::{Host, Key, Origin, Provider, ReferenceTable, Service};
+use fund::common::time::SessionDate;
+use strum::IntoEnumIterator;
 
 /// How the fake `duckdb` answers one view.
 #[derive(Clone, Copy)]
@@ -68,22 +75,22 @@ fn real(answers: &[(&str, Answer)], profile: &str) -> (i32, String) {
 /// The archive's market data views in `views.sql` order, each answering as the daily or the minute bars do.
 fn bars(daily: Answer, minute: Answer) -> Vec<(&'static str, Answer)> {
     vec![
-        ("massive_daily_bars", daily),
         ("alpaca_minute_bars", minute),
-        ("alpaca_trade_bars", minute),
-        ("massive_minute_bars", minute),
-        ("massive_five_minute_bars", minute),
-        ("massive_quote_bars", minute),
-        ("massive_five_minute_quote_bars", minute),
-        ("massive_daily_quote_bars", daily),
-        ("massive_trade_bars", minute),
-        ("massive_five_minute_trade_bars", minute),
-        ("massive_daily_trade_bars", daily),
-        ("alpaca_quote_bars", minute),
+        ("alpaca_minute_quote_bars", minute),
         ("alpaca_five_minute_quote_bars", minute),
         ("alpaca_daily_quote_bars", daily),
+        ("alpaca_minute_trade_bars", minute),
         ("alpaca_five_minute_trade_bars", minute),
         ("alpaca_daily_trade_bars", daily),
+        ("massive_minute_bars", minute),
+        ("massive_five_minute_bars", minute),
+        ("massive_daily_bars", daily),
+        ("massive_minute_quote_bars", minute),
+        ("massive_five_minute_quote_bars", minute),
+        ("massive_daily_quote_bars", daily),
+        ("massive_minute_trade_bars", minute),
+        ("massive_five_minute_trade_bars", minute),
+        ("massive_daily_trade_bars", daily),
         ("trade_conditions", daily),
         ("security_details", daily),
         ("splits", daily),
@@ -112,22 +119,22 @@ fn test_every_view_in_views_sql_is_checked() {
     assert_eq!(
         reported(&output),
         [
-            "massive_daily_bars",
             "alpaca_minute_bars",
-            "alpaca_trade_bars",
-            "massive_minute_bars",
-            "massive_five_minute_bars",
-            "massive_quote_bars",
-            "massive_five_minute_quote_bars",
-            "massive_daily_quote_bars",
-            "massive_trade_bars",
-            "massive_five_minute_trade_bars",
-            "massive_daily_trade_bars",
-            "alpaca_quote_bars",
+            "alpaca_minute_quote_bars",
             "alpaca_five_minute_quote_bars",
             "alpaca_daily_quote_bars",
+            "alpaca_minute_trade_bars",
             "alpaca_five_minute_trade_bars",
             "alpaca_daily_trade_bars",
+            "massive_minute_bars",
+            "massive_five_minute_bars",
+            "massive_daily_bars",
+            "massive_minute_quote_bars",
+            "massive_five_minute_quote_bars",
+            "massive_daily_quote_bars",
+            "massive_minute_trade_bars",
+            "massive_five_minute_trade_bars",
+            "massive_daily_trade_bars",
             "trade_conditions",
             "security_details",
             "splits",
@@ -298,4 +305,203 @@ fn test_a_declaration_the_parser_misses_fails_the_check() {
     let (status, _) = check(&directory.join("check-views"), &[], "");
     assert_eq!(status, 1);
     std::fs::remove_dir_all(&directory).unwrap();
+}
+
+/// `check-views` ends a view at its first line ending in `;`, so that line must be the last before a blank line.
+#[test]
+fn test_every_view_ends_on_its_first_line_ending_in_a_semicolon() {
+    let views = std::fs::read_to_string(root().join("views.sql")).unwrap();
+    let lines: Vec<&str> = views.lines().collect();
+    let mut ended = Vec::new();
+    for (start, line) in lines.iter().enumerate() {
+        let Some(view) = line
+            .strip_prefix("CREATE OR REPLACE VIEW ")
+            .and_then(|rest| rest.strip_suffix(" AS"))
+        else {
+            continue;
+        };
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|line| line.trim_end().ends_with(';'))
+                .unwrap_or_else(|| panic!("{view} has no line ending in ;"));
+        assert!(
+            lines[start..end].iter().all(|line| !line.trim().is_empty()),
+            "{view} runs past a blank line before its ;"
+        );
+        assert!(
+            lines.get(end + 1).is_none_or(|line| line.is_empty()),
+            "{view} ends on line {} with more of it to come",
+            end + 1
+        );
+        ended.push(view);
+    }
+    assert_eq!(ended.len(), 24, "{ended:?}");
+}
+
+/// Each `(bucket, series)` passed to the `sessions` and `snapshots` macros in `views.sql`, in file order.
+fn macro_series() -> Vec<(String, String)> {
+    let views = std::fs::read_to_string(root().join("views.sql")).unwrap();
+    let mut calls = Vec::new();
+    for (name, bucket) in [
+        ("sessions('", None),
+        ("snapshots('", Some("market_data_bucket")),
+    ] {
+        for (start, _) in views.match_indices(name) {
+            let arguments = &views[start + name.len() - 1..];
+            let arguments = &arguments[..arguments.find(')').unwrap()];
+            let quoted: Vec<&str> = arguments.split('\'').skip(1).step_by(2).collect();
+            let bucket = bucket.unwrap_or(quoted[0]).to_string();
+            calls.push((start, bucket, quoted[quoted.len() - 1].to_string()));
+        }
+    }
+    calls.sort();
+    calls
+        .into_iter()
+        .map(|(_, bucket, series)| (bucket, series))
+        .collect()
+}
+
+/// Every parsed archive series the views cover, built from its parts.
+fn archive_keys() -> Vec<Key> {
+    let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 8).unwrap());
+    let bars = |provider, origin, interval| Key::Bars {
+        provider,
+        origin,
+        interval,
+        session,
+    };
+    let mut keys = vec![
+        bars(Provider::Alpaca, Origin::Vendor, BarInterval::OneMinute),
+        bars(Provider::Massive, Origin::Vendor, BarInterval::OneMinute),
+        bars(Provider::Massive, Origin::Derived, BarInterval::FiveMinute),
+        bars(Provider::Massive, Origin::Vendor, BarInterval::OneDay),
+    ];
+    for provider in [Provider::Alpaca, Provider::Massive] {
+        for interval in BarInterval::iter() {
+            keys.push(Key::Quotes {
+                provider,
+                origin: Origin::Derived,
+                interval,
+                session,
+            });
+            keys.push(Key::Trades {
+                provider,
+                origin: Origin::Derived,
+                interval,
+                session,
+            });
+        }
+    }
+    for (provider, table) in [
+        (Provider::Massive, ReferenceTable::Conditions),
+        (Provider::Massive, ReferenceTable::SecurityDetails),
+        (Provider::Massive, ReferenceTable::Splits),
+        (Provider::Alpaca, ReferenceTable::SeriesBoundaries),
+    ] {
+        keys.push(Key::Reference {
+            provider,
+            table,
+            as_of: session,
+        });
+    }
+    keys
+}
+
+/// Whether a views series names a key's series, a `name=*` segment standing for any value of that partition.
+fn names(view_series: &str, key_series: &str) -> bool {
+    let (view, key): (Vec<_>, Vec<_>) = (
+        view_series.split('/').collect(),
+        key_series.split('/').collect(),
+    );
+    view.len() == key.len()
+        && view
+            .iter()
+            .zip(&key)
+            .all(|(view, key)| match view.strip_suffix('*') {
+                Some(partition) => partition.ends_with('=') && key.starts_with(partition),
+                None => view == key,
+            })
+}
+
+#[test]
+fn test_every_series_views_sql_reads_is_a_key_series() {
+    let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 8).unwrap());
+    let mut keys = archive_keys();
+    for host in Host::iter() {
+        keys.push(Key::Journal { host, session });
+        keys.push(Key::Logs {
+            host,
+            service: Service::new("archive_nightly").unwrap(),
+            session,
+        });
+    }
+    let called = macro_series();
+    // 20 archive views, `journal`, `logs`, `experiments`, and `bar_seam`'s two reads.
+    assert_eq!(called.len(), 25, "{called:?}");
+    for (bucket, series) in &called {
+        let expected_bucket = if series.starts_with("records/") {
+            "records_bucket"
+        } else {
+            "market_data_bucket"
+        };
+        assert_eq!(bucket, expected_bucket, "{series}");
+        assert!(
+            keys.iter().any(|key| names(series, &key.series())),
+            "no key writes {series}"
+        );
+    }
+}
+
+#[test]
+fn test_every_archive_series_the_nightly_writes_has_a_view() {
+    let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 8).unwrap());
+    let archive = archive_keys();
+    let read: Vec<String> = macro_series()
+        .into_iter()
+        .map(|(_, series)| series)
+        .collect();
+    for key in &archive {
+        assert!(
+            read.contains(&key.series()),
+            "no view reads {}",
+            key.series()
+        );
+    }
+    // A tick leg's key is its daily file; the leg writes every interval of that series.
+    for leg in Leg::iter() {
+        let key = leg.key(session);
+        let written: Vec<Key> = match key {
+            Key::Quotes {
+                provider, origin, ..
+            } => BarInterval::iter()
+                .map(|interval| Key::Quotes {
+                    provider,
+                    origin,
+                    interval,
+                    session,
+                })
+                .collect(),
+            Key::Trades {
+                provider, origin, ..
+            } => BarInterval::iter()
+                .map(|interval| Key::Trades {
+                    provider,
+                    origin,
+                    interval,
+                    session,
+                })
+                .collect(),
+            Key::Bars { .. }
+            | Key::Reference { .. }
+            | Key::RawBars { .. }
+            | Key::RawQuotes { .. }
+            | Key::RawTrades { .. }
+            | Key::Journal { .. }
+            | Key::Logs { .. } => vec![key],
+        };
+        for key in written {
+            assert!(archive.contains(&key), "{leg} writes {}", key.series());
+        }
+    }
 }
