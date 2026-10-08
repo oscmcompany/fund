@@ -45,6 +45,18 @@ pub enum IndustryCodeRefusal {
     Malformed { raw: String },
 }
 
+impl std::fmt::Display for IndustryCodeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed { raw } => {
+                write!(formatter, "`{raw}` is not a four-digit industry code")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IndustryCodeRefusal {}
+
 impl IndustryCode {
     /// Exactly four digits, as the SEC writes them.
     pub fn new(raw: &str) -> Result<Self, IndustryCodeRefusal> {
@@ -75,6 +87,19 @@ pub struct MarketIdentifierCode(String);
 pub enum MarketIdentifierCodeRefusal {
     Malformed { raw: String },
 }
+
+impl std::fmt::Display for MarketIdentifierCodeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed { raw } => write!(
+                formatter,
+                "`{raw}` is not a four-character market identifier code"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MarketIdentifierCodeRefusal {}
 
 impl MarketIdentifierCode {
     pub fn new(raw: &str) -> Result<Self, MarketIdentifierCodeRefusal> {

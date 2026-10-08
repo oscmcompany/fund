@@ -3,13 +3,24 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::Schema;
+use chrono::{DateTime, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+
+use crate::common::market::corporate_actions::{
+    ActionIdRefusal, BoundaryChangeRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
+};
+use crate::common::market::quote_bars::{QuoteBarRefusal, QuoteSumsRefusal};
+use crate::common::market::record::{BarInterval, BarRefusal, OhlcRefusal};
+use crate::common::market::security_details::{IndustryCodeRefusal, MarketIdentifierCodeRefusal};
+use crate::common::market::trade_bars::{HighLowRefusal, OpenCloseRefusal, TradeBarRefusal};
+use crate::common::market::{Price, PriceRefusal, Symbol, SymbolRefusal};
+use crate::common::time::SessionDate;
 
 /// The metadata key every layout names its version under.
 pub(crate) const LAYOUT_VERSION_KEY: &str = "fund.layout_version";
@@ -129,4 +140,261 @@ pub(crate) fn downcast<T: 'static>(column: &ArrayRef) -> Result<&T, ReadRefusal>
         .ok_or(ReadRefusal::Parquet {
             reason: format!("column is {}", column.data_type()),
         })
+}
+
+impl std::fmt::Display for ReadRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parquet { reason } => {
+                write!(formatter, "the file is not readable Parquet: {reason}")
+            }
+            Self::Schema { found } => write!(formatter, "the file holds other columns: {found}"),
+            Self::Metadata { name } => {
+                write!(formatter, "the metadata `{name}` is absent or unreadable")
+            }
+            Self::Layout { version } => {
+                write!(formatter, "the file is written under layout {version}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadRefusal {}
+
+/// Why a row read back from a file no longer passes its domain's checks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowCause {
+    /// A stored number past what its column's domain type holds.
+    OutOfRange {
+        column: String,
+        value: i128,
+    },
+    OutsideSession {
+        timestamp: DateTime<Utc>,
+        session: SessionDate,
+    },
+    /// Some columns of a group stored whole or not at all are null, named here.
+    PartlyNull {
+        null: Vec<String>,
+    },
+    /// Text that names no value of its column's type.
+    Unparsable {
+        column: String,
+        raw: String,
+    },
+    Symbol(SymbolRefusal),
+    Price(PriceRefusal),
+    Ohlc(OhlcRefusal),
+    Bar(BarRefusal),
+    QuoteSums(QuoteSumsRefusal),
+    QuoteBar(QuoteBarRefusal),
+    OpenClose(OpenCloseRefusal),
+    HighLow(HighLowRefusal),
+    TradeBar(TradeBarRefusal),
+    ActionId(ActionIdRefusal),
+    SplitRatio(SplitRatioRefusal),
+    BoundaryChange(BoundaryChangeRefusal),
+    SeriesBoundary(SeriesBoundaryRefusal),
+    IndustryCode(IndustryCodeRefusal),
+    MarketIdentifierCode(MarketIdentifierCodeRefusal),
+}
+
+impl std::fmt::Display for RowCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange { column, value } => {
+                write!(formatter, "{column} holds {value}, past its type's range")
+            }
+            Self::OutsideSession { timestamp, session } => {
+                write!(formatter, "{timestamp} is outside session {session}")
+            }
+            Self::PartlyNull { null } => write!(formatter, "{} null alone", null.join(" and ")),
+            Self::Unparsable { column, raw } => write!(formatter, "{column} holds `{raw}`"),
+            Self::Symbol(refusal) => refusal.fmt(formatter),
+            Self::Price(refusal) => refusal.fmt(formatter),
+            Self::Ohlc(refusal) => refusal.fmt(formatter),
+            Self::Bar(refusal) => refusal.fmt(formatter),
+            Self::QuoteSums(refusal) => refusal.fmt(formatter),
+            Self::QuoteBar(refusal) => refusal.fmt(formatter),
+            Self::OpenClose(refusal) => refusal.fmt(formatter),
+            Self::HighLow(refusal) => refusal.fmt(formatter),
+            Self::TradeBar(refusal) => refusal.fmt(formatter),
+            Self::ActionId(refusal) => refusal.fmt(formatter),
+            Self::SplitRatio(refusal) => refusal.fmt(formatter),
+            Self::BoundaryChange(refusal) => refusal.fmt(formatter),
+            Self::SeriesBoundary(refusal) => refusal.fmt(formatter),
+            Self::IndustryCode(refusal) => refusal.fmt(formatter),
+            Self::MarketIdentifierCode(refusal) => refusal.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RowCause {}
+
+/// A column as the array type its schema promises, named for a row's refusal.
+pub(crate) struct Column<'a, T> {
+    name: &'a str,
+    array: &'a T,
+}
+
+/// Column `index` of `batch`; the schema check makes a type mismatch a corrupt file.
+pub(crate) fn column<T: 'static>(
+    batch: &RecordBatch,
+    index: usize,
+) -> Result<Column<'_, T>, ReadRefusal> {
+    Ok(Column {
+        name: batch.schema_ref().field(index).name(),
+        array: downcast(batch.column(index))?,
+    })
+}
+
+impl<'a, T> Column<'a, T> {
+    pub(crate) fn name(&self) -> &'a str {
+        self.name
+    }
+
+    fn out_of_range(&self, value: impl Into<i128>) -> RowCause {
+        RowCause::OutOfRange {
+            column: self.name.to_string(),
+            value: value.into(),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Column<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.array
+    }
+}
+
+impl Column<'_, Decimal128Array> {
+    /// The stored decimal's unscaled integer as `N`, refused when it does not fit.
+    pub(crate) fn integer<N: TryFrom<i128>>(&self, row: usize) -> Result<N, RowCause> {
+        let value = self.array.value(row);
+        N::try_from(value).map_err(|_| self.out_of_range(value))
+    }
+
+    pub(crate) fn price(&self, row: usize) -> Result<Price, RowCause> {
+        Price::from_ticks(self.integer(row)?).map_err(RowCause::Price)
+    }
+}
+
+impl Column<'_, TimestampMicrosecondArray> {
+    /// The stored instant, refused unless it lies in `session`.
+    pub(crate) fn instant_in(
+        &self,
+        row: usize,
+        session: SessionDate,
+    ) -> Result<DateTime<Utc>, RowCause> {
+        let micros = self.array.value(row);
+        let timestamp =
+            DateTime::from_timestamp_micros(micros).ok_or_else(|| self.out_of_range(micros))?;
+        match SessionDate::at(timestamp) == session {
+            true => Ok(timestamp),
+            false => Err(RowCause::OutsideSession { timestamp, session }),
+        }
+    }
+}
+
+/// The refusal of a group stored whole or not at all, naming each `(name, valid)` column that is null.
+pub(crate) fn partly_null(columns: &[(&str, bool)]) -> RowCause {
+    RowCause::PartlyNull {
+        null: columns
+            .iter()
+            .filter(|(_, valid)| !valid)
+            .map(|(name, _)| name.to_string())
+            .collect(),
+    }
+}
+
+/// `units` as a thirty-eight-digit decimal's unscaled integer, `None` past what one holds.
+pub(crate) fn widest_decimal(units: u128) -> Option<i128> {
+    i128::try_from(units)
+        .ok()
+        .filter(|units| *units < 10_i128.pow(38))
+}
+
+/// Why a bar was not placed in a file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementRefusal {
+    /// A bar whose interval or session is not the key's.
+    OutsideKey {
+        symbol: Symbol,
+        timestamp: DateTime<Utc>,
+    },
+    /// Two bars for one symbol and instant.
+    Duplicate {
+        symbol: Symbol,
+        timestamp: DateTime<Utc>,
+    },
+}
+
+impl std::fmt::Display for PlacementRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutsideKey { symbol, timestamp } => {
+                write!(formatter, "{symbol} at {timestamp} lies outside the key")
+            }
+            Self::Duplicate { symbol, timestamp } => {
+                write!(formatter, "{symbol} has two bars at {timestamp}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlacementRefusal {}
+
+/// `bars` ordered by symbol and then timestamp, so the same bars always make the same bytes, each one checked to
+/// belong under a key of `interval` and `session` and to be the only bar at its symbol and instant.
+pub(crate) fn place<B>(
+    bars: &[B],
+    interval: BarInterval,
+    session: SessionDate,
+    stamp: impl Fn(&B) -> (&Symbol, BarInterval, DateTime<Utc>),
+) -> Result<Vec<&B>, PlacementRefusal> {
+    let mut ordered: Vec<&B> = bars.iter().collect();
+    ordered.sort_by(|left, right| {
+        let (left, right) = (stamp(left), stamp(right));
+        (left.0, left.2).cmp(&(right.0, right.2))
+    });
+    let mut previous = None;
+    for bar in ordered.iter().copied() {
+        let (symbol, bar_interval, timestamp) = stamp(bar);
+        if bar_interval != interval || SessionDate::at(timestamp) != session {
+            return Err(PlacementRefusal::OutsideKey {
+                symbol: symbol.clone(),
+                timestamp,
+            });
+        }
+        if previous == Some((symbol, timestamp)) {
+            return Err(PlacementRefusal::Duplicate {
+                symbol: symbol.clone(),
+                timestamp,
+            });
+        }
+        previous = Some((symbol, timestamp));
+    }
+    Ok(ordered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_row_cause_reads_as_the_refusal_it_carries() {
+        assert_eq!(
+            RowCause::Symbol(SymbolRefusal::Malformed {
+                raw: "brk.b".to_string()
+            })
+            .to_string(),
+            "`brk.b` is not a ticker"
+        );
+        assert_eq!(
+            partly_null(&[("opened_at", true), ("closed_at", false)]).to_string(),
+            "closed_at null alone"
+        );
+    }
 }

@@ -89,6 +89,8 @@ impl std::fmt::Display for SymbolRefusal {
     }
 }
 
+impl std::error::Error for SymbolRefusal {}
+
 impl TryFrom<String> for Symbol {
     type Error = SymbolRefusal;
 
@@ -117,10 +119,10 @@ impl std::fmt::Display for Symbol {
 pub struct Price(i64);
 
 impl TryFrom<i64> for Price {
-    type Error = String;
+    type Error = PriceRefusal;
 
     fn try_from(ticks: i64) -> Result<Self, Self::Error> {
-        Self::from_ticks(ticks).map_err(|refusal| format!("{refusal:?}"))
+        Self::from_ticks(ticks)
     }
 }
 
@@ -145,6 +147,25 @@ pub enum PriceRefusal {
         dollars: f64,
     },
 }
+
+impl std::fmt::Display for PriceRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFinite { dollars } => {
+                write!(formatter, "{dollars} dollars is not a finite price")
+            }
+            Self::OutOfRange { ticks } => write!(
+                formatter,
+                "{ticks} ticks is not above zero and at most ten million dollars"
+            ),
+            Self::OffGrid { dollars } => {
+                write!(formatter, "{dollars} dollars is finer than a millionth")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PriceRefusal {}
 
 impl Price {
     /// A price read back from its stored integer.
@@ -230,6 +251,25 @@ pub enum SharesRefusal {
         shares: f64,
     },
 }
+
+impl std::fmt::Display for SharesRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFinite { shares } => {
+                write!(formatter, "{shares} shares is not a finite count")
+            }
+            Self::OutOfRange { shares } => write!(
+                formatter,
+                "{shares} shares is negative or past what millionths in a u64 hold"
+            ),
+            Self::OffGrid { shares } => {
+                write!(formatter, "{shares} shares is finer than a millionth")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SharesRefusal {}
 
 impl Shares {
     /// Whole shares, as SIP quotes and trades report them.
@@ -398,6 +438,23 @@ pub enum DollarVolumeRefusal {
     /// Implies a dollar volume past the integer's range.
     OutOfRange { average: f64 },
 }
+
+impl std::fmt::Display for DollarVolumeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid { average } => write!(
+                formatter,
+                "an average price of {average} is not finite and non-negative"
+            ),
+            Self::OutOfRange { average } => write!(
+                formatter,
+                "an average price of {average} implies a dollar volume past its range"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DollarVolumeRefusal {}
 
 impl DollarVolume {
     pub fn of(price: Price, shares: Shares) -> Self {
@@ -694,6 +751,18 @@ mod tests {
         assert_eq!(
             Price::from_ticks(10_000_000_000_000).unwrap().to_string(),
             "10000000.00"
+        );
+    }
+
+    #[test]
+    fn test_a_stored_price_is_refused_with_its_typed_cause() {
+        assert_eq!(
+            Price::try_from(0),
+            Err(PriceRefusal::OutOfRange { ticks: 0 })
+        );
+        assert_eq!(
+            serde_json::from_str::<Price>("-5").unwrap_err().to_string(),
+            "-5 ticks is not above zero and at most ten million dollars"
         );
     }
 

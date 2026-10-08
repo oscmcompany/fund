@@ -13,11 +13,11 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 
-use super::parquet;
+use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 
 use crate::common::journal::{Commit, RunId};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
-use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
+use crate::common::market::{DollarVolume, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
@@ -116,6 +116,14 @@ impl Provenance {
             ),
         ]
     }
+
+    /// The entries as a Parquet file's key-value metadata.
+    pub(crate) fn metadata(&self) -> Vec<KeyValue> {
+        self.entries()
+            .into_iter()
+            .map(|(name, value)| KeyValue::new(name.to_string(), value))
+            .collect()
+    }
 }
 
 /// Why bars were not written under a key.
@@ -124,19 +132,10 @@ pub enum EncodeRefusal {
     NotABarsKey,
     /// The subscription belongs to another provider than the key's.
     SubscriptionProvider {
-        subscription: Subscription,
+        provenance: Provenance,
         key: Provider,
     },
-    /// A bar whose interval or session is not the key's.
-    OutsideKey {
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-    },
-    /// Two bars for one symbol and instant.
-    Duplicate {
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-    },
+    Placement(PlacementRefusal),
     /// A dollar volume past what a thirty-eight-digit decimal holds.
     Unrepresentable {
         symbol: Symbol,
@@ -151,31 +150,23 @@ pub enum EncodeRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
     NotABarsKey,
-    Parquet {
-        reason: String,
-    },
-    /// Metadata absent or unreadable, named by its key.
-    Metadata {
-        name: &'static str,
-    },
-    /// Written under another layout than this build reads.
-    Layout {
-        version: String,
-    },
+    File(ReadRefusal),
     /// A row that no longer passes the domain's own checks.
     Row {
         index: usize,
-        reason: String,
-    },
-    /// Columns other than this layout's, named as found.
-    Schema {
-        found: String,
+        cause: RowCause,
     },
     /// Provenance naming another provider than the key's.
     Provider {
-        subscription: Subscription,
+        provenance: Provenance,
         key: Provider,
     },
+}
+
+impl From<ReadRefusal> for DecodeRefusal {
+    fn from(refusal: ReadRefusal) -> Self {
+        Self::File(refusal)
+    }
 }
 
 /// The key's interval and session, refused unless it is a bars key.
@@ -222,45 +213,30 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
     let (provider, interval, session) = bars_key(key).ok_or(EncodeRefusal::NotABarsKey)?;
     if provenance.subscription.provider() != provider {
         return Err(EncodeRefusal::SubscriptionProvider {
-            subscription: provenance.subscription,
+            provenance: provenance.clone(),
             key: provider,
         });
     }
-    let mut ordered: Vec<&Bar> = bars.iter().collect();
-    ordered.sort_by(|left, right| {
-        (left.symbol(), left.timestamp()).cmp(&(right.symbol(), right.timestamp()))
-    });
+    let ordered = parquet::place(bars, interval, session, |bar| {
+        (bar.symbol(), bar.interval(), bar.timestamp())
+    })
+    .map_err(EncodeRefusal::Placement)?;
     let mut symbols = StringBuilder::new();
     let mut timestamps = TimestampMicrosecondBuilder::new().with_timezone("UTC");
     let mut prices: [Decimal128Builder; 4] = std::array::from_fn(|_| Decimal128Builder::new());
     let mut volumes = Decimal128Builder::new();
     let mut trade_counts = UInt64Builder::new();
     let mut dollar_volumes = Decimal128Builder::new();
-    let mut previous: Option<(&Symbol, DateTime<Utc>)> = None;
     for bar in ordered {
         let (symbol, timestamp) = (bar.symbol(), bar.timestamp());
-        if bar.interval() != interval || SessionDate::at(timestamp) != session {
-            return Err(EncodeRefusal::OutsideKey {
-                symbol: symbol.clone(),
-                timestamp,
-            });
-        }
-        if previous == Some((symbol, timestamp)) {
-            return Err(EncodeRefusal::Duplicate {
-                symbol: symbol.clone(),
-                timestamp,
-            });
-        }
-        previous = Some((symbol, timestamp));
         let dollar_volume = match bar.dollar_volume() {
             Some(dollar_volume) => Some(
-                i128::try_from(dollar_volume.units())
-                    .ok()
-                    .filter(|units| *units < 10_i128.pow(38))
-                    .ok_or_else(|| EncodeRefusal::Unrepresentable {
+                parquet::widest_decimal(dollar_volume.units()).ok_or_else(|| {
+                    EncodeRefusal::Unrepresentable {
                         symbol: symbol.clone(),
                         timestamp,
-                    })?,
+                    }
+                })?,
             ),
             None => None,
         };
@@ -291,16 +267,8 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
         Arc::new(trade_counts.finish()),
         Arc::new(dollar_volumes.finish().with_data_type(DOLLAR_VOLUME_TYPE)),
     ];
-    parquet::write(schema(), columns, LAYOUT_VERSION, metadata(provenance))
+    parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata())
         .map_err(|reason| EncodeRefusal::Parquet { reason })
-}
-
-fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
-    provenance
-        .entries()
-        .into_iter()
-        .map(|(name, value)| KeyValue::new(name.to_string(), value))
-        .collect()
 }
 
 /// The bars and provenance a file written by `encode` under `key` holds, each row rebuilt through the domain's own
@@ -308,73 +276,54 @@ fn metadata(provenance: &Provenance) -> Vec<KeyValue> {
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
     let (provider, interval, session) = bars_key(key).ok_or(DecodeRefusal::NotABarsKey)?;
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
-    let provenance = provenance_from(&entries).map_err(|name| DecodeRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription.provider() != provider {
         return Err(DecodeRefusal::Provider {
-            subscription: provenance.subscription,
+            provenance,
             key: provider,
         });
     }
     let mut bars = Vec::new();
     for batch in batches {
-        let symbols = downcast::<StringArray>(batch.column(0))?;
-        let timestamps = downcast::<TimestampMicrosecondArray>(batch.column(1))?;
-        let prices: Vec<&Decimal128Array> = (2..6)
-            .map(|index| downcast::<Decimal128Array>(batch.column(index)))
-            .collect::<Result<_, _>>()?;
-        let volumes = downcast::<Decimal128Array>(batch.column(6))?;
-        let trade_counts = downcast::<UInt64Array>(batch.column(7))?;
-        let dollar_volumes = downcast::<Decimal128Array>(batch.column(8))?;
-        for row in 0..batch.num_rows() {
-            let index = bars.len();
-            let refused = |reason: String| DecodeRefusal::Row { index, reason };
-            let price = |array: &Decimal128Array| {
-                i64::try_from(array.value(row))
-                    .map_err(|error| error.to_string())
-                    .and_then(|ticks| {
-                        Price::from_ticks(ticks).map_err(|error| format!("{error:?}"))
-                    })
-                    .map_err(refused)
-            };
-            let symbol =
-                Symbol::new(symbols.value(row)).map_err(|error| refused(format!("{error:?}")))?;
-            let timestamp = DateTime::from_timestamp_micros(timestamps.value(row))
-                .ok_or_else(|| refused("timestamp out of range".to_string()))?;
-            if SessionDate::at(timestamp) != session {
-                return Err(refused(format!("{timestamp} is outside session {session}")));
-            }
+        let symbols = parquet::column::<StringArray>(&batch, 0)?;
+        let timestamps = parquet::column::<TimestampMicrosecondArray>(&batch, 1)?;
+        let [open, high, low, close] = [
+            parquet::column::<Decimal128Array>(&batch, 2)?,
+            parquet::column::<Decimal128Array>(&batch, 3)?,
+            parquet::column::<Decimal128Array>(&batch, 4)?,
+            parquet::column::<Decimal128Array>(&batch, 5)?,
+        ];
+        let volumes = parquet::column::<Decimal128Array>(&batch, 6)?;
+        let trade_counts = parquet::column::<UInt64Array>(&batch, 7)?;
+        let dollar_volumes = parquet::column::<Decimal128Array>(&batch, 8)?;
+        let read = |row: usize| -> Result<Bar, RowCause> {
             let prices = Ohlc::new(
-                price(prices[0])?,
-                price(prices[1])?,
-                price(prices[2])?,
-                price(prices[3])?,
+                open.price(row)?,
+                high.price(row)?,
+                low.price(row)?,
+                close.price(row)?,
             )
-            .map_err(|error| refused(format!("{error:?}")))?;
-            let volume = u64::try_from(volumes.value(row))
-                .map(Shares::from_units)
-                .map_err(|error| refused(error.to_string()))?;
-            let trade_count = trade_counts
-                .is_valid(row)
-                .then(|| TradeCount::new(trade_counts.value(row)));
+            .map_err(RowCause::Ohlc)?;
             let dollar_volume = match dollar_volumes.is_valid(row) {
-                true => Some(
-                    u128::try_from(dollar_volumes.value(row))
-                        .map(DollarVolume::from_units)
-                        .map_err(|error| refused(error.to_string()))?,
-                ),
+                true => Some(DollarVolume::from_units(dollar_volumes.integer(row)?)),
                 false => None,
             };
-            let bar = Bar::new(
-                symbol,
+            Bar::new(
+                Symbol::new(symbols.value(row)).map_err(RowCause::Symbol)?,
                 interval,
-                timestamp,
+                timestamps.instant_in(row, session)?,
                 prices,
-                volume,
-                trade_count,
+                Shares::from_units(volumes.integer(row)?),
+                trade_counts
+                    .is_valid(row)
+                    .then(|| TradeCount::new(trade_counts.value(row))),
                 dollar_volume,
             )
-            .map_err(|error| refused(format!("{error:?}")))?;
-            bars.push(bar);
+            .map_err(RowCause::Bar)
+        };
+        for row in 0..batch.num_rows() {
+            let index = bars.len();
+            bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
         }
     }
     Ok((bars, provenance))
@@ -401,21 +350,6 @@ pub(crate) fn provenance_from(entries: &[KeyValue]) -> Result<Provenance, &'stat
     })
 }
 
-fn downcast<T: 'static>(column: &ArrayRef) -> Result<&T, DecodeRefusal> {
-    Ok(parquet::downcast(column)?)
-}
-
-impl From<parquet::ReadRefusal> for DecodeRefusal {
-    fn from(refusal: parquet::ReadRefusal) -> Self {
-        match refusal {
-            parquet::ReadRefusal::Parquet { reason } => Self::Parquet { reason },
-            parquet::ReadRefusal::Schema { found } => Self::Schema { found },
-            parquet::ReadRefusal::Metadata { name } => Self::Metadata { name },
-            parquet::ReadRefusal::Layout { version } => Self::Layout { version },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use ::parquet::arrow::ArrowWriter;
@@ -426,6 +360,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::common::market::Price;
     use crate::common::storage::Origin;
 
     fn session() -> SessionDate {
@@ -512,7 +447,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let decimal = |index: usize| {
-            downcast::<Decimal128Array>(batch.column(index))
+            parquet::downcast::<Decimal128Array>(batch.column(index))
                 .unwrap()
                 .value_as_string(0)
         };
@@ -527,18 +462,18 @@ mod tests {
         let next_day = bar("AAPL", "2026-09-26T14:30:00Z", 10.0, None);
         assert_eq!(
             encode(&minute_key(), &[next_day], &written),
-            Err(EncodeRefusal::OutsideKey {
+            Err(EncodeRefusal::Placement(PlacementRefusal::OutsideKey {
                 symbol: Symbol::new("AAPL").unwrap(),
                 timestamp: "2026-09-26T14:30:00Z".parse().unwrap()
-            })
+            }))
         );
         let twice = bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None);
         assert_eq!(
             encode(&minute_key(), &[twice.clone(), twice], &written),
-            Err(EncodeRefusal::Duplicate {
+            Err(EncodeRefusal::Placement(PlacementRefusal::Duplicate {
                 symbol: Symbol::new("AAPL").unwrap(),
                 timestamp: "2026-09-25T14:30:00Z".parse().unwrap()
-            })
+            }))
         );
     }
 
@@ -547,7 +482,7 @@ mod tests {
         assert_eq!(
             encode(&minute_key(), &[], &provenance(Subscription::StocksStarter)),
             Err(EncodeRefusal::SubscriptionProvider {
-                subscription: Subscription::StocksStarter,
+                provenance: provenance(Subscription::StocksStarter),
                 key: Provider::Alpaca
             })
         );
@@ -576,11 +511,11 @@ mod tests {
         let unnamed = replace(&bytes, b"fund.layout_version", b"fund.layout_versioX");
         assert_eq!(
             decode(&minute_key(), unnamed).map(|_| ()),
-            Err(DecodeRefusal::Metadata {
+            Err(DecodeRefusal::File(ReadRefusal::Metadata {
                 name: "fund.layout_version"
-            })
+            }))
         );
-        let mut entries = metadata(&written);
+        let mut entries = written.metadata();
         entries.push(KeyValue::new(
             "fund.layout_version".to_string(),
             Some("2".to_string()),
@@ -594,15 +529,15 @@ mod tests {
         writer.close().unwrap();
         assert_eq!(
             decode(&minute_key(), later).map(|_| ()),
-            Err(DecodeRefusal::Layout {
+            Err(DecodeRefusal::File(ReadRefusal::Layout {
                 version: "2".to_string()
-            })
+            }))
         );
     }
 
     #[test]
     fn test_a_file_naming_its_layout_twice_is_refused() {
-        let mut entries = metadata(&provenance(Subscription::AlgoTraderPlus));
+        let mut entries = provenance(Subscription::AlgoTraderPlus).metadata();
         for version in [LAYOUT_VERSION, LAYOUT_VERSION] {
             entries.push(KeyValue::new(
                 "fund.layout_version".to_string(),
@@ -619,15 +554,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             decode(&minute_key(), bytes).map(|_| ()),
-            Err(DecodeRefusal::Metadata {
+            Err(DecodeRefusal::File(ReadRefusal::Metadata {
                 name: "fund.layout_version"
-            })
+            }))
         );
     }
 
     /// A file carrying valid provenance under `schema`, with no rows.
     fn file_with(schema: Schema) -> Vec<u8> {
-        let mut entries = metadata(&provenance(Subscription::AlgoTraderPlus));
+        let mut entries = provenance(Subscription::AlgoTraderPlus).metadata();
         entries.push(KeyValue::new(
             "fund.layout_version".to_string(),
             Some(LAYOUT_VERSION.to_string()),
@@ -673,7 +608,7 @@ mod tests {
             assert!(
                 matches!(
                     decode(&minute_key(), file_with(schema)),
-                    Err(DecodeRefusal::Schema { .. })
+                    Err(DecodeRefusal::File(ReadRefusal::Schema { .. }))
                 ),
                 "{name}"
             );
@@ -696,10 +631,16 @@ mod tests {
             interval: BarInterval::OneMinute,
             session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()),
         };
-        assert!(matches!(
-            decode(&next_day, bytes.clone()),
-            Err(DecodeRefusal::Row { index: 0, .. })
-        ));
+        assert_eq!(
+            decode(&next_day, bytes.clone()).map(|_| ()),
+            Err(DecodeRefusal::Row {
+                index: 0,
+                cause: RowCause::OutsideSession {
+                    timestamp: "2026-09-25T14:30:00Z".parse().unwrap(),
+                    session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()),
+                },
+            })
+        );
         let massive = Key::Bars {
             provider: Provider::Massive,
             origin: Origin::Vendor,
@@ -709,7 +650,7 @@ mod tests {
         assert_eq!(
             decode(&massive, bytes).map(|_| ()),
             Err(DecodeRefusal::Provider {
-                subscription: Subscription::AlgoTraderPlus,
+                provenance: provenance(Subscription::AlgoTraderPlus),
                 key: Provider::Massive
             })
         );

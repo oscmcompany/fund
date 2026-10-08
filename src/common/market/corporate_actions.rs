@@ -16,6 +16,16 @@ pub enum ActionIdRefusal {
     Empty,
 }
 
+impl std::fmt::Display for ActionIdRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("an empty action identifier"),
+        }
+    }
+}
+
+impl std::error::Error for ActionIdRefusal {}
+
 impl ActionId {
     pub fn new(raw: &str) -> Result<Self, ActionIdRefusal> {
         match raw.is_empty() {
@@ -43,6 +53,17 @@ pub enum SplitRatioRefusal {
     /// A side of zero shares, which no split has.
     Zero,
 }
+
+impl std::fmt::Display for SplitRatioRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shares(refusal) => write!(formatter, "a split side: {refusal}"),
+            Self::Zero => formatter.write_str("a split side of zero shares"),
+        }
+    }
+}
+
+impl std::error::Error for SplitRatioRefusal {}
 
 impl SplitRatio {
     pub fn new(from: Shares, to: Shares) -> Result<Self, SplitRatioRefusal> {
@@ -144,6 +165,29 @@ pub enum BoundaryChangeRefusal {
     },
 }
 
+impl std::fmt::Display for BoundaryChangeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Related {
+                kind,
+                related: Some(related),
+            } => write!(
+                formatter,
+                "a {kind} names {related} where it names no other symbol"
+            ),
+            Self::Related {
+                kind,
+                related: None,
+            } => write!(
+                formatter,
+                "a {kind} names no other symbol where it needs one"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoundaryChangeRefusal {}
+
 impl BoundaryChange {
     /// The change of `kind`, which carries `related` exactly when it is a rename or a spin-off.
     pub fn new(kind: BoundaryKind, related: Option<Symbol>) -> Result<Self, BoundaryChangeRefusal> {
@@ -195,6 +239,16 @@ pub enum SeriesBoundaryRefusal {
     /// A rename onto the symbol it already had, which ends nothing.
     RenamedToItself { symbol: Symbol },
 }
+
+impl std::fmt::Display for SeriesBoundaryRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RenamedToItself { symbol } => write!(formatter, "{symbol} renamed to itself"),
+        }
+    }
+}
+
+impl std::error::Error for SeriesBoundaryRefusal {}
 
 impl SeriesBoundary {
     pub fn new(
@@ -267,6 +321,15 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use super::*;
+
+    #[test]
+    fn test_a_split_side_refusal_names_its_shares_cause() {
+        let refusal = SplitRatioRefusal::Shares(SharesRefusal::OutOfRange { shares: -1.0 });
+        assert_eq!(
+            refusal.to_string(),
+            "a split side: -1 shares is negative or past what millionths in a u64 hold"
+        );
+    }
 
     fn day(day_of_year: u32) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_yo_opt(2026, day_of_year).unwrap())

@@ -15,10 +15,10 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::DateTime;
 
 use super::bars::{Provenance, provenance_from};
-use super::parquet;
+use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 use crate::common::market::quote_bars::{QuoteBar, QuoteSums, Spread, StandingQuote};
 use crate::common::market::record::BarInterval;
-use crate::common::market::{Price, Shares, Symbol};
+use crate::common::market::{Shares, Symbol};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
@@ -38,15 +38,7 @@ pub enum EncodeRefusal {
         provenance: Provenance,
         key: Provider,
     },
-    /// A bar whose interval or session is not the key's.
-    OutsideKey {
-        symbol: Symbol,
-        timestamp: DateTime<chrono::Utc>,
-    },
-    Duplicate {
-        symbol: Symbol,
-        timestamp: DateTime<chrono::Utc>,
-    },
+    Placement(PlacementRefusal),
     /// A sum past what a thirty-eight-digit decimal holds.
     Unrepresentable {
         symbol: Symbol,
@@ -61,26 +53,21 @@ pub enum EncodeRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
     NotAQuotesKey,
-    Parquet {
-        reason: String,
-    },
-    Metadata {
-        name: &'static str,
-    },
-    Layout {
-        version: String,
-    },
+    File(ReadRefusal),
     Row {
         index: usize,
-        reason: String,
-    },
-    Schema {
-        found: String,
+        cause: RowCause,
     },
     Provider {
         provenance: Provenance,
         key: Provider,
     },
+}
+
+impl From<ReadRefusal> for DecodeRefusal {
+    fn from(refusal: ReadRefusal) -> Self {
+        Self::File(refusal)
+    }
 }
 
 fn quotes_key(key: &Key) -> Option<(Provider, BarInterval, SessionDate)> {
@@ -146,10 +133,10 @@ pub fn encode(
             key: provider,
         });
     }
-    let mut ordered: Vec<&QuoteBar> = bars.iter().collect();
-    ordered.sort_by(|left, right| {
-        (left.symbol(), left.timestamp()).cmp(&(right.symbol(), right.timestamp()))
-    });
+    let ordered = parquet::place(bars, interval, session, |bar| {
+        (bar.symbol(), bar.interval(), bar.timestamp())
+    })
+    .map_err(EncodeRefusal::Placement)?;
     let mut symbols = StringBuilder::new();
     let mut timestamps = TimestampMicrosecondBuilder::new().with_timezone("UTC");
     let mut quote_counts = UInt64Builder::new();
@@ -159,22 +146,8 @@ pub fn encode(
     let mut prices: [Decimal128Builder; 4] = std::array::from_fn(|_| Decimal128Builder::new());
     let mut closing_since = TimestampNanosecondBuilder::new().with_timezone("UTC");
     let mut sizes: [Decimal128Builder; 2] = std::array::from_fn(|_| Decimal128Builder::new());
-    let mut previous: Option<(&Symbol, DateTime<chrono::Utc>)> = None;
     for bar in ordered {
         let (symbol, timestamp) = (bar.symbol(), bar.timestamp());
-        if bar.interval() != interval || SessionDate::at(timestamp) != session {
-            return Err(EncodeRefusal::OutsideKey {
-                symbol: symbol.clone(),
-                timestamp,
-            });
-        }
-        if previous == Some((symbol, timestamp)) {
-            return Err(EncodeRefusal::Duplicate {
-                symbol: symbol.clone(),
-                timestamp,
-            });
-        }
-        previous = Some((symbol, timestamp));
         let unrepresentable = || EncodeRefusal::Unrepresentable {
             symbol: symbol.clone(),
             timestamp,
@@ -186,10 +159,7 @@ pub fn encode(
             sums.bid_size_time(),
             sums.ask_size_time(),
         ]) {
-            let value = i128::try_from(value)
-                .ok()
-                .filter(|value| *value < 10_i128.pow(38))
-                .ok_or_else(unrepresentable)?;
+            let value = parquet::widest_decimal(value).ok_or_else(unrepresentable)?;
             builder.append_value(value);
         }
         let closing = sums.closing();
@@ -241,12 +211,7 @@ pub fn encode(
         bid_size,
         ask_size,
     ];
-    let metadata = provenance
-        .entries()
-        .into_iter()
-        .map(|(name, value)| ::parquet::file::metadata::KeyValue::new(name.to_string(), value))
-        .collect();
-    parquet::write(schema(), columns, LAYOUT_VERSION, metadata)
+    parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata())
         .map_err(|reason| EncodeRefusal::Parquet { reason })
 }
 
@@ -254,7 +219,7 @@ pub fn encode(
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<QuoteBar>, Provenance), DecodeRefusal> {
     let (provider, interval, session) = quotes_key(key).ok_or(DecodeRefusal::NotAQuotesKey)?;
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
-    let provenance = provenance_from(&entries).map_err(|name| DecodeRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
         return Err(DecodeRefusal::Provider {
             provenance,
@@ -263,94 +228,53 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<QuoteBar>, Provenance), 
     }
     let mut bars = Vec::new();
     for batch in batches {
-        let decimals = |index: usize| {
-            parquet::downcast::<Decimal128Array>(batch.column(index)).map_err(DecodeRefusal::from)
-        };
-        let symbols =
-            parquet::downcast::<StringArray>(batch.column(0)).map_err(DecodeRefusal::from)?;
-        let timestamps = parquet::downcast::<TimestampMicrosecondArray>(batch.column(1))
-            .map_err(DecodeRefusal::from)?;
-        let quote_counts =
-            parquet::downcast::<UInt64Array>(batch.column(2)).map_err(DecodeRefusal::from)?;
-        let covered =
-            parquet::downcast::<UInt64Array>(batch.column(3)).map_err(DecodeRefusal::from)?;
+        let decimals = |index: usize| parquet::column::<Decimal128Array>(&batch, index);
+        let symbols = parquet::column::<StringArray>(&batch, 0)?;
+        let timestamps = parquet::column::<TimestampMicrosecondArray>(&batch, 1)?;
+        let quote_counts = parquet::column::<UInt64Array>(&batch, 2)?;
+        let covered = parquet::column::<UInt64Array>(&batch, 3)?;
         let time_weighted = [decimals(4)?, decimals(5)?, decimals(6)?, decimals(7)?];
-        let prices = [decimals(8)?, decimals(9)?, decimals(11)?, decimals(12)?];
-        let closing_since = parquet::downcast::<TimestampNanosecondArray>(batch.column(10))
-            .map_err(DecodeRefusal::from)?;
-        let sizes = [decimals(13)?, decimals(14)?];
-        for row in 0..batch.num_rows() {
-            let index = bars.len();
-            let refused = |reason: String| DecodeRefusal::Row { index, reason };
-            let unsigned = |array: &Decimal128Array| {
-                u128::try_from(array.value(row)).map_err(|error| refused(error.to_string()))
-            };
-            let ticks = |array: &Decimal128Array| {
-                i64::try_from(array.value(row)).map_err(|error| refused(error.to_string()))
-            };
-            let price = |array: &Decimal128Array| {
-                ticks(array).and_then(|ticks| {
-                    Price::from_ticks(ticks).map_err(|error| refused(format!("{error:?}")))
-                })
-            };
-            let spread = |array: &Decimal128Array| {
-                ticks(array).and_then(|ticks| {
-                    u64::try_from(ticks)
-                        .map(Spread::from_ticks)
-                        .map_err(|error| refused(error.to_string()))
-                })
-            };
-            let size = |array: &Decimal128Array| {
-                u64::try_from(array.value(row))
-                    .map(Shares::from_units)
-                    .map_err(|error| refused(error.to_string()))
-            };
-            let symbol =
-                Symbol::new(symbols.value(row)).map_err(|error| refused(format!("{error:?}")))?;
-            let timestamp = DateTime::from_timestamp_micros(timestamps.value(row))
-                .ok_or_else(|| refused("timestamp out of range".to_string()))?;
-            if SessionDate::at(timestamp) != session {
-                return Err(refused(format!("{timestamp} is outside session {session}")));
-            }
+        let [narrowest, widest, bid, ask] =
+            [decimals(8)?, decimals(9)?, decimals(11)?, decimals(12)?];
+        let closing_since = parquet::column::<TimestampNanosecondArray>(&batch, 10)?;
+        let [bid_size, ask_size] = [decimals(13)?, decimals(14)?];
+        let read = |row: usize| -> Result<QuoteBar, RowCause> {
             let closing = StandingQuote::new(
                 DateTime::from_timestamp_nanos(closing_since.value(row)),
-                price(prices[2])?,
-                price(prices[3])?,
-                size(sizes[0])?,
-                size(sizes[1])?,
+                bid.price(row)?,
+                ask.price(row)?,
+                Shares::from_units(bid_size.integer(row)?),
+                Shares::from_units(ask_size.integer(row)?),
             )
-            .map_err(|error| refused(format!("{error:?}")))?;
+            .map_err(RowCause::QuoteSums)?;
             let sums = QuoteSums::new(
                 quote_counts.value(row),
                 covered.value(row),
                 [
-                    unsigned(time_weighted[0])?,
-                    unsigned(time_weighted[1])?,
-                    unsigned(time_weighted[2])?,
-                    unsigned(time_weighted[3])?,
+                    time_weighted[0].integer(row)?,
+                    time_weighted[1].integer(row)?,
+                    time_weighted[2].integer(row)?,
+                    time_weighted[3].integer(row)?,
                 ],
-                spread(prices[0])?,
-                spread(prices[1])?,
+                Spread::from_ticks(narrowest.integer(row)?),
+                Spread::from_ticks(widest.integer(row)?),
                 closing,
             )
-            .map_err(|error| refused(format!("{error:?}")))?;
-            let bar = QuoteBar::new(symbol, interval, timestamp, sums)
-                .map_err(|error| refused(format!("{error:?}")))?;
-            bars.push(bar);
+            .map_err(RowCause::QuoteSums)?;
+            QuoteBar::new(
+                Symbol::new(symbols.value(row)).map_err(RowCause::Symbol)?,
+                interval,
+                timestamps.instant_in(row, session)?,
+                sums,
+            )
+            .map_err(RowCause::QuoteBar)
+        };
+        for row in 0..batch.num_rows() {
+            let index = bars.len();
+            bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
         }
     }
     Ok((bars, provenance))
-}
-
-impl From<parquet::ReadRefusal> for DecodeRefusal {
-    fn from(refusal: parquet::ReadRefusal) -> Self {
-        match refusal {
-            parquet::ReadRefusal::Parquet { reason } => Self::Parquet { reason },
-            parquet::ReadRefusal::Schema { found } => Self::Schema { found },
-            parquet::ReadRefusal::Metadata { name } => Self::Metadata { name },
-            parquet::ReadRefusal::Layout { version } => Self::Layout { version },
-        }
-    }
 }
 
 #[cfg(test)]
@@ -361,6 +285,7 @@ mod tests {
     use super::*;
     use crate::archive::bars::Subscription;
     use crate::common::journal::{Commit, RunId};
+    use crate::common::market::Price;
     use crate::common::market::quote_bars::QuoteFold;
     use crate::common::market::record::Quote;
     use crate::common::storage::Origin;
@@ -433,7 +358,9 @@ mod tests {
         };
         assert!(matches!(
             encode(&other, &bars(), &provenance()),
-            Err(EncodeRefusal::OutsideKey { .. })
+            Err(EncodeRefusal::Placement(
+                PlacementRefusal::OutsideKey { .. }
+            ))
         ));
         let bars_key = Key::Bars {
             provider: Provider::Massive,

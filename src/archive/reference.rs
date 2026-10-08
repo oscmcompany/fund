@@ -13,6 +13,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 
 use super::bars::{Provenance, provenance_from};
+use super::parquet::{ReadRefusal, RowCause};
 use super::{Archive, parquet};
 use crate::common::market::corporate_actions::{
     ActionId, BoundaryChange, BoundaryKind, SeriesBoundary, Split, SplitRatio,
@@ -49,18 +50,11 @@ pub enum ReferenceRefusal {
         provenance: Provenance,
         key: Provider,
     },
+    /// The file was not written.
     Parquet {
         reason: String,
     },
-    Schema {
-        found: String,
-    },
-    Metadata {
-        name: &'static str,
-    },
-    Layout {
-        version: String,
-    },
+    File(ReadRefusal),
     Duplicate {
         code: u16,
     },
@@ -73,18 +67,13 @@ pub enum ReferenceRefusal {
     /// A row that no longer passes its types' own checks.
     Row {
         index: usize,
-        reason: String,
+        cause: RowCause,
     },
 }
 
-impl From<parquet::ReadRefusal> for ReferenceRefusal {
-    fn from(refusal: parquet::ReadRefusal) -> Self {
-        match refusal {
-            parquet::ReadRefusal::Parquet { reason } => Self::Parquet { reason },
-            parquet::ReadRefusal::Schema { found } => Self::Schema { found },
-            parquet::ReadRefusal::Metadata { name } => Self::Metadata { name },
-            parquet::ReadRefusal::Layout { version } => Self::Layout { version },
-        }
+impl From<ReadRefusal> for ReferenceRefusal {
+    fn from(refusal: ReadRefusal) -> Self {
+        Self::File(refusal)
     }
 }
 
@@ -164,7 +153,7 @@ pub fn encode_conditions(
             retired,
         ],
         CONDITIONS_LAYOUT_VERSION,
-        provenance_metadata(provenance),
+        provenance.metadata(),
     )
     .map_err(|reason| ReferenceRefusal::Parquet { reason })
 }
@@ -176,8 +165,7 @@ pub fn decode_conditions(
 ) -> Result<(TradeConditions, Provenance), ReferenceRefusal> {
     table_provider(key, ReferenceTable::Conditions)?;
     let (batches, entries) = parquet::read(bytes, &conditions_schema(), CONDITIONS_LAYOUT_VERSION)?;
-    let provenance =
-        provenance_from(&entries).map_err(|name| ReferenceRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     snapshot_provider(key, ReferenceTable::Conditions, &provenance)?;
     let mut rules = BTreeMap::new();
     for batch in batches {
@@ -189,18 +177,21 @@ pub fn decode_conditions(
             parquet::downcast::<BooleanArray>(batch.column(6))?,
         ];
         let letters = [
-            parquet::downcast::<StringArray>(batch.column(4))?,
-            parquet::downcast::<StringArray>(batch.column(5))?,
+            parquet::column::<StringArray>(&batch, 4)?,
+            parquet::column::<StringArray>(&batch, 5)?,
         ];
         for row in 0..batch.num_rows() {
             let code = codes.value(row);
-            let letter = |array: &StringArray| match array.is_valid(row) {
+            let letter = |array: &parquet::Column<'_, StringArray>| match array.is_valid(row) {
                 false => Ok(None),
                 true => match condition_letter(array.value(row)) {
                     Some(letter) => Ok(Some(letter)),
                     None => Err(ReferenceRefusal::Row {
                         index: row,
-                        reason: format!("condition {code} letter `{}`", array.value(row)),
+                        cause: RowCause::Unparsable {
+                            column: format!("{} of condition {code}", array.name()),
+                            raw: array.value(row).to_string(),
+                        },
                     }),
                 },
             };
@@ -210,8 +201,8 @@ pub fn decode_conditions(
                     flags[1].value(row),
                     flags[2].value(row),
                 ),
-                letter(letters[0])?,
-                letter(letters[1])?,
+                letter(&letters[0])?,
+                letter(&letters[1])?,
                 flags[3].value(row),
             );
             if rules.insert(code, rule).is_some() {
@@ -341,7 +332,7 @@ pub fn encode_security_details(
             Arc::new(central_index_keys.finish()),
         ],
         LAYOUT_VERSION,
-        provenance_metadata(provenance),
+        provenance.metadata(),
     )
     .map_err(|reason| ReferenceRefusal::Parquet { reason })
 }
@@ -353,62 +344,65 @@ pub fn decode_security_details(
 ) -> Result<(Vec<SecurityDetails>, Provenance), ReferenceRefusal> {
     table_provider(key, ReferenceTable::SecurityDetails)?;
     let (batches, entries) = parquet::read(bytes, &security_details_schema(), LAYOUT_VERSION)?;
-    let provenance =
-        provenance_from(&entries).map_err(|name| ReferenceRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     snapshot_provider(key, ReferenceTable::SecurityDetails, &provenance)?;
     let mut details = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for batch in batches {
-        let strings = |index: usize| parquet::downcast::<StringArray>(batch.column(index));
-        let decimals = |index: usize| parquet::downcast::<Decimal128Array>(batch.column(index));
+        let strings = |index: usize| parquet::column::<StringArray>(&batch, index);
+        let decimals = |index: usize| parquet::column::<Decimal128Array>(&batch, index);
         let (symbols, security_types, descriptions, exchanges) =
             (strings(0)?, strings(1)?, strings(3)?, strings(6)?);
-        let industry_codes = parquet::downcast::<UInt16Array>(batch.column(2))?;
+        let industry_codes = parquet::column::<UInt16Array>(&batch, 2)?;
         let (shares, capitalizations) = (decimals(4)?, decimals(5)?);
-        let central_index_keys = parquet::downcast::<UInt64Array>(batch.column(7))?;
-        for row in 0..batch.num_rows() {
-            let index = details.len();
-            let refused = |reason: String| ReferenceRefusal::Row { index, reason };
+        let central_index_keys = parquet::column::<UInt64Array>(&batch, 7)?;
+        let read = |row: usize| -> Result<SecurityDetails, RowCause> {
             let optional = |valid: bool| valid.then_some(());
-            let symbol =
-                Symbol::new(symbols.value(row)).map_err(|error| refused(format!("{error:?}")))?;
             let security_type = optional(security_types.is_valid(row))
-                .map(|()| security_types.value(row).parse::<SecurityType>())
-                .transpose()
-                .map_err(|error| refused(error.to_string()))?;
+                .map(|()| {
+                    let raw = security_types.value(row);
+                    raw.parse::<SecurityType>()
+                        .map_err(|_| RowCause::Unparsable {
+                            column: security_types.name().to_string(),
+                            raw: raw.to_string(),
+                        })
+                })
+                .transpose()?;
             let industry_code = optional(industry_codes.is_valid(row))
                 .map(|()| IndustryCode::new(&format!("{:04}", industry_codes.value(row))))
                 .transpose()
-                .map_err(|error| refused(format!("{error:?}")))?;
-            let industry_description =
-                optional(descriptions.is_valid(row)).map(|()| descriptions.value(row).to_string());
+                .map_err(RowCause::IndustryCode)?;
             let shares_outstanding = optional(shares.is_valid(row))
-                .map(|()| u64::try_from(shares.value(row)).map(Shares::from_units))
-                .transpose()
-                .map_err(|error| refused(error.to_string()))?;
+                .map(|()| shares.integer(row).map(Shares::from_units))
+                .transpose()?;
             let market_capitalization = optional(capitalizations.is_valid(row))
-                .map(|()| u64::try_from(capitalizations.value(row)).map(Dollars::from_millionths))
-                .transpose()
-                .map_err(|error| refused(error.to_string()))?;
+                .map(|()| capitalizations.integer(row).map(Dollars::from_millionths))
+                .transpose()?;
             let primary_exchange = optional(exchanges.is_valid(row))
                 .map(|()| MarketIdentifierCode::new(exchanges.value(row)))
                 .transpose()
-                .map_err(|error| refused(format!("{error:?}")))?;
-            let central_index_key = optional(central_index_keys.is_valid(row))
-                .map(|()| CentralIndexKey::new(central_index_keys.value(row)));
-            if !seen.insert(symbol.clone()) {
-                return Err(ReferenceRefusal::DuplicateSymbol { symbol });
-            }
-            details.push(SecurityDetails::new(
-                symbol,
+                .map_err(RowCause::MarketIdentifierCode)?;
+            Ok(SecurityDetails::new(
+                Symbol::new(symbols.value(row)).map_err(RowCause::Symbol)?,
                 security_type,
                 industry_code,
-                industry_description,
+                optional(descriptions.is_valid(row)).map(|()| descriptions.value(row).to_string()),
                 shares_outstanding,
                 market_capitalization,
                 primary_exchange,
-                central_index_key,
-            ));
+                optional(central_index_keys.is_valid(row))
+                    .map(|()| CentralIndexKey::new(central_index_keys.value(row))),
+            ))
+        };
+        for row in 0..batch.num_rows() {
+            let index = details.len();
+            let row = read(row).map_err(|cause| ReferenceRefusal::Row { index, cause })?;
+            if !seen.insert(row.symbol().clone()) {
+                return Err(ReferenceRefusal::DuplicateSymbol {
+                    symbol: row.symbol().clone(),
+                });
+            }
+            details.push(row);
         }
     }
     Ok((details, provenance))
@@ -421,10 +415,19 @@ fn epoch_days(session: SessionDate) -> i32 {
     i32::try_from(days).expect("a session date lies within Date32's range")
 }
 
-fn from_epoch_days(days: i32) -> Option<SessionDate> {
+/// The session a `Date32` column stores at `row`, refused past what a date holds.
+fn session_at(
+    dates: &parquet::Column<'_, Date32Array>,
+    row: usize,
+) -> Result<SessionDate, RowCause> {
+    let days = dates.value(row);
     NaiveDate::from_ymd_opt(1970, 1, 1)
         .and_then(|epoch| epoch.checked_add_signed(chrono::TimeDelta::days(i64::from(days))))
         .map(SessionDate::from_date)
+        .ok_or_else(|| RowCause::OutOfRange {
+            column: dates.name().to_string(),
+            value: i128::from(days),
+        })
 }
 
 /// The provider `key` names for `table`, checked against the subscription the provenance says fetched it.
@@ -441,14 +444,6 @@ fn snapshot_provider(
             key: provider,
         }),
     }
-}
-
-fn provenance_metadata(provenance: &Provenance) -> Vec<::parquet::file::metadata::KeyValue> {
-    provenance
-        .entries()
-        .into_iter()
-        .map(|(name, value)| ::parquet::file::metadata::KeyValue::new(name.to_string(), value))
-        .collect()
 }
 
 /// The first identifier listed twice, which a snapshot refuses.
@@ -507,7 +502,7 @@ pub fn encode_splits(
             Arc::new(tos.finish().with_data_type(SHARES_TYPE)),
         ],
         LAYOUT_VERSION,
-        provenance_metadata(provenance),
+        provenance.metadata(),
     )
     .map_err(|reason| ReferenceRefusal::Parquet { reason })
 }
@@ -518,36 +513,34 @@ pub fn decode_splits(
     bytes: Vec<u8>,
 ) -> Result<(Vec<Split>, Provenance), ReferenceRefusal> {
     let (batches, entries) = parquet::read(bytes, &splits_schema(), LAYOUT_VERSION)?;
-    let provenance =
-        provenance_from(&entries).map_err(|name| ReferenceRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     snapshot_provider(key, ReferenceTable::Splits, &provenance)?;
     let mut splits = Vec::new();
     for batch in batches {
         let (ids, symbols) = (
-            parquet::downcast::<StringArray>(batch.column(0))?,
-            parquet::downcast::<StringArray>(batch.column(1))?,
+            parquet::column::<StringArray>(&batch, 0)?,
+            parquet::column::<StringArray>(&batch, 1)?,
         );
-        let dates = parquet::downcast::<Date32Array>(batch.column(2))?;
+        let dates = parquet::column::<Date32Array>(&batch, 2)?;
         let (froms, tos) = (
-            parquet::downcast::<Decimal128Array>(batch.column(3))?,
-            parquet::downcast::<Decimal128Array>(batch.column(4))?,
+            parquet::column::<Decimal128Array>(&batch, 3)?,
+            parquet::column::<Decimal128Array>(&batch, 4)?,
         );
+        let read = |row: usize| -> Result<Split, RowCause> {
+            Ok(Split::new(
+                ActionId::new(ids.value(row)).map_err(RowCause::ActionId)?,
+                Symbol::new(symbols.value(row)).map_err(RowCause::Symbol)?,
+                session_at(&dates, row)?,
+                SplitRatio::new(
+                    Shares::from_units(froms.integer(row)?),
+                    Shares::from_units(tos.integer(row)?),
+                )
+                .map_err(RowCause::SplitRatio)?,
+            ))
+        };
         for row in 0..batch.num_rows() {
             let index = splits.len();
-            let refused = |reason: String| ReferenceRefusal::Row { index, reason };
-            let shares = |array: &Decimal128Array| {
-                u64::try_from(array.value(row))
-                    .map(Shares::from_units)
-                    .map_err(|error| refused(error.to_string()))
-            };
-            splits.push(Split::new(
-                ActionId::new(ids.value(row)).map_err(|error| refused(format!("{error:?}")))?,
-                Symbol::new(symbols.value(row)).map_err(|error| refused(format!("{error:?}")))?,
-                from_epoch_days(dates.value(row))
-                    .ok_or_else(|| refused("date out of range".to_string()))?,
-                SplitRatio::new(shares(froms)?, shares(tos)?)
-                    .map_err(|error| refused(format!("{error:?}")))?,
-            ));
+            splits.push(read(row).map_err(|cause| ReferenceRefusal::Row { index, cause })?);
         }
     }
     if let Some(id) = duplicate_action(splits.iter().map(Split::id)) {
@@ -606,7 +599,7 @@ pub fn encode_series_boundaries(
             Arc::new(related.finish()),
         ],
         LAYOUT_VERSION,
-        provenance_metadata(provenance),
+        provenance.metadata(),
     )
     .map_err(|reason| ReferenceRefusal::Parquet { reason })
 }
@@ -617,44 +610,39 @@ pub fn decode_series_boundaries(
     bytes: Vec<u8>,
 ) -> Result<(Vec<SeriesBoundary>, Provenance), ReferenceRefusal> {
     let (batches, entries) = parquet::read(bytes, &series_boundaries_schema(), LAYOUT_VERSION)?;
-    let provenance =
-        provenance_from(&entries).map_err(|name| ReferenceRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     snapshot_provider(key, ReferenceTable::SeriesBoundaries, &provenance)?;
     let mut boundaries = Vec::new();
     for batch in batches {
-        let strings = |index: usize| parquet::downcast::<StringArray>(batch.column(index));
-        let dates = |index: usize| parquet::downcast::<Date32Array>(batch.column(index));
+        let strings = |index: usize| parquet::column::<StringArray>(&batch, index);
+        let dates = |index: usize| parquet::column::<Date32Array>(&batch, index);
         let (ids, symbols, changes, related) = (strings(0)?, strings(1)?, strings(4)?, strings(5)?);
         let (ons, processed) = (dates(2)?, dates(3)?);
-        for row in 0..batch.num_rows() {
-            let index = boundaries.len();
-            let refused = |reason: String| ReferenceRefusal::Row { index, reason };
-            let date = |array: &Date32Array| {
-                from_epoch_days(array.value(row))
-                    .ok_or_else(|| refused("date out of range".to_string()))
-            };
-            let kind = changes
-                .value(row)
+        let read = |row: usize| -> Result<SeriesBoundary, RowCause> {
+            let raw = changes.value(row);
+            let kind = raw
                 .parse::<BoundaryKind>()
-                .map_err(|error| refused(error.to_string()))?;
+                .map_err(|_| RowCause::Unparsable {
+                    column: changes.name().to_string(),
+                    raw: raw.to_string(),
+                })?;
             let related = related
                 .is_valid(row)
                 .then(|| Symbol::new(related.value(row)))
                 .transpose()
-                .map_err(|error| refused(format!("{error:?}")))?;
-            let change = BoundaryChange::new(kind, related)
-                .map_err(|error| refused(format!("{error:?}")))?;
-            boundaries.push(
-                SeriesBoundary::new(
-                    ActionId::new(ids.value(row)).map_err(|error| refused(format!("{error:?}")))?,
-                    Symbol::new(symbols.value(row))
-                        .map_err(|error| refused(format!("{error:?}")))?,
-                    date(ons)?,
-                    date(processed)?,
-                    change,
-                )
-                .map_err(|error| refused(format!("{error:?}")))?,
-            );
+                .map_err(RowCause::Symbol)?;
+            SeriesBoundary::new(
+                ActionId::new(ids.value(row)).map_err(RowCause::ActionId)?,
+                Symbol::new(symbols.value(row)).map_err(RowCause::Symbol)?,
+                session_at(&ons, row)?,
+                session_at(&processed, row)?,
+                BoundaryChange::new(kind, related).map_err(RowCause::BoundaryChange)?,
+            )
+            .map_err(RowCause::SeriesBoundary)
+        };
+        for row in 0..batch.num_rows() {
+            let index = boundaries.len();
+            boundaries.push(read(row).map_err(|cause| ReferenceRefusal::Row { index, cause })?);
         }
     }
     if let Some(id) = duplicate_action(boundaries.iter().map(SeriesBoundary::id)) {
