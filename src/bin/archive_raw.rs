@@ -1215,6 +1215,8 @@ enum RollUpFailure {
     Missing,
     Decode(String),
     Encode(String),
+    /// The roll-up's task panicked or was canceled before it finished.
+    Interrupted(String),
 }
 
 impl std::fmt::Display for RollUpFailure {
@@ -1224,6 +1226,7 @@ impl std::fmt::Display for RollUpFailure {
             Self::Missing => write!(formatter, "the minute bars are gone"),
             Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal}"),
             Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal}"),
+            Self::Interrupted(reason) => write!(formatter, "the roll-up did not finish: {reason}"),
         }
     }
 }
@@ -1340,7 +1343,7 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
         Ok::<_, RollUpFailure>((five_minutes.len(), body))
     })
     .await
-    .map_err(|error| RollUpFailure::Decode(error.to_string()))??;
+    .map_err(|error| RollUpFailure::Interrupted(error.to_string()))??;
     archive
         .create(&key, body)
         .await

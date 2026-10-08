@@ -178,13 +178,27 @@ impl QuoteSums {
     }
 
     fn combine(self, other: Self) -> Self {
+        let time = |left: u128, right: u128, name: &str| {
+            left.checked_add(right)
+                .unwrap_or_else(|| panic!("{name} fits u128"))
+        };
         Self {
-            quote_count: self.quote_count + other.quote_count,
-            covered_nanoseconds: self.covered_nanoseconds + other.covered_nanoseconds,
-            spread_time: self.spread_time + other.spread_time,
-            relative_spread_time: self.relative_spread_time + other.relative_spread_time,
-            bid_size_time: self.bid_size_time + other.bid_size_time,
-            ask_size_time: self.ask_size_time + other.ask_size_time,
+            quote_count: self
+                .quote_count
+                .checked_add(other.quote_count)
+                .expect("quote count fits u64"),
+            covered_nanoseconds: self
+                .covered_nanoseconds
+                .checked_add(other.covered_nanoseconds)
+                .expect("covered nanoseconds fit u64"),
+            spread_time: time(self.spread_time, other.spread_time, "spread time"),
+            relative_spread_time: time(
+                self.relative_spread_time,
+                other.relative_spread_time,
+                "relative spread time",
+            ),
+            bid_size_time: time(self.bid_size_time, other.bid_size_time, "bid size time"),
+            ask_size_time: time(self.ask_size_time, other.ask_size_time, "ask size time"),
             narrowest: self.narrowest.min(other.narrowest),
             widest: self.widest.max(other.widest),
             closing: self.closing.max(other.closing),
@@ -521,6 +535,22 @@ mod tests {
             Shares::whole(ask_size).unwrap(),
         )
         .unwrap()
+    }
+
+    /// A count past `u64` panics naming the sum in every build, as the sibling sums do, rather than wrapping in release.
+    #[test]
+    #[should_panic(expected = "quote count fits u64")]
+    fn test_sums_that_overflow_panic_by_name() {
+        let standing =
+            StandingQuote::of(&quote("SPY", "2026-10-08T14:00:00Z", 100.0, 100.01, 1, 1));
+        let full = QuoteSums {
+            quote_count: u64::MAX,
+            ..QuoteSums::standing(&standing, 1)
+        };
+        let _ = full.combine(QuoteSums {
+            quote_count: 1,
+            ..QuoteSums::standing(&standing, 1)
+        });
     }
 
     /// 2026-10-02, 09:30 to 16:00 Eastern.

@@ -2,6 +2,7 @@
 //! held whole, under a full-object CRC64 that S3 computes and any later copy of the same bytes must match.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -333,10 +334,14 @@ fn fetched_at(metadata: Option<&HashMap<String, String>>) -> Result<Option<DateT
 }
 
 /// The part number, first byte and length of each part a file of `length` bytes is uploaded in, numbered from one.
-fn ranges(length: u64) -> impl Iterator<Item = (i32, u64, u64)> {
+fn ranges(length: u64) -> impl Iterator<Item = (i32, u64, NonZeroU64)> {
     (1..)
         .zip((0..length).step_by(PART_LENGTH as usize))
-        .map(move |(number, start)| (number, start, PART_LENGTH.min(length - start)))
+        .map(move |(number, start)| {
+            let part = NonZeroU64::new(PART_LENGTH.min(length - start))
+                .expect("a part starts before the file ends");
+            (number, start, part)
+        })
 }
 
 fn storage_class(key: &Key) -> aws_sdk_s3::types::StorageClass {
@@ -354,7 +359,7 @@ struct Part {
     upload_id: String,
     number: i32,
     start: u64,
-    length: u64,
+    length: NonZeroU64,
 }
 
 impl Part {
@@ -440,13 +445,16 @@ mod tests {
 
     #[test]
     fn test_parts_cover_every_byte_once_numbered_from_one() {
-        assert_eq!(ranges(1).collect::<Vec<_>>(), vec![(1, 0, 1)]);
+        let ranges = |length| {
+            ranges(length)
+                .map(|(number, start, part)| (number, start, part.get()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(0), vec![]);
+        assert_eq!(ranges(1), vec![(1, 0, 1)]);
+        assert_eq!(ranges(64 * MEBIBYTE), vec![(1, 0, 64 * MEBIBYTE)]);
         assert_eq!(
-            ranges(64 * MEBIBYTE).collect::<Vec<_>>(),
-            vec![(1, 0, 64 * MEBIBYTE)]
-        );
-        assert_eq!(
-            ranges(128 * MEBIBYTE + 1).collect::<Vec<_>>(),
+            ranges(128 * MEBIBYTE + 1),
             vec![
                 (1, 0, 64 * MEBIBYTE),
                 (2, 64 * MEBIBYTE, 64 * MEBIBYTE),

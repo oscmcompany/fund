@@ -85,6 +85,10 @@ pub enum RowRefusal {
     Conditions {
         raw: String,
     },
+    /// A correction code or label no rule reads, so whether the print stands is unknown.
+    Correction {
+        raw: String,
+    },
     /// Answered for a symbol that was not asked for, as when a vendor normalizes a name into another security's.
     Unrequested,
     /// One of several rows claiming the same record; none is kept, since nothing says which is true.
@@ -153,4 +157,9 @@ impl<Key: Ord + Clone> Accepted<Key> {
         let bars = self.rows.into_values().map(|(_, bar)| bar).collect();
         (bars, self.refused)
     }
+}
+
+/// A quote with a side priced at zero, which is no top of book; a negative price is a bad price and refused as one.
+pub(crate) fn one_sided(bid: f64, ask: f64) -> bool {
+    bid == 0.0 || ask == 0.0
 }
