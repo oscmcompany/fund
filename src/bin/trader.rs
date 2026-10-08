@@ -26,6 +26,7 @@ use fund::common::journal::{Commit, Observation, RunId, SessionOpened};
 use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
+use fund::common::playbook::{Playbook, PlaybookRead, Played};
 use fund::common::storage::{Host, Key, Origin, Provider, Service};
 use fund::common::time::SessionDate;
 use fund::common::time::calendar::TradingCalendar;
@@ -124,6 +125,13 @@ async fn main() -> ExitCode {
             tracing::error!(%error, "Configuration was not journaled");
             return ExitCode::from(REFUSED_TO_START);
         }
+        let strategy = match read_playbook(&parameters, &mut journal) {
+            Ok(strategy) => strategy,
+            Err(refusal) => {
+                tracing::error!(%refusal, path = %parameters.playbook().display(), "Playbook refused");
+                return ExitCode::from(REFUSED_TO_START);
+            }
+        };
         let sdk_configuration = aws_config::load_from_env().await;
         let (archive, records) = match (
             Archive::market_data(&sdk_configuration),
@@ -135,7 +143,7 @@ async fn main() -> ExitCode {
                 return ExitCode::from(REFUSED_TO_START);
             }
         };
-        let traded = trade(&parameters, &archive, &mut journal, today).await;
+        let traded = trade(&parameters, strategy, &archive, &mut journal, today).await;
         let outcome = match traded {
             Ok(Ran::NoSession) => {
                 tracing::info!(%today, "No session today");
@@ -209,8 +217,23 @@ enum Stopped {
     Trading(String),
 }
 
+/// Reads and journals the playbook, so the session's records name the playbook it traded under.
+fn read_playbook(parameters: &Parameters, journal: &mut Journal) -> Result<Played, String> {
+    let contents =
+        std::fs::read_to_string(parameters.playbook()).map_err(|error| error.to_string())?;
+    let playbook = Playbook::parse(&contents).map_err(|refusal| refusal.to_string())?;
+    journal
+        .append(
+            Utc::now(),
+            Observation::PlaybookRead(PlaybookRead::new(contents)),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(playbook.play(parameters.universe().symbols()))
+}
+
 async fn trade(
     parameters: &Parameters,
+    strategy: Played,
     archive: &Archive,
     journal: &mut Journal,
     today: SessionDate,
@@ -270,7 +293,7 @@ async fn trade(
     );
     sleep_until(open).await;
     let mut session = Session::new(
-        parameters.strategy().clone(),
+        strategy,
         parameters.settings(),
         calendar,
         today,

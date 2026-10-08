@@ -58,6 +58,10 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
   "connect",
   "rustls-tls-webpki-roots",
 ] }
+toml = { version = "1.1.7", default-features = false, features = [
+  "parse",
+  "serde",
+] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 uuid = { version = "1.26.1", features = ["v4", "serde"] }

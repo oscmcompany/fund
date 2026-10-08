@@ -204,7 +204,8 @@ mod tests {
                         | Observation::BookReconciled(_)
                         | Observation::TargetDecided(_)
                         | Observation::SessionOpened(_)
-                        | Observation::BarBuilt(_) => {}
+                        | Observation::BarBuilt(_)
+                        | Observation::PlaybookRead(_) => {}
                     },
                     ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
                 }

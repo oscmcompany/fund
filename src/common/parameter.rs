@@ -45,8 +45,9 @@ pub enum Parameter {
     Universe,
     /// How often the trader decides: `one_minute` or `five_minute`.
     DecisionInterval,
-    /// Whole shares the noise strategy holds of each symbol it draws.
+    /// Retired: the playbook sets the noise strategy's shares.
     NoiseShares,
+    /// Retired: the playbook sets the noise strategy's seed.
     NoiseSeed,
     /// Dollars the trader may hold across every name at once.
     GrossLimit,
@@ -62,6 +63,8 @@ pub enum Parameter {
     OrderPollMilliseconds,
     /// Seconds an order may stay open before it is canceled.
     OrderOpenSeconds,
+    /// The path of the playbook the trader reads at startup.
+    Playbook,
 }
 
 impl Parameter {
@@ -236,6 +239,7 @@ mod tests {
                 "FUND_STALE_AFTER_SECONDS",
                 "FUND_ORDER_POLL_MILLISECONDS",
                 "FUND_ORDER_OPEN_SECONDS",
+                "FUND_PLAYBOOK",
             ]
         );
     }

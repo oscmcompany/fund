@@ -1,10 +1,10 @@
-//! The trader's settings, each resolved once at startup. The universe, the strategy's settings and the limits have no
-//! default, so a run trades only what was deliberately configured.
+//! The trader's settings, each resolved once at startup. The universe, the playbook and the limits have no default, so a
+//! run trades only what was deliberately configured.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -12,10 +12,9 @@ use chrono::TimeDelta;
 
 use crate::common::book::Cash;
 use crate::common::journal::ConfigurationResolved;
-use crate::common::market::{Dollars, SHARE_SCALE, Shares, Symbol};
+use crate::common::market::{Dollars, Symbol};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record, record_required};
 use crate::common::risk::{Limits, LimitsRefusal};
-use crate::common::strategy::noise::Noise;
 use crate::execution::Patience;
 use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
 use crate::trader::{DecisionInterval, SessionSettings, SettingsRefusal};
@@ -30,9 +29,6 @@ const MAXIMUM_STALE_AFTER_SECONDS: u64 = 3_600;
 const MAXIMUM_ORDER_POLL_MILLISECONDS: NonZeroU64 =
     NonZeroU64::new(60_000).expect("60,000 is not zero");
 const MAXIMUM_ORDER_OPEN_SECONDS: NonZeroU64 = NonZeroU64::new(3_600).expect("3,600 is not zero");
-/// The most whole shares a `Shares` holds.
-const MAXIMUM_NOISE_SHARES: NonZeroU64 =
-    NonZeroU64::new(u64::MAX / SHARE_SCALE).expect("u64::MAX / SHARE_SCALE is not zero");
 
 /// The symbols a run trades: at least one, written comma-separated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +87,7 @@ impl Display for ParametersRefusal {
 #[derive(Debug, Clone)]
 pub struct Parameters {
     universe: Universe,
-    strategy: Noise,
+    playbook: PathBuf,
     settings: SessionSettings,
     journal_directory: PathBuf,
     log_directory: PathBuf,
@@ -109,12 +105,10 @@ impl Parameters {
         let mut resolved = BTreeMap::new();
         let read = |parameter| Ok::<_, ParameterRefusal>((parameter, supplied(parameter)?));
         let universe: Universe = record_required(read(Parameter::Universe)?, &mut resolved)?;
-        let shares = at_most(
-            Parameter::NoiseShares,
-            record_required::<NonZeroU64>(read(Parameter::NoiseShares)?, &mut resolved)?,
-            MAXIMUM_NOISE_SHARES,
-        )?;
-        let seed: u64 = record_required(read(Parameter::NoiseSeed)?, &mut resolved)?;
+        let playbook = PathBuf::from(record_required::<String>(
+            read(Parameter::Playbook)?,
+            &mut resolved,
+        )?);
         let mut limit =
             |parameter| record_required::<Dollars>(read(parameter)?, &mut resolved).map(Cash::from);
         let (gross, per_name, daily_loss) = (
@@ -172,12 +166,8 @@ impl Parameters {
         )
         .map_err(ParametersRefusal::Settings)?;
         let parameters = Self {
-            strategy: Noise::new(
-                universe.symbols().clone(),
-                Shares::whole(shares.get()).expect("at most the whole shares a `Shares` holds"),
-                seed,
-            ),
             universe,
+            playbook,
             settings,
             journal_directory: PathBuf::from(record(
                 read(Parameter::JournalDirectory)?,
@@ -197,8 +187,8 @@ impl Parameters {
         &self.universe
     }
 
-    pub fn strategy(&self) -> &Noise {
-        &self.strategy
+    pub fn playbook(&self) -> &Path {
+        &self.playbook
     }
 
     pub fn settings(&self) -> SessionSettings {
@@ -223,10 +213,9 @@ mod tests {
     use super::*;
     use crate::common::journal::ParameterSource;
 
-    const REQUIRED: [(Parameter, &str); 7] = [
+    const REQUIRED: [(Parameter, &str); 6] = [
         (Parameter::Universe, "SPY, QQQ"),
-        (Parameter::NoiseShares, "2"),
-        (Parameter::NoiseSeed, "11"),
+        (Parameter::Playbook, "/etc/fund/playbook.toml"),
         (Parameter::GrossLimit, "1000"),
         (Parameter::PerNameLimit, "500.5"),
         (Parameter::DailyLossLimit, "50"),
@@ -247,17 +236,7 @@ mod tests {
     fn test_the_required_parameters_resolve_and_the_rest_default() {
         let (parameters, configuration) = Parameters::resolved(&supplied(&REQUIRED)).unwrap();
         assert_eq!(parameters.universe().to_string(), "QQQ,SPY");
-        assert_eq!(
-            parameters.strategy(),
-            &Noise::new(
-                ["QQQ", "SPY"]
-                    .into_iter()
-                    .map(|raw| Symbol::new(raw).unwrap())
-                    .collect(),
-                Shares::whole(2).unwrap(),
-                11
-            )
-        );
+        assert_eq!(parameters.playbook(), Path::new("/etc/fund/playbook.toml"));
         let journaled: Vec<(&str, &str, ParameterSource)> = configuration
             .parameters()
             .iter()
@@ -274,8 +253,6 @@ mod tests {
                 ("log_directory", "/var/log/fund", ParameterSource::Default),
                 ("universe", "QQQ,SPY", ParameterSource::Environment),
                 ("decision_interval", "five_minute", ParameterSource::Default),
-                ("noise_shares", "2", ParameterSource::Environment),
-                ("noise_seed", "11", ParameterSource::Environment),
                 ("gross_limit", "1000.00", ParameterSource::Environment),
                 ("per_name_limit", "500.50", ParameterSource::Environment),
                 ("daily_loss_limit", "50.00", ParameterSource::Environment),
@@ -287,6 +264,11 @@ mod tests {
                 ("stale_after_seconds", "120", ParameterSource::Default),
                 ("order_poll_milliseconds", "500", ParameterSource::Default),
                 ("order_open_seconds", "30", ParameterSource::Default),
+                (
+                    "playbook",
+                    "/etc/fund/playbook.toml",
+                    ParameterSource::Environment
+                ),
             ]
         );
     }
@@ -327,7 +309,7 @@ mod tests {
     #[test]
     fn test_a_zero_limit_is_refused_by_the_limits() {
         let mut values = REQUIRED.to_vec();
-        values[5] = (Parameter::DailyLossLimit, "0");
+        values[4] = (Parameter::DailyLossLimit, "0");
         assert!(matches!(
             Parameters::resolved(&supplied(&values)),
             Err(ParametersRefusal::Limits(LimitsRefusal::NotPositive { .. }))
@@ -337,7 +319,7 @@ mod tests {
     #[test]
     fn test_a_flat_window_past_a_session_is_refused() {
         let mut values = REQUIRED.to_vec();
-        values[6] = (Parameter::FlatBeforeCloseMinutes, "391");
+        values[5] = (Parameter::FlatBeforeCloseMinutes, "391");
         assert_eq!(
             Parameters::resolved(&supplied(&values)).map(|_| ()),
             Err(ParametersRefusal::Parameter(ParameterRefusal::OutOfRange {
