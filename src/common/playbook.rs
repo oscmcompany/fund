@@ -174,7 +174,7 @@ impl Playbook {
     pub fn parse(text: &str) -> Result<Self, PlaybookRefusal> {
         let fields: PlaybookFields =
             toml::from_str(text).map_err(|error| PlaybookRefusal::Unreadable {
-                cause: error.message().to_string(),
+                cause: error.to_string(),
             })?;
         let mut entries = fields
             .entries
@@ -575,6 +575,12 @@ note = "Hold nothing in the afternoon"
                 "{unreadable}"
             );
         }
+        let Err(PlaybookRefusal::Unreadable { cause }) =
+            Playbook::parse(&TWO_ENTRIES.replace("kind = \"flat\"", "kind = \"momentum\""))
+        else {
+            panic!("an unknown strategy kind parsed");
+        };
+        assert!(cause.contains("line 14, column 21"), "{cause}");
     }
 
     /// The morning's noise decides alone, then rolls into the afternoon's flat target over ten minutes, keeping a tenth
@@ -594,7 +600,17 @@ note = "Hold nothing in the afternoon"
             );
         }
         let mut drew = 0;
-        for minute in 1..10 {
+        for (minute, units) in [
+            (1, 1_800_000),
+            (2, 1_600_000),
+            (3, 1_400_000),
+            (4, 1_200_000),
+            (5, 1_000_000),
+            (6, 800_000),
+            (7, 600_000),
+            (8, 400_000),
+            (9, 200_000),
+        ] {
             let state = at(time(12, minute));
             let rolled: Vec<_> = played
                 .decide(&state, &book)
@@ -606,7 +622,7 @@ note = "Hold nothing in the afternoon"
                 .decide(&state, &book)
                 .holdings()
                 .keys()
-                .map(|symbol| (symbol.clone(), 2_000_000 * u64::from(10 - minute) / 10))
+                .map(|symbol| (symbol.clone(), units))
                 .collect();
             drew += expected.len();
             assert_eq!(rolled, expected, "12:0{minute}");
@@ -626,6 +642,58 @@ note = "Hold nothing in the afternoon"
                 "{afternoon}"
             );
         }
+    }
+
+    /// The reverse switch, flat into noise, rolls up into the noise's holdings: none at 12:00, a tenth more a minute,
+    /// and the whole from ten minutes on.
+    #[test]
+    fn test_a_switch_into_a_strategy_that_holds_rolls_up_to_it() {
+        let reversed = r#"
+roll_off_minutes = 10
+
+[[entries]]
+from = "09:30"
+until = "12:00"
+strategy = { kind = "flat" }
+note = "Hold nothing in the morning"
+
+[[entries]]
+from = "12:00"
+until = "16:00"
+strategy = { kind = "noise", shares = 2, seed = 7 }
+note = "Exercise the afternoon on paper"
+"#;
+        let played = Playbook::parse(reversed).unwrap().play(&universe());
+        let noise = Noise::new(universe(), Shares::whole(2).unwrap(), 7);
+        let book = Book::default();
+        assert_eq!(played.decide(&at(time(11, 0)), &book), Target::default());
+        let mut drew = 0;
+        for (minute, units) in [
+            (0, 0),
+            (1, 200_000),
+            (4, 800_000),
+            (9, 1_800_000),
+            (10, 2_000_000),
+            (30, 2_000_000),
+        ] {
+            let state = at(time(12, 0) + TimeDelta::minutes(minute));
+            let rolled: Vec<_> = played
+                .decide(&state, &book)
+                .holdings()
+                .iter()
+                .map(|(symbol, shares)| (symbol.clone(), shares.units()))
+                .collect();
+            let expected: Vec<_> = noise
+                .decide(&state, &book)
+                .holdings()
+                .keys()
+                .filter(|_| units > 0)
+                .map(|symbol| (symbol.clone(), units))
+                .collect();
+            drew += expected.len();
+            assert_eq!(rolled, expected, "{minute} minutes in");
+        }
+        assert!(drew > 0, "the roll-up drew nothing, so it proves nothing");
     }
 
     proptest! {
