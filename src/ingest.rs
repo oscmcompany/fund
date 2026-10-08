@@ -25,10 +25,15 @@ pub enum VariableRefusal {
     Missing {
         name: &'static str,
     },
-    /// Set, but to a value outside the few it may take.
+    /// Set, but not one of the few values it may take.
     Malformed {
         name: &'static str,
         raw: String,
+    },
+    /// Set, but not Unicode; the value is left out, since the variable may hold a secret.
+    NotUnicode {
+        name: &'static str,
+        bytes: usize,
     },
 }
 
@@ -37,12 +42,25 @@ impl std::fmt::Display for VariableRefusal {
         match self {
             Self::Missing { name } => write!(formatter, "{name} is not set"),
             Self::Malformed { name, raw } => write!(formatter, "{name} is `{raw}`"),
+            Self::NotUnicode { name, bytes } => {
+                write!(formatter, "{name} holds {bytes} bytes that are not Unicode")
+            }
         }
     }
 }
 
 pub(crate) fn variable(name: &'static str) -> Result<String, VariableRefusal> {
-    std::env::var(name).map_err(|_| VariableRefusal::Missing { name })
+    std::env::var(name).map_err(|error| variable_refusal(name, error))
+}
+
+fn variable_refusal(name: &'static str, error: std::env::VarError) -> VariableRefusal {
+    match error {
+        std::env::VarError::NotPresent => VariableRefusal::Missing { name },
+        std::env::VarError::NotUnicode(raw) => VariableRefusal::NotUnicode {
+            name,
+            bytes: raw.len(),
+        },
+    }
 }
 
 /// A vendor row that did not become a record, named as the vendor wrote it.
@@ -169,6 +187,27 @@ pub(crate) fn one_sided(bid: f64, ask: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A variable set to bytes that are not Unicode is set, not missing, and is refused without its value, which may
+    /// be a secret.
+    #[test]
+    fn test_a_variable_that_is_not_unicode_is_refused_without_its_value() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(b"paper\xff".to_vec());
+        assert_eq!(
+            variable_refusal("ALPACA_IS_PAPER", std::env::VarError::NotUnicode(raw)),
+            VariableRefusal::NotUnicode {
+                name: "ALPACA_IS_PAPER",
+                bytes: 6,
+            }
+        );
+        assert_eq!(
+            variable_refusal("ALPACA_IS_PAPER", std::env::VarError::NotPresent),
+            VariableRefusal::Missing {
+                name: "ALPACA_IS_PAPER"
+            }
+        );
+    }
 
     /// Only a zero side beside a good price is one-sided; a bad price on either side is left for the price refusal.
     #[test]

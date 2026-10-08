@@ -382,20 +382,20 @@ async fn previous_bars(
 /// Logs what the feed reports of its own gaps and of messages it could not read, which the journal does not hold.
 fn report(event: &FeedEvent) {
     match event {
-        FeedEvent::Lost { cause } => tracing::warn!(cause, "Stream lost"),
+        FeedEvent::Lost { cause } => tracing::warn!(%cause, "Stream lost"),
         FeedEvent::Reopened { attempts } => tracing::info!(attempts, "Stream reopened"),
         FeedEvent::Backfilled { since, fresh } => {
             tracing::info!(%since, fresh, "Tape backfilled");
         }
-        FeedEvent::BackfillFailed { cause } => tracing::warn!(cause, "Backfill failed"),
+        FeedEvent::BackfillFailed { cause } => tracing::warn!(%cause, "Backfill failed"),
         FeedEvent::Message(StreamMessage::Refused { code, message }) => {
             tracing::warn!(code, message, "Stream refused a request");
         }
         FeedEvent::Message(StreamMessage::Unrecognized { kind, raw }) => {
             tracing::warn!(kind, raw, "Stream message unrecognized");
         }
-        FeedEvent::Message(StreamMessage::Malformed { reason, raw }) => {
-            tracing::warn!(reason, raw, "Stream message malformed");
+        FeedEvent::Message(StreamMessage::Malformed { cause, raw }) => {
+            tracing::warn!(%cause, raw, "Stream message malformed");
         }
         FeedEvent::Message(
             StreamMessage::Connected

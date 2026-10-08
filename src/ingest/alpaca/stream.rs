@@ -61,23 +61,66 @@ impl TradeId {
     };
 
     /// Reads `x` and `i` from a trade element, as the stream and the REST history both spell them.
-    pub(crate) fn read(element: &Value) -> Result<Self, String> {
+    pub(crate) fn read(element: &Value) -> Result<Self, StreamElementRefusal> {
         let exchange = element
             .get("x")
             .and_then(Value::as_str)
-            .ok_or_else(|| "a trade with no `x`".to_string())?;
+            .ok_or(StreamElementRefusal::NoExchange)?;
         let mut letters = exchange.chars();
-        let (Some(exchange), None) = (letters.next(), letters.next()) else {
-            return Err(format!("an exchange `{exchange}` that is not one letter"));
+        let (Some(letter), None) = (letters.next(), letters.next()) else {
+            return Err(StreamElementRefusal::ExchangeNotOneLetter {
+                raw: exchange.to_string(),
+            });
         };
-        let number = element
-            .get("i")
-            .ok_or_else(|| "a trade with no `i`".to_string())?
+        let number = element.get("i").ok_or(StreamElementRefusal::NoNumber)?;
+        let number = number
             .as_u64()
-            .ok_or_else(|| format!("an `i` that is no unsigned integer: {}", element["i"]))?;
-        Ok(Self { exchange, number })
+            .ok_or_else(|| StreamElementRefusal::NumberNotUnsigned {
+                raw: number.to_string(),
+            })?;
+        Ok(Self {
+            exchange: letter,
+            number,
+        })
     }
 }
+
+/// Why one element of a frame, or one REST trade's identity, did not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamElementRefusal {
+    NoKind,
+    NoExchange,
+    ExchangeNotOneLetter {
+        raw: String,
+    },
+    NoNumber,
+    NumberNotUnsigned {
+        raw: String,
+    },
+    /// A payload that did not parse as its kind's.
+    Unreadable {
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for StreamElementRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoKind => write!(formatter, "no `T`"),
+            Self::NoExchange => write!(formatter, "a trade with no `x`"),
+            Self::ExchangeNotOneLetter { raw } => {
+                write!(formatter, "an exchange `{raw}` that is not one letter")
+            }
+            Self::NoNumber => write!(formatter, "a trade with no `i`"),
+            Self::NumberNotUnsigned { raw } => {
+                write!(formatter, "an `i` that is no unsigned integer: {raw}")
+            }
+            Self::Unreadable { reason } => write!(formatter, "{reason}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamElementRefusal {}
 
 /// One message off the stream, in the order Alpaca sent it.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,13 +150,13 @@ pub enum StreamMessage {
     },
     /// One element of a frame that did not read, kept whole; the frame's other messages still arrive.
     Malformed {
-        reason: String,
+        cause: StreamElementRefusal,
         raw: String,
     },
 }
 
 /// Why the stream could not be opened or read.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StreamError {
     Socket(String),
     Refused {
@@ -135,6 +178,8 @@ pub enum StreamError {
     Closed {
         awaiting: &'static str,
     },
+    /// The open stream ended.
+    Ended,
 }
 
 impl std::fmt::Display for StreamError {
@@ -161,6 +206,7 @@ impl std::fmt::Display for StreamError {
                 )
             }
             Self::Closed { awaiting } => write!(formatter, "the stream closed awaiting {awaiting}"),
+            Self::Ended => write!(formatter, "the stream closed"),
         }
     }
 }
@@ -355,8 +401,8 @@ fn messages(text: &str) -> Result<Vec<StreamMessage>, StreamError> {
     Ok(elements
         .into_iter()
         .map(|element| {
-            message(&element).unwrap_or_else(|reason| StreamMessage::Malformed {
-                reason,
+            message(&element).unwrap_or_else(|cause| StreamMessage::Malformed {
+                cause,
                 raw: element.to_string(),
             })
         })
@@ -364,13 +410,15 @@ fn messages(text: &str) -> Result<Vec<StreamMessage>, StreamError> {
 }
 
 /// One element as a message, or why it did not read.
-fn message(element: &Value) -> Result<StreamMessage, String> {
+fn message(element: &Value) -> Result<StreamMessage, StreamElementRefusal> {
     let kind = element
         .get("T")
         .and_then(Value::as_str)
-        .ok_or_else(|| "no `T`".to_string())?
+        .ok_or(StreamElementRefusal::NoKind)?
         .to_string();
-    let unreadable = |error: serde_json::Error| error.to_string();
+    let unreadable = |error: serde_json::Error| StreamElementRefusal::Unreadable {
+        reason: error.to_string(),
+    };
     Ok(match kind.as_str() {
         "success" => match element.get("msg").and_then(Value::as_str) {
             Some("connected") => StreamMessage::Connected,
@@ -586,10 +634,10 @@ mod tests {
         ));
         let frame = r#"[{"S":"SPY"},{"T":"t","S":"SPY","x":"P","i":"x","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"t","S":"SPY","x":"P","p":1,"s":1,"z":"B","t":"2026-10-06T22:36:01Z"},{"T":"success","msg":"connected"}]"#;
         let read = messages(frame).unwrap();
-        let reasons: Vec<&str> = read
+        let causes: Vec<&StreamElementRefusal> = read
             .iter()
             .filter_map(|message| match message {
-                StreamMessage::Malformed { reason, .. } => Some(reason.as_str()),
+                StreamMessage::Malformed { cause, .. } => Some(cause),
                 StreamMessage::Connected
                 | StreamMessage::Authenticated
                 | StreamMessage::Subscribed { .. }
@@ -599,9 +647,16 @@ mod tests {
                 | StreamMessage::Unrecognized { .. } => None,
             })
             .collect();
-        assert_eq!(reasons.len(), 3);
-        assert_eq!(reasons[0], "no `T`");
-        assert_eq!(reasons[2], "a trade with no `i`");
+        assert_eq!(
+            causes,
+            [
+                &StreamElementRefusal::NoKind,
+                &StreamElementRefusal::NumberNotUnsigned {
+                    raw: r#""x""#.to_string()
+                },
+                &StreamElementRefusal::NoNumber,
+            ]
+        );
         assert_eq!(read[3], StreamMessage::Connected);
         assert!(matches!(
             messages(

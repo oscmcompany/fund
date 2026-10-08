@@ -770,7 +770,7 @@ mod tests {
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
         session.observe(&FeedEvent::Lost {
-            cause: "the stream closed".to_string(),
+            cause: crate::ingest::alpaca::stream::StreamError::Ended,
         });
         session.observe(&print(1, "14:04:30", 701_000_000));
         session

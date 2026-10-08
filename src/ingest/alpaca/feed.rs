@@ -121,7 +121,7 @@ fn recent_trades(body: &[u8], requested: &[Symbol]) -> Result<Vec<IdentifiedTrad
     let mut trades = Vec::new();
     for (ticker, rows) in page.trades.unwrap_or_default() {
         for row in rows {
-            let id = TradeId::read(&row).map_err(malformed)?;
+            let id = TradeId::read(&row).map_err(|refusal| malformed(refusal.to_string()))?;
             let outcome = match Symbol::new(&ticker) {
                 Ok(symbol) if !requested.contains(&symbol) => {
                     AlpacaTradeOutcome::Refused(RefusedRow {
@@ -183,7 +183,7 @@ pub enum FeedEvent {
     Message(StreamMessage),
     /// The stream ended or failed; prints come from REST until it reopens.
     Lost {
-        cause: String,
+        cause: StreamError,
     },
     /// The stream reopened, `attempts` tries since it last delivered a message.
     Reopened {
@@ -196,7 +196,7 @@ pub enum FeedEvent {
     },
     /// A backfill failed; the gap stays open and is retried with backoff, even while the stream is up.
     BackfillFailed {
-        cause: String,
+        cause: FetchError,
     },
 }
 
@@ -271,8 +271,8 @@ impl<Source: TapeSource> Feed<Source> {
                         return event;
                     }
                 }
-                Some(Err(error)) => return self.lost(error.to_string()),
-                None => return self.lost("the stream closed".to_string()),
+                Some(Err(error)) => return self.lost(error),
+                None => return self.lost(StreamError::Ended),
             }
         }
     }
@@ -326,7 +326,7 @@ impl<Source: TapeSource> Feed<Source> {
         }
     }
 
-    fn lost(&mut self, cause: String) -> FeedEvent {
+    fn lost(&mut self, cause: StreamError) -> FeedEvent {
         self.stream = None;
         let start = self
             .latest
@@ -351,9 +351,7 @@ impl<Source: TapeSource> Feed<Source> {
                     });
                 }
             }
-            Err(error) => self.pending.push_back(FeedEvent::Lost {
-                cause: error.to_string(),
-            }),
+            Err(cause) => self.pending.push_back(FeedEvent::Lost { cause }),
         }
         self.backfill().await;
     }
@@ -392,9 +390,8 @@ impl<Source: TapeSource> Feed<Source> {
             Err(error) => {
                 self.failed_backfills += 1;
                 self.retry_at = Some(Instant::now() + backoff(self.failed_backfills));
-                self.pending.push_back(FeedEvent::BackfillFailed {
-                    cause: error.to_string(),
-                });
+                self.pending
+                    .push_back(FeedEvent::BackfillFailed { cause: error });
             }
         }
     }
@@ -617,10 +614,8 @@ mod tests {
         events
     }
 
-    fn lost(cause: &str) -> FeedEvent {
-        FeedEvent::Lost {
-            cause: cause.to_string(),
-        }
+    fn lost(cause: StreamError) -> FeedEvent {
+        FeedEvent::Lost { cause }
     }
 
     fn backfilled(since: DateTime<Utc>, fresh: usize) -> FeedEvent {
@@ -644,7 +639,7 @@ mod tests {
                 backfilled(at(-60), 0),
                 FeedEvent::Message(print(1, 0)),
                 FeedEvent::Message(print(2, 10)),
-                lost("the stream closed"),
+                lost(StreamError::Ended),
                 FeedEvent::Reopened { attempts: 1 },
                 FeedEvent::Message(print(3, 20)),
                 backfilled(at(8), 1),
@@ -669,7 +664,7 @@ mod tests {
         assert_eq!(
             take(&mut feed, 5).await,
             [
-                lost("the stream's socket failed: refused"),
+                lost(StreamError::Socket("refused".to_string())),
                 FeedEvent::Message(print(1, 0)),
                 backfilled(at(-60), 1),
                 FeedEvent::Reopened { attempts: 2 },
@@ -702,10 +697,12 @@ mod tests {
             [
                 backfilled(at(-60), 0),
                 FeedEvent::Message(print(1, 0)),
-                lost("the stream closed"),
+                lost(StreamError::Ended),
                 FeedEvent::Reopened { attempts: 1 },
                 FeedEvent::BackfillFailed {
-                    cause: "malformed payload: timed out".to_string()
+                    cause: FetchError::Malformed {
+                        reason: "timed out".to_string()
+                    }
                 },
                 FeedEvent::Message(print(5, 300)),
                 FeedEvent::Message(print(2, 100)),
@@ -748,7 +745,7 @@ mod tests {
                 backfilled(at(-60), 0),
                 FeedEvent::Message(print(1, 0)),
                 FeedEvent::Message(refused()),
-                lost("the stream closed"),
+                lost(StreamError::Ended),
                 FeedEvent::Reopened { attempts: 1 },
                 FeedEvent::Message(print_at("AAPL", 1, at(1200))),
                 FeedEvent::Message(print(2, 5)),
@@ -779,7 +776,7 @@ mod tests {
                 .expect("the reopen backfills"),
             [
                 backfilled(at(-60), 0),
-                lost("the stream closed"),
+                lost(StreamError::Ended),
                 FeedEvent::Reopened { attempts: 2 },
                 FeedEvent::Message(print(1, 0)),
                 backfilled(at(-60), 1),
