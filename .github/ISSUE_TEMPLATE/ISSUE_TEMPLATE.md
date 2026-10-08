@@ -1,7 +1,6 @@
 ---
 name: Issue
 about: Create an issue
-title: ''
 projects: ["oscmcompany/1"]
 ---
 # Overview
@@ -18,4 +17,3 @@ Describe the bug, feature, or task.
 Provide solution(s) or recommendation(s) as bullet points.
 Provide specific action items as checkboxes.
 -->
-

@@ -1,9 +1,5 @@
 ---
 extends: default
-ignore: |
-  .venv/
-  target/
-  .pre-commit-config.yaml
 rules:
   line-length:
     max: 120

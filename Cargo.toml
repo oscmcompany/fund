@@ -19,7 +19,12 @@ workspace = true
 arrow-array = "60.0.0"
 arrow-schema = "60.0.0"
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.150.0"
+aws-sdk-s3 = { version = "1.150.0", default-features = false, features = [
+  "sigv4a",
+  "http-1x",
+  "default-https-client",
+  "rt-tokio",
+] }
 bytes = "1.12.1"
 # No `clock` feature, so pure code cannot read the wall clock.
 chrono = { version = "0.4.44", default-features = false, features = [
@@ -76,4 +81,4 @@ syn = { version = "3", default-features = false, features = [
   "parsing",
   "visit",
 ] }
-tokio = { version = "1.53.1", features = ["test-util", "macros", "rt"] }
+tokio = { version = "1.53.1", features = ["test-util", "rt"] }

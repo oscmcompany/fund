@@ -1,2 +1,1 @@
 disabled = ["repeated_keys"]
-ignore = [".devenv", "target", ".venv"]

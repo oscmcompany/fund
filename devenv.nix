@@ -8,62 +8,28 @@ in {
     nix.enable = true;
   };
 
-  git-hooks.hooks = {
-    check-private-files = {
+  # Each hook runs the task CI runs, so a commit and a pull request check the same files the same way.
+  git-hooks.hooks = let
+    hook = name: check: files: {
       enable = true;
-      name = "Check no private file is tracked";
-      entry = "check-private-files";
-      always_run = true;
+      inherit name files;
+      entry = "devenv tasks run checks:${check}";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    check-rust = {
-      enable = true;
-      name = "Check all Rust code";
-      entry = "check-rust";
-      files = "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec)\\.toml|views\\.sql|check-views)$";
-      excludes = ["^src_old/"];
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
-    check-markdown = {
-      enable = true;
-      name = "Check all Markdown code";
-      entry = "check-markdown";
-      files = "\\.md$";
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
-    check-yaml = {
-      enable = true;
-      name = "Check all YAML code";
-      entry = "check-yaml";
-      files = "\\.(yaml|yml)$";
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
-    check-toml = {
-      enable = true;
-      name = "Check all TOML code";
-      entry = "check-toml";
-      files = "\\.toml$";
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
-    check-nix = {
-      enable = true;
-      name = "Check all Nix code";
-      entry = "check-nix";
-      files = "\\.nix$";
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
+  in {
+    check-private-files =
+      hook "Check no private file is tracked" "private-files" ""
+      // {always_run = true;};
+    check-rust =
+      hook "Check all Rust code" "rust"
+      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec)\\.toml|views\\.sql|check-views|check-private-files|devenv\\.(nix|lock))$"
+      // {excludes = ["^src_old/"];};
+    check-markdown = hook "Check all Markdown code" "markdown" "\\.md$";
+    check-yaml = hook "Check all YAML code" "yaml" "\\.(yaml|yml)$";
+    check-toml = hook "Check all TOML code" "toml" "\\.toml$";
+    check-nix = hook "Check all Nix code" "nix" "\\.nix$";
   };
 
   env = {
@@ -84,110 +50,22 @@ in {
     cargo-machete
     cargo-mutants
     curl
-    duckdb # retained for local data exploration and experimentation
+    duckdb # start-duckdb and check-views
     gh
     git
     jq
     llvmPackages.llvm
     markdownlint-cli
-    rustup
     statix
     taplo
     yamllint
   ];
-
-  scripts.format-rust.exec = ''
-    set -euo pipefail
-    echo "Checking Rust code formatting"
-    cargo fmt --all -- --check
-    echo "Rust code formatting check passed"
-  '';
-
-  scripts.lint-rust.exec = ''
-    set -euo pipefail
-    echo "Running Rust lint checks"
-    cargo clippy --workspace --all-features --all-targets -- -D warnings
-    echo "Rust linting completed successfully"
-  '';
-
-  scripts.check-unused-dependencies.exec = ''
-    set -euo pipefail
-    echo "Checking for unused Rust dependencies"
-    cargo machete
-    echo "No unused dependencies found"
-  '';
 
   scripts.mutate-rust.exec = ''
     set -euo pipefail
     echo "Running mutation tests on the lines changed in ''${1:?a unified diff file}"
     cargo mutants --in-diff "$1"
     echo "Every mutant in the diff was caught"
-  '';
-
-  scripts.test-rust.exec = ''
-    set -euo pipefail
-    echo "Running Rust tests"
-
-    mkdir -p .coverage_output
-    export LLVM_COV=$(which llvm-cov)
-    export LLVM_PROFDATA=$(which llvm-profdata)
-    cargo llvm-cov --lib --bins --tests --all-features \
-      --cobertura \
-      --output-path .coverage_output/rust.xml
-
-    rate=$(awk 'match($0, /line-rate="([^"]*)"/, a) {print a[1]; exit}' .coverage_output/rust.xml)
-    rate_pct=$(awk "BEGIN {printf \"%.1f\", ''${rate:-0} * 100}")
-    threshold=75
-    echo "Rust line coverage: ''${rate_pct}%"
-    if awk "BEGIN {exit !(''${rate_pct} + 0 < ''${threshold})}"; then
-      echo "Coverage failure: ''${rate_pct}% is below threshold of ''${threshold}%"
-      exit 1
-    fi
-
-    echo "Rust tests with coverage completed successfully"
-  '';
-
-  scripts.check-rust.exec = ''
-    devenv tasks run checks:rust
-  '';
-
-  scripts.check-markdown.exec = ''
-    set -euo pipefail
-    echo "Running Markdown lint checks"
-    markdownlint "**/*.md" --ignore ".venv" \
-      --ignore "target" --ignore ".scratchpad"
-    echo "Markdown checks completed successfully"
-  '';
-
-  scripts.check-yaml.exec = ''
-    set -euo pipefail
-    echo "Running YAML lint checks"
-    yamllint .
-    echo "YAML checks completed successfully"
-  '';
-
-  scripts.check-toml.exec = ''
-    set -euo pipefail
-    echo "Running TOML checks"
-    find . \
-      \( -path "./.devenv" -o -path "./target" -o -path "./.venv" \) -prune \
-      -o -name "*.toml" -print \
-      | xargs taplo fmt --check --no-auto-config
-    echo "TOML checks completed successfully"
-  '';
-
-  scripts.check-nix.exec = ''
-    set -euo pipefail
-    echo "Checking Nix code formatting"
-    alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target .
-    echo "Nix formatting check passed"
-    echo "Running Nix static analysis"
-    statix check -c .statix.toml .
-    echo "Nix checks completed successfully"
-  '';
-
-  scripts.check-private-files.exec = ''
-    "$DEVENV_ROOT/check-private-files" "$@"
   '';
 
   scripts.start-duckdb.exec = ''
@@ -200,37 +78,79 @@ in {
     "$DEVENV_ROOT/check-views" "$@"
   '';
 
-  scripts.bump-rust-dependencies.exec = ''
+  scripts.update-rust-dependencies.exec = ''
     set -euo pipefail
     cargo update
-    echo "Dependencies bumped. Review changes: git diff Cargo.lock"
+    echo "Dependencies updated. Review changes: git diff Cargo.lock"
   '';
 
+  # Lints read the files git tracks, so the laptop and CI's clean checkout lint the same set.
   tasks = {
     # --- Rust checks (lint and test run in parallel after format) ---
 
-    "checks:rust:format".exec = "format-rust";
+    "checks:rust:format".exec = ''
+      set -euo pipefail
+      cargo fmt --all -- --check
+    '';
 
     "checks:rust:lint" = {
-      exec = "lint-rust";
+      exec = ''
+        set -euo pipefail
+        cargo clippy --workspace --all-features --all-targets -- -D warnings
+      '';
       after = ["checks:rust:format"];
     };
     "checks:rust:test" = {
-      exec = "test-rust";
+      exec = ''
+        set -euo pipefail
+        mkdir -p .coverage_output
+        export LLVM_COV=$(which llvm-cov)
+        export LLVM_PROFDATA=$(which llvm-profdata)
+        cargo llvm-cov --lib --bins --tests --all-features \
+          --cobertura \
+          --output-path .coverage_output/rust.xml
+
+        rate=$(awk 'match($0, /line-rate="([^"]*)"/, a) {print a[1]; exit}' .coverage_output/rust.xml)
+        rate_pct=$(awk "BEGIN {printf \"%.1f\", ''${rate:-0} * 100}")
+        threshold=75
+        echo "Rust line coverage: ''${rate_pct}%"
+        if awk "BEGIN {exit !(''${rate_pct} + 0 < ''${threshold})}"; then
+          echo "Coverage failure: ''${rate_pct}% is below threshold of ''${threshold}%"
+          exit 1
+        fi
+      '';
       after = ["checks:rust:format"];
     };
     "checks:rust:unused-dependencies" = {
-      exec = "check-unused-dependencies";
+      exec = ''
+        set -euo pipefail
+        cargo machete
+      '';
       after = ["checks:rust:format"];
     };
 
     # --- Standalone checks ---
 
-    "checks:markdown".exec = "check-markdown";
-    "checks:yaml".exec = "check-yaml";
-    "checks:toml".exec = "check-toml";
-    "checks:nix".exec = "check-nix";
-    "checks:private".exec = "check-private-files";
+    "checks:markdown".exec = ''
+      set -euo pipefail
+      git ls-files -z '*.md' | xargs -0 -r markdownlint
+    '';
+    "checks:yaml".exec = ''
+      set -euo pipefail
+      git ls-files -z '*.yaml' '*.yml' | xargs -0 -r yamllint
+    '';
+    "checks:toml".exec = ''
+      set -euo pipefail
+      git ls-files -z '*.toml' | xargs -0 -r taplo fmt --check --no-auto-config
+    '';
+    "checks:nix".exec = ''
+      set -euo pipefail
+      git ls-files -z '*.nix' | xargs -0 -r alejandra --check
+      git ls-files -z '*.nix' | xargs -0 -r -n 1 statix check -c .statix.toml
+    '';
+    "checks:private-files".exec = ''
+      "$DEVENV_ROOT/check-private-files"
+    '';
 
     "checks:base" = {
       exec = ''
@@ -241,7 +161,6 @@ in {
         "checks:markdown"
         "checks:yaml"
         "checks:toml"
-        "checks:private"
       ];
     };
 
@@ -251,6 +170,7 @@ in {
       '';
       after = [
         "checks:base"
+        "checks:private-files"
         "checks:rust:format"
         "checks:rust:lint"
         "checks:rust:test"
@@ -269,11 +189,12 @@ in {
       echo "    checks:rust                 All Rust checks (format, lint,"
       echo "                                test with coverage, unused-deps)"
       echo "    checks:base                 Non-language checks (nix, markdown,"
-      echo "                                yaml, toml, private files)"
+      echo "                                yaml, toml)"
+      echo "    checks:private-files        Fail on any tracked private file"
       echo "    checks:all                  All checks combined"
       echo ""
       echo "  Scripts:"
-      echo "    bump-rust-dependencies      Update the Cargo lockfile"
+      echo "    update-rust-dependencies    Update the Cargo lockfile"
       echo "    start-duckdb                DuckDB with the archive views"
       echo "    check-views                 Fail on any archive view that is empty"
       echo "    mutate-rust <diff>          Mutation-test the lines a diff changes"

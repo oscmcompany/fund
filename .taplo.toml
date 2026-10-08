@@ -1,5 +1,2 @@
-include = ["**/*.toml"]
-exclude = [".devenv/**", "target/**", ".venv/**"]
-
 [schema]
 enabled = false

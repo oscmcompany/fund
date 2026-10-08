@@ -19,12 +19,17 @@ This is a collection of guidelines and references.
 - The live plans are `.scratchpad/plan_pivot.md`, `.scratchpad/plan_launch.md` and `.scratchpad/plan_archive.md`,
   local and deliberately untracked (`.scratchpad/` is gitignored because they carry private strategy and capital
   details); cite them as "pivot task N", "launch task N" and "archive task N"
+- Machinery is public and state is private: playbooks, journals, vendor data, fitted weights, capital and plans stay
+  out of git, which `check-private-files` enforces, and fixtures are synthetic because vendor licences forbid
+  redistributing their data
 - Read the `experiments` view (`start-duckdb`) before starting a study to see what has already been tried, under each
   profile or with `SET VARIABLE records_bucket` set to the other bucket, and journal every experiment through a `Study`;
   the catalog records the work and gates none of it, so holdouts are designed per study
 - Studies are throwaway binaries in the gitignored `studies/src/bin/`, run with `cargo run -p studies --bin <name>`,
   and a `Study` journals into the gitignored `journal/` at the root, which `finish` ships to the profile's records
   bucket
+- Measure a replaceable component through `laboratory::compare` against its trivial arm (the null strategy or the
+  component it replaces) over the same replayed sessions, so the paired difference lands in one experiment
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - See `README.md` "Principles" section for developer philosophy

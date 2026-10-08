@@ -21,7 +21,7 @@ use fund::archive::Archive;
 use fund::archive::reference::latest_conditions;
 use fund::archive::trade_bars::decode;
 use fund::broker::Broker;
-use fund::broker::alpaca::PaperAccount;
+use fund::broker::PaperAccount;
 use fund::common::journal::{Commit, Observation, RunId, SessionOpened};
 use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
