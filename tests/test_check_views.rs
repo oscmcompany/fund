@@ -65,12 +65,25 @@ fn real(answers: &[(&str, Answer)], profile: &str) -> (i32, String) {
     check(&root().join("check-views"), answers, profile)
 }
 
-/// The archive's bar views, the derived trade bars answering as the vendor minute bars do.
+/// The archive's market data views in `views.sql` order, each answering as the daily or the minute bars do.
 fn bars(daily: Answer, minute: Answer) -> Vec<(&'static str, Answer)> {
     vec![
         ("massive_daily_bars", daily),
         ("alpaca_minute_bars", minute),
         ("alpaca_trade_bars", minute),
+        ("massive_minute_bars", minute),
+        ("massive_five_minute_bars", minute),
+        ("massive_quote_bars", minute),
+        ("massive_daily_quote_bars", daily),
+        ("massive_trade_bars", minute),
+        ("massive_daily_trade_bars", daily),
+        ("alpaca_quote_bars", minute),
+        ("alpaca_daily_quote_bars", daily),
+        ("alpaca_daily_trade_bars", daily),
+        ("trade_conditions", daily),
+        ("security_details", daily),
+        ("splits", daily),
+        ("series_boundaries", daily),
     ]
 }
 
@@ -98,6 +111,19 @@ fn test_every_view_in_views_sql_is_checked() {
             "massive_daily_bars",
             "alpaca_minute_bars",
             "alpaca_trade_bars",
+            "massive_minute_bars",
+            "massive_five_minute_bars",
+            "massive_quote_bars",
+            "massive_daily_quote_bars",
+            "massive_trade_bars",
+            "massive_daily_trade_bars",
+            "alpaca_quote_bars",
+            "alpaca_daily_quote_bars",
+            "alpaca_daily_trade_bars",
+            "trade_conditions",
+            "security_details",
+            "splits",
+            "series_boundaries",
             "journal",
             "logs",
             "experiments",

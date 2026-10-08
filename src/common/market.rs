@@ -2,6 +2,7 @@
 //! every sum is exact; a float appears only when a value is presented.
 
 pub mod aggregate;
+pub mod corporate_actions;
 pub mod quote_bars;
 pub mod record;
 pub mod security_details;

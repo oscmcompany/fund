@@ -10,8 +10,14 @@ pub use retry::FetchError;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::common::market::corporate_actions::{
+    ActionIdRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
+};
 use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal, QuoteRefusal, TradeRefusal};
-use crate::common::market::{DollarVolumeRefusal, PriceRefusal, SharesRefusal, SymbolRefusal};
+use crate::common::market::security_details::{IndustryCodeRefusal, MarketIdentifierCodeRefusal};
+use crate::common::market::{
+    DollarVolumeRefusal, DollarsRefusal, PriceRefusal, SharesRefusal, SymbolRefusal,
+};
 
 /// Why an environment variable a client needs was not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +89,22 @@ pub enum RowRefusal {
     Unrequested,
     /// One of several rows claiming the same record; none is kept, since nothing says which is true.
     Duplicate,
+    ActionId(ActionIdRefusal),
+    SplitRatio(SplitRatioRefusal),
+    Boundary(SeriesBoundaryRefusal),
+    /// A corporate action with no date to place it on.
+    Undated,
+    /// A security type code no variant names.
+    SecurityType {
+        raw: String,
+    },
+    IndustryCode(IndustryCodeRefusal),
+    Exchange(MarketIdentifierCodeRefusal),
+    Dollars(DollarsRefusal),
+    /// A Central Index Key that is not a number.
+    CentralIndexKey {
+        raw: String,
+    },
 }
 
 /// Refused rows counted by the name of their cause.

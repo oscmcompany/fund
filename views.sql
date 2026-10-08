@@ -53,6 +53,136 @@ FROM read_parquet(
     hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
 );
 
+-- Massive's one-minute bars from its flat files, back to 2003, through the session before the nightly's first.
+CREATE OR REPLACE VIEW massive_minute_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_minute/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- Five-minute bars rolled up from Massive's one-minute bars.
+CREATE OR REPLACE VIEW massive_five_minute_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/bars/provider=massive/origin=derived/interval=five_minute/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- One-minute quote bars folded from Massive's quote flat files, time-weighted over regular hours.
+CREATE OR REPLACE VIEW massive_quote_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/quotes/provider=massive/origin=derived/interval=one_minute/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- Daily quote bars rolled up from Massive's one-minute quote bars.
+CREATE OR REPLACE VIEW massive_daily_quote_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/quotes/provider=massive/origin=derived/interval=one_day/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- One-minute trade bars folded from Massive's trade flat files over the whole Eastern day.
+CREATE OR REPLACE VIEW massive_trade_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/trades/provider=massive/origin=derived/interval=one_minute/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- Daily trade bars rolled up from Massive's one-minute trade bars.
+CREATE OR REPLACE VIEW massive_daily_trade_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/trades/provider=massive/origin=derived/interval=one_day/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- One-minute quote bars the nightly folds from Alpaca's SIP quotes.
+CREATE OR REPLACE VIEW alpaca_quote_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/quotes/provider=alpaca/origin=derived/interval=one_minute/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- Daily quote bars rolled up from Alpaca's one-minute quote bars.
+CREATE OR REPLACE VIEW alpaca_daily_quote_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/quotes/provider=alpaca/origin=derived/interval=one_day/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- Daily trade bars rolled up from Alpaca's one-minute trade bars.
+CREATE OR REPLACE VIEW alpaca_daily_trade_bars AS
+SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/trades/provider=alpaca/origin=derived/interval=one_day/year=*/month=*/day=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': BIGINT, 'month': BIGINT, 'day': BIGINT}
+);
+
+-- Each snapshot of the trade conditions table, one row per condition code, dated by `as_of`.
+CREATE OR REPLACE VIEW trade_conditions AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/reference/provider=massive/table=conditions/as_of=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'as_of': DATE}
+);
+
+-- Each quarterly snapshot of every symbol's details as Massive held them on `as_of`.
+CREATE OR REPLACE VIEW security_details AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/reference/provider=massive/table=security_details/as_of=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'as_of': DATE}
+);
+
+-- Each nightly snapshot of Massive's whole split table, dated by the session it was taken after.
+CREATE OR REPLACE VIEW splits AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/reference/provider=massive/table=splits/as_of=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'as_of': DATE}
+);
+
+-- Each nightly snapshot of the dates a symbol's series may not be read across, from Alpaca's corporate actions.
+CREATE OR REPLACE VIEW series_boundaries AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('market_data_bucket')
+        || '/data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/as_of=*/data.parquet',
+    hive_partitioning = true,
+    hive_types = {'as_of': DATE}
+);
+
 -- Every host's journal, one row per line; `payload` is JSON text for `json_extract`.
 CREATE OR REPLACE VIEW journal AS
 SELECT * EXCLUDE (year, month, day), make_date(year, month, day) AS session
