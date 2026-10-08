@@ -7,14 +7,14 @@ use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
+use super::{Accepted, RefusedRow, RowRefusal, Secret, VariableRefusal, variable};
 use crate::common::market::corporate_actions::{ActionId, Split, SplitRatio};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
 use crate::common::market::trade_bars::{
-    Condition, TradeConditions, UpdateRules, condition_letter,
+    Condition, ConditionCode, ConditionLetter, ConditionStatus, TradeConditions, UpdateRules,
 };
 use crate::common::market::{
     DollarVolume, Dollars, DollarsRefusal, Price, Shares, Symbol, SymbolRefusal, TradeCount,
@@ -38,7 +38,7 @@ pub(crate) fn is_exchange_test_ticker(ticker: &str) -> bool {
 pub struct Massive {
     http_client: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: Secret,
 }
 
 /// One session's daily bars, with every ticker that did not become one: each row of the response is exactly one of a
@@ -101,7 +101,7 @@ impl Massive {
         Ok(Self {
             http_client,
             base_url: variable("MASSIVE_BASE_URL")?,
-            api_key: variable("MASSIVE_API_KEY")?,
+            api_key: Secret::new(variable("MASSIVE_API_KEY")?),
         })
     }
 
@@ -112,7 +112,7 @@ impl Massive {
             send(
                 self.http_client
                     .get(&url)
-                    .bearer_auth(&self.api_key)
+                    .bearer_auth(self.api_key.expose())
                     .query(&[("asset_class", "stocks"), ("limit", "1000")]),
             )
         })
@@ -130,7 +130,7 @@ impl Massive {
             send(
                 self.http_client
                     .get(&url)
-                    .bearer_auth(&self.api_key)
+                    .bearer_auth(self.api_key.expose())
                     .query(&[("adjusted", "false"), ("include_otc", "false")]),
             )
         })
@@ -153,7 +153,7 @@ impl Massive {
                 send(
                     self.http_client
                         .get(&url)
-                        .bearer_auth(&self.api_key)
+                        .bearer_auth(self.api_key.expose())
                         .query(&query),
                 )
             })
@@ -186,7 +186,7 @@ impl Massive {
             send(
                 self.http_client
                     .get(&url)
-                    .bearer_auth(&self.api_key)
+                    .bearer_auth(self.api_key.expose())
                     .query(&[("date", date.as_str())]),
             )
         })
@@ -363,9 +363,7 @@ fn parse_security_details(
     let details = (|| {
         Ok::<_, RowRefusal>(SecurityDetails::new(
             symbol.clone(),
-            row.security_type
-                .map(|code| security_type(&code).ok_or(RowRefusal::SecurityType { raw: code }))
-                .transpose()?,
+            row.security_type.map(security_type).transpose()?,
             row.sic_code
                 .as_deref()
                 .map(IndustryCode::new)
@@ -516,25 +514,29 @@ fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
                     .update_rules
                     .ok_or_else(|| malformed(format!("condition {} has no update rules", row.id)))?
                     .consolidated;
-                let rule = UpdateRules::new(
-                    consolidated.updates_volume,
-                    consolidated.updates_high_low,
-                    consolidated.updates_open_close,
-                );
-                let letter = |plan: &str| -> Result<Option<char>, FetchError> {
-                    match row.sip_mapping.get(plan) {
-                        None => Ok(None),
-                        Some(spelled) => match condition_letter(spelled) {
-                            Some(letter) => Ok(Some(letter)),
-                            None => Err(malformed(format!(
-                                "condition {} spells {plan} as `{spelled}`",
-                                row.id
-                            ))),
-                        },
-                    }
+                let rule = UpdateRules {
+                    volume: consolidated.updates_volume,
+                    high_low: consolidated.updates_high_low,
+                    open_close: consolidated.updates_open_close,
                 };
-                let condition = Condition::new(rule, letter("CTA")?, letter("UTP")?, row.legacy);
-                if rules.insert(row.id, condition).is_some() {
+                let letter = |plan: &str| -> Result<Option<ConditionLetter>, FetchError> {
+                    row.sip_mapping
+                        .get(plan)
+                        .map(|spelled| ConditionLetter::new(spelled))
+                        .transpose()
+                        .map_err(|refusal| {
+                            malformed(format!("condition {} spells {plan}: {refusal}", row.id))
+                        })
+                };
+                let status = match row.legacy {
+                    false => ConditionStatus::Current,
+                    true => ConditionStatus::Retired,
+                };
+                let condition = Condition::new(rule, letter("CTA")?, letter("UTP")?, status);
+                if rules
+                    .insert(ConditionCode::new(row.id), condition)
+                    .is_some()
+                {
                     return Err(malformed(format!("condition {} is listed twice", row.id)));
                 }
             }
@@ -544,23 +546,68 @@ fn parse_trade_conditions(body: &[u8]) -> Result<TradeConditions, FetchError> {
     Ok(TradeConditions::new(rules))
 }
 
-/// Massive's security type code in our terms; `None` for a code no variant names.
-pub fn security_type(code: &str) -> Option<SecurityType> {
-    match code {
-        "CS" => Some(SecurityType::CommonStock),
-        "ETF" => Some(SecurityType::ExchangeTradedFund),
-        "WARRANT" => Some(SecurityType::Warrant),
-        "ADRC" => Some(SecurityType::DepositaryReceipt),
-        "FUND" => Some(SecurityType::Fund),
-        "UNIT" => Some(SecurityType::Unit),
-        "SP" => Some(SecurityType::StructuredProduct),
-        "PFD" => Some(SecurityType::PreferredStock),
-        "ETS" => Some(SecurityType::ExchangeTradedSecurity),
-        "ETN" => Some(SecurityType::ExchangeTradedNote),
-        "ETV" => Some(SecurityType::ExchangeTradedVehicle),
-        "RIGHT" => Some(SecurityType::Right),
-        "INDEX" => Some(SecurityType::Index),
-        _ => None,
+/// Massive's security type codes, each spelled as Massive spells it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "UPPERCASE")]
+enum MassiveTypeCode {
+    #[strum(serialize = "CS")]
+    CommonStock,
+    #[strum(serialize = "ETF")]
+    ExchangeTradedFund,
+    Warrant,
+    #[strum(serialize = "ADRC")]
+    DepositaryReceipt,
+    Fund,
+    Unit,
+    #[strum(serialize = "SP")]
+    StructuredProduct,
+    #[strum(serialize = "PFD")]
+    PreferredStock,
+    #[strum(serialize = "ETS")]
+    ExchangeTradedSecurity,
+    #[strum(serialize = "ETN")]
+    ExchangeTradedNote,
+    #[strum(serialize = "ETV")]
+    ExchangeTradedVehicle,
+    Right,
+    Index,
+}
+
+impl From<MassiveTypeCode> for SecurityType {
+    fn from(code: MassiveTypeCode) -> Self {
+        match code {
+            MassiveTypeCode::CommonStock => Self::CommonStock,
+            MassiveTypeCode::ExchangeTradedFund => Self::ExchangeTradedFund,
+            MassiveTypeCode::Warrant => Self::Warrant,
+            MassiveTypeCode::DepositaryReceipt => Self::DepositaryReceipt,
+            MassiveTypeCode::Fund => Self::Fund,
+            MassiveTypeCode::Unit => Self::Unit,
+            MassiveTypeCode::StructuredProduct => Self::StructuredProduct,
+            MassiveTypeCode::PreferredStock => Self::PreferredStock,
+            MassiveTypeCode::ExchangeTradedSecurity => Self::ExchangeTradedSecurity,
+            MassiveTypeCode::ExchangeTradedNote => Self::ExchangeTradedNote,
+            MassiveTypeCode::ExchangeTradedVehicle => Self::ExchangeTradedVehicle,
+            MassiveTypeCode::Right => Self::Right,
+            MassiveTypeCode::Index => Self::Index,
+        }
+    }
+}
+
+/// Massive's security type `code` in our terms, refused with itself when no variant names it.
+fn security_type(code: String) -> Result<SecurityType, RowRefusal> {
+    match code.parse::<MassiveTypeCode>() {
+        Ok(known) => Ok(known.into()),
+        Err(strum::ParseError::VariantNotFound) => Err(RowRefusal::SecurityType { raw: code }),
     }
 }
 
@@ -607,6 +654,7 @@ pub fn massive_ticker(symbol: &Symbol) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
+    use strum::IntoEnumIterator;
 
     use super::*;
 
@@ -829,21 +877,44 @@ mod tests {
     #[test]
     fn test_conditions_keep_the_trade_kinds_with_their_consolidated_rules() {
         let conditions = parse_trade_conditions(CONDITIONS.as_bytes()).unwrap();
-        let codes: Vec<u16> = conditions.conditions().keys().copied().collect();
+        let codes: Vec<u16> = conditions
+            .conditions()
+            .keys()
+            .map(|code| code.get())
+            .collect();
         assert_eq!(codes, [6, 10, 37, 41]);
-        let condition = |code: u16| conditions.conditions()[&code];
-        assert_eq!(condition(10).rules(), UpdateRules::new(true, true, false));
-        assert_eq!(condition(37).rules(), UpdateRules::new(true, false, false));
-        assert_eq!(condition(41).rules(), UpdateRules::new(true, true, true));
+        let condition = |code: u16| conditions.conditions()[&ConditionCode::new(code)];
+        let rules = |condition: Condition| {
+            let rules = condition.rules();
+            (rules.volume, rules.high_low, rules.open_close)
+        };
+        assert_eq!(rules(condition(10)), (true, true, false));
+        assert_eq!(rules(condition(37)), (true, false, false));
+        assert_eq!(rules(condition(41)), (true, true, true));
         assert_eq!(
             (
-                condition(41).consolidated_tape(),
-                condition(41).unlisted_trading()
+                condition(41).consolidated_tape().map(ConditionLetter::get),
+                condition(41).unlisted_trading().map(ConditionLetter::get)
             ),
             (Some('1'), Some('X'))
         );
-        assert!(!condition(37).retired());
-        assert!(condition(6).retired());
+        assert_eq!(condition(37).status(), ConditionStatus::Current);
+        assert_eq!(condition(6).status(), ConditionStatus::Retired);
+    }
+
+    #[test]
+    fn test_a_condition_spelled_with_two_letters_refuses_the_table() {
+        let spelled_twice = CONDITIONS.replacen(
+            r#"{"CTA": "4", "UTP": "4"}"#,
+            r#"{"CTA": "4", "UTP": "44"}"#,
+            1,
+        );
+        assert_eq!(
+            parse_trade_conditions(spelled_twice.as_bytes()),
+            Err(FetchError::Malformed {
+                reason: "condition 10 spells UTP: `44` is not one condition letter".to_string()
+            })
+        );
     }
 
     #[test]
@@ -853,12 +924,40 @@ mod tests {
             "CS", "ETF", "WARRANT", "ADRC", "FUND", "UNIT", "SP", "PFD", "ETS", "ETN", "ETV",
             "RIGHT", "INDEX",
         ];
-        let mapped: std::collections::BTreeSet<_> = codes
+        let mapped: Vec<SecurityType> = codes
             .iter()
-            .filter_map(|code| security_type(code))
+            .map(|code| security_type(code.to_string()).unwrap())
             .collect();
-        assert_eq!(mapped.len(), 13);
-        assert_eq!(security_type("OS"), None);
+        assert_eq!(
+            mapped,
+            [
+                SecurityType::CommonStock,
+                SecurityType::ExchangeTradedFund,
+                SecurityType::Warrant,
+                SecurityType::DepositaryReceipt,
+                SecurityType::Fund,
+                SecurityType::Unit,
+                SecurityType::StructuredProduct,
+                SecurityType::PreferredStock,
+                SecurityType::ExchangeTradedSecurity,
+                SecurityType::ExchangeTradedNote,
+                SecurityType::ExchangeTradedVehicle,
+                SecurityType::Right,
+                SecurityType::Index,
+            ]
+        );
+        assert_eq!(
+            security_type("OS".to_string()),
+            Err(RowRefusal::SecurityType {
+                raw: "OS".to_string()
+            })
+        );
+        let spelled: Vec<&'static str> =
+            MassiveTypeCode::iter().map(<&'static str>::from).collect();
+        assert_eq!(spelled, codes);
+        for code in MassiveTypeCode::iter() {
+            assert_eq!(code.to_string().parse::<MassiveTypeCode>(), Ok(code));
+        }
     }
 
     /// Massive's splits endpoint on 2026-10-07: its first row, a fractional ratio and the cursor, plus a zero side.

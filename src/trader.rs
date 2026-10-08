@@ -429,7 +429,9 @@ mod tests {
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::Trade;
-    use crate::common::market::trade_bars::{Correction, OpenClose, Print, Tape, TradeSums};
+    use crate::common::market::trade_bars::{
+        ConditionLetter, Correction, OpenClose, Print, Tape, TradeSums,
+    };
     use crate::common::market::{DollarVolume, Shares};
     use crate::common::order::{
         ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest, OrderStatus,
@@ -607,7 +609,7 @@ mod tests {
             outcome: AlpacaTradeOutcome::Print {
                 print: Print::Trade(trade),
                 tape: Tape::ConsolidatedTape,
-                letters: vec![' '],
+                letters: vec![ConditionLetter::of(' ')],
                 correction: Correction::Stands,
             },
         })

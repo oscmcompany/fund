@@ -88,10 +88,8 @@ impl TapeSource for Alpaca {
                     query.push(("page_token", token));
                 }
                 send(
-                    self.http_client
-                        .get(TRADES_URL)
-                        .header("APCA-API-KEY-ID", &self.key_id)
-                        .header("APCA-API-SECRET-KEY", &self.secret)
+                    self.credentials
+                        .sign(self.http_client.get(TRADES_URL))
                         .query(&query),
                 )
             })
@@ -408,7 +406,7 @@ mod tests {
 
     use super::*;
     use crate::common::market::record::Trade;
-    use crate::common::market::trade_bars::{Correction, Print, Tape};
+    use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
     use crate::common::market::{Price, Shares};
 
     /// A page of AAPL trades as the REST history returned it for 2026-10-06 19:59:59, trimmed to three rows.
@@ -440,7 +438,7 @@ mod tests {
             outcome: AlpacaTradeOutcome::Print {
                 print: Print::Trade(trade),
                 tape: Tape::ConsolidatedTape,
-                letters: vec![' '],
+                letters: vec![ConditionLetter::of(' ')],
                 correction: Correction::Stands,
             },
         }

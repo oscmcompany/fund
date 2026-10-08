@@ -57,10 +57,8 @@ impl Alpaca {
                     query.push(("page_token", token));
                 }
                 send(
-                    self.http_client
-                        .get(CORPORATE_ACTIONS_URL)
-                        .header("APCA-API-KEY-ID", &self.key_id)
-                        .header("APCA-API-SECRET-KEY", &self.secret)
+                    self.credentials
+                        .sign(self.http_client.get(CORPORATE_ACTIONS_URL))
                         .query(&query),
                 )
             })
