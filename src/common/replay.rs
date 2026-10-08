@@ -8,11 +8,13 @@ use chrono::{DateTime, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
+use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::state::{MarketEvent, MarketState};
 use crate::common::market::{DollarVolume, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::strategy::{Order, Strategy, orders};
+use crate::common::time::SessionDate;
 
 /// The grid a crossing's charge is rounded to: hundred-millionths of the notional, so a basis point is 10,000.
 const RATE_SCALE: u128 = 100_000_000;
@@ -165,6 +167,12 @@ impl Replay {
         &self.marks
     }
 
+    /// Each marked session's return from the previous session's last mark, or `opening` before the first, to its own
+    /// last mark.
+    pub fn session_returns(&self, opening: Cash) -> Result<Series, SeriesRefusal> {
+        session_returns(&self.marks, opening)
+    }
+
     /// Closes the replay: orders still pending are recorded unfilled at the end of data.
     pub fn finish(mut self) -> Self {
         if let Some(at) = self.reached {
@@ -177,6 +185,27 @@ impl Replay {
         }
         self
     }
+}
+
+/// Unmeasured where either end of a session went unpriced or its start was worth nothing or less.
+fn session_returns(
+    marks: &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
+    opening: Cash,
+) -> Result<Series, SeriesRefusal> {
+    let mut ends: BTreeMap<SessionDate, Option<Cash>> = BTreeMap::new();
+    for (at, mark) in marks {
+        ends.insert(SessionDate::at(*at), mark.as_ref().ok().copied());
+    }
+    let mut start = Some(opening);
+    Series::new(ends.into_iter().map(|(session, end)| {
+        let reading = match (start, end) {
+            (Some(start), Some(end)) => (start.units() > 0)
+                .then(|| (end.units() - start.units()) as f64 / start.units() as f64),
+            (None, Some(_)) | (Some(_), None) | (None, None) => None,
+        };
+        start = end;
+        (session, reading)
+    }))
 }
 
 impl<S: Strategy> Replayer<S> {
@@ -409,6 +438,40 @@ mod tests {
 
     fn replayer<S: Strategy>(strategy: S) -> Replayer<S> {
         Replayer::new(strategy, free(), BarInterval::OneDay)
+    }
+
+    /// A session runs from the last mark before it to its own last; an unpriced end leaves it and the next session
+    /// unmeasured, and so does a start worth nothing or less.
+    #[test]
+    fn test_a_session_returns_from_the_last_mark_before_it() {
+        let unpriced = || {
+            Err(ValuationRefusal::Unpriced {
+                symbol: symbol("AAPL"),
+            })
+        };
+        let units = |units: i128| Ok(Cash::from_units(units));
+        let marks = BTreeMap::from([
+            (day(0) - TimeDelta::hours(2), units(105_000_000_000_000)),
+            (day(0), units(110_000_000_000_000)),
+            (day(1), unpriced()),
+            (day(2), units(121_000_000_000_000)),
+            (day(3), units(133_100_000_000_000)),
+            (day(4), units(0)),
+            (day(5), units(5_000_000_000_000)),
+        ]);
+        let returns = session_returns(&marks, cash(100)).unwrap();
+        let readings: Vec<_> = returns.readings().values().copied().collect();
+        assert_eq!(
+            readings,
+            [Some(0.1), None, None, Some(0.1), Some(-1.0), None]
+        );
+        let sessions: Vec<_> = returns.readings().keys().copied().collect();
+        assert_eq!(
+            sessions,
+            (0..6)
+                .map(|offset| SessionDate::at(day(offset)))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A 10bp spread charges 5bp a crossing, rounded up to the next unit.

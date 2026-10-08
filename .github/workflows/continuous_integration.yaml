@@ -18,6 +18,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      # Ungated, since a private file can be of any type; plain git, so it
+      # needs no devenv shell.
+      - name: Check no private file is tracked
+        run: ./check-private-files
       - name: Detect changed file types
         uses: dorny/paths-filter@v3
         id: changes
@@ -36,6 +40,7 @@ jobs:
               - 'secretspec.toml'
               - 'views.sql'
               - 'check-views'
+              - 'check-private-files'
               - 'devenv.nix'
               - 'devenv.lock'
             base:

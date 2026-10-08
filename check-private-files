@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fails when git tracks a file holding private state: a playbook, a journal, vendor data, fitted weights, the capital
+# ledger, a study or the plans. `.gitignore` keeps them out, so this catches a forced add or a pattern it lacks.
+# Exits 0 when none is tracked, 3 when any is, and 1 when the check could not be made. Checks the repository given
+# as the argument, or the one holding this script.
+set -euo pipefail
+
+repository="${1:-$(dirname "${BASH_SOURCE[0]}")}"
+private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl$|\.safetensors?$|(^|/)capital_flows\.toml$|^journal/|^studies/src/bin/|^\.scratchpad/'
+
+if ! tracked="$(git -C "${repository}" ls-files)"; then
+  echo "Error: could not list the files git tracks in ${repository}" >&2
+  exit 1
+fi
+found="$(grep -E "${private}" <<<"${tracked}" || true)"
+if [[ -n "${found}" ]]; then
+  echo "Error: git tracks private files:" >&2
+  echo "${found}" >&2
+  exit 3
+fi
+echo "No private files are tracked"
