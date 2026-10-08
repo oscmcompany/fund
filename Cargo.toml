@@ -34,11 +34,9 @@ futures-util = { version = "0.3.34", default-features = false, features = [
   "sink",
   "std",
 ] }
-# `zstd` reads only the legacy archiver's files; archive task A6 removes it with the legacy reader.
 parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",
   "snap",
-  "zstd",
 ] }
 reqwest = { version = "0.13.5", default-features = false, features = [
   "rustls",

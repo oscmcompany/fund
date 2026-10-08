@@ -332,8 +332,7 @@ impl Host {
     }
 }
 
-/// Crate-visible for the legacy reader; archive task A6 makes it private again when it deletes that reader.
-pub(crate) fn date_partition(session: SessionDate) -> String {
+fn date_partition(session: SessionDate) -> String {
     let date = session.date();
     format!(
         "year={}/month={:02}/day={:02}",

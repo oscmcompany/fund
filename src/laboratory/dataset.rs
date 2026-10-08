@@ -14,7 +14,6 @@ use crate::common::market::record::Bar;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 use crate::laboratory::Study;
-use crate::laboratory::legacy::{self, LegacyRefusal};
 
 /// Bars by session and the fingerprint of the partitions they came from.
 #[derive(Debug)]
@@ -58,10 +57,9 @@ pub enum DatasetError {
         session: SessionDate,
         refusal: DecodeRefusal,
     },
-    /// A legacy partition that did not decode; archive task A6 deletes it with the legacy reader.
-    LegacyDecode {
-        session: SessionDate,
-        refusal: LegacyRefusal,
+    /// A leg retired with its data, which only journals still name.
+    Retired {
+        leg: DatasetLeg,
     },
     /// A partition that holds no bars is a defect in the archive, not a gap, so it is refused rather than read.
     EmptyPartition {
@@ -78,16 +76,11 @@ impl std::fmt::Display for DatasetError {
             Self::EmptyPartition { session } => {
                 write!(formatter, "the partition for {session} holds no bars")
             }
+            Self::Retired { leg } => write!(formatter, "{leg} was retired with its data"),
             Self::Decode { session, refusal } => {
                 write!(
                     formatter,
                     "the partition for {session} did not decode: {refusal:?}"
-                )
-            }
-            Self::LegacyDecode { session, refusal } => {
-                write!(
-                    formatter,
-                    "the legacy partition for {session} did not decode: {refusal:?}"
                 )
             }
         }
@@ -117,7 +110,7 @@ pub async fn daily_bars(
 }
 
 /// `leg`'s bars for every trading session from `first` to `last`, journaled to `study` before it is returned.
-pub(crate) async fn load(
+async fn load(
     leg: DatasetLeg,
     archive: &Archive,
     calendar: &TradingCalendar,
@@ -166,19 +159,7 @@ async fn partition(
                 decode(&key, body).map_err(|refusal| DatasetError::Decode { session, refusal })?;
             Ok(Some((bars, tag)))
         }
-        // Archive task A6 deletes this arm with the legacy reader.
-        DatasetLeg::LegacyDailyBars => {
-            let Some((body, tag)) = archive
-                .get_tagged_at(legacy::path(session))
-                .await
-                .map_err(DatasetError::Archive)?
-            else {
-                return Ok(None);
-            };
-            let bars = legacy::decode(session, body)
-                .map_err(|refusal| DatasetError::LegacyDecode { session, refusal })?;
-            Ok(Some((bars, tag)))
-        }
+        DatasetLeg::LegacyDailyBars => Err(DatasetError::Retired { leg }),
     }
 }
 
@@ -193,8 +174,8 @@ pub async fn lineage(
             DatasetLeg::MassiveDailyBars => {
                 archive.tag(&Leg::MassiveDailyBars.key(*session)).await?
             }
-            // Archive task A6 deletes this arm with the legacy reader.
-            DatasetLeg::LegacyDailyBars => archive.tag_at(legacy::path(*session)).await?,
+            // Never looked up, so every partition such a read held is reported gone.
+            DatasetLeg::LegacyDailyBars => None,
         };
         if let Some(tag) = tag {
             current.insert(*session, tag.as_str().to_string());
