@@ -181,8 +181,8 @@ struct NightlyArguments {
     /// cap of N sessions would take forty nights to heal a two-hundred-session hole.
     #[arg(long, default_value_t = 240)]
     budget_minutes: u64,
-    /// Exit status of `fetch-trade-conditions --check`, which `run-archiver` runs before the fold.
-    /// Recorded rather than acted on; absent on a hand-run fold, which checked nothing.
+    /// Exit status of `fetch-trade-conditions --check`, which `run-archiver` ran before the fold until the archive
+    /// cutover. Recorded rather than acted on; absent on a hand-run fold, which checked nothing.
     #[arg(long, value_name = "STATUS")]
     conditions_check_status: Option<i32>,
     /// Exit status of `fetch-industry-classifications --check`, recorded the same way.
@@ -3571,10 +3571,10 @@ mod tests {
         );
     }
 
-    /// `run-archiver` passes every status by these names, so a rename here would fail every
-    /// scheduled run at argument parsing -- before the fold, not just the record.
+    /// The names `run-archiver` passed every status by until the archive cutover stopped the fold, kept so a hand
+    /// run with them still parses.
     #[test]
-    fn test_the_nightly_takes_every_check_status_by_the_names_the_wrapper_uses() {
+    fn test_the_nightly_takes_every_check_status_by_the_names_the_wrapper_used() {
         let arguments = nightly(&[
             "--conditions-check-status",
             "3",

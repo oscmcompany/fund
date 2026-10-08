@@ -203,6 +203,45 @@ fn test_the_one_shot_inhibit_is_consumed_after_the_stop_trap_is_armed() {
     );
 }
 
+/// The nightly no longer runs the legacy fold, heals before it exports, and exits with the first failure of sync,
+/// heal, views and export.
+#[test]
+fn test_the_nightly_heals_and_exports_without_the_legacy_fold() {
+    let script =
+        std::fs::read_to_string(tool("run-archiver")).expect("the script must be readable");
+    assert!(
+        !script.contains("run-backfill archive-nightly"),
+        "the legacy fold must not run"
+    );
+    let heal = script
+        .find("tools/run-backfill heal-archive")
+        .expect("run-archiver must run the heal");
+    let export = script
+        .find("tools/run-backfill export-records")
+        .expect("run-archiver must export the records");
+    let exit = script
+        .rfind("exit \"$(first_failure")
+        .expect("run-archiver must exit with the first failing stage");
+    assert!(
+        heal < export && export < exit,
+        "the heal, then the export, then the exit"
+    );
+    let status = &script[exit..script[exit..]
+        .find('\n')
+        .map_or(script.len(), |end| exit + end)];
+    for stage in [
+        "SYNC_STATUS",
+        "NEW_ARCHIVER_STATUS",
+        "VIEWS_STATUS",
+        "EXPORT_STATUS",
+    ] {
+        assert!(
+            status.contains(stage),
+            "the exit must report {stage}: {status}"
+        );
+    }
+}
+
 fn permit_execution(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))

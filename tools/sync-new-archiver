@@ -3,8 +3,8 @@ set -euo pipefail
 
 # sync-new-archiver -- Bring a second checkout, of master, and its `archive_nightly` up to origin/master.
 #
-# The rebuilt archiver (master's pivot task 16) runs on this box beside the legacy fold until cutover, so its layout
-# collects nightly. It gets its own checkout and target directory, since `sync-archiver` resets this one to legacy.
+# The archiver's nightly heal, built from master. It gets its own checkout and target directory, since `sync-archiver`
+# resets this one to legacy, which still carries `run-archiver` and the records export.
 
 ROOT="${FUND_NEW_ROOT:-${HOME:+$HOME/fund-master}}"
 BRANCH=master

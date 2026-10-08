@@ -3,8 +3,8 @@ set -euo pipefail
 
 # run-archiver -- What the worker does when the nightly schedule wakes it.
 #
-# Sync, fold whatever the recent sessions are missing, stop. The schedule fires every night
-# including weekends, because `seed` asks the calendar and the set difference decides what is owed.
+# Sync, heal whatever the recent sessions are missing, stop. The schedule fires every night including
+# weekends, because the heal asks the calendar and the set difference decides what is owed.
 #
 # Stopping is this script's job. The stall alarm is the backstop for a hang, not the normal way the
 # box turns off -- a finished run once sat burning an hour waiting for an idle alarm.
@@ -52,7 +52,7 @@ stop_self() {
   exit "$status"
 }
 
-# An operator debugging the box starts it by hand, and a boot service that folded and then stopped
+# An operator debugging the box starts it by hand, and a boot service that healed and then stopped
 # underneath them would make that impossible.
 # Redirected into a dated, service-named file because `split_log_file_name` collects only
 # `<date>.<service>.log`; the unit's own `archiver.log` carries no date and is invisible to the
@@ -61,16 +61,16 @@ open_the_json_log archiver
 trap 'rm -f "$STATUS_FILE"' EXIT
 
 if [[ -e "$INHIBIT_FILE" ]]; then
-  log "$INHIBIT_FILE present; not folding and not stopping"
+  log "$INHIBIT_FILE present; not healing and not stopping"
   exit 0
 fi
 
 trap stop_self EXIT
 
-# Honoured once and then gone, and the box still stops -- a scheduled start that neither folded nor
+# Honoured once and then gone, and the box still stops -- a scheduled start that neither healed nor
 # stopped would burn until the stall alarm, which is why this is not the operator's file.
 if consume_a_one_shot_inhibit "$ONE_SHOT_INHIBIT_FILE"; then
-  log "$ONE_SHOT_INHIBIT_FILE was present; an unfinished reconcile left it, so skipping the fold"
+  log "$ONE_SHOT_INHIBIT_FILE was present; an unfinished reconcile left it, so skipping the heal"
   exit 0
 fi
 
@@ -81,59 +81,21 @@ fi
 FUND_PROFILE="$(cat "$PROFILE_FILE")"
 export FUND_PROFILE
 
-# The archiver's own journal. `seed` writes the night here and `export-records` ships it, which is
-# the only way anything this box learns survives the power-off at the end of this script.
+# The legacy journal, which nothing writes since the fold stopped; `export-records` still ships it and this
+# script's logs, the only way anything this box learns survives the power-off at the end of this script.
 FUND_JOURNAL_DIRECTORY=/var/journal/fund
 export FUND_JOURNAL_DIRECTORY
 mkdir -p "$FUND_JOURNAL_DIRECTORY"
 
 cd "$REPO_ROOT"
 
+# The legacy fold stopped at archive task A6's cutover; the checkout is still synced for this script and the export.
 log "Syncing"
-SYNCED=true
-if ! run_wrapped sync-archiver tools/sync-archiver; then
-  log "ERROR: sync failed; not folding tonight"
-  SYNCED=false
-fi
+SYNC_STATUS=0
+run_wrapped sync-archiver tools/sync-archiver || SYNC_STATUS=$?
 
-# Before the fold, so every verdict reaches the night's record. Recorded rather than acted on: drift
-# is a fact about the provider, and a view that reads nothing costs a query rather than a fold. No
-# status here is a leg for `first_failure`.
-CONDITIONS_CHECK_STATUS=0
-CLASSIFICATION_CHECK_STATUS=0
-VIEWS_CHECK_STATUS=0
-if [[ "$SYNCED" == true ]]; then
-  log "Checking the reference tables against their sources"
-  # Bounded, because a request that hangs would hold the fold and the export behind it. A check
-  # cut off by the deadline exits 124 and is recorded as failed.
-  run_wrapped conditions-check timeout 300 tools/run-backfill check-reference fetch-trade-conditions \
-    || CONDITIONS_CHECK_STATUS=$?
-  run_wrapped classification-check timeout 300 tools/run-backfill check-reference fetch-industry-classifications \
-    || CLASSIFICATION_CHECK_STATUS=$?
-  run_wrapped views-check timeout 300 tools/run-backfill check-views || VIEWS_CHECK_STATUS=$?
-  log "Reference checks: conditions ${CONDITIONS_CHECK_STATUS}, classification ${CLASSIFICATION_CHECK_STATUS}, views ${VIEWS_CHECK_STATUS}"
-fi
-
-# The fold's exit status is kept, but the export runs either way: a night that failed is the one
-# whose records are most worth having, and `set -e` would otherwise stop before shipping them.
-FOLD_STATUS=0
-if [[ "$SYNCED" == true ]]; then
-  log "Folding as $FUND_PROFILE"
-  run_wrapped seed tools/run-backfill archive-nightly \
-    --conditions-check-status "$CONDITIONS_CHECK_STATUS" \
-    --classification-check-status "$CLASSIFICATION_CHECK_STATUS" \
-    --views-check-status "$VIEWS_CHECK_STATUS" \
-    "$@" || FOLD_STATUS=$?
-  log "Fold finished with status ${FOLD_STATUS}"
-else
-  # The fold is skipped and the run still reaches the export below, because the night that failed to
-  # sync is the one whose diagnostics are worth shipping.
-  FOLD_STATUS=1
-  log "Skipping the fold; the checkout did not sync"
-fi
-
-# The rebuilt archiver, run beside the legacy fold until cutover so its layout collects nightly. Independent of the
-# legacy sync, and never in the way of the export below: its own records ship from inside the binary.
+# The archiver: independent of the legacy sync, and never in the way of the export below, since its own records ship
+# from inside the binary.
 NEW_ARCHIVER_STATUS=0
 VIEWS_STATUS=0
 log "Running the rebuilt archiver"
@@ -158,6 +120,6 @@ else
   log "ERROR: records failed to export with status ${EXPORT_STATUS}; they remain on this box only"
 fi
 
-# Either leg. This used to exit the fold's status alone, so a night whose records never left the box
-# -- the one failure a box that powers itself off cannot recover from -- reported success.
-exit "$(first_failure "$FOLD_STATUS" "$NEW_ARCHIVER_STATUS" "$VIEWS_STATUS" "$EXPORT_STATUS")"
+# Any stage. A night whose records never left the box is the one failure a box that powers itself off cannot recover
+# from, so the export counts as much as the heal.
+exit "$(first_failure "$SYNC_STATUS" "$NEW_ARCHIVER_STATUS" "$VIEWS_STATUS" "$EXPORT_STATUS")"
