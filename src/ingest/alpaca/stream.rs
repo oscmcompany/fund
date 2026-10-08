@@ -113,7 +113,7 @@ impl std::fmt::Display for StreamElementRefusal {
             }
             Self::NoNumber => write!(formatter, "a trade with no `i`"),
             Self::NumberNotUnsigned { raw } => {
-                write!(formatter, "an `i` that is no unsigned integer: {raw}")
+                write!(formatter, "an `i` that is not an unsigned integer: {raw}")
             }
             Self::Unreadable { reason } => write!(formatter, "{reason}"),
         }
