@@ -7,9 +7,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails,
 };
-use crate::common::market::{Dollars, DollarsRefusal, Shares, Symbol};
+use crate::common::market::{Shares, Symbol};
 use crate::common::time::SessionDate;
-use crate::ingest::massive::security_type;
+use crate::ingest::massive::{capitalization_to_the_cent, security_type};
 
 /// Where the legacy archiver kept its snapshots.
 pub const LEGACY_SNAPSHOT_ROOT: &str = "data/derived/equity/reference/";
@@ -27,11 +27,6 @@ pub struct LegacySnapshot {
     pub as_of: SessionDate,
     pub details: Vec<SecurityDetails>,
     pub refused: Vec<RefusedSnapshotRow>,
-}
-
-/// The vendor's capitalization, its own float product a few hundred-millionths off the cent, rounded to the cent.
-fn capitalization_to_the_cent(dollars: f64) -> Result<Dollars, DollarsRefusal> {
-    Dollars::from_float((dollars * 100.0).round() / 100.0)
 }
 
 /// A text cell, `None` where the legacy file holds a null.
@@ -135,19 +130,4 @@ pub fn read_legacy_snapshot(bytes: Vec<u8>) -> Result<LegacySnapshot, String> {
         details,
         refused,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_a_capitalization_off_the_cent_rounds_onto_it() {
-        assert!(Dollars::from_float(1_234.567_891_2).is_err());
-        assert_eq!(
-            capitalization_to_the_cent(1_234.567_891_2).map(Dollars::millionths),
-            Ok(1_234_570_000)
-        );
-        assert!(capitalization_to_the_cent(-1.0).is_err());
-    }
 }

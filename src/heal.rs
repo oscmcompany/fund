@@ -16,25 +16,32 @@ use tokio::time::Instant;
 
 use crate::archive::Archive;
 use crate::archive::bars::{Provenance, Subscription, decode, encode};
-use crate::archive::reference::{conditions_key, encode_conditions, latest_conditions};
+use crate::archive::reference::{
+    conditions_key, decode_series_boundaries, encode_conditions, encode_security_details,
+    encode_series_boundaries, encode_splits, latest_conditions, latest_snapshot,
+};
 use crate::archive::{quote_bars, trade_bars};
-use crate::common::heal::{Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, window};
+use crate::common::heal::{
+    Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, quarter_start, window,
+};
 use crate::common::journal::{
     ConfigurationResolved, HealFinished, Observation, PartitionWritten, Unanswered,
 };
 use crate::common::market::Symbol;
+use crate::common::market::corporate_actions::{SeriesBoundary, refresh_boundaries};
 use crate::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use crate::common::market::record::{Bar, BarInterval};
+use crate::common::market::security_details::SecurityDetails;
 use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
-use crate::common::storage::Key;
+use crate::common::storage::{Key, Provider, ReferenceTable};
 use crate::common::time::SessionDate;
 use crate::ingest::alpaca::{
     Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
 };
-use crate::ingest::massive::Massive;
-use crate::ingest::{FetchError, refused_by_cause};
+use crate::ingest::massive::{DetailsAnswer, Massive};
+use crate::ingest::{FetchError, RefusedRow, refused_by_cause};
 use crate::journal::Journal;
 use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
 
@@ -159,7 +166,8 @@ impl std::fmt::Display for HealError {
 /// The clients the heal reads from and writes to.
 pub struct Clients {
     archive: Archive,
-    massive: Massive,
+    /// Shared by the concurrent security details requests.
+    massive: Arc<Massive>,
     /// Shared by the concurrent one-minute batches, so its secret is held once rather than copied into each.
     alpaca: Arc<Alpaca>,
 }
@@ -168,7 +176,7 @@ impl Clients {
     pub fn new(archive: Archive, massive: Massive, alpaca: Alpaca) -> Self {
         Self {
             archive,
-            massive,
+            massive: Arc::new(massive),
             alpaca: Arc::new(alpaca),
         }
     }
@@ -184,6 +192,8 @@ pub async fn run(
 ) -> Result<HealFinished, HealError> {
     let deadline = Instant::now() + parameters.budget;
     let (first, last) = calendar_range(today, parameters.lookback_sessions);
+    // Reaching back to the quarter's start lets the security details leg find the session that opened it.
+    let first = first.min(quarter_start(last));
     let calendar = clients
         .alpaca
         .calendar(first, last)
@@ -206,7 +216,7 @@ pub async fn run(
             tracing::warn!(%leg, unrecognized = ?held.unrecognized(), "Objects outside the series were not counted as held");
         }
         let mut sessions = BTreeMap::new();
-        for session in owed(&window, held.sessions()) {
+        for session in owed(&leg.keeps(&window, &calendar), held.sessions()) {
             let outcome = if Instant::now() >= deadline {
                 SessionOutcome::Unreached
             } else {
@@ -250,6 +260,13 @@ async fn write(
             return write_quotes(session, hours?, parameters, clients, journal).await;
         }
         Leg::AlpacaTrades => return write_trades(session, parameters, clients, journal).await,
+        Leg::MassiveSplits => return write_splits(session, clients, journal).await,
+        Leg::AlpacaSeriesBoundaries => {
+            return write_series_boundaries(session, clients, journal).await;
+        }
+        Leg::MassiveSecurityDetails => {
+            return write_security_details(session, parameters, clients, journal).await;
+        }
         Leg::MassiveDailyBars => {
             let daily = clients
                 .massive
@@ -304,12 +321,7 @@ async fn write(
     if bars.is_empty() {
         return Err("the vendor answered with no bars".to_string());
     }
-    let provenance = Provenance::new(
-        subscription,
-        Utc::now(),
-        journal.run_id(),
-        journal.commit().cloned(),
-    );
+    let provenance = fetched_now(subscription, journal);
     let body = encode(&key, &bars, &provenance).map_err(|refusal| format!("{refusal:?}"))?;
     clients
         .archive
@@ -322,6 +334,200 @@ async fn write(
         u64::try_from(bars.len()).expect("a partition holds fewer than u64::MAX bars"),
         refused,
         unanswered,
+    ))
+}
+
+/// The provenance of rows `subscription` answered just now, written by this run.
+fn fetched_now(subscription: Subscription, journal: &Journal) -> Provenance {
+    Provenance::new(
+        subscription,
+        Utc::now(),
+        journal.run_id(),
+        journal.commit().cloned(),
+    )
+}
+
+/// Writes Massive's whole split table as the session's snapshot.
+async fn write_splits(
+    session: SessionDate,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, String> {
+    let splits = clients
+        .massive
+        .splits()
+        .await
+        .map_err(|error| error.to_string())?;
+    if splits.splits().is_empty() {
+        return Err("the vendor answered with no splits".to_string());
+    }
+    let key = Leg::MassiveSplits.key(session);
+    let provenance = fetched_now(Subscription::StocksStarter, journal);
+    let body = encode_splits(&key, splits.splits(), &provenance)
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    clients
+        .archive
+        .put(&key, body)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(PartitionWritten::new(
+        Leg::MassiveSplits,
+        session,
+        u64::try_from(splits.splits().len()).expect("a table holds fewer than u64::MAX rows"),
+        refused_by_cause(splits.refused()),
+        BTreeMap::new(),
+    ))
+}
+
+/// How far before the previous snapshot a refresh reaches back, and the span of one request.
+const BOUNDARY_REFRESH_DAYS: i64 = 365;
+
+/// Where the first snapshot's history starts, fetched a refresh window at a time.
+const BOUNDARIES_SINCE: (i32, u32, u32) = (2015, 1, 1);
+
+/// Writes the session's series boundaries: the previous snapshot refreshed from a year before it was taken, so a
+/// missed night leaves no gap, or, with none to refresh, the feed's history; either is read a year at a time.
+async fn write_series_boundaries(
+    session: SessionDate,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, String> {
+    let previous = latest_snapshot(
+        &clients.archive,
+        Provider::Alpaca,
+        ReferenceTable::SeriesBoundaries,
+        session,
+    )
+    .await?;
+    let (held, first) = match previous {
+        Some(key) => {
+            let bytes = clients
+                .archive
+                .get(&key)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{} vanished", key.path()))?;
+            let (held, _) =
+                decode_series_boundaries(&key, bytes).map_err(|refusal| format!("{refusal:?}"))?;
+            (
+                held,
+                key.session().plus_calendar_days(-BOUNDARY_REFRESH_DAYS),
+            )
+        }
+        None => {
+            let (year, month, day) = BOUNDARIES_SINCE;
+            let since = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .expect("the boundaries' first day is a date");
+            (Vec::new(), SessionDate::from_date(since))
+        }
+    };
+    let mut fetched: Vec<SeriesBoundary> = Vec::new();
+    let mut refused: Vec<RefusedRow> = Vec::new();
+    let mut start = first;
+    while start <= session {
+        let end = start
+            .plus_calendar_days(BOUNDARY_REFRESH_DAYS - 1)
+            .min(session);
+        let read = clients
+            .alpaca
+            .series_boundaries(start, end)
+            .await
+            .map_err(|error| error.to_string())?;
+        fetched.extend_from_slice(read.boundaries());
+        refused.extend_from_slice(read.refused());
+        start = end.plus_calendar_days(1);
+    }
+    let boundaries = refresh_boundaries(&held, &fetched, (first, session));
+    if boundaries.is_empty() {
+        return Err("the vendor answered with no boundaries".to_string());
+    }
+    let key = Leg::AlpacaSeriesBoundaries.key(session);
+    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
+    let body = encode_series_boundaries(&key, &boundaries, &provenance)
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    clients
+        .archive
+        .put(&key, body)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(PartitionWritten::new(
+        Leg::AlpacaSeriesBoundaries,
+        session,
+        u64::try_from(boundaries.len()).expect("a table holds fewer than u64::MAX rows"),
+        refused_by_cause(&refused),
+        BTreeMap::new(),
+    ))
+}
+
+/// What the details requests for a session answered, gathered across symbols.
+#[derive(Default)]
+struct DetailsGathered {
+    details: Vec<SecurityDetails>,
+    missing: Vec<Symbol>,
+    refused: Vec<RefusedRow>,
+}
+
+impl Monoid for DetailsGathered {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(mut self, other: Self) -> Self {
+        self.details.extend(other.details);
+        self.missing.extend(other.missing);
+        self.refused.extend(other.refused);
+        self
+    }
+}
+
+/// Writes the details of every symbol that traded on `session`, as Massive held them on that date.
+async fn write_security_details(
+    session: SessionDate,
+    parameters: &Parameters,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, String> {
+    let symbols = symbol_list(clients, session).await?;
+    let one = NonZeroUsize::new(1).expect("one is not zero");
+    let gathered: DetailsGathered =
+        in_batches(&symbols, one, parameters.tick_concurrency, |batch| {
+            let massive = Arc::clone(&clients.massive);
+            async move {
+                let mut gathered = DetailsGathered::default();
+                for symbol in batch {
+                    match massive.security_details(&symbol, session).await? {
+                        DetailsAnswer::Details(details) => gathered.details.push(details),
+                        DetailsAnswer::Missing => gathered.missing.push(symbol),
+                        DetailsAnswer::Refused(row) => gathered.refused.push(row),
+                    }
+                }
+                Ok(gathered)
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if gathered.details.is_empty() {
+        return Err("the vendor answered with no details".to_string());
+    }
+    let key = Leg::MassiveSecurityDetails.key(session);
+    let provenance = fetched_now(Subscription::StocksStarter, journal);
+    let body = encode_security_details(&key, &gathered.details, &provenance)
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    clients
+        .archive
+        .put(&key, body)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(PartitionWritten::new(
+        Leg::MassiveSecurityDetails,
+        session,
+        u64::try_from(gathered.details.len()).expect("a table holds fewer than u64::MAX rows"),
+        refused_by_cause(&gathered.refused),
+        gathered
+            .missing
+            .into_iter()
+            .map(|symbol| (symbol, Unanswered::Missing))
+            .collect(),
     ))
 }
 
@@ -396,7 +602,7 @@ async fn write_quotes(
     if minutes.is_empty() {
         return Err("the vendor answered with no quotes".to_string());
     }
-    let provenance = tick_provenance(journal);
+    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaQuotes.key(session));
     let rollup =
         |interval| {
@@ -462,7 +668,7 @@ async fn write_trades(
     if minutes.is_empty() {
         return Err("the vendor answered with no trades".to_string());
     }
-    let provenance = tick_provenance(journal);
+    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaTrades.key(session));
     let rollup =
         |interval| {
@@ -524,15 +730,6 @@ async fn trade_conditions(clients: &Clients, journal: &Journal) -> Result<TradeC
             Ok(conditions)
         }
     }
-}
-
-fn tick_provenance(journal: &Journal) -> Provenance {
-    Provenance::new(
-        Subscription::AlgoTraderPlus,
-        Utc::now(),
-        journal.run_id(),
-        journal.commit().cloned(),
-    )
 }
 
 /// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` a page at a time as

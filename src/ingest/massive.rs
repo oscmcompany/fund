@@ -1,18 +1,24 @@
-//! Massive's grouped daily bars: every ticker that traded on a session, which is also the session's symbol list.
+//! Massive's grouped daily bars, which are also a session's symbol list, and its reference data: trade conditions,
+//! splits, and each symbol's details as of a date.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
+use crate::common::market::corporate_actions::{ActionId, Split, SplitRatio};
 use crate::common::market::record::{Bar, BarInterval, Ohlc};
-use crate::common::market::security_details::SecurityType;
+use crate::common::market::security_details::{
+    CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
+};
 use crate::common::market::trade_bars::{
     Condition, TradeConditions, UpdateRules, condition_letter,
 };
-use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal, TradeCount};
+use crate::common::market::{
+    DollarVolume, Dollars, DollarsRefusal, Price, Shares, Symbol, SymbolRefusal, TradeCount,
+};
 use crate::common::time::SessionDate;
 
 /// Exchange test tickers, which print in the grouped daily but are not securities. An exact list rather than a pattern,
@@ -131,6 +137,262 @@ impl Massive {
         .await?;
         parse_grouped_daily(&body, session)
     }
+
+    /// Every split Massive has published, past and announced, as one table.
+    pub async fn splits(&self) -> Result<Splits, FetchError> {
+        let url = format!("{}/v3/reference/splits", self.base_url);
+        let mut splits = Splits::default();
+        let mut cursor: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        for _ in 0..SPLITS_PAGES_AT_MOST {
+            let body = with_retries(|| {
+                let mut query = vec![("limit", SPLITS_PAGE_LIMIT)];
+                if let Some(cursor) = cursor.as_deref() {
+                    query.push(("cursor", cursor));
+                }
+                send(
+                    self.http_client
+                        .get(&url)
+                        .bearer_auth(&self.api_key)
+                        .query(&query),
+                )
+            })
+            .await?;
+            match parse_splits_page(&body, &mut splits)? {
+                None => return Ok(splits.unique()),
+                Some(next) if !seen.insert(next.clone()) => {
+                    return Err(FetchError::Malformed {
+                        reason: format!("splits cursor {next} repeated"),
+                    });
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(FetchError::Malformed {
+            reason: format!("splits did not end within {SPLITS_PAGES_AT_MOST} pages"),
+        })
+    }
+
+    /// `symbol`'s details as Massive held them on `as_of`; a symbol not listed that day is `Missing`, not an error.
+    pub async fn security_details(
+        &self,
+        symbol: &Symbol,
+        as_of: SessionDate,
+    ) -> Result<DetailsAnswer, FetchError> {
+        let ticker = massive_ticker(symbol);
+        let url = format!("{}/v3/reference/tickers/{ticker}", self.base_url);
+        let date = as_of.to_string();
+        let answer = with_retries(|| {
+            send(
+                self.http_client
+                    .get(&url)
+                    .bearer_auth(&self.api_key)
+                    .query(&[("date", date.as_str())]),
+            )
+        })
+        .await;
+        match answer {
+            Ok(body) => parse_security_details(&body, symbol, &ticker),
+            Err(FetchError::Refused { status: 404, .. }) => Ok(DetailsAnswer::Missing),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+const SPLITS_PAGE_LIMIT: &str = "1000";
+/// Far past the table's 29 pages, so a cursor that never ends is caught.
+const SPLITS_PAGES_AT_MOST: usize = 200;
+
+/// Massive's split table, with every row that did not become a split.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Splits {
+    splits: Vec<Split>,
+    refused: Vec<RefusedRow>,
+    /// How often each identifier was listed, refused rows included.
+    listed: BTreeMap<String, usize>,
+}
+
+impl Splits {
+    /// The table with every action listed more than once refused, each copy, since nothing says which is true.
+    fn unique(self) -> Self {
+        let listed = self.listed;
+        let (splits, repeated): (Vec<Split>, Vec<Split>) = self
+            .splits
+            .into_iter()
+            .partition(|split| listed.get(split.id().as_str()) == Some(&1));
+        let mut refused = self.refused;
+        refused.extend(repeated.into_iter().map(|split| RefusedRow {
+            ticker: split.symbol().as_str().to_string(),
+            cause: RowRefusal::Duplicate,
+        }));
+        Self {
+            splits,
+            refused,
+            listed,
+        }
+    }
+
+    pub fn splits(&self) -> &[Split] {
+        &self.splits
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
+}
+
+#[derive(Deserialize)]
+struct SplitsPage {
+    #[serde(default)]
+    results: Vec<SplitRow>,
+    next_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SplitRow {
+    id: String,
+    ticker: String,
+    execution_date: NaiveDate,
+    split_from: f64,
+    split_to: f64,
+}
+
+/// Adds one page's splits to `splits` and answers the cursor for the next page. Only the cursor is taken from
+/// `next_url`, so the key is never sent to a host the response named.
+fn parse_splits_page(body: &[u8], splits: &mut Splits) -> Result<Option<String>, FetchError> {
+    let page: SplitsPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
+        reason: error.to_string(),
+    })?;
+    for row in page.results {
+        *splits.listed.entry(row.id.clone()).or_insert(0) += 1;
+        let split = ActionId::new(&row.id)
+            .map_err(RowRefusal::ActionId)
+            .and_then(|id| {
+                let symbol = alpaca_symbol(&row.ticker).map_err(RowRefusal::Symbol)?;
+                let ratio = SplitRatio::from_floats(row.split_from, row.split_to)
+                    .map_err(RowRefusal::SplitRatio)?;
+                Ok(Split::new(
+                    id,
+                    symbol,
+                    SessionDate::from_date(row.execution_date),
+                    ratio,
+                ))
+            });
+        match split {
+            Ok(split) => splits.splits.push(split),
+            Err(cause) => splits.refused.push(RefusedRow {
+                ticker: row.ticker,
+                cause,
+            }),
+        }
+    }
+    page.next_url
+        .map(|next| {
+            reqwest::Url::parse(&next)
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(name, _)| name == "cursor")
+                        .map(|(_, cursor)| cursor.into_owned())
+                })
+                .ok_or(FetchError::Malformed {
+                    reason: format!("next_url without a cursor: {next}"),
+                })
+        })
+        .transpose()
+}
+
+/// What Massive answered about one symbol's details.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetailsAnswer {
+    Details(SecurityDetails),
+    /// Not listed on the date asked.
+    Missing,
+    Refused(RefusedRow),
+}
+
+#[derive(Deserialize)]
+struct DetailsResponse {
+    results: Option<DetailsRow>,
+}
+
+#[derive(Deserialize)]
+struct DetailsRow {
+    ticker: String,
+    #[serde(rename = "type")]
+    security_type: Option<String>,
+    sic_code: Option<String>,
+    sic_description: Option<String>,
+    share_class_shares_outstanding: Option<f64>,
+    market_cap: Option<f64>,
+    primary_exchange: Option<String>,
+    cik: Option<String>,
+}
+
+fn parse_security_details(
+    body: &[u8],
+    symbol: &Symbol,
+    ticker: &str,
+) -> Result<DetailsAnswer, FetchError> {
+    let response: DetailsResponse =
+        serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
+            reason: error.to_string(),
+        })?;
+    let Some(row) = response.results else {
+        return Ok(DetailsAnswer::Missing);
+    };
+    let refused = |cause| {
+        Ok(DetailsAnswer::Refused(RefusedRow {
+            ticker: ticker.to_string(),
+            cause,
+        }))
+    };
+    if row.ticker != ticker {
+        return refused(RowRefusal::Unrequested);
+    }
+    let details = (|| {
+        Ok::<_, RowRefusal>(SecurityDetails::new(
+            symbol.clone(),
+            row.security_type
+                .map(|code| security_type(&code).ok_or(RowRefusal::SecurityType { raw: code }))
+                .transpose()?,
+            row.sic_code
+                .as_deref()
+                .map(IndustryCode::new)
+                .transpose()
+                .map_err(RowRefusal::IndustryCode)?,
+            row.sic_description,
+            row.share_class_shares_outstanding
+                .map(Shares::from_float)
+                .transpose()
+                .map_err(RowRefusal::Shares)?,
+            row.market_cap
+                .map(capitalization_to_the_cent)
+                .transpose()
+                .map_err(RowRefusal::Dollars)?,
+            row.primary_exchange
+                .as_deref()
+                .map(MarketIdentifierCode::new)
+                .transpose()
+                .map_err(RowRefusal::Exchange)?,
+            row.cik
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map(CentralIndexKey::new)
+                        .map_err(|_| RowRefusal::CentralIndexKey { raw })
+                })
+                .transpose()?,
+        ))
+    })();
+    match details {
+        Ok(details) => Ok(DetailsAnswer::Details(details)),
+        Err(cause) => refused(cause),
+    }
+}
+
+/// Massive's capitalization, its own float product a few hundred-millionths off the cent, rounded to the cent.
+pub(crate) fn capitalization_to_the_cent(dollars: f64) -> Result<Dollars, DollarsRefusal> {
+    Dollars::from_float((dollars * 100.0).round() / 100.0)
 }
 
 fn parse_grouped_daily(body: &[u8], session: SessionDate) -> Result<DailyBars, FetchError> {
@@ -316,6 +578,20 @@ pub fn alpaca_symbol(ticker: &str) -> Result<Symbol, SymbolRefusal> {
     Symbol::new(&translated).map_err(|_| SymbolRefusal::Malformed {
         raw: ticker.to_string(),
     })
+}
+
+/// `symbol` in Massive's notation, the inverse of `alpaca_symbol`: `BC.PRC` is `BCpC`, `ABC.WS` is `ABCw` and `ABC.RT`
+/// is `ABCr`, and any other suffix is written as Massive writes it, `BRK.B`.
+pub fn massive_ticker(symbol: &Symbol) -> String {
+    match symbol.as_str().split_once('.') {
+        Some((root, "WS")) => format!("{root}w"),
+        Some((root, "RT")) => format!("{root}r"),
+        Some((root, suffix)) => match suffix.strip_prefix("PR") {
+            Some(series) if !series.is_empty() => format!("{root}p{series}"),
+            Some(_) | None => symbol.as_str().to_string(),
+        },
+        None => symbol.as_str().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -573,5 +849,152 @@ mod tests {
             .collect();
         assert_eq!(mapped.len(), 13);
         assert_eq!(security_type("OS"), None);
+    }
+
+    /// Massive's splits endpoint on 2026-10-07: its first row, a fractional ratio and the cursor, plus a zero side.
+    const SPLITS_PAGE: &str = r#"{"results":[{"execution_date":"2026-12-17","id":"Ee311332e3f60ade13ccbf987b2d89b2085533e7db481fe8b311b5d167e949c8e","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-10-23","id":"E3366d86694dc48ac06cd3a951a03c211a348540830849916066a920737090ee3","split_from":1,"split_to":0.7137,"ticker":"VSEAX"},{"execution_date":"2026-11-02","id":"Eabc","split_from":1,"split_to":0,"ticker":"ZERO"}],"status":"OK","request_id":"191409f29929687bb8cc5810c2fa7054","next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU"}"#;
+
+    #[test]
+    fn test_a_splits_page_keeps_fractional_ratios_and_answers_only_its_cursor() {
+        let mut splits = Splits::default();
+        let cursor = parse_splits_page(SPLITS_PAGE.as_bytes(), &mut splits).unwrap();
+        assert_eq!(
+            cursor.as_deref(),
+            Some("YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU")
+        );
+        let read: Vec<(String, String, u64, u64)> = splits
+            .splits()
+            .iter()
+            .map(|split| {
+                (
+                    split.symbol().as_str().to_string(),
+                    split.executed_on().to_string(),
+                    split.ratio().from().units(),
+                    split.ratio().to().units(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (
+                    "DPU".to_string(),
+                    "2026-12-17".to_string(),
+                    50_000_000,
+                    1_000_000
+                ),
+                (
+                    "VSEAX".to_string(),
+                    "2026-10-23".to_string(),
+                    1_000_000,
+                    713_700
+                ),
+            ]
+        );
+        assert_eq!(splits.refused().len(), 1);
+        assert_eq!(<&str>::from(splits.refused()[0].cause()), "split_ratio");
+        let last = SPLITS_PAGE.replace(
+            r#""next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU""#,
+            r#""next_url":null"#,
+        );
+        assert_eq!(
+            parse_splits_page(last.as_bytes(), &mut Splits::default()),
+            Ok(None)
+        );
+        // The same page read twice, as a cursor revisiting rows would: every repeated action is refused.
+        parse_splits_page(SPLITS_PAGE.as_bytes(), &mut splits).unwrap();
+        let unique = splits.unique();
+        assert!(unique.splits().is_empty());
+        assert_eq!(
+            unique
+                .refused()
+                .iter()
+                .filter(|row| row.cause() == &RowRefusal::Duplicate)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn test_an_action_repeated_beside_a_refused_copy_is_refused_too() {
+        // DPU's action filed again under a ticker no symbol holds: the valid copy cannot be trusted either.
+        let page = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU.WARRANTS"}],"next_url":null}"#;
+        let mut splits = Splits::default();
+        parse_splits_page(page.as_bytes(), &mut splits).unwrap();
+        let unique = splits.unique();
+        assert!(unique.splits().is_empty());
+        let causes: Vec<&str> = unique
+            .refused()
+            .iter()
+            .map(|row| row.cause().into())
+            .collect();
+        assert_eq!(causes, ["symbol", "duplicate"]);
+    }
+
+    #[test]
+    fn test_details_read_every_field_and_refuse_an_answer_about_another_ticker() {
+        // AAPL and BACpL as Massive answered for 2026-10-01, trimmed to the fields kept.
+        let apple = r#"{"results":{"ticker":"AAPL","type":"CS","sic_code":"3571","sic_description":"ELECTRONIC COMPUTERS","share_class_shares_outstanding":14594180000,"market_cap":4820749537600.0,"primary_exchange":"XNAS","cik":"0000320193"},"status":"OK"}"#;
+        let preferred = r#"{"results":{"ticker":"BACpL","type":"PFD","sic_code":"6021","sic_description":"NATIONAL COMMERCIAL BANKS","share_class_shares_outstanding":3080000,"primary_exchange":"XNYS","cik":"0000070858"},"status":"OK"}"#;
+        let aapl = Symbol::new("AAPL").unwrap();
+        let DetailsAnswer::Details(details) =
+            parse_security_details(apple.as_bytes(), &aapl, "AAPL").unwrap()
+        else {
+            panic!("AAPL did not read");
+        };
+        assert_eq!(details.security_type(), Some(SecurityType::CommonStock));
+        assert_eq!(details.industry_code().map(IndustryCode::code), Some(3571));
+        assert_eq!(
+            details.shares_outstanding().map(Shares::units),
+            Some(14_594_180_000_000_000)
+        );
+        assert_eq!(
+            details.market_capitalization().map(Dollars::millionths),
+            Some(4_820_749_537_600_000_000)
+        );
+        assert_eq!(
+            details.central_index_key().map(CentralIndexKey::value),
+            Some(320_193)
+        );
+        let bac = Symbol::new("BAC.PRL").unwrap();
+        assert_eq!(massive_ticker(&bac), "BACpL");
+        let DetailsAnswer::Details(details) =
+            parse_security_details(preferred.as_bytes(), &bac, "BACpL").unwrap()
+        else {
+            panic!("BACpL did not read");
+        };
+        assert_eq!(details.symbol(), &bac);
+        assert_eq!(details.market_capitalization(), None);
+        assert!(matches!(
+            parse_security_details(apple.as_bytes(), &bac, "BACpL"),
+            Ok(DetailsAnswer::Refused(row)) if row.cause() == &RowRefusal::Unrequested
+        ));
+        assert_eq!(
+            parse_security_details(br#"{"status":"OK"}"#, &aapl, "AAPL"),
+            Ok(DetailsAnswer::Missing)
+        );
+    }
+
+    proptest::proptest! {
+        /// Every Massive ticker the mapping translates comes back through `massive_ticker` as written.
+        #[test]
+        fn property_massive_notation_round_trips(
+            root in "[A-Z]{1,4}",
+            suffix in proptest::sample::select(vec!["", "pA", "pB", "w", "r", ".A", ".B", ".U"]),
+        ) {
+            let ticker = format!("{root}{suffix}");
+            let symbol = alpaca_symbol(&ticker).unwrap();
+            proptest::prop_assert_eq!(massive_ticker(&symbol), ticker);
+        }
+    }
+
+    #[test]
+    fn test_a_capitalization_off_the_cent_rounds_onto_it() {
+        assert!(Dollars::from_float(1_234.567_891_2).is_err());
+        assert_eq!(
+            capitalization_to_the_cent(1_234.567_891_2).map(Dollars::millionths),
+            Ok(1_234_570_000)
+        );
+        assert!(capitalization_to_the_cent(-1.0).is_err());
     }
 }

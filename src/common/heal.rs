@@ -4,16 +4,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
+use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::common::market::record::BarInterval;
-use crate::common::storage::{Key, Origin, Provider};
+use crate::common::storage::{Key, Origin, Provider, ReferenceTable};
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 
 /// One series the archiver keeps whole, in the order a run works them: the daily bars first, since they are the
-/// other legs' symbol list. A tick leg writes one-minute, five-minute and daily bars, and is held by its daily file,
-/// which it writes last.
+/// other legs' symbol list, then the reference snapshots, which are quick, before the tick legs. A tick leg writes
+/// one-minute, five-minute and daily bars, and is held by its daily file, which it writes last.
 #[derive(
     Debug,
     Clone,
@@ -34,6 +35,9 @@ use crate::common::time::calendar::TradingCalendar;
 #[strum(serialize_all = "snake_case")]
 pub enum Leg {
     MassiveDailyBars,
+    MassiveSecurityDetails,
+    MassiveSplits,
+    AlpacaSeriesBoundaries,
     AlpacaMinuteBars,
     AlpacaQuotes,
     AlpacaTrades,
@@ -67,7 +71,65 @@ impl Leg {
                 interval: BarInterval::OneDay,
                 session,
             },
+            Self::MassiveSecurityDetails => Key::Reference {
+                provider: Provider::Massive,
+                table: ReferenceTable::SecurityDetails,
+                as_of: session,
+            },
+            Self::MassiveSplits => Key::Reference {
+                provider: Provider::Massive,
+                table: ReferenceTable::Splits,
+                as_of: session,
+            },
+            Self::AlpacaSeriesBoundaries => Key::Reference {
+                provider: Provider::Alpaca,
+                table: ReferenceTable::SeriesBoundaries,
+                as_of: session,
+            },
         }
+    }
+
+    /// The sessions this leg writes. A snapshot of a whole table fetched later cannot stand for an earlier day, so a
+    /// snapshot leg keeps only the window's last session; security details are kept once a quarter, on the session that
+    /// opens the quarter the window ends in, which the vendor answers as of that date however late it is asked, so a
+    /// missed one stays owed for the rest of the quarter. `calendar` must reach back to that quarter's first day.
+    pub fn keeps(self, window: &[SessionDate], calendar: &TradingCalendar) -> Vec<SessionDate> {
+        match self {
+            Self::MassiveDailyBars
+            | Self::AlpacaMinuteBars
+            | Self::AlpacaQuotes
+            | Self::AlpacaTrades => window.to_vec(),
+            Self::MassiveSplits | Self::AlpacaSeriesBoundaries => {
+                window.last().copied().into_iter().collect()
+            }
+            Self::MassiveSecurityDetails => window
+                .last()
+                .and_then(|last| quarter_opening(calendar, *last))
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// The first day of the calendar quarter `session` falls in.
+pub fn quarter_start(session: SessionDate) -> SessionDate {
+    let date = session.date();
+    SessionDate::from_date(
+        NaiveDate::from_ymd_opt(date.year(), date.month0() / 3 * 3 + 1, 1)
+            .expect("a quarter starts on a real date"),
+    )
+}
+
+/// The first trading day of `session`'s quarter, if it falls on or before `session`; `None` when the calendar does
+/// not reach back to the quarter's first day, since it cannot say.
+pub fn quarter_opening(calendar: &TradingCalendar, session: SessionDate) -> Option<SessionDate> {
+    let start = quarter_start(session);
+    match calendar.covers(start, session) {
+        true => calendar
+            .trading_days_in_range(start, session)
+            .first()
+            .copied(),
+        false => None,
     }
 }
 
@@ -341,11 +403,50 @@ mod tests {
             series,
             [
                 "data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/",
+                "data/equity/stage=parsed/reference/provider=massive/table=security_details/",
+                "data/equity/stage=parsed/reference/provider=massive/table=splits/",
+                "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/",
                 "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/",
                 "data/equity/stage=parsed/quotes/provider=alpaca/origin=derived/interval=one_day/",
                 "data/equity/stage=parsed/trades/provider=alpaca/origin=derived/interval=one_day/",
             ]
         );
+    }
+
+    #[test]
+    fn test_each_leg_keeps_its_own_sessions_of_the_window() {
+        // New Year's Day 2027 is a Friday holiday, so the first quarter opens on Monday the 4th.
+        let winter = calendar("2026-12-01", "2027-01-31", &["2026-12-25", "2027-01-01"]);
+        let opening = window(&winter, date("2027-01-07"), sessions(5)).unwrap();
+        let kept = |leg: Leg| -> Vec<String> {
+            leg.keeps(&opening, &winter)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            kept(Leg::AlpacaTrades),
+            [
+                "2026-12-30",
+                "2026-12-31",
+                "2027-01-04",
+                "2027-01-05",
+                "2027-01-06"
+            ]
+        );
+        assert_eq!(kept(Leg::MassiveSplits), ["2027-01-06"]);
+        assert_eq!(kept(Leg::AlpacaSeriesBoundaries), ["2027-01-06"]);
+        assert_eq!(kept(Leg::MassiveSecurityDetails), ["2027-01-04"]);
+        // Weeks later the quarter's opening is long out of the window and still owed until it is held.
+        let later = window(&winter, date("2027-01-28"), sessions(5)).unwrap();
+        assert_eq!(
+            Leg::MassiveSecurityDetails.keeps(&later, &winter),
+            [date("2027-01-04")]
+        );
+        assert_eq!(quarter_start(date("2027-03-31")), date("2027-01-01"));
+        assert_eq!(quarter_opening(&winter, date("2026-12-31")), None);
+        let short = calendar("2027-01-02", "2027-01-31", &[]);
+        assert_eq!(quarter_opening(&short, date("2027-01-28")), None);
     }
 
     fn any_session() -> impl Strategy<Value = SessionDate> {

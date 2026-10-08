@@ -71,6 +71,8 @@ pub enum Origin {
 pub enum ReferenceTable {
     Conditions,
     SecurityDetails,
+    Splits,
+    SeriesBoundaries,
 }
 
 /// The S3 storage class an object is written in.
@@ -539,6 +541,14 @@ mod tests {
                     as_of: session(),
                 },
                 "data/equity/stage=parsed/reference/provider=massive/table=security_details/as_of=2026-08-03/data.parquet",
+            ),
+            (
+                Key::Reference {
+                    provider: Provider::Alpaca,
+                    table: ReferenceTable::SeriesBoundaries,
+                    as_of: session(),
+                },
+                "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/as_of=2026-08-03/data.parquet",
             ),
             (
                 Key::RawBars {
