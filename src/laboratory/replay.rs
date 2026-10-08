@@ -256,7 +256,8 @@ mod tests {
                     | Observation::BookReconciled(_)
                     | Observation::TargetDecided(_)
                     | Observation::SessionOpened(_)
-                    | Observation::BarBuilt(_) => None,
+                    | Observation::BarBuilt(_)
+                    | Observation::PlaybookRead(_) => None,
                 },
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })

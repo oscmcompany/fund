@@ -16,6 +16,7 @@ use crate::common::market::Symbol;
 use crate::common::market::trade_bars::BarBuilt;
 use crate::common::order::{OrderClosed, OrderRefused, OrderSubmitted, OrderUnresolved};
 use crate::common::parameter::Parameter;
+use crate::common::playbook::PlaybookRead;
 use crate::common::reconcile::BookReconciled;
 use crate::common::risk::TargetDecided;
 use crate::common::time::SessionDate;
@@ -196,6 +197,7 @@ pub enum Observation {
     TargetDecided(TargetDecided),
     SessionOpened(SessionOpened),
     BarBuilt(BarBuilt),
+    PlaybookRead(PlaybookRead),
 }
 
 impl Observation {
@@ -708,6 +710,9 @@ mod tests {
                 ),
                 Cash::from_units(9),
             )),
+            Observation::PlaybookRead(crate::common::playbook::PlaybookRead::new(
+                "roll_off_minutes = 5\n".to_string(),
+            )),
         ];
         let payloads: Vec<String> = observations
             .iter()
@@ -736,6 +741,7 @@ mod tests {
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#.to_string(),
                 r#"{"event_type":"session_opened","payload":{"session":"2026-10-07","cash":"-7","positions":{"SPY":"2000000"},"opening":"9"}}"#.to_string(),
+                r#"{"event_type":"playbook_read","payload":{"contents":"roll_off_minutes = 5\n"}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {

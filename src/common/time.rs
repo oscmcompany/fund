@@ -8,8 +8,14 @@ use chrono::{
 };
 use chrono_tz::America::New_York;
 
+/// The 09:30 Eastern bell that opens every regular session.
+pub const REGULAR_OPEN: NaiveTime = match NaiveTime::from_hms_opt(9, 30, 0) {
+    Some(time) => time,
+    None => panic!("09:30 is a valid wall-clock time"),
+};
+
 /// The usual 16:00 Eastern bell, which a daily bar is stamped at and an early close ends before.
-const REGULAR_CLOSE: NaiveTime = match NaiveTime::from_hms_opt(16, 0, 0) {
+pub const REGULAR_CLOSE: NaiveTime = match NaiveTime::from_hms_opt(16, 0, 0) {
     Some(time) => time,
     None => panic!("16:00 is a valid wall-clock time"),
 };
@@ -90,7 +96,7 @@ pub fn eastern_datetime(instant: DateTime<Utc>) -> NaiveDateTime {
 }
 
 /// The Eastern wall-clock time at an instant.
-fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
+pub fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
     eastern_datetime(instant).time()
 }
 
