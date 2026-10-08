@@ -1,6 +1,8 @@
 //! Massive's flat files: one gzipped CSV per dataset per session, served from Massive's own S3 endpoint under the
 //! Stocks Advanced keys, which lapse on 2026-10-26.
 
+use std::num::NonZeroU64;
+
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
@@ -10,7 +12,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
-use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
+use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, one_sided, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
 use crate::common::market::trade_bars::{Correction, Print};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
@@ -217,7 +219,7 @@ impl FlatFiles {
         dataset: FlatFileDataset,
         listed: &Listed,
         start: u64,
-        length: u64,
+        length: NonZeroU64,
     ) -> Result<Bytes, FlatFileError> {
         let path = dataset.path(listed.session);
         let failed = |reason: String| FlatFileError::Get {
@@ -229,7 +231,7 @@ impl FlatFiles {
             .get_object()
             .bucket(BUCKET)
             .key(&path)
-            .range(format!("bytes={start}-{}", start + length - 1))
+            .range(format!("bytes={start}-{}", start + length.get() - 1))
             .if_match(&listed.tag)
             .send()
             .await
@@ -240,10 +242,10 @@ impl FlatFiles {
             .await
             .map_err(|error| failed(error.to_string()))?
             .into_bytes();
-        if body.len() as u64 != length {
+        if body.len() as u64 != length.get() {
             return Err(FlatFileError::ShortRange {
                 path,
-                asked: length,
+                asked: length.get(),
                 received: body.len() as u64,
             });
         }
@@ -414,7 +416,8 @@ impl FlatFiles {
         tokio::spawn(async move {
             let mut start = 0;
             while start < listed.length {
-                let length = STREAM_CHUNK.min(listed.length - start);
+                let length = NonZeroU64::new(STREAM_CHUNK.min(listed.length - start))
+                    .expect("a chunk starts before the file ends");
                 let (flat_files, listed_chunk) = (flat_files.clone(), listed.clone());
                 let fetch = tokio::spawn(async move {
                     // A body that breaks partway is not retried by the client, and losing it loses the whole file.
@@ -440,7 +443,7 @@ impl FlatFiles {
                 if sender.send(fetch).await.is_err() {
                     return;
                 }
-                start += length;
+                start += length.get();
             }
         });
         FlatFileStream {
@@ -511,7 +514,7 @@ fn quote_outcome(row: QuoteRow) -> QuoteRowOutcome {
     if is_exchange_test_ticker(&row.ticker) {
         return QuoteRowOutcome::TestTicker;
     }
-    if row.bid_price <= 0.0 || row.ask_price <= 0.0 {
+    if one_sided(row.bid_price, row.ask_price) {
         return QuoteRowOutcome::OneSided;
     }
     let refused = |cause: RowRefusal| {
@@ -622,7 +625,10 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
         Err(cause) => return refused(RowRefusal::Shares(cause)),
     };
     let timestamp = DateTime::from_timestamp_nanos(row.sip_timestamp);
-    let correction = correction(row.correction);
+    let correction = match correction(row.correction) {
+        Ok(correction) => correction,
+        Err(cause) => return refused(cause),
+    };
     // A price published with no shares, such as the corrected consolidated close, is a print but not a trade.
     let print = match size.is_zero() {
         true => Print::Unsized {
@@ -643,11 +649,14 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
 }
 
 /// Reads the SIP's correction indicator: 12 is the record that replaces a corrected print; 1 marks an original later
-/// corrected, 8 one later canceled and 10 the cancel's own record, and every other nonzero code is withdrawn too.
-fn correction(indicator: Option<u32>) -> Correction {
+/// corrected, 8 one later canceled and 10 the cancel's own record; any other code is refused with itself.
+fn correction(indicator: Option<u32>) -> Result<Correction, RowRefusal> {
     match indicator {
-        None | Some(0) | Some(12) => Correction::Stands,
-        Some(_) => Correction::Withdrawn,
+        None | Some(0 | 12) => Ok(Correction::Stands),
+        Some(1 | 8 | 10) => Ok(Correction::Withdrawn),
+        Some(code) => Err(RowRefusal::Correction {
+            raw: code.to_string(),
+        }),
     }
 }
 
@@ -812,16 +821,17 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
 
     #[test]
     fn test_each_quote_row_is_a_quote_a_test_ticker_one_sided_or_refused() {
-        // The header and first rows of Massive's quotes for 2021-08-23 and 2026-09-18, plus a crossed and a test row.
+        // The header and first rows of Massive's quotes for 2021-08-23 and 2026-09-18, plus a crossed, a negative-bid and a test row.
         let rows = "ticker,ask_exchange,ask_price,ask_size,bid_exchange,bid_price,bid_size,conditions,indicators,participant_timestamp,sequence_number,sip_timestamp,tape,trf_timestamp
 A,8,180.0,100,11,164.28,100,\"1,81\",,1629716400001245000,79497,1629716400044243200,1,0
 A,12,0.0,0,12,0.0,0,\"1,81\",,1789715092739044279,172,1789715092739508637,1,0
 BApA,11,60.10,200,8,60.20,100,\"1,81\",,1629716446119912192,81265,1629716446119946496,1,0
+A,8,180.0,100,11,-1.0,100,\"1,81\",,1629716446119912192,81266,1629716446119946496,1,0
 ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,1629716446119946496,1,0
 ";
         let mut outcomes = Vec::new();
         read_quotes(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
-        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes.len(), 5);
         match &outcomes[0] {
             QuoteRowOutcome::Quote(quote) => {
                 assert_eq!(quote.symbol().as_str(), "A");
@@ -841,7 +851,13 @@ ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,16297164461199464
             &outcomes[2],
             QuoteRowOutcome::Refused(row) if row.ticker() == "BApA"
         ));
-        assert_eq!(outcomes[3], QuoteRowOutcome::TestTicker);
+        // A negative bid is a bad price, not a missing side, as Alpaca's rows read it.
+        assert!(matches!(
+            &outcomes[3],
+            QuoteRowOutcome::Refused(row)
+                if row.ticker() == "A" && <&'static str>::from(row.cause()) == "price"
+        ));
+        assert_eq!(outcomes[4], QuoteRowOutcome::TestTicker);
     }
 
     #[test]
@@ -912,13 +928,15 @@ GRAB,\"53,35,41\",12,4,2,1762287697649000000,5.900000,2,1762287697649651762,1500
         assert_eq!(
             read,
             [
-                Correction::Stands,
-                Correction::Stands,
-                Correction::Withdrawn,
-                Correction::Withdrawn,
-                Correction::Withdrawn,
-                Correction::Stands,
-                Correction::Withdrawn,
+                Ok(Correction::Stands),
+                Ok(Correction::Stands),
+                Ok(Correction::Withdrawn),
+                Ok(Correction::Withdrawn),
+                Ok(Correction::Withdrawn),
+                Ok(Correction::Stands),
+                Err(RowRefusal::Correction {
+                    raw: "7".to_string()
+                }),
             ]
         );
     }

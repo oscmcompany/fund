@@ -85,6 +85,10 @@ pub enum RowRefusal {
     Conditions {
         raw: String,
     },
+    /// A correction code or label no rule reads, so whether the print stands is unknown.
+    Correction {
+        raw: String,
+    },
     /// Answered for a symbol that was not asked for, as when a vendor normalizes a name into another security's.
     Unrequested,
     /// One of several rows claiming the same record; none is kept, since nothing says which is true.
@@ -152,5 +156,36 @@ impl<Key: Ord + Clone> Accepted<Key> {
     fn finish(self) -> (Vec<Bar>, Vec<RefusedRow>) {
         let bars = self.rows.into_values().map(|(_, bar)| bar).collect();
         (bars, self.refused)
+    }
+}
+
+/// A quote with a side priced at zero and no bad price, which is no top of book; a negative or non-finite price on
+/// either side is a bad price and refused as one.
+pub(crate) fn one_sided(bid: f64, ask: f64) -> bool {
+    let priced = |price: f64| price.is_finite() && price >= 0.0;
+    priced(bid) && priced(ask) && (bid == 0.0 || ask == 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a zero side beside a good price is one-sided; a bad price on either side is left for the price refusal.
+    #[test]
+    fn test_a_quote_is_one_sided_only_beside_a_good_price() {
+        let read: Vec<bool> = [
+            (0.0, 10.0),
+            (10.0, 0.0),
+            (0.0, 0.0),
+            (10.0, 10.01),
+            (-1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, f64::NAN),
+            (f64::INFINITY, 0.0),
+        ]
+        .into_iter()
+        .map(|(bid, ask)| one_sided(bid, ask))
+        .collect();
+        assert_eq!(read, [true, true, true, false, false, false, false, false]);
     }
 }

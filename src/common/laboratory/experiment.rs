@@ -86,6 +86,10 @@ pub enum ExperimentRefusal {
         text: String,
     },
     BlankName,
+    /// A parameter, estimate or metric named twice, where keeping either value would hide the other.
+    Duplicate {
+        name: String,
+    },
     /// JSON has no NaN or infinity, so a metric that is neither finite nor absent cannot be journaled.
     NotFinite {
         metric: String,
@@ -103,6 +107,7 @@ impl std::fmt::Display for ExperimentRefusal {
             ),
             Self::LineBreak { text } => write!(formatter, "{text:?} holds a line break"),
             Self::BlankName => write!(formatter, "a parameter, estimate or metric needs a name"),
+            Self::Duplicate { name } => write!(formatter, "{name} is named twice"),
             Self::NotFinite { metric, value } => {
                 write!(formatter, "metric {metric} is {value}, which is not finite")
             }
@@ -186,7 +191,11 @@ impl Parameters {
     ) -> Result<Self, ExperimentRefusal> {
         let mut held = BTreeMap::new();
         for (name, value) in settings {
-            held.insert(Name::new(name)?, value.into());
+            let name = Name::new(name)?;
+            if held.contains_key(&name) {
+                return Err(ExperimentRefusal::Duplicate { name: name.0 });
+            }
+            held.insert(name, value.into());
         }
         Ok(Self(held))
     }
@@ -275,7 +284,11 @@ impl Outputs {
         name: impl Into<String>,
         estimate: Estimate,
     ) -> Result<Self, ExperimentRefusal> {
-        self.estimates.insert(Name::new(name)?, estimate);
+        let name = Name::new(name)?;
+        if self.estimates.contains_key(&name) {
+            return Err(ExperimentRefusal::Duplicate { name: name.0 });
+        }
+        self.estimates.insert(name, estimate);
         Ok(self)
     }
 
@@ -290,6 +303,9 @@ impl Outputs {
                 metric: name.0,
                 value,
             });
+        }
+        if self.metrics.contains_key(&name) {
+            return Err(ExperimentRefusal::Duplicate { name: name.0 });
         }
         self.metrics.insert(name, value);
         Ok(self)
@@ -440,6 +456,37 @@ mod tests {
         assert!(serde_json::from_str::<Label>("\" \"").is_err());
         assert!(serde_json::from_str::<Parameters>(r#"{"":"1"}"#).is_err());
         assert!(serde_json::from_str::<Name>("\"net\\nreturn\"").is_err());
+    }
+
+    /// A name given twice is refused with itself, for a setting, an estimate and a metric alike, rather than the
+    /// later value quietly replacing the earlier.
+    #[test]
+    fn test_a_name_given_twice_is_refused() {
+        let duplicate = Err(ExperimentRefusal::Duplicate {
+            name: "side".to_string(),
+        });
+        assert_eq!(
+            Parameters::new([("side", "long"), ("side", "short")]).map(|_| ()),
+            duplicate
+        );
+        assert_eq!(
+            Outputs::default()
+                .metric("side", 1.0)
+                .and_then(|outputs| outputs.metric("side", 2.0))
+                .map(|_| ()),
+            duplicate
+        );
+        let estimate = Estimate::try_from(summarize(
+            &Series::new([(session(0), Some(1.0)), (session(1), Some(2.0))]).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            Outputs::default()
+                .estimate("side", estimate)
+                .and_then(|outputs| outputs.estimate("side", estimate))
+                .map(|_| ()),
+            duplicate
+        );
     }
 
     #[test]

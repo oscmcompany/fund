@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, variable};
+use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, one_sided, variable};
 use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
 use crate::common::market::trade_bars::{Correction, Print, Tape, condition_letter};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
@@ -476,7 +476,7 @@ fn quote_page(symbol: &Symbol, body: &[u8]) -> Result<(Vec<AlpacaQuoteOutcome>, 
 }
 
 fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
-    if row.bid_price == 0.0 || row.ask_price == 0.0 {
+    if one_sided(row.bid_price, row.ask_price) {
         return AlpacaQuoteOutcome::OneSided;
     }
     let refused = |cause| {
@@ -555,6 +555,10 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
         Ok(size) => size,
         Err(cause) => return refused(RowRefusal::Shares(cause)),
     };
+    let correction = match correction(row.update.as_deref()) {
+        Ok(correction) => correction,
+        Err(cause) => return refused(cause),
+    };
     let print = match size.is_zero() {
         true => Print::Unsized {
             symbol: symbol.clone(),
@@ -570,16 +574,19 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
         print,
         tape,
         letters,
-        correction: correction(row.update.as_deref()),
+        correction,
     }
 }
 
 /// Reads Alpaca's update label: `incorrect` marks the record that replaces a corrected print, the one that stands, while
-/// `corrected` marks the original it replaced and `canceled` a print withdrawn; an unknown label is withdrawn too.
-fn correction(update: Option<&str>) -> Correction {
+/// `corrected` marks the original it replaced and `canceled` a print withdrawn; any other label is refused with itself.
+fn correction(update: Option<&str>) -> Result<Correction, RowRefusal> {
     match update {
-        None | Some("incorrect") => Correction::Stands,
-        Some(_) => Correction::Withdrawn,
+        None | Some("incorrect") => Ok(Correction::Stands),
+        Some("corrected" | "canceled") => Ok(Correction::Withdrawn),
+        Some(label) => Err(RowRefusal::Correction {
+            raw: label.to_string(),
+        }),
     }
 }
 
@@ -1150,11 +1157,13 @@ mod tests {
         assert_eq!(
             read,
             [
-                Correction::Stands,
-                Correction::Stands,
-                Correction::Withdrawn,
-                Correction::Withdrawn,
-                Correction::Withdrawn,
+                Ok(Correction::Stands),
+                Ok(Correction::Stands),
+                Ok(Correction::Withdrawn),
+                Ok(Correction::Withdrawn),
+                Err(RowRefusal::Correction {
+                    raw: "unheard".to_string()
+                }),
             ]
         );
     }

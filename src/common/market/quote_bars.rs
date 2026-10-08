@@ -178,13 +178,27 @@ impl QuoteSums {
     }
 
     fn combine(self, other: Self) -> Self {
+        let time = |left: u128, right: u128, name: &str| {
+            left.checked_add(right)
+                .unwrap_or_else(|| panic!("{name} fits u128"))
+        };
         Self {
-            quote_count: self.quote_count + other.quote_count,
-            covered_nanoseconds: self.covered_nanoseconds + other.covered_nanoseconds,
-            spread_time: self.spread_time + other.spread_time,
-            relative_spread_time: self.relative_spread_time + other.relative_spread_time,
-            bid_size_time: self.bid_size_time + other.bid_size_time,
-            ask_size_time: self.ask_size_time + other.ask_size_time,
+            quote_count: self
+                .quote_count
+                .checked_add(other.quote_count)
+                .expect("quote count fits u64"),
+            covered_nanoseconds: self
+                .covered_nanoseconds
+                .checked_add(other.covered_nanoseconds)
+                .expect("covered nanoseconds fit u64"),
+            spread_time: time(self.spread_time, other.spread_time, "spread time"),
+            relative_spread_time: time(
+                self.relative_spread_time,
+                other.relative_spread_time,
+                "relative spread time",
+            ),
+            bid_size_time: time(self.bid_size_time, other.bid_size_time, "bid size time"),
+            ask_size_time: time(self.ask_size_time, other.ask_size_time, "ask size time"),
             narrowest: self.narrowest.min(other.narrowest),
             widest: self.widest.max(other.widest),
             closing: self.closing.max(other.closing),
@@ -521,6 +535,71 @@ mod tests {
             Shares::whole(ask_size).unwrap(),
         )
         .unwrap()
+    }
+
+    /// Each sum past its type panics naming that sum in every build rather than wrapping in release.
+    #[test]
+    fn test_sums_that_overflow_panic_by_name() {
+        let standing =
+            StandingQuote::of(&quote("SPY", "2026-10-08T14:00:00Z", 100.0, 100.01, 1, 1));
+        let one = QuoteSums::standing(&standing, 1);
+        let cases: [(&str, QuoteSums); 6] = [
+            (
+                "quote count fits u64",
+                QuoteSums {
+                    quote_count: u64::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "covered nanoseconds fit u64",
+                QuoteSums {
+                    covered_nanoseconds: u64::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "spread time fits u128",
+                QuoteSums {
+                    spread_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "relative spread time fits u128",
+                QuoteSums {
+                    relative_spread_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "bid size time fits u128",
+                QuoteSums {
+                    bid_size_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "ask size time fits u128",
+                QuoteSums {
+                    ask_size_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+        ];
+        for (expected, full) in cases {
+            let addend = QuoteSums {
+                quote_count: 1,
+                ..one.clone()
+            };
+            let panicked = std::panic::catch_unwind(|| full.combine(addend)).expect_err(expected);
+            let message = panicked
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panicked.downcast_ref::<&str>().map(|text| text.to_string()))
+                .expect("panic message is text");
+            assert_eq!(message, expected);
+        }
     }
 
     /// 2026-10-02, 09:30 to 16:00 Eastern.
