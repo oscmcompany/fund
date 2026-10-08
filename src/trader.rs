@@ -613,8 +613,10 @@ mod tests {
         })
     }
 
+    /// Every record's event type in the order the journal wrote them, across its session files, since the session's fixed
+    /// clock and execution's wall clock can file one run under two dates.
     fn journaled(directory: &std::path::Path) -> Vec<&'static str> {
-        std::fs::read_dir(directory)
+        let mut records: Vec<_> = std::fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
@@ -623,9 +625,14 @@ mod tests {
             })
             .flat_map(|path| read(&std::fs::read_to_string(path).unwrap()))
             .map(|line| match line {
-                ReadLine::Read(record) => record.observation().event_type(),
+                ReadLine::Read(record) => record,
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
+            .collect();
+        records.sort_by_key(|record| record.sequence());
+        records
+            .iter()
+            .map(|record| record.observation().event_type())
             .collect()
     }
 
