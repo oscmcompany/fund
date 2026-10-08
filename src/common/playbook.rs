@@ -16,12 +16,19 @@ use crate::common::strategy::{Progress, Strategy, Target, roll};
 use crate::common::time::{REGULAR_CLOSE, REGULAR_OPEN, eastern_time};
 
 /// The strategy an entry names, with the settings it is built from; the universe comes from the trader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     /// Holds nothing.
     Flat,
-    /// Holds `shares` whole shares of each symbol its seeded coin draws.
+    /// Holds `shares` of each symbol its seeded coin draws.
+    Noise { shares: Shares, seed: u64 },
+}
+
+/// A `Choice` as written, before its shares are proven to fit a `Shares`.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ChoiceFields {
+    Flat,
     Noise { shares: NonZeroU64, seed: u64 },
 }
 
@@ -163,7 +170,7 @@ struct PlaybookFields {
 struct EntryFields {
     from: String,
     until: String,
-    strategy: Choice,
+    strategy: ChoiceFields,
     note: String,
     #[serde(default)]
     runs: Vec<RunId>,
@@ -233,7 +240,7 @@ impl Playbook {
     }
 
     /// The strategy that trades this playbook over `universe`.
-    pub fn play(&self, universe: &BTreeSet<Symbol>) -> Played {
+    pub fn play(&self, universe: &BTreeSet<Symbol>) -> Played<Chosen> {
         Played {
             roll_off: self.roll_off,
             stretches: self
@@ -242,11 +249,9 @@ impl Playbook {
                 .map(|entry| {
                     let strategy = match entry.choice {
                         Choice::Flat => Chosen::Flat,
-                        Choice::Noise { shares, seed } => Chosen::Noise(Noise::new(
-                            universe.clone(),
-                            Shares::whole(shares.get()).expect("checked when the entry was read"),
-                            seed,
-                        )),
+                        Choice::Noise { shares, seed } => {
+                            Chosen::Noise(Noise::new(universe.clone(), shares, seed))
+                        }
                     };
                     (entry.from, strategy)
                 })
@@ -266,16 +271,18 @@ impl TryFrom<EntryFields> for Entry {
         if fields.note.trim().is_empty() {
             return Err(PlaybookRefusal::BlankNote { from });
         }
-        match fields.strategy {
-            Choice::Noise { shares, .. } if Shares::whole(shares.get()).is_err() => {
-                return Err(PlaybookRefusal::TooManyShares { from, shares });
-            }
-            Choice::Noise { .. } | Choice::Flat => {}
-        }
+        let choice = match fields.strategy {
+            ChoiceFields::Flat => Choice::Flat,
+            ChoiceFields::Noise { shares, seed } => Choice::Noise {
+                shares: Shares::whole(shares.get())
+                    .map_err(|_| PlaybookRefusal::TooManyShares { from, shares })?,
+                seed,
+            },
+        };
         Ok(Self {
             from,
             until,
-            choice: fields.strategy,
+            choice,
             note: fields.note,
             runs: fields.runs,
         })
@@ -290,7 +297,7 @@ fn time(raw: &str) -> Result<NaiveTime, PlaybookRefusal> {
 
 /// An entry's strategy, built over the trader's universe.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Chosen {
+pub enum Chosen {
     Flat,
     Noise(Noise),
 }
@@ -306,31 +313,65 @@ impl Strategy for Chosen {
 
 /// A playbook's strategies by the Eastern time each starts trading.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Played {
+pub struct Played<S = Chosen> {
     roll_off: TimeDelta,
-    stretches: Vec<(NaiveTime, Chosen)>,
+    stretches: Vec<(NaiveTime, S)>,
 }
 
-impl Strategy for Played {
-    /// Decides with the entry trading at the state's clock, rolled from the entry before it over the roll-off; before
-    /// the open the first entry decides, after the close the last, and before any clock it holds nothing.
-    fn decide(&self, state: &MarketState, book: &Book) -> Target {
-        let Some(at) = state.clock().map(eastern_time) else {
-            return Target::default();
-        };
+/// The stretch deciding at a clock: the Eastern time it starts trading, and how far its roll-off has gone, whole for the
+/// first stretch, which has nothing to roll from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stretch {
+    from: NaiveTime,
+    progress: Progress,
+}
+
+impl<S> Played<S> {
+    /// One strategy trading the whole session, for a test that needs a played playbook of its own strategy.
+    #[cfg(test)]
+    pub fn throughout(strategy: S) -> Self {
+        Self {
+            roll_off: TimeDelta::zero(),
+            stretches: vec![(REGULAR_OPEN, strategy)],
+        }
+    }
+
+    /// The stretch deciding at the state's clock; before the open the first decides, after the close
+    /// the last, and before any clock none does.
+    pub fn stretch_at(&self, state: &MarketState) -> Option<Stretch> {
+        self.indexed_stretch_at(state).map(|(_, stretch)| stretch)
+    }
+
+    fn indexed_stretch_at(&self, state: &MarketState) -> Option<(usize, Stretch)> {
+        let at = eastern_time(state.clock()?);
         let index = self
             .stretches
             .iter()
             .rposition(|(from, _)| *from <= at)
             .unwrap_or(0);
-        let (from, current) = &self.stretches[index];
-        let target = current.decide(state, book);
+        let from = self.stretches[index].0;
+        let progress = match index {
+            0 => Progress::WHOLE,
+            1.. => Progress::of(at - from, self.roll_off),
+        };
+        Some((index, Stretch { from, progress }))
+    }
+}
+
+impl<S: Strategy> Strategy for Played<S> {
+    /// Decides with the stretch at the state's clock, rolled from the stretch before it by the stretch's progress, and
+    /// holds nothing before any clock.
+    fn decide(&self, state: &MarketState, book: &Book) -> Target {
+        let Some((index, stretch)) = self.indexed_stretch_at(state) else {
+            return Target::default();
+        };
+        let target = self.stretches[index].1.decide(state, book);
         match index.checked_sub(1) {
             None => target,
             Some(previous) => roll(
                 &self.stretches[previous].1.decide(state, book),
                 &target,
-                Progress::of(at - *from, self.roll_off),
+                stretch.progress,
             ),
         }
     }
@@ -444,7 +485,7 @@ note = "Hold nothing in the afternoon"
                     time(9, 30),
                     time(12, 0),
                     Choice::Noise {
-                        shares: NonZeroU64::new(2).unwrap(),
+                        shares: Shares::whole(2).unwrap(),
                         seed: 7
                     },
                     "Exercise the session on paper",
@@ -642,6 +683,40 @@ note = "Hold nothing in the afternoon"
                 "{afternoon}"
             );
         }
+    }
+
+    /// The stretch at a clock is the entry trading then and its share of the roll-off: whole in the first entry and
+    /// from ten minutes on, and none before any clock.
+    #[test]
+    fn test_the_stretch_at_a_clock_names_its_start_and_its_roll() {
+        let played = Playbook::parse(TWO_ENTRIES).unwrap().play(&universe());
+        let stretches: Vec<Stretch> = [
+            time(8, 0),
+            time(11, 59),
+            time(12, 0),
+            time(12, 5),
+            time(12, 10),
+            time(17, 0),
+        ]
+        .into_iter()
+        .map(|eastern| played.stretch_at(&at(eastern)).unwrap())
+        .collect();
+        let stretch = |from, parts: u32| Stretch {
+            from,
+            progress: Progress::try_from(parts).unwrap(),
+        };
+        assert_eq!(
+            stretches,
+            [
+                stretch(time(9, 30), 1_000_000),
+                stretch(time(9, 30), 1_000_000),
+                stretch(time(12, 0), 0),
+                stretch(time(12, 0), 500_000),
+                stretch(time(12, 0), 1_000_000),
+                stretch(time(12, 0), 1_000_000),
+            ]
+        );
+        assert_eq!(played.stretch_at(&MarketState::default()), None);
     }
 
     /// The reverse switch, flat into noise, rolls up into the noise's holdings: none at 12:00, a tenth more a minute,

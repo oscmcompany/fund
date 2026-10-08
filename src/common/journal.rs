@@ -648,6 +648,16 @@ mod tests {
         )]));
         let fractionable =
             BTreeMap::from([(Symbol::new("DIA").unwrap(), Tradability::Fractionable)]);
+        let rolling = crate::common::playbook::Playbook::parse(
+            "roll_off_minutes = 10\n\n[[entries]]\nfrom = \"09:30\"\nuntil = \"12:00\"\nstrategy = { kind = \"flat\" }\nnote = \"n\"\n\n[[entries]]\nfrom = \"12:00\"\nuntil = \"16:00\"\nstrategy = { kind = \"flat\" }\nnote = \"n\"\n",
+        )
+        .unwrap()
+        .play(&std::collections::BTreeSet::new())
+        .stretch_at(&crate::common::market::state::MarketState::of(
+            crate::common::market::state::MarketEvent::Clock(
+                "2026-10-07T16:05:00Z".parse().unwrap(),
+            ),
+        ));
         let below = guard(orders(&Book::default(), &sliver), &fractionable, |_| {
             Price::from_ticks(470_000_000).ok()
         })
@@ -692,6 +702,7 @@ mod tests {
             )),
             Observation::TargetDecided(TargetDecided::new(
                 "2026-10-07T14:05:00Z".parse().unwrap(),
+                rolling,
                 target.clone(),
                 risk(
                     &Limits::new(
@@ -712,6 +723,7 @@ mod tests {
             )),
             Observation::TargetDecided(TargetDecided::new(
                 "2026-10-07T14:05:00Z".parse().unwrap(),
+                None,
                 target.clone(),
                 Err(ValuationRefusal::Unpriced {
                     symbol: Symbol::new("SPY").unwrap(),
@@ -754,8 +766,8 @@ mod tests {
                 r#"{"event_type":"tradability_read","payload":{"readings":{"VWDRY":"whole_shares_only"}}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":{"exhausted":{"attempts":3,"last":"timed out"}}}}"#.to_string(),
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
-                r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),
-                r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#.to_string(),
+                r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","stretch":{"from":"12:00:00","progress":500000},"wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),
+                r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","stretch":null,"wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#.to_string(),
                 r#"{"event_type":"session_opened","payload":{"session":"2026-10-07","cash":"-7","positions":{"SPY":"2000000"},"opening":"9"}}"#.to_string(),
                 r#"{"event_type":"playbook_read","payload":{"contents":"roll_off_minutes = 5\n"}}"#.to_string(),
             ]
@@ -766,6 +778,11 @@ mod tests {
                 observation
             );
         }
+        let before_stretches = r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#;
+        assert_eq!(
+            &serde_json::from_str::<Observation>(before_stretches).unwrap(),
+            &observations[10]
+        );
     }
 
     /// Every cause an unresolved order or an unread tradability journals, pinned so a rename shows up as a changed
