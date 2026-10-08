@@ -145,8 +145,8 @@ impl QuoteSums {
     /// The sums of `quote` standing for `nanoseconds`, counting no quote; the fold adds counts by minute.
     fn standing(quote: &StandingQuote, nanoseconds: u64) -> Self {
         let spread = Spread::of(quote.bid, quote.ask);
-        let midpoint_doubled = u128::from(quote.bid.ticks().unsigned_abs())
-            + u128::from(quote.ask.ticks().unsigned_abs());
+        let midpoint_doubled =
+            u128::from(quote.bid.ticks_unsigned()) + u128::from(quote.ask.ticks_unsigned());
         let time = u128::from(nanoseconds);
         Self {
             quote_count: 0,

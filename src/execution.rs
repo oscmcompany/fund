@@ -15,18 +15,57 @@ use crate::common::journal::Observation;
 use crate::common::market::{Price, Shares, Symbol};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
-    OrderState, OrderSubmitted, OrderTrouble, OrderUnresolved, UnresolvedCause,
+    OrderSequence, OrderState, OrderSubmitted, OrderTrouble, OrderUnresolved, UnresolvedCause,
 };
 use crate::common::reconcile::{Allowance, BookReconciled, reconcile};
 use crate::common::strategy::{Target, orders};
 use crate::ingest::FetchError;
 use crate::journal::Journal;
 
-/// How often an order is read back, and how long it may stay open before it is canceled.
-#[derive(Debug, Clone, Copy)]
+/// How often an order is read back, never back to back, and how long it may stay open before it is canceled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Patience {
-    pub poll: Duration,
-    pub open_for: Duration,
+    poll: Duration,
+    open_for: Duration,
+}
+
+/// Why a patience was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatienceRefusal {
+    /// A zero poll would read an open order back to back.
+    ZeroPoll,
+    /// A poll longer than `open_for` would leave an order open past it before its cancel.
+    PollPastOpen { poll: Duration, open_for: Duration },
+}
+
+impl std::fmt::Display for PatienceRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroPoll => write!(formatter, "an order cannot be polled every zero seconds"),
+            Self::PollPastOpen { poll, open_for } => write!(
+                formatter,
+                "a poll every {poll:?} is longer than the {open_for:?} an order may stay open"
+            ),
+        }
+    }
+}
+
+impl Patience {
+    pub fn new(poll: Duration, open_for: Duration) -> Result<Self, PatienceRefusal> {
+        match (poll.is_zero(), poll > open_for) {
+            (true, _) => Err(PatienceRefusal::ZeroPoll),
+            (false, true) => Err(PatienceRefusal::PollPastOpen { poll, open_for }),
+            (false, false) => Ok(Self { poll, open_for }),
+        }
+    }
+
+    pub fn poll(self) -> Duration {
+        self.poll
+    }
+
+    pub fn open_for(self) -> Duration {
+        self.open_for
+    }
 }
 
 /// Reads after a cancel before an order still open is left unresolved.
@@ -90,19 +129,38 @@ pub enum OrderOutcome {
 /// possibly closed at the broker with its close unrecorded.
 #[derive(Debug)]
 pub struct JournalFailed {
-    pub outcomes: Vec<OrderOutcome>,
-    pub error: std::io::Error,
+    outcomes: Vec<OrderOutcome>,
+    error: std::io::Error,
+}
+
+impl JournalFailed {
+    fn new(outcomes: Vec<OrderOutcome>, error: std::io::Error) -> Self {
+        Self { outcomes, error }
+    }
+
+    /// Refused before any order was followed.
+    pub fn before_any_order(error: std::io::Error) -> Self {
+        Self::new(Vec::new(), error)
+    }
+
+    pub fn outcomes(&self) -> &[OrderOutcome] {
+        &self.outcomes
+    }
+
+    pub fn error(&self) -> &std::io::Error {
+        &self.error
+    }
 }
 
 /// Sends the orders that take `book` to `target` that the guard passes at `prices`, one at a time, sells
 /// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
-/// overlaps it; `next_sequence` is advanced past every id drawn, so a later call on the same counter cannot repeat one.
+/// overlaps it; each order's id is drawn from `sequence`, so a later call on the same sequence cannot repeat one.
 /// A non-empty tradability read is journaled once, or its failure with its cause, which vouches for nothing, so every
 /// order is held as unread.
 pub async fn execute(
     broker: &impl Broker,
     journal: &mut Journal,
-    next_sequence: &mut u32,
+    sequence: &mut OrderSequence,
     book: &Book,
     target: &Target,
     prices: &BTreeMap<Symbol, Price>,
@@ -116,14 +174,14 @@ pub async fn execute(
         Ok(tradability) => {
             let read = TradabilityRead::new(tradability.clone());
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityRead(read)) {
-                return Err(JournalFailed { outcomes, error });
+                return Err(JournalFailed::new(outcomes, error));
             }
             tradability
         }
         Err(error) => {
             let unread = TradabilityUnread::new(BrokerFailure::from(&error));
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityUnread(unread)) {
-                return Err(JournalFailed { outcomes, error });
+                return Err(JournalFailed::new(outcomes, error));
             }
             BTreeMap::new()
         }
@@ -132,20 +190,16 @@ pub async fn execute(
     for held in guarded.held() {
         outcomes.push(OrderOutcome::Guarded(held.cause()));
         if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held.clone())) {
-            return Err(JournalFailed { outcomes, error });
+            return Err(JournalFailed::new(outcomes, error));
         }
     }
     for order in guarded.passed().iter().cloned() {
-        let sequence = *next_sequence;
-        *next_sequence = sequence
-            .checked_add(1)
-            .expect("a run sends fewer than u32::MAX orders");
-        let request = OrderRequest::new(order, ClientOrderId::new(journal.run_id(), sequence));
+        let request = OrderRequest::new(order, sequence.draw(journal.run_id()));
         if let Err(error) = journal.append(
             Utc::now(),
             Observation::OrderSubmitted(OrderSubmitted::of(&request)),
         ) {
-            return Err(JournalFailed { outcomes, error });
+            return Err(JournalFailed::new(outcomes, error));
         }
         let (observation, outcome) = follow(broker, &request, patience).await;
         let stop = match outcome {
@@ -154,7 +208,7 @@ pub async fn execute(
         };
         outcomes.push(outcome);
         if let Err(error) = journal.append(Utc::now(), observation) {
-            return Err(JournalFailed { outcomes, error });
+            return Err(JournalFailed::new(outcomes, error));
         }
         if stop {
             break;
@@ -191,7 +245,7 @@ pub enum Reconciliation {
 pub async fn reconcile_and_close(
     broker: &impl Broker,
     journal: &mut Journal,
-    next_sequence: &mut u32,
+    sequence: &mut OrderSequence,
     expected: &Book,
     allowance: Allowance,
     prices: &BTreeMap<Symbol, Price>,
@@ -201,12 +255,7 @@ pub async fn reconcile_and_close(
     let reading = reconcile(expected, &reported, allowance);
     journal
         .append(Utc::now(), Observation::BookReconciled(reading.clone()))
-        .map_err(|error| {
-            ReconcileFailed::Journal(JournalFailed {
-                outcomes: Vec::new(),
-                error,
-            })
-        })?;
+        .map_err(|error| ReconcileFailed::Journal(JournalFailed::before_any_order(error)))?;
     if reading.agrees() {
         return Ok(Reconciliation::Agreed { book: reported });
     }
@@ -224,13 +273,7 @@ pub async fn reconcile_and_close(
             .collect(),
     );
     let closing = execute(
-        broker,
-        journal,
-        next_sequence,
-        &reported,
-        &kept,
-        prices,
-        patience,
+        broker, journal, sequence, &reported, &kept, prices, patience,
     )
     .await
     .map_err(ReconcileFailed::Journal)?;
@@ -300,7 +343,7 @@ async fn follow(
         if state.closed().is_some() {
             break;
         }
-        let left = match trouble.is_some() || started.elapsed() >= patience.open_for {
+        let left = match trouble.is_some() || started.elapsed() >= patience.open_for() {
             true => PatienceLeft::Spent,
             false => PatienceLeft::Remaining,
         };
@@ -323,7 +366,7 @@ async fn follow(
                 }
             }
         }
-        tokio::time::sleep(patience.poll).await;
+        tokio::time::sleep(patience.poll()).await;
         // A cancel can race a fill, so the order is always read back rather than assumed canceled.
         match broker.order(id).await {
             Ok(read) => report = Some(read.report()),
@@ -495,10 +538,34 @@ mod tests {
     const FILLED: OrderStatus = OrderStatus::Closed(OrderEnding::Filled);
     const CANCELED: OrderStatus = OrderStatus::Closed(OrderEnding::Canceled);
 
-    const PATIENT: Patience = Patience {
-        poll: Duration::from_secs(1),
-        open_for: Duration::from_secs(3_600),
-    };
+    /// A patience polling every `poll` and open for `open_for`, both in milliseconds.
+    fn patience((poll, open_for): (u64, u64)) -> Patience {
+        Patience::new(Duration::from_millis(poll), Duration::from_millis(open_for)).unwrap()
+    }
+
+    fn patient() -> Patience {
+        patience((1_000, 3_600_000))
+    }
+
+    #[test]
+    fn test_a_zero_poll_or_one_past_the_open_window_is_refused() {
+        assert_eq!(
+            Patience::new(Duration::ZERO, Duration::from_secs(30)),
+            Err(PatienceRefusal::ZeroPoll)
+        );
+        assert_eq!(
+            Patience::new(Duration::from_millis(1_001), Duration::from_secs(1)),
+            Err(PatienceRefusal::PollPastOpen {
+                poll: Duration::from_millis(1_001),
+                open_for: Duration::from_secs(1)
+            })
+        );
+        let patience = patience((1_000, 1_000));
+        assert_eq!(
+            (patience.poll(), patience.open_for()),
+            (Duration::from_secs(1), Duration::from_secs(1))
+        );
+    }
 
     /// Buys of `whole` shares of each symbol from an empty book.
     fn buying(symbols: &[&str], whole: u64) -> Target {
@@ -532,11 +599,11 @@ mod tests {
     ) -> (Vec<OrderOutcome>, Vec<Record>) {
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
-        let mut next_sequence = 0;
+        let mut sequence = OrderSequence::default();
         let outcomes = execute(
             broker,
             &mut journal,
-            &mut next_sequence,
+            &mut sequence,
             &Book::default(),
             target,
             &BTreeMap::new(),
@@ -618,7 +685,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_an_order_filled_on_a_read_closes_with_its_fill() {
         let broker = Scripted::new(&[Answer::Stands(OPEN, 0)], &[Answer::Stands(FILLED, 2)]);
-        let (outcomes, events) = run(&broker, &buying(&["SPY"], 2), PATIENT).await;
+        let (outcomes, events) = run(&broker, &buying(&["SPY"], 2), patient()).await;
         assert_eq!(
             outcomes.iter().map(shares_filled).collect::<Vec<_>>(),
             [Some(2)]
@@ -634,7 +701,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_a_target_already_held_journals_nothing() {
         let broker = Scripted::new(&[], &[]);
-        let (outcomes, events) = run(&broker, &buying(&[], 1), PATIENT).await;
+        let (outcomes, events) = run(&broker, &buying(&[], 1), patient()).await;
         assert_eq!(outcomes, []);
         assert_eq!(events, Vec::<&str>::new());
     }
@@ -643,7 +710,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_a_refused_order_is_journaled_and_the_next_one_sent() {
         let broker = Scripted::new(&[Answer::Refused, Answer::Refused], &[]);
-        let (outcomes, events) = run(&broker, &buying(&["AAPL", "SPY"], 1), PATIENT).await;
+        let (outcomes, events) = run(&broker, &buying(&["AAPL", "SPY"], 1), patient()).await;
         assert_eq!(outcomes, [OrderOutcome::Refused, OrderOutcome::Refused]);
         assert_eq!(broker.calls(), ["submit", "submit"]);
         assert_eq!(
@@ -661,7 +728,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_an_unanswered_submission_is_read_back_rather_than_resent() {
         let broker = Scripted::new(&[Answer::Unanswered], &[Answer::Stands(FILLED, 1)]);
-        let (outcomes, events) = run(&broker, &buying(&["SPY"], 1), PATIENT).await;
+        let (outcomes, events) = run(&broker, &buying(&["SPY"], 1), patient()).await;
         assert_eq!(
             outcomes.iter().map(shares_filled).collect::<Vec<_>>(),
             [Some(1)]
@@ -681,7 +748,7 @@ mod tests {
             &[Answer::Unreadable],
         );
         let (outcomes, records) =
-            run_journaled(&broker, &buying(&["AAPL", "SPY"], 1), PATIENT).await;
+            run_journaled(&broker, &buying(&["AAPL", "SPY"], 1), patient()).await;
         let [
             OrderOutcome::Unresolved {
                 client_order_id,
@@ -721,10 +788,7 @@ mod tests {
                 Answer::Stands(CANCELED, 1),
             ],
         );
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::from_secs(3),
-        };
+        let patience = patience((1_000, 3_000));
         let (outcomes, events) = run(&broker, &buying(&["SPY"], 2), patience).await;
         assert_eq!(
             outcomes.iter().map(shares_filled).collect::<Vec<_>>(),
@@ -748,10 +812,7 @@ mod tests {
             &[Answer::Stands(OPEN, 0), Answer::Stands(CANCELED, 0)],
         );
         broker.submit_takes = Duration::from_secs(2);
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::from_secs(3),
-        };
+        let patience = patience((1_000, 3_000));
         let (outcomes, _) = run(&broker, &buying(&["SPY"], 1), patience).await;
         assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
         assert_eq!(broker.calls(), ["submit", "order", "cancel", "order"]);
@@ -764,7 +825,7 @@ mod tests {
             &[Answer::Stands(OPEN, 1)],
             &[Answer::Stands(OPEN, 0), Answer::Stands(CANCELED, 1)],
         );
-        let (outcomes, _) = run(&broker, &buying(&["SPY"], 2), PATIENT).await;
+        let (outcomes, _) = run(&broker, &buying(&["SPY"], 2), patient()).await;
         assert_eq!(
             outcomes.iter().map(shares_filled).collect::<Vec<_>>(),
             [Some(1)]
@@ -777,10 +838,8 @@ mod tests {
     async fn test_a_failed_cancel_is_followed_by_a_read() {
         let mut broker = Scripted::new(&[Answer::Stands(OPEN, 0)], &[Answer::Stands(FILLED, 1)]);
         broker.cancel_fails = true;
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::ZERO,
-        };
+        broker.submit_takes = Duration::from_secs(1);
+        let patience = patience((1_000, 1_000));
         let (outcomes, _) = run(&broker, &buying(&["SPY"], 1), patience).await;
         assert_eq!(
             outcomes.iter().map(shares_filled).collect::<Vec<_>>(),
@@ -796,7 +855,7 @@ mod tests {
             &[Answer::Stands(OPEN, 0)],
             &[Answer::Unreadable, Answer::Stands(CANCELED, 0)],
         );
-        let (outcomes, events) = run(&broker, &buying(&["SPY"], 1), PATIENT).await;
+        let (outcomes, events) = run(&broker, &buying(&["SPY"], 1), patient()).await;
         assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
         assert_eq!(broker.calls(), ["submit", "order", "cancel", "order"]);
         assert_eq!(
@@ -809,11 +868,9 @@ mod tests {
     /// stops the run.
     #[tokio::test(start_paused = true)]
     async fn test_an_order_that_never_closes_is_unresolved_and_stops_the_run() {
-        let broker = Scripted::new(&[Answer::Stands(OPEN, 1)], &[Answer::Stands(OPEN, 1)]);
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::ZERO,
-        };
+        let mut broker = Scripted::new(&[Answer::Stands(OPEN, 1)], &[Answer::Stands(OPEN, 1)]);
+        broker.submit_takes = Duration::from_secs(1);
+        let patience = patience((1_000, 1_000));
         let (outcomes, records) =
             run_journaled(&broker, &buying(&["AAPL", "SPY"], 2), patience).await;
         assert!(matches!(
@@ -844,10 +901,8 @@ mod tests {
     async fn test_an_unresolved_order_journals_its_last_trouble() {
         let mut broker = Scripted::new(&[Answer::Stands(OPEN, 0)], &[Answer::Stands(OPEN, 0)]);
         broker.cancel_fails = true;
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::ZERO,
-        };
+        broker.submit_takes = Duration::from_secs(1);
+        let patience = patience((1_000, 1_000));
         let (outcomes, records) = run_journaled(&broker, &buying(&["SPY"], 1), patience).await;
         assert!(matches!(
             outcomes.as_slice(),
@@ -870,15 +925,15 @@ mod tests {
             (Symbol::new("AAPL").unwrap(), Tradability::Untradable),
             (Symbol::new("SPY").unwrap(), Tradability::Fractionable),
         ]));
-        let mut next_sequence = 0;
+        let mut sequence = OrderSequence::default();
         let outcomes = execute(
             &broker,
             &mut journal,
-            &mut next_sequence,
+            &mut sequence,
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
-            PATIENT,
+            patient(),
         )
         .await
         .unwrap();
@@ -886,7 +941,7 @@ mod tests {
         assert_eq!(outcomes[0], OrderOutcome::Guarded(GuardCause::Untradable));
         assert_eq!(shares_filled(&outcomes[1]), Some(1));
         assert_eq!(broker.calls(), ["submit"]);
-        assert_eq!(next_sequence, 1);
+        assert_eq!(sequence.draw(journal.run_id()).sequence(), 1);
         assert_eq!(
             journaled(&directory),
             [
@@ -911,15 +966,15 @@ mod tests {
         broker.tradability_fails = true;
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
-        let mut next_sequence = 0;
+        let mut sequence = OrderSequence::default();
         let outcomes = execute(
             &broker,
             &mut journal,
-            &mut next_sequence,
+            &mut sequence,
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
-            PATIENT,
+            patient(),
         )
         .await
         .unwrap();
@@ -1036,15 +1091,15 @@ mod tests {
     ) -> (Reconciliation, Vec<&'static str>) {
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
-        let mut next_sequence = 0;
+        let mut sequence = OrderSequence::default();
         let reconciliation = reconcile_and_close(
             broker,
             &mut journal,
-            &mut next_sequence,
+            &mut sequence,
             expected,
             Allowance::NONE,
             &BTreeMap::new(),
-            PATIENT,
+            patient(),
         )
         .await
         .unwrap();
@@ -1060,15 +1115,15 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         std::fs::remove_dir_all(&directory).unwrap();
-        let mut next_sequence = 0;
+        let mut sequence = OrderSequence::default();
         let halted = execute(
             &broker,
             &mut journal,
-            &mut next_sequence,
+            &mut sequence,
             &Book::default(),
             &buying(&["SPY"], 1),
             &BTreeMap::new(),
-            PATIENT,
+            patient(),
         )
         .await
         .unwrap_err();
@@ -1100,15 +1155,12 @@ mod tests {
         let target = Target::new(holdings);
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
-        let patience = Patience {
-            poll: Duration::from_millis(500),
-            open_for: Duration::from_secs(2),
-        };
-        let mut next_sequence = 0;
+        let patience = patience((500, 2_000));
+        let mut sequence = OrderSequence::default();
         let outcomes = execute(
             &account,
             &mut journal,
-            &mut next_sequence,
+            &mut sequence,
             &before,
             &target,
             &BTreeMap::new(),
@@ -1116,7 +1168,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(next_sequence, 1);
+        assert_eq!(sequence.draw(journal.run_id()).sequence(), 1);
         assert_eq!(
             outcomes,
             [OrderOutcome::Closed(None)],

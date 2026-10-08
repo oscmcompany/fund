@@ -21,14 +21,40 @@ const MAXIMUM_LIMIT: u128 = u128::MAX / SCALE_GRID;
 /// The fund's limits on what a target may hold and when, each required and none defaulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    gross: Cash,
-    per_name: Cash,
-    daily_loss: Cash,
+    gross: DollarLimit,
+    per_name: DollarLimit,
+    daily_loss: DollarLimit,
     flat_before_close: TimeDelta,
 }
 
-/// Which of the fund's dollar limits a refusal names.
+/// A dollar limit's cash units, positive and at most `MAXIMUM_LIMIT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DollarLimit(u128);
+
+impl DollarLimit {
+    fn new(limit: Limit, value: Cash) -> Result<Self, LimitsRefusal> {
+        match u128::try_from(value.units()) {
+            Ok(0) | Err(_) => Err(LimitsRefusal::NotPositive { limit, value }),
+            Ok(units) if units > MAXIMUM_LIMIT => Err(LimitsRefusal::BeyondRange { limit, value }),
+            Ok(units) => Ok(Self(units)),
+        }
+    }
+
+    fn units(self) -> u128 {
+        self.0
+    }
+
+    /// Exact, as `MAXIMUM_LIMIT` is under `i128::MAX`.
+    fn cash(self) -> Cash {
+        Cash::from_units(self.0.cast_signed())
+    }
+}
+
+/// Which of the fund's dollar limits a refusal names.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr, strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum Limit {
     Gross,
     PerName,
@@ -52,6 +78,35 @@ pub enum LimitsRefusal {
     },
 }
 
+impl std::fmt::Display for LimitsRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPositive { limit, value } => {
+                write!(
+                    formatter,
+                    "the {limit} limit is {:.2} dollars, which is not positive",
+                    value.dollars()
+                )
+            }
+            Self::BeyondRange { limit, value } => {
+                write!(
+                    formatter,
+                    "the {limit} limit is {:.2} dollars, past the most a limit may be",
+                    value.dollars()
+                )
+            }
+            Self::NegativeWindow { flat_before_close } => {
+                write!(
+                    formatter,
+                    "the flat window of {flat_before_close} before the close is negative"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LimitsRefusal {}
+
 impl Limits {
     /// `gross` caps the target's worth, `per_name` each holding's, `daily_loss` the loss from the session's opening
     /// equity before going flat, and `flat_before_close` how long before the close the target is emptied.
@@ -61,18 +116,9 @@ impl Limits {
         daily_loss: Cash,
         flat_before_close: TimeDelta,
     ) -> Result<Self, LimitsRefusal> {
-        for (limit, value) in [
-            (Limit::Gross, gross),
-            (Limit::PerName, per_name),
-            (Limit::DailyLoss, daily_loss),
-        ] {
-            if value.units() <= 0 {
-                return Err(LimitsRefusal::NotPositive { limit, value });
-            }
-            if value.units().cast_unsigned() > MAXIMUM_LIMIT {
-                return Err(LimitsRefusal::BeyondRange { limit, value });
-            }
-        }
+        let gross = DollarLimit::new(Limit::Gross, gross)?;
+        let per_name = DollarLimit::new(Limit::PerName, per_name)?;
+        let daily_loss = DollarLimit::new(Limit::DailyLoss, daily_loss)?;
         if flat_before_close < TimeDelta::zero() {
             return Err(LimitsRefusal::NegativeWindow { flat_before_close });
         }
@@ -186,7 +232,7 @@ pub fn risk(
             .checked_sub(book.value(&price)?.units())
             .expect("cash fits i128"),
     );
-    if loss >= limits.daily_loss {
+    if loss >= limits.daily_loss.cash() {
         return Ok(flat(Cut::LossLimit { loss }));
     }
     let mut cuts = Vec::new();
@@ -194,7 +240,7 @@ pub fn risk(
     let mut worth = 0_u128;
     for (symbol, wanted) in target.holdings() {
         let ticks = ticks(&price, symbol)?;
-        let affordable = units(limits.per_name) / ticks;
+        let affordable = limits.per_name.units() / ticks;
         let kept = u128::from(wanted.units()).min(affordable);
         let kept = Shares::from_units(
             u64::try_from(kept).expect("a kept holding is at most the wanted one"),
@@ -211,7 +257,7 @@ pub fn risk(
             .expect("a target's worth fits u128");
         holdings.insert(symbol.clone(), (kept, ticks));
     }
-    let gross = units(limits.gross);
+    let gross = limits.gross.units();
     if worth <= gross {
         let target = Target::new(
             holdings
@@ -258,12 +304,7 @@ fn ticks(
     let price = price(symbol).ok_or_else(|| ValuationRefusal::Unpriced {
         symbol: symbol.clone(),
     })?;
-    Ok(u128::from(price.ticks().unsigned_abs()))
-}
-
-/// A limit's units, positive by `Limits::new`.
-fn units(limit: Cash) -> u128 {
-    u128::try_from(limit.units()).expect("a limit is positive")
+    Ok(u128::from(price.ticks_unsigned()))
 }
 
 #[cfg(test)]
@@ -351,6 +392,18 @@ mod tests {
             })
         );
         assert!(Limits::new(dollars(1), dollars(1), dollars(1), TimeDelta::zero()).is_ok());
+    }
+
+    #[test]
+    fn test_each_limit_is_named_and_a_refusal_reads_with_its_value() {
+        use strum::IntoEnumIterator;
+        let names: Vec<&'static str> = Limit::iter().map(Into::into).collect();
+        assert_eq!(names, ["gross", "per_name", "daily_loss"]);
+        let refused = Limits::new(dollars(1), dollars(-2), dollars(1), TimeDelta::zero());
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "the per_name limit is -2.00 dollars, which is not positive"
+        );
     }
 
     /// A limit past `u128::MAX / SCALE_GRID` units is refused, and the largest accepted scales the largest target at
@@ -594,7 +647,7 @@ mod tests {
             .holdings()
             .iter()
             .map(|(symbol, shares)| {
-                u128::from(prices[symbol].ticks().unsigned_abs()) * u128::from(shares.units())
+                u128::from(prices[symbol].ticks_unsigned()) * u128::from(shares.units())
             })
             .collect()
     }

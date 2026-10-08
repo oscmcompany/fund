@@ -129,7 +129,7 @@ pub fn guard(
         held: Vec::new(),
     };
     for order in orders {
-        let whole = order.shares().units() % SHARE_SCALE == 0;
+        let whole = order.shares().is_whole();
         let cause = match (
             tradability.get(order.symbol()),
             whole,

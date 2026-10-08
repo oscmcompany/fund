@@ -75,6 +75,20 @@ impl ClientOrderId {
     }
 }
 
+/// A run's next place in its order sequence, so no id drawn from it repeats an earlier draw.
+#[derive(Debug, Default)]
+pub struct OrderSequence(u32);
+
+impl OrderSequence {
+    pub fn draw(&mut self, run: RunId) -> ClientOrderId {
+        let sequence = self.0;
+        self.0 = sequence
+            .checked_add(1)
+            .expect("a run sends fewer than u32::MAX orders");
+        ClientOrderId::new(run, sequence)
+    }
+}
+
 /// Why a string is not a client order id this system writes, by the part that failed, with the string refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientOrderIdRefusal {
@@ -598,6 +612,15 @@ mod tests {
             serde_json::from_str::<OrderExecution>(r#"{"shares":1,"average_price":0}"#).is_err()
         );
         assert!(serde_json::from_str::<ClientOrderId>(r#""c_7885f50f""#).is_err());
+    }
+
+    #[test]
+    fn test_a_sequence_draws_each_place_once_under_its_run() {
+        let run = RunId::new(Uuid::from_u128(3));
+        let mut sequence = OrderSequence::default();
+        let drawn: Vec<u32> = (0..3).map(|_| sequence.draw(run).sequence()).collect();
+        assert_eq!(drawn, [0, 1, 2]);
+        assert_eq!(sequence.draw(run).run(), run);
     }
 
     #[test]
