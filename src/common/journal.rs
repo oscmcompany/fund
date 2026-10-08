@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::common::book::{Book, Cash, Position};
 use crate::common::guard::{OrderGuarded, TradabilityUnread};
-use crate::common::heal::{Leg, SessionOutcome};
+use crate::common::heal::{Leg, SessionOutcome, Window};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
 use crate::common::market::trade_bars::BarBuilt;
@@ -307,19 +307,19 @@ pub enum Unanswered {
 /// outcome was already held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealFinished {
-    window: Vec<SessionDate>,
+    window: Window,
     outcomes: BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>>,
 }
 
 impl HealFinished {
     pub fn new(
-        window: Vec<SessionDate>,
+        window: Window,
         outcomes: BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>>,
     ) -> Self {
         Self { window, outcomes }
     }
 
-    pub fn window(&self) -> &[SessionDate] {
+    pub fn window(&self) -> &Window {
         &self.window
     }
 
@@ -551,7 +551,7 @@ mod tests {
             ]),
         );
         let finished = HealFinished::new(
-            vec![session],
+            Window::try_from(vec![session]).unwrap(),
             BTreeMap::from([(
                 Leg::MassiveDailyBars,
                 BTreeMap::from([
@@ -948,7 +948,7 @@ mod tests {
                     ))
                 }),
             (
-                prop::collection::vec(any_session(), 0..6),
+                prop::collection::btree_set(any_session(), 1..6),
                 prop::collection::btree_map(
                     leg,
                     prop::collection::btree_map(any_session(), outcome, 0..4),
@@ -956,6 +956,7 @@ mod tests {
                 ),
             )
                 .prop_map(|(window, outcomes)| {
+                    let window = Window::try_from(window.into_iter().collect::<Vec<_>>()).unwrap();
                     Observation::HealFinished(HealFinished::new(window, outcomes))
                 }),
         ]

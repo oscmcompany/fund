@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::{SHARE_SCALE, Shares, SharesRefusal, Symbol};
-use crate::common::time::SessionDate;
+use crate::common::time::{SessionDate, SessionRange};
 
 /// The vendor's identifier for one corporate action.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -297,16 +297,16 @@ impl SeriesBoundary {
     }
 }
 
-/// The boundaries after a refresh of `[first, last]` by processing date: inside the window the fetch is authoritative,
-/// so a withdrawn action goes, and outside it the earlier snapshot stands; an action held twice keeps the fetched one.
+/// The boundaries after a refresh of `window` by processing date: inside the window the fetch is authoritative, so a
+/// withdrawn action goes, and outside it the earlier snapshot stands; an action held twice keeps the fetched one.
 pub fn refresh_boundaries(
     previous: &[SeriesBoundary],
     fetched: &[SeriesBoundary],
-    (first, last): (SessionDate, SessionDate),
+    window: SessionRange,
 ) -> Vec<SeriesBoundary> {
     let outside = previous
         .iter()
-        .filter(|boundary| !(first..=last).contains(&boundary.processed_on));
+        .filter(|boundary| !window.contains(boundary.processed_on));
     let mut by_id: BTreeMap<ActionId, SeriesBoundary> = BTreeMap::new();
     for boundary in outside.chain(fetched) {
         by_id.insert(boundary.id.clone(), boundary.clone());
@@ -419,7 +419,11 @@ mod tests {
             boundary("revised", 110, 0),
         ];
         let fetched = [boundary("revised", 110, 1), boundary("new", 120, 2)];
-        let refreshed = refresh_boundaries(&previous, &fetched, (day(90), day(150)));
+        let refreshed = refresh_boundaries(
+            &previous,
+            &fetched,
+            SessionRange::new(day(90), day(150)).unwrap(),
+        );
         let ids: Vec<&str> = refreshed
             .iter()
             .map(|boundary| boundary.id().as_str())
@@ -444,7 +448,7 @@ mod tests {
             first in 1_u32..300,
             length in 0_u32..120,
         ) {
-            let window = (day(first), day((first + length).min(365)));
+            let window = SessionRange::new(day(first), day((first + length).min(365))).unwrap();
             let once = refresh_boundaries(&previous, &fetched, window);
             prop_assert_eq!(refresh_boundaries(&once, &fetched, window), once.clone());
             let fresh = refresh_boundaries(&[], &fetched, window);

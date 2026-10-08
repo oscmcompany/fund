@@ -11,8 +11,8 @@ use crate::common::laboratory::dataset::{
 };
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
-use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
+use crate::common::time::{SessionDate, SessionRange};
 use crate::laboratory::Study;
 
 /// Bars by session and the fingerprint of the partitions they came from.
@@ -89,38 +89,35 @@ impl std::fmt::Display for DatasetError {
 
 impl std::error::Error for DatasetError {}
 
-/// Massive daily bars for every trading session from `first` to `last`, journaled to `study` before it is returned; a
-/// session with no partition is recorded missing in the fingerprint rather than refused.
+/// Massive daily bars for every trading session in `range`, journaled to `study` before it is returned; a session with
+/// no partition is recorded missing in the fingerprint rather than refused.
 pub async fn daily_bars(
     archive: &Archive,
     calendar: &TradingCalendar,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     study: &mut Study,
 ) -> Result<Dataset, DatasetError> {
     load(
         DatasetLeg::MassiveDailyBars,
         archive,
         calendar,
-        first,
-        last,
+        range,
         study,
     )
     .await
 }
 
-/// `leg`'s bars for every trading session from `first` to `last`, journaled to `study` before it is returned.
+/// `leg`'s bars for every trading session in `range`, journaled to `study` before it is returned.
 async fn load(
     leg: DatasetLeg,
     archive: &Archive,
     calendar: &TradingCalendar,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     study: &mut Study,
 ) -> Result<Dataset, DatasetError> {
     // Taken empty first, so the window is checked before any read and its missing sessions are the ones to read.
-    let owed = Fingerprint::new(leg, first, last, calendar, BTreeMap::new())
-        .map_err(DatasetError::Window)?;
+    let owed =
+        Fingerprint::new(leg, range, calendar, BTreeMap::new()).map_err(DatasetError::Window)?;
     let (mut bars, mut tags) = (BTreeMap::new(), BTreeMap::new());
     for session in owed.missing() {
         let Some((read, tag)) = partition(archive, leg, *session).await? else {
@@ -129,8 +126,7 @@ async fn load(
         bars.insert(*session, admit(*session, read)?);
         tags.insert(*session, tag.as_str().to_string());
     }
-    let fingerprint =
-        Fingerprint::new(leg, first, last, calendar, tags).map_err(DatasetError::Window)?;
+    let fingerprint = Fingerprint::new(leg, range, calendar, tags).map_err(DatasetError::Window)?;
     study.read(&fingerprint).map_err(DatasetError::Journal)?;
     Ok(Dataset {
         bars,
@@ -219,8 +215,7 @@ pub(crate) mod tests {
             (0..4)
                 .map(|day| TradingSession::new(session(day), open, close).unwrap())
                 .collect(),
-            session(0),
-            session(3),
+            SessionRange::new(session(0), session(3)).unwrap(),
         )
         .unwrap();
         let price = |dollars: f64| Price::from_dollars(dollars).unwrap();
@@ -244,8 +239,7 @@ pub(crate) mod tests {
             bars: [bars(0, 1), bars(1, 2), bars(3, 3)].into(),
             fingerprint: Fingerprint::new(
                 DatasetLeg::MassiveDailyBars,
-                session(0),
-                session(3),
+                SessionRange::new(session(0), session(3)).unwrap(),
                 &calendar,
                 read,
             )
@@ -392,11 +386,11 @@ pub(crate) mod tests {
         let alpaca = Alpaca::from_environment(reqwest::Client::new()).unwrap();
         let session =
             |month, day| SessionDate::from_date(NaiveDate::from_ymd_opt(2026, month, day).unwrap());
-        let (first, last) = (session(9, 28), session(10, 2));
-        let calendar = alpaca.calendar(first, last).await.unwrap();
+        let range = SessionRange::new(session(9, 28), session(10, 2)).unwrap();
+        let calendar = alpaca.calendar(range).await.unwrap();
         let directory = std::env::temp_dir().join(format!("fund-study-{}", uuid::Uuid::new_v4()));
         let mut study = Study::open(Label::new("live loader check").unwrap(), &directory).unwrap();
-        let dataset = daily_bars(&archive, &calendar, first, last, &mut study)
+        let dataset = daily_bars(&archive, &calendar, range, &mut study)
             .await
             .unwrap();
         let fingerprint = dataset.fingerprint();
@@ -407,7 +401,7 @@ pub(crate) mod tests {
         let mut sessions: Vec<SessionDate> = fingerprint.partitions().keys().copied().collect();
         sessions.extend(fingerprint.missing());
         sessions.sort();
-        assert_eq!(sessions, calendar.trading_days_in_range(first, last));
+        assert_eq!(sessions, calendar.trading_days_in_range(range));
         assert_eq!(
             dataset.bars().keys().collect::<Vec<_>>(),
             fingerprint.partitions().keys().collect::<Vec<_>>()
@@ -420,7 +414,7 @@ pub(crate) mod tests {
             counts.readings().keys().collect::<Vec<_>>(),
             fingerprint.partitions().keys().collect::<Vec<_>>()
         );
-        let again = daily_bars(&archive, &calendar, first, last, &mut study)
+        let again = daily_bars(&archive, &calendar, range, &mut study)
             .await
             .unwrap();
         let journaled: Vec<String> = std::fs::read_dir(&directory)

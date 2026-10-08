@@ -9,7 +9,7 @@ use super::super::{RefusedRow, RowRefusal};
 use super::{Alpaca, paginate};
 use crate::common::market::Symbol;
 use crate::common::market::corporate_actions::{ActionId, BoundaryChange, SeriesBoundary};
-use crate::common::time::SessionDate;
+use crate::common::time::{SessionDate, SessionRange};
 
 const CORPORATE_ACTIONS_URL: &str = "https://data.alpaca.markets/v1/corporate-actions";
 
@@ -37,13 +37,12 @@ impl SeriesBoundaries {
 }
 
 impl Alpaca {
-    /// The series boundaries Alpaca processed over `[first, last]`.
+    /// The series boundaries Alpaca processed over `range`.
     pub async fn series_boundaries(
         &self,
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
     ) -> Result<SeriesBoundaries, FetchError> {
-        let (start, end) = (first.to_string(), last.to_string());
+        let (start, end) = (range.first().to_string(), range.last().to_string());
         let (start, end) = (&start, &end);
         let pages = paginate(|page_token| async move {
             with_retries(|| {

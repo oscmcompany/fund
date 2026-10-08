@@ -28,8 +28,8 @@ use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
 use fund::common::playbook::{Playbook, PlaybookRead, Played};
 use fund::common::storage::{Host, Key, Origin, Provider, Service};
-use fund::common::time::SessionDate;
 use fund::common::time::calendar::TradingCalendar;
+use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::alpaca::feed::{Feed, FeedEvent};
 use fund::ingest::alpaca::stream::StreamMessage;
@@ -249,7 +249,10 @@ async fn trade(
     };
     let broker = PaperAccount::new(account).map_err(|error| refused(error.to_string()))?;
     let calendar = tape
-        .calendar(today.plus_calendar_days(-CALENDAR_DAYS_BACK), today)
+        .calendar(
+            SessionRange::single(today)
+                .reaching_back_to(today.plus_calendar_days(-CALENDAR_DAYS_BACK)),
+        )
         .await
         .map_err(|error| refused(error.to_string()))?;
     let Some((open, close)) = calendar.session(today).map(|session| session.hours()) else {

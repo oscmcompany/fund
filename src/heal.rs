@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +22,8 @@ use crate::archive::reference::{
 use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use crate::archive::{quote_bars, trade_bars};
 use crate::common::heal::{
-    Held, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal, calendar_range, owed,
-    quarter_start, window,
+    Held, KeepsRefusal, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal, fetched_range,
+    owed, window,
 };
 use crate::common::journal::{
     ConfigurationResolved, HealFinished, Observation, PartitionWritten, Unanswered,
@@ -37,8 +37,8 @@ use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup}
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
 use crate::common::storage::{Key, Provider, ReferenceTable};
-use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
+use crate::common::time::{SessionDate, SessionRange};
 use crate::ingest::alpaca::{
     Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
 };
@@ -147,6 +147,11 @@ impl Parameters {
 pub enum HealError {
     Calendar(FetchError),
     Window(WindowRefusal),
+    /// A leg's sessions could not be read off the calendar, which the run fetched to reach back far enough.
+    Keeps {
+        leg: Leg,
+        refusal: KeepsRefusal,
+    },
     List(ArchiveError),
     /// A partition was written but its record was not, so the run stops rather than write what it cannot record.
     Journal(std::io::Error),
@@ -157,6 +162,7 @@ impl std::fmt::Display for HealError {
         match self {
             Self::Calendar(error) => write!(formatter, "fetching the calendar failed: {error}"),
             Self::Window(refusal) => write!(formatter, "{refusal}"),
+            Self::Keeps { leg, refusal } => write!(formatter, "the {leg} leg: {refusal}"),
             Self::List(error) => write!(formatter, "{error}"),
             Self::Journal(error) => {
                 write!(formatter, "journaling a written partition failed: {error}")
@@ -290,12 +296,9 @@ pub async fn run(
     today: SessionDate,
 ) -> Result<HealFinished, HealError> {
     let deadline = Instant::now() + parameters.budget;
-    let (first, last) = calendar_range(today, parameters.lookback_sessions);
-    // Reaching back to the quarter's start lets the security details leg find the session that opened it.
-    let first = first.min(quarter_start(last));
     let calendar = clients
         .alpaca
-        .calendar(first, last)
+        .calendar(fetched_range(today, parameters.lookback_sessions))
         .await
         .map_err(HealError::Calendar)?;
     let window =
@@ -314,8 +317,11 @@ pub async fn run(
         if !held.unrecognized().is_empty() {
             tracing::warn!(%leg, unrecognized = ?held.unrecognized(), "Objects outside the series were not counted as held");
         }
+        let kept = leg
+            .keeps(&window, &calendar)
+            .map_err(|refusal| HealError::Keeps { leg, refusal })?;
         let mut sessions = BTreeMap::new();
-        for session in owed(&leg.keeps(&window, &calendar), held.sessions()) {
+        for session in owed(&kept, held.sessions()) {
             let outcome = if Instant::now() >= deadline {
                 SessionOutcome::Unreached
             } else {
@@ -462,7 +468,10 @@ async fn write_splits(
 }
 
 /// How far before the previous snapshot a refresh reaches back, and the span of one request.
-const BOUNDARY_REFRESH_DAYS: i64 = 365;
+const BOUNDARY_REFRESH_DAYS: NonZeroU16 = match NonZeroU16::new(365) {
+    Some(days) => days,
+    None => panic!("a year is more than no days"),
+};
 
 /// Where the first snapshot's history starts, fetched a refresh window at a time.
 const BOUNDARIES_SINCE: (i32, u32, u32) = (2015, 1, 1);
@@ -492,7 +501,8 @@ async fn write_series_boundaries(
                 decode_series_boundaries(&key, bytes).map_err(DecodeRefusal::Reference)?;
             (
                 held,
-                key.session().plus_calendar_days(-BOUNDARY_REFRESH_DAYS),
+                key.session()
+                    .plus_calendar_days(-i64::from(BOUNDARY_REFRESH_DAYS.get())),
             )
         }
         None => {
@@ -504,17 +514,13 @@ async fn write_series_boundaries(
     };
     let mut fetched: Vec<SeriesBoundary> = Vec::new();
     let mut refused: Vec<RefusedRow> = Vec::new();
-    let mut start = first;
-    while start <= session {
-        let end = start
-            .plus_calendar_days(BOUNDARY_REFRESH_DAYS - 1)
-            .min(session);
-        let read = clients.alpaca.series_boundaries(start, end).await?;
+    let window = SessionRange::single(session).reaching_back_to(first);
+    for span in window.spans(BOUNDARY_REFRESH_DAYS) {
+        let read = clients.alpaca.series_boundaries(span).await?;
         fetched.extend_from_slice(read.boundaries());
         refused.extend_from_slice(read.refused());
-        start = end.plus_calendar_days(1);
     }
-    let boundaries = refresh_boundaries(&held, &fetched, (first, session));
+    let boundaries = refresh_boundaries(&held, &fetched, window);
     if boundaries.is_empty() {
         return Err(PartitionFailure::NoRows);
     }
@@ -1090,8 +1096,8 @@ mod tests {
             );
         }
         let today = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap());
-        let (first, _) = calendar_range(today, MAXIMUM_LOOKBACK_SESSIONS);
-        assert_eq!(first.to_string(), "2019-10-30");
+        let range = fetched_range(today, MAXIMUM_LOOKBACK_SESSIONS);
+        assert_eq!(range.first().to_string(), "2019-10-01");
         assert!(
             Instant::now()
                 .checked_add(Duration::from_secs(1_440 * 60))

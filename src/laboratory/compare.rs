@@ -1,7 +1,6 @@
 //! Replays a candidate strategy and its baseline over the same sessions and fill model and journals them as one
 //! experiment, with the paired difference of their session returns, so a shock both arms share cancels.
 
-use crate::common::book::Cash;
 use crate::common::laboratory::estimate::{Control, Estimate, Treatment, paired, summarize};
 use crate::common::laboratory::experiment::{ExperimentRefusal, Name, Outputs, Parameters};
 use crate::common::laboratory::series::Series;
@@ -10,7 +9,7 @@ use crate::common::replay::{FillModel, Replay, Replayer};
 use crate::common::strategy::Strategy;
 use crate::laboratory::Study;
 use crate::laboratory::dataset::Dataset;
-use crate::laboratory::replay::{ReplayStudyError, beside, metrics, run, settings};
+use crate::laboratory::replay::{Opening, ReplayStudyError, beside, metrics, run, settings};
 
 /// One side of a comparison: a strategy and the name that says what it is and the settings that make it so.
 pub struct Arm<S> {
@@ -72,7 +71,7 @@ pub fn compare<C: Strategy, B: Strategy>(
     baseline: Arm<B>,
     fill_model: FillModel,
     decision: BarInterval,
-    opening: Cash,
+    opening: Opening,
 ) -> Result<Comparison, ReplayStudyError> {
     let parameters = beside(
         [
@@ -93,7 +92,7 @@ pub fn compare<C: Strategy, B: Strategy>(
     )?;
     let returns = |replay: &Replay| {
         replay
-            .session_returns(opening)
+            .session_returns(opening.cash())
             .map_err(ReplayStudyError::Series)
     };
     let (candidate_returns, baseline_returns) = (returns(&candidate)?, returns(&baseline)?);
@@ -120,7 +119,7 @@ pub fn compare<C: Strategy, B: Strategy>(
 /// The difference, each arm's own session return, and each arm's replay metrics under its side's prefix.
 fn outputs(
     arms: [(&str, &Replay, &Series); 2],
-    opening: Cash,
+    opening: Opening,
     difference: Estimate,
 ) -> Result<Outputs, ReplayStudyError> {
     let mut outputs = Outputs::default()
@@ -145,7 +144,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::common::book::Book;
+    use crate::common::book::{Book, Cash};
     use crate::common::journal::{Observation, ReadLine, read};
     use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::{ExperimentRan, Label};
@@ -179,8 +178,8 @@ mod tests {
         FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap()
     }
 
-    fn opening() -> Cash {
-        Cash::from_units(100 * 1_000_000_000_000)
+    fn opening() -> Opening {
+        Opening::new(Cash::from_units(100 * 1_000_000_000_000)).unwrap()
     }
 
     /// The one `experiment_ran` the study in `directory` journaled.

@@ -370,8 +370,8 @@ mod tests {
     use crate::common::laboratory::dataset::DatasetLeg;
     use crate::common::laboratory::estimate::summarize;
     use crate::common::laboratory::series::Series;
-    use crate::common::time::SessionDate;
     use crate::common::time::calendar::{TradingCalendar, TradingSession};
+    use crate::common::time::{SessionDate, SessionRange};
 
     fn session(day: i64) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
@@ -386,8 +386,7 @@ mod tests {
             (0..3)
                 .map(|day| TradingSession::new(session(day), open, close).unwrap())
                 .collect(),
-            session(0),
-            session(2),
+            SessionRange::new(session(0), session(2)).unwrap(),
         )
         .unwrap();
         let read = [0, 2]
@@ -395,8 +394,7 @@ mod tests {
             .into();
         Fingerprint::new(
             DatasetLeg::MassiveDailyBars,
-            session(0),
-            session(2),
+            SessionRange::new(session(0), session(2)).unwrap(),
             &calendar,
             read,
         )

@@ -241,8 +241,8 @@ mod tests {
     use crate::common::market::trade_bars::{OpenClose, TradeSums};
     use crate::common::market::{DollarVolume, TradeCount};
     use crate::common::monoid::{concatenate, laws};
-    use crate::common::time::SessionDate;
     use crate::common::time::calendar::TradingSession;
+    use crate::common::time::{SessionDate, SessionRange};
 
     fn session() -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap())
@@ -477,8 +477,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            session(),
-            session(),
+            SessionRange::single(session()),
         )
         .unwrap();
         assert_eq!(MarketState::empty().phase(&calendar), None);
