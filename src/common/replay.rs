@@ -352,7 +352,7 @@ mod tests {
     use proptest::strategy::Strategy as _;
 
     use super::*;
-    use crate::common::market::record::Ohlc;
+    use crate::common::market::record::BarPrices;
     use crate::common::market::{Price, Shares};
     use crate::common::strategy::Strategy;
     use crate::common::strategy::Target;
@@ -420,7 +420,7 @@ mod tests {
             symbol(raw),
             interval,
             timestamp,
-            Ohlc::new(open, open.max(close), open.min(close), close).unwrap(),
+            BarPrices::new(open, open.max(close), open.min(close), close).unwrap(),
             Shares::whole(100).unwrap(),
             None,
             None,

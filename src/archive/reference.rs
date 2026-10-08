@@ -403,7 +403,7 @@ pub fn decode_security_details(
                 })
                 .transpose()?;
             let industry_code = optional(industry_codes.is_valid(row))
-                .map(|()| IndustryCode::new(&format!("{:04}", industry_codes.value(row))))
+                .map(|()| IndustryCode::from_code(industry_codes.value(row)))
                 .transpose()
                 .map_err(RowCause::IndustryCode)?;
             let shares_outstanding = optional(shares.is_valid(row))
@@ -425,7 +425,9 @@ pub fn decode_security_details(
                 market_capitalization,
                 primary_exchange,
                 optional(central_index_keys.is_valid(row))
-                    .map(|()| CentralIndexKey::new(central_index_keys.value(row))),
+                    .map(|()| CentralIndexKey::new(central_index_keys.value(row)))
+                    .transpose()
+                    .map_err(RowCause::CentralIndexKey)?,
             ))
         };
         for row in 0..batch.num_rows() {
@@ -797,7 +799,7 @@ mod tests {
                 Some(Shares::whole(303_000_000).unwrap()),
                 Some(Dollars::from_float(51_340_135_490.0).unwrap()),
                 Some(MarketIdentifierCode::new("XNYS").unwrap()),
-                Some(CentralIndexKey::new(1_090_872)),
+                Some(CentralIndexKey::new(1_090_872).unwrap()),
             ),
         ];
         let provenance = Provenance::new(
@@ -884,7 +886,7 @@ mod tests {
                     proptest::option::of(proptest::prelude::any::<u64>()),
                     proptest::option::of(proptest::prelude::any::<u64>()),
                     proptest::option::of(proptest::sample::select(vec!["XNAS", "XNYS", "ARCX", "BATS", "XASE"])),
-                    proptest::option::of(proptest::prelude::any::<u64>()),
+                    proptest::option::of(1_u64..),
                 ),
                 0..20,
             ),
@@ -895,12 +897,12 @@ mod tests {
                     SecurityDetails::new(
                         Symbol::new(symbol).unwrap(),
                         *kind,
-                        code.map(|code| IndustryCode::new(&format!("{code:04}")).unwrap()),
+                        code.map(|code| IndustryCode::from_code(code).unwrap()),
                         description.clone(),
                         shares.map(Shares::from_units),
                         capitalization.map(Dollars::from_millionths),
                         exchange.map(|code| MarketIdentifierCode::new(code).unwrap()),
-                        central_index_key.map(CentralIndexKey::new),
+                        central_index_key.map(|value| CentralIndexKey::new(value).unwrap()),
                     )
                 })
                 .collect();

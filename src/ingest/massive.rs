@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, Secret, VariableRefusal, variable};
 use crate::common::market::corporate_actions::{ActionId, Split, SplitRatio};
-use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::record::{Bar, BarInterval, BarPrices};
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
@@ -386,8 +386,9 @@ fn parse_security_details(
             row.cik
                 .map(|raw| {
                     raw.parse::<u64>()
-                        .map(CentralIndexKey::new)
-                        .map_err(|_| RowRefusal::CentralIndexKey { raw })
+                        .ok()
+                        .and_then(|value| CentralIndexKey::new(value).ok())
+                        .ok_or(RowRefusal::CentralIndexKey { raw })
                 })
                 .transpose()?,
         ))
@@ -439,7 +440,7 @@ fn daily_bar(row: &GroupedRow, session: SessionDate) -> Result<Bar, RowRefusal> 
         });
     }
     let price = |dollars: f64| Price::from_dollars(dollars).map_err(RowRefusal::Price);
-    let prices = Ohlc::new(
+    let prices = BarPrices::new(
         price(row.open)?,
         price(row.high)?,
         price(row.low)?,

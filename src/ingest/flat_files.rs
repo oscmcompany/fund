@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, one_sided, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
+use crate::common::market::record::{Bar, BarInterval, BarPrices, Quote};
 use crate::common::market::trade_bars::{ConditionCode, Correction, Print};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
@@ -395,7 +395,7 @@ fn flat_file_bar(
         BarInterval::OneMinute | BarInterval::FiveMinute => start,
     };
     let price = |dollars: f64| Price::from_dollars(dollars).map_err(RowRefusal::Price);
-    let prices = Ohlc::new(
+    let prices = BarPrices::new(
         price(row.open)?,
         price(row.high)?,
         price(row.low)?,

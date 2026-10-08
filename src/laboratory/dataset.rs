@@ -195,7 +195,7 @@ pub(crate) mod tests {
     use crate::common::journal::{Observation, ReadLine, read};
     use crate::common::laboratory::estimate::{Estimate, summarize};
     use crate::common::laboratory::experiment::{Label, Outputs, Parameters};
-    use crate::common::market::record::{BarInterval, Ohlc};
+    use crate::common::market::record::{BarInterval, BarPrices};
     use crate::common::market::{Price, Shares, Symbol};
     use crate::common::storage::{Host, Key};
     use crate::common::time::calendar::TradingSession;
@@ -224,7 +224,7 @@ pub(crate) mod tests {
                 Symbol::new("AAPL").unwrap(),
                 BarInterval::OneDay,
                 session(day).regular_close(),
-                Ohlc::new(price(10.0), price(12.0), price(9.5), price(11.0)).unwrap(),
+                BarPrices::new(price(10.0), price(12.0), price(9.5), price(11.0)).unwrap(),
                 Shares::from_float(100.0).unwrap(),
                 None,
                 None,

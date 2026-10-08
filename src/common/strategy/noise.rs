@@ -58,7 +58,7 @@ mod tests {
     use crate::common::book::Cash;
     use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::market::Price;
-    use crate::common::market::record::{Bar, BarInterval, Ohlc};
+    use crate::common::market::record::{Bar, BarInterval, BarPrices};
     use crate::common::market::state::MarketEvent;
     use crate::common::monoid::{Monoid, concatenate};
     use crate::common::replay::{FillModel, Replay, Replayer};
@@ -101,7 +101,7 @@ mod tests {
             symbol(raw),
             BarInterval::OneDay,
             day(index),
-            Ohlc::new(price, price, price, price).unwrap(),
+            BarPrices::new(price, price, price, price).unwrap(),
             Shares::whole(100).unwrap(),
             None,
             None,

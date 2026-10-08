@@ -42,7 +42,7 @@ impl BarInterval {
 
 /// Open, high, low and close, with the open and close inside `[low, high]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ohlc {
+pub struct BarPrices {
     open: Price,
     high: Price,
     low: Price,
@@ -51,7 +51,7 @@ pub struct Ohlc {
 
 /// Why a set of bar prices was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OhlcRefusal {
+pub enum BarPricesRefusal {
     OutsideRange {
         open: Price,
         high: Price,
@@ -60,7 +60,7 @@ pub enum OhlcRefusal {
     },
 }
 
-impl std::fmt::Display for OhlcRefusal {
+impl std::fmt::Display for BarPricesRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OutsideRange {
@@ -76,10 +76,15 @@ impl std::fmt::Display for OhlcRefusal {
     }
 }
 
-impl std::error::Error for OhlcRefusal {}
+impl std::error::Error for BarPricesRefusal {}
 
-impl Ohlc {
-    pub fn new(open: Price, high: Price, low: Price, close: Price) -> Result<Self, OhlcRefusal> {
+impl BarPrices {
+    pub fn new(
+        open: Price,
+        high: Price,
+        low: Price,
+        close: Price,
+    ) -> Result<Self, BarPricesRefusal> {
         let range = low..=high;
         if range.contains(&open) && range.contains(&close) {
             Ok(Self {
@@ -89,7 +94,7 @@ impl Ohlc {
                 close,
             })
         } else {
-            Err(OhlcRefusal::OutsideRange {
+            Err(BarPricesRefusal::OutsideRange {
                 open,
                 high,
                 low,
@@ -121,7 +126,7 @@ pub struct Bar {
     symbol: Symbol,
     interval: BarInterval,
     timestamp: DateTime<Utc>,
-    prices: Ohlc,
+    prices: BarPrices,
     volume: Shares,
     /// `None` when the vendor did not report it.
     trade_count: Option<TradeCount>,
@@ -157,7 +162,7 @@ impl Bar {
         symbol: Symbol,
         interval: BarInterval,
         timestamp: DateTime<Utc>,
-        prices: Ohlc,
+        prices: BarPrices,
         volume: Shares,
         trade_count: Option<TradeCount>,
         dollar_volume: Option<DollarVolume>,
@@ -206,7 +211,7 @@ impl Bar {
     /// and trade count: the input a replay control runs on, where no price moves.
     pub fn at_price(&self, price: Price) -> Self {
         Self {
-            prices: Ohlc {
+            prices: BarPrices {
                 open: price,
                 high: price,
                 low: price,
@@ -219,7 +224,7 @@ impl Bar {
         }
     }
 
-    pub fn prices(&self) -> Ohlc {
+    pub fn prices(&self) -> BarPrices {
         self.prices
     }
 
@@ -390,8 +395,8 @@ mod tests {
         text.parse().unwrap()
     }
 
-    fn prices() -> Ohlc {
-        Ohlc::new(price(10.0), price(11.0), price(9.0), price(10.5)).unwrap()
+    fn prices() -> BarPrices {
+        BarPrices::new(price(10.0), price(11.0), price(9.0), price(10.5)).unwrap()
     }
 
     fn bar(interval: BarInterval, timestamp: &str) -> Result<Bar, BarRefusal> {
@@ -424,16 +429,16 @@ mod tests {
     #[test]
     fn test_an_open_or_close_outside_the_range_is_refused() {
         assert_eq!(
-            Ohlc::new(price(12.0), price(11.0), price(9.0), price(10.0)),
-            Err(OhlcRefusal::OutsideRange {
+            BarPrices::new(price(12.0), price(11.0), price(9.0), price(10.0)),
+            Err(BarPricesRefusal::OutsideRange {
                 open: price(12.0),
                 high: price(11.0),
                 low: price(9.0),
                 close: price(10.0),
             })
         );
-        assert!(Ohlc::new(price(9.0), price(9.0), price(9.0), price(9.0)).is_ok());
-        assert!(Ohlc::new(price(10.0), price(11.0), price(9.0), price(8.0)).is_err());
+        assert!(BarPrices::new(price(9.0), price(9.0), price(9.0), price(9.0)).is_ok());
+        assert!(BarPrices::new(price(10.0), price(11.0), price(9.0), price(8.0)).is_err());
     }
 
     #[test]
@@ -503,7 +508,7 @@ mod tests {
         let repriced = original.at_price(price(2.0));
         assert_eq!(
             repriced.prices(),
-            Ohlc::new(price(2.0), price(2.0), price(2.0), price(2.0)).unwrap()
+            BarPrices::new(price(2.0), price(2.0), price(2.0), price(2.0)).unwrap()
         );
         assert_eq!(repriced.volume_weighted_average_price(), Some(2.0));
         assert_eq!(
@@ -622,7 +627,7 @@ mod tests {
                 Symbol::new("AAPL").unwrap(),
                 interval,
                 open,
-                Ohlc::new(price(ticks[0]), price(high), price(low), price(ticks[1])).unwrap(),
+                BarPrices::new(price(ticks[0]), price(high), price(low), price(ticks[1])).unwrap(),
                 volume,
                 trade_count.map(TradeCount::new),
                 reported.then(|| DollarVolume::of(price(ticks[2]), volume)),
@@ -631,7 +636,7 @@ mod tests {
             let repriced = bar.at_price(price(second));
             prop_assert_eq!(bar.at_price(price(first)).at_price(price(second)), repriced.clone());
             let flat = price(second);
-            prop_assert_eq!(repriced.prices(), Ohlc::new(flat, flat, flat, flat).unwrap());
+            prop_assert_eq!(repriced.prices(), BarPrices::new(flat, flat, flat, flat).unwrap());
             prop_assert_eq!(repriced.dollar_volume(), reported.then(|| DollarVolume::of(flat, volume)));
             prop_assert_eq!(
                 (repriced.symbol(), repriced.interval(), repriced.timestamp(), repriced.volume(), repriced.trade_count()),

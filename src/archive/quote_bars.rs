@@ -16,9 +16,9 @@ use chrono::DateTime;
 
 use super::bars::{Provenance, provenance_from};
 use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
-use crate::common::market::quote_bars::{QuoteBar, QuoteSums, Spread, StandingQuote};
+use crate::common::market::quote_bars::{QuoteBar, QuoteSums, Spread, StandingQuote, TimeWeighted};
 use crate::common::market::record::BarInterval;
-use crate::common::market::{Shares, Symbol};
+use crate::common::market::{QuoteCount, Shares, Symbol};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
@@ -153,11 +153,12 @@ pub fn encode(
             timestamp,
         };
         let sums = bar.sums();
+        let weighted = sums.time_weighted();
         for (builder, value) in time_weighted.iter_mut().zip([
-            sums.spread_time(),
-            sums.relative_spread_time(),
-            sums.bid_size_time(),
-            sums.ask_size_time(),
+            weighted.spread,
+            weighted.relative_spread,
+            weighted.bid_size,
+            weighted.ask_size,
         ]) {
             let value = parquet::widest_decimal(value).ok_or_else(unrepresentable)?;
             builder.append_value(value);
@@ -169,7 +170,7 @@ pub fn encode(
             .ok_or_else(unrepresentable)?;
         symbols.append_value(symbol.as_str());
         timestamps.append_value(timestamp.timestamp_micros());
-        quote_counts.append_value(sums.quote_count());
+        quote_counts.append_value(sums.quote_count().count());
         covered.append_value(sums.covered_nanoseconds());
         for (builder, ticks) in prices.iter_mut().zip([
             i128::from(sums.narrowest().ticks()),
@@ -248,14 +249,14 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<QuoteBar>, Provenance), 
             )
             .map_err(RowCause::QuoteSums)?;
             let sums = QuoteSums::new(
-                quote_counts.value(row),
+                QuoteCount::new(quote_counts.value(row)),
                 covered.value(row),
-                [
-                    time_weighted[0].integer(row)?,
-                    time_weighted[1].integer(row)?,
-                    time_weighted[2].integer(row)?,
-                    time_weighted[3].integer(row)?,
-                ],
+                TimeWeighted {
+                    spread: time_weighted[0].integer(row)?,
+                    relative_spread: time_weighted[1].integer(row)?,
+                    bid_size: time_weighted[2].integer(row)?,
+                    ask_size: time_weighted[3].integer(row)?,
+                },
                 Spread::from_ticks(narrowest.integer(row)?),
                 Spread::from_ticks(widest.integer(row)?),
                 closing,
@@ -409,11 +410,20 @@ mod tests {
                 .unwrap();
                 let narrowest = Spread::from_ticks(u64::try_from(spread).unwrap() / 2);
                 let widest = Spread::from_ticks(u64::try_from(spread).unwrap());
+                // A twelfth of the interval, so up to twelve combined into one bucket still fit it.
+                let covered = 1 + sums[0] % (longest / 12);
+                let span = u128::from(widest.ticks() - narrowest.ticks()) * u128::from(covered);
                 let quote_sums = QuoteSums::new(
-                    count,
-                    // A twelfth of the interval, so up to twelve combined into one bucket still fit it.
-                    1 + sums[0] % (longest / 12),
-                    sums.map(u128::from),
+                    QuoteCount::new(count),
+                    covered,
+                    TimeWeighted {
+                        // Between the narrowest and widest spreads standing for the whole covered time.
+                        spread: u128::from(narrowest.ticks()) * u128::from(covered)
+                            + u128::from(sums[0]) % (span + 1),
+                        relative_spread: u128::from(sums[1]),
+                        bid_size: u128::from(sums[2]),
+                        ask_size: u128::from(sums[3]),
+                    },
                     narrowest,
                     widest,
                     closing,

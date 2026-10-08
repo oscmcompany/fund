@@ -7,7 +7,7 @@ use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
 use super::aggregate::TradeTotals;
 use super::record::{BarInterval, Trade};
-use super::{DollarVolume, Price, Shares, Symbol, TradeCount};
+use super::{DollarVolume, Price, Shares, StampedPrice, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
 
@@ -339,8 +339,8 @@ pub enum Correction {
 /// commutative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenClose {
-    open: (DateTime<Utc>, Price),
-    close: (DateTime<Utc>, Price),
+    open: StampedPrice,
+    close: StampedPrice,
 }
 
 /// Why an open and close were refused.
@@ -348,8 +348,8 @@ pub struct OpenClose {
 pub enum OpenCloseRefusal {
     /// The open orders after the close, by instant and then price.
     Inverted {
-        open: (DateTime<Utc>, Price),
-        close: (DateTime<Utc>, Price),
+        open: StampedPrice,
+        close: StampedPrice,
     },
 }
 
@@ -359,7 +359,10 @@ impl std::fmt::Display for OpenCloseRefusal {
             Self::Inverted { open, close } => write!(
                 formatter,
                 "the open {} at {} orders after the close {} at {}",
-                open.1, open.0, close.1, close.0
+                open.price(),
+                open.at(),
+                close.price(),
+                close.at()
             ),
         }
     }
@@ -368,10 +371,7 @@ impl std::fmt::Display for OpenCloseRefusal {
 impl std::error::Error for OpenCloseRefusal {}
 
 impl OpenClose {
-    pub fn new(
-        open: (DateTime<Utc>, Price),
-        close: (DateTime<Utc>, Price),
-    ) -> Result<Self, OpenCloseRefusal> {
+    pub fn new(open: StampedPrice, close: StampedPrice) -> Result<Self, OpenCloseRefusal> {
         if open > close {
             return Err(OpenCloseRefusal::Inverted { open, close });
         }
@@ -379,7 +379,7 @@ impl OpenClose {
     }
 
     fn of(print: &Print) -> Self {
-        let point = (print.timestamp(), print.price());
+        let point = StampedPrice::new(print.timestamp(), print.price());
         Self {
             open: point,
             close: point,
@@ -394,12 +394,12 @@ impl OpenClose {
     }
 
     /// The opening print's time and price.
-    pub fn open(&self) -> (DateTime<Utc>, Price) {
+    pub fn open(&self) -> StampedPrice {
         self.open
     }
 
     /// The closing print's time and price.
-    pub fn close(&self) -> (DateTime<Utc>, Price) {
+    pub fn close(&self) -> StampedPrice {
         self.close
     }
 }
@@ -596,9 +596,14 @@ impl TradeBar {
 }
 
 /// A bar the trader built from the tape, journaled as `bar_built` with the archive's trade bar columns so a session's
-/// bars can be diffed against the archive's for the same minutes.
+/// bars can be diffed against the archive's for the same minutes; a line is read back through `TradeBar::new`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BarBuilt {
+#[serde(try_from = "BarBuiltColumns", into = "BarBuiltColumns")]
+pub struct BarBuilt(TradeBar);
+
+/// `BarBuilt` as journaled: the archive's trade bar columns, each price pair whole or absent.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BarBuiltColumns {
     symbol: Symbol,
     interval: BarInterval,
     timestamp: DateTime<Utc>,
@@ -613,25 +618,122 @@ pub struct BarBuilt {
     low: Option<Price>,
 }
 
-impl BarBuilt {
-    pub fn of(bar: &TradeBar) -> Self {
-        let totals = bar.sums.totals;
-        let open_close = bar.sums.open_close;
-        let high_low = bar.sums.high_low;
+/// Why a journaled bar was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarBuiltRefusal {
+    /// Some columns of a price pair are null, named here.
+    PartlyNull {
+        null: Vec<&'static str>,
+    },
+    OpenClose(OpenCloseRefusal),
+    HighLow(HighLowRefusal),
+    TradeBar(TradeBarRefusal),
+}
+
+impl std::fmt::Display for BarBuiltRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PartlyNull { null } => {
+                write!(formatter, "a price pair is null in {}", null.join(", "))
+            }
+            Self::OpenClose(refusal) => refusal.fmt(formatter),
+            Self::HighLow(refusal) => refusal.fmt(formatter),
+            Self::TradeBar(refusal) => refusal.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for BarBuiltRefusal {}
+
+/// The names of `columns` that are null, when some but not all are.
+fn partly_null(columns: &[(&'static str, bool)]) -> BarBuiltRefusal {
+    BarBuiltRefusal::PartlyNull {
+        null: columns
+            .iter()
+            .filter(|(_, present)| !present)
+            .map(|(name, _)| *name)
+            .collect(),
+    }
+}
+
+impl TryFrom<BarBuiltColumns> for BarBuilt {
+    type Error = BarBuiltRefusal;
+
+    fn try_from(columns: BarBuiltColumns) -> Result<Self, Self::Error> {
+        let open_close = match (
+            columns.opened_at,
+            columns.open,
+            columns.closed_at,
+            columns.close,
+        ) {
+            (Some(opened_at), Some(open), Some(closed_at), Some(close)) => Some(
+                OpenClose::new(
+                    StampedPrice::new(opened_at, open),
+                    StampedPrice::new(closed_at, close),
+                )
+                .map_err(BarBuiltRefusal::OpenClose)?,
+            ),
+            (None, None, None, None) => None,
+            (opened_at, open, closed_at, close) => {
+                return Err(partly_null(&[
+                    ("opened_at", opened_at.is_some()),
+                    ("open", open.is_some()),
+                    ("closed_at", closed_at.is_some()),
+                    ("close", close.is_some()),
+                ]));
+            }
+        };
+        let high_low = match (columns.high, columns.low) {
+            (Some(high), Some(low)) => {
+                Some(HighLow::new(high, low).map_err(BarBuiltRefusal::HighLow)?)
+            }
+            (None, None) => None,
+            (high, low) => {
+                return Err(partly_null(&[
+                    ("high", high.is_some()),
+                    ("low", low.is_some()),
+                ]));
+            }
+        };
+        let totals = TradeTotals::new(columns.trade_count, columns.volume, columns.dollar_volume);
+        TradeBar::new(
+            columns.symbol,
+            columns.interval,
+            columns.timestamp,
+            TradeSums::new(totals, open_close, high_low),
+        )
+        .map(Self)
+        .map_err(BarBuiltRefusal::TradeBar)
+    }
+}
+
+impl From<BarBuilt> for BarBuiltColumns {
+    fn from(BarBuilt(bar): BarBuilt) -> Self {
+        let TradeSums {
+            totals,
+            open_close,
+            high_low,
+        } = bar.sums;
         Self {
-            symbol: bar.symbol.clone(),
+            symbol: bar.symbol,
             interval: bar.interval,
             timestamp: bar.timestamp,
             trade_count: totals.count(),
             volume: totals.volume(),
             dollar_volume: totals.dollar_volume(),
-            opened_at: open_close.map(|prices| prices.open.0),
-            open: open_close.map(|prices| prices.open.1),
-            closed_at: open_close.map(|prices| prices.close.0),
-            close: open_close.map(|prices| prices.close.1),
+            opened_at: open_close.map(|prices| prices.open.at()),
+            open: open_close.map(|prices| prices.open.price()),
+            closed_at: open_close.map(|prices| prices.close.at()),
+            close: open_close.map(|prices| prices.close.price()),
             high: high_low.map(|prices| prices.high()),
             low: high_low.map(|prices| prices.low()),
         }
+    }
+}
+
+impl BarBuilt {
+    pub fn of(bar: &TradeBar) -> Self {
+        Self(bar.clone())
     }
 }
 
@@ -1002,8 +1104,8 @@ mod tests {
         assert_eq!(first.totals().count().count(), 3);
         assert_eq!(first.totals().volume().units(), 350_000_000);
         let open_close = first.open_close().unwrap();
-        assert_eq!(open_close.open().1.ticks(), 101_000_000);
-        assert_eq!(open_close.close().1.ticks(), 101_000_000);
+        assert_eq!(open_close.open().price().ticks(), 101_000_000);
+        assert_eq!(open_close.close().price().ticks(), 101_000_000);
         let high_low = first.high_low().unwrap();
         assert_eq!(
             (high_low.high().ticks(), high_low.low().ticks()),
@@ -1071,7 +1173,10 @@ mod tests {
         .into_bars();
         let sums = daily[0].sums();
         assert_eq!(sums.totals().volume().units(), 7_150_000_000);
-        assert_eq!(sums.open_close().unwrap().close().1.ticks(), 100_050_000);
+        assert_eq!(
+            sums.open_close().unwrap().close().price().ticks(),
+            100_050_000
+        );
         assert_eq!(sums.high_low().unwrap().high().ticks(), 100_050_000);
     }
 
@@ -1111,7 +1216,10 @@ mod tests {
         )
         .into_bars();
         let sums = daily[0].sums();
-        assert_eq!(sums.open_close().unwrap().close().1.ticks(), 87_680_000);
+        assert_eq!(
+            sums.open_close().unwrap().close().price().ticks(),
+            87_680_000
+        );
         assert_eq!(sums.totals().count().count(), 1);
         assert_eq!(sums.totals().volume().units(), 100_000_000);
         assert_eq!(counts.unsized_prints(), 1);
@@ -1237,14 +1345,88 @@ mod tests {
             instant("2026-10-02T13:30:00Z"),
             instant("2026-10-02T13:30:01Z"),
         );
-        assert!(OpenClose::new((early, price), (late, price)).is_ok());
+        let (early, late) = (
+            StampedPrice::new(early, price),
+            StampedPrice::new(late, price),
+        );
+        assert!(OpenClose::new(early, late).is_ok());
         assert_eq!(
-            OpenClose::new((late, price), (early, price)),
+            OpenClose::new(late, early),
             Err(OpenCloseRefusal::Inverted {
-                open: (late, price),
-                close: (early, price)
+                open: late,
+                close: early
             })
         );
+    }
+
+    const BUILT: &str = r#"{"symbol":"AAPL","interval":"one_minute","timestamp":"2026-10-08T14:00:00Z","trade_count":2,"volume":2000000,"dollar_volume":"201000000000000","opened_at":"2026-10-08T14:00:10Z","open":100000000,"closed_at":"2026-10-08T14:00:50Z","close":101000000,"high":101000000,"low":100000000}"#;
+
+    /// `BUILT` with `replace` swapped for `with`, read back as a journaled bar.
+    fn read_built(replace: &str, with: &str) -> Result<BarBuilt, String> {
+        serde_json::from_str::<BarBuilt>(&BUILT.replace(replace, with))
+            .map_err(|error| error.to_string())
+    }
+
+    /// The journaled columns are the archive's, and a line reads back to the bar that wrote it.
+    #[test]
+    fn test_a_built_bar_writes_the_archive_columns_and_reads_back() {
+        let price = |ticks| Price::from_ticks(ticks).unwrap();
+        let bar = TradeBar::new(
+            Symbol::new("AAPL").unwrap(),
+            BarInterval::OneMinute,
+            instant("2026-10-08T14:00:00Z"),
+            TradeSums::new(
+                TradeTotals::new(
+                    TradeCount::new(2),
+                    Shares::whole(2).unwrap(),
+                    DollarVolume::from_units(201_000_000_000_000),
+                ),
+                Some(
+                    OpenClose::new(
+                        StampedPrice::new(instant("2026-10-08T14:00:10Z"), price(100_000_000)),
+                        StampedPrice::new(instant("2026-10-08T14:00:50Z"), price(101_000_000)),
+                    )
+                    .unwrap(),
+                ),
+                Some(HighLow::new(price(101_000_000), price(100_000_000)).unwrap()),
+            ),
+        )
+        .unwrap();
+        let built = BarBuilt::of(&bar);
+        assert_eq!(serde_json::to_string(&built).unwrap(), BUILT);
+        assert_eq!(read_built("", ""), Ok(built));
+    }
+
+    /// A line `OpenClose`, `HighLow` or `TradeBar` would refuse is refused on read, as is a pair half null.
+    #[test]
+    fn test_a_built_bar_that_could_not_have_been_built_is_refused() {
+        let refusals = [
+            read_built(
+                r#""opened_at":"2026-10-08T14:00:10Z""#,
+                r#""opened_at":null"#,
+            ),
+            read_built(r#""low":100000000"#, r#""low":null"#),
+            read_built(
+                r#""opened_at":"2026-10-08T14:00:10Z""#,
+                r#""opened_at":"2026-10-08T14:00:55Z""#,
+            ),
+            read_built(r#""high":101000000"#, r#""high":99000000"#),
+            read_built(
+                r#""timestamp":"2026-10-08T14:00:00Z""#,
+                r#""timestamp":"2026-10-08T14:00:30Z""#,
+            ),
+        ]
+        .map(|read| read.unwrap_err());
+        let expected = [
+            "a price pair is null in opened_at",
+            "a price pair is null in low",
+            "the open 100.00 at 2026-10-08 14:00:55 UTC orders after the close 101.00 at 2026-10-08 14:00:50 UTC",
+            "the high 99.00 is below the low 100.00",
+            "2026-10-08 14:00:30 UTC does not end a one_minute bar",
+        ];
+        for (refusal, expected) in refusals.iter().zip(expected) {
+            assert!(refusal.starts_with(expected), "{refusal}");
+        }
     }
 
     fn any_rollup() -> impl Strategy<Value = TradeRollup> {

@@ -11,7 +11,7 @@ use crate::common::journal::Observation;
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState};
 use crate::common::market::trade_bars::{BarBuilt, TradeBar, TradeConditions, TradeFold};
-use crate::common::market::{Price, Symbol};
+use crate::common::market::{Price, StampedPrice, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::reconcile::rounding_allowance;
 use crate::common::risk::{Limits, TargetDecided, risk};
@@ -362,8 +362,8 @@ impl<S: Strategy> Session<S> {
 
     /// The symbol's last one-minute close, unless the print that set it is older than the settings allow.
     fn fresh_price(&self, symbol: &Symbol, now: DateTime<Utc>) -> Option<Price> {
-        let (at, price) = self.state.last_close(symbol, BarInterval::OneMinute)?;
-        (now - at <= self.settings.stale_after).then_some(price)
+        let close = self.state.last_close(symbol, BarInterval::OneMinute)?;
+        (now - close.at() <= self.settings.stale_after).then_some(close.price())
     }
 }
 
@@ -380,18 +380,16 @@ pub fn warm(bars: impl IntoIterator<Item = TradeBar>, symbols: &BTreeSet<Symbol>
 pub fn last_closes(bars: &[TradeBar]) -> BTreeMap<Symbol, Price> {
     let mut closes = BTreeMap::new();
     for bar in bars {
-        if let Some((at, price)) = bar.sums().open_close().map(|prices| prices.close()) {
+        if let Some(close) = bar.sums().open_close().map(|prices| prices.close()) {
             closes
                 .entry(bar.symbol().clone())
-                .and_modify(|latest: &mut (DateTime<Utc>, Price)| {
-                    *latest = (*latest).max((at, price))
-                })
-                .or_insert((at, price));
+                .and_modify(|latest: &mut StampedPrice| *latest = (*latest).max(close))
+                .or_insert(close);
         }
     }
     closes
         .into_iter()
-        .map(|(symbol, (_, price))| (symbol, price))
+        .map(|(symbol, close)| (symbol, close.price()))
         .collect()
 }
 
@@ -951,14 +949,15 @@ mod tests {
     }
 
     fn closing(raw: &str, minute: &str, ticks: i64) -> TradeBar {
-        let (start, price) = (at(minute), Price::from_ticks(ticks).unwrap());
+        let start = at(minute);
+        let close = StampedPrice::new(start, Price::from_ticks(ticks).unwrap());
         TradeBar::new(
             Symbol::new(raw).unwrap(),
             BarInterval::OneMinute,
             start,
             TradeSums::new(
                 TradeTotals::default(),
-                Some(OpenClose::new((start, price), (start, price)).unwrap()),
+                Some(OpenClose::new(close, close).unwrap()),
                 None,
             ),
         )
@@ -977,7 +976,10 @@ mod tests {
         );
         assert_eq!(
             state.last_close(&spy(), BarInterval::OneMinute),
-            Some((at("14:01:00"), Price::from_ticks(2).unwrap()))
+            Some(StampedPrice::new(
+                at("14:01:00"),
+                Price::from_ticks(2).unwrap()
+            ))
         );
         assert_eq!(
             state.last_close(&Symbol::new("QQQ").unwrap(), BarInterval::OneMinute),

@@ -1,6 +1,8 @@
 //! What a symbol was on a snapshot date: its kind of security, industry, size and listing, each `None` where the
 //! vendor reported nothing, so a snapshot answers questions about the universe as it stood rather than as it stands.
 
+use std::num::NonZeroU64;
+
 use super::{Dollars, Shares, Symbol};
 
 /// The kind of security a symbol names, in our terms.
@@ -42,7 +44,13 @@ pub struct IndustryCode(u16);
 /// Why an industry code was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndustryCodeRefusal {
-    Malformed { raw: String },
+    Malformed {
+        raw: String,
+    },
+    /// A stored code past four digits.
+    TooLarge {
+        code: u16,
+    },
 }
 
 impl std::fmt::Display for IndustryCodeRefusal {
@@ -50,6 +58,9 @@ impl std::fmt::Display for IndustryCodeRefusal {
         match self {
             Self::Malformed { raw } => {
                 write!(formatter, "`{raw}` is not a four-digit industry code")
+            }
+            Self::TooLarge { code } => {
+                write!(formatter, "{code} is past a four-digit industry code")
             }
         }
     }
@@ -70,6 +81,14 @@ impl IndustryCode {
             false => Err(IndustryCodeRefusal::Malformed {
                 raw: raw.to_string(),
             }),
+        }
+    }
+
+    /// A code read back from its stored integer, which drops the leading zeros the written form keeps.
+    pub fn from_code(code: u16) -> Result<Self, IndustryCodeRefusal> {
+        match code <= 9_999 {
+            true => Ok(Self(code)),
+            false => Err(IndustryCodeRefusal::TooLarge { code }),
         }
     }
 
@@ -117,17 +136,35 @@ impl MarketIdentifierCode {
     }
 }
 
-/// The SEC's Central Index Key, the filer identity that survives a rename.
+/// The SEC's Central Index Key, the filer identity that survives a rename; the SEC issues no zero key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CentralIndexKey(u64);
+pub struct CentralIndexKey(NonZeroU64);
+
+/// Why a Central Index Key was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CentralIndexKeyRefusal {
+    Zero,
+}
+
+impl std::fmt::Display for CentralIndexKeyRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("0 is not a Central Index Key"),
+        }
+    }
+}
+
+impl std::error::Error for CentralIndexKeyRefusal {}
 
 impl CentralIndexKey {
-    pub fn new(value: u64) -> Self {
-        Self(value)
+    pub fn new(value: u64) -> Result<Self, CentralIndexKeyRefusal> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(CentralIndexKeyRefusal::Zero)
     }
 
     pub fn value(self) -> u64 {
-        self.0
+        self.0.get()
     }
 }
 
@@ -221,6 +258,18 @@ mod tests {
     #[test]
     fn test_codes_hold_only_their_written_form() {
         assert_eq!(IndustryCode::new("0100").map(IndustryCode::code), Ok(100));
+        assert_eq!(
+            [0, 9_999, 10_000].map(|code| IndustryCode::from_code(code).map(IndustryCode::code)),
+            [
+                Ok(0),
+                Ok(9_999),
+                Err(IndustryCodeRefusal::TooLarge { code: 10_000 })
+            ]
+        );
+        assert_eq!(
+            [0, 1].map(|value| CentralIndexKey::new(value).map(CentralIndexKey::value)),
+            [Err(CentralIndexKeyRefusal::Zero), Ok(1)]
+        );
         for raw in ["100", "01000", "01a0", ""] {
             assert!(IndustryCode::new(raw).is_err(), "{raw}");
         }

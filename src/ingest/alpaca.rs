@@ -13,7 +13,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{Accepted, RefusedRow, RowRefusal, Secret, VariableRefusal, one_sided, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
+use crate::common::market::record::{Bar, BarInterval, BarPrices, Quote};
 use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
@@ -740,7 +740,7 @@ fn minute_bar(ticker: &str, row: &AlpacaBar, session: SessionDate) -> Result<Bar
         });
     }
     let price = |dollars: f64| Price::from_dollars(dollars).map_err(RowRefusal::Price);
-    let prices = Ohlc::new(
+    let prices = BarPrices::new(
         price(row.open)?,
         price(row.high)?,
         price(row.low)?,

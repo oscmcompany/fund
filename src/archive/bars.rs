@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 
 use crate::common::journal::{Commit, RunId};
-use crate::common::market::record::{Bar, BarInterval, Ohlc};
+use crate::common::market::record::{Bar, BarInterval, BarPrices};
 use crate::common::market::{DollarVolume, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
@@ -242,12 +242,13 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
         };
         symbols.append_value(symbol.as_str());
         timestamps.append_value(timestamp.timestamp_micros());
-        let ohlc = bar.prices();
-        for (builder, price) in
-            prices
-                .iter_mut()
-                .zip([ohlc.open(), ohlc.high(), ohlc.low(), ohlc.close()])
-        {
+        let bar_prices = bar.prices();
+        for (builder, price) in prices.iter_mut().zip([
+            bar_prices.open(),
+            bar_prices.high(),
+            bar_prices.low(),
+            bar_prices.close(),
+        ]) {
             builder.append_value(i128::from(price.ticks()));
         }
         volumes.append_value(i128::from(bar.volume().units()));
@@ -297,13 +298,13 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), Decod
         let trade_counts = parquet::column::<UInt64Array>(&batch, 7)?;
         let dollar_volumes = parquet::column::<Decimal128Array>(&batch, 8)?;
         let read = |row: usize| -> Result<Bar, RowCause> {
-            let prices = Ohlc::new(
+            let prices = BarPrices::new(
                 open.price(row)?,
                 high.price(row)?,
                 low.price(row)?,
                 close.price(row)?,
             )
-            .map_err(RowCause::Ohlc)?;
+            .map_err(RowCause::BarPrices)?;
             let dollar_volume = match dollar_volumes.is_valid(row) {
                 true => Some(DollarVolume::from_units(dollar_volumes.integer(row)?)),
                 false => None,
@@ -391,7 +392,7 @@ mod tests {
             Symbol::new(symbol).unwrap(),
             BarInterval::OneMinute,
             timestamp.parse().unwrap(),
-            Ohlc::new(price(10.0), price(12.0), price(9.5), price(close)).unwrap(),
+            BarPrices::new(price(10.0), price(12.0), price(9.5), price(close)).unwrap(),
             Shares::from_float(213_849.305_802).unwrap(),
             Some(TradeCount::new(3)),
             dollar_volume,
@@ -674,7 +675,7 @@ mod tests {
                         Symbol::new(symbol).unwrap(),
                         BarInterval::OneMinute,
                         session().bounds().0 + TimeDelta::minutes(minute),
-                        Ohlc::new(first, high, low, second).unwrap(),
+                        BarPrices::new(first, high, low, second).unwrap(),
                         Shares::from_units(volume),
                         trades.map(TradeCount::new),
                         dollar_units.map(DollarVolume::from_units),

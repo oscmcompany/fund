@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 use super::record::{Bar, BarInterval};
 use super::trade_bars::TradeBar;
-use super::{Price, Shares, Symbol};
+use super::{Price, Shares, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
 use crate::common::time::calendar::{SessionPhase, TradingCalendar};
 
@@ -94,7 +94,7 @@ impl std::error::Error for RollingVolumeRefusal {}
 struct Retained {
     /// The close and the instant it was set: the closing print's for a trade bar, the bar's end for a vendor bar;
     /// `None` for a trade bar no print was allowed to price, such as a minute of odd lots.
-    close: Option<(DateTime<Utc>, Price)>,
+    close: Option<StampedPrice>,
     volume: Shares,
 }
 
@@ -119,7 +119,7 @@ impl MarketState {
                 bar.interval(),
                 bar.timestamp(),
                 Retained {
-                    close: Some((bar.ends(), bar.prices().close())),
+                    close: Some(StampedPrice::new(bar.ends(), bar.prices().close())),
                     volume: bar.volume(),
                 },
             ),
@@ -156,16 +156,12 @@ impl MarketState {
 
     /// The close of the series' latest priced bar, `None` when no retained bar of it has a close.
     pub fn last_price(&self, symbol: &Symbol, interval: BarInterval) -> Option<Price> {
-        self.last_close(symbol, interval).map(|(_, price)| price)
+        self.last_close(symbol, interval).map(StampedPrice::price)
     }
 
     /// `last_price` with the instant it was set, so a caller can judge how old it is: the closing print's for a trade
     /// bar, the bar's end for a vendor bar.
-    pub fn last_close(
-        &self,
-        symbol: &Symbol,
-        interval: BarInterval,
-    ) -> Option<(DateTime<Utc>, Price)> {
+    pub fn last_close(&self, symbol: &Symbol, interval: BarInterval) -> Option<StampedPrice> {
         self.bars(symbol, interval)?
             .values()
             .rev()
@@ -237,7 +233,7 @@ mod tests {
 
     use super::*;
     use crate::common::market::aggregate::TradeTotals;
-    use crate::common::market::record::Ohlc;
+    use crate::common::market::record::BarPrices;
     use crate::common::market::trade_bars::{OpenClose, TradeSums};
     use crate::common::market::{DollarVolume, TradeCount};
     use crate::common::monoid::{concatenate, laws};
@@ -259,7 +255,7 @@ mod tests {
             symbol(raw),
             BarInterval::OneMinute,
             "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute),
-            Ohlc::new(price, price, price, price).unwrap(),
+            BarPrices::new(price, price, price, price).unwrap(),
             Shares::whole(volume).unwrap(),
             None,
             None,
@@ -272,8 +268,8 @@ mod tests {
         let at =
             "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute);
         let open_close = close.map(|ticks| {
-            let price = Price::from_ticks(ticks).unwrap();
-            OpenClose::new((at, price), (at, price)).unwrap()
+            let close = StampedPrice::new(at, Price::from_ticks(ticks).unwrap());
+            OpenClose::new(close, close).unwrap()
         });
         let totals = TradeTotals::new(
             TradeCount::new(1),
@@ -295,7 +291,7 @@ mod tests {
             symbol(raw),
             BarInterval::OneDay,
             session().plus_calendar_days(day).regular_close(),
-            Ohlc::new(price, price, price, price).unwrap(),
+            BarPrices::new(price, price, price, price).unwrap(),
             Shares::whole(volume).unwrap(),
             None,
             None,
@@ -387,7 +383,7 @@ mod tests {
                     BarInterval::OneMinute,
                     "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap()
                         + TimeDelta::minutes(minute),
-                    Ohlc::new(price, price, price, price).unwrap(),
+                    BarPrices::new(price, price, price, price).unwrap(),
                     Shares::from_units(units),
                     None,
                     None,
