@@ -27,8 +27,6 @@ use crate::common::time::calendar::TradingCalendar;
 #[strum(serialize_all = "snake_case")]
 pub enum DatasetLeg {
     MassiveDailyBars,
-    /// The legacy archiver's daily bars under `data/derived/`; archive task A6 deletes it with the legacy reader.
-    LegacyDailyBars,
 }
 
 /// The partitions a study read, by session with the entity tag of the version read, and every trading session in the
@@ -386,7 +384,7 @@ mod tests {
         use strum::IntoEnumIterator;
         assert_eq!(
             DatasetLeg::iter().map(<&str>::from).collect::<Vec<_>>(),
-            ["massive_daily_bars", "legacy_daily_bars"]
+            ["massive_daily_bars"]
         );
         for leg in DatasetLeg::iter() {
             let stored = serde_json::to_value(leg).unwrap();

@@ -75,26 +75,6 @@ impl FlatFileDataset {
             Self::Trades => Key::RawTrades { provider, session },
         }
     }
-
-    /// The legacy archiver's copy of the same file; archive task A6 deletes it once every session is verified.
-    pub fn legacy_path(self, session: SessionDate) -> String {
-        format!(
-            "{}{}/data.csv.gz",
-            self.legacy_prefix(),
-            crate::common::storage::date_partition(session)
-        )
-    }
-
-    /// The prefix every session of the legacy archiver's copies shares.
-    pub fn legacy_prefix(self) -> String {
-        let segment = match self {
-            Self::DailyBars => "day_aggs",
-            Self::MinuteBars => "minute_aggs",
-            Self::Quotes => "quotes",
-            Self::Trades => "trades",
-        };
-        format!("data/raw/massive/equity/{segment}/schema=v1/")
-    }
 }
 
 /// One file Massive serves, with its length in bytes.
@@ -686,31 +666,26 @@ mod tests {
                 FlatFileDataset::DailyBars,
                 "us_stocks_sip/day_aggs_v1/2021/08/2021-08-23.csv.gz",
                 "data/equity/stage=raw/bars/provider=massive/interval=one_day/year=2021/month=08/day=23/data.csv.gz",
-                "data/raw/massive/equity/day_aggs/schema=v1/year=2021/month=08/day=23/data.csv.gz",
             ),
             (
                 FlatFileDataset::MinuteBars,
                 "us_stocks_sip/minute_aggs_v1/2021/08/2021-08-23.csv.gz",
                 "data/equity/stage=raw/bars/provider=massive/interval=one_minute/year=2021/month=08/day=23/data.csv.gz",
-                "data/raw/massive/equity/minute_aggs/schema=v1/year=2021/month=08/day=23/data.csv.gz",
             ),
             (
                 FlatFileDataset::Quotes,
                 "us_stocks_sip/quotes_v1/2021/08/2021-08-23.csv.gz",
                 "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz",
-                "data/raw/massive/equity/quotes/schema=v1/year=2021/month=08/day=23/data.csv.gz",
             ),
             (
                 FlatFileDataset::Trades,
                 "us_stocks_sip/trades_v1/2021/08/2021-08-23.csv.gz",
                 "data/equity/stage=raw/trades/provider=massive/year=2021/month=08/day=23/data.csv.gz",
-                "data/raw/massive/equity/trades/schema=v1/year=2021/month=08/day=23/data.csv.gz",
             ),
         ];
-        for (dataset, vendor, ours, legacy) in cases {
+        for (dataset, vendor, ours) in cases {
             assert_eq!(dataset.path(session()), vendor);
             assert_eq!(dataset.key(session()).path(), ours);
-            assert_eq!(dataset.legacy_path(session()), legacy);
         }
     }
 

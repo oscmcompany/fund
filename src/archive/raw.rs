@@ -18,12 +18,6 @@ use super::{Archive, ArchiveError, Tag};
 use crate::common::storage::{Key, StorageClass};
 use crate::ingest::flat_files::{FlatFileDataset, FlatFileError, FlatFiles, Listed};
 
-/// The legacy archiver's roots, the only objects `get_legacy_at` reads.
-const LEGACY_READABLE_ROOTS: [&str; 2] = ["data/derived/", "data/raw/"];
-
-/// The legacy archiver's raw copies, the only objects `delete_legacy_at` may remove.
-const LEGACY_RAW_ROOT: &str = "data/raw/massive/equity/";
-
 /// The largest quote file, about 19 GB, is under three hundred parts of this size.
 const PART_LENGTH: u64 = 64 * 1024 * 1024;
 
@@ -276,55 +270,7 @@ impl Archive {
 
     /// What is stored under `key`, read from its metadata alone, so a Deep Archive object needs no restore.
     pub async fn stored(&self, key: &Key) -> Result<Option<Stored>, ArchiveError> {
-        self.stored_at(key.path()).await
-    }
-
-    /// The legacy object at `path`, read only under the legacy roots; archive task A6 deletes this with them.
-    pub async fn get_legacy_at(&self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
-        if !LEGACY_READABLE_ROOTS
-            .iter()
-            .any(|root| path.starts_with(root))
-        {
-            return Err(ArchiveError::Get {
-                path: path.to_string(),
-                reason: format!("only objects under {LEGACY_READABLE_ROOTS:?} are read here"),
-            });
-        }
-        Ok(self
-            .get_tagged_at(path.to_string())
-            .await?
-            .map(|(bytes, _)| bytes))
-    }
-
-    /// Deletes the legacy raw object at `path`, only while it is still the version `tag` names when one is given;
-    /// archive task A6 deletes this with the last of them.
-    pub async fn delete_legacy_at(
-        &self,
-        path: &str,
-        tag: Option<&Tag>,
-    ) -> Result<(), ArchiveError> {
-        if !path.starts_with(LEGACY_RAW_ROOT) {
-            return Err(ArchiveError::Delete {
-                path: path.to_string(),
-                reason: format!("only objects under {LEGACY_RAW_ROOT} may be deleted here"),
-            });
-        }
-        self.s3_client
-            .delete_object()
-            .bucket(&self.bucket_name)
-            .key(path)
-            .set_if_match(tag.map(|tag| tag.as_str().to_string()))
-            .send()
-            .await
-            .map_err(|error| ArchiveError::Delete {
-                path: path.to_string(),
-                reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
-            })?;
-        Ok(())
-    }
-
-    /// `stored` by raw path, for the legacy raw copies no `Key` names; archive task A6 deletes it with them.
-    pub async fn stored_at(&self, path: String) -> Result<Option<Stored>, ArchiveError> {
+        let path = key.path();
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
             reason,
@@ -506,28 +452,6 @@ mod tests {
                 (2, 64 * MEBIBYTE, 64 * MEBIBYTE),
                 (3, 128 * MEBIBYTE, 1),
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_only_a_legacy_raw_path_may_be_deleted() {
-        let configuration = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .build();
-        let archive = Archive {
-            s3_client: aws_sdk_s3::Client::from_conf(configuration),
-            bucket_name: "unused".to_string(),
-        };
-        let path =
-            "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz";
-        assert_eq!(
-            archive.delete_legacy_at(path, None).await,
-            Err(ArchiveError::Delete {
-                path: path.to_string(),
-                reason: "only objects under data/raw/massive/equity/ may be deleted here"
-                    .to_string(),
-            })
         );
     }
 }

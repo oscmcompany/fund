@@ -2,7 +2,6 @@
 //! experiment it reports, then merges the journal into the records bucket.
 
 pub mod dataset;
-pub mod legacy;
 pub mod replay;
 
 use std::io;

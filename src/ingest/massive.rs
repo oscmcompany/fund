@@ -30,7 +30,7 @@ const EXCHANGE_TEST_TICKERS: [&str; 34] = [
     "ZZZTS", "ZZZTT", "ZZZTX",
 ];
 
-/// Whether `ticker` is an exchange test ticker; the legacy reader shares it until archive task A6 deletes that reader.
+/// Whether `ticker` is an exchange test ticker, which the flat files print too.
 pub(crate) fn is_exchange_test_ticker(ticker: &str) -> bool {
     EXCHANGE_TEST_TICKERS.contains(&ticker)
 }
@@ -213,18 +213,28 @@ pub struct Splits {
 }
 
 impl Splits {
-    /// The table with every action listed more than once refused, each copy, since nothing says which is true.
+    /// The table with one copy of an action Massive lists more than once identically; copies that disagree, or a copy
+    /// beside one refused, refuse every copy, since nothing says which is true.
     fn unique(self) -> Self {
         let listed = self.listed;
-        let (splits, repeated): (Vec<Split>, Vec<Split>) = self
-            .splits
-            .into_iter()
-            .partition(|split| listed.get(split.id().as_str()) == Some(&1));
+        let mut copies: BTreeMap<ActionId, Vec<Split>> = BTreeMap::new();
+        for split in self.splits {
+            copies.entry(split.id().clone()).or_default().push(split);
+        }
+        let mut splits = Vec::new();
         let mut refused = self.refused;
-        refused.extend(repeated.into_iter().map(|split| RefusedRow {
-            ticker: split.symbol().as_str().to_string(),
-            cause: RowRefusal::Duplicate,
-        }));
+        for (id, mut copies) in copies {
+            let whole = listed.get(id.as_str()) == Some(&copies.len());
+            if whole && copies.windows(2).all(|pair| pair[0] == pair[1]) {
+                copies.truncate(1);
+                splits.extend(copies);
+            } else {
+                refused.extend(copies.into_iter().map(|split| RefusedRow {
+                    ticker: split.symbol().as_str().to_string(),
+                    cause: RowRefusal::Duplicate,
+                }));
+            }
+        }
         Self {
             splits,
             refused,
@@ -901,18 +911,34 @@ mod tests {
             parse_splits_page(last.as_bytes(), &mut Splits::default()),
             Ok(None)
         );
-        // The same page read twice, as a cursor revisiting rows would: every repeated action is refused.
+        // The same page read twice, as Massive lists CTPVF's 2024-04-29 split twice: identical copies are one action.
         parse_splits_page(SPLITS_PAGE.as_bytes(), &mut splits).unwrap();
         let unique = splits.unique();
-        assert!(unique.splits().is_empty());
-        assert_eq!(
+        let mut kept: Vec<&str> = unique
+            .splits()
+            .iter()
+            .map(|split| split.symbol().as_str())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["DPU", "VSEAX"]);
+        assert!(
             unique
                 .refused()
                 .iter()
-                .filter(|row| row.cause() == &RowRefusal::Duplicate)
-                .count(),
-            4
+                .all(|row| row.cause() != &RowRefusal::Duplicate)
         );
+        // Two copies that disagree on the ratio: nothing says which is true, so neither is kept.
+        let conflicting = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":40,"split_to":1,"ticker":"DPU"}],"next_url":null}"#;
+        let mut splits = Splits::default();
+        parse_splits_page(conflicting.as_bytes(), &mut splits).unwrap();
+        let unique = splits.unique();
+        assert!(unique.splits().is_empty());
+        let causes: Vec<&str> = unique
+            .refused()
+            .iter()
+            .map(|row| row.cause().into())
+            .collect();
+        assert_eq!(causes, ["duplicate", "duplicate"]);
     }
 
     #[test]
