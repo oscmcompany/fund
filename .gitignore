@@ -24,6 +24,12 @@ data/*
 .scratchpad/
 /studies/src/bin/
 /journal/
+playbook*.toml
+capital_flows.toml
+*.parquet
+*.csv.gz
+*.jsonl
+*.safetensors
 .devenv
 .env
 .understand-anything

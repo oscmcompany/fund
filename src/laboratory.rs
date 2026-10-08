@@ -1,6 +1,7 @@
 //! Loads what studies read and catalogs what they do: a `Study` journals every dataset its loaders read and every
 //! experiment it reports, then merges the journal into the records bucket.
 
+pub mod compare;
 pub mod dataset;
 pub mod replay;
 

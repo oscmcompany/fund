@@ -9,6 +9,15 @@ in {
   };
 
   git-hooks.hooks = {
+    check-private-files = {
+      enable = true;
+      name = "Check no private file is tracked";
+      entry = "check-private-files";
+      always_run = true;
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
     check-rust = {
       enable = true;
       name = "Check all Rust code";
@@ -177,6 +186,10 @@ in {
     echo "Nix checks completed successfully"
   '';
 
+  scripts.check-private-files.exec = ''
+    "$DEVENV_ROOT/check-private-files" "$@"
+  '';
+
   scripts.start-duckdb.exec = ''
     set -euo pipefail
     cd "$DEVENV_ROOT"
@@ -217,6 +230,7 @@ in {
     "checks:yaml".exec = "check-yaml";
     "checks:toml".exec = "check-toml";
     "checks:nix".exec = "check-nix";
+    "checks:private".exec = "check-private-files";
 
     "checks:base" = {
       exec = ''
@@ -227,6 +241,7 @@ in {
         "checks:markdown"
         "checks:yaml"
         "checks:toml"
+        "checks:private"
       ];
     };
 
@@ -254,7 +269,7 @@ in {
       echo "    checks:rust                 All Rust checks (format, lint,"
       echo "                                test with coverage, unused-deps)"
       echo "    checks:base                 Non-language checks (nix, markdown,"
-      echo "                                yaml, toml)"
+      echo "                                yaml, toml, private files)"
       echo "    checks:all                  All checks combined"
       echo ""
       echo "  Scripts:"

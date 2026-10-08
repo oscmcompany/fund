@@ -2,11 +2,13 @@
 //! decision interval and the opening cash among its parameters.
 
 use crate::common::book::{Book, Cash};
+use crate::common::laboratory::estimate::EstimateRefusal;
 use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs, Parameters};
+use crate::common::laboratory::series::SeriesRefusal;
 use crate::common::market::DollarVolume;
 use crate::common::market::record::BarInterval;
 use crate::common::monoid::Monoid;
-use crate::common::replay::{Replay, ReplayRefusal, Replayer};
+use crate::common::replay::{FillModel, Replay, ReplayRefusal, Replayer};
 use crate::common::strategy::Strategy;
 use crate::laboratory::dataset::Dataset;
 use crate::laboratory::{Study, StudyError};
@@ -26,6 +28,8 @@ pub enum ReplayStudyError {
         name: String,
     },
     Replay(ReplayRefusal),
+    Series(SeriesRefusal),
+    Estimate(EstimateRefusal),
     Experiment(ExperimentRefusal),
     Study(StudyError),
 }
@@ -53,6 +57,8 @@ impl std::fmt::Display for ReplayStudyError {
                 )
             }
             Self::Replay(refusal) => write!(formatter, "the replay was refused: {refusal:?}"),
+            Self::Series(refusal) => write!(formatter, "the returns were refused: {refusal}"),
+            Self::Estimate(refusal) => write!(formatter, "the estimate was refused: {refusal}"),
             Self::Experiment(refusal) => write!(formatter, "the experiment was refused: {refusal}"),
             Self::Study(error) => write!(formatter, "{error}"),
         }
@@ -69,6 +75,67 @@ pub fn replay<S: Strategy>(
     opening: Cash,
     parameters: &Parameters,
 ) -> Result<Replay, ReplayStudyError> {
+    let own = settings(replayer.fill_model(), replayer.decision(), opening);
+    let parameters = beside(
+        parameters
+            .settings()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.clone())),
+        own,
+    )?;
+    let replay = run(dataset, replayer, opening)?;
+    let outputs = metrics(&replay, opening)
+        .into_iter()
+        .try_fold(Outputs::default(), |outputs, (name, value)| {
+            outputs.metric(name, value)
+        })
+        .map_err(ReplayStudyError::Experiment)?;
+    study
+        .experiment(parameters, &[dataset], outputs)
+        .map_err(ReplayStudyError::Study)?;
+    Ok(replay)
+}
+
+/// The settings every replay journals itself: the decision interval, the fill model and the opening cash.
+pub(crate) fn settings(
+    fill_model: FillModel,
+    decision: BarInterval,
+    opening: Cash,
+) -> [(&'static str, String); 4] {
+    [
+        ("decision_interval", decision.to_string()),
+        ("fill_style", fill_model.style().to_string()),
+        ("opening_cash_units", opening.units().to_string()),
+        (
+            "quoted_spread_basis_points",
+            fill_model.quoted_spread().value().to_string(),
+        ),
+    ]
+}
+
+/// `settings` with the replay's `own`, refused where one of them names an `own` setting.
+pub(crate) fn beside<'a>(
+    settings: impl IntoIterator<Item = (&'a str, String)>,
+    own: [(&'static str, String); 4],
+) -> Result<Parameters, ReplayStudyError> {
+    let settings: Vec<(&str, String)> = settings.into_iter().collect();
+    if let Some((name, _)) = own
+        .iter()
+        .find(|(name, _)| settings.iter().any(|(setting, _)| setting == name))
+    {
+        return Err(ReplayStudyError::ReservedParameter {
+            name: name.to_string(),
+        });
+    }
+    Parameters::new(settings.into_iter().chain(own)).map_err(ReplayStudyError::Experiment)
+}
+
+/// Replays the whole of `dataset` from a book funded with `opening`, refused where it could only misreport.
+pub(crate) fn run<S: Strategy>(
+    dataset: &Dataset,
+    replayer: &Replayer<S>,
+    opening: Cash,
+) -> Result<Replay, ReplayStudyError> {
     if opening.units() <= 0 {
         return Err(ReplayStudyError::Unfunded { opening });
     }
@@ -77,44 +144,15 @@ pub fn replay<S: Strategy>(
     if !bars.clone().any(|bar| bar.interval() == decision) {
         return Err(ReplayStudyError::NoDecisionBars { decision });
     }
-    let fill_model = replayer.fill_model();
-    let own = [
-        ("decision_interval", decision.to_string()),
-        ("fill_style", fill_model.style().to_string()),
-        ("opening_cash_units", opening.units().to_string()),
-        (
-            "quoted_spread_basis_points",
-            fill_model.quoted_spread().value().to_string(),
-        ),
-    ];
-    if let Some((name, _)) = own
-        .iter()
-        .find(|(name, _)| parameters.settings().contains_key(*name))
-    {
-        return Err(ReplayStudyError::ReservedParameter {
-            name: name.to_string(),
-        });
-    }
-    let settings = parameters
-        .settings()
-        .iter()
-        .map(|(name, value)| (name.as_str().to_string(), value.clone()))
-        .chain(own.map(|(name, value)| (name.to_string(), value)));
-    let parameters = Parameters::new(settings).map_err(ReplayStudyError::Experiment)?;
-    let replay = replayer
+    Ok(replayer
         .act(Replay::open(Book::funded(opening)), bars.cloned())
         .map_err(ReplayStudyError::Replay)?
-        .finish();
-    let outputs = outputs(&replay, opening).map_err(ReplayStudyError::Experiment)?;
-    study
-        .experiment(parameters, &[dataset], outputs)
-        .map_err(ReplayStudyError::Study)?;
-    Ok(replay)
+        .finish())
 }
 
 /// Counts, dollars traded and paid, and turnover; the final mark's return net and gross of costs only when that mark
 /// was priced, every fill having landed before it.
-fn outputs(replay: &Replay, opening: Cash) -> Result<Outputs, ExperimentRefusal> {
+pub(crate) fn metrics(replay: &Replay, opening: Cash) -> Vec<(&'static str, f64)> {
     let sum = |amounts: Vec<DollarVolume>| {
         amounts
             .into_iter()
@@ -123,28 +161,31 @@ fn outputs(replay: &Replay, opening: Cash) -> Result<Outputs, ExperimentRefusal>
     let costs = sum(replay.fills().iter().map(|fill| fill.cost()).collect());
     let traded = sum(replay.fills().iter().map(|fill| fill.notional()).collect());
     let unpriced = replay.marks().values().filter(|mark| mark.is_err()).count();
-    let mut outputs = Outputs::default()
-        .metric("fills", replay.fills().len() as f64)?
-        .metric("unfilled", replay.unfilled().len() as f64)?
-        .metric("marks", replay.marks().len() as f64)?
-        .metric("marks_unpriced", unpriced as f64)?
-        .metric("costs_dollars", costs.dollars())?
-        .metric("traded_dollars", traded.dollars())?;
-    outputs = outputs.metric("turnover", traded.dollars() / opening.dollars())?;
+    let mut metrics = vec![
+        ("fills", replay.fills().len() as f64),
+        ("unfilled", replay.unfilled().len() as f64),
+        ("marks", replay.marks().len() as f64),
+        ("marks_unpriced", unpriced as f64),
+        ("costs_dollars", costs.dollars()),
+        ("traded_dollars", traded.dollars()),
+        ("turnover", traded.dollars() / opening.dollars()),
+    ];
     match replay.marks().last_key_value() {
         Some((_, Ok(last))) => {
             // The gain is taken in exact units first, so only the ratio rounds.
             let gain = last.units() - opening.units();
             let paid = i128::try_from(costs.units()).expect("costs fit i128");
-            outputs
-                .metric("net_return", gain as f64 / opening.units() as f64)?
-                .metric(
+            metrics.extend([
+                ("net_return", gain as f64 / opening.units() as f64),
+                (
                     "gross_return",
                     (gain + paid) as f64 / opening.units() as f64,
-                )
+                ),
+            ]);
         }
-        Some((_, Err(_))) | None => Ok(outputs),
+        Some((_, Err(_))) | None => {}
     }
+    metrics
 }
 
 #[cfg(test)]
@@ -158,7 +199,6 @@ mod tests {
     use crate::common::market::record::BarInterval;
     use crate::common::market::state::MarketState;
     use crate::common::market::{Shares, Symbol};
-    use crate::common::replay::FillModel;
     use crate::common::strategy::Target;
     use crate::laboratory::dataset::tests::dataset;
 
