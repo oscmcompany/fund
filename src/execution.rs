@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use crate::broker::Broker;
 use crate::broker::BrokerError;
 use crate::common::book::{Book, Fill};
-use crate::common::guard::{GuardCause, TradabilityUnread, guard};
+use crate::common::guard::{GuardCause, TradabilityRead, TradabilityUnread, guard};
 use crate::common::journal::Observation;
 use crate::common::market::{Price, Shares, Symbol};
 use crate::common::order::{
@@ -80,7 +80,10 @@ pub enum OrderOutcome {
     Guarded(GuardCause),
     Closed(Option<Fill>),
     Refused,
-    Unresolved(Option<OrderExecution>),
+    Unresolved {
+        client_order_id: ClientOrderId,
+        executed: Option<OrderExecution>,
+    },
 }
 
 /// Execution stopped because the journal refused a write; `outcomes` holds every order already followed, the last
@@ -94,7 +97,8 @@ pub struct JournalFailed {
 /// Sends the orders that take `book` to `target` that the guard passes at `prices`, one at a time, sells
 /// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
 /// overlaps it; `next_sequence` is advanced past every id drawn, so a later call on the same counter cannot repeat one.
-/// A failed tradability read is journaled with its cause and vouches for nothing, so every order is held as unread.
+/// A non-empty tradability read is journaled once, or its failure with its cause, which vouches for nothing, so every
+/// order is held as unread.
 pub async fn execute(
     broker: &impl Broker,
     journal: &mut Journal,
@@ -108,7 +112,14 @@ pub async fn execute(
     let orders = orders(book, target);
     let symbols: Vec<Symbol> = orders.iter().map(|order| order.symbol().clone()).collect();
     let tradability = match broker.tradability(&symbols).await {
-        Ok(tradability) => tradability,
+        Ok(tradability) if tradability.is_empty() => tradability,
+        Ok(tradability) => {
+            let read = TradabilityRead::new(tradability.clone());
+            if let Err(error) = journal.append(Utc::now(), Observation::TradabilityRead(read)) {
+                return Err(JournalFailed { outcomes, error });
+            }
+            tradability
+        }
         Err(error) => {
             let unread = TradabilityUnread::new(BrokerFailure::from(&error));
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityUnread(unread)) {
@@ -139,7 +150,7 @@ pub async fn execute(
         let (observation, outcome) = follow(broker, &request, patience).await;
         let stop = match outcome {
             OrderOutcome::Guarded(_) | OrderOutcome::Closed(_) | OrderOutcome::Refused => false,
-            OrderOutcome::Unresolved(_) => true,
+            OrderOutcome::Unresolved { .. } => true,
         };
         outcomes.push(outcome);
         if let Err(error) = journal.append(Utc::now(), observation) {
@@ -159,13 +170,18 @@ pub enum ReconcileFailed {
     Journal(JournalFailed),
 }
 
-/// What reconciliation found, the orders that closed what the journal did not expect, and the broker's book after
-/// them, which is the book to trade from.
+/// Whether the books agreed, and the broker's book to trade from: as read when they agreed, or after the orders that
+/// closed what the journal did not expect when they diverged.
 #[derive(Debug)]
-pub struct Reconciliation {
-    pub reading: BookReconciled,
-    pub closing: Vec<OrderOutcome>,
-    pub book: Book,
+pub enum Reconciliation {
+    Agreed {
+        book: Book,
+    },
+    Diverged {
+        reading: BookReconciled,
+        closing: Vec<OrderOutcome>,
+        book: Book,
+    },
 }
 
 /// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge tries
@@ -192,11 +208,7 @@ pub async fn reconcile_and_close(
             })
         })?;
     if reading.agrees() {
-        return Ok(Reconciliation {
-            reading,
-            closing: Vec::new(),
-            book: reported,
-        });
+        return Ok(Reconciliation::Agreed { book: reported });
     }
     // Kept only where the journal expected a holding and the broker reports a long one; a short is never ours.
     let kept = Target::new(
@@ -223,7 +235,7 @@ pub async fn reconcile_and_close(
     .await
     .map_err(ReconcileFailed::Journal)?;
     let book = broker.book().await.map_err(ReconcileFailed::Unread)?;
-    Ok(Reconciliation {
+    Ok(Reconciliation::Diverged {
         reading,
         closing,
         book,
@@ -241,7 +253,10 @@ async fn follow(
     let unresolved = |cause: UnresolvedCause, executed: Option<OrderExecution>| {
         (
             Observation::OrderUnresolved(OrderUnresolved::new(id, cause, executed)),
-            OrderOutcome::Unresolved(executed),
+            OrderOutcome::Unresolved {
+                client_order_id: id,
+                executed,
+            },
         )
     };
     // The order may be working from the moment it is sent, so its patience runs from then.
@@ -570,7 +585,9 @@ mod tests {
             OrderOutcome::Closed(fill) => {
                 fill.as_ref().map(|fill| fill.shares().units() / 1_000_000)
             }
-            OrderOutcome::Guarded(_) | OrderOutcome::Refused | OrderOutcome::Unresolved(_) => None,
+            OrderOutcome::Guarded(_) | OrderOutcome::Refused | OrderOutcome::Unresolved { .. } => {
+                None
+            }
         }
     }
 
@@ -607,7 +624,19 @@ mod tests {
             [Some(2)]
         );
         assert_eq!(broker.calls(), ["submit", "order"]);
-        assert_eq!(events, ["order_submitted", "order_closed"]);
+        assert_eq!(
+            events,
+            ["tradability_read", "order_submitted", "order_closed"]
+        );
+    }
+
+    /// A target the book already holds reads no tradability, so nothing is journaled.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_target_already_held_journals_nothing() {
+        let broker = Scripted::new(&[], &[]);
+        let (outcomes, events) = run(&broker, &buying(&[], 1), PATIENT).await;
+        assert_eq!(outcomes, []);
+        assert_eq!(events, Vec::<&str>::new());
     }
 
     /// A refusal is the broker's answer, so the next order still goes out.
@@ -620,6 +649,7 @@ mod tests {
         assert_eq!(
             events,
             [
+                "tradability_read",
                 "order_submitted",
                 "order_refused",
                 "order_submitted",
@@ -637,7 +667,10 @@ mod tests {
             [Some(1)]
         );
         assert_eq!(broker.calls(), ["submit", "order"]);
-        assert_eq!(events, ["order_submitted", "order_closed"]);
+        assert_eq!(
+            events,
+            ["tradability_read", "order_submitted", "order_closed"]
+        );
     }
 
     /// An order that may be working and cannot be found stops the run, so no later order overlaps it.
@@ -649,14 +682,26 @@ mod tests {
         );
         let (outcomes, records) =
             run_journaled(&broker, &buying(&["AAPL", "SPY"], 1), PATIENT).await;
-        assert_eq!(outcomes, [OrderOutcome::Unresolved(None)]);
+        let [
+            OrderOutcome::Unresolved {
+                client_order_id,
+                executed: None,
+            },
+        ] = outcomes.as_slice()
+        else {
+            panic!("expected one unresolved order without an execution: {outcomes:?}");
+        };
+        assert_eq!(
+            last_payload(&records)["client_order_id"],
+            serde_json::json!(client_order_id)
+        );
         assert_eq!(broker.calls(), ["submit", "order"]);
         assert_eq!(
             records
                 .iter()
                 .map(|record| record.observation().event_type())
                 .collect::<Vec<_>>(),
-            ["order_submitted", "order_unresolved"]
+            ["tradability_read", "order_submitted", "order_unresolved"]
         );
         assert_eq!(
             last_payload(&records)["cause"],
@@ -689,7 +734,10 @@ mod tests {
             broker.calls(),
             ["submit", "order", "order", "order", "cancel", "order"]
         );
-        assert_eq!(events, ["order_submitted", "order_closed"]);
+        assert_eq!(
+            events,
+            ["tradability_read", "order_submitted", "order_closed"]
+        );
     }
 
     /// Patience runs from before the submit, so a submit that takes two of three seconds leaves one read before the cancel.
@@ -751,7 +799,10 @@ mod tests {
         let (outcomes, events) = run(&broker, &buying(&["SPY"], 1), PATIENT).await;
         assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
         assert_eq!(broker.calls(), ["submit", "order", "cancel", "order"]);
-        assert_eq!(events, ["order_submitted", "order_closed"]);
+        assert_eq!(
+            events,
+            ["tradability_read", "order_submitted", "order_closed"]
+        );
     }
 
     /// An order that never closes is canceled once, read twenty times, left unresolved with what it executed, and
@@ -767,7 +818,7 @@ mod tests {
             run_journaled(&broker, &buying(&["AAPL", "SPY"], 2), patience).await;
         assert!(matches!(
             outcomes.as_slice(),
-            [OrderOutcome::Unresolved(Some(execution))] if execution.shares() == Shares::whole(1).unwrap()
+            [OrderOutcome::Unresolved { executed: Some(execution), .. }] if execution.shares() == Shares::whole(1).unwrap()
         ));
         let calls = broker.calls();
         assert_eq!(
@@ -780,7 +831,7 @@ mod tests {
                 .iter()
                 .map(|record| record.observation().event_type())
                 .collect::<Vec<_>>(),
-            ["order_submitted", "order_unresolved"]
+            ["tradability_read", "order_submitted", "order_unresolved"]
         );
         assert_eq!(
             last_payload(&records)["cause"],
@@ -798,7 +849,10 @@ mod tests {
             open_for: Duration::ZERO,
         };
         let (outcomes, records) = run_journaled(&broker, &buying(&["SPY"], 1), patience).await;
-        assert_eq!(outcomes, [OrderOutcome::Unresolved(None)]);
+        assert!(matches!(
+            outcomes.as_slice(),
+            [OrderOutcome::Unresolved { executed: None, .. }]
+        ));
         assert_eq!(
             last_payload(&records)["cause"],
             serde_json::json!({"open_past_cancel": {"reads": 20, "last": {"cancel_failed": {"exhausted": {"attempts": 3, "last": "status 503"}}}}})
@@ -835,7 +889,17 @@ mod tests {
         assert_eq!(next_sequence, 1);
         assert_eq!(
             journaled(&directory),
-            ["order_guarded", "order_submitted", "order_closed"]
+            [
+                "tradability_read",
+                "order_guarded",
+                "order_submitted",
+                "order_closed"
+            ]
+        );
+        let read = serde_json::to_value(journal_records(&directory)[0].observation()).unwrap();
+        assert_eq!(
+            read["payload"],
+            serde_json::json!({"readings": {"AAPL": "untradable", "SPY": "fractionable"}})
         );
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -895,9 +959,10 @@ mod tests {
         let book = holding(1_000, &[("SPY", 1_000_000)]);
         *broker.books.lock().unwrap() = VecDeque::from([book.clone()]);
         let (reconciliation, events) = reconciling(&broker, &book).await;
-        assert!(reconciliation.reading.agrees());
-        assert!(reconciliation.closing.is_empty());
-        assert_eq!(reconciliation.book, book);
+        let Reconciliation::Agreed { book: agreed } = reconciliation else {
+            panic!("expected the books to agree: {reconciliation:?}");
+        };
+        assert_eq!(agreed, book);
         assert_eq!(broker.calls(), ["book"]);
         assert_eq!(events, ["book_reconciled"]);
     }
@@ -916,16 +981,22 @@ mod tests {
         let after = holding(1_100, &[("SPY", 2_000_000)]);
         *broker.books.lock().unwrap() = VecDeque::from([reported, after.clone()]);
         let (reconciliation, events) = reconciling(&broker, &expected).await;
-        assert!(!reconciliation.reading.agrees());
-        let gaps: Vec<&str> = reconciliation
-            .reading
+        let Reconciliation::Diverged {
+            reading,
+            closing,
+            book,
+        } = reconciliation
+        else {
+            panic!("expected the books to diverge: {reconciliation:?}");
+        };
+        assert!(!reading.agrees());
+        let gaps: Vec<&str> = reading
             .gaps()
             .iter()
             .map(|gap| gap.symbol().as_str())
             .collect();
         assert_eq!(gaps, ["AAPL", "QQQ", "SPY"]);
-        let closed: Vec<(&str, Side, u64)> = reconciliation
-            .closing
+        let closed: Vec<(&str, Side, u64)> = closing
             .iter()
             .filter_map(|outcome| match outcome {
                 OrderOutcome::Closed(Some(fill)) => {
@@ -934,7 +1005,7 @@ mod tests {
                 OrderOutcome::Closed(None)
                 | OrderOutcome::Guarded(_)
                 | OrderOutcome::Refused
-                | OrderOutcome::Unresolved(_) => None,
+                | OrderOutcome::Unresolved { .. } => None,
             })
             .collect();
         assert_eq!(
@@ -944,12 +1015,13 @@ mod tests {
                 ("QQQ", Side::Buy, 1_000_000)
             ]
         );
-        assert_eq!(reconciliation.book, after);
+        assert_eq!(book, after);
         assert_eq!(broker.calls(), ["book", "submit", "submit", "book"]);
         assert_eq!(
             events,
             [
                 "book_reconciled",
+                "tradability_read",
                 "order_submitted",
                 "order_closed",
                 "order_submitted",
@@ -1069,6 +1141,10 @@ mod tests {
                 | Observation::TargetDecided(_)
                 | Observation::SessionOpened(_)
                 | Observation::BarBuilt(_)
+                | Observation::TradabilityRead(_)
+                | Observation::FeedChanged(_)
+                | Observation::SessionHalted(_)
+                | Observation::SessionClosed(_)
                 | Observation::PlaybookRead(_) => None,
             })
             .unwrap();

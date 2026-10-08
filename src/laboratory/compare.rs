@@ -204,6 +204,10 @@ mod tests {
                         | Observation::TargetDecided(_)
                         | Observation::SessionOpened(_)
                         | Observation::BarBuilt(_)
+                        | Observation::TradabilityRead(_)
+                        | Observation::FeedChanged(_)
+                        | Observation::SessionHalted(_)
+                        | Observation::SessionClosed(_)
                         | Observation::PlaybookRead(_) => {}
                     },
                     ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),

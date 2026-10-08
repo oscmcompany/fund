@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::book::{Book, Cash, Position};
-use crate::common::guard::{OrderGuarded, TradabilityUnread};
+use crate::common::guard::{OrderGuarded, TradabilityRead, TradabilityUnread};
 use crate::common::heal::{Leg, SessionOutcome, Window};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
@@ -19,6 +19,7 @@ use crate::common::parameter::Parameter;
 use crate::common::playbook::PlaybookRead;
 use crate::common::reconcile::BookReconciled;
 use crate::common::risk::TargetDecided;
+use crate::common::standing::{FeedChanged, SessionClosed, SessionHalted};
 use crate::common::time::SessionDate;
 
 /// Stamped on every record this build writes; it only goes up, and a reader maps old versions forward.
@@ -192,12 +193,16 @@ pub enum Observation {
     OrderRefused(OrderRefused),
     OrderUnresolved(OrderUnresolved),
     OrderGuarded(OrderGuarded),
+    TradabilityRead(TradabilityRead),
     TradabilityUnread(TradabilityUnread),
     BookReconciled(BookReconciled),
     TargetDecided(TargetDecided),
     SessionOpened(SessionOpened),
     BarBuilt(BarBuilt),
     PlaybookRead(PlaybookRead),
+    FeedChanged(FeedChanged),
+    SessionHalted(SessionHalted),
+    SessionClosed(SessionClosed),
 }
 
 impl Observation {
@@ -599,7 +604,7 @@ mod tests {
     #[test]
     fn test_the_order_records_encode_to_their_wire_format() {
         use crate::common::book::{Book, Cash, Position, ValuationRefusal};
-        use crate::common::guard::{Tradability, TradabilityUnread, guard};
+        use crate::common::guard::{Tradability, TradabilityRead, TradabilityUnread, guard};
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
             BrokerFailure, ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused,
@@ -669,6 +674,7 @@ mod tests {
             )),
             Observation::OrderGuarded(guarded),
             Observation::OrderGuarded(below),
+            Observation::TradabilityRead(TradabilityRead::new(whole_only.clone())),
             Observation::TradabilityUnread(TradabilityUnread::new(BrokerFailure::Exhausted {
                 attempts: 3,
                 last: "timed out".to_string(),
@@ -745,6 +751,7 @@ mod tests {
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"DIA","side":"buy","shares":19,"cause":{"below_minimum":{"price":470000000}}}}"#.to_string(),
+                r#"{"event_type":"tradability_read","payload":{"readings":{"VWDRY":"whole_shares_only"}}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":{"exhausted":{"attempts":3,"last":"timed out"}}}}"#.to_string(),
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),
@@ -898,6 +905,108 @@ mod tests {
                     r#""report":{"status":{"closed":"filled"},"executed":{"shares":1000000,"average_price":1000000},"#,
                     r#""at":"2026-10-06T14:00:00Z"}}}}"#
                 )),
+            ]
+        );
+        for (observation, payload) in observations.iter().zip(&payloads) {
+            assert_eq!(
+                &serde_json::from_str::<Observation>(payload).unwrap(),
+                observation
+            );
+        }
+    }
+
+    /// Every record of a session's standing, each cause and ending among them, pinned so a rename shows up as a changed
+    /// wire format.
+    #[test]
+    fn test_the_standing_records_encode_to_their_wire_format() {
+        use crate::common::order::{BrokerFailure, ClientOrderId};
+        use crate::common::standing::{
+            FeedChanged, FeedContinuity, FeedTransition, HaltCause, SessionClosed, SessionEnding,
+            SessionHalted,
+        };
+
+        let changes = [
+            (FeedContinuity::Whole, FeedTransition::Lost),
+            (
+                FeedContinuity::Interrupted,
+                FeedTransition::Reopened { attempts: 2 },
+            ),
+            (
+                FeedContinuity::Reopened,
+                FeedTransition::Backfilled {
+                    since: "2026-10-07T14:04:00Z".parse().unwrap(),
+                    fresh: 3,
+                },
+            ),
+        ]
+        .map(|(from, transition)| FeedChanged::of(from, transition).unwrap());
+        let causes = [
+            HaltCause::JournalRefused {
+                error: "disk full".to_string(),
+            },
+            HaltCause::ReconcileUnread(BrokerFailure::NotPaper),
+            HaltCause::Diverged,
+            HaltCause::Unresolved {
+                client_order_id: ClientOrderId::new(RunId::new(Uuid::from_u128(2)), 7),
+            },
+        ];
+        let endings = [
+            SessionEnding::NoSession,
+            SessionEnding::ToTheClose,
+            SessionEnding::HeldAtTheClose { positions: 2 },
+            SessionEnding::Halted,
+            SessionEnding::StoppedBeforeTheOpen,
+            SessionEnding::StoppedTrading,
+        ];
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
+        let observations: Vec<Observation> = changes
+            .into_iter()
+            .map(Observation::FeedChanged)
+            .chain(
+                causes
+                    .into_iter()
+                    .map(|cause| Observation::SessionHalted(SessionHalted::new(cause))),
+            )
+            .chain(
+                endings
+                    .into_iter()
+                    .map(|ending| Observation::SessionClosed(SessionClosed::new(session, ending))),
+            )
+            .collect();
+        let payloads: Vec<String> = observations
+            .iter()
+            .map(|observation| serde_json::to_string(observation).unwrap())
+            .collect();
+        let changed =
+            |payload: &str| format!(r#"{{"event_type":"feed_changed","payload":{payload}}}"#);
+        let halted = |cause: &str| {
+            format!(r#"{{"event_type":"session_halted","payload":{{"cause":{cause}}}}}"#)
+        };
+        let closed = |ending: &str| {
+            format!(
+                r#"{{"event_type":"session_closed","payload":{{"session":"2026-10-07","ending":{ending}}}}}"#
+            )
+        };
+        assert_eq!(
+            payloads,
+            [
+                changed(r#"{"from":"whole","transition":"lost"}"#),
+                changed(r#"{"from":"interrupted","transition":{"reopened":{"attempts":2}}}"#),
+                changed(
+                    r#"{"from":"reopened","transition":{"backfilled":{"since":"2026-10-07T14:04:00Z","fresh":3}}}"#
+                ),
+                halted(r#"{"journal_refused":{"error":"disk full"}}"#),
+                halted(r#"{"reconcile_unread":"not_paper"}"#),
+                halted(r#""diverged""#),
+                halted(
+                    r#"{"unresolved":{"client_order_id":"fund:00000000-0000-0000-0000-000000000002:7"}}"#
+                ),
+                closed(r#""no_session""#),
+                closed(r#""to_the_close""#),
+                closed(r#"{"held_at_the_close":{"positions":2}}"#),
+                closed(r#""halted""#),
+                closed(r#""stopped_before_the_open""#),
+                closed(r#""stopped_trading""#),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {

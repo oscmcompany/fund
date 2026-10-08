@@ -27,6 +27,7 @@ use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
 use fund::common::playbook::{Playbook, PlaybookRead, Played};
+use fund::common::standing::{HaltCause, SessionClosed, SessionEnding};
 use fund::common::storage::{Host, Key, Origin, Provider, Service};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
@@ -37,7 +38,7 @@ use fund::journal::{Journal, built_commit, lock};
 use fund::parameter::log_directory_from_environment;
 use fund::records::{log_file_name, ship, shipped_filter};
 use fund::trader::parameters::Parameters;
-use fund::trader::{Session, last_closes, warm};
+use fund::trader::{Session, Standing, last_closes, warm};
 use uuid::Uuid;
 
 const SERVICE: &str = "trader";
@@ -144,6 +145,8 @@ async fn main() -> ExitCode {
             }
         };
         let traded = trade(&parameters, strategy, &archive, &mut journal, today).await;
+        let closed = SessionClosed::new(today, ending(&traded));
+        let journaled = journal.append(Utc::now(), Observation::SessionClosed(closed));
         let outcome = match traded {
             Ok(Ran::NoSession) => {
                 tracing::info!(%today, "No session today");
@@ -153,8 +156,8 @@ async fn main() -> ExitCode {
                 tracing::info!("Session ran to the close");
                 ExitCode::SUCCESS
             }
-            Ok(Ran::Halted) => {
-                tracing::error!("Session halted");
+            Ok(Ran::Halted(cause)) => {
+                tracing::error!(?cause, "Session halted");
                 ExitCode::FAILURE
             }
             Ok(Ran::HeldAtTheClose { positions }) => {
@@ -168,6 +171,17 @@ async fn main() -> ExitCode {
             Err(Stopped::Trading(reason)) => {
                 tracing::error!(reason, "Session stopped");
                 ExitCode::FAILURE
+            }
+        };
+        let outcome = match journaled {
+            Ok(()) => outcome,
+            Err(error) => {
+                tracing::error!(%error, "Session close was not journaled");
+                if outcome == ExitCode::SUCCESS {
+                    ExitCode::FAILURE
+                } else {
+                    outcome
+                }
             }
         };
         // Shipped whatever the session did, since a failed session's records are the ones most worth reading.
@@ -204,7 +218,7 @@ enum Ran {
     NoSession,
     /// Ran to the close and the account held nothing there.
     ToTheClose,
-    Halted,
+    Halted(HaltCause),
     /// Ran to the close but the account still held positions, as when a tape gap kept the session from going flat.
     HeldAtTheClose {
         positions: usize,
@@ -215,6 +229,20 @@ enum Ran {
 enum Stopped {
     BeforeTheOpen(String),
     Trading(String),
+}
+
+/// How a session ended, as journaled; a halt's cause is journaled when it happens, and a stop's reason is logged.
+fn ending(traded: &Result<Ran, Stopped>) -> SessionEnding {
+    match traded {
+        Ok(Ran::NoSession) => SessionEnding::NoSession,
+        Ok(Ran::ToTheClose) => SessionEnding::ToTheClose,
+        Ok(Ran::Halted(_)) => SessionEnding::Halted,
+        Ok(Ran::HeldAtTheClose { positions }) => SessionEnding::HeldAtTheClose {
+            positions: *positions,
+        },
+        Err(Stopped::BeforeTheOpen(_)) => SessionEnding::StoppedBeforeTheOpen,
+        Err(Stopped::Trading(_)) => SessionEnding::StoppedTrading,
+    }
 }
 
 /// Reads and journals the playbook, so the session's records name the playbook it traded under.
@@ -324,7 +352,9 @@ async fn trade(
             event = events.recv() => match event {
                 Some(event) => {
                     report(&event);
-                    session.observe(&event);
+                    if let Err(error) = session.observe(Utc::now(), &event, journal) {
+                        break Err(Stopped::Trading(format!("{error:?}")));
+                    }
                 }
                 // The feed never ends, so a closed channel means its task panicked.
                 None => break Err(Stopped::Trading("the feed task ended".to_string())),
@@ -341,8 +371,9 @@ async fn trade(
                 if let Err(error) = session.advance(now, &broker, journal).await {
                     break Err(Stopped::Trading(format!("{error:?}")));
                 }
-                if session.halted() {
-                    break Ok(Ran::Halted);
+                match session.standing() {
+                    Standing::Trading => {}
+                    Standing::Halted(cause) => break Ok(Ran::Halted(cause.clone())),
                 }
             }
         }
@@ -382,7 +413,8 @@ async fn previous_bars(
     Ok((warm(bars, symbols), closes))
 }
 
-/// Logs what the feed reports of its own gaps and of messages it could not read, which the journal does not hold.
+/// Logs what the feed reports of its own gaps, which the session journals only as continuity changes, and of messages
+/// it could not read, which the journal does not hold.
 fn report(event: &FeedEvent) {
     match event {
         FeedEvent::Lost { cause } => tracing::warn!(%cause, "Stream lost"),
