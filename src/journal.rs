@@ -11,6 +11,39 @@ use crate::common::storage::Service;
 use crate::common::time::SessionDate;
 use chrono::{DateTime, Utc};
 
+/// Why a journal's history was not read whole.
+#[derive(Debug)]
+pub enum HistoryError {
+    Io(io::Error),
+    /// A complete record this build cannot read.
+    Unreadable {
+        file: PathBuf,
+        line: usize,
+        cause: UnreadableCause,
+    },
+}
+
+impl std::fmt::Display for HistoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "{error}"),
+            Self::Unreadable { file, line, cause } => write!(
+                formatter,
+                "{} line {line} is a record this build cannot read: {cause:?}",
+                file.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HistoryError {}
+
+impl From<io::Error> for HistoryError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// Writes one run's records.
 pub struct Journal {
     directory: PathBuf,
@@ -59,7 +92,7 @@ impl Journal {
     /// Every record in this journal's directory, from every run, oldest file first. A line that is not JSON is
     /// skipped, since a crash can tear the last line it wrote; a complete record this build cannot read is an error,
     /// so a reader never acts on a history with a record silently missing.
-    pub fn history(&self) -> io::Result<Vec<Record>> {
+    pub fn history(&self) -> Result<Vec<Record>, HistoryError> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&self.directory)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<io::Result<_>>()?;
@@ -79,13 +112,7 @@ impl Journal {
                         ..
                     } => {}
                     ReadLine::Unreadable { line, cause, .. } => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "{} line {line} is a record this build cannot read: {cause:?}",
-                                file.display()
-                            ),
-                        ));
+                        return Err(HistoryError::Unreadable { file, line, cause });
                     }
                 }
             }
@@ -325,8 +352,10 @@ mod tests {
             let before = std::fs::read_to_string(&file).unwrap();
             append(unreadable);
             let error = journal.history().unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{unreadable}");
-            assert!(error.to_string().contains("line 3"), "{error}");
+            assert!(
+                matches!(error, HistoryError::Unreadable { line: 3, .. }),
+                "{unreadable}: {error}"
+            );
             std::fs::write(&file, before).unwrap();
         }
         std::fs::remove_dir_all(&directory).unwrap();

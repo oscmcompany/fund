@@ -13,9 +13,9 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use fund::archive::bars;
-use fund::archive::bars::{EncodeRefusal, Provenance, Subscription, encode};
+use fund::archive::bars::{Provenance, Subscription, encode};
 use fund::archive::raw::CopyError;
-use fund::archive::{Archive, ArchiveError};
+use fund::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use fund::archive::{quote_bars, reference, trade_bars};
 use fund::common::journal::{Commit, RunId};
 use fund::common::market::aggregate::BarRollup;
@@ -442,7 +442,7 @@ enum ParseFailure {
         test_tickers: usize,
         refused: usize,
     },
-    Encode(EncodeRefusal),
+    Encode(bars::EncodeRefusal),
     /// The blocking parse did not finish.
     Interrupted(String),
 }
@@ -712,12 +712,19 @@ fn fold_clients() -> Option<(FlatFiles, Alpaca)> {
 #[derive(Debug)]
 enum FoldFailure {
     Parse(ParseRefusal),
-    Encode(String),
+    Encode(EncodeRefusal),
     Archive(ArchiveError),
     Interrupted(String),
     Empty,
     /// An earlier run wrote different bars under the key, which this run will not replace.
-    Held(String),
+    Held {
+        key: Key,
+    },
+    /// An earlier run wrote the key, and what it holds does not read back as bars.
+    Unreadable {
+        key: Key,
+        refusal: Box<DecodeRefusal>,
+    },
 }
 
 impl std::fmt::Display for FoldFailure {
@@ -728,7 +735,10 @@ impl std::fmt::Display for FoldFailure {
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Interrupted(reason) => write!(formatter, "the fold did not finish: {reason}"),
             Self::Empty => write!(formatter, "nothing the fold could keep fell in the session"),
-            Self::Held(path) => write!(formatter, "{path} already holds different bars"),
+            Self::Held { key } => write!(formatter, "{} already holds different bars", key.path()),
+            Self::Unreadable { key, refusal } => {
+                write!(formatter, "{} held but unreadable: {refusal}", key.path())
+            }
         }
     }
 }
@@ -945,7 +955,7 @@ async fn fold_quotes_one(
     let symbols = files[2].1.len();
     for (key, bars) in files {
         let body = quote_bars::encode(&key, &bars, provenance)
-            .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
+            .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
         create_or_confirm(archive, &key, body, |held| {
             quote_bars::decode(&key, held).map(|(held, _)| held == bars)
         })
@@ -968,7 +978,7 @@ async fn fold_quotes_one(
 
 /// Creates `key`, or, when an interrupted run already wrote it, accepts it only if it holds the same bars, so a
 /// rerun finishes a session's missing files without replacing what it cannot tell is identical.
-async fn create_or_confirm<Refusal: std::fmt::Debug>(
+async fn create_or_confirm<Refusal: Into<DecodeRefusal>>(
     archive: &Archive,
     key: &Key,
     body: Vec<u8>,
@@ -989,10 +999,11 @@ async fn create_or_confirm<Refusal: std::fmt::Debug>(
                     tracing::info!(path, "Kept bars an earlier run wrote identically");
                     Ok(())
                 }
-                Ok(false) => Err(FoldFailure::Held(path)),
-                Err(refusal) => Err(FoldFailure::Encode(format!(
-                    "{path} held but unreadable: {refusal:?}"
-                ))),
+                Ok(false) => Err(FoldFailure::Held { key: key.clone() }),
+                Err(refusal) => Err(FoldFailure::Unreadable {
+                    key: key.clone(),
+                    refusal: Box::new(refusal.into()),
+                }),
             }
         }
         Err(error) => Err(FoldFailure::Archive(error)),
@@ -1031,7 +1042,7 @@ async fn fetch_conditions(
     let key = reference::conditions_key(SessionDate::at(fetched_at));
     let provenance = Provenance::new(Subscription::StocksStarter, fetched_at, run_id, commit);
     let written = reference::encode_conditions(&key, &conditions, &provenance)
-        .map_err(|refusal| format!("{refusal:?}"))
+        .map_err(EncodeRefusal::Reference)
         .map(|body| archive.create(&key, body));
     match written {
         Ok(write) => match write.await {
@@ -1049,7 +1060,7 @@ async fn fetch_conditions(
             }
         },
         Err(refusal) => {
-            tracing::error!(refusal, "Conditions table not encoded");
+            tracing::error!(%refusal, "Conditions table not encoded");
             ExitCode::FAILURE
         }
     }
@@ -1084,8 +1095,8 @@ async fn fold_trades(
 ) -> ExitCode {
     let (conditions_key, conditions) = match reference::latest_conditions(archive).await {
         Ok(latest) => latest,
-        Err(reason) => {
-            tracing::error!(reason, "Conditions table not read");
+        Err(error) => {
+            tracing::error!(%error, "Conditions table not read");
             return ExitCode::FAILURE;
         }
     };
@@ -1174,7 +1185,7 @@ async fn fold_trades_one(
     let symbols = files[2].1.len();
     for (key, bars) in files {
         let body = trade_bars::encode(&key, &bars, provenance)
-            .map_err(|refusal| FoldFailure::Encode(format!("{refusal:?}")))?;
+            .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
         create_or_confirm(archive, &key, body, |held| {
             trade_bars::decode(&key, held).map(|(held, _)| held == bars)
         })
@@ -1213,8 +1224,8 @@ fn massive_bars_key(origin: Origin, interval: BarInterval, session: SessionDate)
 enum RollUpFailure {
     Archive(ArchiveError),
     Missing,
-    Decode(String),
-    Encode(String),
+    Decode(bars::DecodeRefusal),
+    Encode(bars::EncodeRefusal),
     /// The roll-up's task panicked or was canceled before it finished.
     Interrupted(String),
 }
@@ -1224,8 +1235,8 @@ impl std::fmt::Display for RollUpFailure {
         match self {
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Missing => write!(formatter, "the minute bars are gone"),
-            Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal}"),
-            Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal}"),
+            Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal:?}"),
+            Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal:?}"),
             Self::Interrupted(reason) => write!(formatter, "the roll-up did not finish: {reason}"),
         }
     }
@@ -1332,14 +1343,14 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
     let key = massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session);
     let encoded_key = key.clone();
     let (count, body) = tokio::task::spawn_blocking(move || {
-        let (minutes, provenance) = bars::decode(&minute_key, bytes)
-            .map_err(|refusal| RollUpFailure::Decode(format!("{refusal:?}")))?;
+        let (minutes, provenance) =
+            bars::decode(&minute_key, bytes).map_err(RollUpFailure::Decode)?;
         let five_minutes = concatenate(minutes.iter().map(|bar| {
             BarRollup::of(bar, BarInterval::FiveMinute).expect("minutes roll up to five minutes")
         }))
         .into_bars();
         let body = bars::encode(&encoded_key, &five_minutes, &provenance)
-            .map_err(|refusal| RollUpFailure::Encode(format!("{refusal:?}")))?;
+            .map_err(RollUpFailure::Encode)?;
         Ok::<_, RollUpFailure>((five_minutes.len(), body))
     })
     .await
