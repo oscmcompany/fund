@@ -52,7 +52,15 @@ impl DollarLimit {
 
 /// Which of the fund's dollar limits a refusal names.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr, strum::EnumIter,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum Limit {
@@ -398,6 +406,9 @@ mod tests {
     fn test_each_limit_is_named_and_a_refusal_reads_with_its_value() {
         use strum::IntoEnumIterator;
         let names: Vec<&'static str> = Limit::iter().map(Into::into).collect();
+        for limit in Limit::iter() {
+            assert_eq!(limit.to_string().parse(), Ok(limit));
+        }
         assert_eq!(names, ["gross", "per_name", "daily_loss"]);
         let refused = Limits::new(dollars(1), dollars(-2), dollars(1), TimeDelta::zero());
         assert_eq!(
