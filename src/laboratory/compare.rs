@@ -19,7 +19,7 @@ pub struct Arm<S> {
 }
 
 impl<S: Strategy> Arm<S> {
-    /// Named `kind(setting="value",...)`, values quoted and escaped, so two arms of one kind are told apart by their settings in the journal.
+    /// Named `kind("setting"="value",...)`, each quoted and escaped, so two arms of one kind are told apart by their settings in the journal.
     pub fn new(
         strategy: S,
         kind: &str,
@@ -28,7 +28,7 @@ impl<S: Strategy> Arm<S> {
         let settings: Vec<String> = parameters
             .settings()
             .iter()
-            .map(|(name, value)| format!("{}={value:?}", name.as_str()))
+            .map(|(name, value)| format!("{:?}={value:?}", name.as_str()))
             .collect();
         Ok(Self {
             strategy,
@@ -252,7 +252,7 @@ mod tests {
             settings,
             [
                 ("baseline", "flat()"),
-                ("candidate", r#"one_share(symbol="AAPL")"#),
+                ("candidate", r#"one_share("symbol"="AAPL")"#),
                 ("decision_interval", "one_day"),
                 ("fill_style", "aggressive"),
                 ("opening_cash_units", "100000000000000"),
@@ -299,6 +299,26 @@ mod tests {
                 ("candidate_net_return", 0.00995),
             ]
         );
+    }
+
+    /// Settings whose names hold the separators still name a different arm than the settings they mimic.
+    #[test]
+    fn test_settings_that_mimic_others_name_different_arms() {
+        let name = |settings: &[(&str, &str)]| {
+            Arm::new(
+                Flat,
+                "flat",
+                &Parameters::new(settings.iter().copied()).unwrap(),
+            )
+            .unwrap()
+            .name()
+            .as_str()
+            .to_string()
+        };
+        let two = name(&[("a", "x"), ("b", "y")]);
+        let one = name(&[(r#"a="x",b"#, "y")]);
+        assert_eq!(two, r#"flat("a"="x","b"="y")"#);
+        assert_ne!(one, two);
     }
 
     /// A strategy compared with itself differs by exactly nothing in every session, whatever it trades.

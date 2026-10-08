@@ -4,18 +4,28 @@
 # Exits 0 when none is tracked, 3 when any is, and 1 when the check could not be made. Checks the repository given
 # as the argument, or the one holding this script.
 set -euo pipefail
+# Bytes, not characters: under a UTF-8 locale a path that is not valid UTF-8 matches no pattern.
+export LC_ALL=C
 
 repository="${1:-$(dirname "${BASH_SOURCE[0]}")}"
 private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl$|\.safetensors?$|(^|/)capital_flows\.toml$|^journal/|^studies/src/bin/|^\.scratchpad/'
 
-if ! tracked="$(git -C "${repository}" ls-files)"; then
+listing="$(mktemp)"
+trap 'rm -f "${listing}"' EXIT
+# NUL-delimited, since plain output quotes a path with unusual characters and the quote would hide it from a match.
+if ! git -C "${repository}" ls-files -z >"${listing}"; then
   echo "Error: could not list the files git tracks in ${repository}" >&2
   exit 1
 fi
-found="$(grep -E "${private}" <<<"${tracked}" || true)"
-if [[ -n "${found}" ]]; then
+found=()
+while IFS= read -r -d '' path; do
+  if [[ "${path}" =~ ${private} ]]; then
+    found+=("${path}")
+  fi
+done <"${listing}"
+if ((${#found[@]} > 0)); then
   echo "Error: git tracks private files:" >&2
-  echo "${found}" >&2
+  printf '%s\n' "${found[@]}" >&2
   exit 3
 fi
 echo "No private files are tracked"
