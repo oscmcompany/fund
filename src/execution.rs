@@ -1122,7 +1122,10 @@ mod tests {
             [OrderOutcome::Closed(None)],
             "run while the market is closed"
         );
-        assert_eq!(journaled(&directory), ["order_submitted", "order_closed"]);
+        assert_eq!(
+            journaled(&directory),
+            ["tradability_read", "order_submitted", "order_closed"]
+        );
         let closed = journal_records(&directory)
             .into_iter()
             .find_map(|record| match record.observation() {

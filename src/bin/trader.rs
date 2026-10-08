@@ -126,25 +126,16 @@ async fn main() -> ExitCode {
             tracing::error!(%error, "Configuration was not journaled");
             return ExitCode::from(REFUSED_TO_START);
         }
-        let strategy = match read_playbook(&parameters, &mut journal) {
-            Ok(strategy) => strategy,
-            Err(refusal) => {
-                tracing::error!(%refusal, path = %parameters.playbook().display(), "Playbook refused");
-                return ExitCode::from(REFUSED_TO_START);
-            }
-        };
+        // From here every exit runs through the closing step below, so the journal always holds the session's end.
         let sdk_configuration = aws_config::load_from_env().await;
-        let (archive, records) = match (
-            Archive::market_data(&sdk_configuration),
-            Archive::records(&sdk_configuration),
-        ) {
-            (Ok(archive), Ok(records)) => (archive, records),
-            (Err(refusal), _) | (_, Err(refusal)) => {
-                tracing::error!(%refusal, "Client configuration refused");
-                return ExitCode::from(REFUSED_TO_START);
-            }
+        let records = Archive::records(&sdk_configuration);
+        let archive = Archive::market_data(&sdk_configuration);
+        let traded = match (&records, &archive) {
+            (Ok(_), Ok(archive)) => trade(&parameters, archive, &mut journal, today).await,
+            (Err(refusal), _) | (_, Err(refusal)) => Err(Stopped::BeforeTheOpen(format!(
+                "client configuration refused: {refusal}"
+            ))),
         };
-        let traded = trade(&parameters, strategy, &archive, &mut journal, today).await;
         let closed = SessionClosed::new(today, ending(&traded));
         let journaled = journal.append(Utc::now(), Observation::SessionClosed(closed));
         let outcome = match traded {
@@ -183,6 +174,11 @@ async fn main() -> ExitCode {
                     outcome
                 }
             }
+        };
+        let records = match records {
+            Ok(records) => records,
+            // The refusal was logged as the reason the session did not start.
+            Err(_) => return outcome,
         };
         // Shipped whatever the session did, since a failed session's records are the ones most worth reading.
         let shipped = ship(
@@ -261,12 +257,17 @@ fn read_playbook(parameters: &Parameters, journal: &mut Journal) -> Result<Playe
 
 async fn trade(
     parameters: &Parameters,
-    strategy: Played,
     archive: &Archive,
     journal: &mut Journal,
     today: SessionDate,
 ) -> Result<Ran, Stopped> {
     let refused = Stopped::BeforeTheOpen;
+    let strategy = read_playbook(parameters, journal).map_err(|refusal| {
+        refused(format!(
+            "playbook {} refused: {refusal}",
+            parameters.playbook().display()
+        ))
+    })?;
     let http_client = reqwest::Client::new();
     let (tape, account) = match (
         Alpaca::from_environment(http_client.clone()),
