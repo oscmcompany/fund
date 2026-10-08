@@ -929,11 +929,11 @@ mod tests {
                 let price = |ticks| Price::from_ticks(ticks).unwrap();
                 let open_close = open_close.map(|(first, second, open, close)| {
                     let at = |nanoseconds| start + chrono::TimeDelta::nanoseconds(nanoseconds);
-                    OpenClose::new(
-                        StampedPrice::new(at(first.min(second)), price(open)),
-                        StampedPrice::new(at(first.max(second)), price(close)),
-                    )
-                    .unwrap()
+                    let (open, close) = (
+                        StampedPrice::new(at(first), price(open)),
+                        StampedPrice::new(at(second), price(close)),
+                    );
+                    OpenClose::new(open.min(close), open.max(close)).unwrap()
                 });
                 let high_low = high_low.map(|(first, second)| {
                     HighLow::new(price(first.max(second)), price(first.min(second))).unwrap()
