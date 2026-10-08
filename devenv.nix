@@ -4,7 +4,11 @@ in {
   dotenv.enable = true;
 
   languages = {
-    rust.enable = true;
+    # The one pinned toolchain the laptop, CI and a host's rustup all read.
+    rust = {
+      enable = true;
+      toolchainFile = ./rust-toolchain.toml;
+    };
     nix.enable = true;
   };
 
@@ -24,7 +28,7 @@ in {
       // {always_run = true;};
     check-rust =
       hook "Check all Rust code" "rust"
-      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec)\\.toml|views\\.sql|check-views|check-private-files|devenv\\.(nix|lock))$"
+      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|check-views|check-private-files|devenv\\.(nix|lock|yaml))$"
       // {excludes = ["^src_old/"];};
     check-markdown = hook "Check all Markdown code" "markdown" "\\.md$";
     check-yaml = hook "Check all YAML code" "yaml" "\\.(yaml|yml)$";
@@ -54,7 +58,6 @@ in {
     gh
     git
     jq
-    llvmPackages.llvm
     markdownlint-cli
     statix
     taplo
@@ -104,8 +107,6 @@ in {
       exec = ''
         set -euo pipefail
         mkdir -p .coverage_output
-        export LLVM_COV=$(which llvm-cov)
-        export LLVM_PROFDATA=$(which llvm-profdata)
         cargo llvm-cov --lib --bins --tests --all-features \
           --cobertura \
           --output-path .coverage_output/rust.xml
