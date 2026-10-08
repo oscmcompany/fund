@@ -154,7 +154,17 @@ pub enum StreamMessage {
 }
 
 /// A step of opening the stream, named as a refusal awaiting it reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
 pub enum OpeningStep {
     #[strum(serialize = "the socket")]
     Socket,
@@ -695,14 +705,10 @@ mod tests {
     /// Each opening step reads as its refusals named it before it was typed, and only its own message confirms it.
     #[test]
     fn test_each_opening_step_is_named_and_confirmed_by_its_own_message() {
-        let steps = [
-            OpeningStep::Socket,
-            OpeningStep::Connection,
-            OpeningStep::Authentication,
-            OpeningStep::Subscription,
-        ];
+        use strum::IntoEnumIterator;
+        let names: Vec<&str> = OpeningStep::iter().map(Into::into).collect();
         assert_eq!(
-            steps.map(|step| step.to_string()),
+            names,
             [
                 "the socket",
                 "the connection",
@@ -710,6 +716,15 @@ mod tests {
                 "the subscription"
             ]
         );
+        for step in OpeningStep::iter() {
+            assert_eq!(step.to_string().parse(), Ok(step));
+        }
+        let steps = [
+            OpeningStep::Socket,
+            OpeningStep::Connection,
+            OpeningStep::Authentication,
+            OpeningStep::Subscription,
+        ];
         assert_eq!(
             StreamError::TimedOut {
                 awaiting: OpeningStep::Socket
