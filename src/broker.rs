@@ -7,11 +7,12 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::common::book::{Book, Cash, Position, Side};
+use crate::common::book::{Book, Cash, Position};
 use crate::common::guard::Tradability;
-use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
+use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol, SymbolRefusal};
 use crate::common::order::{
-    ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest, OrderStatus,
+    BrokerFailure, ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest,
+    OrderStatus,
 };
 use crate::ingest::FetchError;
 use crate::ingest::alpaca::Alpaca;
@@ -120,9 +121,12 @@ pub enum BrokerError {
         field: &'static str,
         raw: String,
     },
-    /// A status this client does not map, which a caller should treat as unknown rather than guess.
-    UnknownStatus {
-        status: String,
+    /// A position's symbol that is not a ticker.
+    Symbol(SymbolRefusal),
+    /// A status Alpaca documents that this client does not map, which a caller should treat as unknown rather than
+    /// guess.
+    UnmappedStatus {
+        status: AlpacaOrderStatus,
     },
 }
 
@@ -135,12 +139,45 @@ impl std::fmt::Display for BrokerError {
             }
             Self::Fetch(error) => write!(formatter, "{error}"),
             Self::Malformed { field, raw } => write!(formatter, "{field} read `{raw}`"),
-            Self::UnknownStatus { status } => write!(formatter, "unknown order status `{status}`"),
+            Self::Symbol(refusal) => write!(formatter, "{refusal}"),
+            Self::UnmappedStatus { status } => {
+                write!(formatter, "unmapped order status `{status}`")
+            }
         }
     }
 }
 
 impl std::error::Error for BrokerError {}
+
+impl From<&BrokerError> for BrokerFailure {
+    fn from(error: &BrokerError) -> Self {
+        match error {
+            BrokerError::NotPaper => Self::NotPaper,
+            BrokerError::Unanswered { cause } => Self::Unanswered {
+                cause: cause.clone(),
+            },
+            BrokerError::Fetch(FetchError::Refused { status, body }) => Self::Refused {
+                status: *status,
+                body: body.clone(),
+            },
+            BrokerError::Fetch(FetchError::Exhausted { attempts, last }) => Self::Exhausted {
+                attempts: *attempts,
+                last: last.clone(),
+            },
+            BrokerError::Fetch(FetchError::Malformed { reason }) => Self::Unparsed {
+                reason: reason.clone(),
+            },
+            BrokerError::Malformed { field, raw } => Self::Malformed {
+                field: (*field).to_string(),
+                raw: raw.clone(),
+            },
+            BrokerError::Symbol(refusal) => Self::Symbol(refusal.clone()),
+            BrokerError::UnmappedStatus { status } => Self::UnmappedStatus {
+                status: status.to_string(),
+            },
+        }
+    }
+}
 
 impl From<FetchError> for BrokerError {
     fn from(error: FetchError) -> Self {
@@ -160,9 +197,64 @@ struct PositionPayload {
     qty: String,
 }
 
+/// An asset's status as Alpaca documents it; any other string fails to parse.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum AlpacaAssetStatus {
+    Active,
+    Inactive,
+}
+
+/// An order's status as Alpaca documents it; any other string fails to parse.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AlpacaOrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    DoneForDay,
+    Canceled,
+    Expired,
+    Replaced,
+    PendingCancel,
+    PendingReplace,
+    Accepted,
+    PendingNew,
+    AcceptedForBidding,
+    Stopped,
+    Rejected,
+    Suspended,
+    Calculated,
+    Held,
+}
+
 #[derive(Deserialize)]
 struct AssetPayload {
-    status: String,
+    status: AlpacaAssetStatus,
     tradable: bool,
     fractionable: bool,
 }
@@ -170,7 +262,7 @@ struct AssetPayload {
 #[derive(Deserialize)]
 struct OrderPayload {
     id: BrokerOrderId,
-    status: String,
+    status: AlpacaOrderStatus,
     filled_qty: String,
     filled_avg_price: Option<String>,
     updated_at: DateTime<Utc>,
@@ -217,10 +309,7 @@ impl Broker for PaperAccount {
         let body = OrderBody {
             symbol: order.symbol().as_str(),
             qty: units_to_decimal(u128::from(order.shares().units()), SHARE_DIGITS),
-            side: match order.side() {
-                Side::Buy => "buy",
-                Side::Sell => "sell",
-            },
+            side: order.side().into(),
             order_type: "market",
             time_in_force: "day",
             client_order_id: request.client_order_id().to_string(),
@@ -301,21 +390,14 @@ fn asset(outcome: Result<Vec<u8>, FetchError>) -> Result<Tradability, BrokerErro
         Err(error) => return Err(error.into()),
     };
     let payload: AssetPayload = parse(&body)?;
-    match (
-        payload.status.as_str(),
-        payload.tradable,
-        payload.fractionable,
-    ) {
-        ("active", true, true) => Ok(Tradability::Fractionable),
-        ("active", true, false) => Ok(Tradability::WholeSharesOnly),
-        ("active", false, true | false) | ("inactive", true | false, true | false) => {
-            Ok(Tradability::Untradable)
-        }
-        (status, true | false, true | false) => Err(BrokerError::Malformed {
-            field: "status",
-            raw: status.to_string(),
-        }),
-    }
+    Ok(
+        match (payload.status, payload.tradable, payload.fractionable) {
+            (AlpacaAssetStatus::Active, true, true) => Tradability::Fractionable,
+            (AlpacaAssetStatus::Active, true, false) => Tradability::WholeSharesOnly,
+            (AlpacaAssetStatus::Active, false, true | false)
+            | (AlpacaAssetStatus::Inactive, true | false, true | false) => Tradability::Untradable,
+        },
+    )
 }
 
 fn parse<Payload: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<Payload, BrokerError> {
@@ -329,15 +411,17 @@ fn parse<Payload: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<Payload, Bro
 fn book(account: &[u8], positions: &[u8]) -> Result<Book, BrokerError> {
     let account: AccountPayload = parse(account)?;
     let positions: Vec<PositionPayload> = parse(positions)?;
-    let cash = Cash::from_units(decimal(&account.cash, CASH_DIGITS, "cash")?);
+    let cash = Cash::from_units(decimal(
+        &account.cash,
+        CASH_DIGITS,
+        Rounding::Exact,
+        "cash",
+    )?);
     let positions = positions
         .into_iter()
         .map(|position| {
-            let symbol = Symbol::new(&position.symbol).map_err(|_| BrokerError::Malformed {
-                field: "symbol",
-                raw: position.symbol.clone(),
-            })?;
-            let units = decimal(&position.qty, SHARE_DIGITS, "qty")?;
+            let symbol = Symbol::new(&position.symbol).map_err(BrokerError::Symbol)?;
+            let units = decimal(&position.qty, SHARE_DIGITS, Rounding::Exact, "qty")?;
             Ok((symbol, Position::from_units(units)))
         })
         .collect::<Result<Vec<_>, BrokerError>>()?;
@@ -346,8 +430,13 @@ fn book(account: &[u8], positions: &[u8]) -> Result<Book, BrokerError> {
 
 fn broker_order(body: &[u8]) -> Result<BrokerOrder, BrokerError> {
     let payload: OrderPayload = parse(body)?;
-    let status = order_status(&payload.status)?;
-    let filled = decimal(&payload.filled_qty, SHARE_DIGITS, "filled_qty")?;
+    let status = order_status(payload.status)?;
+    let filled = decimal(
+        &payload.filled_qty,
+        SHARE_DIGITS,
+        Rounding::Exact,
+        "filled_qty",
+    )?;
     let filled = u64::try_from(filled).map_err(|_| BrokerError::Malformed {
         field: "filled_qty",
         raw: payload.filled_qty.clone(),
@@ -361,7 +450,12 @@ fn broker_order(body: &[u8]) -> Result<BrokerOrder, BrokerError> {
             });
         }
         (_, Some(raw)) => {
-            let ticks = rounded(raw, PRICE_DIGITS, "filled_avg_price")?;
+            let ticks = decimal(
+                raw,
+                PRICE_DIGITS,
+                Rounding::HalfAwayFromZero,
+                "filled_avg_price",
+            )?;
             let price = i64::try_from(ticks)
                 .ok()
                 .and_then(|ticks| Price::from_ticks(ticks).ok())
@@ -378,48 +472,52 @@ fn broker_order(body: &[u8]) -> Result<BrokerOrder, BrokerError> {
     })
 }
 
-/// Alpaca's statuses, collapsed; `replaced` and anything unlisted is refused, since this client never replaces.
-fn order_status(status: &str) -> Result<OrderStatus, BrokerError> {
+/// Alpaca's statuses, collapsed; `replaced` is refused, since this client never replaces.
+fn order_status(status: AlpacaOrderStatus) -> Result<OrderStatus, BrokerError> {
     match status {
-        "new"
-        | "accepted"
-        | "pending_new"
-        | "accepted_for_bidding"
-        | "partially_filled"
-        | "pending_cancel"
-        | "pending_replace"
-        | "calculated"
-        | "stopped"
-        | "suspended"
-        | "held"
-        | "done_for_day" => Ok(OrderStatus::Open),
-        "filled" => Ok(OrderStatus::Closed(OrderEnding::Filled)),
-        "canceled" => Ok(OrderStatus::Closed(OrderEnding::Canceled)),
-        "expired" => Ok(OrderStatus::Closed(OrderEnding::Expired)),
-        "rejected" => Ok(OrderStatus::Closed(OrderEnding::Rejected)),
-        unknown => Err(BrokerError::UnknownStatus {
-            status: unknown.to_string(),
-        }),
+        AlpacaOrderStatus::New
+        | AlpacaOrderStatus::Accepted
+        | AlpacaOrderStatus::PendingNew
+        | AlpacaOrderStatus::AcceptedForBidding
+        | AlpacaOrderStatus::PartiallyFilled
+        | AlpacaOrderStatus::PendingCancel
+        | AlpacaOrderStatus::PendingReplace
+        | AlpacaOrderStatus::Calculated
+        | AlpacaOrderStatus::Stopped
+        | AlpacaOrderStatus::Suspended
+        | AlpacaOrderStatus::Held
+        | AlpacaOrderStatus::DoneForDay => Ok(OrderStatus::Open),
+        AlpacaOrderStatus::Filled => Ok(OrderStatus::Closed(OrderEnding::Filled)),
+        AlpacaOrderStatus::Canceled => Ok(OrderStatus::Closed(OrderEnding::Canceled)),
+        AlpacaOrderStatus::Expired => Ok(OrderStatus::Closed(OrderEnding::Expired)),
+        AlpacaOrderStatus::Rejected => Ok(OrderStatus::Closed(OrderEnding::Rejected)),
+        AlpacaOrderStatus::Replaced => Err(BrokerError::UnmappedStatus { status }),
     }
 }
 
-/// A signed decimal string as a whole number of `10^-digits`, refused when it holds more digits than that.
-fn decimal(raw: &str, digits: u32, field: &'static str) -> Result<i128, BrokerError> {
-    scaled(raw, digits, false).ok_or_else(|| BrokerError::Malformed {
+/// How a decimal with more digits than kept is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rounding {
+    /// Refused unless every digit past those kept is zero.
+    Exact,
+    /// Rounded half away from zero, for an average that need not sit on the grid.
+    HalfAwayFromZero,
+}
+
+/// A signed decimal string as a whole number of `10^-digits`, refused as `field` when it does not read under `rounding`.
+fn decimal(
+    raw: &str,
+    digits: u32,
+    rounding: Rounding,
+    field: &'static str,
+) -> Result<i128, BrokerError> {
+    scaled(raw, digits, rounding).ok_or_else(|| BrokerError::Malformed {
         field,
         raw: raw.to_string(),
     })
 }
 
-/// As `decimal`, rounding half away from zero past `digits`, for an average that need not sit on the grid.
-fn rounded(raw: &str, digits: u32, field: &'static str) -> Result<i128, BrokerError> {
-    scaled(raw, digits, true).ok_or_else(|| BrokerError::Malformed {
-        field,
-        raw: raw.to_string(),
-    })
-}
-
-fn scaled(raw: &str, digits: u32, round: bool) -> Option<i128> {
+fn scaled(raw: &str, digits: u32, rounding: Rounding) -> Option<i128> {
     let (negative, unsigned) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, raw),
@@ -431,9 +529,6 @@ fn scaled(raw: &str, digits: u32, round: bool) -> Option<i128> {
     }
     let width = usize::try_from(digits).ok()?;
     let (kept, dropped) = fraction.split_at(fraction.len().min(width));
-    if !round && dropped.bytes().any(|byte| byte != b'0') {
-        return None;
-    }
     let mut units = whole.parse::<i128>().ok()?;
     for byte in kept
         .bytes()
@@ -443,9 +538,14 @@ fn scaled(raw: &str, digits: u32, round: bool) -> Option<i128> {
             .checked_mul(10)?
             .checked_add(i128::from(byte - b'0'))?;
     }
-    if round && dropped.bytes().next().is_some_and(|byte| byte >= b'5') {
-        units = units.checked_add(1)?;
-    }
+    let carry = match rounding {
+        Rounding::Exact if dropped.bytes().any(|byte| byte != b'0') => return None,
+        Rounding::Exact => 0,
+        Rounding::HalfAwayFromZero => {
+            i128::from(dropped.bytes().next().is_some_and(|byte| byte >= b'5'))
+        }
+    };
+    units = units.checked_add(carry)?;
     Some(if negative { -units } else { units })
 }
 
@@ -570,34 +670,76 @@ mod tests {
         );
         assert!(book(b"", b"[]").is_err());
         assert!(book(account, b"").is_err());
+        assert!(matches!(
+            book(account, br#"[{"symbol":"spy","qty":"1"}]"#),
+            Err(BrokerError::Symbol(SymbolRefusal::Malformed { raw })) if raw == "spy"
+        ));
+    }
+
+    /// Alpaca's documented names read alike through serde and strum, and nothing else reads.
+    #[test]
+    fn test_the_vendor_statuses_read_by_their_documented_names() {
+        use strum::IntoEnumIterator;
+
+        let orders: Vec<&str> = AlpacaOrderStatus::iter().map(Into::into).collect();
+        assert_eq!(
+            orders,
+            [
+                "new",
+                "partially_filled",
+                "filled",
+                "done_for_day",
+                "canceled",
+                "expired",
+                "replaced",
+                "pending_cancel",
+                "pending_replace",
+                "accepted",
+                "pending_new",
+                "accepted_for_bidding",
+                "stopped",
+                "rejected",
+                "suspended",
+                "calculated",
+                "held",
+            ]
+        );
+        let assets: Vec<&str> = AlpacaAssetStatus::iter().map(Into::into).collect();
+        assert_eq!(assets, ["active", "inactive"]);
+        for status in AlpacaOrderStatus::iter() {
+            let named = format!("\"{status}\"");
+            assert_eq!(
+                serde_json::from_str::<AlpacaOrderStatus>(&named).unwrap(),
+                status
+            );
+            assert_eq!(status.to_string().parse(), Ok(status));
+        }
+        for status in AlpacaAssetStatus::iter() {
+            let named = format!("\"{status}\"");
+            assert_eq!(
+                serde_json::from_str::<AlpacaAssetStatus>(&named).unwrap(),
+                status
+            );
+            assert_eq!(status.to_string().parse(), Ok(status));
+        }
+        assert!(serde_json::from_str::<AlpacaOrderStatus>(r#""Filled""#).is_err());
+        assert!(serde_json::from_str::<AlpacaAssetStatus>(r#""delisted""#).is_err());
     }
 
     #[test]
     fn test_every_status_maps_or_is_refused() {
-        let mapped: Vec<(&str, OrderStatus)> = [
-            "new",
-            "accepted",
-            "pending_new",
-            "accepted_for_bidding",
-            "partially_filled",
-            "pending_cancel",
-            "pending_replace",
-            "calculated",
-            "stopped",
-            "suspended",
-            "held",
-            "filled",
-            "canceled",
-            "expired",
-            "done_for_day",
-            "rejected",
-        ]
-        .into_iter()
-        .map(|status| (status, order_status(status).unwrap()))
-        .filter(|(_, status)| *status != OrderStatus::Open)
-        .collect();
+        use strum::IntoEnumIterator;
+
+        let closed: Vec<(&str, OrderStatus)> = AlpacaOrderStatus::iter()
+            .filter_map(|status| {
+                order_status(status)
+                    .ok()
+                    .map(|mapped| (status.into(), mapped))
+            })
+            .filter(|(_, mapped)| *mapped != OrderStatus::Open)
+            .collect();
         assert_eq!(
-            mapped,
+            closed,
             [
                 ("filled", OrderStatus::Closed(OrderEnding::Filled)),
                 ("canceled", OrderStatus::Closed(OrderEnding::Canceled)),
@@ -605,9 +747,22 @@ mod tests {
                 ("rejected", OrderStatus::Closed(OrderEnding::Rejected)),
             ]
         );
-        assert!(
-            matches!(order_status("replaced"), Err(BrokerError::UnknownStatus { status }) if status == "replaced")
-        );
+        let refused: Vec<&str> = AlpacaOrderStatus::iter()
+            .filter(|status| order_status(*status).is_err())
+            .map(Into::into)
+            .collect();
+        assert_eq!(refused, ["replaced"]);
+        assert!(matches!(
+            order_status(AlpacaOrderStatus::Replaced),
+            Err(BrokerError::UnmappedStatus {
+                status: AlpacaOrderStatus::Replaced
+            })
+        ));
+        let unknown = CANCELED.replace(r#""status":"canceled""#, r#""status":"unheard_of""#);
+        assert!(matches!(
+            broker_order(unknown.as_bytes()),
+            Err(BrokerError::Fetch(FetchError::Malformed { reason })) if reason.contains("unheard_of")
+        ));
     }
 
     /// Assets as the paper account returned them on 2026-10-06, trimmed to the fields read and two beside, and its
@@ -652,37 +807,31 @@ mod tests {
         ));
         assert!(matches!(
             asset(Ok(br#"{"status":"delisted","tradable":false,"fractionable":false}"#.to_vec())),
-            Err(BrokerError::Malformed { field: "status", raw }) if raw == "delisted"
+            Err(BrokerError::Fetch(FetchError::Malformed { reason })) if reason.contains("delisted")
         ));
     }
 
     #[test]
     fn test_decimals_read_exactly_or_are_refused() {
+        let exact = |raw, digits| decimal(raw, digits, Rounding::Exact, "qty");
+        let rounded = |raw, digits| decimal(raw, digits, Rounding::HalfAwayFromZero, "price");
         assert_eq!(
-            decimal("19752.73", CASH_DIGITS, "cash").unwrap(),
+            exact("19752.73", CASH_DIGITS).unwrap(),
             19_752_730_000_000_000
         );
-        assert_eq!(decimal("-5", SHARE_DIGITS, "qty").unwrap(), -5_000_000);
-        assert_eq!(
-            decimal("0.500000000", SHARE_DIGITS, "qty").unwrap(),
-            500_000
-        );
-        assert_eq!(
-            rounded("37.8912345", PRICE_DIGITS, "price").unwrap(),
-            37_891_235
-        );
-        assert_eq!(
-            rounded("37.8912344", PRICE_DIGITS, "price").unwrap(),
-            37_891_234
-        );
-        assert_eq!(rounded("-0.0000005", PRICE_DIGITS, "price").unwrap(), -1);
-        assert_eq!(
-            rounded("9.9999995", PRICE_DIGITS, "price").unwrap(),
-            10_000_000
-        );
-        assert_eq!(rounded("-0.5", 0, "price").unwrap(), -1);
+        assert_eq!(exact("-5", SHARE_DIGITS).unwrap(), -5_000_000);
+        assert_eq!(exact("0.500000000", SHARE_DIGITS).unwrap(), 500_000);
+        assert_eq!(rounded("37.8912345", PRICE_DIGITS).unwrap(), 37_891_235);
+        assert_eq!(rounded("37.8912344", PRICE_DIGITS).unwrap(), 37_891_234);
+        assert_eq!(rounded("0.1234567", SHARE_DIGITS).unwrap(), 123_457);
+        assert_eq!(rounded("-0.0000005", PRICE_DIGITS).unwrap(), -1);
+        assert_eq!(rounded("9.9999995", PRICE_DIGITS).unwrap(), 10_000_000);
+        assert_eq!(rounded("-0.5", 0).unwrap(), -1);
         for raw in ["0.1234567", "", ".5", "1e3", "--1", "1,000", " 1"] {
-            assert!(decimal(raw, SHARE_DIGITS, "qty").is_err(), "{raw}");
+            assert!(
+                matches!(exact(raw, SHARE_DIGITS), Err(BrokerError::Malformed { field: "qty", raw: refused }) if refused == raw),
+                "{raw}"
+            );
         }
         assert_eq!(units_to_decimal(1_500_000, SHARE_DIGITS), "1.5");
         assert_eq!(units_to_decimal(3_000_000, SHARE_DIGITS), "3");
@@ -739,7 +888,7 @@ mod tests {
         #[test]
         fn property_a_quantity_written_reads_back(units in any::<u64>()) {
             let written = units_to_decimal(u128::from(units), SHARE_DIGITS);
-            prop_assert_eq!(decimal(&written, SHARE_DIGITS, "qty").unwrap(), i128::from(units));
+            prop_assert_eq!(decimal(&written, SHARE_DIGITS, Rounding::Exact, "qty").unwrap(), i128::from(units));
         }
     }
 

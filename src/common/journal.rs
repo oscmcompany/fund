@@ -599,8 +599,8 @@ mod tests {
         use crate::common::guard::{Tradability, TradabilityUnread, guard};
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
-            ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused, OrderReport,
-            OrderRequest, OrderState, OrderStatus, OrderUnresolved,
+            BrokerFailure, ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused,
+            OrderReport, OrderRequest, OrderState, OrderStatus, OrderUnresolved, UnresolvedCause,
         };
         use crate::common::reconcile::{reconcile, rounding_allowance};
         use crate::common::risk::{Limits, TargetDecided, risk};
@@ -655,7 +655,10 @@ mod tests {
             )),
             Observation::OrderUnresolved(OrderUnresolved::new(
                 id,
-                "cancel failed".to_string(),
+                UnresolvedCause::OpenPastCancel {
+                    reads: 20,
+                    last: None,
+                },
                 OrderExecution::new(
                     Shares::from_units(500_000),
                     Price::from_ticks(12_400_000).unwrap(),
@@ -663,7 +666,10 @@ mod tests {
             )),
             Observation::OrderGuarded(guarded),
             Observation::OrderGuarded(below),
-            Observation::TradabilityUnread(TradabilityUnread::new("timed out".to_string())),
+            Observation::TradabilityUnread(TradabilityUnread::new(BrokerFailure::Exhausted {
+                attempts: 3,
+                last: "timed out".to_string(),
+            })),
             Observation::BookReconciled(reconcile(
                 &Book::reported(Cash::from_units(1_000), []),
                 &Book::reported(
@@ -732,16 +738,163 @@ mod tests {
                     r#"{{"event_type":"order_refused","payload":{{{id},"status":403,"body":"insufficient buying power"}}}}"#
                 ),
                 format!(
-                    r#"{{"event_type":"order_unresolved","payload":{{{id},"cause":"cancel failed","executed":{{"shares":500000,"average_price":12400000}}}}}}"#
+                    r#"{{"event_type":"order_unresolved","payload":{{{id},"cause":{{"open_past_cancel":{{"reads":20,"last":null}}}},"executed":{{"shares":500000,"average_price":12400000}}}}}}"#
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"DIA","side":"buy","shares":19,"cause":{"below_minimum":{"price":470000000}}}}"#.to_string(),
-                r#"{"event_type":"tradability_unread","payload":{"cause":"timed out"}}"#.to_string(),
+                r#"{"event_type":"tradability_unread","payload":{"cause":{"exhausted":{"attempts":3,"last":"timed out"}}}}"#.to_string(),
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"restrained":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}]}}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#.to_string(),
                 r#"{"event_type":"session_opened","payload":{"session":"2026-10-07","cash":"-7","positions":{"SPY":"2000000"},"opening":"9"}}"#.to_string(),
                 r#"{"event_type":"playbook_read","payload":{"contents":"roll_off_minutes = 5\n"}}"#.to_string(),
+            ]
+        );
+        for (observation, payload) in observations.iter().zip(&payloads) {
+            assert_eq!(
+                &serde_json::from_str::<Observation>(payload).unwrap(),
+                observation
+            );
+        }
+    }
+
+    /// Every cause an unresolved order or an unread tradability journals, pinned so a rename shows up as a changed
+    /// wire format.
+    #[test]
+    fn test_the_order_causes_encode_to_their_wire_format() {
+        use crate::common::guard::TradabilityUnread;
+        use crate::common::market::{Price, Shares, SymbolRefusal};
+        use crate::common::order::{
+            BrokerFailure, ClientOrderId, OrderEnding, OrderExecution, OrderRefusal, OrderReport,
+            OrderStatus, OrderTrouble, OrderUnresolved, UnresolvedCause,
+        };
+
+        let id = ClientOrderId::new(RunId::new(Uuid::from_u128(2)), 7);
+        let shares = |count| Shares::whole(count).unwrap();
+        let failures = [
+            BrokerFailure::NotPaper,
+            BrokerFailure::Unanswered {
+                cause: "status 503".to_string(),
+            },
+            BrokerFailure::Refused {
+                status: 403,
+                body: "forbidden".to_string(),
+            },
+            BrokerFailure::Exhausted {
+                attempts: 3,
+                last: "timed out".to_string(),
+            },
+            BrokerFailure::Unparsed {
+                reason: "EOF".to_string(),
+            },
+            BrokerFailure::Malformed {
+                field: "qty".to_string(),
+                raw: "1e3".to_string(),
+            },
+            BrokerFailure::Symbol(SymbolRefusal::Malformed {
+                raw: "spy".to_string(),
+            }),
+            BrokerFailure::UnmappedStatus {
+                status: "replaced".to_string(),
+            },
+        ];
+        let refusals = [
+            OrderRefusal::ExecutionShrank {
+                held: shares(2),
+                reported: shares(1),
+            },
+            OrderRefusal::Overfilled {
+                ordered: shares(1),
+                reported: shares(2),
+            },
+            OrderRefusal::FilledShort {
+                ordered: shares(2),
+                reported: shares(1),
+            },
+            OrderRefusal::ChangedAfterClosing {
+                ending: OrderEnding::Canceled,
+                executed: None,
+                report: OrderReport::new(
+                    OrderStatus::Closed(OrderEnding::Filled),
+                    OrderExecution::new(shares(1), Price::from_ticks(1_000_000).unwrap()),
+                    "2026-10-06T14:00:00Z".parse().unwrap(),
+                ),
+            },
+        ];
+        let causes =
+            [
+                UnresolvedCause::SubmittedThenUnreadable {
+                    failure: BrokerFailure::NotPaper,
+                },
+                UnresolvedCause::OpenPastCancel {
+                    reads: 20,
+                    last: Some(OrderTrouble::CancelFailed(BrokerFailure::NotPaper)),
+                },
+                UnresolvedCause::OpenPastCancel {
+                    reads: 20,
+                    last: Some(OrderTrouble::Unreadable(BrokerFailure::NotPaper)),
+                },
+            ]
+            .into_iter()
+            .chain(refusals.into_iter().map(|refusal| {
+                UnresolvedCause::OpenPastCancel {
+                    reads: 20,
+                    last: Some(OrderTrouble::ReportRefused(refusal)),
+                }
+            }));
+        let observations: Vec<Observation> =
+            failures
+                .into_iter()
+                .map(|failure| Observation::TradabilityUnread(TradabilityUnread::new(failure)))
+                .chain(causes.map(|cause| {
+                    Observation::OrderUnresolved(OrderUnresolved::new(id, cause, None))
+                }))
+                .collect();
+        let payloads: Vec<String> = observations
+            .iter()
+            .map(|observation| serde_json::to_string(observation).unwrap())
+            .collect();
+        let unread = |cause: &str| {
+            format!(r#"{{"event_type":"tradability_unread","payload":{{"cause":{cause}}}}}"#)
+        };
+        let unresolved = |cause: &str| {
+            format!(
+                r#"{{"event_type":"order_unresolved","payload":{{"client_order_id":"fund:00000000-0000-0000-0000-000000000002:7","cause":{cause},"executed":null}}}}"#
+            )
+        };
+        let past_cancel = |last: &str| {
+            unresolved(&format!(
+                r#"{{"open_past_cancel":{{"reads":20,"last":{last}}}}}"#
+            ))
+        };
+        assert_eq!(
+            payloads,
+            [
+                unread(r#""not_paper""#),
+                unread(r#"{"unanswered":{"cause":"status 503"}}"#),
+                unread(r#"{"refused":{"status":403,"body":"forbidden"}}"#),
+                unread(r#"{"exhausted":{"attempts":3,"last":"timed out"}}"#),
+                unread(r#"{"unparsed":{"reason":"EOF"}}"#),
+                unread(r#"{"malformed":{"field":"qty","raw":"1e3"}}"#),
+                unread(r#"{"symbol":{"malformed":{"raw":"spy"}}}"#),
+                unread(r#"{"unmapped_status":{"status":"replaced"}}"#),
+                unresolved(r#"{"submitted_then_unreadable":{"failure":"not_paper"}}"#),
+                past_cancel(r#"{"cancel_failed":"not_paper"}"#),
+                past_cancel(r#"{"unreadable":"not_paper"}"#),
+                past_cancel(
+                    r#"{"report_refused":{"execution_shrank":{"held":2000000,"reported":1000000}}}"#
+                ),
+                past_cancel(
+                    r#"{"report_refused":{"overfilled":{"ordered":1000000,"reported":2000000}}}"#
+                ),
+                past_cancel(
+                    r#"{"report_refused":{"filled_short":{"ordered":2000000,"reported":1000000}}}"#
+                ),
+                past_cancel(concat!(
+                    r#"{"report_refused":{"changed_after_closing":{"ending":"canceled","executed":null,"#,
+                    r#""report":{"status":{"closed":"filled"},"executed":{"shares":1000000,"average_price":1000000},"#,
+                    r#""at":"2026-10-06T14:00:00Z"}}}}"#
+                )),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {

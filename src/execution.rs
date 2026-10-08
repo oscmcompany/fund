@@ -14,8 +14,8 @@ use crate::common::guard::{GuardCause, TradabilityUnread, guard};
 use crate::common::journal::Observation;
 use crate::common::market::{Price, Shares, Symbol};
 use crate::common::order::{
-    ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest, OrderState,
-    OrderSubmitted, OrderUnresolved,
+    BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
+    OrderState, OrderSubmitted, OrderTrouble, OrderUnresolved, UnresolvedCause,
 };
 use crate::common::reconcile::{Allowance, BookReconciled, reconcile};
 use crate::common::strategy::{Target, orders};
@@ -39,6 +39,13 @@ enum Waiting {
     AfterCancel { reads: u32 },
 }
 
+/// Whether an open order may wait longer before its cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatienceLeft {
+    Remaining,
+    Spent,
+}
+
 /// What to do before the next read of an open order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -47,15 +54,19 @@ enum Action {
 }
 
 impl Waiting {
-    /// The next action and wait once patience has or has not run out; `None` once the reads after a cancel are spent.
-    fn next(self, patience_spent: bool) -> Option<(Action, Self)> {
-        match (self, patience_spent) {
-            (Self::BeforeCancel, false) => Some((Action::Read, self)),
-            (Self::BeforeCancel, true) => {
+    /// The next action and wait given the patience left; `None` once the reads after a cancel are spent.
+    fn next(self, patience: PatienceLeft) -> Option<(Action, Self)> {
+        match (self, patience) {
+            (Self::BeforeCancel, PatienceLeft::Remaining) => Some((Action::Read, self)),
+            (Self::BeforeCancel, PatienceLeft::Spent) => {
                 Some((Action::CancelThenRead, Self::AfterCancel { reads: 1 }))
             }
-            (Self::AfterCancel { reads }, true | false) if reads >= READS_AFTER_CANCEL => None,
-            (Self::AfterCancel { reads }, true | false) => {
+            (Self::AfterCancel { reads }, PatienceLeft::Remaining | PatienceLeft::Spent)
+                if reads >= READS_AFTER_CANCEL =>
+            {
+                None
+            }
+            (Self::AfterCancel { reads }, PatienceLeft::Remaining | PatienceLeft::Spent) => {
                 Some((Action::Read, Self::AfterCancel { reads: reads + 1 }))
             }
         }
@@ -99,7 +110,7 @@ pub async fn execute(
     let tradability = match broker.tradability(&symbols).await {
         Ok(tradability) => tradability,
         Err(error) => {
-            let unread = TradabilityUnread::new(error.to_string());
+            let unread = TradabilityUnread::new(BrokerFailure::from(&error));
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityUnread(unread)) {
                 return Err(JournalFailed { outcomes, error });
             }
@@ -227,7 +238,7 @@ async fn follow(
     patience: Patience,
 ) -> (Observation, OrderOutcome) {
     let id = request.client_order_id();
-    let unresolved = |cause: String, executed: Option<OrderExecution>| {
+    let unresolved = |cause: UnresolvedCause, executed: Option<OrderExecution>| {
         (
             Observation::OrderUnresolved(OrderUnresolved::new(id, cause, executed)),
             OrderOutcome::Unresolved(executed),
@@ -249,10 +260,14 @@ async fn follow(
             | BrokerError::Unanswered { .. }
             | BrokerError::Fetch(FetchError::Exhausted { .. } | FetchError::Malformed { .. })
             | BrokerError::Malformed { .. }
-            | BrokerError::UnknownStatus { .. },
+            | BrokerError::Symbol(_)
+            | BrokerError::UnmappedStatus { .. },
         ) => match broker.order(id).await {
             Ok(order) => order,
-            Err(error) => return unresolved(format!("submitted, then unreadable: {error}"), None),
+            Err(error) => {
+                let failure = BrokerFailure::from(&error);
+                return unresolved(UnresolvedCause::SubmittedThenUnreadable { failure }, None);
+            }
         },
     };
     let order = request.order();
@@ -264,30 +279,32 @@ async fn follow(
         if let Some(report) = report.take() {
             match state.observe(order, report) {
                 Ok(next) => state = next,
-                Err(refusal) => trouble = Some(format!("{refusal:?}")),
+                Err(refusal) => trouble = Some(OrderTrouble::ReportRefused(refusal)),
             }
         }
         if state.closed().is_some() {
             break;
         }
+        let left = match trouble.is_some() || started.elapsed() >= patience.open_for {
+            true => PatienceLeft::Spent,
+            false => PatienceLeft::Remaining,
+        };
         let action;
-        (action, waiting) = match waiting
-            .next(trouble.is_some() || started.elapsed() >= patience.open_for)
-        {
+        (action, waiting) = match waiting.next(left) {
             Some(next) => next,
             None => {
-                let trouble = trouble.map_or(String::new(), |trouble| format!(", last {trouble}"));
-                return unresolved(
-                    format!("open after {READS_AFTER_CANCEL} reads past a cancel{trouble}"),
-                    state.executed(),
-                );
+                let cause = UnresolvedCause::OpenPastCancel {
+                    reads: READS_AFTER_CANCEL,
+                    last: trouble,
+                };
+                return unresolved(cause, state.executed());
             }
         };
         match action {
             Action::Read => {}
             Action::CancelThenRead => {
                 if let Err(error) = broker.cancel(submitted.id()).await {
-                    trouble = Some(format!("cancel failed: {error}"));
+                    trouble = Some(OrderTrouble::CancelFailed(BrokerFailure::from(&error)));
                 }
             }
         }
@@ -295,7 +312,7 @@ async fn follow(
         // A cancel can race a fill, so the order is always read back rather than assumed canceled.
         match broker.order(id).await {
             Ok(read) => report = Some(read.report()),
-            Err(error) => trouble = Some(format!("unreadable: {error}")),
+            Err(error) => trouble = Some(OrderTrouble::Unreadable(BrokerFailure::from(&error))),
         }
     }
     let closed = OrderClosed::of(id, state).expect("the loop leaves only a closed order");
@@ -410,7 +427,7 @@ mod tests {
             let answer = match reads.len() {
                 0 => panic!("the script has no read"),
                 1 => reads[0],
-                _ => reads.pop_front().unwrap(),
+                2.. => reads.pop_front().unwrap(),
             };
             Self::answer(answer)
         }
@@ -432,7 +449,7 @@ mod tests {
             Ok(match books.len() {
                 0 => panic!("the script has no book"),
                 1 => books[0].clone(),
-                _ => books.pop_front().unwrap(),
+                2.. => books.pop_front().unwrap(),
             })
         }
 
@@ -484,6 +501,20 @@ mod tests {
         target: &Target,
         patience: Patience,
     ) -> (Vec<OrderOutcome>, Vec<&'static str>) {
+        let (outcomes, records) = run_journaled(broker, target, patience).await;
+        let events = records
+            .iter()
+            .map(|record| record.observation().event_type())
+            .collect();
+        (outcomes, events)
+    }
+
+    /// As `run`, returning the records journaled.
+    async fn run_journaled(
+        broker: &Scripted,
+        target: &Target,
+        patience: Patience,
+    ) -> (Vec<OrderOutcome>, Vec<Record>) {
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         let mut next_sequence = 0;
@@ -498,9 +529,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let events = journaled(&directory);
+        let records = journal_records(&directory);
         std::fs::remove_dir_all(&directory).unwrap();
-        (outcomes, events)
+        (outcomes, records)
+    }
+
+    /// The payload of the last record, which is where an order's end is journaled.
+    fn last_payload(records: &[Record]) -> serde_json::Value {
+        serde_json::to_value(records.last().unwrap().observation()).unwrap()["payload"].clone()
     }
 
     /// Every record across the journal's session files in the order it wrote them, so a run crossing midnight reads whole.
@@ -543,12 +579,12 @@ mod tests {
     #[test]
     fn test_an_open_order_is_canceled_once_then_read_a_bounded_number_of_times() {
         assert_eq!(
-            Waiting::BeforeCancel.next(false),
+            Waiting::BeforeCancel.next(PatienceLeft::Remaining),
             Some((Action::Read, Waiting::BeforeCancel))
         );
         let mut waiting = Waiting::BeforeCancel;
         let mut actions = Vec::new();
-        while let Some((action, next)) = waiting.next(true) {
+        while let Some((action, next)) = waiting.next(PatienceLeft::Spent) {
             actions.push(action);
             waiting = next;
         }
@@ -557,7 +593,7 @@ mod tests {
         assert!(actions[1..].iter().all(|action| *action == Action::Read));
         assert_eq!(waiting, Waiting::AfterCancel { reads: 20 });
         assert_eq!(
-            Waiting::AfterCancel { reads: 3 }.next(false),
+            Waiting::AfterCancel { reads: 3 }.next(PatienceLeft::Remaining),
             Some((Action::Read, Waiting::AfterCancel { reads: 4 }))
         );
     }
@@ -611,10 +647,21 @@ mod tests {
             &[Answer::Unanswered, Answer::Unanswered],
             &[Answer::Unreadable],
         );
-        let (outcomes, events) = run(&broker, &buying(&["AAPL", "SPY"], 1), PATIENT).await;
+        let (outcomes, records) =
+            run_journaled(&broker, &buying(&["AAPL", "SPY"], 1), PATIENT).await;
         assert_eq!(outcomes, [OrderOutcome::Unresolved(None)]);
         assert_eq!(broker.calls(), ["submit", "order"]);
-        assert_eq!(events, ["order_submitted", "order_unresolved"]);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.observation().event_type())
+                .collect::<Vec<_>>(),
+            ["order_submitted", "order_unresolved"]
+        );
+        assert_eq!(
+            last_payload(&records)["cause"],
+            serde_json::json!({"submitted_then_unreadable": {"failure": {"malformed": {"field": "status", "raw": ""}}}})
+        );
     }
 
     /// Reads at one, two and three seconds, then a cancel, and the part executed before the cancel took is the fill.
@@ -716,7 +763,8 @@ mod tests {
             poll: Duration::from_secs(1),
             open_for: Duration::ZERO,
         };
-        let (outcomes, events) = run(&broker, &buying(&["AAPL", "SPY"], 2), patience).await;
+        let (outcomes, records) =
+            run_journaled(&broker, &buying(&["AAPL", "SPY"], 2), patience).await;
         assert!(matches!(
             outcomes.as_slice(),
             [OrderOutcome::Unresolved(Some(execution))] if execution.shares() == Shares::whole(1).unwrap()
@@ -727,7 +775,34 @@ mod tests {
                 .map(|call| calls.iter().filter(|made| **made == call).count()),
             [1, 1, 20]
         );
-        assert_eq!(events, ["order_submitted", "order_unresolved"]);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.observation().event_type())
+                .collect::<Vec<_>>(),
+            ["order_submitted", "order_unresolved"]
+        );
+        assert_eq!(
+            last_payload(&records)["cause"],
+            serde_json::json!({"open_past_cancel": {"reads": 20, "last": null}})
+        );
+    }
+
+    /// An order left open past a cancel that failed is journaled with that failure as its last trouble.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_unresolved_order_journals_its_last_trouble() {
+        let mut broker = Scripted::new(&[Answer::Stands(OPEN, 0)], &[Answer::Stands(OPEN, 0)]);
+        broker.cancel_fails = true;
+        let patience = Patience {
+            poll: Duration::from_secs(1),
+            open_for: Duration::ZERO,
+        };
+        let (outcomes, records) = run_journaled(&broker, &buying(&["SPY"], 1), patience).await;
+        assert_eq!(outcomes, [OrderOutcome::Unresolved(None)]);
+        assert_eq!(
+            last_payload(&records)["cause"],
+            serde_json::json!({"open_past_cancel": {"reads": 20, "last": {"cancel_failed": {"exhausted": {"attempts": 3, "last": "status 503"}}}}})
+        );
     }
 
     /// The guard's holds are journaled before any order goes out, and only the vouched-for order is sent.
@@ -799,7 +874,7 @@ mod tests {
         let unread = serde_json::to_value(journal_records(&directory)[0].observation()).unwrap();
         assert_eq!(
             unread["payload"]["cause"],
-            "still failing after 3 attempts: timed out"
+            serde_json::json!({"exhausted": {"attempts": 3, "last": "timed out"}})
         );
         std::fs::remove_dir_all(&directory).unwrap();
     }
