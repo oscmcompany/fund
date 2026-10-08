@@ -77,12 +77,13 @@ impl Alpaca {
 
 #[derive(Deserialize)]
 struct CorporateActionsPage {
-    #[serde(default)]
+    /// Required, so a response without it fails rather than reading as a window with no actions, which would withdraw
+    /// every boundary the window held.
     corporate_actions: Categories,
 }
 
 /// Each category is absent from a page that has none of it.
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct Categories {
     #[serde(default)]
     name_changes: Vec<NameChange>,
@@ -286,5 +287,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(empty, SeriesBoundaries::default());
+        assert!(matches!(
+            parse_boundaries_page(br#"{"next_page_token": null}"#, &mut empty),
+            Err(FetchError::Malformed { .. })
+        ));
     }
 }

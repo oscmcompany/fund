@@ -89,9 +89,10 @@ impl Leg {
         }
     }
 
-    /// The sessions of `window` this leg writes. A snapshot of a whole table fetched later cannot stand for an earlier
-    /// day, so a snapshot leg keeps only the window's last session; security details are kept once a quarter, on the
-    /// session that opens it, which the vendor answers as of that date however late it is asked.
+    /// The sessions this leg writes. A snapshot of a whole table fetched later cannot stand for an earlier day, so a
+    /// snapshot leg keeps only the window's last session; security details are kept once a quarter, on the session that
+    /// opens the quarter the window ends in, which the vendor answers as of that date however late it is asked, so a
+    /// missed one stays owed for the rest of the quarter. `calendar` must reach back to that quarter's first day.
     pub fn keeps(self, window: &[SessionDate], calendar: &TradingCalendar) -> Vec<SessionDate> {
         match self {
             Self::MassiveDailyBars
@@ -102,25 +103,34 @@ impl Leg {
                 window.last().copied().into_iter().collect()
             }
             Self::MassiveSecurityDetails => window
-                .iter()
-                .copied()
-                .filter(|session| opens_quarter(calendar, *session))
+                .last()
+                .and_then(|last| quarter_opening(calendar, *last))
+                .into_iter()
                 .collect(),
         }
     }
 }
 
-/// Whether `session` is the first trading day of its calendar quarter; `false` when the calendar does not reach back
-/// to the quarter's first day, since it cannot say.
-pub fn opens_quarter(calendar: &TradingCalendar, session: SessionDate) -> bool {
+/// The first day of the calendar quarter `session` falls in.
+pub fn quarter_start(session: SessionDate) -> SessionDate {
     let date = session.date();
-    let first_month = date.month0() / 3 * 3 + 1;
-    let start = SessionDate::from_date(
-        NaiveDate::from_ymd_opt(date.year(), first_month, 1)
+    SessionDate::from_date(
+        NaiveDate::from_ymd_opt(date.year(), date.month0() / 3 * 3 + 1, 1)
             .expect("a quarter starts on a real date"),
-    );
-    calendar.covers(start, session)
-        && calendar.trading_days_in_range(start, session).first() == Some(&session)
+    )
+}
+
+/// The first trading day of `session`'s quarter, if it falls on or before `session`; `None` when the calendar does
+/// not reach back to the quarter's first day, since it cannot say.
+pub fn quarter_opening(calendar: &TradingCalendar, session: SessionDate) -> Option<SessionDate> {
+    let start = quarter_start(session);
+    match calendar.covers(start, session) {
+        true => calendar
+            .trading_days_in_range(start, session)
+            .first()
+            .copied(),
+        false => None,
+    }
 }
 
 /// How one owed session ended.
@@ -407,9 +417,9 @@ mod tests {
     fn test_each_leg_keeps_its_own_sessions_of_the_window() {
         // New Year's Day 2027 is a Friday holiday, so the first quarter opens on Monday the 4th.
         let winter = calendar("2026-12-01", "2027-01-31", &["2026-12-25", "2027-01-01"]);
-        let window = window(&winter, date("2027-01-07"), sessions(5)).unwrap();
+        let opening = window(&winter, date("2027-01-07"), sessions(5)).unwrap();
         let kept = |leg: Leg| -> Vec<String> {
-            leg.keeps(&window, &winter)
+            leg.keeps(&opening, &winter)
                 .iter()
                 .map(ToString::to_string)
                 .collect()
@@ -427,11 +437,16 @@ mod tests {
         assert_eq!(kept(Leg::MassiveSplits), ["2027-01-06"]);
         assert_eq!(kept(Leg::AlpacaSeriesBoundaries), ["2027-01-06"]);
         assert_eq!(kept(Leg::MassiveSecurityDetails), ["2027-01-04"]);
-        assert!(opens_quarter(&winter, date("2027-01-04")));
-        assert!(!opens_quarter(&winter, date("2027-01-05")));
-        assert!(!opens_quarter(&winter, date("2026-12-01")));
+        // Weeks later the quarter's opening is long out of the window and still owed until it is held.
+        let later = window(&winter, date("2027-01-28"), sessions(5)).unwrap();
+        assert_eq!(
+            Leg::MassiveSecurityDetails.keeps(&later, &winter),
+            [date("2027-01-04")]
+        );
+        assert_eq!(quarter_start(date("2027-03-31")), date("2027-01-01"));
+        assert_eq!(quarter_opening(&winter, date("2026-12-31")), None);
         let short = calendar("2027-01-02", "2027-01-31", &[]);
-        assert!(!opens_quarter(&short, date("2027-01-04")));
+        assert_eq!(quarter_opening(&short, date("2027-01-28")), None);
     }
 
     fn any_session() -> impl Strategy<Value = SessionDate> {

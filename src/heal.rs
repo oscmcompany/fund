@@ -21,7 +21,9 @@ use crate::archive::reference::{
     encode_series_boundaries, encode_splits, latest_conditions, latest_snapshot,
 };
 use crate::archive::{quote_bars, trade_bars};
-use crate::common::heal::{Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, window};
+use crate::common::heal::{
+    Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, quarter_start, window,
+};
 use crate::common::journal::{
     ConfigurationResolved, HealFinished, Observation, PartitionWritten, Unanswered,
 };
@@ -190,6 +192,8 @@ pub async fn run(
 ) -> Result<HealFinished, HealError> {
     let deadline = Instant::now() + parameters.budget;
     let (first, last) = calendar_range(today, parameters.lookback_sessions);
+    // Reaching back to the quarter's start lets the security details leg find the session that opened it.
+    let first = first.min(quarter_start(last));
     let calendar = clients
         .alpaca
         .calendar(first, last)

@@ -208,25 +208,28 @@ const SPLITS_PAGES_AT_MOST: usize = 200;
 pub struct Splits {
     splits: Vec<Split>,
     refused: Vec<RefusedRow>,
+    /// How often each identifier was listed, refused rows included.
+    listed: BTreeMap<String, usize>,
 }
 
 impl Splits {
     /// The table with every action listed more than once refused, each copy, since nothing says which is true.
     fn unique(self) -> Self {
-        let mut counts: BTreeMap<ActionId, usize> = BTreeMap::new();
-        for split in &self.splits {
-            *counts.entry(split.id().clone()).or_insert(0) += 1;
-        }
+        let listed = self.listed;
         let (splits, repeated): (Vec<Split>, Vec<Split>) = self
             .splits
             .into_iter()
-            .partition(|split| counts[split.id()] == 1);
+            .partition(|split| listed.get(split.id().as_str()) == Some(&1));
         let mut refused = self.refused;
         refused.extend(repeated.into_iter().map(|split| RefusedRow {
             ticker: split.symbol().as_str().to_string(),
             cause: RowRefusal::Duplicate,
         }));
-        Self { splits, refused }
+        Self {
+            splits,
+            refused,
+            listed,
+        }
     }
 
     pub fn splits(&self) -> &[Split] {
@@ -261,6 +264,7 @@ fn parse_splits_page(body: &[u8], splits: &mut Splits) -> Result<Option<String>,
         reason: error.to_string(),
     })?;
     for row in page.results {
+        *splits.listed.entry(row.id.clone()).or_insert(0) += 1;
         let split = ActionId::new(&row.id)
             .map_err(RowRefusal::ActionId)
             .and_then(|id| {
@@ -909,6 +913,22 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn test_an_action_repeated_beside_a_refused_copy_is_refused_too() {
+        // DPU's action filed again under a ticker no symbol holds: the valid copy cannot be trusted either.
+        let page = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU.WARRANTS"}],"next_url":null}"#;
+        let mut splits = Splits::default();
+        parse_splits_page(page.as_bytes(), &mut splits).unwrap();
+        let unique = splits.unique();
+        assert!(unique.splits().is_empty());
+        let causes: Vec<&str> = unique
+            .refused()
+            .iter()
+            .map(|row| row.cause().into())
+            .collect();
+        assert_eq!(causes, ["symbol", "duplicate"]);
     }
 
     #[test]
