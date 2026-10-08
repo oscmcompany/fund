@@ -424,7 +424,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::broker::alpaca::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
+    use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
     use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, RunId, read};
     use crate::common::market::aggregate::TradeTotals;

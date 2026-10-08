@@ -8,7 +8,7 @@ use chrono::Utc;
 use tokio::time::Instant;
 
 use crate::broker::Broker;
-use crate::broker::alpaca::BrokerError;
+use crate::broker::BrokerError;
 use crate::common::book::{Book, Fill};
 use crate::common::guard::{GuardCause, TradabilityUnread, guard};
 use crate::common::journal::Observation;
@@ -314,7 +314,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::broker::alpaca::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
+    use crate::broker::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
     use crate::common::book::{Cash, Position, Side};
     use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, Record, RunId, read};

@@ -4,13 +4,6 @@ markdown:
       - any-glob-to-any-file:
           - "**/*.md"
 
-python:
-  - changed-files:
-      - any-glob-to-any-file:
-          - "**/*.py"
-          - "**/pyproject.toml"
-          - "**/uv.lock"
-
 rust:
   - changed-files:
       - any-glob-to-any-file:
@@ -38,3 +31,11 @@ nix:
   - changed-files:
       - any-glob-to-any-file:
           - "**/*.nix"
+
+bash:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "check-views"
+          - "check-private-files"
+          - "tools/**"
+          - "**/*.sh"
