@@ -190,6 +190,7 @@ mod tests {
 
     /// A variable set to bytes that are not Unicode is set, not missing, and is refused without its value, which may
     /// be a secret.
+    #[cfg(unix)]
     #[test]
     fn test_a_variable_that_is_not_unicode_is_refused_without_its_value() {
         use std::os::unix::ffi::OsStringExt;
