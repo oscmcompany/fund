@@ -8,28 +8,37 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The view's statement as `check-views` reads it, pointed at `records` and `archive` in place of the two buckets.
-fn statement(records: &Path, archive: &Path) -> String {
-    let views = std::fs::read_to_string(root().join("views.sql")).unwrap();
+/// The statement opening on `opening`, through its first line ending in `;`, as `check-views` reads a view.
+fn statement(views: &str, opening: &str) -> String {
     let start = views
-        .find("CREATE OR REPLACE VIEW bar_seam AS\n")
-        .expect("views.sql declares bar_seam");
-    let length = views[start..]
-        .find("\n);\n")
-        .expect("the declaration ends on its own line")
-        + "\n);".len();
-    let statement = &views[start..start + length];
-    let pointed = statement
-        .replace(
-            "'s3://' || getvariable('records_bucket')",
-            &format!("'{}'", records.display()),
-        )
-        .replace(
-            "'s3://' || getvariable('market_data_bucket')",
-            &format!("'{}'", archive.display()),
-        );
-    assert!(!pointed.contains("s3://"), "{pointed}");
-    pointed
+        .find(opening)
+        .unwrap_or_else(|| panic!("views.sql holds {opening}"));
+    let mut statement = String::new();
+    for line in views[start..].lines() {
+        statement.push_str(line);
+        statement.push('\n');
+        if line.trim_end().ends_with(';') {
+            return statement;
+        }
+    }
+    panic!("{opening} never ends a line in `;`")
+}
+
+/// The macros `bar_seam` calls and the view itself, reading `records` and `archive` in place of the two buckets.
+fn pointed(records: &Path, archive: &Path) -> String {
+    let views = std::fs::read_to_string(root().join("views.sql")).unwrap();
+    let script = format!(
+        "SET VARIABLE records_bucket = '{}';\nSET VARIABLE market_data_bucket = '{}';\n{}\n{}\n{}\n{}\n",
+        records.display(),
+        archive.display(),
+        statement(&views, "CREATE OR REPLACE MACRO sessions("),
+        statement(&views, "CREATE OR REPLACE MACRO millionths("),
+        statement(&views, "CREATE OR REPLACE MACRO trillionths("),
+        statement(&views, "CREATE OR REPLACE VIEW bar_seam AS\n"),
+    )
+    .replace("'s3://' || ", "");
+    assert!(!script.contains("s3://"), "{script}");
+    script
 }
 
 /// A journal line of the trader's run `fixture`, journaled at 20:00 so its own `timestamp` matches no bar's.
@@ -42,12 +51,12 @@ fn line(event_type: &str, payload: &str) -> String {
 
 /// A trader bar in the journal's units: whole-cent prices as millionths, two trades of one share, and the high and
 /// low bounding the open and close.
-fn built(symbol: &str, minute: &str, open_cents: u64, close_cents: u64) -> String {
+fn built(symbol: &str, interval: &str, minute: &str, open_cents: u64, close_cents: u64) -> String {
     let [open, close] = [open_cents, close_cents].map(|cents| cents * 10_000);
     line(
         "bar_built",
         &format!(
-            r#"{{"symbol":"{symbol}","interval":"one_minute","timestamp":"2026-10-08T{minute}:00Z","trade_count":2,"volume":2000000,"dollar_volume":"{dollar_volume}","opened_at":"2026-10-08T{minute}:10Z","open":{open},"closed_at":"2026-10-08T{minute}:50Z","close":{close},"high":{high},"low":{low}}}"#,
+            r#"{{"symbol":"{symbol}","interval":"{interval}","timestamp":"2026-10-08T{minute}:00Z","trade_count":2,"volume":2000000,"dollar_volume":"{dollar_volume}","opened_at":"2026-10-08T{minute}:10Z","open":{open},"closed_at":"2026-10-08T{minute}:50Z","close":{close},"high":{high},"low":{low}}}"#,
             dollar_volume = u128::from(open + close) * 1_000_000,
             high = open.max(close),
             low = open.min(close),
@@ -87,9 +96,11 @@ fn test_the_seam_matches_minutes_in_the_run_and_differs_only_where_the_bars_do()
             "configuration_resolved",
             r#"{"parameters":{"universe":{"source":"environment","value":"QQQ,SPY"}}}"#,
         ),
-        built("SPY", "14:00", 78_010, 78_015),
-        built("SPY", "14:01", 78_015, 78_016),
-        built("QQQ", "14:01", 76_100, 76_100),
+        built("SPY", "one_minute", "14:00", 78_010, 78_015),
+        built("SPY", "one_minute", "14:01", 78_015, 78_016),
+        built("QQQ", "one_minute", "14:01", 76_100, 76_100),
+        // A five-minute bar is no minute of the seam and widens no run.
+        built("SPY", "five_minute", "14:05", 78_020, 78_020),
     ];
     let archive_rows = [
         derived("SPY", "13:59", 78_000, 78_000),
@@ -111,7 +122,7 @@ fn test_the_seam_matches_minutes_in_the_run_and_differs_only_where_the_bars_do()
         journal.display(),
         archive_rows.join(" UNION ALL "),
         bars.display(),
-        statement(&records, &archive),
+        pointed(&records, &archive),
     );
     let output = Command::new("duckdb")
         .args(["-csv", "-noheader", "-c", &script])
