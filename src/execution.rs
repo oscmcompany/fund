@@ -317,7 +317,7 @@ mod tests {
     use crate::broker::alpaca::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
     use crate::common::book::{Cash, Position, Side};
     use crate::common::guard::Tradability;
-    use crate::common::journal::{ReadLine, RunId, read};
+    use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::{Price, Shares, Symbol};
     use crate::common::order::{OrderEnding, OrderReport, OrderStatus};
     use crate::ingest::alpaca::Alpaca;
@@ -503,25 +503,29 @@ mod tests {
         (outcomes, events)
     }
 
-    fn journal_lines(directory: &Path) -> Vec<ReadLine> {
-        let file = std::fs::read_dir(directory)
+    /// Every record across the journal's session files in the order it wrote them, so a run crossing midnight reads whole.
+    fn journal_records(directory: &Path) -> Vec<Record> {
+        let mut records: Vec<Record> = std::fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .find(|path| {
+            .filter(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "jsonl")
             })
-            .unwrap();
-        read(&std::fs::read_to_string(&file).unwrap())
+            .flat_map(|path| read(&std::fs::read_to_string(path).unwrap()))
+            .map(|line| match line {
+                ReadLine::Read(record) => *record,
+                ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
+            })
+            .collect();
+        records.sort_by_key(Record::sequence);
+        records
     }
 
     fn journaled(directory: &Path) -> Vec<&'static str> {
-        journal_lines(directory)
+        journal_records(directory)
             .iter()
-            .map(|line| match line {
-                ReadLine::Read(record) => record.observation().event_type(),
-                ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
-            })
+            .map(|record| record.observation().event_type())
             .collect()
     }
 
@@ -792,10 +796,7 @@ mod tests {
             journaled(&directory),
             ["tradability_unread", "order_guarded", "order_guarded"]
         );
-        let unread = match &journal_lines(&directory)[0] {
-            ReadLine::Read(record) => serde_json::to_value(record.observation()).unwrap(),
-            ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
-        };
+        let unread = serde_json::to_value(journal_records(&directory)[0].observation()).unwrap();
         assert_eq!(
             unread["payload"]["cause"],
             "still failing after 3 attempts: timed out"
@@ -975,27 +976,24 @@ mod tests {
             "run while the market is closed"
         );
         assert_eq!(journaled(&directory), ["order_submitted", "order_closed"]);
-        let closed = journal_lines(&directory)
+        let closed = journal_records(&directory)
             .into_iter()
-            .find_map(|line| match line {
-                ReadLine::Read(record) => match record.observation() {
-                    Observation::OrderClosed(closed) => Some(closed.clone()),
-                    Observation::ConfigurationResolved(_)
-                    | Observation::PartitionWritten(_)
-                    | Observation::HealFinished(_)
-                    | Observation::DatasetRead(_)
-                    | Observation::ExperimentRan(_)
-                    | Observation::OrderSubmitted(_)
-                    | Observation::OrderRefused(_)
-                    | Observation::OrderUnresolved(_)
-                    | Observation::OrderGuarded(_)
-                    | Observation::TradabilityUnread(_)
-                    | Observation::BookReconciled(_)
-                    | Observation::TargetDecided(_)
-                    | Observation::SessionOpened(_)
-                    | Observation::BarBuilt(_) => None,
-                },
-                ReadLine::Unreadable { .. } => None,
+            .find_map(|record| match record.observation() {
+                Observation::OrderClosed(closed) => Some(closed.clone()),
+                Observation::ConfigurationResolved(_)
+                | Observation::PartitionWritten(_)
+                | Observation::HealFinished(_)
+                | Observation::DatasetRead(_)
+                | Observation::ExperimentRan(_)
+                | Observation::OrderSubmitted(_)
+                | Observation::OrderRefused(_)
+                | Observation::OrderUnresolved(_)
+                | Observation::OrderGuarded(_)
+                | Observation::TradabilityUnread(_)
+                | Observation::BookReconciled(_)
+                | Observation::TargetDecided(_)
+                | Observation::SessionOpened(_)
+                | Observation::BarBuilt(_) => None,
             })
             .unwrap();
         assert_eq!(
