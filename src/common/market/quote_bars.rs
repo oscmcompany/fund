@@ -537,20 +537,69 @@ mod tests {
         .unwrap()
     }
 
-    /// A count past `u64` panics naming the sum in every build, as the sibling sums do, rather than wrapping in release.
+    /// Each sum past its type panics naming that sum in every build rather than wrapping in release.
     #[test]
-    #[should_panic(expected = "quote count fits u64")]
     fn test_sums_that_overflow_panic_by_name() {
         let standing =
             StandingQuote::of(&quote("SPY", "2026-10-08T14:00:00Z", 100.0, 100.01, 1, 1));
-        let full = QuoteSums {
-            quote_count: u64::MAX,
-            ..QuoteSums::standing(&standing, 1)
-        };
-        let _ = full.combine(QuoteSums {
-            quote_count: 1,
-            ..QuoteSums::standing(&standing, 1)
-        });
+        let one = QuoteSums::standing(&standing, 1);
+        let cases: [(&str, QuoteSums); 6] = [
+            (
+                "quote count fits u64",
+                QuoteSums {
+                    quote_count: u64::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "covered nanoseconds fit u64",
+                QuoteSums {
+                    covered_nanoseconds: u64::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "spread time fits u128",
+                QuoteSums {
+                    spread_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "relative spread time fits u128",
+                QuoteSums {
+                    relative_spread_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "bid size time fits u128",
+                QuoteSums {
+                    bid_size_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+            (
+                "ask size time fits u128",
+                QuoteSums {
+                    ask_size_time: u128::MAX,
+                    ..one.clone()
+                },
+            ),
+        ];
+        for (expected, full) in cases {
+            let addend = QuoteSums {
+                quote_count: 1,
+                ..one.clone()
+            };
+            let panicked = std::panic::catch_unwind(|| full.combine(addend)).expect_err(expected);
+            let message = panicked
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panicked.downcast_ref::<&str>().map(|text| text.to_string()))
+                .expect("panic message is text");
+            assert_eq!(message, expected);
+        }
     }
 
     /// 2026-10-02, 09:30 to 16:00 Eastern.
