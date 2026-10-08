@@ -10,10 +10,13 @@ use uuid::Uuid;
 
 use crate::common::book::{Book, Cash, Position};
 use crate::common::guard::{OrderGuarded, TradabilityUnread};
-use crate::common::heal::{Leg, SessionOutcome, Window};
+use crate::common::heal::{Leg, PartitionFailureKind, SessionOutcome, Unrecognized, Window};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
-use crate::common::market::trade_bars::BarBuilt;
+use crate::common::market::quote_bars::QuoteFoldCounts;
+use crate::common::market::refusal::RowRefusalKind;
+use crate::common::market::trade_bars::{BarBuilt, TradeFoldCounts};
+use crate::common::monoid::Tally;
 use crate::common::order::{OrderClosed, OrderRefused, OrderSubmitted, OrderUnresolved};
 use crate::common::parameter::Parameter;
 use crate::common::playbook::PlaybookRead;
@@ -184,6 +187,8 @@ impl Record {
 pub enum Observation {
     ConfigurationResolved(ConfigurationResolved),
     PartitionWritten(PartitionWritten),
+    PartitionFailed(PartitionFailed),
+    ConditionsWritten(ConditionsWritten),
     HealFinished(HealFinished),
     DatasetRead(Box<DatasetRead>),
     ExperimentRan(Box<ExperimentRan>),
@@ -250,9 +255,10 @@ pub struct PartitionWritten {
     leg: Leg,
     session: SessionDate,
     bars: u64,
-    /// Refused rows counted by cause, the `RowRefusal` variant in snake case.
-    refused: BTreeMap<String, u64>,
+    refused: Tally<RowRefusalKind>,
     unanswered: BTreeMap<Symbol, Unanswered>,
+    /// What a tick leg's fold did with each row it was offered; empty for a leg that folds nothing.
+    folded: BTreeMap<FoldCount, u64>,
 }
 
 impl PartitionWritten {
@@ -260,8 +266,9 @@ impl PartitionWritten {
         leg: Leg,
         session: SessionDate,
         bars: u64,
-        refused: BTreeMap<String, u64>,
+        refused: Tally<RowRefusalKind>,
         unanswered: BTreeMap<Symbol, Unanswered>,
+        folded: BTreeMap<FoldCount, u64>,
     ) -> Self {
         Self {
             leg,
@@ -269,6 +276,7 @@ impl PartitionWritten {
             bars,
             refused,
             unanswered,
+            folded,
         }
     }
 
@@ -284,12 +292,107 @@ impl PartitionWritten {
         self.bars
     }
 
-    pub fn refused(&self) -> &BTreeMap<String, u64> {
+    pub fn refused(&self) -> &Tally<RowRefusalKind> {
         &self.refused
     }
 
     pub fn unanswered(&self) -> &BTreeMap<Symbol, Unanswered> {
         &self.unanswered
+    }
+
+    pub fn folded(&self) -> &BTreeMap<FoldCount, u64> {
+        &self.folded
+    }
+}
+
+/// One count a tick leg's fold keeps, named as the fold's counts name it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum FoldCount {
+    Accepted,
+    OutOfOrder,
+    OneSided,
+    Folded,
+    OtherSession,
+    Withdrawn,
+    VolumeIneligible,
+    UnsizedPrints,
+    Unresolved,
+    Late,
+}
+
+/// Every count of a quote fold, with the one-sided quotes left out before it.
+pub fn quotes_folded(counts: QuoteFoldCounts, one_sided: u64) -> BTreeMap<FoldCount, u64> {
+    BTreeMap::from([
+        (FoldCount::Accepted, counts.accepted()),
+        (FoldCount::OutOfOrder, counts.out_of_order()),
+        (FoldCount::OneSided, one_sided),
+    ])
+}
+
+/// Every count of a trade fold; the unresolved prints are counted whole, their causes left to the log.
+pub fn trades_folded(counts: &TradeFoldCounts) -> BTreeMap<FoldCount, u64> {
+    BTreeMap::from([
+        (FoldCount::Folded, counts.folded()),
+        (FoldCount::OtherSession, counts.other_session()),
+        (FoldCount::Withdrawn, counts.withdrawn()),
+        (FoldCount::VolumeIneligible, counts.volume_ineligible()),
+        (FoldCount::UnsizedPrints, counts.unsized_prints()),
+        (FoldCount::Unresolved, counts.unresolved().total()),
+        (FoldCount::Late, counts.late()),
+    ])
+}
+
+/// One owed partition of a leg left unwritten, recorded when it failed rather than when the run finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionFailed {
+    leg: Leg,
+    session: SessionDate,
+    failure: PartitionFailureKind,
+    cause: String,
+}
+
+impl PartitionFailed {
+    pub fn new(
+        leg: Leg,
+        session: SessionDate,
+        failure: PartitionFailureKind,
+        cause: String,
+    ) -> Self {
+        Self {
+            leg,
+            session,
+            failure,
+            cause,
+        }
+    }
+}
+
+/// A conditions snapshot fetched and written because none in the archive read, which the trade leg folds under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionsWritten {
+    as_of: SessionDate,
+    conditions: u64,
+}
+
+impl ConditionsWritten {
+    pub fn new(as_of: SessionDate, conditions: u64) -> Self {
+        Self { as_of, conditions }
     }
 }
 
@@ -303,20 +406,26 @@ pub enum Unanswered {
     Invalid,
 }
 
-/// A run's heal: the window it covered and how each owed session of each leg ended. A session of the window with no
-/// outcome was already held.
+/// A run's heal: the window it covered, how each owed session of each leg ended, and every path under a leg's
+/// series that was not one of its keys. A session of the window with no outcome was already held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealFinished {
     window: Window,
     outcomes: BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>>,
+    unrecognized: BTreeMap<Leg, BTreeMap<String, Unrecognized>>,
 }
 
 impl HealFinished {
     pub fn new(
         window: Window,
         outcomes: BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>>,
+        unrecognized: BTreeMap<Leg, BTreeMap<String, Unrecognized>>,
     ) -> Self {
-        Self { window, outcomes }
+        Self {
+            window,
+            outcomes,
+            unrecognized,
+        }
     }
 
     pub fn window(&self) -> &Window {
@@ -465,11 +574,11 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use super::*;
-    use crate::common::heal::PartitionFailureKind;
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::BarInterval;
     use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
     use crate::common::market::{DollarVolume, Price, Shares, StampedPrice, TradeCount};
+    use crate::common::monoid::concatenate;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -548,12 +657,27 @@ mod tests {
             Leg::AlpacaMinuteBars,
             session,
             1_872_987,
-            BTreeMap::from([("duplicate".to_string(), 2)]),
+            concatenate(
+                [
+                    RowRefusalKind::Duplicate,
+                    RowRefusalKind::DollarVolume,
+                    RowRefusalKind::Duplicate,
+                ]
+                .map(Tally::of),
+            ),
             BTreeMap::from([
                 (Symbol::new("ABC").unwrap(), Unanswered::Missing),
                 (Symbol::new("BC.PRC").unwrap(), Unanswered::Invalid),
             ]),
+            quotes_folded(QuoteFoldCounts::default(), 3),
         );
+        let failed = PartitionFailed::new(
+            Leg::AlpacaTrades,
+            session,
+            PartitionFailureKind::NoRows,
+            "the vendor answered with no rows".to_string(),
+        );
+        let conditions = ConditionsWritten::new(session, 70);
         let finished = HealFinished::new(
             Window::try_from(vec![session]).unwrap(),
             BTreeMap::from([(
@@ -569,6 +693,10 @@ mod tests {
                     (session.plus_calendar_days(-1), SessionOutcome::Unreached),
                 ]),
             )]),
+            BTreeMap::from([(
+                Leg::AlpacaQuotes,
+                BTreeMap::from([("data/stray.parquet".to_string(), Unrecognized::NotAKey)]),
+            )]),
         );
         let prefix = concat!(
             r#"{"schema_version":1,"run_id":"00000000-0000-0000-0000-000000000001","sequence":1,"#,
@@ -580,8 +708,31 @@ mod tests {
                 "{prefix}{}",
                 concat!(
                     r#""event_type":"partition_written","payload":{"leg":"alpaca_minute_bars","#,
-                    r#""session":"2026-09-29","bars":1872987,"refused":{"duplicate":2},"#,
-                    r#""unanswered":{"ABC":"missing","BC.PRC":"invalid"}}}"#,
+                    r#""session":"2026-09-29","bars":1872987,"#,
+                    r#""refused":{"dollar_volume":1,"duplicate":2},"#,
+                    r#""unanswered":{"ABC":"missing","BC.PRC":"invalid"},"#,
+                    r#""folded":{"accepted":0,"out_of_order":0,"one_sided":3}}}"#,
+                )
+            )
+        );
+        assert_eq!(
+            envelope(Observation::PartitionFailed(failed)),
+            format!(
+                "{prefix}{}",
+                concat!(
+                    r#""event_type":"partition_failed","payload":{"leg":"alpaca_trades","#,
+                    r#""session":"2026-09-29","failure":"no_rows","#,
+                    r#""cause":"the vendor answered with no rows"}}"#,
+                )
+            )
+        );
+        assert_eq!(
+            envelope(Observation::ConditionsWritten(conditions)),
+            format!(
+                "{prefix}{}",
+                concat!(
+                    r#""event_type":"conditions_written","#,
+                    r#""payload":{"as_of":"2026-09-29","conditions":70}}"#,
                 )
             )
         );
@@ -593,9 +744,79 @@ mod tests {
                     r#""event_type":"heal_finished","payload":{"window":["2026-09-29"],"#,
                     r#""outcomes":{"massive_daily_bars":{"2026-09-28":{"outcome":"unreached"},"#,
                     r#""2026-09-29":{"outcome":"failed","failure":"fetch","#,
-                    r#""cause":"refused with 403"}}}}}"#,
+                    r#""cause":"refused with 403"}}},"#,
+                    r#""unrecognized":{"alpaca_quotes":{"data/stray.parquet":"not_a_key"}}}}"#,
                 )
             )
+        );
+    }
+
+    #[test]
+    fn test_serde_and_strum_agree_on_every_fold_count() {
+        let names: Vec<String> = FoldCount::iter()
+            .map(|count| {
+                let json = serde_json::to_string(&count).unwrap();
+                assert_eq!(json, format!("\"{count}\""));
+                assert_eq!(count.to_string().parse::<FoldCount>(), Ok(count));
+                assert_eq!(serde_json::from_str::<FoldCount>(&json).unwrap(), count);
+                json
+            })
+            .collect();
+        assert_eq!(names.len(), 10);
+        assert_eq!(
+            names[..3],
+            [r#""accepted""#, r#""out_of_order""#, r#""one_sided""#]
+        );
+    }
+
+    /// Each count reaches the journal under its own name: one print unresolved, two withdrawn and three of another
+    /// session, so a swapped field changes the map.
+    #[test]
+    fn test_a_trade_fold_journals_every_count_under_its_name() {
+        use crate::common::market::record::Trade;
+        use crate::common::market::trade_bars::{
+            ConditionCode, Correction, Print, TradeConditions, TradeFold,
+        };
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
+        let print = |at: &str| {
+            Print::Trade(
+                Trade::new(
+                    Symbol::new("AAPL").unwrap(),
+                    at.parse().unwrap(),
+                    Price::from_dollars(100.0).unwrap(),
+                    Shares::whole(10).unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let mut fold = TradeFold::new(session, TradeConditions::new(BTreeMap::new()));
+        fold.push(
+            &print("2026-10-02T13:30:00Z"),
+            &[ConditionCode::new(99)],
+            Correction::Stands,
+        );
+        for _ in 0..2 {
+            fold.push(&print("2026-10-02T13:31:00Z"), &[], Correction::Withdrawn);
+        }
+        for _ in 0..3 {
+            fold.push(&print("2026-10-03T13:30:00Z"), &[], Correction::Stands);
+        }
+        let (_, counts) = fold.finish();
+        let folded: Vec<(&'static str, u64)> = trades_folded(&counts)
+            .into_iter()
+            .map(|(count, value)| (count.into(), value))
+            .collect();
+        assert_eq!(
+            folded,
+            [
+                ("folded", 1),
+                ("other_session", 3),
+                ("withdrawn", 2),
+                ("volume_ineligible", 0),
+                ("unsized_prints", 0),
+                ("unresolved", 1),
+                ("late", 0),
+            ]
         );
     }
 
@@ -961,6 +1182,9 @@ mod tests {
         let leg = prop::sample::select(Leg::iter().collect::<Vec<_>>());
         let symbol = "[A-Z]{1,5}(\\.[A-Z]{1,3})?".prop_map(|raw| Symbol::new(&raw).unwrap());
         let unanswered = prop::sample::select(vec![Unanswered::Missing, Unanswered::Invalid]);
+        let refusal = prop::sample::select(RowRefusalKind::iter().collect::<Vec<_>>());
+        let fold_count = prop::sample::select(FoldCount::iter().collect::<Vec<_>>());
+        let stray = prop::sample::select(Unrecognized::iter().collect::<Vec<_>>());
         let outcome = prop_oneof![
             Just(SessionOutcome::Written),
             Just(SessionOutcome::Unreached),
@@ -987,25 +1211,48 @@ mod tests {
                 leg.clone(),
                 any_session(),
                 any::<u64>(),
-                prop::collection::btree_map("[a-z_]{1,12}", any::<u64>(), 0..4),
+                prop::collection::vec(refusal, 0..6),
                 prop::collection::btree_map(symbol, unanswered, 0..6),
+                prop::collection::btree_map(fold_count, any::<u64>(), 0..4),
             )
-                .prop_map(|(leg, session, bars, refused, unanswered)| {
+                .prop_map(|(leg, session, bars, refused, unanswered, folded)| {
                     Observation::PartitionWritten(PartitionWritten::new(
-                        leg, session, bars, refused, unanswered,
+                        leg,
+                        session,
+                        bars,
+                        concatenate(refused.into_iter().map(Tally::of)),
+                        unanswered,
+                        folded,
                     ))
                 }),
             (
+                leg.clone(),
+                any_session(),
+                prop::sample::select(PartitionFailureKind::iter().collect::<Vec<_>>()),
+                ".{0,20}",
+            )
+                .prop_map(|(leg, session, failure, cause)| {
+                    Observation::PartitionFailed(PartitionFailed::new(leg, session, failure, cause))
+                }),
+            (any_session(), any::<u64>()).prop_map(|(as_of, conditions)| {
+                Observation::ConditionsWritten(ConditionsWritten::new(as_of, conditions))
+            }),
+            (
                 prop::collection::btree_set(any_session(), 1..6),
                 prop::collection::btree_map(
-                    leg,
+                    leg.clone(),
                     prop::collection::btree_map(any_session(), outcome, 0..4),
                     0..3
                 ),
+                prop::collection::btree_map(
+                    leg,
+                    prop::collection::btree_map(".{0,20}", stray, 0..3),
+                    0..3
+                ),
             )
-                .prop_map(|(window, outcomes)| {
+                .prop_map(|(window, outcomes, unrecognized)| {
                     let window = Window::try_from(window.into_iter().collect::<Vec<_>>()).unwrap();
-                    Observation::HealFinished(HealFinished::new(window, outcomes))
+                    Observation::HealFinished(HealFinished::new(window, outcomes, unrecognized))
                 }),
             any_bar_built().prop_map(Observation::BarBuilt),
         ]

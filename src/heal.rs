@@ -26,7 +26,8 @@ use crate::common::heal::{
     owed, window,
 };
 use crate::common::journal::{
-    ConfigurationResolved, HealFinished, Observation, PartitionWritten, Unanswered,
+    ConditionsWritten, ConfigurationResolved, HealFinished, Observation, PartitionFailed,
+    PartitionWritten, Unanswered, quotes_folded, trades_folded,
 };
 use crate::common::market::Symbol;
 use crate::common::market::corporate_actions::{SeriesBoundary, refresh_boundaries};
@@ -153,7 +154,7 @@ pub enum HealError {
         refusal: KeepsRefusal,
     },
     List(ArchiveError),
-    /// A partition was written but its record was not, so the run stops rather than write what it cannot record.
+    /// A write or failure went unrecorded, so the run stops rather than go on with what it cannot record.
     Journal(std::io::Error),
 }
 
@@ -165,7 +166,7 @@ impl std::fmt::Display for HealError {
             Self::Keeps { leg, refusal } => write!(formatter, "the {leg} leg: {refusal}"),
             Self::List(error) => write!(formatter, "{error}"),
             Self::Journal(error) => {
-                write!(formatter, "journaling a written partition failed: {error}")
+                write!(formatter, "journaling the heal failed: {error}")
             }
         }
     }
@@ -192,6 +193,8 @@ pub enum PartitionFailure {
         key: Key,
     },
     Fold(QuoteFoldRefusal),
+    /// A write the partition needed could not be journaled, which stops the run.
+    Journal(std::io::Error),
 }
 
 impl PartitionFailure {
@@ -206,7 +209,13 @@ impl PartitionFailure {
             Self::Vanished { .. } => PartitionFailureKind::Vanished,
             Self::NoSymbols { .. } => PartitionFailureKind::NoSymbols,
             Self::Fold(_) => PartitionFailureKind::Fold,
+            Self::Journal(_) => PartitionFailureKind::Journal,
         }
+    }
+
+    /// The record of this failure, journaled as it happens.
+    fn failed(&self, leg: Leg, session: SessionDate) -> PartitionFailed {
+        PartitionFailed::new(leg, session, self.kind(), self.to_string())
     }
 
     /// The outcome the journal records, its kind beside its text.
@@ -238,6 +247,7 @@ impl std::fmt::Display for PartitionFailure {
                 )
             }
             Self::Fold(refusal) => write!(formatter, "{refusal}"),
+            Self::Journal(error) => write!(formatter, "journaling a write failed: {error}"),
         }
     }
 }
@@ -304,6 +314,7 @@ pub async fn run(
     let window =
         window(&calendar, today, parameters.lookback_sessions).map_err(HealError::Window)?;
     let mut outcomes = BTreeMap::new();
+    let mut unrecognized = BTreeMap::new();
     for leg in Leg::iter() {
         let series = leg.key(today).series();
         let held = Held::of(
@@ -316,6 +327,7 @@ pub async fn run(
         );
         if !held.unrecognized().is_empty() {
             tracing::warn!(%leg, unrecognized = ?held.unrecognized(), "Objects outside the series were not counted as held");
+            unrecognized.insert(leg, held.unrecognized().clone());
         }
         let kept = leg
             .keeps(&window, &calendar)
@@ -327,14 +339,21 @@ pub async fn run(
             } else {
                 match write(leg, session, &calendar, parameters, clients, journal).await {
                     Ok(written) => {
-                        tracing::info!(%leg, %session, bars = written.bars(), refused = ?written.refused(), unanswered = written.unanswered().len(), "Partition written");
+                        tracing::info!(%leg, %session, bars = written.bars(), refused = %written.refused(), unanswered = written.unanswered().len(), "Partition written");
                         journal
                             .append(Utc::now(), Observation::PartitionWritten(written))
                             .map_err(HealError::Journal)?;
                         SessionOutcome::Written
                     }
+                    Err(PartitionFailure::Journal(error)) => return Err(HealError::Journal(error)),
                     Err(failure) => {
                         tracing::warn!(%leg, %session, %failure, "Partition not written");
+                        journal
+                            .append(
+                                Utc::now(),
+                                Observation::PartitionFailed(failure.failed(leg, session)),
+                            )
+                            .map_err(HealError::Journal)?;
                         failure.outcome()
                     }
                 }
@@ -343,7 +362,7 @@ pub async fn run(
         }
         outcomes.insert(leg, sessions);
     }
-    Ok(HealFinished::new(window, outcomes))
+    Ok(HealFinished::new(window, outcomes, unrecognized))
 }
 
 /// Fetches one leg's session and writes it, returning its record, or why it was not written.
@@ -353,7 +372,7 @@ async fn write(
     calendar: &TradingCalendar,
     parameters: &Parameters,
     clients: &Clients,
-    journal: &Journal,
+    journal: &mut Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
     let key = leg.key(session);
     let (bars, refused, unanswered, subscription) = match leg {
@@ -430,6 +449,7 @@ async fn write(
         u64::try_from(bars.len()).expect("a partition holds fewer than u64::MAX bars"),
         refused,
         unanswered,
+        BTreeMap::new(),
     ))
 }
 
@@ -463,6 +483,7 @@ async fn write_splits(
         session,
         u64::try_from(splits.splits().len()).expect("a table holds fewer than u64::MAX rows"),
         refused_by_cause(splits.refused()),
+        BTreeMap::new(),
         BTreeMap::new(),
     ))
 }
@@ -535,6 +556,7 @@ async fn write_series_boundaries(
         u64::try_from(boundaries.len()).expect("a table holds fewer than u64::MAX rows"),
         refused_by_cause(&refused),
         BTreeMap::new(),
+        BTreeMap::new(),
     ))
 }
 
@@ -602,6 +624,7 @@ async fn write_security_details(
             .into_iter()
             .map(|symbol| (symbol, Unanswered::Missing))
             .collect(),
+        BTreeMap::new(),
     ))
 }
 
@@ -699,6 +722,7 @@ async fn write_quotes(
         u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
         refused_by_cause(&refused),
         unanswered,
+        quotes_folded(counts, one_sided),
     ))
 }
 
@@ -707,7 +731,7 @@ async fn write_trades(
     session: SessionDate,
     parameters: &Parameters,
     clients: &Clients,
-    journal: &Journal,
+    journal: &mut Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
     let conditions = trade_conditions(clients, journal).await?;
@@ -752,21 +776,22 @@ async fn write_trades(
         let body = trade_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
         clients.archive.put(&key, body).await?;
     }
-    tracing::info!(%session, folded = counts.folded(), withdrawn = counts.withdrawn(), unresolved = counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
+    tracing::info!(%session, folded = counts.folded(), withdrawn = counts.withdrawn(), unresolved = counts.unresolved().total(), unresolved_by_cause = %counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
     Ok(PartitionWritten::new(
         Leg::AlpacaTrades,
         session,
         u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
         refused_by_cause(&refused),
         unanswered,
+        trades_folded(&counts),
     ))
 }
 
 /// The newest conditions snapshot, or, when none reads under this build's layout, today's fetched from Massive and
-/// written first, so the trade leg never waits on an operator.
+/// written and journaled first, so the trade leg never waits on an operator.
 async fn trade_conditions(
     clients: &Clients,
-    journal: &Journal,
+    journal: &mut Journal,
 ) -> Result<TradeConditions, PartitionFailure> {
     match latest_conditions(&clients.archive).await {
         Ok((_, conditions)) => Ok(conditions),
@@ -784,6 +809,14 @@ async fn trade_conditions(
             let body = encode_conditions(&key, &conditions, &provenance)
                 .map_err(EncodeRefusal::Reference)?;
             clients.archive.put(&key, body).await?;
+            let written = ConditionsWritten::new(
+                key.session(),
+                u64::try_from(conditions.conditions().len())
+                    .expect("a table holds fewer than u64::MAX rows"),
+            );
+            journal
+                .append(Utc::now(), Observation::ConditionsWritten(written))
+                .map_err(PartitionFailure::Journal)?;
             Ok(conditions)
         }
     }
@@ -973,6 +1006,29 @@ mod tests {
                      year=2026/month=09/day=29/data.parquet to take the symbols from"
                 ),
             ]
+        );
+    }
+
+    /// The record journaled when a partition fails carries the same kind and text its run's outcome does.
+    #[test]
+    fn test_a_failure_is_journaled_as_it_happens_with_its_outcome() {
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
+        let failure = PartitionFailure::Fetch(FetchError::Refused {
+            status: 403,
+            body: "forbidden".to_string(),
+        });
+        assert_eq!(
+            failure.failed(Leg::AlpacaTrades, session),
+            PartitionFailed::new(
+                Leg::AlpacaTrades,
+                session,
+                PartitionFailureKind::Fetch,
+                "refused with 403: forbidden".to_string()
+            )
+        );
+        assert_eq!(
+            PartitionFailure::Journal(std::io::Error::other("disk full")).kind(),
+            PartitionFailureKind::Journal
         );
     }
 

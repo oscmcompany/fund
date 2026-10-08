@@ -265,6 +265,7 @@ mod tests {
                 Leg::MassiveDailyBars,
                 BTreeMap::from([(session().plus_calendar_days(-1), SessionOutcome::Unreached)]),
             )]),
+            BTreeMap::new(),
         );
         [
             record(

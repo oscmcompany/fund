@@ -8,7 +8,7 @@ use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use super::aggregate::TradeTotals;
 use super::record::{BarInterval, Trade};
 use super::{DollarVolume, Price, Shares, StampedPrice, Symbol, TradeCount};
-use crate::common::monoid::Monoid;
+use crate::common::monoid::{Monoid, Tally};
 use crate::common::time::SessionDate;
 
 /// What a print carrying one sale condition may update on the consolidated tape; every combination is valid.
@@ -191,7 +191,7 @@ pub enum Eligibility {
 }
 
 /// Why a print's condition could not be placed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Unplaced {
     UnknownCode {
         code: ConditionCode,
@@ -205,6 +205,20 @@ pub enum Unplaced {
         tape: Tape,
         letter: ConditionLetter,
     },
+}
+
+impl std::fmt::Display for Unplaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownCode { code } => write!(formatter, "unknown code {}", code.get()),
+            Self::UnknownLetter { tape, letter } => {
+                write!(formatter, "unknown letter '{}' on {tape:?}", letter.get())
+            }
+            Self::AmbiguousLetter { tape, letter } => {
+                write!(formatter, "ambiguous letter '{}' on {tape:?}", letter.get())
+            }
+        }
+    }
 }
 
 impl TradeConditions {
@@ -840,7 +854,7 @@ impl Monoid for TradeRollup {
 }
 
 /// What a session's fold did with the prints it was offered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TradeFoldCounts {
     folded: u64,
     /// Stamped for another session's Eastern date.
@@ -850,7 +864,8 @@ pub struct TradeFoldCounts {
     volume_ineligible: u64,
     /// Published with no shares, which may set prices and never volume.
     unsized_prints: u64,
-    unresolved: u64,
+    /// Counted by the first condition each could not place.
+    unresolved: Tally<Unplaced>,
     /// Arrived for a minute ending by the cutoff `drain_through` set, whether or not that minute held a bar, and left out so
     /// a bar handed out never changes.
     late: u64,
@@ -877,8 +892,8 @@ impl TradeFoldCounts {
         self.unsized_prints
     }
 
-    pub fn unresolved(&self) -> u64 {
-        self.unresolved
+    pub fn unresolved(&self) -> &Tally<Unplaced> {
+        &self.unresolved
     }
 
     pub fn late(&self) -> u64 {
@@ -950,8 +965,8 @@ impl TradeFold {
         }
         let allowed = match eligibility {
             Eligibility::Resolved(allowed) => allowed,
-            Eligibility::Unresolved(_) => {
-                self.counts.unresolved += 1;
+            Eligibility::Unresolved(unplaced) => {
+                self.counts.unresolved.add(unplaced);
                 UpdateRules::VOLUME_ONLY
             }
         };
@@ -1325,6 +1340,12 @@ mod tests {
             &codes(&[99]),
             Correction::Stands,
         );
+        // The first code the table cannot place is the one counted.
+        fold.push(
+            &trade("2026-10-02T13:30:02Z", 100.00, 50.0),
+            &codes(&[98, 99]),
+            Correction::Stands,
+        );
         // 00:30 Eastern on the next day is another session's.
         fold.push(
             &trade("2026-10-03T04:30:00Z", 100.00, 50.0),
@@ -1333,9 +1354,16 @@ mod tests {
         );
         let (bars, counts) = fold.finish();
         assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0].sums().totals().volume().units(), 50_000_000);
+        assert_eq!(bars[0].sums().totals().volume().units(), 100_000_000);
         assert_eq!(bars[0].sums().open_close(), None);
-        assert_eq!((counts.unresolved(), counts.other_session()), (1, 1));
+        assert_eq!(
+            counts.unresolved().to_string(),
+            "unknown code 98=1, unknown code 99=1"
+        );
+        assert_eq!(
+            (counts.unresolved().total(), counts.other_session()),
+            (2, 1)
+        );
     }
 
     #[test]

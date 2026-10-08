@@ -22,11 +22,11 @@ use fund::common::market::aggregate::BarRollup;
 use fund::common::market::quote_bars::{QuoteFold, QuoteRollup};
 use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
-use fund::common::monoid::concatenate;
+use fund::common::monoid::{Monoid, Tally, concatenate};
 use fund::common::storage::{Key, Origin, Provider};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
-use fund::ingest::RefusedRow;
+use fund::ingest::RowRefusalKind;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::flat_files::{
     BarFile, FlatFileDataset, FlatFileStream, FlatFiles, ParseRefusal, QuoteRowOutcome,
@@ -635,7 +635,7 @@ async fn parse_one(
         bars = parsed.bars().len(),
         test_tickers = parsed.test_tickers().len(),
         refused = parsed.refused().len(),
-        refused_by_cause = ?refused_by_cause(parsed.refused()),
+        refused_by_cause = %refused_by_cause(parsed.refused()),
         "Parsed a raw file"
     );
     Ok(())
@@ -886,7 +886,7 @@ async fn fold_quotes_one(
             QuoteRowOutcome::Quote(quote) => fold.push(&quote),
             QuoteRowOutcome::TestTicker => rows.test_tickers += 1,
             QuoteRowOutcome::OneSided => rows.one_sided += 1,
-            QuoteRowOutcome::Refused(row) => count_cause(&mut rows.refused, &row),
+            QuoteRowOutcome::Refused(row) => rows.refused.add(row.cause().kind()),
         })
         .map_err(FoldFailure::Parse)?;
         let (minutes, counts) = fold.finish();
@@ -928,8 +928,8 @@ async fn fold_quotes_one(
         out_of_order = counts.out_of_order(),
         one_sided = rows.one_sided,
         test_tickers = rows.test_tickers,
-        refused = rows.refused.values().sum::<u64>(),
-        refused_by_cause = ?rows.refused,
+        refused = rows.refused.total(),
+        refused_by_cause = %rows.refused,
         "Wrote quote bars"
     );
     Ok(())
@@ -969,18 +969,13 @@ async fn create_or_confirm<Refusal: Into<DecodeRefusal>>(
     }
 }
 
-/// Counts `row` under the name of its cause.
-fn count_cause(counts: &mut BTreeMap<&'static str, u64>, row: &RefusedRow) {
-    *counts.entry(row.cause().into()).or_insert(0) += 1;
-}
-
 /// Rows of a quote file that did not become a quote, by what they were.
 #[derive(Default)]
 struct QuoteRowCounts {
     test_tickers: u64,
     one_sided: u64,
     /// Counted by cause rather than kept, since a session refuses tens of thousands of rows.
-    refused: BTreeMap<&'static str, u64>,
+    refused: Tally<RowRefusalKind>,
 }
 
 /// Fetches Massive's condition table and writes it as today's snapshot.
@@ -1106,7 +1101,7 @@ async fn fold_trades_one(
     let folded = tokio::task::spawn_blocking(move || {
         let mut fold = TradeFold::new(session, conditions);
         let mut test_tickers = 0_u64;
-        let mut refused = BTreeMap::new();
+        let mut refused = Tally::empty();
         read_trades(stream, |outcome| match outcome {
             TradeRowOutcome::Print {
                 print,
@@ -1114,7 +1109,7 @@ async fn fold_trades_one(
                 correction,
             } => fold.push(&print, &conditions, correction),
             TradeRowOutcome::TestTicker => test_tickers += 1,
-            TradeRowOutcome::Refused(row) => count_cause(&mut refused, &row),
+            TradeRowOutcome::Refused(row) => refused.add(row.cause().kind()),
         })
         .map_err(FoldFailure::Parse)?;
         let (minutes, counts) = fold.finish();
@@ -1157,10 +1152,11 @@ async fn fold_trades_one(
         withdrawn = counts.withdrawn(),
         volume_ineligible = counts.volume_ineligible(),
         unsized_prints = counts.unsized_prints(),
-        unresolved = counts.unresolved(),
+        unresolved = counts.unresolved().total(),
+        unresolved_by_cause = %counts.unresolved(),
         test_tickers,
-        refused = refused.values().sum::<u64>(),
-        refused_by_cause = ?refused,
+        refused = refused.total(),
+        refused_by_cause = %refused,
         "Wrote trade bars"
     );
     Ok(())

@@ -982,6 +982,8 @@ mod tests {
                 Observation::OrderClosed(closed) => Some(closed.clone()),
                 Observation::ConfigurationResolved(_)
                 | Observation::PartitionWritten(_)
+                | Observation::PartitionFailed(_)
+                | Observation::ConditionsWritten(_)
                 | Observation::HealFinished(_)
                 | Observation::DatasetRead(_)
                 | Observation::ExperimentRan(_)

@@ -204,7 +204,33 @@ impl Archive {
         self.write(key, body, Condition::Unchanged(tag)).await
     }
 
+    /// Writes and verifies `body`, logging the outcome here so no caller has to.
     async fn write(
+        &self,
+        key: &Key,
+        body: Vec<u8>,
+        condition: Condition<'_>,
+    ) -> Result<(), ArchiveError> {
+        let bytes = body.len();
+        let condition_name: &'static str = condition.into();
+        let written = self.write_verified(key, body, condition).await;
+        match &written {
+            Ok(()) => {
+                tracing::debug!(
+                    path = key.path(),
+                    bytes,
+                    condition = condition_name,
+                    "Wrote an object"
+                )
+            }
+            Err(error) => {
+                tracing::warn!(path = key.path(), bytes, condition = condition_name, %error, "Object not written")
+            }
+        }
+        written
+    }
+
+    async fn write_verified(
         &self,
         key: &Key,
         body: Vec<u8>,
@@ -253,17 +279,27 @@ impl Archive {
     /// Deletes the object under `key`; deleting one already gone succeeds, as S3 answers it.
     pub async fn delete(&self, key: &Key) -> Result<(), ArchiveError> {
         let path = key.path();
-        self.s3_client
+        match self
+            .s3_client
             .delete_object()
             .bucket(&self.bucket_name)
             .key(&path)
             .send()
             .await
-            .map_err(|error| ArchiveError::Delete {
-                path,
-                reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
-            })?;
-        Ok(())
+        {
+            Ok(_) => {
+                tracing::debug!(path, "Deleted an object");
+                Ok(())
+            }
+            Err(error) => {
+                let error = ArchiveError::Delete {
+                    path: path.clone(),
+                    reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
+                };
+                tracing::warn!(path, %error, "Object not deleted");
+                Err(error)
+            }
+        }
     }
 
     /// Every path under `prefix`, across as many pages as S3 answers with.
@@ -385,6 +421,8 @@ impl Tag {
     }
 }
 
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum Condition<'a> {
     Any,
     Absent,

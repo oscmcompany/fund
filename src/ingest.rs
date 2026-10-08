@@ -10,14 +10,10 @@ pub use retry::FetchError;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::common::market::corporate_actions::{
-    ActionIdRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
-};
-use crate::common::market::record::{Bar, BarPricesRefusal, BarRefusal, QuoteRefusal};
-use crate::common::market::security_details::{IndustryCodeRefusal, MarketIdentifierCodeRefusal};
-use crate::common::market::{
-    DollarVolumeRefusal, DollarsRefusal, PriceRefusal, SharesRefusal, SymbolRefusal,
-};
+pub use crate::common::market::refusal::{RowRefusal, RowRefusalKind};
+
+use crate::common::market::record::Bar;
+use crate::common::monoid::{Tally, concatenate};
 
 /// Why an environment variable a client needs was not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,61 +95,9 @@ impl RefusedRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum RowRefusal {
-    Symbol(SymbolRefusal),
-    /// Stamped for a session other than the one requested.
-    Session {
-        timestamp: String,
-    },
-    Price(PriceRefusal),
-    Prices(BarPricesRefusal),
-    Shares(SharesRefusal),
-    DollarVolume(DollarVolumeRefusal),
-    Bar(BarRefusal),
-    Quote(QuoteRefusal),
-    /// A tape letter other than A, B or C.
-    Tape {
-        raw: String,
-    },
-    /// A condition field holding something other than comma-separated codes.
-    Conditions {
-        raw: String,
-    },
-    /// A correction code or label no rule reads, so whether the print stands is unknown.
-    Correction {
-        raw: String,
-    },
-    /// Answered for a symbol that was not asked for, as when a vendor normalizes a name into another security's.
-    Unrequested,
-    /// One of several rows claiming the same record; none is kept, since nothing says which is true.
-    Duplicate,
-    ActionId(ActionIdRefusal),
-    SplitRatio(SplitRatioRefusal),
-    Boundary(SeriesBoundaryRefusal),
-    /// A corporate action with no date to place it on.
-    Undated,
-    /// A security type code no variant names.
-    SecurityType {
-        raw: String,
-    },
-    IndustryCode(IndustryCodeRefusal),
-    Exchange(MarketIdentifierCodeRefusal),
-    Dollars(DollarsRefusal),
-    /// A Central Index Key that is not a number, or is zero, which the SEC never issues.
-    CentralIndexKey {
-        raw: String,
-    },
-}
-
-/// Refused rows counted by the name of their cause.
-pub fn refused_by_cause(rows: &[RefusedRow]) -> BTreeMap<String, u64> {
-    rows.iter().fold(BTreeMap::new(), |mut counts, row| {
-        let cause: &'static str = row.cause().into();
-        *counts.entry(cause.to_string()).or_insert(0) += 1;
-        counts
-    })
+/// Refused rows counted by the kind of their cause.
+pub fn refused_by_cause(rows: &[RefusedRow]) -> Tally<RowRefusalKind> {
+    concatenate(rows.iter().map(|row| Tally::of(row.cause().kind())))
 }
 
 /// Collects a report's bars by the record each claims to be, so a key claimed twice keeps neither row.

@@ -1266,7 +1266,7 @@ mod tests {
                     matches!(print, Print::Unsized { .. })
                 ),
                 AlpacaTradeOutcome::Refused(row) => {
-                    format!("refused {}", <&'static str>::from(row.cause()))
+                    format!("refused {}", <&'static str>::from(row.cause().kind()))
                 }
             })
             .collect();
