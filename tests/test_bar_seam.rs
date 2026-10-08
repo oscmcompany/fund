@@ -13,11 +13,15 @@ fn statement(views: &str, opening: &str) -> String {
     let start = views
         .find(opening)
         .unwrap_or_else(|| panic!("views.sql holds {opening}"));
-    let length = views[start..]
-        .find(";\n")
-        .expect("the statement ends a line")
-        + 1;
-    views[start..start + length].to_string()
+    let mut statement = String::new();
+    for line in views[start..].lines() {
+        statement.push_str(line);
+        statement.push('\n');
+        if line.trim_end().ends_with(';') {
+            return statement;
+        }
+    }
+    panic!("{opening} never ends a line in `;`")
 }
 
 /// The macros `bar_seam` calls and the view itself, reading `records` and `archive` in place of the two buckets.
