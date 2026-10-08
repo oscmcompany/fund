@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 
-/// One archive series a study can read, under the name the journal stores.
+/// One archive series a study reads or once read, under the name the journal stores.
 #[derive(
     Debug,
     Clone,
@@ -27,6 +27,9 @@ use crate::common::time::calendar::TradingCalendar;
 #[strum(serialize_all = "snake_case")]
 pub enum DatasetLeg {
     MassiveDailyBars,
+    /// The legacy archiver's daily bars, which no longer load; kept so journals that recorded a read of them still
+    /// decode.
+    LegacyDailyBars,
 }
 
 /// The partitions a study read, by session with the entity tag of the version read, and every trading session in the
@@ -384,7 +387,12 @@ mod tests {
         use strum::IntoEnumIterator;
         assert_eq!(
             DatasetLeg::iter().map(<&str>::from).collect::<Vec<_>>(),
-            ["massive_daily_bars"]
+            ["massive_daily_bars", "legacy_daily_bars"]
+        );
+        // What the 2026-10-08 comparison run journaled, which a study's next shipment re-reads.
+        assert_eq!(
+            serde_json::from_str::<DatasetLeg>("\"legacy_daily_bars\"").unwrap(),
+            DatasetLeg::LegacyDailyBars
         );
         for leg in DatasetLeg::iter() {
             let stored = serde_json::to_value(leg).unwrap();

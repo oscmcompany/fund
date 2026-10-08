@@ -57,6 +57,10 @@ pub enum DatasetError {
         session: SessionDate,
         refusal: DecodeRefusal,
     },
+    /// A leg retired with its data, which only journals still name.
+    Retired {
+        leg: DatasetLeg,
+    },
     /// A partition that holds no bars is a defect in the archive, not a gap, so it is refused rather than read.
     EmptyPartition {
         session: SessionDate,
@@ -72,6 +76,7 @@ impl std::fmt::Display for DatasetError {
             Self::EmptyPartition { session } => {
                 write!(formatter, "the partition for {session} holds no bars")
             }
+            Self::Retired { leg } => write!(formatter, "{leg} was retired with its data"),
             Self::Decode { session, refusal } => {
                 write!(
                     formatter,
@@ -154,6 +159,7 @@ async fn partition(
                 decode(&key, body).map_err(|refusal| DatasetError::Decode { session, refusal })?;
             Ok(Some((bars, tag)))
         }
+        DatasetLeg::LegacyDailyBars => Err(DatasetError::Retired { leg }),
     }
 }
 
@@ -168,6 +174,8 @@ pub async fn lineage(
             DatasetLeg::MassiveDailyBars => {
                 archive.tag(&Leg::MassiveDailyBars.key(*session)).await?
             }
+            // Never looked up, so every partition such a read held is reported gone.
+            DatasetLeg::LegacyDailyBars => None,
         };
         if let Some(tag) = tag {
             current.insert(*session, tag.as_str().to_string());
