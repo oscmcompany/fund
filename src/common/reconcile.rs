@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, Fill, Position};
 use crate::common::market::Symbol;
+use crate::common::monoid::{Monoid, concatenate};
 
 /// Where the expected and reported books differ, or that they agree; journaled either way as `book_reconciled`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,22 @@ pub struct Allowance(u128);
 impl Allowance {
     /// Cash must agree exactly.
     pub const NONE: Self = Self(0);
+
+    /// How far one fill can move cash when priced at the broker's average rounded to the tick, half a tick a share unit
+    /// rounded up, and booked to the cent, half a cent more.
+    fn of(fill: &Fill) -> Self {
+        Self(u128::from(fill.shares().units().div_ceil(2)) + HALF_CENT)
+    }
+}
+
+impl Monoid for Allowance {
+    fn empty() -> Self {
+        Self::NONE
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self(self.0.checked_add(other.0).expect("an allowance fits u128"))
+    }
 }
 
 impl TryFrom<String> for Allowance {
@@ -101,15 +118,9 @@ pub fn reconcile(expected: &Book, reported: &Book, allowance: Allowance) -> Book
 /// Half a cent in cash units, the most rounding a fill's cash to the cent can move it.
 const HALF_CENT: u128 = 5_000_000_000;
 
-/// How far the journal's cash can stray from the broker's when each fill is priced at the broker's average rounded
-/// to the nearest tick, half a tick a share unit, and the broker books each fill's cash to the cent, half a cent more.
+/// How far the journal's cash can stray from the broker's over `fills`: the sum of each fill's allowance.
 pub fn rounding_allowance<'a>(fills: impl IntoIterator<Item = &'a Fill>) -> Allowance {
-    Allowance(
-        fills
-            .into_iter()
-            .map(|fill| u128::from(fill.shares().units().div_ceil(2)) + HALF_CENT)
-            .sum(),
-    )
+    concatenate(fills.into_iter().map(Allowance::of))
 }
 
 #[cfg(test)]
@@ -206,6 +217,15 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn property_allowances_are_a_commutative_monoid(
+            first in 0..(1u128 << 120),
+            second in 0..(1u128 << 120),
+            third in 0..(1u128 << 120),
+        ) {
+            crate::common::monoid::laws::check(Allowance(first), Allowance(second), Allowance(third))?;
+        }
+
         #[test]
         fn property_allowance_round_trips_through_its_decimal_string(units in any::<u128>()) {
             let written = serde_json::to_string(&Allowance(units)).unwrap();

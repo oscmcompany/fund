@@ -171,9 +171,14 @@ fn below_minimum(order: &Order, price: impl Fn(&Symbol) -> Option<Price>) -> Opt
 mod tests {
     use proptest::prelude::*;
 
+    use chrono::TimeDelta;
+
     use super::*;
-    use crate::common::book::Book;
+    use crate::common::book::{Book, Cash, Fill, Position};
+    use crate::common::monoid::{Monoid, concatenate};
+    use crate::common::risk::{Limits, risk};
     use crate::common::strategy::{Target, orders};
+    use crate::common::time::calendar::SessionPhase;
 
     fn symbol(raw: &str) -> Symbol {
         Symbol::new(raw).unwrap()
@@ -363,7 +368,195 @@ mod tests {
         assert_eq!(held(sell, &price), []);
     }
 
+    const SYMBOLS: [&str; 4] = ["AAPL", "MSFT", "SPY", "QQQ"];
+
+    /// What the live chain is given at one decision: a book, a target, a price for every symbol, risk's inputs and
+    /// limits, and a reading per symbol, absent where none was taken.
+    #[derive(Debug, Clone)]
+    struct Decision {
+        book: Book,
+        wanted: Target,
+        prices: BTreeMap<Symbol, Price>,
+        gross: Cash,
+        per_name: Cash,
+        limits: Limits,
+        phase: SessionPhase,
+        opening: Cash,
+        readings: BTreeMap<Symbol, Tradability>,
+    }
+
+    /// Prices from ten cents to $500, half under a dollar, so a fractional buy can fall under the minimum.
+    fn arbitrary_decision(
+        readings: impl prop::strategy::Strategy<Value = Option<Tradability>>,
+    ) -> impl prop::strategy::Strategy<Value = Decision> {
+        let units = || {
+            prop::collection::btree_map(
+                prop::sample::select(SYMBOLS.to_vec()).prop_map(symbol),
+                0..20_000_000u64,
+                0..4,
+            )
+        };
+        let dollars = |count: i128| Cash::from_units(count * 1_000_000_000_000);
+        (
+            (0..20_000i128, units()),
+            units(),
+            prop::collection::vec(
+                prop_oneof![100_000..1_000_000i64, 1_000_000..500_000_000i64],
+                4,
+            ),
+            (1..20_000i128, 1..20_000i128, 1..20_000i128, 0..20_000i128),
+            prop::option::of(0..390i64),
+            prop::collection::vec(readings, 4),
+        )
+            .prop_map(
+                move |(
+                    (cash, held),
+                    wanted,
+                    ticks,
+                    (gross, per_name, loss, opening),
+                    until_close,
+                    readings,
+                )| {
+                    Decision {
+                        book: Book::reported(
+                            dollars(cash),
+                            held.into_iter().map(|(symbol, units)| {
+                                (symbol, Position::from_units(i128::from(units)))
+                            }),
+                        ),
+                        wanted: Target::new(
+                            wanted
+                                .into_iter()
+                                .map(|(symbol, units)| (symbol, Shares::from_units(units)))
+                                .collect(),
+                        ),
+                        prices: SYMBOLS
+                            .iter()
+                            .zip(ticks)
+                            .map(|(raw, ticks)| (symbol(raw), Price::from_ticks(ticks).unwrap()))
+                            .collect(),
+                        gross: dollars(gross),
+                        per_name: dollars(per_name),
+                        limits: Limits::new(
+                            dollars(gross),
+                            dollars(per_name),
+                            dollars(loss),
+                            TimeDelta::minutes(15),
+                        )
+                        .unwrap(),
+                        phase: until_close.map_or(SessionPhase::AfterClose, |minutes| {
+                            SessionPhase::Open {
+                                until_close: TimeDelta::minutes(minutes),
+                            }
+                        }),
+                        opening: dollars(opening),
+                        readings: SYMBOLS
+                            .iter()
+                            .zip(readings)
+                            .filter_map(|(raw, reading)| Some((symbol(raw), reading?)))
+                            .collect(),
+                    }
+                },
+            )
+    }
+
+    /// The live chain's pure stages: risk's target, the guard over the orders that reach it, and the book after every
+    /// passed order fills at its price.
+    fn chain(decision: &Decision) -> (Target, Guarded, Book) {
+        let price = |symbol: &Symbol| decision.prices.get(symbol).copied();
+        let restrained = risk(
+            &decision.limits,
+            decision.phase,
+            decision.opening,
+            &decision.book,
+            price,
+            decision.wanted.clone(),
+        )
+        .unwrap();
+        let guarded = guard(
+            orders(&decision.book, restrained.target()),
+            &decision.readings,
+            price,
+        );
+        let after = decision
+            .book
+            .clone()
+            .combine(concatenate(guarded.passed().iter().map(|order| {
+                Book::of(
+                    &Fill::new(
+                        "2026-10-08T15:00:00Z".parse().unwrap(),
+                        order.symbol().clone(),
+                        order.side(),
+                        order.shares(),
+                        decision.prices[order.symbol()],
+                        DollarVolume::default(),
+                    )
+                    .unwrap(),
+                )
+            })));
+        (restrained.target().clone(), guarded, after)
+    }
+
     proptest! {
+        /// Whatever the readings, the orders still owed from the book the passed fills reach to risk's target are
+        /// exactly the held ones, and with none held that book is the target.
+        #[test]
+        fn property_what_the_guard_holds_is_what_the_chain_leaves_owed(
+            decision in arbitrary_decision(prop::sample::select(vec![
+                None,
+                Some(Tradability::Fractionable),
+                Some(Tradability::WholeSharesOnly),
+                Some(Tradability::Untradable),
+                Some(Tradability::Unlisted),
+            ])),
+        ) {
+            let (target, guarded, after) = chain(&decision);
+            let owed: Vec<(Symbol, Side, Shares)> = orders(&after, &target)
+                .into_iter()
+                .map(|order| (order.symbol().clone(), order.side(), order.shares()))
+                .collect();
+            let held: Vec<(Symbol, Side, Shares)> = guarded
+                .held()
+                .iter()
+                .map(|held| (held.symbol.clone(), held.side, held.shares))
+                .collect();
+            prop_assert_eq!(owed, held);
+            if guarded.held().is_empty() {
+                let reached: BTreeMap<Symbol, Shares> = after
+                    .positions()
+                    .iter()
+                    .map(|(symbol, position)| {
+                        (symbol.clone(), Shares::from_units(u64::try_from(position.units()).unwrap()))
+                    })
+                    .collect();
+                prop_assert_eq!(reached.keys().collect::<Vec<_>>(), target.holdings().keys().collect::<Vec<_>>());
+                prop_assert_eq!(&reached, target.holdings());
+            }
+        }
+
+        /// Where every symbol trades fractions, only buys under the minimum are held, so the book the chain reaches
+        /// holds no symbol above risk's target and stays within the per-name and gross limits at the decision's prices.
+        #[test]
+        fn property_a_fractionable_chain_reaches_no_further_than_risk_allows(
+            decision in arbitrary_decision(Just(Some(Tradability::Fractionable))),
+        ) {
+            let (target, guarded, after) = chain(&decision);
+            for held in guarded.held() {
+                prop_assert_eq!(held.side, Side::Buy);
+                let below_minimum = matches!(held.cause, GuardCause::BelowMinimum { .. });
+                prop_assert!(below_minimum, "{:?}", held);
+            }
+            let mut worth = 0_i128;
+            for (symbol, position) in after.positions() {
+                let wanted = target.holdings().get(symbol).copied().unwrap_or_default();
+                prop_assert!(0 <= position.units() && position.units() <= i128::from(wanted.units()));
+                let value = position.units() * i128::from(decision.prices[symbol].ticks());
+                prop_assert!(value <= decision.per_name.units());
+                worth += value;
+            }
+            prop_assert!(worth <= decision.gross.units());
+        }
+
         /// Every order is either passed or held, never both or neither, and the passed keep their order.
         #[test]
         fn property_the_guard_partitions_the_orders(
