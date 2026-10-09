@@ -549,7 +549,7 @@ impl Key {
 }
 
 impl Host {
-    /// The prefixes this host may write, which its IAM grant is built from.
+    /// The prefixes this host may write; `tests/test_host.rs` checks its IAM grant allows each.
     pub fn writable_prefixes(self) -> Vec<String> {
         let records = ["journal", "logs"]
             .map(|kind| format!("{RECORDS_ROOT}/{kind}/producer={self}/"))

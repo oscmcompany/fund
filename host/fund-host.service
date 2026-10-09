@@ -1,0 +1,15 @@
+[Unit]
+# Runs this host's role on every boot; the run powers the box off, and the role's stop schedule bounds a hang.
+Description=Run this host's role once, then power off
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fund
+ExecStart=/home/ubuntu/fund/host/run-host
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
