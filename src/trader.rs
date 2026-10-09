@@ -128,6 +128,25 @@ pub enum SessionError {
     Reconcile(ReconcileFailed),
 }
 
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal(failed) | Self::Reconcile(ReconcileFailed::Journal(failed)) => write!(
+                formatter,
+                "the journal refused a write after {} orders: {}",
+                failed.outcomes().len(),
+                failed.error()
+            ),
+            Self::Reconcile(ReconcileFailed::Unread(error)) => {
+                write!(
+                    formatter,
+                    "the broker's book was not read to reconcile: {error}"
+                )
+            }
+        }
+    }
+}
+
 /// One session's trading state; `observe` folds the tape in and `advance` moves the session to an instant.
 pub struct Session<S: Strategy> {
     strategy: Played<S>,
