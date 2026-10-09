@@ -36,7 +36,7 @@ use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::security_details::SecurityDetails;
 use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use crate::common::monoid::{Monoid, concatenate};
-use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
+use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record, refuse_retired};
 use crate::common::storage::{Key, Provider, ReferenceTable};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
@@ -83,6 +83,7 @@ impl Parameters {
     fn resolved(
         supplied: &impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal>,
     ) -> Result<(Self, ConfigurationResolved), ParameterRefusal> {
+        refuse_retired(supplied)?;
         let mut resolved = BTreeMap::new();
         let read = |parameter| Ok::<_, ParameterRefusal>((parameter, supplied(parameter)?));
         let budget_minutes = at_most(
@@ -1384,6 +1385,16 @@ mod tests {
                 (Parameter::MinuteConcurrency, "8", ParameterSource::Default),
                 (Parameter::TickConcurrency, "16", ParameterSource::Default),
             ]
+        );
+    }
+
+    #[test]
+    fn test_a_supplied_retired_parameter_refuses_to_start() {
+        assert_eq!(
+            Parameters::resolved(&supplied(&[(Parameter::NoiseSeed, "7")])).map(|_| ()),
+            Err(ParameterRefusal::Retired {
+                parameter: Parameter::NoiseSeed
+            })
         );
     }
 
