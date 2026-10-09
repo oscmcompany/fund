@@ -323,12 +323,12 @@ impl<S: Strategy> Session<S> {
         Ok(())
     }
 
-    /// Withdraws the print a correction or cancel names, logging one whose bar was already built, which stays as built.
+    /// Withdraws the print a correction or cancel names, logging one no open minute holds, which changes no bar.
     fn withdraw(&mut self, symbol: &Symbol, original: TradeId) {
         match self.fold.withdraw(&(symbol.clone(), original)) {
             Withdrawal::Applied => {}
             Withdrawal::NotHeld => {
-                tracing::warn!(%symbol, ?original, "Withdrawal arrived after its print's bar");
+                tracing::warn!(%symbol, ?original, "Withdrawal not applied");
             }
         }
     }
@@ -1529,23 +1529,24 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// The QQQ correction and a SPY cancel of 2026-10-08 moved onto the test session, as the stream sent them.
-    const CORRECTED_PRINT: &str = r#"{"T":"t","S":"QQQ","i":6779,"x":"D","p":747.1571,"s":3500,"c":["@","7","Z","V"],"t":"2026-10-07T17:07:28.379388955Z","z":"C"}"#;
-    const CORRECTION: &str = r#"{"S":"QQQ","T":"c","cc":["@","7","Z","V"],"ci":8271,"cp":747.1571,"cs":3500,"oc":["?"],"oi":6779,"op":747.1571,"os":3500,"t":"2026-10-07T18:36:51.447795025Z","x":"D","z":"C"}"#;
-    const STANDING_PRINT: &str = r#"{"T":"t","S":"SPY","i":1,"x":"P","p":772.95,"s":100,"c":[" "],"t":"2026-10-07T18:50:10Z","z":"B"}"#;
-    const CANCELED_PRINT: &str = r#"{"T":"t","S":"SPY","i":71757381915470,"x":"D","p":772.94,"s":14050,"c":[" ","7","V"],"t":"2026-10-07T18:50:30.0518858Z","z":"B"}"#;
-    const CANCEL: &str = r#"{"S":"SPY","T":"x","a":"C","i":71757381915470,"p":772.94,"s":14050,"t":"2026-10-07T18:52:00Z","x":"D","z":"B"}"#;
+    /// A correction of an ABC print and a cancel of an XYZ print, shaped as the stream sends them.
+    const CORRECTED_PRINT: &str = r#"{"T":"t","S":"ABC","i":4101,"x":"Q","p":50.25,"s":200,"c":["@","I"],"t":"2026-10-07T15:12:07.5Z","z":"C"}"#;
+    const CORRECTION: &str = r#"{"S":"ABC","T":"c","cc":["@","I"],"ci":4188,"cp":50.3,"cs":250,"oc":["@"],"oi":4101,"op":50.25,"os":200,"t":"2026-10-07T16:40:02.25Z","x":"Q","z":"C"}"#;
+    const STANDING_PRINT: &str = r#"{"T":"t","S":"XYZ","i":1,"x":"P","p":20.1,"s":100,"c":[" "],"t":"2026-10-07T16:50:10Z","z":"B"}"#;
+    const CANCELED_PRINT: &str = r#"{"T":"t","S":"XYZ","i":900001,"x":"N","p":20.05,"s":700,"c":[" ","I"],"t":"2026-10-07T16:50:30.25Z","z":"B"}"#;
+    const CANCEL: &str = r#"{"S":"XYZ","T":"x","a":"C","i":900001,"p":20.05,"s":700,"t":"2026-10-07T16:52:00Z","x":"N","z":"B"}"#;
 
-    /// The same prints as Alpaca's REST history labelled them on 2026-10-08, folded as the archive folds them.
+    /// The same prints as the REST history labels them, the replacement keeping its original's number, folded as the
+    /// archive folds them.
     fn archive_bars() -> Vec<serde_json::Value> {
         let pages = [
             (
-                "QQQ",
-                r#"[{"c":["@","7","Z","V"],"i":6779,"p":747.1571,"s":3500,"t":"2026-10-07T17:07:28.379388955Z","u":"corrected","x":"D","z":"C"},{"c":["@","7","V"],"i":6779,"p":747.1571,"s":3500,"t":"2026-10-07T18:36:51.447795025Z","u":"incorrect","x":"D","z":"C"}]"#,
+                "ABC",
+                r#"[{"c":["@","I"],"i":4101,"p":50.25,"s":200,"t":"2026-10-07T15:12:07.5Z","u":"corrected","x":"Q","z":"C"},{"c":["@","I"],"i":4101,"p":50.3,"s":250,"t":"2026-10-07T16:40:02.25Z","u":"incorrect","x":"Q","z":"C"}]"#,
             ),
             (
-                "SPY",
-                r#"[{"c":[" "],"i":1,"p":772.95,"s":100,"t":"2026-10-07T18:50:10Z","x":"P","z":"B"},{"c":[" ","7","V"],"i":71757381915470,"p":772.94,"s":14050,"t":"2026-10-07T18:50:30.0518858Z","u":"canceled","x":"D","z":"B"}]"#,
+                "XYZ",
+                r#"[{"c":[" "],"i":1,"p":20.1,"s":100,"t":"2026-10-07T16:50:10Z","x":"P","z":"B"},{"c":[" ","I"],"i":900001,"p":20.05,"s":700,"t":"2026-10-07T16:50:30.25Z","u":"canceled","x":"N","z":"B"}]"#,
             ),
         ];
         let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
@@ -1631,8 +1632,8 @@ mod tests {
         assert_eq!(
             minutes,
             [
-                ("QQQ", "2026-10-07T18:36:00Z"),
-                ("SPY", "2026-10-07T18:50:00Z")
+                ("ABC", "2026-10-07T16:40:00Z"),
+                ("XYZ", "2026-10-07T16:50:00Z")
             ]
         );
         assert_eq!(live, archive_bars());
@@ -1644,10 +1645,10 @@ mod tests {
     async fn test_a_late_correction_or_cancel_leaves_the_built_bar() {
         let live = live_bars(&[
             (None, CORRECTED_PRINT),
-            (Some("17:09:00"), CORRECTION),
+            (Some("15:14:00"), CORRECTION),
             (None, STANDING_PRINT),
             (None, CANCELED_PRINT),
-            (Some("18:52:00"), CANCEL),
+            (Some("16:52:00"), CANCEL),
         ])
         .await;
         let volumes: Vec<(&str, &str, i64)> = live
@@ -1663,9 +1664,9 @@ mod tests {
         assert_eq!(
             volumes,
             [
-                ("QQQ", "2026-10-07T17:07:00Z", 3_500_000_000),
-                ("QQQ", "2026-10-07T18:36:00Z", 3_500_000_000),
-                ("SPY", "2026-10-07T18:50:00Z", 14_150_000_000),
+                ("ABC", "2026-10-07T15:12:00Z", 200_000_000),
+                ("ABC", "2026-10-07T16:40:00Z", 250_000_000),
+                ("XYZ", "2026-10-07T16:50:00Z", 800_000_000),
             ]
         );
     }

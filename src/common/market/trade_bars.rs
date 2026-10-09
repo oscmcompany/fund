@@ -879,10 +879,7 @@ impl TradeFold {
                 return;
             }
         }
-        if self
-            .drained_through
-            .is_some_and(|drained| minute_ended_by(print, drained))
-        {
+        if self.closed(print) {
             self.counts.late += 1;
             return;
         }
@@ -905,6 +902,12 @@ impl TradeFold {
             timestamp: BarInterval::OneMinute.bucket(print.timestamp()),
         };
         self.minutes.add(key, TradeSums::of(print, allowed));
+    }
+
+    /// Whether `print`'s minute ended by the cutoff the latest `drain_through` set, so the fold counts it late.
+    fn closed(&self, print: &Print) -> bool {
+        self.drained_through
+            .is_some_and(|drained| minute_ended_by(print, drained))
     }
 
     /// The one-minute bars that have ended by `through`, each handed out once; bars handed out minute by minute and
@@ -960,7 +963,8 @@ impl<Identity: Ord> LiveTradeFold<Identity> {
         }
     }
 
-    /// Holds a standing print until its minute drains, and folds a withdrawn one at once, as `TradeFold` counts it.
+    /// Holds a standing print until its minute drains; a withdrawn print, or one for a minute already drained, is folded
+    /// at once, as `TradeFold` counts it.
     pub fn push(
         &mut self,
         identity: Identity,
@@ -970,6 +974,10 @@ impl<Identity: Ord> LiveTradeFold<Identity> {
         correction: Correction,
     ) {
         match correction {
+            Correction::Stands if self.fold.closed(&print) => {
+                self.fold
+                    .push_lettered(&print, tape, &letters, Correction::Stands);
+            }
             Correction::Stands => {
                 self.held.insert(
                     identity,
@@ -1102,6 +1110,37 @@ mod tests {
 
     fn session() -> TradeFold {
         TradeFold::new(october_second(), conditions())
+    }
+
+    /// A print for a minute already drained is late at once, so a later withdrawal of it applies to nothing, while one
+    /// for an open minute is held and withdrawn.
+    #[test]
+    fn test_a_print_for_a_drained_minute_is_never_held() {
+        let mut fold = LiveTradeFold::new(october_second(), conditions());
+        assert!(
+            fold.drain_through(instant("2026-10-02T14:02:00Z"))
+                .is_empty()
+        );
+        for (identity, at) in [(1, "2026-10-02T14:01:10Z"), (2, "2026-10-02T14:02:10Z")] {
+            fold.push(
+                identity,
+                trade(at, 100.0, 1.0),
+                Tape::ConsolidatedTape,
+                letters(&[' ']),
+                Correction::Stands,
+            );
+        }
+        assert_eq!(
+            (fold.withdraw(&1), fold.withdraw(&2)),
+            (Withdrawal::NotHeld, Withdrawal::Applied)
+        );
+        assert!(
+            fold.drain_through(instant("2026-10-02T14:05:00Z"))
+                .is_empty()
+        );
+        let (bars, counts) = fold.fold.finish();
+        assert!(bars.is_empty());
+        assert_eq!((counts.late(), counts.withdrawn()), (1, 1));
     }
 
     #[test]

@@ -651,54 +651,51 @@ mod tests {
         );
     }
 
-    /// The QQQ correction the stream sent on 2026-10-08 and the QQQ cancel captured on 2026-10-07, whose `t` the capture
-    /// elided; a cancel action this client does not read is refused, never taken as a withdrawal.
+    /// A correction whose replacement differs from its original in price and size, and a cancel, shaped as the stream
+    /// sends them; a cancel action this client does not read is refused, never taken as a withdrawal.
     #[test]
     fn test_corrections_and_cancels_read_as_the_stream_sends_them() {
-        let qqq = Symbol::new("QQQ").unwrap();
-        let correction = r#"[{"S":"QQQ","T":"c","cc":["@","7","Z","V"],"ci":8271,"cp":747.1571,"cs":3500,"oc":["?"],"oi":6779,"op":747.1571,"os":3500,"t":"2026-10-08T18:36:51.447795025Z","x":"D","z":"C"}]"#;
+        let abc = Symbol::new("ABC").unwrap();
+        let correction = r#"[{"S":"ABC","T":"c","cc":["@","I"],"ci":4188,"cp":50.3,"cs":250,"oc":["@"],"oi":4101,"op":50.25,"os":200,"t":"2026-10-07T16:40:02.25Z","x":"Q","z":"C"}]"#;
         assert_eq!(
             messages(correction).unwrap(),
             [StreamMessage::Corrected {
-                symbol: qqq.clone(),
+                symbol: abc.clone(),
                 original: TradeId {
-                    exchange: 'D',
-                    number: 6779
+                    exchange: 'Q',
+                    number: 4101
                 },
                 replacement: TradeId {
-                    exchange: 'D',
-                    number: 8271
+                    exchange: 'Q',
+                    number: 4188
                 },
                 outcome: AlpacaTradeOutcome::Print {
                     print: Print::new(
-                        qqq.clone(),
-                        "2026-10-08T18:36:51.447795025Z".parse().unwrap(),
-                        Price::from_dollars(747.1571).unwrap(),
-                        Shares::whole(3500).unwrap(),
+                        abc.clone(),
+                        "2026-10-07T16:40:02.25Z".parse().unwrap(),
+                        Price::from_dollars(50.3).unwrap(),
+                        Shares::whole(250).unwrap(),
                     ),
                     tape: Tape::UnlistedTrading,
-                    letters: ['@', '7', 'Z', 'V']
-                        .into_iter()
-                        .map(ConditionLetter::of)
-                        .collect(),
+                    letters: ['@', 'I'].into_iter().map(ConditionLetter::of).collect(),
                     correction: Correction::Stands,
                 },
             }]
         );
         let cancel = |action: &str| {
             messages(&format!(
-                r#"[{{"S":"QQQ","T":"x","a":"{action}","i":285160,"p":761.158,"s":1,"t":"2026-10-07T19:56:39Z","x":"D","z":"C"}}]"#
+                r#"[{{"S":"ABC","T":"x","a":"{action}","i":4101,"p":50.25,"s":200,"t":"2026-10-07T16:41:00Z","x":"Q","z":"C"}}]"#
             ))
             .unwrap()
         };
         let original = TradeId {
-            exchange: 'D',
-            number: 285_160,
+            exchange: 'Q',
+            number: 4101,
         };
         assert_eq!(
             cancel("C"),
             [StreamMessage::Canceled {
-                symbol: qqq.clone(),
+                symbol: abc.clone(),
                 original,
                 action: CancelAction::Cancel,
             }]
@@ -706,7 +703,7 @@ mod tests {
         assert_eq!(
             cancel("E"),
             [StreamMessage::Canceled {
-                symbol: qqq,
+                symbol: abc,
                 original,
                 action: CancelAction::Error,
             }]
