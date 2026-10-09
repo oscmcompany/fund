@@ -12,7 +12,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
-use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, one_sided, variable};
+use super::{Accepted, RefusedRow, RowRefusal, SessionBars, VariableRefusal, one_sided, variable};
 use crate::common::market::record::{Bar, BarInterval, BarPrices, Quote};
 use crate::common::market::trade_bars::{ConditionCode, Correction, Print};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
@@ -253,30 +253,6 @@ impl FlatFiles {
     }
 }
 
-/// One session's bars from a flat bar file, with every row that did not become one: each row is exactly one of a bar, a
-/// test ticker or a refusal.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FlatFileBars {
-    bars: Vec<Bar>,
-    test_tickers: Vec<String>,
-    refused: Vec<RefusedRow>,
-}
-
-impl FlatFileBars {
-    /// In symbol, then timestamp, order.
-    pub fn bars(&self) -> &[Bar] {
-        &self.bars
-    }
-
-    pub fn test_tickers(&self) -> &[String] {
-        &self.test_tickers
-    }
-
-    pub fn refused(&self) -> &[RefusedRow] {
-        &self.refused
-    }
-}
-
 /// Why a flat bar file was not read at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseRefusal {
@@ -348,7 +324,7 @@ impl BarFile {
         self,
         gzipped: &[u8],
         session: SessionDate,
-    ) -> Result<FlatFileBars, ParseRefusal> {
+    ) -> Result<SessionBars, ParseRefusal> {
         let interval = self.interval();
         let mut reader = csv::Reader::from_reader(flate2::read::GzDecoder::new(gzipped));
         let mut test_tickers = Vec::new();
@@ -368,12 +344,7 @@ impl BarFile {
                 Err(cause) => accepted.refuse(row.ticker, cause),
             }
         }
-        let (bars, refused) = accepted.finish();
-        Ok(FlatFileBars {
-            bars,
-            test_tickers,
-            refused,
-        })
+        Ok(SessionBars::new(accepted, test_tickers))
     }
 }
 

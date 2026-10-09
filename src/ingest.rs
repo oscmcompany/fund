@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub use crate::common::market::refusal::{RowRefusal, RowRefusalKind};
 
 use crate::common::market::record::Bar;
-use crate::common::monoid::Tally;
+use crate::common::monoid::{Tally, concatenate};
 
 /// Why an environment variable a client needs was not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +86,14 @@ pub struct RefusedRow {
 }
 
 impl RefusedRow {
+    #[cfg(test)]
+    pub(crate) fn new(ticker: &str, cause: RowRefusal) -> Self {
+        Self {
+            ticker: ticker.to_string(),
+            cause,
+        }
+    }
+
     pub fn ticker(&self) -> &str {
         &self.ticker
     }
@@ -97,11 +105,40 @@ impl RefusedRow {
 
 /// Refused rows counted by the kind of their cause.
 pub fn refused_by_cause(rows: &[RefusedRow]) -> Tally<RowRefusalKind> {
-    let mut tally = Tally::default();
-    for row in rows {
-        tally.add(row.cause().kind());
+    concatenate(rows.iter().map(|row| Tally::of(row.cause().kind())))
+}
+
+/// One session's bars from a Massive report, with every row that did not become one: each row is exactly one of a bar,
+/// a test ticker or a refusal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionBars {
+    bars: Vec<Bar>,
+    test_tickers: Vec<String>,
+    refused: Vec<RefusedRow>,
+}
+
+impl SessionBars {
+    fn new<Key: Ord + Clone>(accepted: Accepted<Key>, test_tickers: Vec<String>) -> Self {
+        let (bars, refused) = accepted.finish();
+        Self {
+            bars,
+            test_tickers,
+            refused,
+        }
     }
-    tally
+
+    /// In symbol, then timestamp, order.
+    pub fn bars(&self) -> &[Bar] {
+        &self.bars
+    }
+
+    pub fn test_tickers(&self) -> &[String] {
+        &self.test_tickers
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
 }
 
 /// Collects a report's bars by the record each claims to be, so a key claimed twice keeps neither row.

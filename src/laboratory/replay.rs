@@ -5,9 +5,8 @@ use crate::common::book::{Book, Cash};
 use crate::common::laboratory::estimate::EstimateRefusal;
 use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs, Parameters};
 use crate::common::laboratory::series::SeriesRefusal;
-use crate::common::market::DollarVolume;
 use crate::common::market::record::BarInterval;
-use crate::common::monoid::Monoid;
+use crate::common::monoid::concatenate;
 use crate::common::replay::{FillModel, Replay, ReplayRefusal, Replayer};
 use crate::common::strategy::Strategy;
 use crate::laboratory::dataset::Dataset;
@@ -175,13 +174,8 @@ pub(crate) fn run<S: Strategy>(
 /// was priced, every fill having landed before it.
 pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(&'static str, f64)> {
     let opening = opening.cash();
-    let sum = |amounts: Vec<DollarVolume>| {
-        amounts
-            .into_iter()
-            .fold(DollarVolume::empty(), Monoid::combine)
-    };
-    let costs = sum(replay.fills().iter().map(|fill| fill.cost()).collect());
-    let traded = sum(replay.fills().iter().map(|fill| fill.notional()).collect());
+    let costs = concatenate(replay.fills().iter().map(|fill| fill.cost()));
+    let traded = concatenate(replay.fills().iter().map(|fill| fill.notional()));
     let unpriced = replay.marks().values().filter(|mark| mark.is_err()).count();
     let mut metrics = vec![
         ("fills", replay.fills().len() as f64),
