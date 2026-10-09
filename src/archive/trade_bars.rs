@@ -283,7 +283,8 @@ mod tests {
     use crate::common::journal::RunId;
     use crate::common::market::record::Trade;
     use crate::common::market::trade_bars::{
-        Condition, Correction, Print, TradeConditions, TradeFold, UpdateRules,
+        Condition, ConditionCode, ConditionStatus, Correction, Print, TradeConditions, TradeFold,
+        UpdateRules,
     };
     use crate::common::market::{Price, PriceRefusal};
     use crate::common::storage::Origin;
@@ -300,13 +301,23 @@ mod tests {
         let mut fold = TradeFold::new(
             session,
             TradeConditions::new(BTreeMap::from([(
-                37,
-                Condition::new(UpdateRules::new(true, false, false), None, None, false),
+                ConditionCode::new(37),
+                Condition::new(
+                    UpdateRules::VOLUME_ONLY,
+                    None,
+                    None,
+                    ConditionStatus::Current,
+                ),
             )])),
         );
         for (at, dollars, shares, codes) in [
             ("2026-10-02T13:30:01.000000123Z", 100.01, 300.0, vec![]),
-            ("2026-10-02T13:31:00Z", 100.02, 0.25, vec![37]),
+            (
+                "2026-10-02T13:31:00Z",
+                100.02,
+                0.25,
+                vec![ConditionCode::new(37)],
+            ),
         ] {
             let trade = Trade::new(
                 Symbol::new("AAPL").unwrap(),

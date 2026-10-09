@@ -22,7 +22,7 @@ use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
 use crate::common::market::trade_bars::{
-    Condition, TradeConditions, UpdateRules, condition_letter,
+    Condition, ConditionCode, ConditionLetter, ConditionStatus, TradeConditions, UpdateRules,
 };
 use crate::common::market::{Dollars, Shares, Symbol};
 use crate::common::storage::{Key, Provider, ReferenceTable};
@@ -121,20 +121,23 @@ pub fn encode_conditions(
     let mut letters: [StringBuilder; 2] = std::array::from_fn(|_| StringBuilder::new());
     for (code, condition) in conditions.conditions() {
         let rules = condition.rules();
-        codes.append_value(*code);
-        for (builder, flag) in flags.iter_mut().zip([
-            rules.volume(),
-            rules.high_low(),
-            rules.open_close(),
-            condition.retired(),
-        ]) {
+        codes.append_value(code.get());
+        let retired = match condition.status() {
+            ConditionStatus::Current => false,
+            ConditionStatus::Retired => true,
+        };
+        for (builder, flag) in
+            flags
+                .iter_mut()
+                .zip([rules.volume, rules.high_low, rules.open_close, retired])
+        {
             builder.append_value(flag);
         }
         for (builder, letter) in letters
             .iter_mut()
             .zip([condition.consolidated_tape(), condition.unlisted_trading()])
         {
-            builder.append_option(letter.map(String::from));
+            builder.append_option(letter.map(|letter| String::from(letter.get())));
         }
     }
     let [volume, high_low, open_close, retired] =
@@ -184,28 +187,31 @@ pub fn decode_conditions(
             let code = codes.value(row);
             let letter = |array: &parquet::Column<'_, StringArray>| match array.is_valid(row) {
                 false => Ok(None),
-                true => match condition_letter(array.value(row)) {
-                    Some(letter) => Ok(Some(letter)),
-                    None => Err(ReferenceRefusal::Row {
+                true => ConditionLetter::new(array.value(row))
+                    .map(Some)
+                    .map_err(|refusal| ReferenceRefusal::Row {
                         index: row,
                         cause: RowCause::Unparsable {
                             column: format!("{} of condition {code}", array.name()),
-                            raw: array.value(row).to_string(),
+                            raw: refusal.raw,
                         },
                     }),
-                },
+            };
+            let status = match flags[3].value(row) {
+                false => ConditionStatus::Current,
+                true => ConditionStatus::Retired,
             };
             let rule = Condition::new(
-                UpdateRules::new(
-                    flags[0].value(row),
-                    flags[1].value(row),
-                    flags[2].value(row),
-                ),
+                UpdateRules {
+                    volume: flags[0].value(row),
+                    high_low: flags[1].value(row),
+                    open_close: flags[2].value(row),
+                },
                 letter(&letters[0])?,
                 letter(&letters[1])?,
-                flags[3].value(row),
+                status,
             );
-            if rules.insert(code, rule).is_some() {
+            if rules.insert(ConditionCode::new(code), rule).is_some() {
                 return Err(ReferenceRefusal::Duplicate { code });
             }
         }
@@ -705,30 +711,48 @@ mod tests {
     fn test_conditions_read_back_exactly_and_only_from_their_table() {
         let conditions = TradeConditions::new(BTreeMap::from([
             (
-                6,
-                Condition::new(UpdateRules::new(true, false, false), Some('I'), None, true),
-            ),
-            (
-                10,
+                ConditionCode::new(6),
                 Condition::new(
-                    UpdateRules::new(true, true, false),
-                    Some('4'),
-                    Some('X'),
-                    false,
-                ),
-            ),
-            (
-                15,
-                Condition::new(
-                    UpdateRules::new(false, false, false),
+                    UpdateRules::VOLUME_ONLY,
+                    Some(ConditionLetter::of('I')),
                     None,
-                    Some('W'),
-                    false,
+                    ConditionStatus::Retired,
                 ),
             ),
             (
-                37,
-                Condition::new(UpdateRules::new(true, false, false), None, None, false),
+                ConditionCode::new(10),
+                Condition::new(
+                    UpdateRules {
+                        volume: true,
+                        high_low: true,
+                        open_close: false,
+                    },
+                    Some(ConditionLetter::of('4')),
+                    Some(ConditionLetter::of('X')),
+                    ConditionStatus::Current,
+                ),
+            ),
+            (
+                ConditionCode::new(15),
+                Condition::new(
+                    UpdateRules {
+                        volume: false,
+                        high_low: false,
+                        open_close: false,
+                    },
+                    None,
+                    Some(ConditionLetter::of('W')),
+                    ConditionStatus::Current,
+                ),
+            ),
+            (
+                ConditionCode::new(37),
+                Condition::new(
+                    UpdateRules::VOLUME_ONLY,
+                    None,
+                    None,
+                    ConditionStatus::Current,
+                ),
             ),
         ]));
         let provenance = Provenance::new(

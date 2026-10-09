@@ -29,8 +29,8 @@ use fund::common::time::calendar::TradingCalendar;
 use fund::ingest::RefusedRow;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::flat_files::{
-    FlatFileDataset, FlatFileStream, FlatFiles, ParseRefusal, QuoteRowOutcome, TradeRowOutcome,
-    read_quotes, read_trades,
+    BarFile, FlatFileDataset, FlatFileStream, FlatFiles, ParseRefusal, QuoteRowOutcome,
+    TradeRowOutcome, read_quotes, read_trades,
 };
 use fund::ingest::massive::Massive;
 use fund::ingest::refused_by_cause;
@@ -59,7 +59,7 @@ enum Command {
         concurrency: usize,
     },
     Parse {
-        dataset: FlatFileDataset,
+        file: BarFile,
         first: SessionDate,
         last: SessionDate,
         concurrency: usize,
@@ -104,7 +104,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
         }),
         [command, dataset, first, last, concurrency] if command == "parse" => {
             Some(Command::Parse {
-                dataset: dataset.parse().ok()?,
+                file: dataset.parse().ok()?,
                 first: date(first)?,
                 last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
                 concurrency: concurrency
@@ -280,11 +280,11 @@ async fn main() -> ExitCode {
                 .await
             }
             Command::Parse {
-                dataset,
+                file,
                 first,
                 last,
                 concurrency,
-            } => parse_bars(archive, dataset, first, last, concurrency, run_id, commit).await,
+            } => parse_bars(archive, file, first, last, concurrency, run_id, commit).await,
         }
     }
     .instrument(span)
@@ -469,31 +469,21 @@ impl std::fmt::Display for ParseFailure {
 
 async fn parse_bars(
     archive: Archive,
-    dataset: FlatFileDataset,
+    file: BarFile,
     first: SessionDate,
     last: SessionDate,
     concurrency: usize,
     run_id: RunId,
     commit: Option<Commit>,
 ) -> ExitCode {
-    let interval = match dataset {
-        FlatFileDataset::DailyBars => BarInterval::OneDay,
-        FlatFileDataset::MinuteBars => BarInterval::OneMinute,
-        FlatFileDataset::Quotes | FlatFileDataset::Trades => {
-            tracing::error!(%dataset, "Only bar files parse into bars");
-            return ExitCode::from(REFUSED_TO_START);
-        }
-    };
+    let (dataset, interval) = (file.dataset(), file.interval());
     let heal_start = SessionDate::from_date(HEAL_DAILY_BARS_FROM);
-    match dataset {
-        FlatFileDataset::DailyBars if last >= heal_start => {
+    match file {
+        BarFile::Daily if last >= heal_start => {
             tracing::error!(%last, %heal_start, "Daily bars from this session on are the nightly heal's to write");
             return ExitCode::from(REFUSED_TO_START);
         }
-        FlatFileDataset::DailyBars
-        | FlatFileDataset::MinuteBars
-        | FlatFileDataset::Quotes
-        | FlatFileDataset::Trades => {}
+        BarFile::Daily | BarFile::Minute => {}
     }
     let bars_key = move |session| Key::Bars {
         provider: Provider::Massive,
@@ -550,7 +540,7 @@ async fn parse_bars(
         let key = bars_key(session);
         tasks.spawn(
             async move {
-                let outcome = parse_one(&archive, dataset, &key, run_id, commit).await;
+                let outcome = parse_one(&archive, file, &key, run_id, commit).await;
                 match &outcome {
                     Ok(()) => {}
                     Err(failure) => {
@@ -626,13 +616,13 @@ fn listed(sessions: &[SessionDate]) -> String {
 /// Reads one held raw file, parses it, and creates its bars under `key`, which must be unwritten.
 async fn parse_one(
     archive: &Archive,
-    dataset: FlatFileDataset,
+    file: BarFile,
     key: &Key,
     run_id: RunId,
     commit: Option<Commit>,
 ) -> Result<(), ParseFailure> {
     let session = key.session();
-    let raw_key = dataset.key(session);
+    let raw_key = file.dataset().key(session);
     let fetched_at = archive
         .stored(&raw_key)
         .await
@@ -649,7 +639,7 @@ async fn parse_one(
     let encoded_key = key.clone();
     // Decompressing, parsing and encoding a minute file is seconds of CPU, which belongs off the async workers.
     let (parsed, body) = tokio::task::spawn_blocking(move || {
-        let parsed = dataset
+        let parsed = file
             .parse_bars(&gzipped, session)
             .map_err(ParseFailure::Parse)?;
         if parsed.bars().is_empty() {
@@ -1377,6 +1367,16 @@ mod tests {
         assert!(parse(&arguments("2021-08-24", "2021-08-23")).is_none());
         let parsing = ["parse", "daily_bars", "2021-08-24", "2021-08-23", "4"].map(String::from);
         assert!(parse(&parsing).is_none());
+        let parse_file =
+            |file: &str| parse(&["parse", file, "2021-08-23", "2021-08-24", "4"].map(String::from));
+        assert!(matches!(
+            parse_file("minute_bars"),
+            Some(Command::Parse {
+                file: BarFile::Minute,
+                ..
+            })
+        ));
+        assert!(parse_file("quotes").is_none());
         let folding = |first: &str, last: &str, concurrency: &str| {
             parse(&["fold-quotes", first, last, concurrency].map(String::from))
         };

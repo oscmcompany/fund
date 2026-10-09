@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::common::market::corporate_actions::{
     ActionIdRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
 };
-use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal, QuoteRefusal, TradeRefusal};
+use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal, QuoteRefusal};
 use crate::common::market::security_details::{IndustryCodeRefusal, MarketIdentifierCodeRefusal};
 use crate::common::market::{
     DollarVolumeRefusal, DollarsRefusal, PriceRefusal, SharesRefusal, SymbolRefusal,
@@ -63,6 +63,25 @@ fn variable_refusal(name: &'static str, error: std::env::VarError) -> VariableRe
     }
 }
 
+/// A key a vendor authenticates with; its `Debug` prints none of it.
+pub(crate) struct Secret(String);
+
+impl Secret {
+    pub(crate) fn new(key: String) -> Self {
+        Self(key)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Secret(..)")
+    }
+}
+
 /// A vendor row that did not become a record, named as the vendor wrote it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefusedRow {
@@ -94,7 +113,6 @@ pub enum RowRefusal {
     DollarVolume(DollarVolumeRefusal),
     Bar(BarRefusal),
     Quote(QuoteRefusal),
-    Trade(TradeRefusal),
     /// A tape letter other than A, B or C.
     Tape {
         raw: String,

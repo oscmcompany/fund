@@ -15,8 +15,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::common::market::Symbol;
 use crate::ingest::alpaca::{
-    Alpaca, AlpacaQuote, AlpacaQuoteOutcome, AlpacaTrade, AlpacaTradeOutcome, quote_outcome,
-    trade_outcome,
+    Alpaca, AlpacaQuote, AlpacaQuoteOutcome, AlpacaTrade, AlpacaTradeOutcome, Credentials,
+    quote_outcome, trade_outcome,
 };
 use crate::ingest::{RefusedRow, RowRefusal};
 
@@ -240,20 +240,12 @@ impl MarketStream {
     /// the subscription on every channel; corrections and cancels come with the trades unasked. Refused if opening
     /// outlasts `OPENING_WINDOW`.
     pub async fn open(alpaca: &Alpaca, symbols: &[Symbol]) -> Result<Self, StreamError> {
-        Self::open_at(
-            STREAM_URL,
-            &alpaca.key_id,
-            &alpaca.secret,
-            symbols,
-            OPENING_WINDOW,
-        )
-        .await
+        Self::open_at(STREAM_URL, &alpaca.credentials, symbols, OPENING_WINDOW).await
     }
 
     async fn open_at(
         url: &str,
-        key_id: &str,
-        secret: &str,
+        credentials: &Credentials,
         symbols: &[Symbol],
         window: Duration,
     ) -> Result<Self, StreamError> {
@@ -273,9 +265,8 @@ impl MarketStream {
                 matches!(message, StreamMessage::Connected)
             })
             .await?;
-        let authenticate = serde_json::json!({"action": "auth", "key": key_id, "secret": secret});
         stream
-            .send(deadline, "authentication", &authenticate)
+            .send(deadline, "authentication", &credentials.authentication())
             .await?;
         stream
             .awaiting(deadline, "authentication", |message| {
@@ -485,6 +476,8 @@ mod tests {
     use crate::common::market::record::Quote;
     use crate::common::market::trade_bars::{Correction, Print, Tape};
     use crate::common::market::{Price, Shares};
+    use crate::ingest::Secret;
+    use crate::ingest::alpaca::{quote_page, trade_page};
 
     /// The control frames as the SIP stream sent them on 2026-10-06, and its answer to a malformed request.
     #[test]
@@ -555,7 +548,13 @@ mod tests {
                     }
                 );
                 assert_eq!(*tape, Tape::ConsolidatedTape);
-                assert_eq!(*letters, [' ', 'F', 'T', 'I']);
+                assert_eq!(
+                    letters
+                        .iter()
+                        .map(|letter| letter.get())
+                        .collect::<Vec<char>>(),
+                    [' ', 'F', 'T', 'I']
+                );
                 assert_eq!(*correction, Correction::Stands);
                 match print {
                     Print::Trade(trade) => {
@@ -590,6 +589,60 @@ mod tests {
             read[2],
             quote(779.81, 280, "2026-10-06T22:35:56.180096716Z")
         );
+    }
+
+    proptest::proptest! {
+        /// One trade element, read off the stream and off a REST page, becomes the same outcome, refusals included.
+        #[test]
+        fn property_a_trade_reads_the_same_live_and_archived(
+            ticks in -1_000_i64..2_000_000_000,
+            size in proptest::sample::select(vec![0.0, 0.5, 1.0, 4.0, 1_000.0, -1.0]),
+            tape in proptest::sample::select(vec!["A", "B", "C", "E", "AB"]),
+            conditions in proptest::collection::vec(
+                proptest::sample::select(vec![" ", "@", "F", "T", "I", "XY", ""]),
+                0..4,
+            ),
+            update in proptest::option::of(
+                proptest::sample::select(vec!["incorrect", "corrected", "canceled", "unheard"]),
+            ),
+        ) {
+            let element = serde_json::json!({
+                "T": "t", "S": "SPY", "i": 7, "x": "P", "p": ticks as f64 / 1_000_000.0, "s": size,
+                "c": conditions, "z": tape, "u": update, "t": "2026-10-06T22:36:01.216274112Z",
+            });
+            let live = match message(&element) {
+                Ok(StreamMessage::Trade { outcome, .. }) => outcome,
+                other => panic!("{other:?}"),
+            };
+            let page = serde_json::json!({"next_page_token": null, "trades": {"SPY": [element]}});
+            let (archived, answered) =
+                trade_page(&Symbol::new("SPY").unwrap(), page.to_string().as_bytes()).unwrap();
+            proptest::prop_assert!(answered);
+            proptest::prop_assert_eq!(archived, vec![live]);
+        }
+
+        /// One quote element, read off the stream and off a REST page, becomes the same outcome, one-sided included.
+        #[test]
+        fn property_a_quote_reads_the_same_live_and_archived(
+            bid in proptest::sample::select(vec![0.0, 99.99, 100.0, -1.0]),
+            ask in proptest::sample::select(vec![0.0, 100.0, 100.01]),
+            bid_size in proptest::sample::select(vec![0.0, 1.0, 480.0, 0.5]),
+            ask_size in proptest::sample::select(vec![1.0, 1_000.0]),
+        ) {
+            let element = serde_json::json!({
+                "T": "q", "S": "SPY", "bx": "K", "bp": bid, "bs": bid_size, "ax": "P", "ap": ask,
+                "as": ask_size, "c": ["R"], "z": "B", "t": "2026-10-06T22:35:56.179976636Z",
+            });
+            let live = match message(&element) {
+                Ok(StreamMessage::Quote(outcome)) => outcome,
+                other => panic!("{other:?}"),
+            };
+            let page = serde_json::json!({"next_page_token": null, "quotes": {"SPY": [element]}});
+            let (archived, answered) =
+                quote_page(&Symbol::new("SPY").unwrap(), page.to_string().as_bytes()).unwrap();
+            proptest::prop_assert!(answered);
+            proptest::prop_assert_eq!(archived, vec![live]);
+        }
     }
 
     /// A confirmation leaving a symbol off a channel names the symbol and the channel.
@@ -683,8 +736,10 @@ mod tests {
         });
         let opened = MarketStream::open_at(
             &format!("ws://{address}"),
-            "key",
-            "secret",
+            &Credentials {
+                key_id: Secret::new("key".to_string()),
+                secret: Secret::new("secret".to_string()),
+            },
             &[Symbol::new("SPY").unwrap()],
             Duration::from_millis(300),
         )

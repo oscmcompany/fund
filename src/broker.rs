@@ -15,7 +15,7 @@ use crate::common::order::{
     OrderStatus,
 };
 use crate::ingest::FetchError;
-use crate::ingest::alpaca::Alpaca;
+use crate::ingest::alpaca::{Account, Alpaca};
 use crate::ingest::retry::{Outcome, send, with_retries};
 
 /// What execution asks of a broker, so the order loop runs alike against the paper account and a scripted one.
@@ -281,10 +281,9 @@ struct OrderBody<'a> {
 
 impl PaperAccount {
     pub fn new(alpaca: Alpaca) -> Result<Self, BrokerError> {
-        if alpaca.is_paper() {
-            Ok(Self { alpaca })
-        } else {
-            Err(BrokerError::NotPaper)
+        match alpaca.account() {
+            Account::Paper => Ok(Self { alpaca }),
+            Account::Live => Err(BrokerError::NotPaper),
         }
     }
 

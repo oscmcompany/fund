@@ -12,9 +12,9 @@ use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, one_sided, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
-use crate::common::market::trade_bars::{Correction, Print, Tape, condition_letter};
+use super::{Accepted, RefusedRow, RowRefusal, Secret, VariableRefusal, one_sided, variable};
+use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
+use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
@@ -24,18 +24,50 @@ const BARS_URL: &str = "https://data.alpaca.markets/v2/stocks/bars";
 const QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes";
 const TRADES_URL: &str = "https://data.alpaca.markets/v2/stocks/trades";
 
-/// The trading API, which serves the calendar; paper and live keys each work only against their own.
-const PAPER_TRADING_URL: &str = "https://paper-api.alpaca.markets";
-const LIVE_TRADING_URL: &str = "https://api.alpaca.markets";
-
 /// Bars per page, the endpoint's maximum.
 const PAGE_LIMIT: &str = "10000";
 
 pub struct Alpaca {
     http_client: reqwest::Client,
-    key_id: String,
-    secret: String,
-    trading_url: &'static str,
+    credentials: Credentials,
+    account: Account,
+}
+
+/// The account a key pair trades against; paper and live keys each work only against their own trading API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Account {
+    Paper,
+    Live,
+}
+
+impl Account {
+    /// The trading API, which also serves the calendar.
+    fn trading_url(self) -> &'static str {
+        match self {
+            Self::Paper => "https://paper-api.alpaca.markets",
+            Self::Live => "https://api.alpaca.markets",
+        }
+    }
+}
+
+/// The key pair every Alpaca request and stream carries, and the only reader of its keys.
+#[derive(Debug)]
+struct Credentials {
+    key_id: Secret,
+    secret: Secret,
+}
+
+impl Credentials {
+    fn sign(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("APCA-API-KEY-ID", self.key_id.expose())
+            .header("APCA-API-SECRET-KEY", self.secret.expose())
+    }
+
+    /// The stream's authentication message.
+    fn authentication(&self) -> serde_json::Value {
+        serde_json::json!({"action": "auth", "key": self.key_id.expose(), "secret": self.secret.expose()})
+    }
 }
 
 /// One batch's one-minute bars. Every symbol asked for is exactly one of answered (its rows are bars or refusals),
@@ -193,9 +225,11 @@ impl Alpaca {
     pub fn from_environment(http_client: reqwest::Client) -> Result<Self, VariableRefusal> {
         Ok(Self {
             http_client,
-            key_id: variable("ALPACA_API_KEY_ID")?,
-            secret: variable("ALPACA_API_SECRET")?,
-            trading_url: trading_url(variable("ALPACA_IS_PAPER")?)?,
+            credentials: Credentials {
+                key_id: Secret::new(variable("ALPACA_API_KEY_ID")?),
+                secret: Secret::new(variable("ALPACA_API_SECRET")?),
+            },
+            account: account(variable("ALPACA_IS_PAPER")?)?,
         })
     }
 
@@ -204,24 +238,24 @@ impl Alpaca {
     pub(crate) fn unkeyed(is_paper: &str) -> Self {
         Self {
             http_client: reqwest::Client::new(),
-            key_id: String::new(),
-            secret: String::new(),
-            trading_url: trading_url(is_paper.to_string())
-                .expect("a test passes a valid paper flag"),
+            credentials: Credentials {
+                key_id: Secret::new(String::new()),
+                secret: Secret::new(String::new()),
+            },
+            account: account(is_paper.to_string()).expect("a test passes a valid paper flag"),
         }
     }
 
-    /// Whether the keys trade against the paper account.
-    pub(crate) fn is_paper(&self) -> bool {
-        self.trading_url == PAPER_TRADING_URL
+    pub(crate) fn account(&self) -> Account {
+        self.account
     }
 
     /// A request to the trading API at `path`, carrying the keys.
     pub(crate) fn trading(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http_client
-            .request(method, format!("{}{path}", self.trading_url))
-            .header("APCA-API-KEY-ID", &self.key_id)
-            .header("APCA-API-SECRET-KEY", &self.secret)
+        self.credentials.sign(
+            self.http_client
+                .request(method, format!("{}{path}", self.account.trading_url())),
+        )
     }
 
     /// The published sessions over `[first, last]`. A row that does not read refuses the whole calendar, since
@@ -231,14 +265,12 @@ impl Alpaca {
         first: SessionDate,
         last: SessionDate,
     ) -> Result<TradingCalendar, FetchError> {
-        let url = format!("{}/v2/calendar", self.trading_url);
+        let url = format!("{}/v2/calendar", self.account.trading_url());
         let (start, end) = (first.to_string(), last.to_string());
         let body = with_retries(|| {
             send(
-                self.http_client
-                    .get(&url)
-                    .header("APCA-API-KEY-ID", &self.key_id)
-                    .header("APCA-API-SECRET-KEY", &self.secret)
+                self.credentials
+                    .sign(self.http_client.get(&url))
                     .query(&[("start", start.as_str()), ("end", end.as_str())]),
             )
         })
@@ -291,10 +323,8 @@ impl Alpaca {
                     query.push(("page_token", token));
                 }
                 send(
-                    self.http_client
-                        .get(BARS_URL)
-                        .header("APCA-API-KEY-ID", &self.key_id)
-                        .header("APCA-API-SECRET-KEY", &self.secret)
+                    self.credentials
+                        .sign(self.http_client.get(BARS_URL))
                         .query(&query),
                 )
             })
@@ -349,6 +379,24 @@ struct AlpacaTrade {
     update: Option<String>,
 }
 
+/// The tape letter a trade is reported under, as Alpaca spells it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+enum TapeLetter {
+    A,
+    B,
+    C,
+}
+
 /// What one Alpaca quote became.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlpacaQuoteOutcome {
@@ -364,15 +412,15 @@ pub enum AlpacaTradeOutcome {
     Print {
         print: Print,
         tape: Tape,
-        letters: Vec<char>,
+        letters: Vec<ConditionLetter>,
         correction: Correction,
     },
     Refused(RefusedRow),
 }
 
-/// Stands in for a condition element longer than one letter, which no condition spells, so the print reads as
+/// Stands in for a condition element that is not one letter, which no condition spells, so the print reads as
 /// unresolved rather than being dropped.
-const UNSPELLABLE: char = '\u{FFFD}';
+const UNSPELLABLE: ConditionLetter = ConditionLetter::of('\u{FFFD}');
 
 /// Reads one page of a symbol's ticks into outcomes, with whether any row came filed under that symbol.
 type PageParser<Outcome> = fn(&Symbol, &[u8]) -> Result<(Vec<Outcome>, bool), FetchError>;
@@ -433,10 +481,8 @@ impl Alpaca {
                     query.push(("page_token", token));
                 }
                 send(
-                    self.http_client
-                        .get(url)
-                        .header("APCA-API-KEY-ID", &self.key_id)
-                        .header("APCA-API-SECRET-KEY", &self.secret)
+                    self.credentials
+                        .sign(self.http_client.get(url))
                         .query(&query),
                 )
             })
@@ -533,10 +579,10 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
             cause,
         })
     };
-    let tape = match row.tape.as_str() {
-        "A" | "B" => Tape::ConsolidatedTape,
-        "C" => Tape::UnlistedTrading,
-        _ => {
+    let tape = match row.tape.parse::<TapeLetter>() {
+        Ok(TapeLetter::A | TapeLetter::B) => Tape::ConsolidatedTape,
+        Ok(TapeLetter::C) => Tape::UnlistedTrading,
+        Err(strum::ParseError::VariantNotFound) => {
             return refused(RowRefusal::Tape {
                 raw: row.tape.clone(),
             });
@@ -545,7 +591,7 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
     let letters = row
         .conditions
         .iter()
-        .map(|element| condition_letter(element).unwrap_or(UNSPELLABLE))
+        .map(|element| ConditionLetter::new(element).unwrap_or(UNSPELLABLE))
         .collect();
     let price = match Price::from_dollars(row.price) {
         Ok(price) => price,
@@ -559,17 +605,7 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
         Ok(correction) => correction,
         Err(cause) => return refused(cause),
     };
-    let print = match size.is_zero() {
-        true => Print::Unsized {
-            symbol: symbol.clone(),
-            timestamp: row.timestamp,
-            price,
-        },
-        false => match Trade::new(symbol.clone(), row.timestamp, price, size) {
-            Ok(trade) => Print::Trade(trade),
-            Err(cause) => return refused(RowRefusal::Trade(cause)),
-        },
-    };
+    let print = Print::new(symbol.clone(), row.timestamp, price, size);
     AlpacaTradeOutcome::Print {
         print,
         tape,
@@ -590,11 +626,11 @@ fn correction(update: Option<&str>) -> Result<Correction, RowRefusal> {
     }
 }
 
-/// The trading API a paper flag names.
-fn trading_url(is_paper: String) -> Result<&'static str, VariableRefusal> {
+/// The account a paper flag names.
+fn account(is_paper: String) -> Result<Account, VariableRefusal> {
     match is_paper.to_ascii_lowercase().parse::<bool>() {
-        Ok(true) => Ok(PAPER_TRADING_URL),
-        Ok(false) => Ok(LIVE_TRADING_URL),
+        Ok(true) => Ok(Account::Paper),
+        Ok(false) => Ok(Account::Live),
         Err(_) => Err(VariableRefusal::Malformed {
             name: "ALPACA_IS_PAPER",
             raw: is_paper,
@@ -741,6 +777,7 @@ fn minute_bar(ticker: &str, row: &AlpacaBar, session: SessionDate) -> Result<Bar
 mod tests {
     use chrono::NaiveDate;
     use proptest::prelude::*;
+    use strum::IntoEnumIterator;
 
     use super::*;
     use crate::common::monoid::laws;
@@ -1039,23 +1076,56 @@ mod tests {
         SessionDate::from_date(text.parse().unwrap())
     }
 
+    /// The keys reach a request's headers and the stream's authentication, and never a printed client.
+    #[test]
+    fn test_credentials_sign_a_request_and_print_no_key() {
+        let credentials = Credentials {
+            key_id: Secret::new("key-id-value".to_string()),
+            secret: Secret::new("secret-value".to_string()),
+        };
+        assert_eq!(
+            format!("{credentials:?}"),
+            "Credentials { key_id: Secret(..), secret: Secret(..) }"
+        );
+        let request = credentials
+            .sign(reqwest::Client::new().get("https://example.com"))
+            .build()
+            .unwrap();
+        let headers: Vec<(&str, &str)> = request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                ("apca-api-key-id", "key-id-value"),
+                ("apca-api-secret-key", "secret-value")
+            ]
+        );
+        assert_eq!(
+            credentials.authentication(),
+            serde_json::json!({"action": "auth", "key": "key-id-value", "secret": "secret-value"})
+        );
+    }
+
     #[test]
     fn test_the_paper_flag_is_read_in_any_case_and_nothing_else() {
         for raw in ["true", "TRUE", "True"] {
             assert_eq!(
-                trading_url(raw.to_string()),
+                account(raw.to_string()).map(Account::trading_url),
                 Ok("https://paper-api.alpaca.markets")
             );
         }
         for raw in ["false", "FALSE", "False"] {
             assert_eq!(
-                trading_url(raw.to_string()),
+                account(raw.to_string()).map(Account::trading_url),
                 Ok("https://api.alpaca.markets")
             );
         }
         for raw in ["", "yes", "1", " true"] {
             assert_eq!(
-                trading_url(raw.to_string()),
+                account(raw.to_string()),
                 Err(VariableRefusal::Malformed {
                     name: "ALPACA_IS_PAPER",
                     raw: raw.to_string()
@@ -1169,6 +1239,16 @@ mod tests {
     }
 
     #[test]
+    fn test_a_tape_letter_is_spelled_as_alpaca_spells_it() {
+        let spelled: Vec<&'static str> = TapeLetter::iter().map(<&'static str>::from).collect();
+        assert_eq!(spelled, ["A", "B", "C"]);
+        for letter in TapeLetter::iter() {
+            assert_eq!(letter.to_string().parse::<TapeLetter>(), Ok(letter));
+        }
+        assert!("a".parse::<TapeLetter>().is_err());
+    }
+
+    #[test]
     fn test_alpaca_trades_carry_their_tape_letters_and_corrections() {
         let symbol = Symbol::new("AAPL").unwrap();
         let (outcomes, answered) = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
@@ -1182,7 +1262,11 @@ mod tests {
                     letters,
                     correction,
                 } => format!(
-                    "{tape:?} {letters:?} {correction:?} unsized={}",
+                    "{tape:?} {:?} {correction:?} unsized={}",
+                    letters
+                        .iter()
+                        .map(|letter| letter.get())
+                        .collect::<Vec<char>>(),
                     matches!(print, Print::Unsized { .. })
                 ),
                 AlpacaTradeOutcome::Refused(row) => {

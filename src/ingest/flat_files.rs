@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use super::massive::{alpaca_symbol, is_exchange_test_ticker};
 use super::{Accepted, RefusedRow, RowRefusal, VariableRefusal, one_sided, variable};
-use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote, Trade};
-use crate::common::market::trade_bars::{Correction, Print};
+use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
+use crate::common::market::trade_bars::{ConditionCode, Correction, Print};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
@@ -280,8 +280,6 @@ impl FlatFileBars {
 /// Why a flat bar file was not read at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseRefusal {
-    /// Only bar files parse into bars.
-    NotBars { dataset: FlatFileDataset },
     /// A gzip or CSV error, with the line it stopped on where the reader knows it.
     Malformed { line: Option<u64>, reason: String },
 }
@@ -289,7 +287,6 @@ pub enum ParseRefusal {
 impl std::fmt::Display for ParseRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotBars { dataset } => write!(formatter, "{dataset} is not a bar file"),
             Self::Malformed { line, reason } => {
                 write!(formatter, "malformed at line {line:?}: {reason}")
             }
@@ -311,19 +308,48 @@ struct BarRow {
     transactions: Option<u64>,
 }
 
-impl FlatFileDataset {
-    /// Reads `gzipped`, this dataset's file for `session`, into bars in our notation; exchange test tickers are set
-    /// aside and every other row that cannot become a bar is refused with its cause.
+/// A flat-file dataset that holds bars, spelled on a command line as its dataset is.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+pub enum BarFile {
+    #[strum(serialize = "daily_bars")]
+    Daily,
+    #[strum(serialize = "minute_bars")]
+    Minute,
+}
+
+impl BarFile {
+    pub fn dataset(self) -> FlatFileDataset {
+        match self {
+            Self::Daily => FlatFileDataset::DailyBars,
+            Self::Minute => FlatFileDataset::MinuteBars,
+        }
+    }
+
+    pub fn interval(self) -> BarInterval {
+        match self {
+            Self::Daily => BarInterval::OneDay,
+            Self::Minute => BarInterval::OneMinute,
+        }
+    }
+
+    /// Reads `gzipped`, this file for `session`, into bars in our notation; exchange test tickers are set aside and
+    /// every other row that cannot become a bar is refused with its cause.
     pub fn parse_bars(
         self,
         gzipped: &[u8],
         session: SessionDate,
     ) -> Result<FlatFileBars, ParseRefusal> {
-        let interval = match self {
-            Self::DailyBars => BarInterval::OneDay,
-            Self::MinuteBars => BarInterval::OneMinute,
-            Self::Quotes | Self::Trades => return Err(ParseRefusal::NotBars { dataset: self }),
-        };
+        let interval = self.interval();
         let mut reader = csv::Reader::from_reader(flate2::read::GzDecoder::new(gzipped));
         let mut test_tickers = Vec::new();
         // Keyed by symbol and instant, so two tickers the notation map sends to one symbol keep neither.
@@ -567,7 +593,7 @@ struct TradeRow {
 pub enum TradeRowOutcome {
     Print {
         print: Print,
-        conditions: Vec<u16>,
+        conditions: Vec<ConditionCode>,
         correction: Correction,
     },
     TestTicker,
@@ -600,12 +626,12 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
             cause,
         })
     };
-    let conditions: Result<Vec<u16>, _> = row
+    let conditions: Result<Vec<ConditionCode>, _> = row
         .conditions
         .split(',')
         .map(str::trim)
         .filter(|code| !code.is_empty())
-        .map(str::parse)
+        .map(|code| code.parse().map(ConditionCode::new))
         .collect();
     let Ok(conditions) = conditions else {
         return refused(RowRefusal::Conditions {
@@ -629,18 +655,7 @@ fn trade_outcome(row: TradeRow) -> TradeRowOutcome {
         Ok(correction) => correction,
         Err(cause) => return refused(cause),
     };
-    // A price published with no shares, such as the corrected consolidated close, is a print but not a trade.
-    let print = match size.is_zero() {
-        true => Print::Unsized {
-            symbol,
-            timestamp,
-            price,
-        },
-        false => match Trade::new(symbol, timestamp, price, size) {
-            Ok(trade) => Print::Trade(trade),
-            Err(cause) => return refused(RowRefusal::Trade(cause)),
-        },
-    };
+    let print = Print::new(symbol, timestamp, price, size);
     TradeRowOutcome::Print {
         print,
         conditions,
@@ -662,6 +677,8 @@ fn correction(indicator: Option<u32>) -> Result<Correction, RowRefusal> {
 
 #[cfg(test)]
 mod tests {
+    use strum::IntoEnumIterator;
+
     use super::*;
 
     fn session() -> SessionDate {
@@ -723,7 +740,7 @@ ZZZTA,6944.000000,4974.800000,5500.000000,5500.000000,4974.800000,17909136000000
 
     #[test]
     fn test_a_daily_file_maps_notation_and_accounts_for_every_row() {
-        let parsed = FlatFileDataset::DailyBars
+        let parsed = BarFile::Daily
             .parse_bars(&gzipped(DAILY), october_second())
             .unwrap();
         let symbols: Vec<&str> = parsed
@@ -751,7 +768,7 @@ AAPL,13809.484049,331.050000,331.170000,331.501900,330.880000,179092800000000000
 AAPL,7171.021026,331.330000,331.310000,331.590000,330.550000,1790928060000000000,452
 BApA,250.116310,60.550000,60.550000,60.550000,60.550000,1790947800000000000,12
 ";
-        let parsed = FlatFileDataset::MinuteBars
+        let parsed = BarFile::Minute
             .parse_bars(&gzipped(minute), october_second())
             .unwrap();
         let stamped: Vec<(String, String)> = parsed
@@ -785,7 +802,7 @@ AAPL,1.0,1.0,1.0,1.0,1.0,1790913600000000000,1
 AAPL,2.0,2.0,2.0,2.0,2.0,1790913600000000000,1
 MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
 ";
-        let parsed = FlatFileDataset::DailyBars
+        let parsed = BarFile::Daily
             .parse_bars(&gzipped(rows), october_second())
             .unwrap();
         assert!(parsed.bars().is_empty());
@@ -804,17 +821,44 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
         );
     }
 
+    /// A bar file is spelled on a command line as its dataset is, and reads back as itself.
     #[test]
-    fn test_only_bar_files_parse_and_a_broken_file_names_its_line() {
-        assert_eq!(
-            FlatFileDataset::Quotes.parse_bars(&gzipped(DAILY), october_second()),
-            Err(ParseRefusal::NotBars {
-                dataset: FlatFileDataset::Quotes
+    fn test_a_bar_file_is_spelled_as_its_dataset() {
+        let spelled: Vec<(String, String, BarInterval)> = BarFile::iter()
+            .map(|file| {
+                (
+                    file.to_string(),
+                    file.dataset().to_string(),
+                    file.interval(),
+                )
             })
+            .collect();
+        assert_eq!(
+            spelled,
+            [
+                (
+                    "daily_bars".to_string(),
+                    "daily_bars".to_string(),
+                    BarInterval::OneDay
+                ),
+                (
+                    "minute_bars".to_string(),
+                    "minute_bars".to_string(),
+                    BarInterval::OneMinute
+                ),
+            ]
         );
+        for file in BarFile::iter() {
+            assert_eq!(file.to_string().parse::<BarFile>(), Ok(file));
+        }
+        assert!("quotes".parse::<BarFile>().is_err());
+    }
+
+    #[test]
+    fn test_a_broken_bar_file_names_its_line() {
         let broken = format!("{DAILY}AAPL,not-a-number,1,1,1,1,1790913600000000000,1\n");
         assert!(matches!(
-            FlatFileDataset::DailyBars.parse_bars(&gzipped(&broken), october_second()),
+            BarFile::Daily.parse_bars(&gzipped(&broken), october_second()),
             Err(ParseRefusal::Malformed { line: Some(10), .. })
         ));
     }
@@ -880,7 +924,10 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
             } => {
                 assert_eq!(trade.price().ticks(), 157_350_000);
                 assert_eq!(trade.size().units(), 10_000_000);
-                assert_eq!(conditions, &[12, 37]);
+                assert_eq!(
+                    conditions,
+                    &[ConditionCode::new(12), ConditionCode::new(37)]
+                );
                 assert_eq!(correction, &Correction::Stands);
             }
             other @ (TradeRowOutcome::Print { .. }
