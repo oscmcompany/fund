@@ -529,7 +529,7 @@ mod tests {
     use crate::common::market::{Price, Shares};
 
     /// A page of ABC trades for 2026-10-06 19:59:59 with invented values in the REST history's shape; the token
-    /// encodes the next row as Alpaca's do.
+    /// encodes the next row as Alpaca's tokens do.
     const PAGE: &str = r#"{"next_page_token":"QUJDfDE3OTEzMTY3OTkwMDAwMDA0MDB8UXw5MDA0","trades":{"ABC":[{"c":["@","F"],"i":9001,"p":50.255,"s":40,"t":"2026-10-06T19:59:59.000000100Z","x":"Q","z":"C"},{"c":["@","F"],"i":9002,"p":50.26,"s":100,"t":"2026-10-06T19:59:59.000000200Z","x":"Q","z":"C"},{"c":["@","F"],"i":9003,"p":50.26,"s":60,"t":"2026-10-06T19:59:59.000000300Z","x":"Q","z":"C"}]}}"#;
 
     fn id(exchange: &str, number: u64) -> TradeId {
