@@ -262,7 +262,7 @@ pub fn encode(lines: &[LogLine]) -> Result<Vec<u8>, EncodeRefusal> {
                     Some(target.clone()),
                     Some(message.clone()),
                     run_id.map(|run_id| run_id.to_string()),
-                    commit.as_ref().map(|commit| commit.as_str().to_string()),
+                    commit.as_ref().map(Commit::to_string),
                     Some(fields.to_string()),
                     None,
                 ];

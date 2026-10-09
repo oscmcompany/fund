@@ -47,10 +47,20 @@ impl std::fmt::Display for RunId {
     }
 }
 
-/// A 40-character git sha, suffixed `-dirty` when the tree that built it differed from it.
+/// A 40-character git sha and whether the tree that built it differed from it, written with a `-dirty` suffix if so.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct Commit(String);
+pub struct Commit {
+    sha: String,
+    tree: Tree,
+}
+
+/// Whether the working tree that built a commit matched it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Tree {
+    Clean,
+    Dirty,
+}
 
 /// Why a commit was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,10 +78,16 @@ impl std::fmt::Display for CommitRefusal {
 
 impl Commit {
     pub fn new(raw: &str) -> Result<Self, CommitRefusal> {
-        let sha = raw.strip_suffix("-dirty").unwrap_or(raw);
+        let (sha, tree) = match raw.strip_suffix(DIRTY_SUFFIX) {
+            Some(sha) => (sha, Tree::Dirty),
+            None => (raw, Tree::Clean),
+        };
         let hexadecimal = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
         if sha.len() == 40 && sha.bytes().all(hexadecimal) {
-            Ok(Self(raw.to_string()))
+            Ok(Self {
+                sha: sha.to_string(),
+                tree,
+            })
         } else {
             Err(CommitRefusal::Malformed {
                 raw: raw.to_string(),
@@ -80,11 +96,22 @@ impl Commit {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.0.ends_with("-dirty")
+        match self.tree {
+            Tree::Clean => false,
+            Tree::Dirty => true,
+        }
     }
+}
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+const DIRTY_SUFFIX: &str = "-dirty";
+
+impl std::fmt::Display for Commit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let suffix = match self.tree {
+            Tree::Clean => "",
+            Tree::Dirty => DIRTY_SUFFIX,
+        };
+        write!(formatter, "{}{suffix}", self.sha)
     }
 }
 
@@ -108,7 +135,7 @@ impl TryFrom<String> for Commit {
 
 impl From<Commit> for String {
     fn from(commit: Commit) -> Self {
-        commit.0
+        commit.to_string()
     }
 }
 
@@ -1344,6 +1371,40 @@ mod tests {
                 }),
                 "{raw}"
             );
+        }
+    }
+
+    #[test]
+    fn test_a_commit_writes_back_the_text_it_was_read_from() {
+        let clean = Commit::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let dirty = Commit::new("0123456789abcdef0123456789abcdef01234567-dirty").unwrap();
+        assert_eq!(
+            serde_json::to_string(&clean).unwrap(),
+            r#""0123456789abcdef0123456789abcdef01234567""#
+        );
+        assert_eq!(
+            serde_json::to_string(&dirty).unwrap(),
+            r#""0123456789abcdef0123456789abcdef01234567-dirty""#
+        );
+        assert_eq!(
+            String::from(dirty),
+            "0123456789abcdef0123456789abcdef01234567-dirty"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn test_a_commit_round_trips_through_its_text(
+            sha in "[0-9a-f]{40}",
+            dirty in any::<bool>(),
+        ) {
+            let raw = if dirty { format!("{sha}-dirty") } else { sha };
+            let commit = Commit::new(&raw).unwrap();
+            prop_assert_eq!(commit.is_dirty(), dirty);
+            prop_assert_eq!(commit.to_string(), raw.clone());
+            let serialized = serde_json::to_string(&commit).unwrap();
+            prop_assert_eq!(&serialized, &format!("\"{raw}\""));
+            prop_assert_eq!(serde_json::from_str::<Commit>(&serialized).unwrap(), commit);
         }
     }
 
