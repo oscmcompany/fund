@@ -28,7 +28,7 @@ in {
       // {always_run = true;};
     check-rust =
       hook "Check all Rust code" "rust"
-      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|check-views|check-private-files|devenv\\.(nix|lock|yaml))$"
+      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|check-views|check-private-files|^host/.+|devenv\\.(nix|lock|yaml))$"
       // {excludes = ["^src_old/"];};
     check-markdown = hook "Check all Markdown code" "markdown" "\\.md$";
     check-yaml = hook "Check all YAML code" "yaml" "\\.(yaml|yml)$";

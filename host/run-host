@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Runs this host's role once at boot from a fresh build of master, then powers the box off.
+# The role and profile are the instance's `fund-role` and `fund-profile` tags; a `fund-hold` tag runs nothing.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+
+metadata() {
+  local token
+  token="$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")"
+  curl -sf -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
+}
+
+# Left up rather than powered off: an unreadable hold may be an operator's, and the stop schedule still bounds the box.
+if ! tags="$(metadata tags/instance)"; then
+  echo "Error: instance tags are unreadable; leaving the box up for the stop schedule"
+  exit 1
+fi
+if grep -qx fund-hold <<<"$tags"; then
+  echo "Held by fund-hold ($(metadata tags/instance/fund-hold || true)); running nothing and staying up"
+  exit 0
+fi
+
+trap 'echo "Powering off"; sudo systemctl poweroff' EXIT
+
+role="$(metadata tags/instance/fund-role || true)"
+profile="$(metadata tags/instance/fund-profile || true)"
+AWS_REGION="$(metadata placement/region)"
+export AWS_REGION FUND_PROFILE="$profile" SECRETSPEC_PROVIDER=awssm
+echo "Running role ${role:-<none>} under profile ${profile:-<none>}"
+
+case "$role" in
+  archiver) binary=archive_nightly ;;
+  trader)
+    echo "Error: the trader role is not built on this script yet"
+    exit 1
+    ;;
+  researcher)
+    echo "The researcher role is reserved: studies run on demand and nothing schedules one yet"
+    exit 0
+    ;;
+  *)
+    echo "Error: fund-role is \"$role\", not archiver, trader or researcher"
+    exit 1
+    ;;
+esac
+
+if git fetch -q origin master; then
+  git reset -q --hard origin/master
+else
+  echo "Error: git fetch failed; keeping $(git rev-parse --short HEAD)"
+fi
+if ! cargo build -q --release --bin "$binary"; then
+  if [[ ! -x "target/release/$binary" ]]; then
+    echo "Error: building $binary at $(git rev-parse --short HEAD) failed and no previous build exists"
+    exit 1
+  fi
+  echo "Error: building $binary at $(git rev-parse --short HEAD) failed; running the previous build"
+fi
+
+with_secrets() {
+  secretspec run --profile "$profile" -- "$@"
+}
+
+case "$role" in
+  archiver)
+    status=0
+    with_secrets "target/release/$binary" || status=$?
+    views=0
+    with_secrets ./check-views || views=$?
+    echo "Archiver finished with status $status, its views with $views"
+    [[ "$status" -ne 0 ]] && exit "$status"
+    exit "$views"
+    ;;
+esac

@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# Reconciles one host's EC2 instance, IAM, security group and start and stop schedules for a role and a profile.
+# Dry run unless --apply; a setting that cannot change in place is reported as drift and refused, never adopted.
+set -euo pipefail
+
+REGION="${AWS_REGION:-us-east-1}"
+ARCHIVE_BUCKET="oscm-fund-archive"
+ROLE=""
+PROFILE=""
+APPLY=false
+
+usage() {
+  echo "Usage: $(basename "$0") --role <archiver|trader|researcher> --profile <profile> [--apply]"
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role)
+      [[ -z "${2:-}" ]] && { echo "Error: --role requires a value" >&2; usage 1; }
+      ROLE="$2"; shift 2 ;;
+    --profile)
+      [[ -z "${2:-}" ]] && { echo "Error: --profile requires a value" >&2; usage 1; }
+      PROFILE="$2"; shift 2 ;;
+    --apply) APPLY=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "Error: unknown option '$1'" >&2; usage 1 ;;
+  esac
+done
+
+# Schedules are UTC: the archiver folds the session that closed the previous Eastern day, and its stop bounds the heal.
+case "$ROLE" in
+  archiver)
+    INSTANCE_TYPE="r6i.2xlarge"
+    ARCHITECTURE="amd64"
+    VOLUME_SIZE_GB=100
+    BINARY="archive_nightly"
+    START_EXPRESSION="cron(0 7 * * ? *)"
+    STOP_EXPRESSION="cron(0 12 * * ? *)"
+    ;;
+  trader)
+    echo "Error: the trader role is not provisioned by this script yet" >&2
+    exit 1
+    ;;
+  researcher)
+    echo "The researcher role is reserved: studies run on demand and nothing provisions a box for them yet"
+    exit 0
+    ;;
+  *)
+    echo "Error: --role must be archiver, trader or researcher; got \"$ROLE\"" >&2
+    exit 1
+    ;;
+esac
+
+# The profile names the secrets the box may read, so a malformed one would widen the grant rather than fail.
+if [[ ! "$PROFILE" =~ ^(production|development/[a-z0-9][a-z0-9.-]*)$ ]]; then
+  echo "Error: --profile must be production or development/<name>; got \"$PROFILE\"" >&2
+  exit 1
+fi
+
+SLUG="${PROFILE//[\/.]/-}"
+NAME="fund-${ROLE}-${SLUG}"
+RECORDS_BUCKET="oscm-fund-${SLUG}"
+if [[ ${#NAME} -gt 54 ]]; then
+  echo "Error: \"$NAME\" is ${#NAME} characters; ${NAME}-scheduler would exceed IAM's 64" >&2
+  exit 1
+fi
+
+case "$ARCHITECTURE" in
+  amd64) AWS_CLI_ARCHITECTURE="x86_64" ;;
+  arm64) AWS_CLI_ARCHITECTURE="aarch64" ;;
+esac
+
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+DRIFT=0
+
+step() { printf '\n==> %s\n' "$1"; }
+unchanged() { echo "    ok: $1"; }
+changed() {
+  if [[ "$APPLY" == true ]]; then echo "    CHANGED: $1"; else echo "    WOULD CHANGE: $1"; fi
+}
+# Counted rather than raised, so one run reports every mismatch.
+drift() {
+  echo "    DRIFT: $1" >&2
+  DRIFT=$((DRIFT + 1))
+}
+
+[[ "$APPLY" == true ]] || echo "DRY RUN -- pass --apply to make changes"
+echo "Role:     $ROLE ($INSTANCE_TYPE, $ARCHITECTURE)"
+echo "Profile:  $PROFILE"
+echo "Names:    $NAME"
+echo "Region:   $REGION"
+
+step "IAM role $NAME"
+
+TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+ROLE_DESCRIPTION="The $ROLE host ($PROFILE). Managed by host/provision-host."
+
+if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
+  unchanged "role exists"
+  changed "refresh trust policy and description"
+  if [[ "$APPLY" == true ]]; then
+    aws iam update-assume-role-policy --role-name "$NAME" --policy-document "$TRUST_POLICY"
+    aws iam update-role --role-name "$NAME" --description "$ROLE_DESCRIPTION" >/dev/null
+  fi
+else
+  changed "create role"
+  if [[ "$APPLY" == true ]]; then
+    aws iam create-role --role-name "$NAME" --assume-role-policy-document "$TRUST_POLICY" \
+      --description "$ROLE_DESCRIPTION" >/dev/null
+    aws iam wait role-exists --role-name "$NAME"
+  fi
+fi
+if [[ "$APPLY" == true ]]; then
+  aws iam attach-role-policy --role-name "$NAME" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+fi
+
+step "Instance profile $NAME"
+
+if aws iam get-instance-profile --instance-profile-name "$NAME" >/dev/null 2>&1; then
+  ATTACHED="$(aws iam get-instance-profile --instance-profile-name "$NAME" \
+    --query 'InstanceProfile.Roles[].RoleName' --output text)"
+  if [[ "$ATTACHED" == "$NAME" ]]; then
+    unchanged "instance profile carries $NAME"
+  elif [[ -z "$ATTACHED" || "$ATTACHED" == "None" ]]; then
+    changed "attach $NAME to the empty instance profile"
+    if [[ "$APPLY" == true ]]; then
+      aws iam add-role-to-instance-profile --instance-profile-name "$NAME" --role-name "$NAME"
+    fi
+  else
+    drift "instance profile $NAME carries role \"$ATTACHED\", not $NAME"
+  fi
+else
+  changed "create instance profile"
+  if [[ "$APPLY" == true ]]; then
+    aws iam create-instance-profile --instance-profile-name "$NAME" >/dev/null
+    aws iam add-role-to-instance-profile --instance-profile-name "$NAME" --role-name "$NAME"
+    aws iam wait instance-profile-exists --instance-profile-name "$NAME"
+  fi
+fi
+
+step "Security group $NAME"
+
+VPC_ID="$(aws ec2 describe-vpcs --region "$REGION" --filters Name=is-default,Values=true \
+  --query 'Vpcs[0].VpcId' --output text)"
+if [[ "$VPC_ID" == "None" || -z "$VPC_ID" ]]; then
+  echo "Error: no default VPC in $REGION" >&2
+  exit 1
+fi
+SECURITY_GROUP_ID="$(aws ec2 describe-security-groups --region "$REGION" \
+  --filters "Name=group-name,Values=$NAME" "Name=vpc-id,Values=$VPC_ID" \
+  --query 'SecurityGroups[0].GroupId' --output text)"
+if [[ "$SECURITY_GROUP_ID" != "None" && -n "$SECURITY_GROUP_ID" ]]; then
+  INGRESS="$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$SECURITY_GROUP_ID" \
+    --query 'length(SecurityGroups[0].IpPermissions)' --output text)"
+  if [[ "$INGRESS" == "0" ]]; then
+    unchanged "security group $SECURITY_GROUP_ID, no ingress"
+  else
+    drift "security group $SECURITY_GROUP_ID has $INGRESS ingress rules; it should have none"
+  fi
+else
+  changed "create security group (no ingress; SSM reaches the box outbound)"
+  if [[ "$APPLY" == true ]]; then
+    SECURITY_GROUP_ID="$(aws ec2 create-security-group --region "$REGION" --group-name "$NAME" --vpc-id "$VPC_ID" \
+      --description "The $ROLE host ($PROFILE): outbound only, reached via SSM" --query GroupId --output text)"
+  fi
+fi
+
+step "Instance $NAME"
+
+# Filtered on the profile as well as the role, or a second profile would adopt the first's box and its secrets.
+# Assigned before `read` so a failed lookup aborts rather than reading as no box and launching a second.
+FOUND="$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=tag:fund-role,Values=$ROLE" "Name=tag:fund-profile,Values=$PROFILE" \
+    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[].Instances[].[InstanceId,InstanceType,IamInstanceProfile.Arn,MetadataOptions.HttpTokens,MetadataOptions.InstanceMetadataTags]' \
+  --output text)"
+if [[ "$(grep -c . <<<"$FOUND" || true)" -gt 1 ]]; then
+  echo "Error: more than one $ROLE instance is tagged $PROFILE:" >&2
+  echo "$FOUND" >&2
+  exit 1
+fi
+read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS FOUND_TAGS <<<"$FOUND"
+
+if [[ "$INSTANCE_ID" != "None" && -n "$INSTANCE_ID" ]]; then
+  unchanged "instance $INSTANCE_ID"
+  [[ "$FOUND_TYPE" == "$INSTANCE_TYPE" ]] \
+    || drift "instance $INSTANCE_ID is $FOUND_TYPE, not $INSTANCE_TYPE (replace it to change this)"
+  [[ "$FOUND_PROFILE_ARN" == *"/$NAME" ]] \
+    || drift "instance $INSTANCE_ID carries instance profile $FOUND_PROFILE_ARN, not $NAME"
+  [[ "$FOUND_TOKENS" == "required" ]] \
+    || drift "instance $INSTANCE_ID has IMDS tokens \"$FOUND_TOKENS\", not required"
+  # run-host reads its role from the tags, so a box without tag metadata would run nothing.
+  [[ "$FOUND_TAGS" == "enabled" ]] \
+    || drift "instance $INSTANCE_ID has tag metadata \"$FOUND_TAGS\", not enabled (replace it)"
+  ATTACHED_GROUPS="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].SecurityGroups[].GroupId' --output text)"
+  [[ "$ATTACHED_GROUPS" == *"$SECURITY_GROUP_ID"* ]] \
+    || drift "instance $INSTANCE_ID is in $ATTACHED_GROUPS, not $SECURITY_GROUP_ID"
+else
+  # Resolved rather than pinned so a new box gets current security updates; the id is tagged for audit.
+  AMI_ID="$(aws ssm get-parameter --region "$REGION" \
+    --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/${ARCHITECTURE}/hvm/ebs-gp3/ami-id" \
+    --query 'Parameter.Value' --output text)"
+
+  if [[ "$ROLE" == archiver ]]; then
+    INSTALL_DUCKDB="bash /home/ubuntu/fund/host/install-duckdb"
+  else
+    INSTALL_DUCKDB=":"
+  fi
+
+  # First boot only, as root; it powers off at the end so the first run is the first scheduled start.
+  USER_DATA="$(cat <<CLOUDINIT
+#!/bin/bash
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y git curl unzip build-essential pkg-config libssl-dev cmake
+curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-${AWS_CLI_ARCHITECTURE}.zip -o /tmp/awscli.zip
+unzip -q /tmp/awscli.zip -d /tmp
+/tmp/aws/install --update
+mkdir -p /var/log/fund /var/journal/fund
+chown ubuntu:ubuntu /var/log/fund /var/journal/fund
+sudo -u ubuntu -H bash -c '
+  set -euxo pipefail
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+  export PATH="\$HOME/.cargo/bin:\$PATH"
+  cargo install secretspec --version 0.10.1 --locked --no-default-features --features cli,awssm
+  git clone --branch master https://github.com/oscmcompany/fund.git "\$HOME/fund"
+  cd "\$HOME/fund"
+  cargo build --release --bin ${BINARY}
+'
+${INSTALL_DUCKDB}
+install -m 0644 /home/ubuntu/fund/host/fund-host.service /etc/systemd/system/fund-host.service
+systemctl daemon-reload
+systemctl enable fund-host.service
+systemctl poweroff
+CLOUDINIT
+)"
+
+  changed "run instance $INSTANCE_TYPE from $AMI_ID, bootstrapping the checkout, toolchain and $BINARY"
+  if [[ "$APPLY" == true ]]; then
+    # One token for every attempt, so a lost response is retried rather than duplicated into a second box.
+    CLIENT_TOKEN="$(uuidgen)"
+    INSTANCE_ID=""
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      # EC2 sees a new instance profile later than IAM does, so RunInstances rejects it for a while.
+      if INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" --client-token "$CLIENT_TOKEN" \
+        --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
+        --iam-instance-profile "Name=$NAME" --security-group-ids "$SECURITY_GROUP_ID" \
+        --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_SIZE_GB,VolumeType=gp3}" \
+        --metadata-options "HttpTokens=required,InstanceMetadataTags=enabled" \
+        --instance-initiated-shutdown-behavior stop \
+        --user-data "$USER_DATA" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=fund-role,Value=$ROLE},{Key=fund-profile,Value=$PROFILE},{Key=fund-ami,Value=$AMI_ID}]" \
+        --query 'Instances[0].InstanceId' --output text)"; then
+        break
+      fi
+      echo "    instance profile not visible to EC2 yet; retry $attempt of 10"
+      INSTANCE_ID=""
+      sleep 10
+    done
+    if [[ -z "$INSTANCE_ID" ]]; then
+      echo "Error: RunInstances kept rejecting instance profile $NAME after 10 attempts" >&2
+      exit 1
+    fi
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+    echo "    instance $INSTANCE_ID running cloud-init; it powers off when the bootstrap ends"
+    echo "    follow it with: aws ssm start-session --target $INSTANCE_ID, then tail -f /var/log/cloud-init-output.log"
+  fi
+fi
+
+if [[ "$DRIFT" -gt 0 ]]; then
+  echo "Error: $DRIFT drifted field(s) above; fix or replace the instance" >&2
+  exit 1
+fi
+if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; then
+  echo "Error: no instance id, so the schedules cannot be scoped to one" >&2
+  exit 1
+fi
+
+step "Inline policy $ROLE"
+
+case "$ROLE" in
+  archiver)
+    ROLE_STATEMENTS="$(cat <<JSON
+    {"Sid": "ReadWriteArchiveData", "Effect": "Allow",
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/data/equity/*"},
+    {"Sid": "ListArchive", "Effect": "Allow",
+     "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}"},
+    {"Sid": "ReadRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:GetObject"],
+     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/records/*"},
+    {"Sid": "ListRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:ListBucket"],
+     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}",
+     "Condition": {"StringLike": {"s3:prefix": ["records/*"]}}},
+JSON
+)"
+    ;;
+esac
+
+# Writes are scoped to this host's producer prefixes, since the records bucket is shared by every host of the profile.
+ROLE_POLICY="$(cat <<JSON
+{"Version": "2012-10-17", "Statement": [
+${ROLE_STATEMENTS}
+    {"Sid": "ReadOwnSecretspecKeys", "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],
+     "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"},
+    {"Sid": "WriteOwnRecords", "Effect": "Allow", "Action": ["s3:PutObject"],
+     "Resource": ["arn:aws:s3:::${RECORDS_BUCKET}/records/journal/producer=${ROLE}/*",
+                  "arn:aws:s3:::${RECORDS_BUCKET}/records/logs/producer=${ROLE}/*"]}
+]}
+JSON
+)"
+
+changed "put inline policy $ROLE on $NAME"
+if [[ "$APPLY" == true ]]; then
+  aws iam put-role-policy --role-name "$NAME" --policy-name "$ROLE" --policy-document "$ROLE_POLICY"
+fi
+
+# EventBridge Scheduler starts the box and stops it as the backstop; the run's own power-off is the normal stop.
+step "Schedules $NAME-start and $NAME-stop"
+
+SCHEDULER_ROLE="${NAME}-scheduler"
+SCHEDULER_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+SCHEDULER_DESCRIPTION="Lets EventBridge Scheduler start and stop the $PROFILE $ROLE, and nothing else. Managed by host/provision-host."
+
+if aws iam get-role --role-name "$SCHEDULER_ROLE" >/dev/null 2>&1; then
+  unchanged "scheduler role exists"
+  if [[ "$APPLY" == true ]]; then
+    aws iam update-assume-role-policy --role-name "$SCHEDULER_ROLE" --policy-document "$SCHEDULER_TRUST"
+    aws iam update-role --role-name "$SCHEDULER_ROLE" --description "$SCHEDULER_DESCRIPTION" >/dev/null
+  fi
+else
+  changed "create scheduler role"
+  if [[ "$APPLY" == true ]]; then
+    aws iam create-role --role-name "$SCHEDULER_ROLE" --assume-role-policy-document "$SCHEDULER_TRUST" \
+      --description "$SCHEDULER_DESCRIPTION" >/dev/null
+    aws iam wait role-exists --role-name "$SCHEDULER_ROLE"
+  fi
+fi
+
+if [[ "$APPLY" == true ]]; then
+  aws iam put-role-policy --role-name "$SCHEDULER_ROLE" --policy-name start-and-stop --policy-document \
+    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ec2:StartInstances\",\"ec2:StopInstances\"],\"Resource\":\"arn:aws:ec2:${REGION}:${ACCOUNT_ID}:instance/${INSTANCE_ID}\"}]}"
+fi
+
+put_schedule() {
+  local name="$1" expression="$2" action="$3" description="$4" verb target
+  changed "ensure $name at $expression ($action)"
+  [[ "$APPLY" == true ]] || return 0
+  target="{\"Arn\":\"arn:aws:scheduler:::aws-sdk:ec2:${action}\",\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULER_ROLE}\",\"Input\":\"{\\\"InstanceIds\\\":[\\\"${INSTANCE_ID}\\\"]}\"}"
+  if aws scheduler get-schedule --region "$REGION" --name "$name" >/dev/null 2>&1; then
+    verb=update-schedule
+  else
+    verb=create-schedule
+  fi
+  # Scheduler checks it can assume the role, and a fresh trust policy reaches it late.
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if aws scheduler "$verb" --region "$REGION" --name "$name" --state ENABLED --description "$description" \
+      --schedule-expression "$expression" --schedule-expression-timezone UTC \
+      --flexible-time-window '{"Mode":"OFF"}' --target "$target" >/dev/null; then
+      return 0
+    fi
+    echo "    scheduler cannot assume $SCHEDULER_ROLE yet; retry $attempt of 10"
+    sleep 10
+  done
+  echo "Error: $verb $name kept failing" >&2
+  exit 1
+}
+
+put_schedule "$NAME-start" "$START_EXPRESSION" startInstances \
+  "Start the $PROFILE $ROLE; the run powers it off. Managed by host/provision-host."
+put_schedule "$NAME-stop" "$STOP_EXPRESSION" stopInstances \
+  "Stop the $PROFILE $ROLE if its run has not. Managed by host/provision-host."
+
+step "Done"
+echo "  Instance: ${INSTANCE_ID}"
+echo "  Start:    ${START_EXPRESSION} UTC"
+echo "  Stop:     ${STOP_EXPRESSION} UTC"
+[[ "$APPLY" == true ]] || echo "  Dry run. Re-run with --apply to make these changes."
