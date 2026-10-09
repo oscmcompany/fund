@@ -16,7 +16,21 @@ const LEAST_FRACTIONAL_BUY: DollarVolume =
     DollarVolume::from_units(PRICE_SCALE.unsigned_abs() as u128 * SHARE_SCALE as u128);
 
 /// What the broker reports of a symbol's trading, read before orders go out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Tradability {
     /// Trades in any amount, fractions included.
     Fractionable,
@@ -59,6 +73,18 @@ pub struct OrderGuarded {
 impl OrderGuarded {
     pub fn cause(&self) -> GuardCause {
         self.cause
+    }
+}
+
+/// The tradability the broker reported for every symbol an execution would trade, journaled when there was one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradabilityRead {
+    readings: BTreeMap<Symbol, Tradability>,
+}
+
+impl TradabilityRead {
+    pub fn new(readings: BTreeMap<Symbol, Tradability>) -> Self {
+        Self { readings }
     }
 }
 
@@ -151,6 +177,29 @@ mod tests {
 
     fn symbol(raw: &str) -> Symbol {
         Symbol::new(raw).unwrap()
+    }
+
+    #[test]
+    fn test_tradability_names_agree_between_strum_and_serde() {
+        use strum::IntoEnumIterator;
+
+        let names: Vec<&str> = Tradability::iter().map(Into::into).collect();
+        assert_eq!(
+            names,
+            [
+                "fractionable",
+                "whole_shares_only",
+                "untradable",
+                "unlisted"
+            ]
+        );
+        for tradability in Tradability::iter() {
+            assert_eq!(tradability.to_string().parse(), Ok(tradability));
+            assert_eq!(
+                serde_json::to_string(&tradability).unwrap(),
+                format!("\"{tradability}\"")
+            );
+        }
     }
 
     /// Buys from an empty book, one per symbol, in the symbol order `orders` gives.
