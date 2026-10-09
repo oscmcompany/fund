@@ -246,7 +246,7 @@ impl<F: Family> ParsedKey<F> {
         self.session
     }
 
-    /// The same series and session at another interval.
+    /// The same provider, origin, kind and session at another interval, which names another series.
     pub fn at_interval(self, interval: BarInterval) -> Self {
         Self { interval, ..self }
     }
