@@ -59,6 +59,22 @@ pub enum DecodeRefusal {
     },
 }
 
+impl std::fmt::Display for DecodeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(refusal) => refusal.fmt(formatter),
+            Self::Row { index, cause } => write!(formatter, "row {index} refused: {cause}"),
+            Self::Provider { provenance, key } => write!(
+                formatter,
+                "the file was fetched under {} but the key names {key}",
+                provenance.subscription()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DecodeRefusal {}
+
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
@@ -270,6 +286,45 @@ mod tests {
     use crate::common::market::{Price, PriceRefusal};
     use crate::common::storage::Origin;
     use crate::common::time::SessionDate;
+
+    #[test]
+    fn test_each_decode_refusal_displays_its_cause() {
+        let provenance = Provenance::new(
+            Subscription::StocksAdvanced,
+            "2026-10-03T07:00:00Z".parse().unwrap(),
+            RunId::new(Uuid::from_u128(5)),
+            None,
+        );
+        let displayed = [
+            DecodeRefusal::File(ReadRefusal::Layout {
+                version: "9".to_string(),
+            }),
+            DecodeRefusal::Row {
+                index: 3,
+                cause: RowCause::Price(PriceRefusal::OutOfRange { ticks: 0 }),
+            },
+            DecodeRefusal::Provider {
+                provenance,
+                key: Provider::Alpaca,
+            },
+        ]
+        .map(|refusal| refusal.to_string());
+        assert_eq!(
+            displayed,
+            [
+                "the file is written under layout 9",
+                "row 3 refused: 0 ticks is not above zero and at most ten million dollars",
+                "the file was fetched under stocks_advanced but the key names alpaca",
+            ]
+        );
+        assert_eq!(
+            crate::archive::DecodeRefusal::TradeBars(DecodeRefusal::File(ReadRefusal::Layout {
+                version: "9".to_string(),
+            }))
+            .to_string(),
+            "trade bars not decoded: the file is written under layout 9"
+        );
+    }
 
     #[test]
     fn test_trade_bars_read_back_exactly_with_their_missing_prices() {

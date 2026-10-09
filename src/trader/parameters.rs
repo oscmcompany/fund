@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, ParseIntError};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -12,23 +12,19 @@ use chrono::TimeDelta;
 
 use crate::common::book::Cash;
 use crate::common::journal::ConfigurationResolved;
-use crate::common::market::{Dollars, Symbol};
-use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record, record_required};
+use crate::common::market::{Dollars, Symbol, SymbolRefusal};
+use crate::common::parameter::{
+    Parameter, ParameterRefusal, record, record_required, refuse_retired,
+};
 use crate::common::risk::{Limits, LimitsRefusal};
-use crate::execution::Patience;
+use crate::execution::{Patience, PatienceRefusal};
 use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
 use crate::trader::{DecisionInterval, SessionSettings, SettingsRefusal};
 
 const DEFAULT_DECISION_INTERVAL: DecisionInterval = DecisionInterval::FiveMinute;
-const DEFAULT_STALE_AFTER_SECONDS: u64 = 120;
-const DEFAULT_ORDER_POLL_MILLISECONDS: NonZeroU64 = NonZeroU64::new(500).expect("500 is not zero");
-const DEFAULT_ORDER_OPEN_SECONDS: NonZeroU64 = NonZeroU64::new(30).expect("30 is not zero");
-/// A whole regular session.
-const MAXIMUM_FLAT_BEFORE_CLOSE_MINUTES: u64 = 390;
-const MAXIMUM_STALE_AFTER_SECONDS: u64 = 3_600;
-const MAXIMUM_ORDER_POLL_MILLISECONDS: NonZeroU64 =
-    NonZeroU64::new(60_000).expect("60,000 is not zero");
-const MAXIMUM_ORDER_OPEN_SECONDS: NonZeroU64 = NonZeroU64::new(3_600).expect("3,600 is not zero");
+const DEFAULT_STALE_AFTER: StaleAfter = StaleAfter(120);
+const DEFAULT_ORDER_POLL: OrderPoll = OrderPoll(NonZeroU16::new(500).expect("500 is not zero"));
+const DEFAULT_ORDER_OPEN: OrderOpen = OrderOpen(NonZeroU16::new(30).expect("30 is not zero"));
 
 /// The symbols a run trades: at least one, written comma-separated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,13 +36,32 @@ impl Universe {
     }
 }
 
+/// Why a universe was refused: it names no symbol, or one that is not a ticker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UniverseRefusal {
+    Empty,
+    Symbol(SymbolRefusal),
+}
+
+impl Display for UniverseRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "the universe names no symbol"),
+            Self::Symbol(refusal) => write!(formatter, "{refusal}"),
+        }
+    }
+}
+
 impl FromStr for Universe {
-    type Err = String;
+    type Err = UniverseRefusal;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw.trim().is_empty() {
+            return Err(UniverseRefusal::Empty);
+        }
         let symbols = raw
             .split(',')
-            .map(|symbol| Symbol::new(symbol.trim()).map_err(|refusal| refusal.to_string()))
+            .map(|symbol| Symbol::new(symbol.trim()).map_err(UniverseRefusal::Symbol))
             .collect::<Result<BTreeSet<_>, _>>()?;
         Ok(Self(symbols))
     }
@@ -59,11 +74,126 @@ impl Display for Universe {
     }
 }
 
-/// Why the trader's settings were refused: one parameter, or limits that do not hold together.
+/// Why a bounded count was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CountRefusal {
+    NotACount(ParseIntError),
+    Zero,
+    PastMost { most: u16 },
+}
+
+impl Display for CountRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotACount(error) => write!(formatter, "not a whole count: {error}"),
+            Self::Zero => write!(formatter, "zero is not allowed"),
+            Self::PastMost { most } => write!(formatter, "past its most of {most}"),
+        }
+    }
+}
+
+fn count(raw: &str, most: u16) -> Result<u16, CountRefusal> {
+    let value: u64 = raw.parse().map_err(CountRefusal::NotACount)?;
+    u16::try_from(value)
+        .ok()
+        .filter(|value| *value <= most)
+        .ok_or(CountRefusal::PastMost { most })
+}
+
+fn positive_count(raw: &str, most: u16) -> Result<NonZeroU16, CountRefusal> {
+    NonZeroU16::new(count(raw, most)?).ok_or(CountRefusal::Zero)
+}
+
+/// Minutes before the close from which the trader holds nothing, at most a whole regular session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlatBeforeClose(u16);
+
+impl FromStr for FlatBeforeClose {
+    type Err = CountRefusal;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        count(raw, 390).map(Self)
+    }
+}
+
+impl From<FlatBeforeClose> for TimeDelta {
+    fn from(minutes: FlatBeforeClose) -> Self {
+        TimeDelta::minutes(i64::from(minutes.0))
+    }
+}
+
+/// Seconds a price may age before the trader treats its symbol as unpriced, at most an hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaleAfter(u16);
+
+impl FromStr for StaleAfter {
+    type Err = CountRefusal;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        count(raw, 3_600).map(Self)
+    }
+}
+
+impl From<StaleAfter> for TimeDelta {
+    fn from(seconds: StaleAfter) -> Self {
+        TimeDelta::seconds(i64::from(seconds.0))
+    }
+}
+
+/// Milliseconds between reads of an open order, positive and at most a minute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderPoll(NonZeroU16);
+
+impl FromStr for OrderPoll {
+    type Err = CountRefusal;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        positive_count(raw, 60_000).map(Self)
+    }
+}
+
+impl From<OrderPoll> for Duration {
+    fn from(milliseconds: OrderPoll) -> Self {
+        Duration::from_millis(u64::from(milliseconds.0.get()))
+    }
+}
+
+/// Seconds an order may stay open before it is canceled, positive and at most an hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderOpen(NonZeroU16);
+
+impl FromStr for OrderOpen {
+    type Err = CountRefusal;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        positive_count(raw, 3_600).map(Self)
+    }
+}
+
+impl From<OrderOpen> for Duration {
+    fn from(seconds: OrderOpen) -> Self {
+        Duration::from_secs(u64::from(seconds.0.get()))
+    }
+}
+
+macro_rules! display_count {
+    ($($type:ty),*) => {$(
+        impl Display for $type {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+    )*};
+}
+
+display_count!(FlatBeforeClose, StaleAfter, OrderPoll, OrderOpen);
+
+/// Why the trader's settings were refused: one parameter, or settings that do not hold together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParametersRefusal {
     Parameter(ParameterRefusal),
     Limits(LimitsRefusal),
+    Patience(PatienceRefusal),
     Settings(SettingsRefusal),
 }
 
@@ -77,8 +207,9 @@ impl Display for ParametersRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parameter(refusal) => write!(formatter, "{refusal}"),
-            Self::Limits(refusal) => write!(formatter, "the limits are refused: {refusal:?}"),
-            Self::Settings(refusal) => write!(formatter, "the settings are refused: {refusal:?}"),
+            Self::Limits(refusal) => write!(formatter, "the limits are refused: {refusal}"),
+            Self::Patience(refusal) => write!(formatter, "the patience is refused: {refusal}"),
+            Self::Settings(refusal) => write!(formatter, "the settings are refused: {refusal}"),
         }
     }
 }
@@ -102,6 +233,7 @@ impl Parameters {
     fn resolved(
         supplied: &impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal>,
     ) -> Result<(Self, ConfigurationResolved), ParametersRefusal> {
+        refuse_retired(supplied)?;
         let mut resolved = BTreeMap::new();
         let read = |parameter| Ok::<_, ParameterRefusal>((parameter, supplied(parameter)?));
         let universe: Universe = record_required(read(Parameter::Universe)?, &mut resolved)?;
@@ -116,55 +248,34 @@ impl Parameters {
             limit(Parameter::PerNameLimit)?,
             limit(Parameter::DailyLossLimit)?,
         );
-        let flat_before_close = at_most(
-            Parameter::FlatBeforeCloseMinutes,
-            record_required(read(Parameter::FlatBeforeCloseMinutes)?, &mut resolved)?,
-            MAXIMUM_FLAT_BEFORE_CLOSE_MINUTES,
-        )?;
-        let limits = Limits::new(gross, per_name, daily_loss, minutes(flat_before_close))
+        let flat_before_close: FlatBeforeClose =
+            record_required(read(Parameter::FlatBeforeCloseMinutes)?, &mut resolved)?;
+        let limits = Limits::new(gross, per_name, daily_loss, flat_before_close.into())
             .map_err(ParametersRefusal::Limits)?;
         let decision = record(
             read(Parameter::DecisionInterval)?,
             DEFAULT_DECISION_INTERVAL,
             &mut resolved,
         )?;
-        let stale_after = at_most(
-            Parameter::StaleAfterSeconds,
-            record(
-                read(Parameter::StaleAfterSeconds)?,
-                DEFAULT_STALE_AFTER_SECONDS,
-                &mut resolved,
-            )?,
-            MAXIMUM_STALE_AFTER_SECONDS,
+        let stale_after = record(
+            read(Parameter::StaleAfterSeconds)?,
+            DEFAULT_STALE_AFTER,
+            &mut resolved,
         )?;
-        let poll = at_most(
-            Parameter::OrderPollMilliseconds,
-            record(
-                read(Parameter::OrderPollMilliseconds)?,
-                DEFAULT_ORDER_POLL_MILLISECONDS,
-                &mut resolved,
-            )?,
-            MAXIMUM_ORDER_POLL_MILLISECONDS,
+        let poll = record(
+            read(Parameter::OrderPollMilliseconds)?,
+            DEFAULT_ORDER_POLL,
+            &mut resolved,
         )?;
-        let open_for = at_most(
-            Parameter::OrderOpenSeconds,
-            record(
-                read(Parameter::OrderOpenSeconds)?,
-                DEFAULT_ORDER_OPEN_SECONDS,
-                &mut resolved,
-            )?,
-            MAXIMUM_ORDER_OPEN_SECONDS,
+        let open_for = record(
+            read(Parameter::OrderOpenSeconds)?,
+            DEFAULT_ORDER_OPEN,
+            &mut resolved,
         )?;
-        let settings = SessionSettings::new(
-            decision,
-            limits,
-            Patience {
-                poll: Duration::from_millis(poll.get()),
-                open_for: Duration::from_secs(open_for.get()),
-            },
-            TimeDelta::seconds(i64::try_from(stale_after).expect("at most an hour of seconds")),
-        )
-        .map_err(ParametersRefusal::Settings)?;
+        let patience =
+            Patience::new(poll.into(), open_for.into()).map_err(ParametersRefusal::Patience)?;
+        let settings = SessionSettings::new(decision, limits, patience, stale_after.into())
+            .map_err(ParametersRefusal::Settings)?;
         let parameters = Self {
             universe,
             playbook,
@@ -204,12 +315,10 @@ impl Parameters {
     }
 }
 
-fn minutes(count: u64) -> TimeDelta {
-    TimeDelta::minutes(i64::try_from(count).expect("at most a session of minutes"))
-}
-
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::common::journal::ParameterSource;
 
@@ -289,21 +398,119 @@ mod tests {
     }
 
     #[test]
-    fn test_an_empty_or_invalid_universe_is_refused() {
-        for raw in ["", "SPY,", "SPY,not a symbol"] {
-            let mut values = REQUIRED.to_vec();
-            values[0] = (Parameter::Universe, raw);
-            assert!(
-                matches!(
-                    Parameters::resolved(&supplied(&values)),
-                    Err(ParametersRefusal::Parameter(ParameterRefusal::Unparsable {
-                        parameter: Parameter::Universe,
-                        ..
-                    }))
-                ),
-                "{raw}"
-            );
+    fn test_a_supplied_retired_parameter_refuses_to_start() {
+        let mut values = REQUIRED.to_vec();
+        values.push((Parameter::NoiseShares, "1"));
+        assert_eq!(
+            Parameters::resolved(&supplied(&values)).map(|_| ()),
+            Err(ParametersRefusal::Parameter(ParameterRefusal::Retired {
+                parameter: Parameter::NoiseShares
+            }))
+        );
+    }
+
+    #[test]
+    fn test_an_empty_or_invalid_universe_is_refused_with_its_cause() {
+        let refused = |raw: &str| Universe::from_str(raw).unwrap_err();
+        assert_eq!(refused(""), UniverseRefusal::Empty);
+        assert_eq!(refused(" "), UniverseRefusal::Empty);
+        assert_eq!(
+            refused("SPY,"),
+            UniverseRefusal::Symbol(SymbolRefusal::Malformed { raw: String::new() })
+        );
+        assert_eq!(
+            refused("SPY,not a symbol").to_string(),
+            "`not a symbol` is not a ticker"
+        );
+        let mut values = REQUIRED.to_vec();
+        values[0] = (Parameter::Universe, "");
+        assert_eq!(
+            Parameters::resolved(&supplied(&values)).map(|_| ()),
+            Err(ParametersRefusal::Parameter(ParameterRefusal::Unparsable {
+                parameter: Parameter::Universe,
+                raw: String::new(),
+                reason: "the universe names no symbol".to_string(),
+            }))
+        );
+    }
+
+    proptest! {
+        /// The text the journal records for a universe reads back as the same universe.
+        #[test]
+        fn property_a_universe_round_trips_through_its_text(
+            symbols in prop::collection::btree_set("[A-Z]{1,5}(\\.[A-Z]{1,3})?", 1..6),
+        ) {
+            let universe: Universe = symbols.iter().cloned().collect::<Vec<_>>().join(",").parse().unwrap();
+            prop_assert_eq!(universe.symbols().len(), symbols.len());
+            prop_assert_eq!(universe.to_string().parse::<Universe>(), Ok(universe));
         }
+    }
+
+    #[test]
+    fn test_each_default_count_reads_back_from_its_text() {
+        assert_eq!(
+            DEFAULT_STALE_AFTER.to_string().parse(),
+            Ok(DEFAULT_STALE_AFTER)
+        );
+        assert_eq!(
+            DEFAULT_ORDER_POLL.to_string().parse(),
+            Ok(DEFAULT_ORDER_POLL)
+        );
+        assert_eq!(
+            DEFAULT_ORDER_OPEN.to_string().parse(),
+            Ok(DEFAULT_ORDER_OPEN)
+        );
+    }
+
+    #[test]
+    fn test_a_count_is_refused_past_its_most_at_zero_or_unread() {
+        assert_eq!(
+            FlatBeforeClose::from_str("390").map(TimeDelta::from),
+            Ok(TimeDelta::minutes(390))
+        );
+        assert_eq!(
+            FlatBeforeClose::from_str("391"),
+            Err(CountRefusal::PastMost { most: 390 })
+        );
+        assert_eq!(
+            StaleAfter::from_str("3600").map(TimeDelta::from),
+            Ok(TimeDelta::hours(1))
+        );
+        assert_eq!(
+            StaleAfter::from_str("65536"),
+            Err(CountRefusal::PastMost { most: 3_600 })
+        );
+        assert_eq!(
+            OrderPoll::from_str("60000").map(Duration::from),
+            Ok(Duration::from_secs(60))
+        );
+        assert_eq!(
+            OrderPoll::from_str("60001"),
+            Err(CountRefusal::PastMost { most: 60_000 })
+        );
+        assert_eq!(
+            OrderOpen::from_str("3600").map(Duration::from),
+            Ok(Duration::from_secs(3_600))
+        );
+        assert_eq!(OrderOpen::from_str("0"), Err(CountRefusal::Zero));
+        assert!(matches!(
+            StaleAfter::from_str("-1"),
+            Err(CountRefusal::NotACount(_))
+        ));
+    }
+
+    #[test]
+    fn test_a_poll_longer_than_the_open_window_is_refused_by_the_patience() {
+        let mut values = REQUIRED.to_vec();
+        values.push((Parameter::OrderPollMilliseconds, "2000"));
+        values.push((Parameter::OrderOpenSeconds, "1"));
+        assert_eq!(
+            Parameters::resolved(&supplied(&values)).map(|_| ()),
+            Err(ParametersRefusal::Patience(PatienceRefusal::PollPastOpen {
+                poll: Duration::from_secs(2),
+                open_for: Duration::from_secs(1),
+            }))
+        );
     }
 
     #[test]
@@ -322,10 +529,10 @@ mod tests {
         values[5] = (Parameter::FlatBeforeCloseMinutes, "391");
         assert_eq!(
             Parameters::resolved(&supplied(&values)).map(|_| ()),
-            Err(ParametersRefusal::Parameter(ParameterRefusal::OutOfRange {
+            Err(ParametersRefusal::Parameter(ParameterRefusal::Unparsable {
                 parameter: Parameter::FlatBeforeCloseMinutes,
-                value: "391".to_string(),
-                most: "390".to_string(),
+                raw: "391".to_string(),
+                reason: "past its most of 390".to_string(),
             }))
         );
     }

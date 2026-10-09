@@ -1,5 +1,7 @@
 //! A seeded generator and shuffle that never change, so a null drawn from a seed can be drawn again exactly.
 
+use std::num::NonZeroU64;
+
 /// SplitMix64: one 64-bit state, advanced by a fixed odd constant and finalized; the sequence for a seed is part of
 /// the record, so neither the constants nor the finalizer may change.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,8 +23,8 @@ impl Generator {
     }
 
     /// A uniform draw from `0..bound`, rejecting the low remainder so no value is favored.
-    pub fn below(&mut self, bound: u64) -> u64 {
-        assert!(bound > 0, "a draw needs at least one value");
+    pub fn below(&mut self, bound: NonZeroU64) -> u64 {
+        let bound = bound.get();
         let threshold = bound.wrapping_neg() % bound;
         loop {
             let value = self.next_u64();
@@ -39,7 +41,7 @@ impl Generator {
     /// Fisher–Yates, from the back.
     pub fn shuffle<T>(&mut self, items: &mut [T]) {
         for index in (1..items.len()).rev() {
-            let chosen = self.below(index as u64 + 1) as usize;
+            let chosen = self.below(NonZeroU64::MIN.saturating_add(index as u64)) as usize;
             items.swap(index, chosen);
         }
     }
