@@ -217,6 +217,59 @@ if [[ "$INSTANCE_ID" != "None" && -n "$INSTANCE_ID" ]]; then
   [[ "$ATTACHED_GROUPS" == *"$SECURITY_GROUP_ID"* ]] \
     || drift "instance $INSTANCE_ID is in $ATTACHED_GROUPS, not $SECURITY_GROUP_ID"
 else
+  echo "    none found; one is launched after the inline policy below"
+fi
+
+if [[ "$DRIFT" -gt 0 ]]; then
+  echo "Error: $DRIFT drifted field(s) above; fix or replace the instance" >&2
+  exit 1
+fi
+
+# Before any launch: the bootstrap enters devenv, whose secretspec integration reads the profile's secrets.
+step "Inline policy $ROLE"
+
+case "$ROLE" in
+  archiver)
+    ROLE_STATEMENTS="$(cat <<JSON
+    {"Sid": "ReadWriteArchiveData", "Effect": "Allow",
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/data/equity/*"},
+    {"Sid": "ListArchive", "Effect": "Allow",
+     "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}"},
+    {"Sid": "ReadRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:GetObject"],
+     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/records/*"},
+    {"Sid": "ListRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:ListBucket"],
+     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}",
+     "Condition": {"StringLike": {"s3:prefix": ["records/*"]}}},
+JSON
+)"
+    ;;
+esac
+
+# Writes are scoped to this host's producer prefixes, since the records bucket is shared by every host of the profile.
+# BatchGetSecretValue takes no resource, so it is granted on `*` and each value is still gated by GetSecretValue.
+ROLE_POLICY="$(cat <<JSON
+{"Version": "2012-10-17", "Statement": [
+${ROLE_STATEMENTS}
+    {"Sid": "ReadOwnSecretspecKeys", "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],
+     "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"},
+    {"Sid": "BatchReadSecretspecKeys", "Effect": "Allow", "Action": ["secretsmanager:BatchGetSecretValue"],
+     "Resource": "*"},
+    {"Sid": "WriteOwnRecords", "Effect": "Allow", "Action": ["s3:PutObject"],
+     "Resource": ["arn:aws:s3:::${RECORDS_BUCKET}/records/journal/producer=${ROLE}/*",
+                  "arn:aws:s3:::${RECORDS_BUCKET}/records/logs/producer=${ROLE}/*"]}
+]}
+JSON
+)"
+
+changed "put inline policy $ROLE on $NAME"
+if [[ "$APPLY" == true ]]; then
+  aws iam put-role-policy --role-name "$NAME" --policy-name "$ROLE" --policy-document "$ROLE_POLICY"
+fi
+
+if [[ "$INSTANCE_ID" == "None" || -z "$INSTANCE_ID" ]]; then
+  step "Launch $NAME"
   # Resolved rather than pinned so a new box gets current security updates; the id is tagged for audit.
   AMI_ID="$(aws ssm get-parameter --region "$REGION" \
     --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/${ARCHITECTURE}/hvm/ebs-gp3/ami-id" \
@@ -294,52 +347,9 @@ CLOUDINIT
   fi
 fi
 
-if [[ "$DRIFT" -gt 0 ]]; then
-  echo "Error: $DRIFT drifted field(s) above; fix or replace the instance" >&2
-  exit 1
-fi
 if [[ "$APPLY" == true && ( -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ) ]]; then
   echo "Error: no instance id, so the schedules cannot be scoped to one" >&2
   exit 1
-fi
-
-step "Inline policy $ROLE"
-
-case "$ROLE" in
-  archiver)
-    ROLE_STATEMENTS="$(cat <<JSON
-    {"Sid": "ReadWriteArchiveData", "Effect": "Allow",
-     "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
-     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/data/equity/*"},
-    {"Sid": "ListArchive", "Effect": "Allow",
-     "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
-     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}"},
-    {"Sid": "ReadRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:GetObject"],
-     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/records/*"},
-    {"Sid": "ListRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:ListBucket"],
-     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}",
-     "Condition": {"StringLike": {"s3:prefix": ["records/*"]}}},
-JSON
-)"
-    ;;
-esac
-
-# Writes are scoped to this host's producer prefixes, since the records bucket is shared by every host of the profile.
-ROLE_POLICY="$(cat <<JSON
-{"Version": "2012-10-17", "Statement": [
-${ROLE_STATEMENTS}
-    {"Sid": "ReadOwnSecretspecKeys", "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],
-     "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:secretspec/fund/${PROFILE}/*"},
-    {"Sid": "WriteOwnRecords", "Effect": "Allow", "Action": ["s3:PutObject"],
-     "Resource": ["arn:aws:s3:::${RECORDS_BUCKET}/records/journal/producer=${ROLE}/*",
-                  "arn:aws:s3:::${RECORDS_BUCKET}/records/logs/producer=${ROLE}/*"]}
-]}
-JSON
-)"
-
-changed "put inline policy $ROLE on $NAME"
-if [[ "$APPLY" == true ]]; then
-  aws iam put-role-policy --role-name "$NAME" --policy-name "$ROLE" --policy-document "$ROLE_POLICY"
 fi
 
 # EventBridge Scheduler starts the box and stops it as the backstop; the run's own power-off is the normal stop.

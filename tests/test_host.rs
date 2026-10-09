@@ -297,6 +297,17 @@ fn test_a_new_archiver_is_granted_its_prefixes_and_scheduled_once_bootstrapped()
         ]
     );
 
+    let secrets =
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:secretspec/fund/production/*";
+    assert!(
+        allows(&grant, "secretsmanager:GetSecretValue", secrets),
+        "{grant}"
+    );
+    assert!(
+        allows(&grant, "secretsmanager:BatchGetSecretValue", "*"),
+        "{grant}"
+    );
+
     let scheduler = provisioned.json("policy-start-and-stop.json");
     let instance = "arn:aws:ec2:us-east-1:123456789012:instance/i-0new";
     assert!(
@@ -319,6 +330,18 @@ fn test_a_new_archiver_is_granted_its_prefixes_and_scheduled_once_bootstrapped()
     }
 
     let calls = provisioned.calls();
+    let granted_at = calls
+        .iter()
+        .position(|call| call == "iam put-role-policy")
+        .unwrap();
+    let launched = calls
+        .iter()
+        .position(|call| call == "ec2 run-instances")
+        .unwrap();
+    assert!(
+        granted_at < launched,
+        "the bootstrap ran without its grant: {calls:?}"
+    );
     let bootstrapped = calls
         .iter()
         .position(|call| call == "ec2 create-tags")
@@ -352,7 +375,7 @@ fn test_an_untagged_role_is_tagged_and_an_owned_one_is_left_alone() {
 }
 
 #[test]
-fn test_an_unfinished_bootstrap_or_another_profiles_role_is_refused_before_any_grant() {
+fn test_a_refused_box_is_never_scheduled_and_only_a_bootstrapping_one_is_granted() {
     let unfinished = Provisioned::run(
         "production",
         &[(
@@ -365,10 +388,30 @@ fn test_an_unfinished_bootstrap_or_another_profiles_role_is_refused_before_any_g
         &[("STUB_STATE", "running"), ("BOOTSTRAP_POLLS", "2")],
     );
     let collided = Provisioned::run("development/a.b", &[("STUB_ROLE_OWNER", "development/a-b")]);
-    for (provisioned, refusal) in [
-        (&unfinished, "never finished its bootstrap"),
-        (&still_running, "its bootstrap failed or is still running"),
-        (&collided, "belongs to profile development/a-b"),
+    // A box still bootstrapping holds its grant already, since its bootstrap enters devenv and reads secrets.
+    let every_write = [
+        "iam put-role-policy",
+        "iam tag-role",
+        "ec2 create-tags",
+        "iam update-assume-role-policy",
+        "scheduler create-schedule",
+    ];
+    for (provisioned, refusal, forbidden) in [
+        (
+            &unfinished,
+            "never finished its bootstrap",
+            &every_write[..],
+        ),
+        (
+            &still_running,
+            "its bootstrap failed or is still running",
+            &["ec2 create-tags", "scheduler create-schedule"][..],
+        ),
+        (
+            &collided,
+            "belongs to profile development/a-b",
+            &every_write[..],
+        ),
     ] {
         assert_eq!(provisioned.code, 1, "{}", provisioned.output);
         assert!(
@@ -378,13 +421,7 @@ fn test_an_unfinished_bootstrap_or_another_profiles_role_is_refused_before_any_g
         );
         let calls = provisioned.calls();
         assert!(!calls.is_empty());
-        for write in [
-            "iam put-role-policy",
-            "iam tag-role",
-            "ec2 create-tags",
-            "iam update-assume-role-policy",
-            "scheduler create-schedule",
-        ] {
+        for write in forbidden {
             assert!(
                 !calls.iter().any(|call| call == write),
                 "{write} ran: {calls:?}"
