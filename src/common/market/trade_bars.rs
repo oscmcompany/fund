@@ -3,12 +3,12 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Utc};
 
-use super::aggregate::TradeTotals;
+use super::aggregate::{BarKey, RollsUp, Rollup, TradeTotals};
 use super::record::{BarInterval, Trade};
 use super::{DollarVolume, Price, Shares, StampedPrice, Symbol, TradeCount};
-use crate::common::monoid::{Monoid, Tally};
+use crate::common::monoid::{Monoid, Semigroup, Tally};
 use crate::common::time::SessionDate;
 
 /// What a print carrying one sale condition may update on the consolidated tape; every combination is valid.
@@ -509,14 +509,6 @@ impl TradeSums {
         }
     }
 
-    fn combine(self, other: Self) -> Self {
-        Self {
-            totals: self.totals.combine(other.totals),
-            open_close: either(self.open_close, other.open_close, OpenClose::combine),
-            high_low: either(self.high_low, other.high_low, HighLow::combine),
-        }
-    }
-
     pub fn totals(&self) -> TradeTotals {
         self.totals
     }
@@ -527,6 +519,16 @@ impl TradeSums {
 
     pub fn high_low(&self) -> Option<HighLow> {
         self.high_low
+    }
+}
+
+impl Semigroup for TradeSums {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            totals: self.totals.combine(other.totals),
+            open_close: either(self.open_close, other.open_close, OpenClose::combine),
+            high_low: either(self.high_low, other.high_low, HighLow::combine),
+        }
     }
 }
 
@@ -577,7 +579,7 @@ impl TradeBar {
         timestamp: DateTime<Utc>,
         sums: TradeSums,
     ) -> Result<Self, TradeBarRefusal> {
-        if bucket(timestamp, interval) != timestamp {
+        if interval.bucket(timestamp) != timestamp {
             return Err(TradeBarRefusal::Misaligned {
                 interval,
                 timestamp,
@@ -751,105 +753,21 @@ impl BarBuilt {
     }
 }
 
-/// The bucket an instant falls in at `interval`; a daily bucket is its session's close.
-fn bucket(instant: DateTime<Utc>, interval: BarInterval) -> DateTime<Utc> {
-    let minute = instant
-        .with_second(0)
-        .and_then(|instant| instant.with_nanosecond(0))
-        .expect("zero seconds and nanoseconds exist in every minute");
-    match interval {
-        BarInterval::OneMinute => minute,
-        BarInterval::FiveMinute => minute - TimeDelta::minutes(i64::from(minute.minute() % 5)),
-        BarInterval::OneDay => SessionDate::at(instant).regular_close(),
-    }
-}
+impl RollsUp for TradeBar {
+    type Sums = TradeSums;
 
-/// Trade bars built so far, one per symbol, interval and bucket.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TradeRollup(BTreeMap<(Symbol, BarInterval, DateTime<Utc>), TradeSums>);
-
-/// Why a trade bar could not be rolled up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TradeRollupRefusal {
-    Finer { from: BarInterval, to: BarInterval },
-}
-
-impl std::fmt::Display for TradeRollupRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Finer { from, to } => write!(
-                formatter,
-                "a {from} trade bar cannot roll up into the finer {to}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TradeRollupRefusal {}
-
-impl TradeRollup {
-    /// The fragment `bar` contributes to the `interval` bar containing it.
-    pub fn of(bar: &TradeBar, interval: BarInterval) -> Result<Self, TradeRollupRefusal> {
-        if interval < bar.interval {
-            return Err(TradeRollupRefusal::Finer {
-                from: bar.interval,
-                to: interval,
-            });
-        }
-        let key = (
-            bar.symbol.clone(),
-            interval,
-            bucket(bar.timestamp, interval),
-        );
-        Ok(Self(BTreeMap::from([(key, bar.sums)])))
+    fn parts(&self) -> (BarKey, TradeSums) {
+        let key = BarKey {
+            symbol: self.symbol.clone(),
+            interval: self.interval,
+            timestamp: self.timestamp,
+        };
+        (key, self.sums)
     }
 
-    fn print(print: &Print, allowed: UpdateRules) -> Self {
-        let key = (
-            print.symbol().clone(),
-            BarInterval::OneMinute,
-            bucket(print.timestamp(), BarInterval::OneMinute),
-        );
-        Self(BTreeMap::from([(key, TradeSums::of(print, allowed))]))
-    }
-
-    /// Takes out every bar that has ended by `through`, leaving the rest.
-    fn split_through(&mut self, through: DateTime<Utc>) -> Self {
-        let (ended, open) = std::mem::take(&mut self.0)
-            .into_iter()
-            .partition(|((_, interval, timestamp), _)| interval.ends(*timestamp) <= through);
-        self.0 = open;
-        Self(ended)
-    }
-
-    /// Every bar built, ordered by symbol, interval and timestamp.
-    pub fn into_bars(self) -> Vec<TradeBar> {
-        self.0
-            .into_iter()
-            .map(|((symbol, interval, timestamp), sums)| TradeBar {
-                symbol,
-                interval,
-                timestamp,
-                sums,
-            })
-            .collect()
-    }
-}
-
-impl Monoid for TradeRollup {
-    fn empty() -> Self {
-        Self::default()
-    }
-
-    fn combine(mut self, other: Self) -> Self {
-        for (key, sums) in other.0 {
-            let merged = match self.0.remove(&key) {
-                Some(existing) => existing.combine(sums),
-                None => sums,
-            };
-            self.0.insert(key, merged);
-        }
-        self
+    fn from_parts(key: BarKey, sums: TradeSums) -> Self {
+        Self::new(key.symbol, key.interval, key.timestamp, sums)
+            .expect("a rolled-up bucket sits on its interval's grid")
     }
 }
 
@@ -906,7 +824,7 @@ impl TradeFoldCounts {
 pub struct TradeFold {
     session: SessionDate,
     conditions: TradeConditions,
-    minutes: TradeRollup,
+    minutes: Rollup<TradeBar>,
     /// The cutoff the latest `drain_through` set: every minute ending by it is closed to further prints.
     drained_through: Option<DateTime<Utc>>,
     counts: TradeFoldCounts,
@@ -917,7 +835,7 @@ impl TradeFold {
         Self {
             session,
             conditions,
-            minutes: TradeRollup::empty(),
+            minutes: Rollup::empty(),
             drained_through: None,
             counts: TradeFoldCounts::default(),
         }
@@ -954,11 +872,10 @@ impl TradeFold {
                 return;
             }
         }
-        let minute_ends =
-            BarInterval::OneMinute.ends(bucket(print.timestamp(), BarInterval::OneMinute));
+        let minute = BarInterval::OneMinute.bucket(print.timestamp());
         if self
             .drained_through
-            .is_some_and(|drained| minute_ends <= drained)
+            .is_some_and(|drained| BarInterval::OneMinute.ends(minute) <= drained)
         {
             self.counts.late += 1;
             return;
@@ -976,8 +893,12 @@ impl TradeFold {
             Print::Trade(_) => {}
         }
         self.counts.folded += 1;
-        let minutes = std::mem::take(&mut self.minutes);
-        self.minutes = minutes.combine(TradeRollup::print(print, allowed));
+        let key = BarKey {
+            symbol: print.symbol().clone(),
+            interval: BarInterval::OneMinute,
+            timestamp: minute,
+        };
+        self.minutes.add(key, TradeSums::of(print, allowed));
     }
 
     /// The one-minute bars that have ended by `through`, each handed out once; bars handed out minute by minute and
@@ -1000,8 +921,11 @@ impl TradeFold {
 mod tests {
     use proptest::prelude::*;
 
+    use chrono::TimeDelta;
+
     use super::*;
     use crate::common::market::Shares;
+    use crate::common::market::aggregate::{check_rollups_compose, roll_up};
     use crate::common::monoid::{concatenate, laws};
 
     fn codes(raw: &[u16]) -> Vec<ConditionCode> {
@@ -1180,12 +1104,7 @@ mod tests {
             Correction::Stands,
         );
         let minutes = fold.finish().0;
-        let daily = concatenate(
-            minutes
-                .iter()
-                .map(|bar| TradeRollup::of(bar, BarInterval::OneDay).unwrap()),
-        )
-        .into_bars();
+        let daily = roll_up(&minutes, BarInterval::OneDay).unwrap();
         let sums = daily[0].sums();
         assert_eq!(sums.totals().volume().units(), 7_150_000_000);
         assert_eq!(
@@ -1224,12 +1143,7 @@ mod tests {
         };
         fold.push(&corrected_close, &codes(&[38]), Correction::Stands);
         let (minutes, counts) = fold.finish();
-        let daily = concatenate(
-            minutes
-                .iter()
-                .map(|bar| TradeRollup::of(bar, BarInterval::OneDay).unwrap()),
-        )
-        .into_bars();
+        let daily = roll_up(&minutes, BarInterval::OneDay).unwrap();
         let sums = daily[0].sums();
         assert_eq!(
             sums.open_close().unwrap().close().price().ticks(),
@@ -1457,9 +1371,10 @@ mod tests {
         }
     }
 
-    fn any_rollup() -> impl Strategy<Value = TradeRollup> {
+    /// One print's fragment, stamped within `seconds` of the open.
+    fn any_rollup(seconds: std::ops::Range<i64>) -> impl Strategy<Value = Rollup<TradeBar>> {
         (
-            0_i64..120,
+            seconds,
             1_i64..2_000_000,
             1_u64..1_000_000,
             any::<[bool; 3]>(),
@@ -1472,14 +1387,19 @@ mod tests {
                     Shares::from_units(units),
                 )
                 .unwrap();
-                TradeRollup::print(
-                    &Print::Trade(trade),
-                    UpdateRules {
-                        volume,
-                        high_low,
-                        open_close,
-                    },
-                )
+                let key = BarKey {
+                    symbol: trade.symbol().clone(),
+                    interval: BarInterval::OneMinute,
+                    timestamp: BarInterval::OneMinute.bucket(trade.timestamp()),
+                };
+                let allowed = UpdateRules {
+                    volume,
+                    high_low,
+                    open_close,
+                };
+                let mut rollup = Rollup::empty();
+                rollup.add(key, TradeSums::of(&Print::Trade(trade), allowed));
+                rollup
             })
     }
 
@@ -1535,10 +1455,10 @@ mod tests {
         let minute = fold
             .drain_through(instant("2026-10-02T13:32:00Z"))
             .remove(0);
-        let mut five = TradeRollup::of(&minute, BarInterval::FiveMinute).unwrap();
+        let mut five = Rollup::of(&minute, BarInterval::FiveMinute).unwrap();
         assert_eq!(
             five.split_through(instant("2026-10-02T13:34:59Z")),
-            TradeRollup::empty()
+            Rollup::empty()
         );
         let ended = five
             .split_through(instant("2026-10-02T13:35:00Z"))
@@ -1614,7 +1534,7 @@ mod tests {
             let mut handed_out = Vec::new();
             for (index, (print, codes)) in prints.iter().enumerate() {
                 if drains.contains(&index) {
-                    handed_out.extend(live.drain_through(bucket(print.timestamp(), BarInterval::OneMinute)));
+                    handed_out.extend(live.drain_through(BarInterval::OneMinute.bucket(print.timestamp())));
                 }
                 whole.push(print, codes, Correction::Stands);
                 live.push(print, codes, Correction::Stands);
@@ -1628,18 +1548,19 @@ mod tests {
 
         #[test]
         fn property_trade_rollups_are_a_commutative_monoid(
-            first in any_rollup(),
-            second in any_rollup(),
-            third in any_rollup(),
+            first in any_rollup(0..120),
+            second in any_rollup(0..120),
+            third in any_rollup(0..120),
         ) {
             laws::check(first, second, third)?;
         }
 
-        /// The daily bar's totals are its minutes' totals, whatever the grouping.
+        /// The daily bar's totals are its minutes' totals, whatever the grouping, and in stages or at once.
         #[test]
-        fn property_a_daily_bar_totals_its_minutes(minutes in prop::collection::vec(any_rollup(), 1..30)) {
+        fn property_a_daily_bar_totals_its_minutes(minutes in prop::collection::vec(any_rollup(0..1_200), 1..30)) {
             let minute_bars = concatenate(minutes).into_bars();
-            let daily = concatenate(minute_bars.iter().map(|bar| TradeRollup::of(bar, BarInterval::OneDay).unwrap())).into_bars();
+            check_rollups_compose(&minute_bars)?;
+            let daily = roll_up(&minute_bars, BarInterval::OneDay).unwrap();
             prop_assert_eq!(daily.len(), 1);
             let volume: u64 = minute_bars.iter().map(|bar| bar.sums().totals().volume().units()).sum();
             prop_assert_eq!(daily[0].sums().totals().volume().units(), volume);

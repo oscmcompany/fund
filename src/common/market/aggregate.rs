@@ -2,12 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Utc};
 
 use super::record::{Bar, BarInterval, BarPrices, Trade};
 use super::{DollarVolume, Price, Shares, StampedPrice, Symbol, TradeCount};
-use crate::common::monoid::Monoid;
-use crate::common::time::SessionDate;
+use crate::common::monoid::{Monoid, Semigroup};
 
 /// Count, volume and dollar volume of a set of trades, all exact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,51 +66,27 @@ impl Monoid for TradeTotals {
     }
 }
 
-/// The bars built so far, one per symbol, interval and bucket, so fragments of different bars never mix.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BarRollup(BTreeMap<BarKey, Span>);
-
-/// The bar a fragment belongs to, taken from the source bar rather than from the caller.
+/// The bar a fragment belongs to: its symbol, interval and bucket.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct BarKey {
-    symbol: Symbol,
-    interval: BarInterval,
-    timestamp: DateTime<Utc>,
+pub struct BarKey {
+    pub(super) symbol: Symbol,
+    pub(super) interval: BarInterval,
+    pub(super) timestamp: DateTime<Utc>,
 }
 
-/// One bar's extremes: its open is the earliest fragment's, its close the latest's, and fragments stamped alike
-/// break the tie on price so the combine stays commutative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Span {
-    first: StampedPrice,
-    last: StampedPrice,
-    high: Price,
-    low: Price,
-    volume: Shares,
-    /// Unreported in any fragment makes it unreported for the bar, since a partial sum reads as a whole one.
-    trade_count: Option<TradeCount>,
-    dollar_volume: Option<DollarVolume>,
+/// A bar that splits into its key and sums and is rebuilt from them, so a `Rollup` can merge any kind of bar.
+pub trait RollsUp: Sized {
+    type Sums: Semigroup + Clone + PartialEq + Eq + std::fmt::Debug;
+
+    fn parts(&self) -> (BarKey, Self::Sums);
+
+    /// Panics on parts no bar of this kind could hold, such as a quote bar covered for longer than its interval.
+    fn from_parts(key: BarKey, sums: Self::Sums) -> Self;
 }
 
-impl Span {
-    fn combine(self, other: Self) -> Self {
-        Self {
-            first: self.first.min(other.first),
-            last: self.last.max(other.last),
-            high: self.high.max(other.high),
-            low: self.low.min(other.low),
-            volume: self.volume.plus(other.volume),
-            trade_count: self
-                .trade_count
-                .zip(other.trade_count)
-                .map(|(left, right)| left.plus(right)),
-            dollar_volume: self
-                .dollar_volume
-                .zip(other.dollar_volume)
-                .map(|(left, right)| left.plus(right)),
-        }
-    }
-}
+/// The bars built so far, one per symbol, interval and bucket, so fragments of different bars never mix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rollup<B: RollsUp>(BTreeMap<BarKey, B::Sums>);
 
 /// Why a bar could not be rolled up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,81 +106,191 @@ impl std::fmt::Display for RollupRefusal {
 
 impl std::error::Error for RollupRefusal {}
 
-impl BarRollup {
-    /// The fragment `bar` contributes to the `interval` bar containing it; a daily bucket is its session's close.
-    pub fn of(bar: &Bar, interval: BarInterval) -> Result<Self, RollupRefusal> {
-        if interval < bar.interval() {
+impl<B: RollsUp> Rollup<B> {
+    /// The fragment `bar` contributes to the `interval` bar containing it.
+    pub fn of(bar: &B, interval: BarInterval) -> Result<Self, RollupRefusal> {
+        let (key, sums) = bar.parts();
+        if interval < key.interval {
             return Err(RollupRefusal::Finer {
-                from: bar.interval(),
+                from: key.interval,
                 to: interval,
             });
         }
-        let start = bar.timestamp();
-        let timestamp = match interval {
-            BarInterval::OneMinute => start,
-            BarInterval::FiveMinute => start - TimeDelta::minutes(i64::from(start.minute() % 5)),
-            BarInterval::OneDay => SessionDate::at(start).regular_close(),
-        };
         let key = BarKey {
-            symbol: bar.symbol().clone(),
+            timestamp: interval.bucket(key.timestamp),
             interval,
-            timestamp,
+            ..key
         };
-        let prices = bar.prices();
-        let span = Span {
-            first: StampedPrice::new(start, prices.open()),
-            last: StampedPrice::new(start, prices.close()),
-            high: prices.high(),
-            low: prices.low(),
-            volume: bar.volume(),
-            trade_count: bar.trade_count(),
-            dollar_volume: bar.dollar_volume(),
+        Ok(Self(BTreeMap::from([(key, sums)])))
+    }
+
+    /// Merges `sums` into the bar at `key` in place, as combining with a rollup of that one fragment would.
+    pub(super) fn add(&mut self, key: BarKey, sums: B::Sums) {
+        let merged = match self.0.remove(&key) {
+            Some(existing) => existing.combine(sums),
+            None => sums,
         };
-        Ok(Self(BTreeMap::from([(key, span)])))
+        self.0.insert(key, merged);
+    }
+
+    pub(super) fn get_mut(&mut self, key: &BarKey) -> Option<&mut B::Sums> {
+        self.0.get_mut(key)
+    }
+
+    /// Takes out every bar that has ended by `through`, leaving the rest.
+    pub(super) fn split_through(&mut self, through: DateTime<Utc>) -> Self {
+        let (ended, open) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|(key, _)| key.interval.ends(key.timestamp) <= through);
+        self.0 = open;
+        Self(ended)
     }
 
     /// Every bar built, ordered by symbol, interval and timestamp.
-    pub fn into_bars(self) -> Vec<Bar> {
+    pub fn into_bars(self) -> Vec<B> {
         self.0
             .into_iter()
-            .map(|(key, span)| {
-                let prices =
-                    BarPrices::new(span.first.price(), span.high, span.low, span.last.price())
-                        .expect("every combined open and close lies within the combined range");
-                Bar::new(
-                    key.symbol,
-                    key.interval,
-                    key.timestamp,
-                    prices,
-                    span.volume,
-                    span.trade_count,
-                    span.dollar_volume,
-                )
-                .expect("a bucket timestamp sits on its interval's grid")
-            })
+            .map(|(key, sums)| B::from_parts(key, sums))
             .collect()
     }
 }
 
-impl Monoid for BarRollup {
+impl<B: RollsUp> Monoid for Rollup<B> {
     fn empty() -> Self {
-        Self::default()
+        Self(BTreeMap::new())
     }
 
     fn combine(mut self, other: Self) -> Self {
-        for (key, span) in other.0 {
-            let merged = match self.0.remove(&key) {
-                Some(existing) => existing.combine(span),
-                None => span,
-            };
-            self.0.insert(key, merged);
+        for (key, sums) in other.0 {
+            self.add(key, sums);
         }
         self
     }
 }
 
+/// `bars` rolled up into `interval` bars, ordered by symbol, interval and timestamp.
+pub fn roll_up<B: RollsUp>(bars: &[B], interval: BarInterval) -> Result<Vec<B>, RollupRefusal> {
+    bars.iter()
+        .try_fold(Rollup::empty(), |rolled, bar| {
+            Ok(rolled.combine(Rollup::of(bar, interval)?))
+        })
+        .map(Rollup::into_bars)
+}
+
+/// A fold's one-minute bars beside their five-minute and daily rollups, each with its interval and the daily last, as a
+/// session's ticks are written; panics on a daily bar, which no fold hands out.
+pub fn session_bars<B: RollsUp>(minutes: Vec<B>) -> [(BarInterval, Vec<B>); 3] {
+    let roll = |interval| {
+        let bars = roll_up(&minutes, interval).expect("a fold's minutes roll up to coarser bars");
+        (interval, bars)
+    };
+    let five_minutes = roll(BarInterval::FiveMinute);
+    let daily = roll(BarInterval::OneDay);
+    [(BarInterval::OneMinute, minutes), five_minutes, daily]
+}
+
+/// One bar's extremes: its open is the earliest fragment's, its close the latest's, and fragments stamped alike
+/// break the tie on price so the combine stays commutative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarSums {
+    first: StampedPrice,
+    last: StampedPrice,
+    high: Price,
+    low: Price,
+    volume: Shares,
+    /// Unreported in any fragment makes it unreported for the bar, since a partial sum reads as a whole one.
+    trade_count: Option<TradeCount>,
+    dollar_volume: Option<DollarVolume>,
+}
+
+impl Semigroup for BarSums {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            first: self.first.min(other.first),
+            last: self.last.max(other.last),
+            high: self.high.max(other.high),
+            low: self.low.min(other.low),
+            volume: self.volume.plus(other.volume),
+            trade_count: self
+                .trade_count
+                .zip(other.trade_count)
+                .map(|(left, right)| left.plus(right)),
+            dollar_volume: self
+                .dollar_volume
+                .zip(other.dollar_volume)
+                .map(|(left, right)| left.plus(right)),
+        }
+    }
+}
+
+impl RollsUp for Bar {
+    type Sums = BarSums;
+
+    /// The open and close are stamped at the bar's own timestamp, so the earliest fragment opens a coarser bar.
+    fn parts(&self) -> (BarKey, BarSums) {
+        let key = BarKey {
+            symbol: self.symbol().clone(),
+            interval: self.interval(),
+            timestamp: self.timestamp(),
+        };
+        let prices = self.prices();
+        let sums = BarSums {
+            first: StampedPrice::new(key.timestamp, prices.open()),
+            last: StampedPrice::new(key.timestamp, prices.close()),
+            high: prices.high(),
+            low: prices.low(),
+            volume: self.volume(),
+            trade_count: self.trade_count(),
+            dollar_volume: self.dollar_volume(),
+        };
+        (key, sums)
+    }
+
+    fn from_parts(key: BarKey, sums: BarSums) -> Self {
+        let prices = BarPrices::new(sums.first.price(), sums.high, sums.low, sums.last.price())
+            .expect("every combined open and close lies within the combined range");
+        Bar::new(
+            key.symbol,
+            key.interval,
+            key.timestamp,
+            prices,
+            sums.volume,
+            sums.trade_count,
+            sums.dollar_volume,
+        )
+        .expect("a bucket timestamp sits on its interval's grid")
+    }
+}
+
+/// The daily bars `session_bars` writes are its five-minute bars rolled up, and the minutes rolled up at once.
+#[cfg(test)]
+pub(super) fn check_rollups_compose<B: RollsUp + PartialEq + std::fmt::Debug>(
+    minutes: &[B],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let roll = |bars: &[B], interval| roll_up(bars, interval).unwrap();
+    let [(minute, minute_bars), (five, five_minutes), (day, daily)] =
+        session_bars(roll(minutes, BarInterval::OneMinute));
+    proptest::prop_assert_eq!(
+        (minute, five, day),
+        (
+            BarInterval::OneMinute,
+            BarInterval::FiveMinute,
+            BarInterval::OneDay
+        )
+    );
+    proptest::prop_assert_eq!(minute_bars, roll(minutes, BarInterval::OneMinute));
+    proptest::prop_assert_eq!(daily.is_empty(), minutes.is_empty());
+    proptest::prop_assert_eq!(
+        roll(&five_minutes, BarInterval::OneDay),
+        roll(minutes, BarInterval::OneDay)
+    );
+    proptest::prop_assert_eq!(roll(&five_minutes, BarInterval::OneDay), daily);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::TimeDelta;
     use proptest::prelude::*;
 
     use super::*;
@@ -264,7 +349,7 @@ mod tests {
     }
 
     fn roll(bars: &[Bar], interval: BarInterval) -> Vec<Bar> {
-        concatenate(bars.iter().map(|bar| BarRollup::of(bar, interval).unwrap())).into_bars()
+        roll_up(bars, interval).unwrap()
     }
 
     #[test]
@@ -380,13 +465,13 @@ mod tests {
             BarInterval::FiveMinute,
         );
         assert_eq!(
-            BarRollup::of(&five[0], BarInterval::OneMinute),
+            Rollup::of(&five[0], BarInterval::OneMinute),
             Err(RollupRefusal::Finer {
                 from: BarInterval::FiveMinute,
                 to: BarInterval::OneMinute
             })
         );
-        assert_eq!(BarRollup::empty().into_bars(), Vec::new());
+        assert_eq!(Rollup::<Bar>::empty().into_bars(), Vec::new());
     }
 
     /// Prices under $10,000 and sizes under a billion shares, so a few hundred sums stay far from overflow.
@@ -437,7 +522,7 @@ mod tests {
             )
     }
 
-    fn any_bar() -> impl Strategy<Value = BarRollup> {
+    fn any_bar() -> impl Strategy<Value = Rollup<Bar>> {
         (
             any_minute_bar(),
             prop::sample::select(vec![
@@ -446,11 +531,11 @@ mod tests {
                 BarInterval::OneDay,
             ]),
         )
-            .prop_map(|(bar, interval)| BarRollup::of(&bar, interval).unwrap())
+            .prop_map(|(bar, interval)| Rollup::of(&bar, interval).unwrap())
     }
 
-    fn any_rollup() -> impl Strategy<Value = BarRollup> {
-        prop_oneof![1 => Just(BarRollup::empty()), 9 => any_bar()]
+    fn any_rollup() -> impl Strategy<Value = Rollup<Bar>> {
+        prop_oneof![1 => Just(Rollup::empty()), 9 => any_bar()]
     }
 
     proptest! {
@@ -476,18 +561,16 @@ mod tests {
             laws::check(first, second, third)?;
         }
 
-        /// Rolling up in stages builds the same bars as rolling up at once.
         #[test]
         fn property_rollups_compose(bars in prop::collection::vec(any_minute_bar(), 0..50)) {
-            let direct = roll(&bars, BarInterval::OneDay);
-            prop_assert_eq!(
-                roll(&roll(&bars, BarInterval::FiveMinute), BarInterval::OneDay),
-                direct.clone()
-            );
-            prop_assert_eq!(
-                roll(&roll(&bars, BarInterval::OneMinute), BarInterval::OneDay),
-                direct
-            );
+            check_rollups_compose(&bars)?;
+        }
+
+        /// A bar splits into parts it is rebuilt from unchanged.
+        #[test]
+        fn property_a_bar_is_rebuilt_from_its_parts(bar in any_minute_bar()) {
+            let (key, sums) = bar.parts();
+            prop_assert_eq!(Bar::from_parts(key, sums), bar);
         }
 
         #[test]

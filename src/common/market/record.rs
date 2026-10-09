@@ -38,6 +38,19 @@ impl BarInterval {
             Self::OneDay => timestamp,
         }
     }
+
+    /// The timestamp of the bar `instant` falls in: an intraday bar's start, or for a daily bar its session's close.
+    pub fn bucket(self, instant: DateTime<Utc>) -> DateTime<Utc> {
+        let minute = instant
+            .with_second(0)
+            .and_then(|instant| instant.with_nanosecond(0))
+            .expect("zero seconds and nanoseconds exist in every minute");
+        match self {
+            Self::OneMinute => minute,
+            Self::FiveMinute => minute - TimeDelta::minutes(i64::from(minute.minute() % 5)),
+            Self::OneDay => SessionDate::at(instant).regular_close(),
+        }
+    }
 }
 
 /// Open, high, low and close, with the open and close inside `[low, high]`.
@@ -167,13 +180,7 @@ impl Bar {
         trade_count: Option<TradeCount>,
         dollar_volume: Option<DollarVolume>,
     ) -> Result<Self, BarRefusal> {
-        let on_minute = timestamp.second() == 0 && timestamp.nanosecond() == 0;
-        let aligned = match interval {
-            BarInterval::OneMinute => on_minute,
-            BarInterval::FiveMinute => on_minute && timestamp.minute().is_multiple_of(5),
-            BarInterval::OneDay => timestamp == SessionDate::at(timestamp).regular_close(),
-        };
-        if !aligned {
+        if interval.bucket(timestamp) != timestamp {
             return Err(BarRefusal::Misaligned {
                 interval,
                 timestamp,
@@ -606,6 +613,23 @@ mod tests {
     }
 
     proptest! {
+        /// An instant's bucket is its own bucket, and an intraday bar stamped there is the one that holds the instant.
+        #[test]
+        fn property_a_bucket_holds_its_instant(
+            nanoseconds in 0..(2 * 86_400_000_000_000i64),
+            interval in prop::sample::select(vec![BarInterval::OneMinute, BarInterval::FiveMinute, BarInterval::OneDay]),
+        ) {
+            let at = instant("2026-07-31T00:00:00Z") + TimeDelta::nanoseconds(nanoseconds);
+            let bucket = interval.bucket(at);
+            prop_assert_eq!(interval.bucket(bucket), bucket);
+            match interval {
+                BarInterval::OneMinute | BarInterval::FiveMinute => {
+                    prop_assert!(bucket <= at && at < interval.ends(bucket));
+                }
+                BarInterval::OneDay => prop_assert_eq!(SessionDate::at(bucket), SessionDate::at(at)),
+            }
+        }
+
         /// Repricing twice is repricing once to the second price, and repricing keeps all but the prices.
         #[test]
         fn property_repricing_composes_to_the_last_price(

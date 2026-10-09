@@ -30,11 +30,12 @@ use crate::common::journal::{
     PartitionWritten, Unanswered, quotes_folded, trades_folded,
 };
 use crate::common::market::Symbol;
+use crate::common::market::aggregate::session_bars;
 use crate::common::market::corporate_actions::{SeriesBoundary, refresh_boundaries};
-use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal, QuoteRollup};
+use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
 use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::security_details::SecurityDetails;
-use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
+use crate::common::market::trade_bars::{TradeConditions, TradeFold};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record, refuse_retired};
 use crate::common::storage::{Key, Provider, ReferenceTable};
@@ -651,36 +652,31 @@ async fn write_security_details(
     ))
 }
 
-/// Keys for a tick leg's bars at every interval, minutes first and the daily, which marks the session held, last.
-fn tick_keys(leg_key: &Key) -> [Key; 3] {
-    let intervals = [
-        BarInterval::OneMinute,
-        BarInterval::FiveMinute,
-        BarInterval::OneDay,
-    ];
+/// The key of a tick leg's bars at `interval`.
+fn tick_key(leg_key: &Key, interval: BarInterval) -> Key {
     match leg_key {
         Key::Quotes {
             provider,
             origin,
             session,
             ..
-        } => intervals.map(|interval| Key::Quotes {
+        } => Key::Quotes {
             provider: *provider,
             origin: *origin,
             interval,
             session: *session,
-        }),
+        },
         Key::Trades {
             provider,
             origin,
             session,
             ..
-        } => intervals.map(|interval| Key::Trades {
+        } => Key::Trades {
             provider: *provider,
             origin: *origin,
             interval,
             session: *session,
-        }),
+        },
         Key::Bars { .. }
         | Key::Reference { .. }
         | Key::RawBars { .. }
@@ -722,19 +718,11 @@ async fn write_quotes(
         return Err(PartitionFailure::NoRows);
     }
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
-    let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaQuotes.key(session));
-    let rollup =
-        |interval| {
-            concatenate(minutes.iter().map(|bar| {
-                QuoteRollup::of(bar, interval).expect("minutes roll up to coarser bars")
-            }))
-            .into_bars()
-        };
-    for (key, bars) in [
-        (minute_key, minutes.clone()),
-        (five_minute_key, rollup(BarInterval::FiveMinute)),
-        (daily_key, rollup(BarInterval::OneDay)),
-    ] {
+    let minute_bars =
+        u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars");
+    // The daily file is written last, so a session reads as held only once all three are.
+    for (interval, bars) in session_bars(minutes) {
+        let key = tick_key(&Leg::AlpacaQuotes.key(session), interval);
         let body = quote_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
         clients.archive.put(&key, body).await?;
     }
@@ -742,7 +730,7 @@ async fn write_quotes(
     Ok(PartitionWritten::new(
         Leg::AlpacaQuotes,
         session,
-        u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
+        minute_bars,
         refused_by_cause(&refused),
         unanswered,
         quotes_folded(counts, one_sided),
@@ -783,19 +771,11 @@ async fn write_trades(
         return Err(PartitionFailure::NoRows);
     }
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
-    let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaTrades.key(session));
-    let rollup =
-        |interval| {
-            concatenate(minutes.iter().map(|bar| {
-                TradeRollup::of(bar, interval).expect("minutes roll up to coarser bars")
-            }))
-            .into_bars()
-        };
-    for (key, bars) in [
-        (minute_key, minutes.clone()),
-        (five_minute_key, rollup(BarInterval::FiveMinute)),
-        (daily_key, rollup(BarInterval::OneDay)),
-    ] {
+    let minute_bars =
+        u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars");
+    // The daily file is written last, so a session reads as held only once all three are.
+    for (interval, bars) in session_bars(minutes) {
+        let key = tick_key(&Leg::AlpacaTrades.key(session), interval);
         let body = trade_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
         clients.archive.put(&key, body).await?;
     }
@@ -803,7 +783,7 @@ async fn write_trades(
     Ok(PartitionWritten::new(
         Leg::AlpacaTrades,
         session,
-        u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars"),
+        minute_bars,
         refused_by_cause(&refused),
         unanswered,
         trades_folded(&counts),
