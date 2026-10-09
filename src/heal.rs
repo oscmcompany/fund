@@ -34,12 +34,12 @@ use crate::common::market::Symbol;
 use crate::common::market::aggregate::{RollsUp, session_bars};
 use crate::common::market::corporate_actions::refresh_boundaries;
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
-use crate::common::market::record::{Bar, BarInterval};
+use crate::common::market::record::{Bar, BarInterval, BarPartition, BarPartitionRefusal};
 use crate::common::market::security_details::SecurityDetails;
 use crate::common::market::trade_bars::{TradeConditions, TradeFold};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
-use crate::common::storage::{Key, Provider, ReferenceTable};
+use crate::common::storage::{BarsKey, Key, Provider, ReferenceTable};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 use crate::ingest::alpaca::corporate_actions::SeriesBoundaries;
@@ -440,6 +440,22 @@ async fn publish<K: Into<Key>, Row, Refusal: Into<EncodeRefusal>>(
     Ok(u64::try_from(rows.len()).expect("a partition holds fewer than u64::MAX rows"))
 }
 
+/// Encodes `bars` under `key` and writes them with `put`, returning how many were written; an empty answer is refused
+/// as `publish` refuses one.
+async fn publish_bars(
+    put: impl AsyncFnOnce(&Key, Vec<u8>) -> Result<(), ArchiveError>,
+    key: BarsKey,
+    bars: Vec<Bar>,
+    provenance: &Provenance,
+) -> Result<u64, PartitionFailure> {
+    let bars = BarPartition::try_from(bars).map_err(|refusal| match refusal {
+        BarPartitionRefusal::Empty => PartitionFailure::NoRows,
+    })?;
+    let body = encode(&key, &bars, provenance).map_err(EncodeRefusal::from)?;
+    put(&key.into(), body).await?;
+    Ok(u64::try_from(bars.bars().len()).expect("a partition holds fewer than u64::MAX rows"))
+}
+
 /// Publishes a fold's minute bars and their rollups under `key` at each interval, the daily last so a session reads as
 /// held only once all three are, returning how many minute bars were written.
 async fn publish_ticks<K: Into<Key>, B: RollsUp, Refusal: Into<EncodeRefusal>>(
@@ -468,19 +484,19 @@ async fn write_daily_bars(
         tracing::info!(%session, test_tickers = daily.test_tickers().len(), "Exchange test tickers left out");
     }
     let provenance = fetched_now(Subscription::StocksStarter, journal);
-    let bars = publish(
+    let refused = refused_by_cause(daily.refused());
+    let bars = publish_bars(
         clients.put(),
         massive_daily_bars(session),
-        daily.bars(),
+        daily.into_bars(),
         &provenance,
-        encode,
     )
     .await?;
     Ok(PartitionWritten::new(
         Leg::MassiveDailyBars,
         session,
         bars,
-        refused_by_cause(daily.refused()),
+        refused,
         BTreeMap::new(),
         BTreeMap::new(),
     ))
@@ -516,19 +532,19 @@ async fn write_minute_bars(
         )
         .collect();
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
-    let bars = publish(
+    let refused = refused_by_cause(minute.refused());
+    let bars = publish_bars(
         clients.put(),
         alpaca_minute_bars(session),
-        minute.bars(),
+        minute.into_bars(),
         &provenance,
-        encode,
     )
     .await?;
     Ok(PartitionWritten::new(
         Leg::AlpacaMinuteBars,
         session,
         bars,
-        refused_by_cause(minute.refused()),
+        refused,
         unanswered,
         BTreeMap::new(),
     ))
@@ -911,7 +927,7 @@ async fn symbol_list(
         .await?
         .ok_or(PartitionFailure::NoSymbols { key: key.into() })?;
     let (bars, _) = decode(&key, body).map_err(DecodeRefusal::from)?;
-    Ok(bars.iter().map(Bar::symbol).cloned().collect())
+    Ok(bars.bars().iter().map(Bar::symbol).cloned().collect())
 }
 
 /// Fetches `symbols` in batches with at most `concurrency` in flight, concatenating the answers in the order the
@@ -1333,6 +1349,27 @@ mod tests {
             trade_bars::encode,
         )
         .await;
+        assert!(matches!(refused, Err(PartitionFailure::NoRows)));
+        assert_eq!(*written.lock().unwrap(), Vec::<String>::new());
+    }
+
+    /// An empty bars answer is refused before anything is written, so the session is not marked held.
+    #[tokio::test]
+    async fn test_no_bars_are_refused_unwritten() {
+        let [session, _] = sessions();
+        let provenance = Provenance::new(
+            Subscription::StocksStarter,
+            "2026-09-30T07:00:00Z".parse().unwrap(),
+            RunId::new(uuid::Uuid::from_u128(1)),
+            None,
+        );
+        let written = std::sync::Mutex::new(Vec::new());
+        let put = async |key: &Key, _body| {
+            written.lock().unwrap().push(key.path());
+            Ok(())
+        };
+        let refused =
+            publish_bars(&put, massive_daily_bars(session), Vec::new(), &provenance).await;
         assert!(matches!(refused, Err(PartitionFailure::NoRows)));
         assert_eq!(*written.lock().unwrap(), Vec::<String>::new());
     }

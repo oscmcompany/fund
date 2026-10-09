@@ -10,7 +10,7 @@ use crate::common::laboratory::dataset::{
     Contamination, DatasetLeg, Fingerprint, FingerprintRefusal,
 };
 use crate::common::laboratory::series::{Series, SeriesRefusal};
-use crate::common::market::record::Bar;
+use crate::common::market::record::{Bar, BarPartition};
 use crate::common::storage::EntityTag;
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
@@ -19,14 +19,14 @@ use crate::laboratory::Study;
 /// Bars by session and the fingerprint of the partitions they came from.
 #[derive(Debug)]
 pub struct Dataset {
-    bars: BTreeMap<SessionDate, Vec<Bar>>,
+    bars: BTreeMap<SessionDate, BarPartition>,
     fingerprint: Fingerprint,
     /// The run whose journal holds this read.
     run: RunId,
 }
 
 impl Dataset {
-    pub fn bars(&self) -> &BTreeMap<SessionDate, Vec<Bar>> {
+    pub fn bars(&self) -> &BTreeMap<SessionDate, BarPartition> {
         &self.bars
     }
 
@@ -43,7 +43,7 @@ impl Dataset {
         Series::new(
             self.bars
                 .iter()
-                .map(|(session, bars)| (*session, read(bars))),
+                .map(|(session, bars)| (*session, read(bars.bars()))),
         )
     }
 }
@@ -58,10 +58,6 @@ pub enum DatasetError {
         session: SessionDate,
         refusal: DecodeRefusal,
     },
-    /// A partition that holds no bars is a defect in the archive, not a gap, so it is refused rather than read.
-    EmptyPartition {
-        session: SessionDate,
-    },
 }
 
 impl std::fmt::Display for DatasetError {
@@ -70,9 +66,6 @@ impl std::fmt::Display for DatasetError {
             Self::Window(refusal) => write!(formatter, "{refusal}"),
             Self::Journal(error) => write!(formatter, "the read could not be journaled: {error}"),
             Self::Archive(error) => write!(formatter, "{error}"),
-            Self::EmptyPartition { session } => {
-                write!(formatter, "the partition for {session} holds no bars")
-            }
             Self::Decode { session, refusal } => {
                 write!(
                     formatter,
@@ -119,7 +112,7 @@ async fn load(
         let Some((read, tag)) = partition(archive, leg, *session).await? else {
             continue;
         };
-        bars.insert(*session, admit(*session, read)?);
+        bars.insert(*session, read);
         tags.insert(*session, tag);
     }
     let fingerprint = Fingerprint::new(leg, range, calendar, tags).map_err(DatasetError::Window)?;
@@ -136,7 +129,7 @@ async fn partition(
     archive: &Archive,
     leg: DatasetLeg,
     session: SessionDate,
-) -> Result<Option<(Vec<Bar>, EntityTag)>, DatasetError> {
+) -> Result<Option<(BarPartition, EntityTag)>, DatasetError> {
     match leg {
         DatasetLeg::MassiveDailyBars => {
             let key = massive_daily_bars(session);
@@ -171,13 +164,6 @@ pub async fn lineage(
         }
     }
     Ok(fingerprint.contaminated(&current))
-}
-
-fn admit(session: SessionDate, bars: Vec<Bar>) -> Result<Vec<Bar>, DatasetError> {
-    match bars.is_empty() {
-        true => Err(DatasetError::EmptyPartition { session }),
-        false => Ok(bars),
-    }
 }
 
 #[cfg(test)]
@@ -223,7 +209,10 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
-            (session(day), vec![bar; count])
+            (
+                session(day),
+                BarPartition::try_from(vec![bar; count]).unwrap(),
+            )
         };
         let read = [0, 1, 3]
             .map(|day| (session(day), EntityTag::new(&format!("\"tag-{day}\""))))
@@ -357,15 +346,6 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    #[test]
-    fn test_an_empty_partition_is_refused_rather_than_read() {
-        let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 28).unwrap());
-        assert!(matches!(
-            admit(session, Vec::new()),
-            Err(DatasetError::EmptyPartition { session: refused }) if refused == session
-        ));
-    }
-
     /// Read-only: one week of the production archive, read twice, under secretspec. The week holds the layout's first
     /// sessions, 2026-09-28 and 09-29, so it always reads something.
     #[tokio::test]
@@ -397,7 +377,11 @@ pub(crate) mod tests {
             fingerprint.partitions().keys().collect::<Vec<_>>()
         );
         for (session, bars) in dataset.bars() {
-            assert!(bars.len() > 1000, "{session}: {} bars", bars.len());
+            assert!(
+                bars.bars().len() > 1000,
+                "{session}: {} bars",
+                bars.bars().len()
+            );
         }
         let counts = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
         assert_eq!(
@@ -419,7 +403,11 @@ pub(crate) mod tests {
             "{} sessions read, {} missing, {} bars; {:?}",
             fingerprint.partitions().len(),
             fingerprint.missing().len(),
-            dataset.bars().values().map(Vec::len).sum::<usize>(),
+            dataset
+                .bars()
+                .values()
+                .map(|bars| bars.bars().len())
+                .sum::<usize>(),
             fingerprint.partitions()
         );
     }

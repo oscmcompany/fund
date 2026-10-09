@@ -5,7 +5,7 @@ use crate::common::book::{Book, Cash};
 use crate::common::laboratory::estimate::EstimateRefusal;
 use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs, Parameters};
 use crate::common::laboratory::series::SeriesRefusal;
-use crate::common::market::record::BarInterval;
+use crate::common::market::record::{BarInterval, BarPartition};
 use crate::common::monoid::concatenate;
 use crate::common::replay::{FillModel, Replay, ReplayRefusal, Replayer};
 use crate::common::strategy::Strategy;
@@ -186,7 +186,7 @@ pub(crate) fn run<S: Strategy>(
     opening: Opening,
 ) -> Result<Replay, ReplayStudyError> {
     let decision = replayer.decision();
-    let bars = dataset.bars().values().flatten();
+    let bars = dataset.bars().values().flat_map(BarPartition::bars);
     if !bars.clone().any(|bar| bar.interval() == decision) {
         return Err(ReplayStudyError::NoDecisionBars { decision });
     }

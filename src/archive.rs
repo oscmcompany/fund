@@ -519,18 +519,20 @@ mod tests {
             RunId::new(Uuid::new_v4()),
             None,
         );
-        let body = encode(&key, daily.bars(), &provenance).unwrap();
+        let written =
+            crate::common::market::record::BarPartition::try_from(daily.bars().to_vec()).unwrap();
+        let body = encode(&key, &written, &provenance).unwrap();
         let configuration = aws_config::load_from_env().await;
         let archive = Archive::market_data(&configuration).unwrap();
         archive.put(&key.into(), body.clone()).await.unwrap();
         let (bars, read) = decode(&key, archive.get(&key.into()).await.unwrap().unwrap()).unwrap();
         println!(
             "{} bars, {} bytes, {}",
-            bars.len(),
+            bars.bars().len(),
             body.len(),
             Key::from(key).path()
         );
-        assert_eq!(bars, daily.bars());
+        assert_eq!(bars, written);
         assert_eq!(read, provenance);
     }
 }

@@ -136,6 +136,10 @@ impl MinuteBars {
         &self.bars
     }
 
+    pub fn into_bars(self) -> Vec<Bar> {
+        self.bars
+    }
+
     /// Asked for but absent from every page: Alpaca drops a name it does not know without saying so.
     pub fn missing(&self) -> &[Symbol] {
         &self.missing
