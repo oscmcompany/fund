@@ -7,6 +7,9 @@ REGION="${AWS_REGION:-us-east-1}"
 ARCHIVE_BUCKET="oscm-fund-archive"
 # The devenv release a box installs; it then supplies the toolchain pinned in devenv.lock.
 DEVENV_VERSION="2.1.2"
+# How long a new box's cold bootstrap (Nix, devenv, the toolchain and a release build) may take: 90 minutes.
+BOOTSTRAP_POLLS="${BOOTSTRAP_POLLS:-180}"
+BOOTSTRAP_POLL_SECONDS="${BOOTSTRAP_POLL_SECONDS:-30}"
 ROLE=""
 PROFILE=""
 APPLY=false
@@ -94,7 +97,19 @@ TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal"
 ROLE_DESCRIPTION="The $ROLE host ($PROFILE). Managed by host/provision-host."
 
 if aws iam get-role --role-name "$NAME" >/dev/null 2>&1; then
+  # Two profiles can share a slug (`a.b` and `a-b`), so the role records its owner and refuses any other.
+  ROLE_OWNER="$(aws iam list-role-tags --role-name "$NAME" --query "Tags[?Key=='fund-profile'].Value" --output text)"
+  if [[ -n "$ROLE_OWNER" && "$ROLE_OWNER" != "None" && "$ROLE_OWNER" != "$PROFILE" ]]; then
+    echo "Error: role $NAME belongs to profile $ROLE_OWNER, which shares this profile's slug" >&2
+    exit 1
+  fi
   unchanged "role exists"
+  if [[ "$ROLE_OWNER" != "$PROFILE" ]]; then
+    changed "tag role with fund-profile=$PROFILE"
+    if [[ "$APPLY" == true ]]; then
+      aws iam tag-role --role-name "$NAME" --tags "Key=fund-profile,Value=$PROFILE"
+    fi
+  fi
   changed "refresh trust policy and description"
   if [[ "$APPLY" == true ]]; then
     aws iam update-assume-role-policy --role-name "$NAME" --policy-document "$TRUST_POLICY"
@@ -104,7 +119,7 @@ else
   changed "create role"
   if [[ "$APPLY" == true ]]; then
     aws iam create-role --role-name "$NAME" --assume-role-policy-document "$TRUST_POLICY" \
-      --description "$ROLE_DESCRIPTION" >/dev/null
+      --description "$ROLE_DESCRIPTION" --tags "Key=fund-profile,Value=$PROFILE" >/dev/null
     aws iam wait role-exists --role-name "$NAME"
   fi
 fi
@@ -170,14 +185,14 @@ step "Instance $NAME"
 FOUND="$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:fund-role,Values=$ROLE" "Name=tag:fund-profile,Values=$PROFILE" \
     "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-  --query 'Reservations[].Instances[].[InstanceId,InstanceType,IamInstanceProfile.Arn,MetadataOptions.HttpTokens,MetadataOptions.InstanceMetadataTags]' \
+  --query "Reservations[].Instances[].[InstanceId,InstanceType,IamInstanceProfile.Arn,MetadataOptions.HttpTokens,MetadataOptions.InstanceMetadataTags,Tags[?Key=='fund-bootstrapped'].Value|[0]]" \
   --output text)"
 if [[ "$(grep -c . <<<"$FOUND" || true)" -gt 1 ]]; then
   echo "Error: more than one $ROLE instance is tagged $PROFILE:" >&2
   echo "$FOUND" >&2
   exit 1
 fi
-read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS FOUND_TAGS <<<"$FOUND"
+read -r INSTANCE_ID FOUND_TYPE FOUND_PROFILE_ARN FOUND_TOKENS FOUND_TAGS FOUND_BOOTSTRAPPED <<<"$FOUND"
 
 if [[ "$INSTANCE_ID" != "None" && -n "$INSTANCE_ID" ]]; then
   unchanged "instance $INSTANCE_ID"
@@ -185,11 +200,18 @@ if [[ "$INSTANCE_ID" != "None" && -n "$INSTANCE_ID" ]]; then
     || drift "instance $INSTANCE_ID is $FOUND_TYPE, not $INSTANCE_TYPE (replace it to change this)"
   [[ "$FOUND_PROFILE_ARN" == *"/$NAME" ]] \
     || drift "instance $INSTANCE_ID carries instance profile $FOUND_PROFILE_ARN, not $NAME"
-  [[ "$FOUND_TOKENS" == "required" ]] \
-    || drift "instance $INSTANCE_ID has IMDS tokens \"$FOUND_TOKENS\", not required"
+  [[ "$FOUND_BOOTSTRAPPED" != "None" && -n "$FOUND_BOOTSTRAPPED" ]] \
+    || drift "instance $INSTANCE_ID never finished its bootstrap (no fund-bootstrapped tag); terminate it"
   # run-host reads its role from the tags, so a box without tag metadata would run nothing.
-  [[ "$FOUND_TAGS" == "enabled" ]] \
-    || drift "instance $INSTANCE_ID has tag metadata \"$FOUND_TAGS\", not enabled (replace it)"
+  if [[ "$FOUND_TOKENS" == "required" && "$FOUND_TAGS" == "enabled" ]]; then
+    unchanged "IMDS tokens required, tag metadata enabled"
+  else
+    changed "require IMDS tokens and enable tag metadata (were $FOUND_TOKENS, $FOUND_TAGS)"
+    if [[ "$APPLY" == true ]]; then
+      aws ec2 modify-instance-metadata-options --region "$REGION" --instance-id "$INSTANCE_ID" \
+        --http-tokens required --instance-metadata-tags enabled >/dev/null
+    fi
+  fi
   ATTACHED_GROUPS="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
     --query 'Reservations[0].Instances[0].SecurityGroups[].GroupId' --output text)"
   [[ "$ATTACHED_GROUPS" == *"$SECURITY_GROUP_ID"* ]] \
@@ -254,9 +276,21 @@ CLOUDINIT
       echo "Error: RunInstances kept rejecting instance profile $NAME after 10 attempts" >&2
       exit 1
     fi
-    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
-    echo "    instance $INSTANCE_ID running cloud-init; it powers off when the bootstrap ends"
+    echo "    waiting for $INSTANCE_ID to power off, which cloud-init does only when the bootstrap succeeds"
     echo "    follow it with: aws ssm start-session --target $INSTANCE_ID, then tail -f /var/log/cloud-init-output.log"
+    STATE=""
+    for _ in $(seq 1 "$BOOTSTRAP_POLLS"); do
+      STATE="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].State.Name' --output text)"
+      [[ "$STATE" == "stopped" ]] && break
+      sleep "$BOOTSTRAP_POLL_SECONDS"
+    done
+    if [[ "$STATE" != "stopped" ]]; then
+      echo "Error: $INSTANCE_ID is $STATE, so its bootstrap failed or is still running; no schedule was written" >&2
+      exit 1
+    fi
+    aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" \
+      --tags "Key=fund-bootstrapped,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
 fi
 
