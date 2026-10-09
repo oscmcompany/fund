@@ -307,7 +307,7 @@ mod tests {
         let metrics: Vec<_> = ran
             .metrics()
             .iter()
-            .map(|(name, value)| (name.as_str(), *value))
+            .map(|(name, value)| (name.as_str(), value.value()))
             .collect();
         assert_eq!(
             metrics,

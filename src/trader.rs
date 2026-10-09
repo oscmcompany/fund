@@ -13,7 +13,7 @@ use crate::common::market::state::{MarketEvent, MarketState};
 use crate::common::market::trade_bars::{BarBuilt, TradeBar, TradeConditions, TradeFold};
 use crate::common::market::{Price, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
-use crate::common::order::BrokerFailure;
+use crate::common::order::{BrokerFailure, OrderSequence};
 use crate::common::playbook::Played;
 use crate::common::reconcile::rounding_allowance;
 use crate::common::risk::{Limits, TargetDecided, risk};
@@ -90,6 +90,18 @@ pub enum SettingsRefusal {
     StalenessUnderAMinute { stale_after: TimeDelta },
 }
 
+impl std::fmt::Display for SettingsRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StalenessUnderAMinute { stale_after } => {
+                write!(formatter, "a staleness of {stale_after} is under a minute")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SettingsRefusal {}
+
 impl SessionSettings {
     pub fn new(
         decision: DecisionInterval,
@@ -129,7 +141,7 @@ pub struct Session<S: Strategy> {
     /// Fills since the last reconciliation, which bound how far the broker's cash may stray from the book's.
     fills: Vec<Fill>,
     next_decision: DateTime<Utc>,
-    next_sequence: u32,
+    sequence: OrderSequence,
     /// Whether the tape is whole: draining and deciding wait out a gap until a backfill after a reopen covers it.
     continuity: FeedContinuity,
     standing: Standing,
@@ -192,7 +204,7 @@ impl<S: Strategy> Session<S> {
             book,
             opening,
             fills: Vec::new(),
-            next_sequence: 0,
+            sequence: OrderSequence::default(),
             // The feed's first backfill, from where the tape is wanted, makes it whole.
             continuity: FeedContinuity::Reopened,
             standing: Standing::Trading,
@@ -221,10 +233,9 @@ impl<S: Strategy> Session<S> {
             self.continuity = changed.to();
             if let Err(error) = journal.append(now, Observation::FeedChanged(changed)) {
                 self.halt(journal, journal_refused(&error));
-                return Err(SessionError::Journal(JournalFailed {
-                    outcomes: Vec::new(),
+                return Err(SessionError::Journal(JournalFailed::before_any_order(
                     error,
-                }));
+                )));
             }
         }
         match event {
@@ -277,10 +288,9 @@ impl<S: Strategy> Session<S> {
         for bar in self.fold.drain_through(settled) {
             if let Err(error) = journal.append(now, Observation::BarBuilt(BarBuilt::of(&bar))) {
                 self.halt(journal, journal_refused(&error));
-                return Err(SessionError::Journal(JournalFailed {
-                    outcomes: Vec::new(),
+                return Err(SessionError::Journal(JournalFailed::before_any_order(
                     error,
-                }));
+                )));
             }
             self.fold_in(MarketEvent::Trades(bar));
         }
@@ -307,10 +317,9 @@ impl<S: Strategy> Session<S> {
         let decided = TargetDecided::new(bar, stretch, wanted, restrained.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
             self.halt(journal, journal_refused(&error));
-            return Err(SessionError::Journal(JournalFailed {
-                outcomes: Vec::new(),
+            return Err(SessionError::Journal(JournalFailed::before_any_order(
                 error,
-            }));
+            )));
         }
         let restrained = match restrained {
             Ok(restrained) => restrained,
@@ -327,7 +336,7 @@ impl<S: Strategy> Session<S> {
         let executed = execute(
             broker,
             journal,
-            &mut self.next_sequence,
+            &mut self.sequence,
             &self.book,
             restrained.target(),
             &prices,
@@ -338,8 +347,8 @@ impl<S: Strategy> Session<S> {
             Ok(outcomes) => outcomes,
             Err(failed) => {
                 // The orders already followed are real, so their fills reach the book before the session halts.
-                self.take(&failed.outcomes, journal);
-                self.halt(journal, journal_refused(&failed.error));
+                self.take(failed.outcomes(), journal);
+                self.halt(journal, journal_refused(failed.error()));
                 return Err(SessionError::Journal(failed));
             }
         };
@@ -347,7 +356,7 @@ impl<S: Strategy> Session<S> {
         let reconciliation = match reconcile_and_close(
             broker,
             journal,
-            &mut self.next_sequence,
+            &mut self.sequence,
             &self.book,
             rounding_allowance(&self.fills),
             &prices,
@@ -361,7 +370,7 @@ impl<S: Strategy> Session<S> {
                     ReconcileFailed::Unread(error) => {
                         HaltCause::ReconcileUnread(BrokerFailure::from(error))
                     }
-                    ReconcileFailed::Journal(failed) => journal_refused(&failed.error),
+                    ReconcileFailed::Journal(failed) => journal_refused(failed.error()),
                 };
                 self.halt(journal, cause);
                 return Err(SessionError::Reconcile(failed));
@@ -638,10 +647,7 @@ mod tests {
             TimeDelta::minutes(15),
         )
         .unwrap();
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::from_secs(30),
-        };
+        let patience = Patience::new(Duration::from_secs(1), Duration::from_secs(30)).unwrap();
         let settings =
             SessionSettings::new(DecisionInterval::FiveMinute, limits, patience, stale_after)
                 .unwrap();
@@ -1266,10 +1272,7 @@ mod tests {
             TimeDelta::zero(),
         )
         .unwrap();
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::from_secs(1),
-        };
+        let patience = Patience::new(Duration::from_secs(1), Duration::from_secs(1)).unwrap();
         let settings = |seconds| {
             SessionSettings::new(
                 DecisionInterval::OneMinute,

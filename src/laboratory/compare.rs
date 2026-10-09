@@ -292,7 +292,7 @@ mod tests {
             .metrics()
             .iter()
             .filter(|(name, _)| name.as_str().ends_with("_return"))
-            .map(|(name, value)| (name.as_str(), *value))
+            .map(|(name, value)| (name.as_str(), value.value()))
             .collect();
         assert_eq!(
             metrics,
