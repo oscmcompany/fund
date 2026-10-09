@@ -119,6 +119,18 @@ pub enum RollupRefusal {
     Finer { from: BarInterval, to: BarInterval },
 }
 
+impl std::fmt::Display for RollupRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Finer { from, to } => {
+                write!(formatter, "a {from} bar cannot roll up into the finer {to}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RollupRefusal {}
+
 impl BarRollup {
     /// The fragment `bar` contributes to the `interval` bar containing it; a daily bucket is its session's close.
     pub fn of(bar: &Bar, interval: BarInterval) -> Result<Self, RollupRefusal> {

@@ -60,6 +60,24 @@ pub enum OhlcRefusal {
     },
 }
 
+impl std::fmt::Display for OhlcRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutsideRange {
+                open,
+                high,
+                low,
+                close,
+            } => write!(
+                formatter,
+                "open {open} and close {close} do not lie within low {low} and high {high}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OhlcRefusal {}
+
 impl Ohlc {
     pub fn new(open: Price, high: Price, low: Price, close: Price) -> Result<Self, OhlcRefusal> {
         let range = low..=high;
@@ -119,6 +137,19 @@ pub enum BarRefusal {
         timestamp: DateTime<Utc>,
     },
 }
+
+impl std::fmt::Display for BarRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Misaligned {
+                interval,
+                timestamp,
+            } => write!(formatter, "{timestamp} does not end a {interval} bar"),
+        }
+    }
+}
+
+impl std::error::Error for BarRefusal {}
 
 impl Bar {
     /// A bar whose timestamp sits on its interval's grid.
@@ -227,6 +258,16 @@ pub enum QuoteRefusal {
     Crossed { bid: Price, ask: Price },
 }
 
+impl std::fmt::Display for QuoteRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Crossed { bid, ask } => write!(formatter, "the bid {bid} is above the ask {ask}"),
+        }
+    }
+}
+
+impl std::error::Error for QuoteRefusal {}
+
 impl Quote {
     pub fn new(
         symbol: Symbol,
@@ -288,6 +329,16 @@ pub struct Trade {
 pub enum TradeRefusal {
     NoShares { price: Price },
 }
+
+impl std::fmt::Display for TradeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoShares { price } => write!(formatter, "a trade at {price} for no shares"),
+        }
+    }
+}
+
+impl std::error::Error for TradeRefusal {}
 
 impl Trade {
     pub fn new(

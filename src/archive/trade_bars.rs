@@ -15,11 +15,11 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 
 use super::bars::{Provenance, provenance_from};
-use super::parquet;
+use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 use crate::common::market::aggregate::TradeTotals;
 use crate::common::market::record::BarInterval;
 use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
-use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
+use crate::common::market::{DollarVolume, Shares, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
@@ -38,14 +38,7 @@ pub enum EncodeRefusal {
         provenance: Provenance,
         key: Provider,
     },
-    OutsideKey {
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-    },
-    Duplicate {
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-    },
+    Placement(PlacementRefusal),
     Unrepresentable {
         symbol: Symbol,
         timestamp: DateTime<Utc>,
@@ -59,21 +52,10 @@ pub enum EncodeRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
     NotATradesKey,
-    Parquet {
-        reason: String,
-    },
-    Metadata {
-        name: &'static str,
-    },
-    Layout {
-        version: String,
-    },
+    File(ReadRefusal),
     Row {
         index: usize,
-        reason: String,
-    },
-    Schema {
-        found: String,
+        cause: RowCause,
     },
     Provider {
         provenance: Provenance,
@@ -81,14 +63,9 @@ pub enum DecodeRefusal {
     },
 }
 
-impl From<parquet::ReadRefusal> for DecodeRefusal {
-    fn from(refusal: parquet::ReadRefusal) -> Self {
-        match refusal {
-            parquet::ReadRefusal::Parquet { reason } => Self::Parquet { reason },
-            parquet::ReadRefusal::Schema { found } => Self::Schema { found },
-            parquet::ReadRefusal::Metadata { name } => Self::Metadata { name },
-            parquet::ReadRefusal::Layout { version } => Self::Layout { version },
-        }
+impl From<ReadRefusal> for DecodeRefusal {
+    fn from(refusal: ReadRefusal) -> Self {
+        Self::File(refusal)
     }
 }
 
@@ -152,10 +129,10 @@ pub fn encode(
             key: provider,
         });
     }
-    let mut ordered: Vec<&TradeBar> = bars.iter().collect();
-    ordered.sort_by(|left, right| {
-        (left.symbol(), left.timestamp()).cmp(&(right.symbol(), right.timestamp()))
-    });
+    let ordered = parquet::place(bars, interval, session, |bar| {
+        (bar.symbol(), bar.interval(), bar.timestamp())
+    })
+    .map_err(EncodeRefusal::Placement)?;
     let mut symbols = StringBuilder::new();
     let mut timestamps = TimestampMicrosecondBuilder::new().with_timezone("UTC");
     let mut counts = UInt64Builder::new();
@@ -164,32 +141,16 @@ pub fn encode(
     let mut opened_at = TimestampNanosecondBuilder::new().with_timezone("UTC");
     let mut closed_at = TimestampNanosecondBuilder::new().with_timezone("UTC");
     let mut prices: [Decimal128Builder; 4] = std::array::from_fn(|_| Decimal128Builder::new());
-    let mut previous: Option<(&Symbol, DateTime<Utc>)> = None;
     for bar in ordered {
         let (symbol, timestamp) = (bar.symbol(), bar.timestamp());
-        if bar.interval() != interval || SessionDate::at(timestamp) != session {
-            return Err(EncodeRefusal::OutsideKey {
-                symbol: symbol.clone(),
-                timestamp,
-            });
-        }
-        if previous == Some((symbol, timestamp)) {
-            return Err(EncodeRefusal::Duplicate {
-                symbol: symbol.clone(),
-                timestamp,
-            });
-        }
-        previous = Some((symbol, timestamp));
         let unrepresentable = || EncodeRefusal::Unrepresentable {
             symbol: symbol.clone(),
             timestamp,
         };
         let sums = bar.sums();
         let totals = sums.totals();
-        let dollar_volume = i128::try_from(totals.dollar_volume().units())
-            .ok()
-            .filter(|units| *units < 10_i128.pow(38))
-            .ok_or_else(unrepresentable)?;
+        let dollar_volume =
+            parquet::widest_decimal(totals.dollar_volume().units()).ok_or_else(unrepresentable)?;
         let nanoseconds = |instant: DateTime<Utc>| instant.timestamp_nanos_opt();
         let open_close = sums.open_close();
         let (open_instant, close_instant) = match open_close {
@@ -231,12 +192,7 @@ pub fn encode(
         high,
         low,
     ];
-    let metadata = provenance
-        .entries()
-        .into_iter()
-        .map(|(name, value)| ::parquet::file::metadata::KeyValue::new(name.to_string(), value))
-        .collect();
-    parquet::write(schema(), columns, LAYOUT_VERSION, metadata)
+    parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata())
         .map_err(|reason| EncodeRefusal::Parquet { reason })
 }
 
@@ -244,7 +200,7 @@ pub fn encode(
 pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<TradeBar>, Provenance), DecodeRefusal> {
     let (provider, interval, session) = trades_key(key).ok_or(DecodeRefusal::NotATradesKey)?;
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
-    let provenance = provenance_from(&entries).map_err(|name| DecodeRefusal::Metadata { name })?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
         return Err(DecodeRefusal::Provider {
             provenance,
@@ -253,83 +209,64 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<TradeBar>, Provenance), 
     }
     let mut bars = Vec::new();
     for batch in batches {
-        let decimals = |index: usize| parquet::downcast::<Decimal128Array>(batch.column(index));
-        let instants =
-            |index: usize| parquet::downcast::<TimestampNanosecondArray>(batch.column(index));
-        let symbols = parquet::downcast::<StringArray>(batch.column(0))?;
-        let timestamps = parquet::downcast::<TimestampMicrosecondArray>(batch.column(1))?;
-        let counts = parquet::downcast::<UInt64Array>(batch.column(2))?;
-        let volumes = decimals(3)?;
-        let dollar_volumes = decimals(4)?;
+        let decimals = |index: usize| parquet::column::<Decimal128Array>(&batch, index);
+        let instants = |index: usize| parquet::column::<TimestampNanosecondArray>(&batch, index);
+        let symbols = parquet::column::<StringArray>(&batch, 0)?;
+        let timestamps = parquet::column::<TimestampMicrosecondArray>(&batch, 1)?;
+        let counts = parquet::column::<UInt64Array>(&batch, 2)?;
+        let (volumes, dollar_volumes) = (decimals(3)?, decimals(4)?);
         let (opened_at, open, closed_at, close) =
             (instants(5)?, decimals(6)?, instants(7)?, decimals(8)?);
         let (high, low) = (decimals(9)?, decimals(10)?);
-        for row in 0..batch.num_rows() {
-            let index = bars.len();
-            let refused = |reason: String| DecodeRefusal::Row { index, reason };
-            let price = |array: &Decimal128Array| {
-                i64::try_from(array.value(row))
-                    .map_err(|error| error.to_string())
-                    .and_then(|ticks| {
-                        Price::from_ticks(ticks).map_err(|error| format!("{error:?}"))
-                    })
-                    .map_err(refused)
-            };
-            let symbol =
-                Symbol::new(symbols.value(row)).map_err(|error| refused(format!("{error:?}")))?;
-            let timestamp = DateTime::from_timestamp_micros(timestamps.value(row))
-                .ok_or_else(|| refused("timestamp out of range".to_string()))?;
-            if SessionDate::at(timestamp) != session {
-                return Err(refused(format!("{timestamp} is outside session {session}")));
-            }
+        let read = |row: usize| -> Result<TradeBar, RowCause> {
             let totals = TradeTotals::new(
                 TradeCount::new(counts.value(row)),
-                u64::try_from(volumes.value(row))
-                    .map(Shares::from_units)
-                    .map_err(|error| refused(error.to_string()))?,
-                u128::try_from(dollar_volumes.value(row))
-                    .map(DollarVolume::from_units)
-                    .map_err(|error| refused(error.to_string()))?,
+                Shares::from_units(volumes.integer(row)?),
+                DollarVolume::from_units(dollar_volumes.integer(row)?),
             );
+            let instant = |column: &TimestampNanosecondArray| {
+                DateTime::from_timestamp_nanos(column.value(row))
+            };
             // A pair is whole or absent; a null read as a value would be a price or instant no print set.
-            let open_close = match (
-                opened_at.is_valid(row),
-                open.is_valid(row),
-                closed_at.is_valid(row),
-                close.is_valid(row),
-            ) {
-                (true, true, true, true) => Some(
+            let pair = [
+                (opened_at.name(), opened_at.is_valid(row)),
+                (open.name(), open.is_valid(row)),
+                (closed_at.name(), closed_at.is_valid(row)),
+                (close.name(), close.is_valid(row)),
+            ];
+            let open_close = match pair.map(|(_, valid)| valid) {
+                [true, true, true, true] => Some(
                     OpenClose::new(
-                        (
-                            DateTime::from_timestamp_nanos(opened_at.value(row)),
-                            price(open)?,
-                        ),
-                        (
-                            DateTime::from_timestamp_nanos(closed_at.value(row)),
-                            price(close)?,
-                        ),
+                        (instant(&opened_at), open.price(row)?),
+                        (instant(&closed_at), close.price(row)?),
                     )
-                    .map_err(|error| refused(format!("{error:?}")))?,
+                    .map_err(RowCause::OpenClose)?,
                 ),
-                (false, false, false, false) => None,
-                partial => return Err(refused(format!("open and close partly null: {partial:?}"))),
+                [false, false, false, false] => None,
+                _partial => return Err(parquet::partly_null(&pair)),
             };
-            let high_low = match (high.is_valid(row), low.is_valid(row)) {
-                (true, true) => Some(
-                    HighLow::new(price(high)?, price(low)?)
-                        .map_err(|error| refused(format!("{error:?}")))?,
+            let pair = [
+                (high.name(), high.is_valid(row)),
+                (low.name(), low.is_valid(row)),
+            ];
+            let high_low = match pair.map(|(_, valid)| valid) {
+                [true, true] => Some(
+                    HighLow::new(high.price(row)?, low.price(row)?).map_err(RowCause::HighLow)?,
                 ),
-                (false, false) => None,
-                partial => return Err(refused(format!("high and low partly null: {partial:?}"))),
+                [false, false] => None,
+                _partial => return Err(parquet::partly_null(&pair)),
             };
-            let bar = TradeBar::new(
-                symbol,
+            TradeBar::new(
+                Symbol::new(symbols.value(row)).map_err(RowCause::Symbol)?,
                 interval,
-                timestamp,
+                timestamps.instant_in(row, session)?,
                 TradeSums::new(totals, open_close, high_low),
             )
-            .map_err(|error| refused(format!("{error:?}")))?;
-            bars.push(bar);
+            .map_err(RowCause::TradeBar)
+        };
+        for row in 0..batch.num_rows() {
+            let index = bars.len();
+            bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
         }
     }
     Ok((bars, provenance))
@@ -348,6 +285,7 @@ mod tests {
     use crate::common::market::trade_bars::{
         Condition, Correction, Print, TradeConditions, TradeFold, UpdateRules,
     };
+    use crate::common::market::{Price, PriceRefusal};
     use crate::common::storage::Origin;
 
     #[test]
@@ -395,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_open_without_its_close_is_refused() {
+    fn test_a_row_is_refused_with_its_typed_cause() {
         let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
         let key = Key::Trades {
             provider: Provider::Massive,
@@ -416,33 +354,45 @@ mod tests {
         let price = |ticks: Option<i128>| {
             Arc::new(Decimal128Array::from(vec![ticks]).with_data_type(PRICE_TYPE)) as ArrayRef
         };
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec!["AAPL"])),
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![1_790_947_800_000_000]).with_timezone("UTC"),
-            ),
-            Arc::new(UInt64Array::from(vec![1])),
-            Arc::new(Decimal128Array::from(vec![1_000_000]).with_data_type(SHARES_TYPE)),
-            Arc::new(
-                Decimal128Array::from(vec![100_000_000_000_000]).with_data_type(DOLLAR_VOLUME_TYPE),
-            ),
-            Arc::new(TimestampNanosecondArray::from(vec![opened]).with_timezone("UTC")),
-            price(Some(100_000_000)),
-            Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
-            price(Some(100_000_000)),
-            price(None),
-            price(None),
-        ];
-        let metadata = provenance
-            .entries()
-            .into_iter()
-            .map(|(name, value)| ::parquet::file::metadata::KeyValue::new(name.to_string(), value))
-            .collect();
-        let bytes = parquet::write(schema(), columns, LAYOUT_VERSION, metadata).unwrap();
-        assert!(matches!(
-            decode(&key, bytes),
-            Err(DecodeRefusal::Row { index: 0, reason }) if reason.contains("partly null")
-        ));
+        let file = |closed: Option<i64>, high: Option<i128>| {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(vec!["AAPL"])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_790_947_800_000_000])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(Decimal128Array::from(vec![1_000_000]).with_data_type(SHARES_TYPE)),
+                Arc::new(
+                    Decimal128Array::from(vec![100_000_000_000_000])
+                        .with_data_type(DOLLAR_VOLUME_TYPE),
+                ),
+                Arc::new(TimestampNanosecondArray::from(vec![opened]).with_timezone("UTC")),
+                price(Some(100_000_000)),
+                Arc::new(TimestampNanosecondArray::from(vec![closed]).with_timezone("UTC")),
+                price(Some(100_000_000)),
+                price(high),
+                price(Some(1)),
+            ];
+            parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata()).unwrap()
+        };
+        assert_eq!(
+            decode(&key, file(None, Some(2))).map(|_| ()),
+            Err(DecodeRefusal::Row {
+                index: 0,
+                cause: RowCause::PartlyNull {
+                    null: vec!["closed_at".to_string()]
+                },
+            })
+        );
+        assert_eq!(
+            decode(&key, file(opened, Some(0))).map(|_| ()),
+            Err(DecodeRefusal::Row {
+                index: 0,
+                cause: RowCause::Price(PriceRefusal::OutOfRange { ticks: 0 }),
+            })
+        );
+        assert!(decode(&key, file(opened, Some(2))).is_ok());
     }
 
     proptest::proptest! {

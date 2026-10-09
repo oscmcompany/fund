@@ -289,6 +289,20 @@ pub enum OpenCloseRefusal {
     },
 }
 
+impl std::fmt::Display for OpenCloseRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inverted { open, close } => write!(
+                formatter,
+                "the open {} at {} orders after the close {} at {}",
+                open.1, open.0, close.1, close.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpenCloseRefusal {}
+
 impl OpenClose {
     pub fn new(
         open: (DateTime<Utc>, Price),
@@ -338,6 +352,18 @@ pub struct HighLow {
 pub enum HighLowRefusal {
     Inverted { high: Price, low: Price },
 }
+
+impl std::fmt::Display for HighLowRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inverted { high, low } => {
+                write!(formatter, "the high {high} is below the low {low}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HighLowRefusal {}
 
 impl HighLow {
     pub fn new(high: Price, low: Price) -> Result<Self, HighLowRefusal> {
@@ -453,6 +479,19 @@ pub enum TradeBarRefusal {
     },
 }
 
+impl std::fmt::Display for TradeBarRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Misaligned {
+                interval,
+                timestamp,
+            } => write!(formatter, "{timestamp} does not end a {interval} bar"),
+        }
+    }
+}
+
+impl std::error::Error for TradeBarRefusal {}
+
 impl TradeBar {
     pub fn new(
         symbol: Symbol,
@@ -554,6 +593,19 @@ pub struct TradeRollup(BTreeMap<(Symbol, BarInterval, DateTime<Utc>), TradeSums>
 pub enum TradeRollupRefusal {
     Finer { from: BarInterval, to: BarInterval },
 }
+
+impl std::fmt::Display for TradeRollupRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Finer { from, to } => write!(
+                formatter,
+                "a {from} trade bar cannot roll up into the finer {to}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TradeRollupRefusal {}
 
 impl TradeRollup {
     /// The fragment `bar` contributes to the `interval` bar containing it.

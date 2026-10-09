@@ -35,6 +35,20 @@ pub enum VolumeDepthRefusal {
     BeyondRetained { depth: usize },
 }
 
+impl std::fmt::Display for VolumeDepthRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("a depth of zero bars"),
+            Self::BeyondRetained { depth } => write!(
+                formatter,
+                "a depth of {depth} bars is past the {RETAINED_BARS} retained"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VolumeDepthRefusal {}
+
 impl VolumeDepth {
     pub fn new(depth: usize) -> Result<Self, VolumeDepthRefusal> {
         match NonZeroUsize::new(depth) {
@@ -57,6 +71,23 @@ pub enum RollingVolumeRefusal {
     /// The latest `depth` volumes sum past what `Shares` holds.
     BeyondRange { depth: usize },
 }
+
+impl std::fmt::Display for RollingVolumeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShortOfDepth { held } => write!(
+                formatter,
+                "the series holds {held} bars, fewer than the depth"
+            ),
+            Self::BeyondRange { depth } => write!(
+                formatter,
+                "the latest {depth} volumes sum past what a share count holds"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RollingVolumeRefusal {}
 
 /// What one bar leaves in the state; ordered so a repeated timestamp keeps the greater and the combine commutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
