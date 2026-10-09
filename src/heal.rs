@@ -793,7 +793,7 @@ async fn write_conditions(
     );
     let body =
         encode_conditions(&key, &conditions, &provenance).map_err(EncodeRefusal::Reference)?;
-    put(&key.clone().into(), body).await?;
+    put(&key.into(), body).await?;
     let written = ConditionsWritten::new(
         key.as_of(),
         u64::try_from(conditions.conditions().len())
