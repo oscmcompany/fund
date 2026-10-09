@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
 use crate::common::laboratory::permutation::Generator;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
-use crate::common::monoid::{Monoid, concatenate};
 use crate::common::time::SessionDate;
 
 /// The measured count, mean and summed squared deviations, with the unmeasured counted beside them.
@@ -22,41 +21,29 @@ pub struct Summary {
 }
 
 impl Summary {
+    pub const EMPTY: Self = Self {
+        measured: 0,
+        undefined: 0,
+        mean: 0.0,
+        squared_deviations: 0.0,
+    };
+
     fn of(reading: Option<f64>) -> Self {
         match reading {
             Some(value) => Self {
                 measured: 1,
                 mean: value,
-                ..Self::empty()
+                ..Self::EMPTY
             },
             None => Self {
                 undefined: 1,
-                ..Self::empty()
+                ..Self::EMPTY
             },
         }
     }
 
-    pub fn measured(self) -> u64 {
-        self.measured
-    }
-
-    pub fn undefined(self) -> u64 {
-        self.undefined
-    }
-}
-
-impl Monoid for Summary {
-    fn empty() -> Self {
-        Self {
-            measured: 0,
-            undefined: 0,
-            mean: 0.0,
-            squared_deviations: 0.0,
-        }
-    }
-
-    /// Chan's pairwise update: associative up to rounding, and exact against `empty`.
-    fn combine(self, other: Self) -> Self {
+    /// Chan's pairwise update: associative up to rounding, and exact against `EMPTY`.
+    pub fn combine(self, other: Self) -> Self {
         let undefined = self.undefined + other.undefined;
         match (self.measured, other.measured) {
             (0, _) => Self { undefined, ..other },
@@ -76,15 +63,22 @@ impl Monoid for Summary {
             }
         }
     }
+
+    pub fn measured(self) -> u64 {
+        self.measured
+    }
+
+    pub fn undefined(self) -> u64 {
+        self.undefined
+    }
 }
 
 pub fn summarize(series: &Series) -> Summary {
-    concatenate(
-        series
-            .readings()
-            .values()
-            .map(|reading| Summary::of(*reading)),
-    )
+    series
+        .readings()
+        .values()
+        .map(|reading| Summary::of(*reading))
+        .fold(Summary::EMPTY, Summary::combine)
 }
 
 /// A mean with its sample, its standard error (zero where the readings never varied) and the freedom it was taken on.
@@ -861,8 +855,8 @@ mod tests {
     proptest! {
         #[test]
         fn test_empty_is_the_identity_of_combine(summary in any_summary()) {
-            prop_assert_eq!(Summary::empty().combine(summary), summary);
-            prop_assert_eq!(summary.combine(Summary::empty()), summary);
+            prop_assert_eq!(Summary::EMPTY.combine(summary), summary);
+            prop_assert_eq!(summary.combine(Summary::EMPTY), summary);
         }
 
         /// Exact on the counts, and on the moments up to the rounding Chan's update carries.
