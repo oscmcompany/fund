@@ -136,6 +136,10 @@ impl SessionBars {
         &self.bars
     }
 
+    pub fn into_bars(self) -> Vec<Bar> {
+        self.bars
+    }
+
     pub fn test_tickers(&self) -> &[String] {
         &self.test_tickers
     }

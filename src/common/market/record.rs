@@ -253,6 +253,48 @@ impl Bar {
     }
 }
 
+/// Bars to write or read as one partition, at least one, since a partition written empty would mark its session
+/// held with nothing in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarPartition(Vec<Bar>);
+
+/// Why bars were refused as a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarPartitionRefusal {
+    Empty,
+}
+
+impl std::fmt::Display for BarPartitionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "a partition holds no bars"),
+        }
+    }
+}
+
+impl std::error::Error for BarPartitionRefusal {}
+
+impl TryFrom<Vec<Bar>> for BarPartition {
+    type Error = BarPartitionRefusal;
+
+    fn try_from(bars: Vec<Bar>) -> Result<Self, Self::Error> {
+        match bars.is_empty() {
+            true => Err(BarPartitionRefusal::Empty),
+            false => Ok(Self(bars)),
+        }
+    }
+}
+
+impl BarPartition {
+    pub fn bars(&self) -> &[Bar] {
+        &self.0
+    }
+
+    pub fn into_bars(self) -> Vec<Bar> {
+        self.0
+    }
+}
+
 /// A top-of-book quote in shares; a locked book is a quote, a crossed one is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quote {
@@ -610,6 +652,14 @@ mod tests {
         };
         assert_eq!(trade(0), Err(TradeRefusal::NoShares { price: price(10.0) }));
         assert_eq!(trade(1).unwrap().size(), Shares::whole(1).unwrap());
+    }
+
+    #[test]
+    fn test_an_empty_partition_is_refused() {
+        assert_eq!(
+            BarPartition::try_from(Vec::new()),
+            Err(BarPartitionRefusal::Empty)
+        );
     }
 
     proptest! {
