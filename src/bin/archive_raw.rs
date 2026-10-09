@@ -23,7 +23,9 @@ use fund::common::market::quote_bars::QuoteFold;
 use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold};
 use fund::common::monoid::{Monoid, Tally};
-use fund::common::storage::{Key, Origin, Provider};
+use fund::common::storage::{
+    BarsKey, Family, Key, Origin, ParsedKey, Provider, QuotesKey, TradesKey,
+};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::RowRefusalKind;
@@ -309,7 +311,7 @@ async fn copy(
         owed = owed.len(),
         owed_bytes = owed.iter().map(|listed| listed.length()).sum::<u64>(),
         concurrency,
-        series = dataset.key(range.first()).series(),
+        series = %dataset.key(range.first()).series(),
         "Planned a raw copy"
     );
     let permits = Arc::new(Semaphore::new(concurrency));
@@ -457,13 +459,9 @@ async fn parse_bars(
         }
         BarFile::Daily | BarFile::Minute => {}
     }
-    let bars_key = move |session| Key::Bars {
-        provider: Provider::Massive,
-        origin: Origin::Vendor,
-        interval,
-        session,
-    };
-    let series = bars_key(range.first()).series();
+    let bars_key =
+        move |session| BarsKey::new(Provider::Massive, Origin::Vendor, interval, session);
+    let series = Key::from(bars_key(range.first())).series();
     let (raw, parsed) = match (held(&archive, dataset).await, archive.list(&series).await) {
         (Ok(raw), Ok(parsed)) => (
             raw,
@@ -495,7 +493,7 @@ async fn parse_bars(
         already_held_sessions = listed(&already),
         owed = owed.len(),
         concurrency,
-        series,
+        %series,
         "Planned a raw parse"
     );
     let mut tasks = JoinSet::new();
@@ -512,7 +510,7 @@ async fn parse_bars(
         let key = bars_key(session);
         tasks.spawn(
             async move {
-                let outcome = parse_one(&archive, file, &key, run_id, commit).await;
+                let outcome = parse_one(&archive, file, key, run_id, commit).await;
                 match &outcome {
                     Ok(()) => {}
                     Err(failure) => {
@@ -589,7 +587,7 @@ fn listed(sessions: &[SessionDate]) -> String {
 async fn parse_one(
     archive: &Archive,
     file: BarFile,
-    key: &Key,
+    key: BarsKey,
     run_id: RunId,
     commit: Option<Commit>,
 ) -> Result<(), ParseFailure> {
@@ -608,7 +606,6 @@ async fn parse_one(
         .map_err(ParseFailure::Archive)?
         .ok_or(ParseFailure::Missing)?;
     let provenance = Provenance::new(Subscription::StocksAdvanced, fetched_at, run_id, commit);
-    let encoded_key = key.clone();
     // Decompressing, parsing and encoding a minute file is seconds of CPU, which belongs off the async workers.
     let (parsed, body) = tokio::task::spawn_blocking(move || {
         let parsed = file
@@ -620,14 +617,13 @@ async fn parse_one(
                 refused: parsed.refused().len(),
             });
         }
-        let body =
-            encode(&encoded_key, parsed.bars(), &provenance).map_err(ParseFailure::Encode)?;
+        let body = encode(&key, parsed.bars(), &provenance).map_err(ParseFailure::Encode)?;
         Ok((parsed, body))
     })
     .await
     .map_err(|error| ParseFailure::Interrupted(error.to_string()))??;
     archive
-        .create(key, body)
+        .create(&key.into(), body)
         .await
         .map_err(ParseFailure::Archive)?;
     tracing::info!(
@@ -641,14 +637,9 @@ async fn parse_one(
     Ok(())
 }
 
-/// Where a session's quote bars at `interval` are written.
-fn quote_key(interval: BarInterval, session: SessionDate) -> Key {
-    Key::Quotes {
-        provider: Provider::Massive,
-        origin: Origin::Derived,
-        interval,
-        session,
-    }
+/// Where a session's quote or trade bars folded from Massive's flat files at `interval` are written.
+fn massive_derived<F: Family>(interval: BarInterval, session: SessionDate) -> ParsedKey<F> {
+    ParsedKey::new(Provider::Massive, Origin::Derived, interval, session)
 }
 
 /// The flat files to stream and the calendar to plan by, or `None` once the refusal is logged.
@@ -838,13 +829,13 @@ async fn fold_quotes(
             return ExitCode::FAILURE;
         }
     };
-    let daily = quote_key(BarInterval::OneDay, range.first());
+    let daily: QuotesKey = massive_derived(BarInterval::OneDay, range.first());
     fold_sessions(
         archive,
         flat_files,
         &calendar,
         FlatFileDataset::Quotes,
-        daily,
+        daily.into(),
         range,
         concurrency,
         "quote",
@@ -897,10 +888,10 @@ async fn fold_quotes_one(
     let files = session_bars(minutes);
     let symbols = files[2].1.len();
     for (interval, bars) in files {
-        let key = quote_key(interval, session);
+        let key = massive_derived(interval, session);
         let body = quote_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
-        create_or_confirm(archive, &key, body, |held| {
+        create_or_confirm(archive, &key.into(), body, |held| {
             quote_bars::decode(&key, held).map(|(held, _)| held == bars)
         })
         .await?;
@@ -979,15 +970,16 @@ async fn fetch_conditions(
         }
     };
     let key = reference::conditions_key(SessionDate::at(fetched_at));
+    let object = Key::from(key);
     let provenance = Provenance::new(Subscription::StocksStarter, fetched_at, run_id, commit);
     let written = reference::encode_conditions(&key, &conditions, &provenance)
         .map_err(EncodeRefusal::Reference)
-        .map(|body| archive.create(&key, body));
+        .map(|body| archive.create(&object, body));
     match written {
         Ok(write) => match write.await {
             Ok(()) => {
                 tracing::info!(
-                    path = key.path(),
+                    path = object.path(),
                     codes = conditions.conditions().len(),
                     "Wrote the conditions table"
                 );
@@ -1002,16 +994,6 @@ async fn fetch_conditions(
             tracing::error!(%refusal, "Conditions table not encoded");
             ExitCode::FAILURE
         }
-    }
-}
-
-/// Where a session's trade bars at `interval` are written.
-fn trade_key(interval: BarInterval, session: SessionDate) -> Key {
-    Key::Trades {
-        provider: Provider::Massive,
-        origin: Origin::Derived,
-        interval,
-        session,
     }
 }
 
@@ -1034,7 +1016,7 @@ async fn fold_trades(
         }
     };
     tracing::info!(
-        conditions = conditions_key.path(),
+        conditions = Key::from(conditions_key).path(),
         codes = conditions.conditions().len(),
         "Read the conditions table"
     );
@@ -1045,13 +1027,13 @@ async fn fold_trades(
             return ExitCode::FAILURE;
         }
     };
-    let daily = trade_key(BarInterval::OneDay, range.first());
+    let daily: TradesKey = massive_derived(BarInterval::OneDay, range.first());
     fold_sessions(
         archive,
         flat_files,
         &calendar,
         FlatFileDataset::Trades,
-        daily,
+        daily.into(),
         range,
         concurrency,
         "trade",
@@ -1105,10 +1087,10 @@ async fn fold_trades_one(
     let files = session_bars(minutes);
     let symbols = files[2].1.len();
     for (interval, bars) in files {
-        let key = trade_key(interval, session);
+        let key = massive_derived(interval, session);
         let body = trade_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
-        create_or_confirm(archive, &key, body, |held| {
+        create_or_confirm(archive, &key.into(), body, |held| {
             trade_bars::decode(&key, held).map(|(held, _)| held == bars)
         })
         .await?;
@@ -1133,13 +1115,8 @@ async fn fold_trades_one(
 }
 
 /// Massive's bars at `interval` and `origin` for a session.
-fn massive_bars_key(origin: Origin, interval: BarInterval, session: SessionDate) -> Key {
-    Key::Bars {
-        provider: Provider::Massive,
-        origin,
-        interval,
-        session,
-    }
+fn massive_bars_key(origin: Origin, interval: BarInterval, session: SessionDate) -> BarsKey {
+    BarsKey::new(Provider::Massive, origin, interval, session)
 }
 
 /// Why a session's minutes were not rolled up.
@@ -1171,7 +1148,7 @@ async fn roll_up(archive: Archive, range: SessionRange, concurrency: usize) -> E
         let archive = archive.clone();
         async move {
             archive
-                .list(&massive_bars_key(origin, interval, range.first()).series())
+                .list(&Key::from(massive_bars_key(origin, interval, range.first())).series())
                 .await
                 .map(|paths| {
                     paths
@@ -1254,25 +1231,23 @@ async fn roll_up(archive: Archive, range: SessionRange, concurrency: usize) -> E
 async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, RollUpFailure> {
     let minute_key = massive_bars_key(Origin::Vendor, BarInterval::OneMinute, session);
     let bytes = archive
-        .get(&minute_key)
+        .get(&minute_key.into())
         .await
         .map_err(RollUpFailure::Archive)?
         .ok_or(RollUpFailure::Missing)?;
     let key = massive_bars_key(Origin::Derived, BarInterval::FiveMinute, session);
-    let encoded_key = key.clone();
     let (count, body) = tokio::task::spawn_blocking(move || {
         let (minutes, provenance) =
             bars::decode(&minute_key, bytes).map_err(RollUpFailure::Decode)?;
         let five_minutes = aggregate::roll_up(&minutes, BarInterval::FiveMinute)
             .expect("minutes roll up to five minutes");
-        let body = bars::encode(&encoded_key, &five_minutes, &provenance)
-            .map_err(RollUpFailure::Encode)?;
+        let body = bars::encode(&key, &five_minutes, &provenance).map_err(RollUpFailure::Encode)?;
         Ok::<_, RollUpFailure>((five_minutes.len(), body))
     })
     .await
     .map_err(|error| RollUpFailure::Interrupted(error.to_string()))??;
     archive
-        .create(&key, body)
+        .create(&key.into(), body)
         .await
         .map_err(RollUpFailure::Archive)?;
     Ok(count)

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::archive::bars::{DecodeRefusal, decode};
 use crate::archive::{Archive, ArchiveError, Tag};
-use crate::common::heal::Leg;
+use crate::common::heal::massive_daily_bars;
 use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{
     Contamination, DatasetLeg, Fingerprint, FingerprintRefusal,
@@ -143,9 +143,9 @@ async fn partition(
 ) -> Result<Option<(Vec<Bar>, Tag)>, DatasetError> {
     match leg {
         DatasetLeg::MassiveDailyBars => {
-            let key = Leg::MassiveDailyBars.key(session);
+            let key = massive_daily_bars(session);
             let Some((body, tag)) = archive
-                .get_tagged(&key)
+                .get_tagged(&key.into())
                 .await
                 .map_err(DatasetError::Archive)?
             else {
@@ -168,7 +168,7 @@ pub async fn lineage(
     for session in fingerprint.partitions().keys() {
         let tag = match fingerprint.leg() {
             DatasetLeg::MassiveDailyBars => {
-                archive.tag(&Leg::MassiveDailyBars.key(*session)).await?
+                archive.tag(&massive_daily_bars(*session).into()).await?
             }
             // Never looked up, so every partition such a read held is reported gone.
             DatasetLeg::LegacyDailyBars => None,
@@ -197,7 +197,7 @@ pub(crate) mod tests {
     use crate::common::laboratory::experiment::{Label, Outputs, Parameters};
     use crate::common::market::record::{BarInterval, BarPrices};
     use crate::common::market::{Price, Shares, Symbol};
-    use crate::common::storage::{Host, Key};
+    use crate::common::storage::{Host, JournalKey};
     use crate::common::time::calendar::TradingSession;
     use crate::ingest::alpaca::Alpaca;
 
@@ -334,10 +334,7 @@ pub(crate) mod tests {
             ReadLine::Read(record) => record.session(),
             ReadLine::Unreadable { .. } => unreachable!("every line read above"),
         };
-        let key = Key::Journal {
-            host: Host::Researcher,
-            session,
-        };
+        let key = JournalKey::new(Host::Researcher, session);
         let encoded = crate::archive::journal::encode(&key, &lines).unwrap();
         assert_eq!(
             crate::archive::journal::decode(&key, encoded).unwrap(),

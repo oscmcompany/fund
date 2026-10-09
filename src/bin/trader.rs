@@ -27,7 +27,7 @@ use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
 use fund::common::playbook::{Playbook, PlaybookRead, Played};
-use fund::common::storage::{Host, Key, Origin, Provider, Service};
+use fund::common::storage::{Host, Key, Origin, Provider, Service, TradesKey};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::alpaca::Alpaca;
@@ -362,17 +362,17 @@ async fn previous_bars(
     let previous = calendar
         .previous_trading_day(today)
         .ok_or_else(|| format!("no trading day in the {CALENDAR_DAYS_BACK} days before {today}"))?;
-    let key = Key::Trades {
-        provider: Provider::Alpaca,
-        origin: Origin::Derived,
-        interval: BarInterval::OneMinute,
-        session: previous,
-    };
+    let key = TradesKey::new(
+        Provider::Alpaca,
+        Origin::Derived,
+        BarInterval::OneMinute,
+        previous,
+    );
     let bytes = archive
-        .get(&key)
+        .get(&key.into())
         .await
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("{} is not archived", key.path()))?;
+        .ok_or_else(|| format!("{} is not archived", Key::from(key).path()))?;
     let (bars, _) = decode(&key, bytes).map_err(|refusal| format!("{refusal:?}"))?;
     let bars: Vec<_> = bars
         .into_iter()

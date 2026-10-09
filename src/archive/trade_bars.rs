@@ -17,11 +17,9 @@ use chrono::{DateTime, Utc};
 use super::bars::{Provenance, provenance_from};
 use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 use crate::common::market::aggregate::TradeTotals;
-use crate::common::market::record::BarInterval;
 use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
 use crate::common::market::{DollarVolume, Shares, StampedPrice, Symbol, TradeCount};
-use crate::common::storage::{Key, Provider};
-use crate::common::time::SessionDate;
+use crate::common::storage::{Provider, TradesKey};
 
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
@@ -33,7 +31,6 @@ const DOLLAR_VOLUME_TYPE: DataType = DataType::Decimal128(38, 12);
 /// Why trade bars were not written under a key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeRefusal {
-    NotATradesKey,
     SubscriptionProvider {
         provenance: Provenance,
         key: Provider,
@@ -51,7 +48,6 @@ pub enum EncodeRefusal {
 /// Why a file was not read as trade bars.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
-    NotATradesKey,
     File(ReadRefusal),
     Row {
         index: usize,
@@ -66,25 +62,6 @@ pub enum DecodeRefusal {
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
-    }
-}
-
-fn trades_key(key: &Key) -> Option<(Provider, BarInterval, SessionDate)> {
-    match key {
-        Key::Trades {
-            provider,
-            interval,
-            session,
-            ..
-        } => Some((*provider, *interval, *session)),
-        Key::Bars { .. }
-        | Key::Quotes { .. }
-        | Key::Reference { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Journal { .. }
-        | Key::Logs { .. } => None,
     }
 }
 
@@ -118,11 +95,11 @@ fn schema() -> Schema {
 
 /// The file for `key`, rows ordered by symbol and then timestamp so the same bars always make the same bytes.
 pub fn encode(
-    key: &Key,
+    key: &TradesKey,
     bars: &[TradeBar],
     provenance: &Provenance,
 ) -> Result<Vec<u8>, EncodeRefusal> {
-    let (provider, interval, session) = trades_key(key).ok_or(EncodeRefusal::NotATradesKey)?;
+    let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     if provenance.subscription().provider() != provider {
         return Err(EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
@@ -197,8 +174,11 @@ pub fn encode(
 }
 
 /// The trade bars and provenance a file written by `encode` under `key` holds, each rebuilt through `TradeBar::new`.
-pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<TradeBar>, Provenance), DecodeRefusal> {
-    let (provider, interval, session) = trades_key(key).ok_or(DecodeRefusal::NotATradesKey)?;
+pub fn decode(
+    key: &TradesKey,
+    bytes: Vec<u8>,
+) -> Result<(Vec<TradeBar>, Provenance), DecodeRefusal> {
+    let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
@@ -281,6 +261,7 @@ mod tests {
     use super::*;
     use crate::archive::bars::Subscription;
     use crate::common::journal::RunId;
+    use crate::common::market::record::BarInterval;
     use crate::common::market::record::Trade;
     use crate::common::market::trade_bars::{
         Condition, ConditionCode, ConditionStatus, Correction, Print, TradeConditions, TradeFold,
@@ -288,16 +269,17 @@ mod tests {
     };
     use crate::common::market::{Price, PriceRefusal};
     use crate::common::storage::Origin;
+    use crate::common::time::SessionDate;
 
     #[test]
     fn test_trade_bars_read_back_exactly_with_their_missing_prices() {
         let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
-        let key = Key::Trades {
-            provider: Provider::Massive,
-            origin: Origin::Derived,
-            interval: BarInterval::OneMinute,
+        let key = TradesKey::new(
+            Provider::Massive,
+            Origin::Derived,
+            BarInterval::OneMinute,
             session,
-        };
+        );
         let mut fold = TradeFold::new(
             session,
             TradeConditions::new(BTreeMap::from([(
@@ -346,12 +328,12 @@ mod tests {
     #[test]
     fn test_a_row_is_refused_with_its_typed_cause() {
         let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
-        let key = Key::Trades {
-            provider: Provider::Massive,
-            origin: Origin::Derived,
-            interval: BarInterval::OneMinute,
+        let key = TradesKey::new(
+            Provider::Massive,
+            Origin::Derived,
+            BarInterval::OneMinute,
             session,
-        };
+        );
         let provenance = Provenance::new(
             Subscription::StocksAdvanced,
             "2026-10-03T07:00:00Z".parse().unwrap(),
@@ -450,7 +432,7 @@ mod tests {
                     Some(TradeBar::new(Symbol::new(symbol).unwrap(), interval, timestamp, TradeSums::new(totals, open_close, high_low)).unwrap())
                 })
                 .collect();
-            let key = Key::Trades { provider: Provider::Massive, origin: Origin::Derived, interval, session };
+            let key = TradesKey::new(Provider::Massive, Origin::Derived, interval, session);
             let provenance = Provenance::new(
                 Subscription::StocksAdvanced,
                 "2026-10-03T07:00:00Z".parse().unwrap(),

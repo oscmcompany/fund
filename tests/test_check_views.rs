@@ -7,7 +7,10 @@ use std::process::Command;
 use chrono::NaiveDate;
 use fund::common::heal::Leg;
 use fund::common::market::record::BarInterval;
-use fund::common::storage::{Host, Key, Origin, Provider, ReferenceTable, Service};
+use fund::common::storage::{
+    BarsKey, Host, JournalKey, Key, LogsKey, Origin, Provider, QuotesKey, ReferenceKey,
+    ReferenceTable, Service, TradesKey,
+};
 use fund::common::time::SessionDate;
 use strum::IntoEnumIterator;
 
@@ -365,12 +368,8 @@ fn macro_series() -> Vec<(String, String)> {
 /// Every parsed archive series the views cover, built from its parts.
 fn archive_keys() -> Vec<Key> {
     let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 8).unwrap());
-    let bars = |provider, origin, interval| Key::Bars {
-        provider,
-        origin,
-        interval,
-        session,
-    };
+    let bars =
+        |provider, origin, interval| Key::from(BarsKey::new(provider, origin, interval, session));
     let mut keys = vec![
         bars(Provider::Alpaca, Origin::Vendor, BarInterval::OneMinute),
         bars(Provider::Massive, Origin::Vendor, BarInterval::OneMinute),
@@ -379,18 +378,8 @@ fn archive_keys() -> Vec<Key> {
     ];
     for provider in [Provider::Alpaca, Provider::Massive] {
         for interval in BarInterval::iter() {
-            keys.push(Key::Quotes {
-                provider,
-                origin: Origin::Derived,
-                interval,
-                session,
-            });
-            keys.push(Key::Trades {
-                provider,
-                origin: Origin::Derived,
-                interval,
-                session,
-            });
+            keys.push(QuotesKey::new(provider, Origin::Derived, interval, session).into());
+            keys.push(TradesKey::new(provider, Origin::Derived, interval, session).into());
         }
     }
     for (provider, table) in [
@@ -399,11 +388,7 @@ fn archive_keys() -> Vec<Key> {
         (Provider::Massive, ReferenceTable::Splits),
         (Provider::Alpaca, ReferenceTable::SeriesBoundaries),
     ] {
-        keys.push(Key::Reference {
-            provider,
-            table,
-            as_of: session,
-        });
+        keys.push(ReferenceKey::new(provider, table, session).into());
     }
     keys
 }
@@ -429,12 +414,8 @@ fn test_every_series_views_sql_reads_is_a_key_series() {
     let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 8).unwrap());
     let mut keys = archive_keys();
     for host in Host::iter() {
-        keys.push(Key::Journal { host, session });
-        keys.push(Key::Logs {
-            host,
-            service: Service::new("archive_nightly").unwrap(),
-            session,
-        });
+        keys.push(JournalKey::new(host, session).into());
+        keys.push(LogsKey::new(host, Service::new("archive_nightly").unwrap(), session).into());
     }
     let called = macro_series();
     // 20 archive views, `journal`, `logs`, `experiments`, and `bar_seam`'s two reads.
@@ -447,7 +428,7 @@ fn test_every_series_views_sql_reads_is_a_key_series() {
         };
         assert_eq!(bucket, expected_bucket, "{series}");
         assert!(
-            keys.iter().any(|key| names(series, &key.series())),
+            keys.iter().any(|key| names(series, key.series().as_str())),
             "no key writes {series}"
         );
     }
@@ -463,7 +444,7 @@ fn test_every_archive_series_the_nightly_writes_has_a_view() {
         .collect();
     for key in &archive {
         assert!(
-            read.contains(&key.series()),
+            read.contains(&key.series().to_string()),
             "no view reads {}",
             key.series()
         );
@@ -472,33 +453,19 @@ fn test_every_archive_series_the_nightly_writes_has_a_view() {
     for leg in Leg::iter() {
         let key = leg.key(session);
         let written: Vec<Key> = match key {
-            Key::Quotes {
-                provider, origin, ..
-            } => BarInterval::iter()
-                .map(|interval| Key::Quotes {
-                    provider,
-                    origin,
-                    interval,
-                    session,
-                })
+            Key::Quotes(daily) => BarInterval::iter()
+                .map(|interval| daily.at_interval(interval).into())
                 .collect(),
-            Key::Trades {
-                provider, origin, ..
-            } => BarInterval::iter()
-                .map(|interval| Key::Trades {
-                    provider,
-                    origin,
-                    interval,
-                    session,
-                })
+            Key::Trades(daily) => BarInterval::iter()
+                .map(|interval| daily.at_interval(interval).into())
                 .collect(),
-            Key::Bars { .. }
-            | Key::Reference { .. }
+            Key::Bars(..)
+            | Key::Reference(..)
             | Key::RawBars { .. }
             | Key::RawQuotes { .. }
             | Key::RawTrades { .. }
-            | Key::Journal { .. }
-            | Key::Logs { .. } => vec![key],
+            | Key::Journal(..)
+            | Key::Logs(..) => vec![key],
         };
         for key in written {
             assert!(archive.contains(&key), "{leg} writes {}", key.series());

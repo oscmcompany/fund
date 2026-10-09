@@ -13,7 +13,7 @@ pub mod trade_bars;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 
-use crate::common::storage::{Key, StorageClass};
+use crate::common::storage::{Key, SeriesPrefix, StorageClass};
 use crate::ingest::VariableRefusal;
 
 /// One S3 bucket the fund writes: the shared market data or a profile's records.
@@ -35,7 +35,7 @@ pub enum ArchiveError {
         reason: String,
     },
     List {
-        prefix: String,
+        series: SeriesPrefix,
         reason: String,
     },
     Delete {
@@ -63,7 +63,7 @@ impl std::fmt::Display for ArchiveError {
         match self {
             Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
             Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
-            Self::List { prefix, reason } => write!(formatter, "listing {prefix} failed: {reason}"),
+            Self::List { series, reason } => write!(formatter, "listing {series} failed: {reason}"),
             Self::Delete { path, reason } => write!(formatter, "deleting {path} failed: {reason}"),
             Self::Contended { path } => {
                 write!(
@@ -302,19 +302,19 @@ impl Archive {
         }
     }
 
-    /// Every path under `prefix`, across as many pages as S3 answers with.
-    pub async fn list(&self, prefix: &str) -> Result<Vec<String>, ArchiveError> {
+    /// Every path under `series`, across as many pages as S3 answers with.
+    pub async fn list(&self, series: &SeriesPrefix) -> Result<Vec<String>, ArchiveError> {
         let mut pages = self
             .s3_client
             .list_objects_v2()
             .bucket(&self.bucket_name)
-            .prefix(prefix)
+            .prefix(series.as_str())
             .into_paginator()
             .send();
         let mut paths = Vec::new();
         while let Some(page) = pages.next().await {
             let page = page.map_err(|error| ArchiveError::List {
-                prefix: prefix.to_string(),
+                series: series.clone(),
                 reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
             })?;
             paths.extend(
@@ -437,8 +437,7 @@ mod tests {
     use super::bars::{Provenance, Subscription, decode, encode};
     use super::*;
     use crate::common::journal::RunId;
-    use crate::common::market::record::BarInterval;
-    use crate::common::storage::{Origin, Provider};
+    use crate::common::storage::Provider;
     use crate::common::time::SessionDate;
     use crate::ingest::massive::Massive;
 
@@ -470,12 +469,7 @@ mod tests {
     #[ignore = "writes one real object to the shared archive bucket; run once, deliberately, under secretspec"]
     async fn live_writes_and_reads_back_one_real_key() {
         let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
-        let key = Key::Bars {
-            provider: Provider::Massive,
-            origin: Origin::Vendor,
-            interval: BarInterval::OneDay,
-            session,
-        };
+        let key = crate::common::heal::massive_daily_bars(session);
         let daily = Massive::from_environment(reqwest::Client::new())
             .unwrap()
             .grouped_daily(session)
@@ -490,9 +484,14 @@ mod tests {
         let body = encode(&key, daily.bars(), &provenance).unwrap();
         let configuration = aws_config::load_from_env().await;
         let archive = Archive::market_data(&configuration).unwrap();
-        archive.put(&key, body.clone()).await.unwrap();
-        let (bars, read) = decode(&key, archive.get(&key).await.unwrap().unwrap()).unwrap();
-        println!("{} bars, {} bytes, {}", bars.len(), body.len(), key.path());
+        archive.put(&key.into(), body.clone()).await.unwrap();
+        let (bars, read) = decode(&key, archive.get(&key.into()).await.unwrap().unwrap()).unwrap();
+        println!(
+            "{} bars, {} bytes, {}",
+            bars.len(),
+            body.len(),
+            Key::from(key).path()
+        );
         assert_eq!(bars, daily.bars());
         assert_eq!(read, provenance);
     }

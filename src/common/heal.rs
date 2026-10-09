@@ -8,7 +8,9 @@ use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::common::market::record::BarInterval;
-use crate::common::storage::{Key, KeyRefusal, Origin, Provider, ReferenceTable};
+use crate::common::storage::{
+    BarsKey, Key, KeyRefusal, Origin, Provider, QuotesKey, ReferenceKey, ReferenceTable, TradesKey,
+};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 
@@ -47,45 +49,13 @@ impl Leg {
     /// The key whose presence means the session is held.
     pub fn key(self, session: SessionDate) -> Key {
         match self {
-            Self::MassiveDailyBars => Key::Bars {
-                provider: Provider::Massive,
-                origin: Origin::Vendor,
-                interval: BarInterval::OneDay,
-                session,
-            },
-            Self::AlpacaMinuteBars => Key::Bars {
-                provider: Provider::Alpaca,
-                origin: Origin::Vendor,
-                interval: BarInterval::OneMinute,
-                session,
-            },
-            Self::AlpacaQuotes => Key::Quotes {
-                provider: Provider::Alpaca,
-                origin: Origin::Derived,
-                interval: BarInterval::OneDay,
-                session,
-            },
-            Self::AlpacaTrades => Key::Trades {
-                provider: Provider::Alpaca,
-                origin: Origin::Derived,
-                interval: BarInterval::OneDay,
-                session,
-            },
-            Self::MassiveSecurityDetails => Key::Reference {
-                provider: Provider::Massive,
-                table: ReferenceTable::SecurityDetails,
-                as_of: session,
-            },
-            Self::MassiveSplits => Key::Reference {
-                provider: Provider::Massive,
-                table: ReferenceTable::Splits,
-                as_of: session,
-            },
-            Self::AlpacaSeriesBoundaries => Key::Reference {
-                provider: Provider::Alpaca,
-                table: ReferenceTable::SeriesBoundaries,
-                as_of: session,
-            },
+            Self::MassiveDailyBars => massive_daily_bars(session).into(),
+            Self::AlpacaMinuteBars => alpaca_minute_bars(session).into(),
+            Self::AlpacaQuotes => alpaca_quotes(session).into(),
+            Self::AlpacaTrades => alpaca_trades(session).into(),
+            Self::MassiveSecurityDetails => massive_security_details(session).into(),
+            Self::MassiveSplits => massive_splits(session).into(),
+            Self::AlpacaSeriesBoundaries => alpaca_series_boundaries(session).into(),
         }
     }
 
@@ -109,6 +79,57 @@ impl Leg {
             }
         }
     }
+}
+
+/// Massive's daily bars, the session's symbol list.
+pub fn massive_daily_bars(session: SessionDate) -> BarsKey {
+    BarsKey::new(
+        Provider::Massive,
+        Origin::Vendor,
+        BarInterval::OneDay,
+        session,
+    )
+}
+
+pub fn alpaca_minute_bars(session: SessionDate) -> BarsKey {
+    BarsKey::new(
+        Provider::Alpaca,
+        Origin::Vendor,
+        BarInterval::OneMinute,
+        session,
+    )
+}
+
+/// Alpaca's daily quote bars; the leg writes the series' other intervals beside them.
+pub fn alpaca_quotes(session: SessionDate) -> QuotesKey {
+    QuotesKey::new(
+        Provider::Alpaca,
+        Origin::Derived,
+        BarInterval::OneDay,
+        session,
+    )
+}
+
+/// Alpaca's daily trade bars; the leg writes the series' other intervals beside them.
+pub fn alpaca_trades(session: SessionDate) -> TradesKey {
+    TradesKey::new(
+        Provider::Alpaca,
+        Origin::Derived,
+        BarInterval::OneDay,
+        session,
+    )
+}
+
+pub fn massive_security_details(session: SessionDate) -> ReferenceKey {
+    ReferenceKey::new(Provider::Massive, ReferenceTable::SecurityDetails, session)
+}
+
+pub fn massive_splits(session: SessionDate) -> ReferenceKey {
+    ReferenceKey::new(Provider::Massive, ReferenceTable::Splits, session)
+}
+
+pub fn alpaca_series_boundaries(session: SessionDate) -> ReferenceKey {
+    ReferenceKey::new(Provider::Alpaca, ReferenceTable::SeriesBoundaries, session)
 }
 
 /// Why a leg's sessions could not be read off the calendar.
@@ -600,7 +621,7 @@ mod tests {
     #[test]
     fn test_each_leg_has_its_series() {
         let series: Vec<String> = Leg::iter()
-            .map(|leg| leg.key(date("2026-09-29")).series())
+            .map(|leg| leg.key(date("2026-09-29")).series().to_string())
             .collect();
         assert_eq!(
             series,
