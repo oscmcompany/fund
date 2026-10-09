@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, ValuationRefusal};
 use crate::common::market::{Price, Shares, Symbol};
+use crate::common::playbook::Stretch;
 use crate::common::strategy::Target;
 use crate::common::time::calendar::SessionPhase;
 
@@ -101,11 +102,14 @@ impl Restrained {
     }
 }
 
-/// A decision as journaled: the strategy's target and what risk made of it, or why risk could not price it.
+/// A decision as journaled: the playbook stretch that decided, the strategy's target and what risk made of it, or why
+/// risk could not price it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetDecided {
     /// The end of the decision bar decided at; a bar missed by a late call has no record of its own.
     bar: DateTime<Utc>,
+    /// `None` when the state had no clock, so no stretch decided.
+    stretch: Option<Stretch>,
     wanted: Target,
     #[serde(flatten)]
     decision: Decision,
@@ -122,6 +126,7 @@ enum Decision {
 impl TargetDecided {
     pub fn new(
         bar: DateTime<Utc>,
+        stretch: Option<Stretch>,
         wanted: Target,
         restrained: Result<Restrained, ValuationRefusal>,
     ) -> Self {
@@ -131,6 +136,7 @@ impl TargetDecided {
         };
         Self {
             bar,
+            stretch,
             wanted,
             decision,
         }

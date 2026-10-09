@@ -14,6 +14,7 @@ use crate::common::market::trade_bars::{BarBuilt, TradeBar, TradeConditions, Tra
 use crate::common::market::{Price, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::order::BrokerFailure;
+use crate::common::playbook::Played;
 use crate::common::reconcile::rounding_allowance;
 use crate::common::risk::{Limits, TargetDecided, risk};
 use crate::common::standing::{
@@ -117,7 +118,7 @@ pub enum SessionError {
 
 /// One session's trading state; `observe` folds the tape in and `advance` moves the session to an instant.
 pub struct Session<S: Strategy> {
-    strategy: S,
+    strategy: Played<S>,
     settings: SessionSettings,
     calendar: TradingCalendar,
     fold: TradeFold,
@@ -171,7 +172,7 @@ impl<S: Strategy> Session<S> {
         reason = "each is one independent input a session starts from"
     )]
     pub fn new(
-        strategy: S,
+        strategy: Played<S>,
         settings: SessionSettings,
         calendar: TradingCalendar,
         session: SessionDate,
@@ -302,7 +303,8 @@ impl<S: Strategy> Session<S> {
             |symbol| self.fresh_price(symbol, now),
             wanted.clone(),
         );
-        let decided = TargetDecided::new(bar, wanted, restrained.clone());
+        let stretch = self.strategy.stretch_at(&self.state);
+        let decided = TargetDecided::new(bar, stretch, wanted, restrained.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
             self.halt(journal, journal_refused(&error));
             return Err(SessionError::Journal(JournalFailed {
@@ -312,7 +314,7 @@ impl<S: Strategy> Session<S> {
         }
         let restrained = match restrained {
             Ok(restrained) => restrained,
-            // An unpriced exposure cannot be capped, so the book is left as it stands until the price returns.
+            // An unpriced exposure cannot be capped, so the book is left as it stands; the refusal is journaled above.
             Err(_) => return Ok(()),
         };
         let prices: BTreeMap<Symbol, Price> = self
@@ -644,7 +646,7 @@ mod tests {
             SessionSettings::new(DecisionInterval::FiveMinute, limits, patience, stale_after)
                 .unwrap();
         let mut session = Session::new(
-            OneShare,
+            Played::throughout(OneShare),
             settings,
             calendar,
             date,
@@ -816,6 +818,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "target_decided"]);
+        assert_eq!(
+            payloads(&directory)[1]["stretch"],
+            serde_json::json!({"from": "09:30:00", "progress": 1_000_000})
+        );
         assert_eq!(session.book(), &funded);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -1014,7 +1020,7 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let started = session(TimeDelta::minutes(5), funded.clone());
         let mut session = Session::new(
-            OneShare,
+            Played::throughout(OneShare),
             started.settings,
             started.calendar,
             date,
