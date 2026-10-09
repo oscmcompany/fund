@@ -10,22 +10,11 @@ use serde::{Deserialize, Serialize};
 pub struct BasisPoints(f64);
 
 /// A basis-point reading refused for being negative or not finite, with the value read.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("{value} is not a finite, non-negative basis-point reading")]
 pub struct BasisPointsRefusal {
     pub value: f64,
 }
-
-impl std::fmt::Display for BasisPointsRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} is not a finite, non-negative basis-point reading",
-            self.value
-        )
-    }
-}
-
-impl std::error::Error for BasisPointsRefusal {}
 
 impl BasisPoints {
     pub fn new(value: f64) -> Result<Self, BasisPointsRefusal> {
@@ -79,41 +68,24 @@ pub enum FillStyle {
 }
 
 /// Why a cost could not be quoted, with the spread that was offered.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum CostRefusal {
     /// The style pays no spread but turns on a fill rate the archive does not measure; zero would flatter it.
+    #[error(
+        "a {style} fill turns on a fill rate the archive does not measure; the book quoted {quoted_spread}"
+    )]
     FillRateUnmeasured {
         style: FillStyle,
         quoted_spread: BasisPoints,
     },
     /// The charge overflowed what a basis-point reading holds, or a fill model's crossing would cost more than its
     /// notional.
+    #[error("a quoted spread of {quoted_spread} over {names} name(s) is not representable")]
     Unrepresentable {
         quoted_spread: BasisPoints,
         names: NonZeroU32,
     },
-}
-
-impl std::fmt::Display for CostRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CostRefusal::FillRateUnmeasured {
-                style,
-                quoted_spread,
-            } => write!(
-                formatter,
-                "a {style} fill turns on a fill rate the archive does not measure; the book quoted {quoted_spread}"
-            ),
-            CostRefusal::Unrepresentable {
-                quoted_spread,
-                names,
-            } => write!(
-                formatter,
-                "a quoted spread of {quoted_spread} over {names} name(s) is not representable"
-            ),
-        }
-    }
 }
 
 /// The cost assumption a study reports net of. A round trip counts names, each crossed in and out, so half a

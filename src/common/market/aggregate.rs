@@ -89,22 +89,11 @@ pub trait RollsUp: Sized {
 pub struct Rollup<B: RollsUp>(BTreeMap<BarKey, B::Sums>);
 
 /// Why a bar could not be rolled up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RollupRefusal {
+    #[error("a {from} bar cannot roll up into the finer {to}")]
     Finer { from: BarInterval, to: BarInterval },
 }
-
-impl std::fmt::Display for RollupRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Finer { from, to } => {
-                write!(formatter, "a {from} bar cannot roll up into the finer {to}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RollupRefusal {}
 
 impl<B: RollsUp> Rollup<B> {
     /// The fragment `bar` contributes to the `interval` bar containing it.

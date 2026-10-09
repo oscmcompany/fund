@@ -14,22 +14,11 @@ pub const FAMILY_WISE_ERROR_RATE: f64 = 0.05;
 pub struct DegreesOfFreedom(f64);
 
 /// A count of degrees of freedom refused for being below one or not finite, with the value read.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("{value} is not a usable count of degrees of freedom")]
 pub struct DegreesOfFreedomRefusal {
     pub value: f64,
 }
-
-impl std::fmt::Display for DegreesOfFreedomRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} is not a usable count of degrees of freedom",
-            self.value
-        )
-    }
-}
-
-impl std::error::Error for DegreesOfFreedomRefusal {}
 
 impl DegreesOfFreedom {
     pub fn new(value: f64) -> Result<Self, DegreesOfFreedomRefusal> {

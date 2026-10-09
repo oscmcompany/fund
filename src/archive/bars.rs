@@ -13,7 +13,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 
-use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
+use super::parquet::{self, ReadRefusal, RowCause};
 
 use crate::common::journal::{Commit, RunId};
 use crate::common::market::record::{Bar, BarPartition, BarPartitionRefusal, BarPrices};
@@ -136,48 +136,6 @@ impl Provenance {
     }
 }
 
-/// Why bars were not written under a key.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EncodeRefusal {
-    /// The subscription belongs to another provider than the key's.
-    SubscriptionProvider {
-        provenance: Provenance,
-        key: Provider,
-    },
-    Placement(PlacementRefusal),
-    /// A dollar volume past what a thirty-eight-digit decimal holds.
-    Unrepresentable {
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-    },
-    Parquet {
-        reason: String,
-    },
-}
-
-/// Why a file was not read as bars.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DecodeRefusal {
-    File(ReadRefusal),
-    /// A row that no longer passes the domain's own checks.
-    Row {
-        index: usize,
-        cause: RowCause,
-    },
-    /// Provenance naming another provider than the key's.
-    Provider {
-        provenance: Provenance,
-        key: Provider,
-    },
-    Partition(BarPartitionRefusal),
-}
-
-impl From<ReadRefusal> for DecodeRefusal {
-    fn from(refusal: ReadRefusal) -> Self {
-        Self::File(refusal)
-    }
-}
-
 fn schema() -> Schema {
     let price = |name: &str| Field::new(name, PRICE_TYPE, false);
     Schema::new(vec![
@@ -202,10 +160,10 @@ pub fn encode(
     key: &BarsKey,
     bars: &BarPartition,
     provenance: &Provenance,
-) -> Result<Vec<u8>, EncodeRefusal> {
+) -> Result<Vec<u8>, parquet::EncodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     if provenance.subscription.provider() != provider {
-        return Err(EncodeRefusal::SubscriptionProvider {
+        return Err(parquet::EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
             key: provider,
         });
@@ -213,7 +171,7 @@ pub fn encode(
     let ordered = parquet::place(bars.bars(), interval, session, |bar| {
         (bar.symbol(), bar.interval(), bar.timestamp())
     })
-    .map_err(EncodeRefusal::Placement)?;
+    .map_err(parquet::EncodeRefusal::Placement)?;
     let mut symbols = StringBuilder::new();
     let mut timestamps = TimestampMicrosecondBuilder::new().with_timezone("UTC");
     let mut prices: [Decimal128Builder; 4] = std::array::from_fn(|_| Decimal128Builder::new());
@@ -225,7 +183,7 @@ pub fn encode(
         let dollar_volume = match bar.dollar_volume() {
             Some(dollar_volume) => Some(
                 parquet::widest_decimal(dollar_volume.units()).ok_or_else(|| {
-                    EncodeRefusal::Unrepresentable {
+                    parquet::EncodeRefusal::Unrepresentable {
                         symbol: symbol.clone(),
                         timestamp,
                     }
@@ -262,7 +220,28 @@ pub fn encode(
         Arc::new(dollar_volumes.finish().with_data_type(DOLLAR_VOLUME_TYPE)),
     ];
     parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata())
-        .map_err(|reason| EncodeRefusal::Parquet { reason })
+        .map_err(|reason| parquet::EncodeRefusal::Parquet { reason })
+}
+
+/// Why a file was not read as vendor bars: the refusal every bar layout shares, or a file holding no bars.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DecodeRefusal {
+    #[error("{0}")]
+    Bars(parquet::DecodeRefusal),
+    #[error("{0}")]
+    Partition(BarPartitionRefusal),
+}
+
+impl From<parquet::DecodeRefusal> for DecodeRefusal {
+    fn from(refusal: parquet::DecodeRefusal) -> Self {
+        Self::Bars(refusal)
+    }
+}
+
+impl From<ReadRefusal> for DecodeRefusal {
+    fn from(refusal: ReadRefusal) -> Self {
+        Self::Bars(refusal.into())
+    }
 }
 
 /// The bars and provenance a file written by `encode` under `key` holds, each row rebuilt through the domain's own
@@ -272,10 +251,11 @@ pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(BarPartition, Provenance
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription.provider() != provider {
-        return Err(DecodeRefusal::Provider {
+        return Err(parquet::DecodeRefusal::Provider {
             provenance,
             key: provider,
-        });
+        }
+        .into());
     }
     let mut bars = Vec::new();
     for batch in batches {
@@ -317,7 +297,7 @@ pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(BarPartition, Provenance
         };
         for row in 0..batch.num_rows() {
             let index = bars.len();
-            bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
+            bars.push(read(row).map_err(|cause| parquet::DecodeRefusal::Row { index, cause })?);
         }
     }
     let bars = BarPartition::try_from(bars).map_err(DecodeRefusal::Partition)?;
@@ -326,26 +306,25 @@ pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(BarPartition, Provenance
 
 /// The provenance `Provenance::entries` wrote, or the name of the first entry absent or unreadable.
 pub(crate) fn provenance_from(entries: &[KeyValue]) -> Result<Provenance, &'static str> {
-    use MetadataEntry as Entry;
-    let name = |entry: Entry| -> &'static str { entry.into() };
-    let value = |entry: Entry| parquet::value(entries, name(entry));
-    let required = |entry: Entry| value(entry).ok_or(name(entry));
+    let name = |entry: MetadataEntry| -> &'static str { entry.into() };
+    let value = |entry: MetadataEntry| parquet::value(entries, name(entry));
+    let required = |entry: MetadataEntry| value(entry).ok_or(name(entry));
     Ok(Provenance {
-        subscription: required(Entry::Subscription)?
+        subscription: required(MetadataEntry::Subscription)?
             .parse()
-            .map_err(|_| name(Entry::Subscription))?,
-        fetched_at: required(Entry::FetchedAt)?
+            .map_err(|_| name(MetadataEntry::Subscription))?,
+        fetched_at: required(MetadataEntry::FetchedAt)?
             .parse()
-            .map_err(|_| name(Entry::FetchedAt))?,
+            .map_err(|_| name(MetadataEntry::FetchedAt))?,
         run_id: RunId::new(
-            required(Entry::RunId)?
+            required(MetadataEntry::RunId)?
                 .parse()
-                .map_err(|_| name(Entry::RunId))?,
+                .map_err(|_| name(MetadataEntry::RunId))?,
         ),
-        commit: value(Entry::Commit)
+        commit: value(MetadataEntry::Commit)
             .map(|raw| Commit::new(&raw))
             .transpose()
-            .map_err(|_| name(Entry::Commit))?,
+            .map_err(|_| name(MetadataEntry::Commit))?,
     })
 }
 
@@ -359,8 +338,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::archive::parquet::PlacementRefusal;
     use crate::common::market::Price;
-    use crate::common::market::record::BarInterval;
+    use crate::common::market::record::{BarInterval, BarPartitionRefusal};
     use crate::common::storage::Origin;
     use crate::common::time::SessionDate;
 
@@ -517,18 +497,22 @@ mod tests {
         let next_day = bar("AAPL", "2026-09-26T14:30:00Z", 10.0, None);
         assert_eq!(
             encode(&minute_key(), &partition(&[next_day]), &written),
-            Err(EncodeRefusal::Placement(PlacementRefusal::OutsideKey {
-                symbol: Symbol::new("AAPL").unwrap(),
-                timestamp: "2026-09-26T14:30:00Z".parse().unwrap()
-            }))
+            Err(parquet::EncodeRefusal::Placement(
+                PlacementRefusal::OutsideKey {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    timestamp: "2026-09-26T14:30:00Z".parse().unwrap()
+                }
+            ))
         );
         let twice = bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None);
         assert_eq!(
             encode(&minute_key(), &partition(&[twice.clone(), twice]), &written),
-            Err(EncodeRefusal::Placement(PlacementRefusal::Duplicate {
-                symbol: Symbol::new("AAPL").unwrap(),
-                timestamp: "2026-09-25T14:30:00Z".parse().unwrap()
-            }))
+            Err(parquet::EncodeRefusal::Placement(
+                PlacementRefusal::Duplicate {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    timestamp: "2026-09-25T14:30:00Z".parse().unwrap()
+                }
+            ))
         );
     }
 
@@ -540,7 +524,7 @@ mod tests {
                 &one_bar(),
                 &provenance(Subscription::StocksStarter)
             ),
-            Err(EncodeRefusal::SubscriptionProvider {
+            Err(parquet::EncodeRefusal::SubscriptionProvider {
                 provenance: provenance(Subscription::StocksStarter),
                 key: Provider::Alpaca
             })
@@ -562,9 +546,11 @@ mod tests {
         let unnamed = replace(&bytes, b"fund.layout_version", b"fund.layout_versioX");
         assert_eq!(
             decode(&minute_key(), unnamed).map(|_| ()),
-            Err(DecodeRefusal::File(ReadRefusal::Metadata {
-                name: "fund.layout_version"
-            }))
+            Err(DecodeRefusal::Bars(parquet::DecodeRefusal::File(
+                ReadRefusal::Metadata {
+                    name: "fund.layout_version"
+                }
+            )))
         );
         let mut entries = written.metadata();
         entries.push(KeyValue::new(
@@ -580,9 +566,11 @@ mod tests {
         writer.close().unwrap();
         assert_eq!(
             decode(&minute_key(), later).map(|_| ()),
-            Err(DecodeRefusal::File(ReadRefusal::Layout {
-                version: "2".to_string()
-            }))
+            Err(DecodeRefusal::Bars(parquet::DecodeRefusal::File(
+                ReadRefusal::Layout {
+                    version: "2".to_string()
+                }
+            )))
         );
     }
 
@@ -605,9 +593,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             decode(&minute_key(), bytes).map(|_| ()),
-            Err(DecodeRefusal::File(ReadRefusal::Metadata {
-                name: "fund.layout_version"
-            }))
+            Err(DecodeRefusal::Bars(parquet::DecodeRefusal::File(
+                ReadRefusal::Metadata {
+                    name: "fund.layout_version"
+                }
+            )))
         );
     }
 
@@ -659,7 +649,9 @@ mod tests {
             assert!(
                 matches!(
                     decode(&minute_key(), file_with(schema)),
-                    Err(DecodeRefusal::File(ReadRefusal::Schema { .. }))
+                    Err(DecodeRefusal::Bars(parquet::DecodeRefusal::File(
+                        ReadRefusal::Schema { .. }
+                    )))
                 ),
                 "{name}"
             );
@@ -691,13 +683,13 @@ mod tests {
         );
         assert_eq!(
             decode(&next_day, bytes.clone()).map(|_| ()),
-            Err(DecodeRefusal::Row {
+            Err(DecodeRefusal::Bars(parquet::DecodeRefusal::Row {
                 index: 0,
                 cause: RowCause::OutsideSession {
                     timestamp: "2026-09-25T14:30:00Z".parse().unwrap(),
                     session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()),
                 },
-            })
+            }))
         );
         let massive = BarsKey::new(
             Provider::Massive,
@@ -707,10 +699,10 @@ mod tests {
         );
         assert_eq!(
             decode(&massive, bytes).map(|_| ()),
-            Err(DecodeRefusal::Provider {
+            Err(DecodeRefusal::Bars(parquet::DecodeRefusal::Provider {
                 provenance: provenance(Subscription::AlgoTraderPlus),
                 key: Provider::Massive
-            })
+            }))
         );
     }
 

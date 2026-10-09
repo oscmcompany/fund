@@ -92,7 +92,7 @@ pub struct Estimate {
     degrees_of_freedom: DegreesOfFreedom,
 }
 
-/// An estimate as stored, admitted only if `TryFrom<Summary>` or `welch` could have produced it.
+/// An estimate as stored, admitted only if `Estimate::from_summary` or `welch` could have produced it.
 #[derive(Deserialize)]
 struct EstimateFields {
     mean: f64,
@@ -130,22 +130,21 @@ impl TryFrom<EstimateFields> for Estimate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum EstimateRefusal {
+    #[error("{0}")]
     Series(SeriesRefusal),
     /// A matched comparison where only one arm read `session`.
-    Unmatched {
-        session: SessionDate,
-    },
+    #[error("only one arm read {session}, so it cannot be matched")]
+    Unmatched { session: SessionDate },
     /// A disjoint comparison where both arms read `session`, so their errors would not add in quadrature.
-    Shared {
-        session: SessionDate,
-    },
+    #[error("both arms read {session}, so they are not disjoint")]
+    Shared { session: SessionDate },
     /// Below two measured sessions there is no spread to take an error from.
-    TooFewSessions {
-        measured: u64,
-    },
+    #[error("{measured} measured sessions cannot carry an error")]
+    TooFewSessions { measured: u64 },
     /// Stored fields no summary or Welch comparison could have produced.
+    #[error("mean {mean}, standard error {standard_error} over {sessions} sessions with {} degrees of freedom is not an estimate", .degrees_of_freedom.value())]
     Inadmissible {
         mean: f64,
         standard_error: f64,
@@ -154,49 +153,9 @@ pub enum EstimateRefusal {
     },
 }
 
-impl std::fmt::Display for EstimateRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Series(refusal) => write!(formatter, "{refusal}"),
-            Self::Unmatched { session } => {
-                write!(
-                    formatter,
-                    "only one arm read {session}, so it cannot be matched"
-                )
-            }
-            Self::Shared { session } => {
-                write!(
-                    formatter,
-                    "both arms read {session}, so they are not disjoint"
-                )
-            }
-            Self::TooFewSessions { measured } => {
-                write!(
-                    formatter,
-                    "{measured} measured sessions cannot carry an error"
-                )
-            }
-            Self::Inadmissible {
-                mean,
-                standard_error,
-                sessions,
-                degrees_of_freedom,
-            } => write!(
-                formatter,
-                "mean {mean}, standard error {standard_error} over {sessions} sessions with {} degrees of \
-                 freedom is not an estimate",
-                degrees_of_freedom.value()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EstimateRefusal {}
-
-impl TryFrom<Summary> for Estimate {
-    type Error = EstimateRefusal;
-
-    fn try_from(summary: Summary) -> Result<Self, Self::Error> {
+impl Estimate {
+    /// The mean and its standard error over `summary`'s measured sessions, refused below two.
+    pub fn from_summary(summary: Summary) -> Result<Self, EstimateRefusal> {
         if summary.measured < 2 {
             return Err(EstimateRefusal::TooFewSessions {
                 measured: summary.measured,
@@ -212,9 +171,7 @@ impl TryFrom<Summary> for Estimate {
                 .expect("two or more sessions leave at least one degree of freedom"),
         })
     }
-}
 
-impl Estimate {
     pub fn mean(self) -> f64 {
         self.mean
     }
@@ -282,7 +239,7 @@ pub fn paired(
     treatment: Treatment<&Series>,
     control: Control<&Series>,
 ) -> Result<Estimate, EstimateRefusal> {
-    Estimate::try_from(summarize(&matched(treatment, control)?))
+    Estimate::from_summary(summarize(&matched(treatment, control)?))
 }
 
 /// Treatment less control over arms that share no session: errors in quadrature, with Welch–Satterthwaite degrees
@@ -293,8 +250,8 @@ pub fn welch(
 ) -> Result<Estimate, EstimateRefusal> {
     disjoint(treatment, control)?;
     let (treatment, control) = (
-        Estimate::try_from(summarize(treatment))?,
-        Estimate::try_from(summarize(control))?,
+        Estimate::from_summary(summarize(treatment))?,
+        Estimate::from_summary(summarize(control))?,
     );
     let (treatment_variance, control_variance) = (
         treatment.standard_error.powi(2),
@@ -442,7 +399,7 @@ mod tests {
     }
 
     fn estimate(readings: &[f64]) -> Estimate {
-        Estimate::try_from(summarize(&measured(0, readings))).unwrap()
+        Estimate::from_summary(summarize(&measured(0, readings))).unwrap()
     }
 
     fn haircut(tests: u32) -> Haircut {
@@ -566,7 +523,7 @@ mod tests {
         );
         assert_eq!((flat.t(), flat.clears(haircut(1))), (None, None));
         assert_eq!(
-            Estimate::try_from(summarize(&series(0, &[Some(1.0), None]))),
+            Estimate::from_summary(summarize(&series(0, &[Some(1.0), None]))),
             Err(EstimateRefusal::TooFewSessions { measured: 1 })
         );
     }

@@ -12,6 +12,8 @@ use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
+use super::bars::Provenance;
+
 use crate::common::market::corporate_actions::{
     ActionIdRefusal, BoundaryChangeRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
 };
@@ -22,28 +24,25 @@ use crate::common::market::security_details::{
 };
 use crate::common::market::trade_bars::{HighLowRefusal, OpenCloseRefusal, TradeBarRefusal};
 use crate::common::market::{Price, PriceRefusal, Symbol, SymbolRefusal};
+use crate::common::storage::Provider;
 use crate::common::time::SessionDate;
 
 /// The metadata key every layout names its version under.
 pub(crate) const LAYOUT_VERSION_KEY: &str = "fund.layout_version";
 
 /// Why a file was not read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReadRefusal {
-    Parquet {
-        reason: String,
-    },
+    #[error("the file is not readable Parquet: {reason}")]
+    Parquet { reason: String },
     /// Columns other than the layout's, named as found.
-    Schema {
-        found: String,
-    },
-    Metadata {
-        name: &'static str,
-    },
+    #[error("the file holds other columns: {found}")]
+    Schema { found: String },
+    #[error("the metadata `{name}` is absent or unreadable")]
+    Metadata { name: &'static str },
     /// Written under another layout than this build reads.
-    Layout {
-        version: String,
-    },
+    #[error("the file is written under layout {version}")]
+    Layout { version: String },
 }
 
 /// One file of `columns` under `schema`, compressed with Snappy and carrying `metadata` beside the layout version.
@@ -144,96 +143,56 @@ pub(crate) fn downcast<T: 'static>(column: &ArrayRef) -> Result<&T, ReadRefusal>
         })
 }
 
-impl std::fmt::Display for ReadRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parquet { reason } => {
-                write!(formatter, "the file is not readable Parquet: {reason}")
-            }
-            Self::Schema { found } => write!(formatter, "the file holds other columns: {found}"),
-            Self::Metadata { name } => {
-                write!(formatter, "the metadata `{name}` is absent or unreadable")
-            }
-            Self::Layout { version } => {
-                write!(formatter, "the file is written under layout {version}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ReadRefusal {}
-
 /// Why a row read back from a file no longer passes its domain's checks.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RowCause {
     /// A stored number past what its column's domain type holds.
-    OutOfRange {
-        column: String,
-        value: i128,
-    },
+    #[error("{column} holds {value}, past its type's range")]
+    OutOfRange { column: String, value: i128 },
+    #[error("{timestamp} is outside session {session}")]
     OutsideSession {
         timestamp: DateTime<Utc>,
         session: SessionDate,
     },
     /// Some columns of a group stored whole or not at all are null, named here.
-    PartlyNull {
-        null: Vec<String>,
-    },
+    #[error("{} null alone", .null.join(" and "))]
+    PartlyNull { null: Vec<String> },
     /// Text that names no value of its column's type.
-    Unparsable {
-        column: String,
-        raw: String,
-    },
+    #[error("{column} holds `{raw}`")]
+    Unparsable { column: String, raw: String },
+    #[error("{0}")]
     Symbol(SymbolRefusal),
+    #[error("{0}")]
     Price(PriceRefusal),
+    #[error("{0}")]
     BarPrices(BarPricesRefusal),
+    #[error("{0}")]
     Bar(BarRefusal),
+    #[error("{0}")]
     QuoteSums(QuoteSumsRefusal),
+    #[error("{0}")]
     QuoteBar(QuoteBarRefusal),
+    #[error("{0}")]
     OpenClose(OpenCloseRefusal),
+    #[error("{0}")]
     HighLow(HighLowRefusal),
+    #[error("{0}")]
     TradeBar(TradeBarRefusal),
+    #[error("{0}")]
     ActionId(ActionIdRefusal),
+    #[error("{0}")]
     SplitRatio(SplitRatioRefusal),
+    #[error("{0}")]
     BoundaryChange(BoundaryChangeRefusal),
+    #[error("{0}")]
     SeriesBoundary(SeriesBoundaryRefusal),
+    #[error("{0}")]
     IndustryCode(IndustryCodeRefusal),
+    #[error("{0}")]
     MarketIdentifierCode(MarketIdentifierCodeRefusal),
+    #[error("{0}")]
     CentralIndexKey(CentralIndexKeyRefusal),
 }
-
-impl std::fmt::Display for RowCause {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OutOfRange { column, value } => {
-                write!(formatter, "{column} holds {value}, past its type's range")
-            }
-            Self::OutsideSession { timestamp, session } => {
-                write!(formatter, "{timestamp} is outside session {session}")
-            }
-            Self::PartlyNull { null } => write!(formatter, "{} null alone", null.join(" and ")),
-            Self::Unparsable { column, raw } => write!(formatter, "{column} holds `{raw}`"),
-            Self::Symbol(refusal) => refusal.fmt(formatter),
-            Self::Price(refusal) => refusal.fmt(formatter),
-            Self::BarPrices(refusal) => refusal.fmt(formatter),
-            Self::Bar(refusal) => refusal.fmt(formatter),
-            Self::QuoteSums(refusal) => refusal.fmt(formatter),
-            Self::QuoteBar(refusal) => refusal.fmt(formatter),
-            Self::OpenClose(refusal) => refusal.fmt(formatter),
-            Self::HighLow(refusal) => refusal.fmt(formatter),
-            Self::TradeBar(refusal) => refusal.fmt(formatter),
-            Self::ActionId(refusal) => refusal.fmt(formatter),
-            Self::SplitRatio(refusal) => refusal.fmt(formatter),
-            Self::BoundaryChange(refusal) => refusal.fmt(formatter),
-            Self::SeriesBoundary(refusal) => refusal.fmt(formatter),
-            Self::IndustryCode(refusal) => refusal.fmt(formatter),
-            Self::MarketIdentifierCode(refusal) => refusal.fmt(formatter),
-            Self::CentralIndexKey(refusal) => refusal.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for RowCause {}
 
 /// A column as the array type its schema promises, named for a row's refusal.
 pub(crate) struct Column<'a, T> {
@@ -321,34 +280,62 @@ pub(crate) fn widest_decimal(units: u128) -> Option<i128> {
 }
 
 /// Why a bar was not placed in a file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PlacementRefusal {
     /// A bar whose interval or session is not the key's.
+    #[error("{symbol} at {timestamp} lies outside the key")]
     OutsideKey {
         symbol: Symbol,
         timestamp: DateTime<Utc>,
     },
     /// Two bars for one symbol and instant.
+    #[error("{symbol} has two bars at {timestamp}")]
     Duplicate {
         symbol: Symbol,
         timestamp: DateTime<Utc>,
     },
 }
 
-impl std::fmt::Display for PlacementRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OutsideKey { symbol, timestamp } => {
-                write!(formatter, "{symbol} at {timestamp} lies outside the key")
-            }
-            Self::Duplicate { symbol, timestamp } => {
-                write!(formatter, "{symbol} has two bars at {timestamp}")
-            }
-        }
-    }
+/// Why bars of any layout (vendor, quote or trade) were not written under a key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncodeRefusal {
+    /// The subscription belongs to another provider than the key's.
+    SubscriptionProvider {
+        provenance: Provenance,
+        key: Provider,
+    },
+    Placement(PlacementRefusal),
+    /// A total past what its column's decimal holds.
+    Unrepresentable {
+        symbol: Symbol,
+        timestamp: DateTime<Utc>,
+    },
+    Parquet {
+        reason: String,
+    },
 }
 
-impl std::error::Error for PlacementRefusal {}
+/// Why a file was not read as bars of any layout.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DecodeRefusal {
+    #[error("{0}")]
+    File(ReadRefusal),
+    /// A row that no longer passes the domain's own checks.
+    #[error("row {index} refused: {cause}")]
+    Row { index: usize, cause: RowCause },
+    /// Provenance naming another provider than the key's.
+    #[error("the file was fetched under {} but the key names {key}", .provenance.subscription())]
+    Provider {
+        provenance: Provenance,
+        key: Provider,
+    },
+}
+
+impl From<ReadRefusal> for DecodeRefusal {
+    fn from(refusal: ReadRefusal) -> Self {
+        Self::File(refusal)
+    }
+}
 
 /// `bars` ordered by symbol and then timestamp, so the same bars always make the same bytes, each one checked to
 /// belong under a key of `interval` and `session` and to be the only bar at its symbol and instant.

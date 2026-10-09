@@ -30,24 +30,14 @@ pub struct Patience {
 }
 
 /// Why a patience was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PatienceRefusal {
     /// A zero poll would read an open order back to back.
+    #[error("an order cannot be polled every zero seconds")]
     ZeroPoll,
     /// A poll longer than `open_for` would never read an order back before its cancel.
+    #[error("a poll every {poll:?} is longer than the {open_for:?} an order may stay open")]
     PollPastOpen { poll: Duration, open_for: Duration },
-}
-
-impl std::fmt::Display for PatienceRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroPoll => write!(formatter, "an order cannot be polled every zero seconds"),
-            Self::PollPastOpen { poll, open_for } => write!(
-                formatter,
-                "a poll every {poll:?} is longer than the {open_for:?} an order may stay open"
-            ),
-        }
-    }
 }
 
 impl Patience {
@@ -128,12 +118,12 @@ pub enum OrderOutcome {
 /// Execution stopped because the journal refused a write; `outcomes` holds every order already followed, the last
 /// possibly closed at the broker with its close unrecorded.
 #[derive(Debug)]
-pub struct JournalFailed {
+pub struct JournalFailure {
     outcomes: Vec<OrderOutcome>,
     error: std::io::Error,
 }
 
-impl JournalFailed {
+impl JournalFailure {
     fn new(outcomes: Vec<OrderOutcome>, error: std::io::Error) -> Self {
         Self { outcomes, error }
     }
@@ -165,7 +155,7 @@ pub async fn execute(
     target: &Target,
     prices: &BTreeMap<Symbol, Price>,
     patience: Patience,
-) -> Result<Vec<OrderOutcome>, JournalFailed> {
+) -> Result<Vec<OrderOutcome>, JournalFailure> {
     let mut outcomes = Vec::new();
     let orders = orders(book, target);
     let symbols: Vec<Symbol> = orders.iter().map(|order| order.symbol().clone()).collect();
@@ -174,14 +164,14 @@ pub async fn execute(
         Ok(tradability) => {
             let read = TradabilityRead::new(tradability.clone());
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityRead(read)) {
-                return Err(JournalFailed::new(outcomes, error));
+                return Err(JournalFailure::new(outcomes, error));
             }
             tradability
         }
         Err(error) => {
             let unread = TradabilityUnread::new(BrokerFailure::from(&error));
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityUnread(unread)) {
-                return Err(JournalFailed::new(outcomes, error));
+                return Err(JournalFailure::new(outcomes, error));
             }
             BTreeMap::new()
         }
@@ -190,7 +180,7 @@ pub async fn execute(
     for held in guarded.held() {
         outcomes.push(OrderOutcome::Guarded(held.cause()));
         if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held.clone())) {
-            return Err(JournalFailed::new(outcomes, error));
+            return Err(JournalFailure::new(outcomes, error));
         }
     }
     for order in guarded.passed().iter().cloned() {
@@ -199,7 +189,7 @@ pub async fn execute(
             Utc::now(),
             Observation::OrderSubmitted(OrderSubmitted::of(&request)),
         ) {
-            return Err(JournalFailed::new(outcomes, error));
+            return Err(JournalFailure::new(outcomes, error));
         }
         let (observation, outcome) = follow(broker, &request, patience).await;
         let stop = match outcome {
@@ -208,7 +198,7 @@ pub async fn execute(
         };
         outcomes.push(outcome);
         if let Err(error) = journal.append(Utc::now(), observation) {
-            return Err(JournalFailed::new(outcomes, error));
+            return Err(JournalFailure::new(outcomes, error));
         }
         if stop {
             break;
@@ -219,9 +209,9 @@ pub async fn execute(
 
 /// Why reconciliation stopped: the broker's book could not be read, or the journal refused a write.
 #[derive(Debug)]
-pub enum ReconcileFailed {
+pub enum ReconcileFailure {
     Unread(BrokerError),
-    Journal(JournalFailed),
+    Journal(JournalFailure),
 }
 
 /// Whether the books agreed, and the broker's book to trade from: as read when they agreed, or after the orders that
@@ -250,12 +240,12 @@ pub async fn reconcile_and_close(
     allowance: Allowance,
     prices: &BTreeMap<Symbol, Price>,
     patience: Patience,
-) -> Result<Reconciliation, ReconcileFailed> {
-    let reported = broker.book().await.map_err(ReconcileFailed::Unread)?;
+) -> Result<Reconciliation, ReconcileFailure> {
+    let reported = broker.book().await.map_err(ReconcileFailure::Unread)?;
     let reading = reconcile(expected, &reported, allowance);
     journal
         .append(Utc::now(), Observation::BookReconciled(reading.clone()))
-        .map_err(|error| ReconcileFailed::Journal(JournalFailed::before_any_order(error)))?;
+        .map_err(|error| ReconcileFailure::Journal(JournalFailure::before_any_order(error)))?;
     if reading.agrees() {
         return Ok(Reconciliation::Agreed { book: reported });
     }
@@ -276,8 +266,8 @@ pub async fn reconcile_and_close(
         broker, journal, sequence, &reported, &kept, prices, patience,
     )
     .await
-    .map_err(ReconcileFailed::Journal)?;
-    let book = broker.book().await.map_err(ReconcileFailed::Unread)?;
+    .map_err(ReconcileFailure::Journal)?;
+    let book = broker.book().await.map_err(ReconcileFailure::Unread)?;
     Ok(Reconciliation::Diverged {
         reading,
         closing,

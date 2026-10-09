@@ -88,18 +88,11 @@ impl ConditionCode {
 pub struct ConditionLetter(char);
 
 /// A condition spelled with other than exactly one character, with the spelling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{raw}` is not one condition letter")]
 pub struct ConditionLetterRefusal {
     pub raw: String,
 }
-
-impl std::fmt::Display for ConditionLetterRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "`{}` is not one condition letter", self.raw)
-    }
-}
-
-impl std::error::Error for ConditionLetterRefusal {}
 
 impl ConditionLetter {
     pub const fn of(letter: char) -> Self {
@@ -208,34 +201,15 @@ impl Eligibility {
 }
 
 /// Why a print's condition could not be placed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, thiserror::Error)]
 pub enum Unplaced {
-    UnknownCode {
-        code: ConditionCode,
-    },
-    UnknownLetter {
-        tape: Tape,
-        letter: ConditionLetter,
-    },
+    #[error("unknown code {}", .code.get())]
+    UnknownCode { code: ConditionCode },
+    #[error("unknown letter '{}' on {tape:?}", .letter.get())]
+    UnknownLetter { tape: Tape, letter: ConditionLetter },
     /// Two current conditions share the letter with different rules.
-    AmbiguousLetter {
-        tape: Tape,
-        letter: ConditionLetter,
-    },
-}
-
-impl std::fmt::Display for Unplaced {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownCode { code } => write!(formatter, "unknown code {}", code.get()),
-            Self::UnknownLetter { tape, letter } => {
-                write!(formatter, "unknown letter '{}' on {tape:?}", letter.get())
-            }
-            Self::AmbiguousLetter { tape, letter } => {
-                write!(formatter, "ambiguous letter '{}' on {tape:?}", letter.get())
-            }
-        }
-    }
+    #[error("ambiguous letter '{}' on {tape:?}", .letter.get())]
+    AmbiguousLetter { tape: Tape, letter: ConditionLetter },
 }
 
 impl TradeConditions {
@@ -364,31 +338,15 @@ pub struct OpenClose {
 }
 
 /// Why an open and close were refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum OpenCloseRefusal {
     /// The open orders after the close, by instant and then price.
+    #[error("the open {} at {} orders after the close {} at {}", .open.price(), .open.at(), .close.price(), .close.at())]
     Inverted {
         open: StampedPrice,
         close: StampedPrice,
     },
 }
-
-impl std::fmt::Display for OpenCloseRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inverted { open, close } => write!(
-                formatter,
-                "the open {} at {} orders after the close {} at {}",
-                open.price(),
-                open.at(),
-                close.price(),
-                close.at()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for OpenCloseRefusal {}
 
 impl OpenClose {
     pub fn new(open: StampedPrice, close: StampedPrice) -> Result<Self, OpenCloseRefusal> {
@@ -432,22 +390,11 @@ pub struct HighLow {
 }
 
 /// Why a high and low were refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HighLowRefusal {
+    #[error("the high {high} is below the low {low}")]
     Inverted { high: Price, low: Price },
 }
-
-impl std::fmt::Display for HighLowRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inverted { high, low } => {
-                write!(formatter, "the high {high} is below the low {low}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HighLowRefusal {}
 
 impl HighLow {
     pub fn new(high: Price, low: Price) -> Result<Self, HighLowRefusal> {
@@ -557,26 +504,14 @@ pub struct TradeBar {
 }
 
 /// Why a trade bar was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TradeBarRefusal {
+    #[error("{timestamp} does not end a {interval} bar")]
     Misaligned {
         interval: BarInterval,
         timestamp: DateTime<Utc>,
     },
 }
-
-impl std::fmt::Display for TradeBarRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Misaligned {
-                interval,
-                timestamp,
-            } => write!(formatter, "{timestamp} does not end a {interval} bar"),
-        }
-    }
-}
-
-impl std::error::Error for TradeBarRefusal {}
 
 impl TradeBar {
     pub fn new(
@@ -641,31 +576,18 @@ struct BarBuiltColumns {
 }
 
 /// Why a journaled bar was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BarBuiltRefusal {
     /// Some columns of a price pair are null, named here.
-    PartlyNull {
-        null: Vec<&'static str>,
-    },
+    #[error("a price pair is null in {}", .null.join(", "))]
+    PartlyNull { null: Vec<&'static str> },
+    #[error("{0}")]
     OpenClose(OpenCloseRefusal),
+    #[error("{0}")]
     HighLow(HighLowRefusal),
+    #[error("{0}")]
     TradeBar(TradeBarRefusal),
 }
-
-impl std::fmt::Display for BarBuiltRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PartlyNull { null } => {
-                write!(formatter, "a price pair is null in {}", null.join(", "))
-            }
-            Self::OpenClose(refusal) => refusal.fmt(formatter),
-            Self::HighLow(refusal) => refusal.fmt(formatter),
-            Self::TradeBar(refusal) => refusal.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for BarBuiltRefusal {}
 
 /// The names of `columns` that are null, when some but not all are.
 fn partly_null(columns: &[(&'static str, bool)]) -> BarBuiltRefusal {

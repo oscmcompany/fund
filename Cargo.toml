@@ -53,6 +53,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Exact float parsing, so a journaled reading reads back as the value written.
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 strum = { version = "0.28", features = ["derive"] }
+thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = [
   "macros",
   "rt-multi-thread",

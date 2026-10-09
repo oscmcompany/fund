@@ -43,18 +43,15 @@ pub struct StandingQuote {
 }
 
 /// Why a standing quote or a bar's sums were refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteSumsRefusal {
-    Crossed {
-        bid: Price,
-        ask: Price,
-    },
+    #[error("the bid {bid} is above the ask {ask}")]
+    Crossed { bid: Price, ask: Price },
     /// The narrowest spread is wider than the widest.
-    Inverted {
-        narrowest: Spread,
-        widest: Spread,
-    },
+    #[error("the narrowest spread of {} ticks is wider than the widest of {}", .narrowest.ticks(), .widest.ticks())]
+    Inverted { narrowest: Spread, widest: Spread },
     /// The time-weighted spread is outside the narrowest and widest spreads standing for the covered time.
+    #[error("a time-weighted spread of {spread} is outside {} to {} ticks over {covered_nanoseconds} nanoseconds", .narrowest.ticks(), .widest.ticks())]
     SpreadOutsideRange {
         spread: u128,
         narrowest: Spread,
@@ -62,33 +59,6 @@ pub enum QuoteSumsRefusal {
         covered_nanoseconds: u64,
     },
 }
-
-impl std::fmt::Display for QuoteSumsRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Crossed { bid, ask } => write!(formatter, "the bid {bid} is above the ask {ask}"),
-            Self::Inverted { narrowest, widest } => write!(
-                formatter,
-                "the narrowest spread of {} ticks is wider than the widest of {}",
-                narrowest.ticks(),
-                widest.ticks()
-            ),
-            Self::SpreadOutsideRange {
-                spread,
-                narrowest,
-                widest,
-                covered_nanoseconds,
-            } => write!(
-                formatter,
-                "a time-weighted spread of {spread} is outside {} to {} ticks over {covered_nanoseconds} nanoseconds",
-                narrowest.ticks(),
-                widest.ticks()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for QuoteSumsRefusal {}
 
 impl StandingQuote {
     /// A quote whose bid is not above its ask, as `Quote` guarantees for one read from a vendor.
@@ -295,34 +265,17 @@ pub struct QuoteBar {
 }
 
 /// Why a quote bar was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteBarRefusal {
+    #[error("{timestamp} does not end a {interval} bar")]
     Misaligned {
         interval: BarInterval,
         timestamp: DateTime<Utc>,
     },
     /// Covered for no time, or longer than the interval it is stamped for.
+    #[error("{covered_nanoseconds} nanoseconds covered is none or longer than the interval")]
     Coverage { covered_nanoseconds: u64 },
 }
-
-impl std::fmt::Display for QuoteBarRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Misaligned {
-                interval,
-                timestamp,
-            } => write!(formatter, "{timestamp} does not end a {interval} bar"),
-            Self::Coverage {
-                covered_nanoseconds,
-            } => write!(
-                formatter,
-                "{covered_nanoseconds} nanoseconds covered is none or longer than the interval"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for QuoteBarRefusal {}
 
 impl QuoteBar {
     /// A bar on its interval's grid, covered for some time and for no longer than its interval, a day for a daily bar.
@@ -425,25 +378,14 @@ pub struct QuoteFold {
 }
 
 /// Why a fold could not start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteFoldRefusal {
+    #[error("the close {close} is not after the open {open}")]
     CloseNotAfterOpen {
         open: DateTime<Utc>,
         close: DateTime<Utc>,
     },
 }
-
-impl std::fmt::Display for QuoteFoldRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CloseNotAfterOpen { open, close } => {
-                write!(formatter, "the close {close} is not after the open {open}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for QuoteFoldRefusal {}
 
 impl QuoteFold {
     pub fn new(open: DateTime<Utc>, close: DateTime<Utc>) -> Result<Self, QuoteFoldRefusal> {

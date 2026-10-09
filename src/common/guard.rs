@@ -34,11 +34,9 @@ const LEAST_FRACTIONAL_BUY: DollarVolume =
 pub enum Tradability {
     /// Trades in any amount, fractions included.
     Fractionable,
-    /// Trades in whole shares only.
     WholeSharesOnly,
     /// Listed, but inactive or reported not open to orders.
     Untradable,
-    /// Not listed at the broker at all.
     Unlisted,
 }
 

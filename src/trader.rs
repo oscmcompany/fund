@@ -26,7 +26,7 @@ use crate::common::strategy::Strategy;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 use crate::execution::{
-    JournalFailed, OrderOutcome, Patience, ReconcileFailed, Reconciliation, execute,
+    JournalFailure, OrderOutcome, Patience, ReconcileFailure, Reconciliation, execute,
     reconcile_and_close,
 };
 use crate::ingest::alpaca::AlpacaTradeOutcome;
@@ -87,22 +87,11 @@ pub struct SessionSettings {
 const LEAST_STALENESS: TimeDelta = TimeDelta::minutes(1);
 
 /// Why settings were refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SettingsRefusal {
+    #[error("a staleness of {stale_after} is under a minute")]
     StalenessUnderAMinute { stale_after: TimeDelta },
 }
-
-impl std::fmt::Display for SettingsRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StalenessUnderAMinute { stale_after } => {
-                write!(formatter, "a staleness of {stale_after} is under a minute")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SettingsRefusal {}
 
 impl SessionSettings {
     pub fn new(
@@ -126,20 +115,20 @@ impl SessionSettings {
 /// Why a session stopped: the journal refused a write, or the broker's book could not be reconciled.
 #[derive(Debug)]
 pub enum SessionError {
-    Journal(JournalFailed),
-    Reconcile(ReconcileFailed),
+    Journal(JournalFailure),
+    Reconcile(ReconcileFailure),
 }
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Journal(failed) | Self::Reconcile(ReconcileFailed::Journal(failed)) => write!(
+            Self::Journal(failed) | Self::Reconcile(ReconcileFailure::Journal(failed)) => write!(
                 formatter,
                 "the journal refused a write after {} orders: {}",
                 failed.outcomes().len(),
                 failed.error()
             ),
-            Self::Reconcile(ReconcileFailed::Unread(error)) => {
+            Self::Reconcile(ReconcileFailure::Unread(error)) => {
                 write!(
                     formatter,
                     "the broker's book was not read to reconcile: {error}"
@@ -254,7 +243,7 @@ impl<S: Strategy> Session<S> {
             self.continuity = changed.to();
             if let Err(error) = journal.append(now, Observation::FeedChanged(changed)) {
                 self.halt(journal, journal_refused(&error));
-                return Err(SessionError::Journal(JournalFailed::before_any_order(
+                return Err(SessionError::Journal(JournalFailure::before_any_order(
                     error,
                 )));
             }
@@ -351,7 +340,7 @@ impl<S: Strategy> Session<S> {
         for bar in self.fold.drain_through(settled) {
             if let Err(error) = journal.append(now, Observation::BarBuilt(BarBuilt::of(&bar))) {
                 self.halt(journal, journal_refused(&error));
-                return Err(SessionError::Journal(JournalFailed::before_any_order(
+                return Err(SessionError::Journal(JournalFailure::before_any_order(
                     error,
                 )));
             }
@@ -380,7 +369,7 @@ impl<S: Strategy> Session<S> {
         let decided = TargetDecided::new(bar, stretch, wanted, restrained.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
             self.halt(journal, journal_refused(&error));
-            return Err(SessionError::Journal(JournalFailed::before_any_order(
+            return Err(SessionError::Journal(JournalFailure::before_any_order(
                 error,
             )));
         }
@@ -430,10 +419,10 @@ impl<S: Strategy> Session<S> {
             Ok(reconciliation) => reconciliation,
             Err(failed) => {
                 let cause = match &failed {
-                    ReconcileFailed::Unread(error) => {
+                    ReconcileFailure::Unread(error) => {
                         HaltCause::ReconcileUnread(BrokerFailure::from(error))
                     }
-                    ReconcileFailed::Journal(failed) => journal_refused(failed.error()),
+                    ReconcileFailure::Journal(failed) => journal_refused(failed.error()),
                 };
                 self.halt(journal, cause);
                 return Err(SessionError::Reconcile(failed));
@@ -1194,7 +1183,7 @@ mod tests {
         let failed = session.advance(at("14:05:02"), &broker, &mut journal).await;
         assert!(matches!(
             failed,
-            Err(SessionError::Reconcile(ReconcileFailed::Unread(_)))
+            Err(SessionError::Reconcile(ReconcileFailure::Unread(_)))
         ));
         assert_eq!(
             session.standing(),
@@ -1375,7 +1364,7 @@ mod tests {
             [
                 closing("SPY", "14:01:00", 2),
                 closing("SPY", "14:00:00", 1),
-                closing("QQQ", "14:01:00", 3),
+                closing("ABC", "14:01:00", 3),
             ],
             &BTreeSet::from([spy()]),
         );
@@ -1387,7 +1376,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            state.last_close(&Symbol::new("QQQ").unwrap(), BarInterval::OneMinute),
+            state.last_close(&Symbol::new("ABC").unwrap(), BarInterval::OneMinute),
             None
         );
         assert_eq!(state.clock(), None);

@@ -15,10 +15,10 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::DateTime;
 
 use super::bars::{Provenance, provenance_from};
-use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
+use super::parquet::{self, ReadRefusal, RowCause};
 use crate::common::market::quote_bars::{QuoteBar, QuoteSums, Spread, StandingQuote, TimeWeighted};
 use crate::common::market::{QuoteCount, Shares, Symbol};
-use crate::common::storage::{Provider, QuotesKey};
+use crate::common::storage::QuotesKey;
 
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
@@ -27,44 +27,6 @@ const PRICE_TYPE: DataType = DataType::Decimal128(18, 6);
 const SHARES_TYPE: DataType = DataType::Decimal128(20, 6);
 /// A sum of six-digit quantities multiplied by nanoseconds; thirty-eight digits hold a day of any of them.
 const TIME_WEIGHTED_TYPE: DataType = DataType::Decimal128(38, 6);
-
-/// Why quote bars were not written under a key.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EncodeRefusal {
-    SubscriptionProvider {
-        provenance: Provenance,
-        key: Provider,
-    },
-    Placement(PlacementRefusal),
-    /// A sum past what a thirty-eight-digit decimal holds.
-    Unrepresentable {
-        symbol: Symbol,
-        timestamp: DateTime<chrono::Utc>,
-    },
-    Parquet {
-        reason: String,
-    },
-}
-
-/// Why a file was not read as quote bars.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DecodeRefusal {
-    File(ReadRefusal),
-    Row {
-        index: usize,
-        cause: RowCause,
-    },
-    Provider {
-        provenance: Provenance,
-        key: Provider,
-    },
-}
-
-impl From<ReadRefusal> for DecodeRefusal {
-    fn from(refusal: ReadRefusal) -> Self {
-        Self::File(refusal)
-    }
-}
 
 fn schema() -> Schema {
     let price = |name: &str| Field::new(name, PRICE_TYPE, false);
@@ -102,10 +64,10 @@ pub fn encode(
     key: &QuotesKey,
     bars: &[QuoteBar],
     provenance: &Provenance,
-) -> Result<Vec<u8>, EncodeRefusal> {
+) -> Result<Vec<u8>, parquet::EncodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     if provenance.subscription().provider() != provider {
-        return Err(EncodeRefusal::SubscriptionProvider {
+        return Err(parquet::EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
             key: provider,
         });
@@ -113,7 +75,7 @@ pub fn encode(
     let ordered = parquet::place(bars, interval, session, |bar| {
         (bar.symbol(), bar.interval(), bar.timestamp())
     })
-    .map_err(EncodeRefusal::Placement)?;
+    .map_err(parquet::EncodeRefusal::Placement)?;
     let mut symbols = StringBuilder::new();
     let mut timestamps = TimestampMicrosecondBuilder::new().with_timezone("UTC");
     let mut quote_counts = UInt64Builder::new();
@@ -125,7 +87,7 @@ pub fn encode(
     let mut sizes: [Decimal128Builder; 2] = std::array::from_fn(|_| Decimal128Builder::new());
     for bar in ordered {
         let (symbol, timestamp) = (bar.symbol(), bar.timestamp());
-        let unrepresentable = || EncodeRefusal::Unrepresentable {
+        let unrepresentable = || parquet::EncodeRefusal::Unrepresentable {
             symbol: symbol.clone(),
             timestamp,
         };
@@ -190,19 +152,19 @@ pub fn encode(
         ask_size,
     ];
     parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata())
-        .map_err(|reason| EncodeRefusal::Parquet { reason })
+        .map_err(|reason| parquet::EncodeRefusal::Parquet { reason })
 }
 
 /// The quote bars and provenance a file written by `encode` under `key` holds, each rebuilt through `QuoteBar::new`.
 pub fn decode(
     key: &QuotesKey,
     bytes: Vec<u8>,
-) -> Result<(Vec<QuoteBar>, Provenance), DecodeRefusal> {
+) -> Result<(Vec<QuoteBar>, Provenance), parquet::DecodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
-        return Err(DecodeRefusal::Provider {
+        return Err(parquet::DecodeRefusal::Provider {
             provenance,
             key: provider,
         });
@@ -252,7 +214,7 @@ pub fn decode(
         };
         for row in 0..batch.num_rows() {
             let index = bars.len();
-            bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
+            bars.push(read(row).map_err(|cause| parquet::DecodeRefusal::Row { index, cause })?);
         }
     }
     Ok((bars, provenance))
@@ -265,12 +227,13 @@ mod tests {
 
     use super::*;
     use crate::archive::bars::Subscription;
+    use crate::archive::parquet::PlacementRefusal;
     use crate::common::journal::{Commit, RunId};
     use crate::common::market::Price;
     use crate::common::market::quote_bars::QuoteFold;
     use crate::common::market::record::BarInterval;
     use crate::common::market::record::Quote;
-    use crate::common::storage::Origin;
+    use crate::common::storage::{Origin, Provider};
     use crate::common::time::SessionDate;
 
     fn session() -> SessionDate {
@@ -341,7 +304,7 @@ mod tests {
         );
         assert!(matches!(
             encode(&other, &bars(), &provenance()),
-            Err(EncodeRefusal::Placement(
+            Err(parquet::EncodeRefusal::Placement(
                 PlacementRefusal::OutsideKey { .. }
             ))
         ));

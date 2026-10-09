@@ -53,7 +53,6 @@ pub enum RowRefusal {
     ActionId(ActionIdRefusal),
     SplitRatio(SplitRatioRefusal),
     Boundary(SeriesBoundaryRefusal),
-    /// A corporate action with no date to place it on.
     Undated,
     /// A security type code no variant names.
     SecurityType {

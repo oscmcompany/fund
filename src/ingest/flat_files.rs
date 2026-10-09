@@ -99,39 +99,19 @@ impl Listed {
 }
 
 /// Why a flat-file request produced nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FlatFileError {
-    List {
-        prefix: String,
-        reason: String,
-    },
-    Get {
-        path: String,
-        reason: String,
-    },
+    #[error("listing {prefix} failed: {reason}")]
+    List { prefix: String, reason: String },
+    #[error("reading {path} failed: {reason}")]
+    Get { path: String, reason: String },
     /// A range answered with a different number of bytes than asked for.
+    #[error("{path} answered {received} bytes where {asked} were asked for")]
     ShortRange {
         path: String,
         asked: u64,
         received: u64,
     },
-}
-
-impl std::fmt::Display for FlatFileError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::List { prefix, reason } => write!(formatter, "listing {prefix} failed: {reason}"),
-            Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
-            Self::ShortRange {
-                path,
-                asked,
-                received,
-            } => write!(
-                formatter,
-                "{path} answered {received} bytes where {asked} were asked for"
-            ),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -255,20 +235,11 @@ impl FlatFiles {
 }
 
 /// Why a flat bar file was not read at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseRefusal {
     /// A gzip or CSV error, with the line it stopped on where the reader knows it.
+    #[error("malformed at line {line:?}: {reason}")]
     Malformed { line: Option<u64>, reason: String },
-}
-
-impl std::fmt::Display for ParseRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malformed { line, reason } => {
-                write!(formatter, "malformed at line {line:?}: {reason}")
-            }
-        }
-    }
 }
 
 /// A flat bar file's row, which carries no volume-weighted price, so its bars carry no dollar volume.
@@ -698,16 +669,16 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap())
     }
 
-    /// Rows copied from Massive's `day_aggs_v1` file for 2026-10-02.
+    /// A `day_aggs_v1` file for 2026-10-02 with invented values in Massive's shape, one row per notation case.
     const DAILY: &str = "ticker,volume,open,close,high,low,window_start,transactions
-AAPL,33278552.153126,333.260000,333.690000,334.540000,330.610000,1790913600000000000,628334
-BApA,1733619.463400,60.550000,60.040000,60.770000,59.550000,1790913600000000000,1344
-BCATrw,89401.000000,0.005500,0.007500,0.007500,0.005000,1790913600000000000,101
-BRK.B,4193461.418487,500.100000,502.650000,503.620000,499.010000,1790913600000000000,102058
-DCOMp,10461.533600,16.780000,16.820000,16.870000,16.700100,1790913600000000000,79
-NE.WS.A,364.000000,16.000000,15.580000,16.000000,15.580000,1790913600000000000,7
-NMCOr,1223988.000000,0.022500,0.030000,0.034000,0.022500,1790913600000000000,2420
-ZZZTA,6944.000000,4974.800000,5500.000000,5500.000000,4974.800000,1790913600000000000,942
+ABC,33000000.125000,333.250000,333.750000,334.500000,330.500000,1790913600000000000,630000
+ABC.B,4200000.250000,500.000000,502.500000,503.750000,499.000000,1790913600000000000,100000
+ABFpA,1700000.500000,60.500000,60.000000,60.750000,59.500000,1790913600000000000,1300
+ABHp,10500.250000,16.750000,16.800000,16.875000,16.700100,1790913600000000000,80
+ABJ.WS.A,400.000000,16.000000,15.500000,16.000000,15.500000,1790913600000000000,7
+ABLrw,89000.000000,0.005500,0.007500,0.007500,0.005000,1790913600000000000,100
+ABMr,1200000.000000,0.022500,0.030000,0.034000,0.022500,1790913600000000000,2400
+ZZZTA,7000.000000,5000.000000,5500.000000,5500.000000,5000.000000,1790913600000000000,900
 ";
 
     #[test]
@@ -720,25 +691,25 @@ ZZZTA,6944.000000,4974.800000,5500.000000,5500.000000,4974.800000,17909136000000
             .iter()
             .map(|bar| bar.symbol().as_str())
             .collect();
-        assert_eq!(symbols, ["AAPL", "BA.PRA", "BRK.B", "NMCO.RT"]);
+        assert_eq!(symbols, ["ABC", "ABC.B", "ABF.PRA", "ABM.RT"]);
         assert_eq!(parsed.test_tickers(), ["ZZZTA"]);
         let refused: Vec<&str> = parsed.refused().iter().map(RefusedRow::ticker).collect();
         // The same three the grouped daily refuses: no rule maps them and `Symbol` takes one suffix.
-        assert_eq!(refused, ["BCATrw", "DCOMp", "NE.WS.A"]);
-        let apple = &parsed.bars()[0];
-        assert_eq!(apple.timestamp().to_rfc3339(), "2026-10-02T20:00:00+00:00");
-        assert_eq!(apple.prices().close().ticks(), 333_690_000);
-        assert_eq!(apple.volume().units(), 33_278_552_153_126);
-        assert_eq!(apple.trade_count().map(TradeCount::count), Some(628_334));
-        assert_eq!(apple.dollar_volume(), None);
+        assert_eq!(refused, ["ABHp", "ABJ.WS.A", "ABLrw"]);
+        let abc = &parsed.bars()[0];
+        assert_eq!(abc.timestamp().to_rfc3339(), "2026-10-02T20:00:00+00:00");
+        assert_eq!(abc.prices().close().ticks(), 333_750_000);
+        assert_eq!(abc.volume().units(), 33_000_000_125_000);
+        assert_eq!(abc.trade_count().map(TradeCount::count), Some(630_000));
+        assert_eq!(abc.dollar_volume(), None);
     }
 
     #[test]
     fn test_a_minute_file_keeps_each_minute_at_its_start() {
         let minute = "ticker,volume,open,close,high,low,window_start,transactions
-AAPL,13809.484049,331.050000,331.170000,331.501900,330.880000,1790928000000000000,801
-AAPL,7171.021026,331.330000,331.310000,331.590000,330.550000,1790928060000000000,452
-BApA,250.116310,60.550000,60.550000,60.550000,60.550000,1790947800000000000,12
+ABC,13800.125000,331.000000,331.250000,331.500000,330.875000,1790928000000000000,800
+ABC,7200.500000,331.250000,331.300000,331.600000,330.550000,1790928060000000000,450
+ABFpA,250.125000,60.500000,60.500000,60.500000,60.500000,1790947800000000000,12
 ";
         let parsed = BarFile::Minute
             .parse_bars(&gzipped(minute), october_second())
@@ -756,10 +727,10 @@ BApA,250.116310,60.550000,60.550000,60.550000,60.550000,1790947800000000000,12
         assert_eq!(
             stamped,
             [
-                ("AAPL".to_string(), "2026-10-02T08:00:00+00:00".to_string()),
-                ("AAPL".to_string(), "2026-10-02T08:01:00+00:00".to_string()),
+                ("ABC".to_string(), "2026-10-02T08:00:00+00:00".to_string()),
+                ("ABC".to_string(), "2026-10-02T08:01:00+00:00".to_string()),
                 (
-                    "BA.PRA".to_string(),
+                    "ABF.PRA".to_string(),
                     "2026-10-02T13:30:00+00:00".to_string()
                 ),
             ]
@@ -770,9 +741,9 @@ BApA,250.116310,60.550000,60.550000,60.550000,60.550000,1790947800000000000,12
     #[test]
     fn test_a_row_for_another_session_or_claimed_twice_is_refused() {
         let rows = "ticker,volume,open,close,high,low,window_start,transactions
-AAPL,1.0,1.0,1.0,1.0,1.0,1790913600000000000,1
-AAPL,2.0,2.0,2.0,2.0,2.0,1790913600000000000,1
-MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
+ABC,1.0,1.0,1.0,1.0,1.0,1790913600000000000,1
+ABC,2.0,2.0,2.0,2.0,2.0,1790913600000000000,1
+ABD,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
 ";
         let parsed = BarFile::Daily
             .parse_bars(&gzipped(rows), october_second())
@@ -786,9 +757,9 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
         assert_eq!(
             causes,
             [
-                ("AAPL", "duplicate"),
-                ("AAPL", "duplicate"),
-                ("MSFT", "session")
+                ("ABC", "duplicate"),
+                ("ABC", "duplicate"),
+                ("ABD", "session")
             ]
         );
     }
@@ -828,7 +799,7 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
 
     #[test]
     fn test_a_broken_bar_file_names_its_line() {
-        let broken = format!("{DAILY}AAPL,not-a-number,1,1,1,1,1790913600000000000,1\n");
+        let broken = format!("{DAILY}ABC,not-a-number,1,1,1,1,1790913600000000000,1\n");
         assert!(matches!(
             BarFile::Daily.parse_bars(&gzipped(&broken), october_second()),
             Err(ParseRefusal::Malformed { line: Some(10), .. })
@@ -837,25 +808,26 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
 
     #[test]
     fn test_each_quote_row_is_a_quote_a_test_ticker_one_sided_or_refused() {
-        // The header and first rows of Massive's quotes for 2021-08-23 and 2026-09-18, plus a crossed, a negative-bid and a test row.
+        // Massive's quote header with invented rows for 2021-08-23 and 2026-09-18: a quote, an empty book, a crossed, a
+        // negative-bid and a test row.
         let rows = "ticker,ask_exchange,ask_price,ask_size,bid_exchange,bid_price,bid_size,conditions,indicators,participant_timestamp,sequence_number,sip_timestamp,tape,trf_timestamp
-A,8,180.0,100,11,164.28,100,\"1,81\",,1629716400001245000,79497,1629716400044243200,1,0
-A,12,0.0,0,12,0.0,0,\"1,81\",,1789715092739044279,172,1789715092739508637,1,0
-BApA,11,60.10,200,8,60.20,100,\"1,81\",,1629716446119912192,81265,1629716446119946496,1,0
-A,8,180.0,100,11,-1.0,100,\"1,81\",,1629716446119912192,81266,1629716446119946496,1,0
-ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,1629716446119946496,1,0
+ABC,8,51.0,100,11,50.25,100,\"1,81\",,1629716400001234500,1001,1629716400012345600,1,0
+ABC,12,0.0,0,12,0.0,0,\"1,81\",,1789715092000000123,2,1789715092000000456,1,0
+ABFpA,11,60.00,200,8,60.25,100,\"1,81\",,1629716446000000256,2001,1629716446000000512,1,0
+ABC,8,51.0,100,11,-1.0,100,\"1,81\",,1629716446000000256,2002,1629716446000000512,1,0
+ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446000000256,2001,1629716446000000512,1,0
 ";
         let mut outcomes = Vec::new();
         read_quotes(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
         assert_eq!(outcomes.len(), 5);
         match &outcomes[0] {
             QuoteRowOutcome::Quote(quote) => {
-                assert_eq!(quote.symbol().as_str(), "A");
-                assert_eq!(quote.bid().ticks(), 164_280_000);
+                assert_eq!(quote.symbol().as_str(), "ABC");
+                assert_eq!(quote.bid().ticks(), 50_250_000);
                 assert_eq!(quote.ask_size().units(), 100_000_000);
                 assert_eq!(
                     quote.timestamp().to_rfc3339(),
-                    "2021-08-23T11:00:00.044243200+00:00"
+                    "2021-08-23T11:00:00.012345600+00:00"
                 );
             }
             other @ (QuoteRowOutcome::TestTicker
@@ -865,25 +837,25 @@ ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,16297164461199464
         assert_eq!(outcomes[1], QuoteRowOutcome::OneSided);
         assert!(matches!(
             &outcomes[2],
-            QuoteRowOutcome::Refused(row) if row.ticker() == "BApA"
+            QuoteRowOutcome::Refused(row) if row.ticker() == "ABFpA"
         ));
         // A negative bid is a bad price, not a missing side, as Alpaca's rows read it.
         assert!(matches!(
             &outcomes[3],
             QuoteRowOutcome::Refused(row)
-                if row.ticker() == "A" && <&'static str>::from(row.cause().kind()) == "price"
+                if row.ticker() == "ABC" && <&'static str>::from(row.cause().kind()) == "price"
         ));
         assert_eq!(outcomes[4], QuoteRowOutcome::TestTicker);
     }
 
     #[test]
     fn test_each_trade_row_carries_its_conditions_and_correction() {
-        // The header and first rows of Massive's trades for 2026-09-18, a corrected copy, and two refusals.
+        // Massive's trade header with invented rows for 2026-09-18: a print, a late corrected copy, a refusal and an unsized print.
         let rows = "ticker,conditions,correction,exchange,id,participant_timestamp,price,sequence_number,sip_timestamp,size,tape,trf_id,trf_timestamp
-A,\"12,37\",0,4,71675222901845,1789718400814766587,157.350000,3372,1789718400831008119,10.000000,1,202,1789718400830651291
-A,,1,4,71675225257543,1789706368198846000,156.340000,3610,1789718406372522227,0.001500,1,202,1789718406372164990
-A,\"12,x\",0,4,71675225257544,1789706368198859000,156.340000,3611,1789718406372684563,0.711800,1,202,1789718406372327693
-A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1,202,1789718406372327693
+ABC,\"12,37\",0,4,70000000000001,1789718400000000123,50.250000,1001,1789718400000000456,10.000000,1,202,1789718400000000400
+ABC,,1,4,70000000000002,1789706400000000000,50.000000,1002,1789718406000000123,0.002500,1,202,1789718406000000100
+ABC,\"12,x\",0,4,70000000000003,1789706400000000500,50.000000,1003,1789718406000000789,0.500000,1,202,1789718406000000700
+ABC,,,4,70000000000004,1789706400000000500,50.000000,1004,1789718406000000789,0,1,202,1789718406000000700
 ";
         let mut outcomes = Vec::new();
         read_trades(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();
@@ -894,7 +866,7 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
                 conditions,
                 correction,
             } => {
-                assert_eq!(trade.price().ticks(), 157_350_000);
+                assert_eq!(trade.price().ticks(), 50_250_000);
                 assert_eq!(trade.size().units(), 10_000_000);
                 assert_eq!(
                     conditions,
@@ -926,10 +898,10 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
 
     #[test]
     fn test_a_correction_record_stands_and_what_it_replaces_or_cancels_is_withdrawn() {
-        // GRAB's 1,500,000-share print on 2025-11-04 and the record that replaced it, trimmed from Massive's file.
+        // An invented 1,000,000-share print on 2025-11-04 and the later record that replaces it, in Massive's shape.
         let rows = "ticker,conditions,correction,exchange,id,participant_timestamp,price,sequence_number,sip_timestamp,size,tape,trf_id,trf_timestamp
-GRAB,\"53,32,35,41\",1,4,1,1762272164704000000,5.900000,1,1762272164704409379,1500000,3,202,1762272164704000000
-GRAB,\"53,35,41\",12,4,2,1762287697649000000,5.900000,2,1762287697649651762,1500000,3,202,1762287697649000000
+ABC,\"53,32,35,41\",1,4,1,1762272000500000000,6.000000,1,1762272000500000123,1000000,3,202,1762272000500000000
+ABC,\"53,35,41\",12,4,2,1762286400250000000,6.000000,2,1762286400250000456,1000000,3,202,1762286400250000000
 ";
         let mut outcomes = Vec::new();
         read_trades(gzipped(rows).as_slice(), |outcome| outcomes.push(outcome)).unwrap();

@@ -24,102 +24,61 @@ pub struct Archive {
 }
 
 /// Why a write or read did not complete.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ArchiveError {
-    Put {
-        path: String,
-        reason: String,
-    },
-    Get {
-        path: String,
-        reason: String,
-    },
+    #[error("writing {path} failed: {reason}")]
+    Put { path: String, reason: String },
+    #[error("reading {path} failed: {reason}")]
+    Get { path: String, reason: String },
+    #[error("listing {series} failed: {reason}")]
     List {
         series: SeriesPrefix,
         reason: String,
     },
-    Delete {
-        path: String,
-        reason: String,
-    },
+    #[error("deleting {path} failed: {reason}")]
+    Delete { path: String, reason: String },
     /// A create found the key already written, or a replace found it changed since it was read.
-    Contended {
-        path: String,
-    },
+    #[error("{path} was written by someone else first; read it again")]
+    Contended { path: String },
     /// The key's storage class cannot be read back, so this path cannot verify it; raw ticks go through `raw`.
-    Unverifiable {
-        path: String,
-    },
-    /// Read back different bytes than were written.
+    #[error("{path} lands in Deep Archive, which cannot be read back")]
+    Unverifiable { path: String },
+    #[error("{path} read back {read} bytes where {written} were written")]
     ReadBackMismatch {
         path: String,
         written: usize,
         read: usize,
     },
-    /// Written, then found absent when read back.
-    VanishedAfterWrite {
-        path: String,
-        written: usize,
-    },
+    #[error("{path} was absent when read back after {written} bytes were written")]
+    VanishedAfterWrite { path: String, written: usize },
 }
-
-impl std::fmt::Display for ArchiveError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Put { path, reason } => write!(formatter, "writing {path} failed: {reason}"),
-            Self::Get { path, reason } => write!(formatter, "reading {path} failed: {reason}"),
-            Self::List { series, reason } => write!(formatter, "listing {series} failed: {reason}"),
-            Self::Delete { path, reason } => write!(formatter, "deleting {path} failed: {reason}"),
-            Self::Contended { path } => {
-                write!(
-                    formatter,
-                    "{path} was written by someone else first; read it again"
-                )
-            }
-            Self::Unverifiable { path } => {
-                write!(
-                    formatter,
-                    "{path} lands in Deep Archive, which cannot be read back"
-                )
-            }
-            Self::ReadBackMismatch {
-                path,
-                written,
-                read,
-            } => write!(
-                formatter,
-                "{path} read back {read} bytes where {written} were written"
-            ),
-            Self::VanishedAfterWrite { path, written } => {
-                write!(
-                    formatter,
-                    "{path} was absent when read back after {written} bytes were written"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ArchiveError {}
 
 /// Why a file of any layout was not encoded, kept as the layout's own refusal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EncodeRefusal {
-    Bars(bars::EncodeRefusal),
-    QuoteBars(quote_bars::EncodeRefusal),
-    TradeBars(trade_bars::EncodeRefusal),
+    /// Vendor, quote and trade bars share one refusal, so the layout is named by the key the caller holds.
+    #[error("bars not encoded: {0:?}")]
+    Bars(parquet::EncodeRefusal),
+    #[error("reference table not encoded: {0:?}")]
     Reference(reference::ReferenceRefusal),
+    #[error("journal not encoded: {0:?}")]
     Journal(journal::EncodeRefusal),
+    #[error("logs not encoded: {0:?}")]
     Logs(logs::EncodeRefusal),
 }
 
 /// Why a file of any layout was not decoded, kept as the layout's own refusal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DecodeRefusal {
-    Bars(bars::DecodeRefusal),
-    QuoteBars(quote_bars::DecodeRefusal),
-    TradeBars(trade_bars::DecodeRefusal),
+    /// Quote and trade bars share one refusal, so the layout is named by the key the caller holds.
+    #[error("bars not decoded: {0}")]
+    Bars(parquet::DecodeRefusal),
+    /// Vendor bars, at any interval, add the refusal of a file holding none.
+    #[error("bars not decoded: {0}")]
+    VendorBars(bars::DecodeRefusal),
+    #[error("reference table not decoded: {0:?}")]
     Reference(reference::ReferenceRefusal),
+    #[error("journal not decoded: {0:?}")]
     Journal(journal::DecodeRefusal),
 }
 
@@ -135,51 +94,15 @@ macro_rules! wrap_refusal {
 }
 
 wrap_refusal!(
-    EncodeRefusal::Bars(bars::EncodeRefusal),
-    EncodeRefusal::QuoteBars(quote_bars::EncodeRefusal),
-    EncodeRefusal::TradeBars(trade_bars::EncodeRefusal),
+    EncodeRefusal::Bars(parquet::EncodeRefusal),
     EncodeRefusal::Reference(reference::ReferenceRefusal),
     EncodeRefusal::Journal(journal::EncodeRefusal),
     EncodeRefusal::Logs(logs::EncodeRefusal),
-    DecodeRefusal::Bars(bars::DecodeRefusal),
-    DecodeRefusal::QuoteBars(quote_bars::DecodeRefusal),
-    DecodeRefusal::TradeBars(trade_bars::DecodeRefusal),
+    DecodeRefusal::Bars(parquet::DecodeRefusal),
+    DecodeRefusal::VendorBars(bars::DecodeRefusal),
     DecodeRefusal::Reference(reference::ReferenceRefusal),
     DecodeRefusal::Journal(journal::DecodeRefusal),
 );
-
-impl std::fmt::Display for EncodeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bars(refusal) => write!(formatter, "bars not encoded: {refusal:?}"),
-            Self::QuoteBars(refusal) => write!(formatter, "quote bars not encoded: {refusal:?}"),
-            Self::TradeBars(refusal) => write!(formatter, "trade bars not encoded: {refusal:?}"),
-            Self::Reference(refusal) => {
-                write!(formatter, "reference table not encoded: {refusal:?}")
-            }
-            Self::Journal(refusal) => write!(formatter, "journal not encoded: {refusal:?}"),
-            Self::Logs(refusal) => write!(formatter, "logs not encoded: {refusal:?}"),
-        }
-    }
-}
-
-impl std::error::Error for EncodeRefusal {}
-
-impl std::fmt::Display for DecodeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bars(refusal) => write!(formatter, "bars not decoded: {refusal:?}"),
-            Self::QuoteBars(refusal) => write!(formatter, "quote bars not decoded: {refusal:?}"),
-            Self::TradeBars(refusal) => write!(formatter, "trade bars not decoded: {refusal}"),
-            Self::Reference(refusal) => {
-                write!(formatter, "reference table not decoded: {refusal:?}")
-            }
-            Self::Journal(refusal) => write!(formatter, "journal not decoded: {refusal:?}"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeRefusal {}
 
 impl Archive {
     /// The shared market-data archive named by `AWS_S3_ARCHIVE_BUCKET_NAME`, which only the archiver writes.
@@ -451,7 +374,7 @@ mod tests {
     use chrono::{NaiveDate, Utc};
     use uuid::Uuid;
 
-    use super::bars::{Provenance, Subscription, decode, encode};
+    use super::bars::{Provenance, Subscription};
     use super::*;
     use crate::common::journal::RunId;
     use crate::common::storage::Provider;
@@ -521,11 +444,12 @@ mod tests {
         );
         let written =
             crate::common::market::record::BarPartition::try_from(daily.bars().to_vec()).unwrap();
-        let body = encode(&key, &written, &provenance).unwrap();
+        let body = bars::encode(&key, &written, &provenance).unwrap();
         let configuration = aws_config::load_from_env().await;
         let archive = Archive::market_data(&configuration).unwrap();
         archive.put(&key.into(), body.clone()).await.unwrap();
-        let (bars, read) = decode(&key, archive.get(&key.into()).await.unwrap().unwrap()).unwrap();
+        let (bars, read) =
+            bars::decode(&key, archive.get(&key.into()).await.unwrap().unwrap()).unwrap();
         println!(
             "{} bars, {} bytes, {}",
             bars.bars().len(),

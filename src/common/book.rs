@@ -212,21 +212,12 @@ impl Fill {
 }
 
 /// Why a book could not be marked: it holds a symbol with no price.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum ValuationRefusal {
+    #[error("the book holds {symbol} with no price")]
     Unpriced { symbol: Symbol },
 }
-
-impl std::fmt::Display for ValuationRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unpriced { symbol } => write!(formatter, "the book holds {symbol} with no price"),
-        }
-    }
-}
-
-impl std::error::Error for ValuationRefusal {}
 
 /// Cash and every non-zero position; a zero position is dropped, so equal holdings are equal books.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

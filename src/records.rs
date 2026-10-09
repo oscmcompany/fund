@@ -15,7 +15,7 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
 
-use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journal, logs};
+use crate::archive::{self, Archive, ArchiveError, logs};
 use crate::common::journal::{ConfigurationResolved, Observation, RunId, read};
 use crate::common::storage::{Host, JournalKey, Key, LogsKey, Service};
 use crate::common::time::SessionDate;
@@ -167,41 +167,23 @@ pub fn log_file_name(service: &Service, session: SessionDate) -> String {
 }
 
 /// Why one records file did not land in the bucket.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ShipFailure {
+    #[error("reading {} failed: {error}", .path.display())]
     Read {
         path: PathBuf,
         error: std::io::Error,
     },
-    Encode(EncodeRefusal),
-    Decode(DecodeRefusal),
+    #[error("{0}")]
+    Encode(archive::EncodeRefusal),
+    #[error("{0}")]
+    Decode(archive::DecodeRefusal),
+    #[error("{0}")]
     Archive(ArchiveError),
     /// Another writer changed the object on each of this many attempts.
-    Contended {
-        attempts: u32,
-    },
+    #[error("another writer changed the object on each of {attempts} attempts")]
+    Contended { attempts: u32 },
 }
-
-impl std::fmt::Display for ShipFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Read { path, error } => {
-                write!(formatter, "reading {} failed: {error}", path.display())
-            }
-            Self::Encode(refusal) => write!(formatter, "{refusal}"),
-            Self::Decode(refusal) => write!(formatter, "{refusal}"),
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Contended { attempts } => {
-                write!(
-                    formatter,
-                    "another writer changed the object on each of {attempts} attempts"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ShipFailure {}
 
 /// Each recent journal and log file that exists, encoded under its key, or why it could not be.
 fn shipments(
@@ -218,7 +200,7 @@ fn shipments(
         let journal_path = journal_directory.join(crate::journal::file_name(session));
         if let Some(contents) = contents(&journal_path) {
             let encoded = contents.and_then(|text| {
-                journal::encode(&journal_key, &read(&text))
+                archive::journal::encode(&journal_key, &read(&text))
                     .map_err(|refusal| ShipFailure::Encode(refusal.into()))
             });
             shipments.push((journal_key.into(), encoded));

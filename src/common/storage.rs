@@ -428,16 +428,22 @@ impl std::fmt::Display for SeriesPrefix {
 }
 
 /// Why a path was not read as a key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyRefusal {
+    #[error("`{path}` is not a key")]
     Unrecognized { path: String },
 }
 
-impl std::fmt::Display for KeyRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unrecognized { path } => write!(formatter, "`{path}` is not a key"),
-        }
+/// Accepts only the exact path `path()` writes, so no two paths name one key.
+impl std::str::FromStr for Key {
+    type Err = KeyRefusal;
+
+    fn from_str(path: &str) -> Result<Self, Self::Err> {
+        parse_segments(&path.split('/').collect::<Vec<_>>())
+            .filter(|key| key.path() == path)
+            .ok_or_else(|| KeyRefusal::Unrecognized {
+                path: path.to_string(),
+            })
     }
 }
 
@@ -445,7 +451,7 @@ impl TryFrom<String> for Key {
     type Error = KeyRefusal;
 
     fn try_from(path: String) -> Result<Self, Self::Error> {
-        Self::parse(&path)
+        path.parse()
     }
 }
 
@@ -539,15 +545,6 @@ impl Key {
             | Self::Journal(..)
             | Self::Logs(..) => StorageClass::Standard,
         }
-    }
-
-    /// Accepts only the exact path `path()` writes, so no two paths name one key.
-    pub fn parse(path: &str) -> Result<Self, KeyRefusal> {
-        parse_segments(&path.split('/').collect::<Vec<_>>())
-            .filter(|key| key.path() == path)
-            .ok_or_else(|| KeyRefusal::Unrecognized {
-                path: path.to_string(),
-            })
     }
 }
 
@@ -799,7 +796,7 @@ pub(crate) mod tests {
         ];
         for (key, path) in cases {
             assert_eq!(key.path(), path);
-            assert_eq!(Key::parse(path), Ok(key));
+            assert_eq!(path.parse::<Key>(), Ok(key));
         }
     }
 
@@ -826,7 +823,7 @@ pub(crate) mod tests {
             "records/journal/producer=archiver/year=2026/month=08/day=03/data.parquet.metadata",
         ] {
             assert_eq!(
-                Key::parse(path),
+                path.parse::<Key>(),
                 Err(KeyRefusal::Unrecognized {
                     path: path.to_string()
                 }),
@@ -951,7 +948,7 @@ pub(crate) mod tests {
         /// A round trip makes `path` injective: two keys that shared a path would parse back to the same key.
         #[test]
         fn property_a_path_parses_back_to_its_key(key in any_key()) {
-            prop_assert_eq!(Key::parse(&key.path()), Ok(key));
+            prop_assert_eq!(key.path().parse::<Key>(), Ok(key));
         }
 
         /// A key serializes as its path string and deserializes back to itself.
@@ -977,7 +974,7 @@ pub(crate) mod tests {
             let rest = path.strip_prefix(key.series().as_str());
             prop_assert!(rest.is_some(), "{} outside {}", path, key.series());
             prop_assert!(!rest.unwrap().contains("provider="), "{}", path);
-            prop_assert_eq!(Key::parse(&path).map(|parsed| parsed.session()), Ok(key.session()));
+            prop_assert_eq!(path.parse::<Key>().map(|parsed| parsed.session()), Ok(key.session()));
         }
 
         /// A listing under one series finds exactly one key's series, and never a neighbour's.

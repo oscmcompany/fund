@@ -63,17 +63,10 @@ enum Tree {
 }
 
 /// Why a commit was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommitRefusal {
+    #[error("`{raw}` is not a 40-character git sha")]
     Malformed { raw: String },
-}
-
-impl std::fmt::Display for CommitRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malformed { raw } => write!(formatter, "`{raw}` is not a 40-character git sha"),
-        }
-    }
 }
 
 impl Commit {
@@ -114,8 +107,6 @@ impl std::fmt::Display for Commit {
         write!(formatter, "{}{suffix}", self.sha)
     }
 }
-
-impl std::error::Error for CommitRefusal {}
 
 impl std::str::FromStr for Commit {
     type Err = CommitRefusal;
@@ -745,7 +736,7 @@ mod tests {
         let object_written = ObjectWritten::new(raw_trades.clone(), 4_096);
         let object_deleted = ObjectDeleted::new(raw_trades);
         let finished = HealFinished::new(
-            Window::try_from(vec![session]).unwrap(),
+            Window::new(vec![session]).unwrap(),
             BTreeMap::from([(
                 Leg::MassiveDailyBars,
                 BTreeMap::from([
@@ -1642,7 +1633,7 @@ mod tests {
                 ),
             )
                 .prop_map(|(window, outcomes, unrecognized)| {
-                    let window = Window::try_from(window.into_iter().collect::<Vec<_>>()).unwrap();
+                    let window = Window::new(window.into_iter().collect::<Vec<_>>()).unwrap();
                     Observation::HealFinished(HealFinished::new(window, outcomes, unrecognized))
                 }),
             any_bar_built().prop_map(Observation::BarBuilt),

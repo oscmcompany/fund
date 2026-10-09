@@ -12,48 +12,25 @@ use crate::common::strategy::Strategy;
 use crate::laboratory::dataset::Dataset;
 use crate::laboratory::{Study, StudyError};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReplayStudyError {
     /// The dataset holds no bar of the interval the strategy decides on, so it would never decide.
-    NoDecisionBars {
-        decision: BarInterval,
-    },
+    #[error("the dataset holds no {decision} bar to decide on")]
+    NoDecisionBars { decision: BarInterval },
     /// A strategy parameter names a setting the replay journals itself.
-    ReservedParameter {
-        setting: ReplaySetting,
-    },
+    #[error("the parameter {setting} is one the replay journals itself")]
+    ReservedParameter { setting: ReplaySetting },
+    #[error("the replay was refused: {0:?}")]
     Replay(ReplayRefusal),
+    #[error("the returns were refused: {0}")]
     Series(SeriesRefusal),
+    #[error("the estimate was refused: {0}")]
     Estimate(EstimateRefusal),
+    #[error("the experiment was refused: {0}")]
     Experiment(ExperimentRefusal),
+    #[error("{0}")]
     Study(StudyError),
 }
-
-impl std::fmt::Display for ReplayStudyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoDecisionBars { decision } => {
-                write!(
-                    formatter,
-                    "the dataset holds no {decision} bar to decide on"
-                )
-            }
-            Self::ReservedParameter { setting } => {
-                write!(
-                    formatter,
-                    "the parameter {setting} is one the replay journals itself"
-                )
-            }
-            Self::Replay(refusal) => write!(formatter, "the replay was refused: {refusal:?}"),
-            Self::Series(refusal) => write!(formatter, "the returns were refused: {refusal}"),
-            Self::Estimate(refusal) => write!(formatter, "the estimate was refused: {refusal}"),
-            Self::Experiment(refusal) => write!(formatter, "the experiment was refused: {refusal}"),
-            Self::Study(error) => write!(formatter, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for ReplayStudyError {}
 
 /// A setting every replay journals itself, by the name it is journaled under.
 #[derive(
@@ -87,22 +64,11 @@ pub(crate) enum ReplayMetric {
 pub struct Opening(Cash);
 
 /// An opening that holds no cash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("an opening of {} dollars funds nothing", .cash.dollars())]
 pub struct Unfunded {
     cash: Cash,
 }
-
-impl std::fmt::Display for Unfunded {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "an opening of {} dollars funds nothing",
-            self.cash.dollars()
-        )
-    }
-}
-
-impl std::error::Error for Unfunded {}
 
 impl Opening {
     pub fn new(cash: Cash) -> Result<Self, Unfunded> {

@@ -100,28 +100,14 @@ pub struct SessionRange {
 }
 
 /// Why a range was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SessionRangeRefusal {
+    #[error("the range {first} to {last} ends before it starts")]
     Inverted {
         first: SessionDate,
         last: SessionDate,
     },
 }
-
-impl std::fmt::Display for SessionRangeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inverted { first, last } => {
-                write!(
-                    formatter,
-                    "the range {first} to {last} ends before it starts"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SessionRangeRefusal {}
 
 impl SessionRange {
     pub fn new(first: SessionDate, last: SessionDate) -> Result<Self, SessionRangeRefusal> {

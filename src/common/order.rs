@@ -35,9 +35,54 @@ impl ClientOrderId {
         Self { run, sequence }
     }
 
-    /// Reads an identifier back, refusing any string other than exactly what `Display` writes, so another spelling of
-    /// one of ours is not ours.
-    pub fn parse(raw: &str) -> Result<Self, ClientOrderIdRefusal> {
+    pub fn run(self) -> RunId {
+        self.run
+    }
+
+    pub fn sequence(self) -> u32 {
+        self.sequence
+    }
+}
+
+/// A run's next place in its order sequence, so no id drawn from it repeats an earlier draw.
+#[derive(Debug, Default)]
+pub struct OrderSequence(u32);
+
+impl OrderSequence {
+    pub fn draw(&mut self, run: RunId) -> ClientOrderId {
+        let sequence = self.0;
+        self.0 = sequence
+            .checked_add(1)
+            .expect("a run sends fewer than u32::MAX orders");
+        ClientOrderId::new(run, sequence)
+    }
+}
+
+/// Why a string is not a client order id this system writes, by the part that failed, with the string refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClientOrderIdRefusal {
+    /// Not three colon-separated fields under the `fund` prefix.
+    #[error(
+        "`{raw}` is not a client order id this system writes: not `{CLIENT_ORDER_ID_PREFIX}:<run>:<sequence>`"
+    )]
+    Shape { raw: String },
+    /// The run field is not a UUID.
+    #[error("`{raw}` is not a client order id this system writes: the run is not a UUID")]
+    Run { raw: String },
+    /// The sequence field is not a `u32`.
+    #[error("`{raw}` is not a client order id this system writes: the sequence is not a u32")]
+    Sequence { raw: String },
+    /// Every field reads, but not in the spelling `Display` writes.
+    #[error("`{raw}` is not a client order id this system writes: not the spelling written")]
+    Spelling { raw: String },
+}
+
+/// Reads an identifier back, refusing any string other than exactly what `Display` writes, so another spelling of
+/// one of ours is not ours.
+impl std::str::FromStr for ClientOrderId {
+    type Err = ClientOrderIdRefusal;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let mut fields = raw.split(':');
         let (Some(CLIENT_ORDER_ID_PREFIX), Some(run), Some(sequence), None) =
             (fields.next(), fields.next(), fields.next(), fields.next())
@@ -65,66 +110,13 @@ impl ClientOrderId {
             }),
         }
     }
-
-    pub fn run(self) -> RunId {
-        self.run
-    }
-
-    pub fn sequence(self) -> u32 {
-        self.sequence
-    }
 }
-
-/// A run's next place in its order sequence, so no id drawn from it repeats an earlier draw.
-#[derive(Debug, Default)]
-pub struct OrderSequence(u32);
-
-impl OrderSequence {
-    pub fn draw(&mut self, run: RunId) -> ClientOrderId {
-        let sequence = self.0;
-        self.0 = sequence
-            .checked_add(1)
-            .expect("a run sends fewer than u32::MAX orders");
-        ClientOrderId::new(run, sequence)
-    }
-}
-
-/// Why a string is not a client order id this system writes, by the part that failed, with the string refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientOrderIdRefusal {
-    /// Not three colon-separated fields under the `fund` prefix.
-    Shape { raw: String },
-    /// The run field is not a UUID.
-    Run { raw: String },
-    /// The sequence field is not a `u32`.
-    Sequence { raw: String },
-    /// Every field reads, but not in the spelling `Display` writes.
-    Spelling { raw: String },
-}
-
-impl std::fmt::Display for ClientOrderIdRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shape = format!("not `{CLIENT_ORDER_ID_PREFIX}:<run>:<sequence>`");
-        let (part, raw) = match self {
-            Self::Shape { raw } => (shape.as_str(), raw),
-            Self::Run { raw } => ("the run is not a UUID", raw),
-            Self::Sequence { raw } => ("the sequence is not a u32", raw),
-            Self::Spelling { raw } => ("not the spelling written", raw),
-        };
-        write!(
-            formatter,
-            "`{raw}` is not a client order id this system writes: {part}"
-        )
-    }
-}
-
-impl std::error::Error for ClientOrderIdRefusal {}
 
 impl TryFrom<String> for ClientOrderId {
     type Error = ClientOrderIdRefusal;
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
-        Self::parse(&raw)
+        raw.parse()
     }
 }
 
@@ -631,7 +623,7 @@ mod tests {
             id.to_string(),
             "fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42"
         );
-        assert_eq!(ClientOrderId::parse(&id.to_string()), Ok(id));
+        assert_eq!(id.to_string().parse::<ClientOrderId>(), Ok(id));
         assert_eq!((id.run(), id.sequence()), (run, 42));
         let shape = |raw: &str| ClientOrderIdRefusal::Shape {
             raw: raw.to_string(),
@@ -659,7 +651,7 @@ mod tests {
             }),
         ] {
             assert_eq!(
-                ClientOrderId::parse(foreign),
+                foreign.parse::<ClientOrderId>(),
                 Err(refusal(foreign)),
                 "{foreign}"
             );
@@ -920,7 +912,7 @@ mod tests {
         #[test]
         fn property_a_client_order_id_round_trips(bytes in any::<[u8; 16]>(), sequence in any::<u32>()) {
             let id = ClientOrderId::new(RunId::new(Uuid::from_bytes(bytes)), sequence);
-            prop_assert_eq!(ClientOrderId::parse(&id.to_string()), Ok(id));
+            prop_assert_eq!(id.to_string().parse::<ClientOrderId>(), Ok(id));
         }
     }
 }

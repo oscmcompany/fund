@@ -106,48 +106,27 @@ pub enum Cancel {
     NotCancelable,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
     /// The keys trade live; this client refuses them.
+    #[error("the Alpaca keys trade live, not on paper")]
     NotPaper,
     /// A submission whose answer was lost or unreadable, so the order may or may not exist; read it back by its
     /// client order id.
-    Unanswered {
-        cause: String,
-    },
+    #[error("the order submission got no answer: {cause}")]
+    Unanswered { cause: String },
+    #[error("{0}")]
     Fetch(FetchError),
     /// A field that did not read as the documented payload, named with its raw value.
-    Malformed {
-        field: &'static str,
-        raw: String,
-    },
-    /// A position's symbol that is not a ticker.
+    #[error("{field} read `{raw}`")]
+    Malformed { field: &'static str, raw: String },
+    #[error("{0}")]
     Symbol(SymbolRefusal),
     /// A status Alpaca documents that this client does not map, which a caller should treat as unknown rather than
     /// guess.
-    UnmappedStatus {
-        status: AlpacaOrderStatus,
-    },
+    #[error("unmapped order status `{status}`")]
+    UnmappedStatus { status: AlpacaOrderStatus },
 }
-
-impl std::fmt::Display for BrokerError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotPaper => write!(formatter, "the Alpaca keys trade live, not on paper"),
-            Self::Unanswered { cause } => {
-                write!(formatter, "the order submission got no answer: {cause}")
-            }
-            Self::Fetch(error) => write!(formatter, "{error}"),
-            Self::Malformed { field, raw } => write!(formatter, "{field} read `{raw}`"),
-            Self::Symbol(refusal) => write!(formatter, "{refusal}"),
-            Self::UnmappedStatus { status } => {
-                write!(formatter, "unmapped order status `{status}`")
-            }
-        }
-    }
-}
-
-impl std::error::Error for BrokerError {}
 
 impl From<&BrokerError> for BrokerFailure {
     fn from(error: &BrokerError) -> Self {

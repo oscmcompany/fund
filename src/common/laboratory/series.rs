@@ -11,33 +11,14 @@ pub struct Series {
     readings: BTreeMap<SessionDate, Option<f64>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum SeriesRefusal {
     /// NaN, or beyond `READING_BOUND`, where sums and squares would stop being finite.
-    OutOfRange {
-        session: SessionDate,
-        value: f64,
-    },
-    ReadTwice {
-        session: SessionDate,
-    },
+    #[error("the reading for {session} is out of range: {value}")]
+    OutOfRange { session: SessionDate, value: f64 },
+    #[error("{session} was read twice")]
+    ReadTwice { session: SessionDate },
 }
-
-impl std::fmt::Display for SeriesRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OutOfRange { session, value } => {
-                write!(
-                    formatter,
-                    "the reading for {session} is out of range: {value}"
-                )
-            }
-            Self::ReadTwice { session } => write!(formatter, "{session} was read twice"),
-        }
-    }
-}
-
-impl std::error::Error for SeriesRefusal {}
 
 impl Series {
     pub fn new(

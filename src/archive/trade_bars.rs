@@ -15,11 +15,11 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 
 use super::bars::{Provenance, provenance_from};
-use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
+use super::parquet::{self, ReadRefusal, RowCause};
 use crate::common::market::aggregate::TradeTotals;
 use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
 use crate::common::market::{DollarVolume, Shares, StampedPrice, Symbol, TradeCount};
-use crate::common::storage::{Provider, TradesKey};
+use crate::common::storage::TradesKey;
 
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
@@ -27,59 +27,6 @@ const LAYOUT_VERSION: &str = "1";
 const PRICE_TYPE: DataType = DataType::Decimal128(18, 6);
 const SHARES_TYPE: DataType = DataType::Decimal128(20, 6);
 const DOLLAR_VOLUME_TYPE: DataType = DataType::Decimal128(38, 12);
-
-/// Why trade bars were not written under a key.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EncodeRefusal {
-    SubscriptionProvider {
-        provenance: Provenance,
-        key: Provider,
-    },
-    Placement(PlacementRefusal),
-    Unrepresentable {
-        symbol: Symbol,
-        timestamp: DateTime<Utc>,
-    },
-    Parquet {
-        reason: String,
-    },
-}
-
-/// Why a file was not read as trade bars.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DecodeRefusal {
-    File(ReadRefusal),
-    Row {
-        index: usize,
-        cause: RowCause,
-    },
-    Provider {
-        provenance: Provenance,
-        key: Provider,
-    },
-}
-
-impl std::fmt::Display for DecodeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::File(refusal) => refusal.fmt(formatter),
-            Self::Row { index, cause } => write!(formatter, "row {index} refused: {cause}"),
-            Self::Provider { provenance, key } => write!(
-                formatter,
-                "the file was fetched under {} but the key names {key}",
-                provenance.subscription()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DecodeRefusal {}
-
-impl From<ReadRefusal> for DecodeRefusal {
-    fn from(refusal: ReadRefusal) -> Self {
-        Self::File(refusal)
-    }
-}
 
 fn schema() -> Schema {
     let instant = |name: &str| {
@@ -114,10 +61,10 @@ pub fn encode(
     key: &TradesKey,
     bars: &[TradeBar],
     provenance: &Provenance,
-) -> Result<Vec<u8>, EncodeRefusal> {
+) -> Result<Vec<u8>, parquet::EncodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     if provenance.subscription().provider() != provider {
-        return Err(EncodeRefusal::SubscriptionProvider {
+        return Err(parquet::EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
             key: provider,
         });
@@ -125,7 +72,7 @@ pub fn encode(
     let ordered = parquet::place(bars, interval, session, |bar| {
         (bar.symbol(), bar.interval(), bar.timestamp())
     })
-    .map_err(EncodeRefusal::Placement)?;
+    .map_err(parquet::EncodeRefusal::Placement)?;
     let mut symbols = StringBuilder::new();
     let mut timestamps = TimestampMicrosecondBuilder::new().with_timezone("UTC");
     let mut counts = UInt64Builder::new();
@@ -136,7 +83,7 @@ pub fn encode(
     let mut prices: [Decimal128Builder; 4] = std::array::from_fn(|_| Decimal128Builder::new());
     for bar in ordered {
         let (symbol, timestamp) = (bar.symbol(), bar.timestamp());
-        let unrepresentable = || EncodeRefusal::Unrepresentable {
+        let unrepresentable = || parquet::EncodeRefusal::Unrepresentable {
             symbol: symbol.clone(),
             timestamp,
         };
@@ -186,19 +133,19 @@ pub fn encode(
         low,
     ];
     parquet::write(schema(), columns, LAYOUT_VERSION, provenance.metadata())
-        .map_err(|reason| EncodeRefusal::Parquet { reason })
+        .map_err(|reason| parquet::EncodeRefusal::Parquet { reason })
 }
 
 /// The trade bars and provenance a file written by `encode` under `key` holds, each rebuilt through `TradeBar::new`.
 pub fn decode(
     key: &TradesKey,
     bytes: Vec<u8>,
-) -> Result<(Vec<TradeBar>, Provenance), DecodeRefusal> {
+) -> Result<(Vec<TradeBar>, Provenance), parquet::DecodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
-        return Err(DecodeRefusal::Provider {
+        return Err(parquet::DecodeRefusal::Provider {
             provenance,
             key: provider,
         });
@@ -262,7 +209,7 @@ pub fn decode(
         };
         for row in 0..batch.num_rows() {
             let index = bars.len();
-            bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
+            bars.push(read(row).map_err(|cause| parquet::DecodeRefusal::Row { index, cause })?);
         }
     }
     Ok((bars, provenance))
@@ -284,7 +231,7 @@ mod tests {
         UpdateRules,
     };
     use crate::common::market::{Price, PriceRefusal};
-    use crate::common::storage::Origin;
+    use crate::common::storage::{Origin, Provider};
     use crate::common::time::SessionDate;
 
     #[test]
@@ -296,14 +243,14 @@ mod tests {
             None,
         );
         let displayed = [
-            DecodeRefusal::File(ReadRefusal::Layout {
+            parquet::DecodeRefusal::File(ReadRefusal::Layout {
                 version: "9".to_string(),
             }),
-            DecodeRefusal::Row {
+            parquet::DecodeRefusal::Row {
                 index: 3,
                 cause: RowCause::Price(PriceRefusal::OutOfRange { ticks: 0 }),
             },
-            DecodeRefusal::Provider {
+            parquet::DecodeRefusal::Provider {
                 provenance,
                 key: Provider::Alpaca,
             },
@@ -318,11 +265,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            crate::archive::DecodeRefusal::TradeBars(DecodeRefusal::File(ReadRefusal::Layout {
-                version: "9".to_string(),
-            }))
+            crate::archive::DecodeRefusal::Bars(parquet::DecodeRefusal::File(
+                ReadRefusal::Layout {
+                    version: "9".to_string(),
+                }
+            ))
             .to_string(),
-            "trade bars not decoded: the file is written under layout 9"
+            "bars not decoded: the file is written under layout 9"
         );
     }
 
@@ -426,7 +375,7 @@ mod tests {
         };
         assert_eq!(
             decode(&key, file(None, Some(2))).map(|_| ()),
-            Err(DecodeRefusal::Row {
+            Err(parquet::DecodeRefusal::Row {
                 index: 0,
                 cause: RowCause::PartlyNull {
                     null: vec!["closed_at".to_string()]
@@ -435,7 +384,7 @@ mod tests {
         );
         assert_eq!(
             decode(&key, file(opened, Some(0))).map(|_| ()),
-            Err(DecodeRefusal::Row {
+            Err(parquet::DecodeRefusal::Row {
                 index: 0,
                 cause: RowCause::Price(PriceRefusal::OutOfRange { ticks: 0 }),
             })
