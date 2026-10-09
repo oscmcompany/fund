@@ -8,8 +8,19 @@ fn script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("check-private-files")
 }
 
+/// A command that ignores the `GIT_*` variables a hook exports, so it acts on the scratch repository it names.
+fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 fn git(repository: &Path, arguments: &[&str]) {
-    let status = Command::new("git")
+    let status = isolated("git")
         .arg("-C")
         .arg(repository)
         .args(arguments)
@@ -29,7 +40,7 @@ fn check(paths: &[&str]) -> (i32, String) {
         std::fs::write(&file, "x").unwrap();
         git(&repository, &["add", "--force", path]);
     }
-    let output = Command::new(script()).arg(&repository).output().unwrap();
+    let output = isolated(script()).arg(&repository).output().unwrap();
     std::fs::remove_dir_all(&repository).unwrap();
     (
         output.status.code().unwrap(),
@@ -93,7 +104,7 @@ fn test_a_private_path_that_is_not_utf8_fails() {
     let entry = std::ffi::OsStr::from_bytes(
         b"100644,e69de29bb2d1d6434b8b29ae775ad8c2e48c5391,config/playbook\xff.toml",
     );
-    let status = Command::new("git")
+    let status = isolated("git")
         .arg("-C")
         .arg(&repository)
         .args(["update-index", "--add", "--cacheinfo"])
@@ -101,7 +112,7 @@ fn test_a_private_path_that_is_not_utf8_fails() {
         .status()
         .unwrap();
     assert!(status.success());
-    let output = Command::new(script())
+    let output = isolated(script())
         .arg(&repository)
         .env("LC_ALL", "en_US.UTF-8")
         .output()
@@ -114,11 +125,34 @@ fn test_a_private_path_that_is_not_utf8_fails() {
 fn test_a_directory_that_is_no_repository_cannot_be_checked() {
     let directory = std::env::temp_dir().join(format!("check-private-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
-    let output = Command::new(script())
+    let output = isolated(script())
         .arg(&directory)
         .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
         .output()
         .unwrap();
     std::fs::remove_dir_all(&directory).unwrap();
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn test_a_hook_environment_leaves_the_calling_repository_alone() {
+    let decoy = std::env::temp_dir().join(format!("check-private-decoy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&decoy).unwrap();
+    git(&decoy, &["init", "--quiet"]);
+    let config_before = std::fs::read_to_string(decoy.join(".git/config")).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "test_public_files_pass", "--test-threads", "1"])
+        .env("GIT_DIR", decoy.join(".git"))
+        .env("GIT_INDEX_FILE", decoy.join(".git/index"))
+        .output()
+        .unwrap();
+    let config_after = std::fs::read_to_string(decoy.join(".git/config")).unwrap();
+    let index_written = decoy.join(".git/index").exists();
+    std::fs::remove_dir_all(&decoy).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(config_after, config_before);
+    assert!(
+        !index_written,
+        "the scratch repository's files were staged into the caller's index"
+    );
 }
