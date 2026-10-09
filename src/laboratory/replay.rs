@@ -19,10 +19,6 @@ pub enum ReplayStudyError {
     NoDecisionBars {
         decision: BarInterval,
     },
-    /// The opening holds no cash, so neither a return nor a turnover is measurable against it.
-    Unfunded {
-        opening: Cash,
-    },
     /// A strategy parameter names a setting the replay journals itself.
     ReservedParameter {
         name: String,
@@ -43,13 +39,6 @@ impl std::fmt::Display for ReplayStudyError {
                     "the dataset holds no {decision} bar to decide on"
                 )
             }
-            Self::Unfunded { opening } => {
-                write!(
-                    formatter,
-                    "an opening of {} dollars funds nothing",
-                    opening.dollars()
-                )
-            }
             Self::ReservedParameter { name } => {
                 write!(
                     formatter,
@@ -67,12 +56,47 @@ impl std::fmt::Display for ReplayStudyError {
 
 impl std::error::Error for ReplayStudyError {}
 
+/// The cash a replay opens with, positive so a return and a turnover are measurable against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opening(Cash);
+
+/// An opening that holds no cash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unfunded {
+    cash: Cash,
+}
+
+impl std::fmt::Display for Unfunded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "an opening of {} dollars funds nothing",
+            self.cash.dollars()
+        )
+    }
+}
+
+impl std::error::Error for Unfunded {}
+
+impl Opening {
+    pub fn new(cash: Cash) -> Result<Self, Unfunded> {
+        match cash.units() > 0 {
+            true => Ok(Self(cash)),
+            false => Err(Unfunded { cash }),
+        }
+    }
+
+    pub fn cash(self) -> Cash {
+        self.0
+    }
+}
+
 /// Replays `dataset` from a book funded with `opening` and journals it beside the strategy's own `parameters`.
 pub fn replay<S: Strategy>(
     study: &mut Study,
     dataset: &Dataset,
     replayer: &Replayer<S>,
-    opening: Cash,
+    opening: Opening,
     parameters: &Parameters,
 ) -> Result<Replay, ReplayStudyError> {
     let own = settings(replayer.fill_model(), replayer.decision(), opening);
@@ -100,12 +124,12 @@ pub fn replay<S: Strategy>(
 pub(crate) fn settings(
     fill_model: FillModel,
     decision: BarInterval,
-    opening: Cash,
+    opening: Opening,
 ) -> [(&'static str, String); 4] {
     [
         ("decision_interval", decision.to_string()),
         ("fill_style", fill_model.style().to_string()),
-        ("opening_cash_units", opening.units().to_string()),
+        ("opening_cash_units", opening.cash().units().to_string()),
         (
             "quoted_spread_basis_points",
             fill_model.quoted_spread().value().to_string(),
@@ -134,25 +158,23 @@ pub(crate) fn beside<'a>(
 pub(crate) fn run<S: Strategy>(
     dataset: &Dataset,
     replayer: &Replayer<S>,
-    opening: Cash,
+    opening: Opening,
 ) -> Result<Replay, ReplayStudyError> {
-    if opening.units() <= 0 {
-        return Err(ReplayStudyError::Unfunded { opening });
-    }
     let decision = replayer.decision();
     let bars = dataset.bars().values().flatten();
     if !bars.clone().any(|bar| bar.interval() == decision) {
         return Err(ReplayStudyError::NoDecisionBars { decision });
     }
     Ok(replayer
-        .act(Replay::open(Book::funded(opening)), bars.cloned())
+        .act(Replay::open(Book::funded(opening.cash())), bars.cloned())
         .map_err(ReplayStudyError::Replay)?
         .finish())
 }
 
 /// Counts, dollars traded and paid, and turnover; the final mark's return net and gross of costs only when that mark
 /// was priced, every fill having landed before it.
-pub(crate) fn metrics(replay: &Replay, opening: Cash) -> Vec<(&'static str, f64)> {
+pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(&'static str, f64)> {
+    let opening = opening.cash();
     let sum = |amounts: Vec<DollarVolume>| {
         amounts
             .into_iter()
@@ -226,7 +248,7 @@ mod tests {
             FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap(),
             BarInterval::OneDay,
         );
-        let opening = Cash::from_units(100 * 1_000_000_000_000);
+        let opening = Opening::new(Cash::from_units(100 * 1_000_000_000_000)).unwrap();
         let parameters = Parameters::new([("strategy", "one_share")]).unwrap();
         let replay = replay(&mut study, &dataset, &replayer, opening, &parameters).unwrap();
         assert_eq!(replay.fills().len(), 1);
@@ -309,7 +331,7 @@ mod tests {
         let dataset = dataset(study.run_id());
         let fill_model =
             FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap();
-        let opening = Cash::from_units(1);
+        let opening = Opening::new(Cash::from_units(1)).unwrap();
         let daily = Replayer::new(OneShare, fill_model, BarInterval::OneDay);
         let none = Parameters::new([("strategy", "one_share")]).unwrap();
         let minute = Replayer::new(OneShare, fill_model, BarInterval::OneMinute);
@@ -319,10 +341,15 @@ mod tests {
                 decision: BarInterval::OneMinute
             })
         ));
-        assert!(matches!(
-            replay(&mut study, &dataset, &daily, Cash::from_units(0), &none),
-            Err(ReplayStudyError::Unfunded { .. })
-        ));
+        for (unfunded, refused) in [
+            (0, "an opening of 0 dollars funds nothing"),
+            (-1, "an opening of -0.000000000001 dollars funds nothing"),
+        ] {
+            assert_eq!(
+                Opening::new(Cash::from_units(unfunded)).map_err(|refusal| refusal.to_string()),
+                Err(refused.to_string())
+            );
+        }
         let clashing = Parameters::new([("fill_style", "mine")]).unwrap();
         assert!(matches!(
             replay(&mut study, &dataset, &daily, opening, &clashing),

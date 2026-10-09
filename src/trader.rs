@@ -437,6 +437,7 @@ mod tests {
         ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest, OrderStatus,
     };
     use crate::common::strategy::Target;
+    use crate::common::time::SessionRange;
     use crate::common::time::calendar::TradingSession;
     use crate::ingest::alpaca::stream::TradeId;
 
@@ -558,8 +559,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            date,
-            date,
+            SessionRange::single(date),
         )
         .unwrap();
         let dollars = |count: i128| Cash::from_units(count * DOLLAR);

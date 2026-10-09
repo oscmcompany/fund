@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::market::record::BarInterval;
 use crate::common::storage::{Key, Origin, Provider, ReferenceTable};
-use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
+use crate::common::time::{SessionDate, SessionRange};
 
 /// One series the archiver keeps whole, in the order a run works them: the daily bars first, since they are the
 /// other legs' symbol list, then the reference snapshots, which are quick, before the tick legs. A tick leg writes
@@ -93,20 +93,53 @@ impl Leg {
     /// snapshot leg keeps only the window's last session; security details are kept once a quarter, on the session that
     /// opens the quarter the window ends in, which the vendor answers as of that date however late it is asked, so a
     /// missed one stays owed for the rest of the quarter. `calendar` must reach back to that quarter's first day.
-    pub fn keeps(self, window: &[SessionDate], calendar: &TradingCalendar) -> Vec<SessionDate> {
+    pub fn keeps(
+        self,
+        window: &Window,
+        calendar: &TradingCalendar,
+    ) -> Result<Vec<SessionDate>, KeepsRefusal> {
         match self {
             Self::MassiveDailyBars
             | Self::AlpacaMinuteBars
             | Self::AlpacaQuotes
-            | Self::AlpacaTrades => window.to_vec(),
-            Self::MassiveSplits | Self::AlpacaSeriesBoundaries => {
-                window.last().copied().into_iter().collect()
+            | Self::AlpacaTrades => Ok(window.sessions().to_vec()),
+            Self::MassiveSplits | Self::AlpacaSeriesBoundaries => Ok(vec![window.last()]),
+            Self::MassiveSecurityDetails => {
+                quarter_opening(calendar, window.last()).map(|opening| vec![opening])
             }
-            Self::MassiveSecurityDetails => window
-                .last()
-                .and_then(|last| quarter_opening(calendar, *last))
-                .into_iter()
-                .collect(),
+        }
+    }
+}
+
+/// Why a leg's sessions could not be read off the calendar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepsRefusal {
+    CalendarShort {
+        quarter: SessionRange,
+        covered: SessionRange,
+    },
+    NoTradingDay {
+        quarter: SessionRange,
+    },
+}
+
+impl std::fmt::Display for KeepsRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CalendarShort { quarter, covered } => write!(
+                formatter,
+                "the calendar covers {} to {}, short of the quarter's {} to {}",
+                covered.first(),
+                covered.last(),
+                quarter.first(),
+                quarter.last()
+            ),
+            Self::NoTradingDay { quarter } => write!(
+                formatter,
+                "the calendar has no trading day from {} to {}",
+                quarter.first(),
+                quarter.last()
+            ),
         }
     }
 }
@@ -120,16 +153,22 @@ pub fn quarter_start(session: SessionDate) -> SessionDate {
     )
 }
 
-/// The first trading day of `session`'s quarter, if it falls on or before `session`; `None` when the calendar does
-/// not reach back to the quarter's first day, since it cannot say.
-pub fn quarter_opening(calendar: &TradingCalendar, session: SessionDate) -> Option<SessionDate> {
-    let start = quarter_start(session);
-    match calendar.covers(start, session) {
+/// The first trading day of `session`'s quarter on or before `session`, refused when the calendar cannot say.
+pub fn quarter_opening(
+    calendar: &TradingCalendar,
+    session: SessionDate,
+) -> Result<SessionDate, KeepsRefusal> {
+    let quarter = SessionRange::single(session).reaching_back_to(quarter_start(session));
+    match calendar.covers(quarter) {
         true => calendar
-            .trading_days_in_range(start, session)
+            .trading_days_in_range(quarter)
             .first()
-            .copied(),
-        false => None,
+            .copied()
+            .ok_or(KeepsRefusal::NoTradingDay { quarter }),
+        false => Err(KeepsRefusal::CalendarShort {
+            quarter,
+            covered: calendar.range(),
+        }),
     }
 }
 
@@ -175,30 +214,81 @@ pub enum SessionOutcome {
     Unreached,
 }
 
-/// Why no window was drawn.
+/// Why no window was drawn, or read back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowRefusal {
     NotCovered {
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
     },
     TooFewSessions {
         wanted: usize,
         found: usize,
+    },
+    Empty,
+    NotAscending {
+        earlier: SessionDate,
+        later: SessionDate,
     },
 }
 
 impl std::fmt::Display for WindowRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotCovered { first, last } => {
-                write!(formatter, "the calendar does not cover {first} to {last}")
-            }
+            Self::NotCovered { range } => write!(
+                formatter,
+                "the calendar does not cover {} to {}",
+                range.first(),
+                range.last()
+            ),
             Self::TooFewSessions { wanted, found } => write!(
                 formatter,
                 "the calendar has {found} trading days where {wanted} were wanted"
             ),
+            Self::Empty => write!(formatter, "the window holds no session"),
+            Self::NotAscending { earlier, later } => {
+                write!(formatter, "the window lists {earlier} after {later}")
+            }
         }
+    }
+}
+
+/// The trading days a heal covers, oldest first: ascending and never empty, and each a trading day before today when
+/// drawn by [`window`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<SessionDate>", into = "Vec<SessionDate>")]
+pub struct Window(Vec<SessionDate>);
+
+impl TryFrom<Vec<SessionDate>> for Window {
+    type Error = WindowRefusal;
+
+    fn try_from(sessions: Vec<SessionDate>) -> Result<Self, Self::Error> {
+        if sessions.is_empty() {
+            return Err(WindowRefusal::Empty);
+        }
+        if let Some(pair) = sessions.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(WindowRefusal::NotAscending {
+                earlier: pair[1],
+                later: pair[0],
+            });
+        }
+        Ok(Self(sessions))
+    }
+}
+
+impl From<Window> for Vec<SessionDate> {
+    fn from(window: Window) -> Self {
+        window.0
+    }
+}
+
+impl Window {
+    pub fn sessions(&self) -> &[SessionDate] {
+        &self.0
+    }
+
+    /// The latest session.
+    pub fn last(&self) -> SessionDate {
+        *self.0.last().expect("a window is never empty")
     }
 }
 
@@ -207,13 +297,18 @@ const CALENDAR_DAYS_PER_SESSION: i64 = 2;
 const HOLIDAY_PADDING_DAYS: i64 = 7;
 
 /// The calendar days a window of `sessions` trading days before `today` is drawn from.
-pub fn calendar_range(today: SessionDate, sessions: NonZeroUsize) -> (SessionDate, SessionDate) {
+pub fn calendar_range(today: SessionDate, sessions: NonZeroUsize) -> SessionRange {
     let sessions = i64::try_from(sessions.get()).unwrap_or(i64::MAX / 4);
     let days = sessions * CALENDAR_DAYS_PER_SESSION + HOLIDAY_PADDING_DAYS;
-    (
-        today.plus_calendar_days(-days),
-        today.plus_calendar_days(-1),
-    )
+    SessionRange::single(today.plus_calendar_days(-1))
+        .reaching_back_to(today.plus_calendar_days(-days))
+}
+
+/// The calendar days a run fetches: `calendar_range` reaching back to its first day's quarter start, which no window
+/// drawn from it can end before, so [`Leg::keeps`] can always find that quarter's opening.
+pub fn fetched_range(today: SessionDate, sessions: NonZeroUsize) -> SessionRange {
+    let range = calendar_range(today, sessions);
+    range.reaching_back_to(quarter_start(range.first()))
 }
 
 /// The last `sessions` trading days strictly before `today`, oldest first; today is never owed, since its session
@@ -222,12 +317,12 @@ pub fn window(
     calendar: &TradingCalendar,
     today: SessionDate,
     sessions: NonZeroUsize,
-) -> Result<Vec<SessionDate>, WindowRefusal> {
-    let (first, last) = calendar_range(today, sessions);
-    if !calendar.covers(first, last) {
-        return Err(WindowRefusal::NotCovered { first, last });
+) -> Result<Window, WindowRefusal> {
+    let range = calendar_range(today, sessions);
+    if !calendar.covers(range) {
+        return Err(WindowRefusal::NotCovered { range });
     }
-    let trading = calendar.trading_days_in_range(first, last);
+    let trading = calendar.trading_days_in_range(range);
     let skip = trading
         .len()
         .checked_sub(sessions.get())
@@ -235,7 +330,7 @@ pub fn window(
             wanted: sessions.get(),
             found: trading.len(),
         })?;
-    Ok(trading[skip..].to_vec())
+    Window::try_from(trading[skip..].to_vec())
 }
 
 /// The sessions of `window` a series does not hold, oldest first.
@@ -321,7 +416,7 @@ mod tests {
             }
             day = day.plus_calendar_days(1);
         }
-        TradingCalendar::new(sessions, first, last).unwrap()
+        TradingCalendar::new(sessions, SessionRange::new(first, last).unwrap()).unwrap()
     }
 
     fn sessions(count: usize) -> NonZeroUsize {
@@ -332,7 +427,7 @@ mod tests {
     fn test_the_window_ends_before_today_and_skips_thanksgiving() {
         let calendar = calendar("2026-11-01", "2026-12-31", &["2026-11-26"]);
         let window = window(&calendar, date("2026-11-30"), sessions(5)).unwrap();
-        let dates: Vec<String> = window.iter().map(ToString::to_string).collect();
+        let dates: Vec<String> = window.sessions().iter().map(ToString::to_string).collect();
         assert_eq!(
             dates,
             [
@@ -351,8 +446,7 @@ mod tests {
         assert_eq!(
             window(&calendar, date("2026-11-30"), sessions(5)),
             Err(WindowRefusal::NotCovered {
-                first: date("2026-11-13"),
-                last: date("2026-11-29"),
+                range: SessionRange::new(date("2026-11-13"), date("2026-11-29")).unwrap(),
             })
         );
     }
@@ -481,6 +575,7 @@ mod tests {
         let opening = window(&winter, date("2027-01-07"), sessions(5)).unwrap();
         let kept = |leg: Leg| -> Vec<String> {
             leg.keeps(&opening, &winter)
+                .unwrap()
                 .iter()
                 .map(ToString::to_string)
                 .collect()
@@ -502,12 +597,76 @@ mod tests {
         let later = window(&winter, date("2027-01-28"), sessions(5)).unwrap();
         assert_eq!(
             Leg::MassiveSecurityDetails.keeps(&later, &winter),
-            [date("2027-01-04")]
+            Ok(vec![date("2027-01-04")])
         );
         assert_eq!(quarter_start(date("2027-03-31")), date("2027-01-01"));
-        assert_eq!(quarter_opening(&winter, date("2026-12-31")), None);
+    }
+
+    /// On the first trading day of a quarter that opens on a holiday, the window still ends in the quarter before, so
+    /// the fetched calendar must reach back to that quarter's start or the run is refused.
+    #[test]
+    fn test_the_fetched_range_reaches_the_quarter_the_window_ends_in() {
+        let today = date("2027-01-04");
+        let range = fetched_range(today, sessions(5));
+        assert_eq!(
+            range,
+            SessionRange::new(date("2026-10-01"), date("2027-01-03")).unwrap()
+        );
+        let fetched = calendar("2026-10-01", "2027-01-03", &["2026-12-25", "2027-01-01"]);
+        let drawn = window(&fetched, today, sessions(5)).unwrap();
+        assert_eq!(drawn.last(), date("2026-12-31"));
+        assert_eq!(
+            Leg::MassiveSecurityDetails.keeps(&drawn, &fetched),
+            Ok(vec![date("2026-10-01")])
+        );
+    }
+
+    /// A calendar that starts after the quarter does cannot name its opening, so the leg is refused rather than owed
+    /// nothing.
+    #[test]
+    fn test_a_calendar_short_of_the_quarter_refuses_the_security_details_leg() {
         let short = calendar("2027-01-02", "2027-01-31", &[]);
-        assert_eq!(quarter_opening(&short, date("2027-01-28")), None);
+        let window = window(&short, date("2027-01-28"), sessions(5)).unwrap();
+        assert_eq!(
+            Leg::MassiveSecurityDetails.keeps(&window, &short),
+            Err(KeepsRefusal::CalendarShort {
+                quarter: SessionRange::new(date("2027-01-01"), date("2027-01-27")).unwrap(),
+                covered: SessionRange::new(date("2027-01-02"), date("2027-01-31")).unwrap(),
+            })
+        );
+        assert_eq!(
+            Leg::MassiveSplits.keeps(&window, &short),
+            Ok(vec![date("2027-01-27")])
+        );
+        // A quarter the calendar covers but where nothing trades has no opening either.
+        let closed = calendar("2027-01-01", "2027-01-31", &["2027-01-01"]);
+        assert_eq!(
+            quarter_opening(&closed, date("2027-01-01")),
+            Err(KeepsRefusal::NoTradingDay {
+                quarter: SessionRange::single(date("2027-01-01")),
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_window_is_ascending_and_never_empty() {
+        assert_eq!(Window::try_from(vec![]), Err(WindowRefusal::Empty));
+        for repeated_or_reversed in ["2026-09-29", "2026-09-28"] {
+            assert_eq!(
+                Window::try_from(vec![date("2026-09-29"), date(repeated_or_reversed)]),
+                Err(WindowRefusal::NotAscending {
+                    earlier: date(repeated_or_reversed),
+                    later: date("2026-09-29"),
+                })
+            );
+        }
+        let window = Window::try_from(vec![date("2026-09-28"), date("2026-09-29")]).unwrap();
+        assert_eq!(window.last(), date("2026-09-29"));
+        let json = serde_json::to_string(&window).unwrap();
+        assert_eq!(json, r#"["2026-09-28","2026-09-29"]"#);
+        assert_eq!(serde_json::from_str::<Window>(&json).unwrap(), window);
+        assert!(serde_json::from_str::<Window>(r#"["2026-09-29","2026-09-28"]"#).is_err());
+        assert!(serde_json::from_str::<Window>("[]").is_err());
     }
 
     fn any_session() -> impl Strategy<Value = SessionDate> {
@@ -528,12 +687,12 @@ mod tests {
             let calendar = calendar("2025-09-01", "2027-03-01", &holidays);
             let window = window(&calendar, today, sessions(count));
             prop_assume!(window.is_ok());
-            let window = window.unwrap();
+            let window = window.unwrap().sessions().to_vec();
             prop_assert_eq!(window.len(), count);
             prop_assert!(window.windows(2).all(|pair| pair[0] < pair[1]));
             prop_assert!(window.iter().all(|day| calendar.is_trading_day(*day) && *day < today));
             prop_assert_eq!(
-                calendar.trading_days_in_range(window[0], today.plus_calendar_days(-1)),
+                calendar.trading_days_in_range(SessionRange::new(window[0], today.plus_calendar_days(-1)).unwrap()),
                 window
             );
         }

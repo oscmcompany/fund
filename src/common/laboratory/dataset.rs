@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
+use crate::common::time::{SessionDate, SessionRange, SessionRangeRefusal};
 
 /// One archive series a study reads or once read, under the name the journal stores.
 #[derive(
@@ -38,8 +38,8 @@ pub enum DatasetLeg {
 #[serde(try_from = "FingerprintFields")]
 pub struct Fingerprint {
     leg: DatasetLeg,
-    first: SessionDate,
-    last: SessionDate,
+    #[serde(flatten)]
+    range: SessionRange,
     partitions: BTreeMap<SessionDate, String>,
     /// Trading sessions in the window with no partition, so an absence is read as one rather than as a short window.
     missing: Vec<SessionDate>,
@@ -59,11 +59,9 @@ impl TryFrom<FingerprintFields> for Fingerprint {
 
     /// Checks what holds without a calendar; that every session trades was checked when the fingerprint was taken.
     fn try_from(fields: FingerprintFields) -> Result<Self, Self::Error> {
-        let (first, last) = (fields.first, fields.last);
-        if last < first {
-            return Err(FingerprintRefusal::Inverted { first, last });
-        }
-        let outside = |session: &&SessionDate| **session < first || last < **session;
+        let range =
+            SessionRange::new(fields.first, fields.last).map_err(FingerprintRefusal::Inverted)?;
+        let outside = |session: &&SessionDate| !range.contains(**session);
         if let Some(session) = fields
             .partitions
             .keys()
@@ -84,8 +82,7 @@ impl TryFrom<FingerprintFields> for Fingerprint {
         }
         Ok(Self {
             leg: fields.leg,
-            first,
-            last,
+            range,
             partitions: fields.partitions,
             missing: fields.missing,
         })
@@ -95,13 +92,9 @@ impl TryFrom<FingerprintFields> for Fingerprint {
 /// Why a fingerprint could not be taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FingerprintRefusal {
-    Inverted {
-        first: SessionDate,
-        last: SessionDate,
-    },
+    Inverted(SessionRangeRefusal),
     CalendarShort {
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
     },
     /// A partition for a day the calendar does not trade, or outside the window.
     NotATradingSession {
@@ -116,13 +109,13 @@ pub enum FingerprintRefusal {
 impl std::fmt::Display for FingerprintRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Inverted { first, last } => write!(
+            Self::Inverted(refusal) => write!(formatter, "{refusal}"),
+            Self::CalendarShort { range } => write!(
                 formatter,
-                "the window {first} to {last} ends before it starts"
+                "the calendar does not cover {} to {}",
+                range.first(),
+                range.last()
             ),
-            Self::CalendarShort { first, last } => {
-                write!(formatter, "the calendar does not cover {first} to {last}")
-            }
             Self::ReadAndMissing { session } => {
                 write!(formatter, "{session} is both read and missing")
             }
@@ -138,22 +131,18 @@ impl std::fmt::Display for FingerprintRefusal {
 }
 
 impl Fingerprint {
-    /// `partitions` holds what was found; every other trading session from `first` to `last` is recorded missing. Taken
-    /// only by the crate's loaders, so a study cannot vouch for partitions nothing read.
+    /// `partitions` holds what was found; every other trading session in `range` is recorded missing. Taken only by the
+    /// crate's loaders, so a study cannot vouch for partitions nothing read.
     pub(crate) fn new(
         leg: DatasetLeg,
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
         calendar: &TradingCalendar,
         partitions: BTreeMap<SessionDate, String>,
     ) -> Result<Self, FingerprintRefusal> {
-        if last < first {
-            return Err(FingerprintRefusal::Inverted { first, last });
+        if !calendar.covers(range) {
+            return Err(FingerprintRefusal::CalendarShort { range });
         }
-        if !calendar.covers(first, last) {
-            return Err(FingerprintRefusal::CalendarShort { first, last });
-        }
-        let sessions = calendar.trading_days_in_range(first, last);
+        let sessions = calendar.trading_days_in_range(range);
         if let Some(session) = partitions
             .keys()
             .find(|session| !sessions.contains(session))
@@ -166,8 +155,7 @@ impl Fingerprint {
             .collect();
         Ok(Self {
             leg,
-            first,
-            last,
+            range,
             partitions,
             missing,
         })
@@ -229,10 +217,13 @@ mod tests {
             (21..=25)
                 .map(|day| TradingSession::new(session(day), open, close).unwrap())
                 .collect(),
-            session(21),
-            session(27),
+            range(21, 27),
         )
         .unwrap()
+    }
+
+    fn range(first: u32, last: u32) -> SessionRange {
+        SessionRange::new(session(first), session(last)).unwrap()
     }
 
     fn tags(days: &[u32]) -> BTreeMap<SessionDate, String> {
@@ -245,8 +236,7 @@ mod tests {
     fn test_every_trading_session_is_read_or_named_missing() {
         let fingerprint = Fingerprint::new(
             DatasetLeg::MassiveDailyBars,
-            session(21),
-            session(27),
+            range(21, 27),
             &calendar(),
             tags(&[21, 22, 25]),
         )
@@ -264,27 +254,12 @@ mod tests {
         assert_eq!(
             Fingerprint::new(
                 DatasetLeg::MassiveDailyBars,
-                session(25),
-                session(21),
-                &calendar(),
-                tags(&[])
-            ),
-            Err(FingerprintRefusal::Inverted {
-                first: session(25),
-                last: session(21)
-            })
-        );
-        assert_eq!(
-            Fingerprint::new(
-                DatasetLeg::MassiveDailyBars,
-                session(21),
-                session(28),
+                range(21, 28),
                 &calendar(),
                 tags(&[])
             ),
             Err(FingerprintRefusal::CalendarShort {
-                first: session(21),
-                last: session(28)
+                range: range(21, 28)
             })
         );
         // Saturday, and a session outside the window.
@@ -292,8 +267,7 @@ mod tests {
             assert_eq!(
                 Fingerprint::new(
                     DatasetLeg::MassiveDailyBars,
-                    session(21),
-                    session(24),
+                    range(21, 24),
                     &calendar(),
                     tags(&[21, day])
                 ),
@@ -308,8 +282,7 @@ mod tests {
     fn test_a_partition_rewritten_or_gone_since_it_was_read_is_contaminated() {
         let fingerprint = Fingerprint::new(
             DatasetLeg::MassiveDailyBars,
-            session(21),
-            session(25),
+            range(21, 25),
             &calendar(),
             tags(&[21, 22, 24]),
         )
@@ -340,8 +313,7 @@ mod tests {
         let stored = serde_json::to_value(
             Fingerprint::new(
                 DatasetLeg::MassiveDailyBars,
-                session(21),
-                session(25),
+                range(21, 25),
                 &calendar(),
                 tags(&[21, 24]),
             )
@@ -356,25 +328,34 @@ mod tests {
         unordered["missing"] = serde_json::json!(["2026-09-23", "2026-09-22"]);
         let mut inverted = stored;
         inverted["last"] = serde_json::json!("2026-09-20");
-        for refused in [outside, both, unordered, inverted] {
+        for refused in [outside, both, unordered] {
             assert!(
                 serde_json::from_value::<Fingerprint>(refused.clone()).is_err(),
                 "{refused}"
             );
         }
+        assert_eq!(
+            serde_json::from_value::<Fingerprint>(inverted)
+                .unwrap_err()
+                .to_string(),
+            "the range 2026-09-21 to 2026-09-20 ends before it starts"
+        );
     }
 
     #[test]
     fn test_a_fingerprint_reads_back_as_written() {
         let fingerprint = Fingerprint::new(
             DatasetLeg::MassiveDailyBars,
-            session(21),
-            session(25),
+            range(21, 25),
             &calendar(),
             tags(&[21, 24]),
         )
         .unwrap();
         let encoded = serde_json::to_string(&fingerprint).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"leg":"massive_daily_bars","first":"2026-09-21","last":"2026-09-25","partitions":{"2026-09-21":"\"tag-21\"","2026-09-24":"\"tag-24\""},"missing":["2026-09-22","2026-09-23","2026-09-25"]}"#
+        );
         assert_eq!(
             serde_json::from_str::<Fingerprint>(&encoded).unwrap(),
             fingerprint

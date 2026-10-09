@@ -6,7 +6,7 @@ use std::ops::Bound;
 
 use chrono::{DateTime, NaiveTime, TimeDelta, Utc};
 
-use super::{REGULAR_CLOSE, SessionDate, eastern_time};
+use super::{REGULAR_CLOSE, SessionDate, SessionRange, eastern_time};
 
 /// One published trading day with the Eastern wall-clock hours it actually keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,46 +102,36 @@ mod nanoseconds {
 /// Why a calendar was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalendarRefusal {
-    InvertedRange {
-        first: SessionDate,
-        last: SessionDate,
-    },
     SessionOutsideRange {
         date: SessionDate,
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
     },
     DuplicateSession {
         date: SessionDate,
     },
 }
 
-/// The sessions a provider published over the inclusive range `[first, last]`.
+/// The sessions a provider published over an inclusive range.
 ///
 /// The range is carried rather than inferred, because a range opening on a holiday has no session
 /// at its own start. A date without a session is treated as not trading, never as unknown-so-open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradingCalendar {
     sessions: BTreeMap<SessionDate, TradingSession>,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
 }
 
 impl TradingCalendar {
-    /// A calendar over `[first, last]`, refusing a duplicated date or a session outside the range.
+    /// A calendar over `range`, refusing a duplicated date or a session outside the range.
     pub fn new(
         sessions: Vec<TradingSession>,
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
     ) -> Result<Self, CalendarRefusal> {
-        if last < first {
-            return Err(CalendarRefusal::InvertedRange { first, last });
-        }
         let mut indexed = BTreeMap::new();
         for session in sessions {
             let date = session.date();
-            if date < first || last < date {
-                return Err(CalendarRefusal::SessionOutsideRange { date, first, last });
+            if !range.contains(date) {
+                return Err(CalendarRefusal::SessionOutsideRange { date, range });
             }
             if indexed.insert(date, session).is_some() {
                 return Err(CalendarRefusal::DuplicateSession { date });
@@ -149,14 +139,18 @@ impl TradingCalendar {
         }
         Ok(Self {
             sessions: indexed,
-            first,
-            last,
+            range,
         })
     }
 
-    /// Whether the published range spans the whole of `[start, end]`; a reversed range is never covered.
-    pub fn covers(&self, start: SessionDate, end: SessionDate) -> bool {
-        start <= end && self.first <= start && end <= self.last
+    /// The range the provider published over.
+    pub fn range(&self) -> SessionRange {
+        self.range
+    }
+
+    /// Whether the published range spans the whole of `range`.
+    pub fn covers(&self, range: SessionRange) -> bool {
+        self.range.encloses(range)
     }
 
     /// Whether the market trades on `date`; a date outside the range answers `false`.
@@ -198,13 +192,10 @@ impl TradingCalendar {
             .map(|(day, _)| *day)
     }
 
-    /// Every trading day in the inclusive range, empty when `end` precedes `start`.
-    pub fn trading_days_in_range(&self, start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
-        if end < start {
-            return Vec::new();
-        }
+    /// Every trading day in `range`.
+    pub fn trading_days_in_range(&self, range: SessionRange) -> Vec<SessionDate> {
         self.sessions
-            .range(start..=end)
+            .range(range.first()..=range.last())
             .map(|(day, _)| *day)
             .collect()
     }
@@ -240,6 +231,10 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
     }
 
+    fn range(first: SessionDate, last: SessionDate) -> SessionRange {
+        SessionRange::new(first, last).unwrap()
+    }
+
     fn time(hour: u32, minute: u32) -> NaiveTime {
         NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
     }
@@ -261,8 +256,7 @@ mod tests {
                 day(date(2026, 11, 27), (9, 30), (13, 0)),
                 day(date(2026, 11, 30), (9, 30), (16, 0)),
             ],
-            date(2026, 11, 23),
-            date(2026, 11, 30),
+            range(date(2026, 11, 23), date(2026, 11, 30)),
         )
         .unwrap()
     }
@@ -280,28 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn test_a_calendar_refuses_an_inverted_range() {
-        assert_eq!(
-            TradingCalendar::new(vec![], date(2026, 11, 30), date(2026, 11, 23)),
-            Err(CalendarRefusal::InvertedRange {
-                first: date(2026, 11, 30),
-                last: date(2026, 11, 23),
-            })
-        );
-    }
-
-    #[test]
     fn test_a_calendar_refuses_a_session_outside_its_range() {
         assert_eq!(
             TradingCalendar::new(
                 vec![day(date(2026, 12, 1), (9, 30), (16, 0))],
-                date(2026, 11, 23),
-                date(2026, 11, 30),
+                range(date(2026, 11, 23), date(2026, 11, 30)),
             ),
             Err(CalendarRefusal::SessionOutsideRange {
                 date: date(2026, 12, 1),
-                first: date(2026, 11, 23),
-                last: date(2026, 11, 30),
+                range: range(date(2026, 11, 23), date(2026, 11, 30)),
             })
         );
     }
@@ -315,8 +296,7 @@ mod tests {
                     day(date(2026, 11, 27), (9, 30), (16, 0)),
                     day(date(2026, 11, 27), (9, 30), (13, 0)),
                 ],
-                date(2026, 11, 23),
-                date(2026, 11, 30),
+                range(date(2026, 11, 23), date(2026, 11, 30)),
             ),
             Err(CalendarRefusal::DuplicateSession {
                 date: date(2026, 11, 27)
@@ -327,14 +307,10 @@ mod tests {
     #[test]
     fn test_covers_only_ranges_inside_the_published_one() {
         let calendar = calendar();
-        assert!(calendar.covers(date(2026, 11, 23), date(2026, 11, 30)));
-        assert!(!calendar.covers(date(2026, 11, 22), date(2026, 11, 30)));
-        assert!(!calendar.covers(date(2026, 11, 23), date(2026, 12, 1)));
-    }
-
-    #[test]
-    fn test_covers_refuses_a_reversed_range() {
-        assert!(!calendar().covers(date(2026, 11, 30), date(2026, 11, 23)));
+        assert!(calendar.covers(range(date(2026, 11, 23), date(2026, 11, 30))));
+        assert!(calendar.covers(range(date(2026, 11, 25), date(2026, 11, 25))));
+        assert!(!calendar.covers(range(date(2026, 11, 22), date(2026, 11, 30))));
+        assert!(!calendar.covers(range(date(2026, 11, 23), date(2026, 12, 1))));
     }
 
     #[test]
@@ -382,7 +358,8 @@ mod tests {
 
     #[test]
     fn test_empty_calendar_refuses_everything() {
-        let empty = TradingCalendar::new(vec![], date(2026, 11, 28), date(2026, 11, 29)).unwrap();
+        let empty =
+            TradingCalendar::new(vec![], range(date(2026, 11, 28), date(2026, 11, 29))).unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
         assert!(!empty.is_trading_day(date(2026, 11, 24)));
@@ -426,22 +403,13 @@ mod tests {
     #[test]
     fn test_trading_days_in_range_excludes_non_sessions() {
         assert_eq!(
-            calendar().trading_days_in_range(date(2026, 11, 24), date(2026, 11, 30)),
+            calendar().trading_days_in_range(range(date(2026, 11, 24), date(2026, 11, 30))),
             vec![
                 date(2026, 11, 24),
                 date(2026, 11, 25),
                 date(2026, 11, 27),
                 date(2026, 11, 30),
             ]
-        );
-    }
-
-    /// The legacy range call panicked here, because a `BTreeMap` range with its start after its end panics.
-    #[test]
-    fn test_trading_days_in_an_inverted_range_is_empty() {
-        assert_eq!(
-            calendar().trading_days_in_range(date(2026, 11, 30), date(2026, 11, 24)),
-            Vec::<SessionDate>::new()
         );
     }
 
@@ -515,14 +483,14 @@ mod tests {
                         .unwrap()
                     })
                     .collect();
-                TradingCalendar::new(sessions, first, last).unwrap()
+                TradingCalendar::new(sessions, range(first, last)).unwrap()
             })
     }
 
     proptest! {
         #[test]
         fn property_next_and_previous_are_inverses_on_trading_days(calendar in any_calendar()) {
-            let trading_days = calendar.trading_days_in_range(calendar.first, calendar.last);
+            let trading_days = calendar.trading_days_in_range(calendar.range());
             prop_assert_eq!(trading_days.len(), calendar.len());
             for day in trading_days {
                 if let Some(next) = calendar.next_trading_day(day) {
@@ -539,15 +507,20 @@ mod tests {
             calendar in any_calendar(),
             offset in -5_i64..65,
         ) {
-            let start = calendar.first.plus_calendar_days(offset);
+            let start = calendar.range().first().plus_calendar_days(offset);
             if let Some(next) = calendar.next_trading_day(start) {
                 prop_assert!(calendar.is_trading_day(next) && start < next);
-                let between = calendar.trading_days_in_range(start.plus_calendar_days(1), next.plus_calendar_days(-1));
+                // Adjacent days leave an inverted range, which holds nothing between them.
+                let between = SessionRange::new(start.plus_calendar_days(1), next.plus_calendar_days(-1))
+                    .map(|between| calendar.trading_days_in_range(between))
+                    .unwrap_or_default();
                 prop_assert!(between.is_empty());
             }
             if let Some(previous) = calendar.previous_trading_day(start) {
                 prop_assert!(calendar.is_trading_day(previous) && previous < start);
-                let between = calendar.trading_days_in_range(previous.plus_calendar_days(1), start.plus_calendar_days(-1));
+                let between = SessionRange::new(previous.plus_calendar_days(1), start.plus_calendar_days(-1))
+                    .map(|between| calendar.trading_days_in_range(between))
+                    .unwrap_or_default();
                 prop_assert!(between.is_empty());
             }
         }
@@ -558,7 +531,7 @@ mod tests {
             offset in 0_i64..60,
             minute in 0_i64..1_440,
         ) {
-            let day = calendar.first.plus_calendar_days(offset);
+            let day = calendar.range().first().plus_calendar_days(offset);
             let at = day.midnight() + TimeDelta::minutes(minute);
             prop_assume!(SessionDate::at(at) == day);
             let phase = calendar.phase_at(at);

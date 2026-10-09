@@ -24,8 +24,8 @@ use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
 use fund::common::monoid::concatenate;
 use fund::common::storage::{Key, Origin, Provider};
-use fund::common::time::SessionDate;
 use fund::common::time::calendar::TradingCalendar;
+use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::RefusedRow;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::flat_files::{
@@ -54,19 +54,16 @@ const STREAM_AHEAD: usize = 8;
 enum Command {
     Copy {
         dataset: FlatFileDataset,
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
         concurrency: usize,
     },
     Parse {
         file: BarFile,
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
         concurrency: usize,
     },
     FoldQuotes {
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
         concurrency: usize,
     },
     FetchConditions,
@@ -75,13 +72,11 @@ enum Command {
         keys: Vec<Key>,
     },
     RollUp {
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
         concurrency: usize,
     },
     FoldTrades {
-        first: SessionDate,
-        last: SessionDate,
+        range: SessionRange,
         concurrency: usize,
     },
 }
@@ -92,11 +87,11 @@ fn parse(arguments: &[String]) -> Option<Command> {
             .ok()
             .map(SessionDate::from_date)
     };
+    let range = |first: &str, last: &str| SessionRange::new(date(first)?, date(last)?).ok();
     match arguments {
         [command, dataset, first, last, concurrency] if command == "copy" => Some(Command::Copy {
             dataset: dataset.parse().ok()?,
-            first: date(first)?,
-            last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+            range: range(first, last)?,
             concurrency: concurrency
                 .parse()
                 .ok()
@@ -105,8 +100,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
         [command, dataset, first, last, concurrency] if command == "parse" => {
             Some(Command::Parse {
                 file: dataset.parse().ok()?,
-                first: date(first)?,
-                last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+                range: range(first, last)?,
                 concurrency: concurrency
                     .parse()
                     .ok()
@@ -123,8 +117,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
             })
         }
         [command, first, last, concurrency] if command == "roll-up" => Some(Command::RollUp {
-            first: date(first)?,
-            last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+            range: range(first, last)?,
             concurrency: concurrency
                 .parse()
                 .ok()
@@ -132,8 +125,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
         }),
         [command, first, last, concurrency] if command == "fold-trades" => {
             Some(Command::FoldTrades {
-                first: date(first)?,
-                last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+                range: range(first, last)?,
                 concurrency: concurrency
                     .parse()
                     .ok()
@@ -142,8 +134,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
         }
         [command, first, last, concurrency] if command == "fold-quotes" => {
             Some(Command::FoldQuotes {
-                first: date(first)?,
-                last: date(last).filter(|last| date(first).is_some_and(|first| first <= *last))?,
+                range: range(first, last)?,
                 concurrency: concurrency
                     .parse()
                     .ok()
@@ -187,8 +178,7 @@ async fn main() -> ExitCode {
         match command {
             Command::Copy {
                 dataset,
-                first,
-                last,
+                range,
                 concurrency,
             } => {
                 let flat_files = match FlatFiles::from_environment() {
@@ -202,19 +192,14 @@ async fn main() -> ExitCode {
                     &archive,
                     &flat_files,
                     dataset,
-                    first,
-                    last,
+                    range,
                     concurrency,
                     run_id,
                     commit,
                 )
                 .await
             }
-            Command::RollUp {
-                first,
-                last,
-                concurrency,
-            } => roll_up(archive, first, last, concurrency).await,
+            Command::RollUp { range, concurrency } => roll_up(archive, range, concurrency).await,
             Command::Delete { keys } => {
                 let mut failed = 0;
                 for key in &keys {
@@ -239,11 +224,7 @@ async fn main() -> ExitCode {
                     ExitCode::from(REFUSED_TO_START)
                 }
             },
-            Command::FoldTrades {
-                first,
-                last,
-                concurrency,
-            } => {
+            Command::FoldTrades { range, concurrency } => {
                 let Some((flat_files, alpaca)) = fold_clients() else {
                     return ExitCode::from(REFUSED_TO_START);
                 };
@@ -251,19 +232,14 @@ async fn main() -> ExitCode {
                     &archive,
                     &flat_files,
                     &alpaca,
-                    first,
-                    last,
+                    range,
                     concurrency,
                     run_id,
                     commit,
                 )
                 .await
             }
-            Command::FoldQuotes {
-                first,
-                last,
-                concurrency,
-            } => {
+            Command::FoldQuotes { range, concurrency } => {
                 let Some((flat_files, alpaca)) = fold_clients() else {
                     return ExitCode::from(REFUSED_TO_START);
                 };
@@ -271,8 +247,7 @@ async fn main() -> ExitCode {
                     &archive,
                     &flat_files,
                     &alpaca,
-                    first,
-                    last,
+                    range,
                     concurrency,
                     run_id,
                     commit,
@@ -281,10 +256,9 @@ async fn main() -> ExitCode {
             }
             Command::Parse {
                 file,
-                first,
-                last,
+                range,
                 concurrency,
-            } => parse_bars(archive, file, first, last, concurrency, run_id, commit).await,
+            } => parse_bars(archive, file, range, concurrency, run_id, commit).await,
         }
     }
     .instrument(span)
@@ -296,8 +270,7 @@ async fn copy(
     archive: &Archive,
     flat_files: &FlatFiles,
     dataset: FlatFileDataset,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     concurrency: usize,
     run_id: RunId,
     commit: Option<Commit>,
@@ -318,7 +291,7 @@ async fn copy(
     };
     let offered: Vec<_> = listing
         .into_iter()
-        .filter(|listed| (first..=last).contains(&listed.session()))
+        .filter(|listed| range.contains(listed.session()))
         .collect();
     let owed: Vec<_> = offered
         .iter()
@@ -327,8 +300,8 @@ async fn copy(
         .collect();
     tracing::info!(
         %dataset,
-        %first,
-        %last,
+        first = %range.first(),
+        last = %range.last(),
         offered = offered.len(),
         offered_first = ?offered.first().map(|listed| listed.session().to_string()),
         offered_last = ?offered.last().map(|listed| listed.session().to_string()),
@@ -336,7 +309,7 @@ async fn copy(
         owed = owed.len(),
         owed_bytes = owed.iter().map(|listed| listed.length()).sum::<u64>(),
         concurrency,
-        series = dataset.key(first).series(),
+        series = dataset.key(range.first()).series(),
         "Planned a raw copy"
     );
     let permits = Arc::new(Semaphore::new(concurrency));
@@ -470,8 +443,7 @@ impl std::fmt::Display for ParseFailure {
 async fn parse_bars(
     archive: Archive,
     file: BarFile,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     concurrency: usize,
     run_id: RunId,
     commit: Option<Commit>,
@@ -479,8 +451,8 @@ async fn parse_bars(
     let (dataset, interval) = (file.dataset(), file.interval());
     let heal_start = SessionDate::from_date(HEAL_DAILY_BARS_FROM);
     match file {
-        BarFile::Daily if last >= heal_start => {
-            tracing::error!(%last, %heal_start, "Daily bars from this session on are the nightly heal's to write");
+        BarFile::Daily if range.last() >= heal_start => {
+            tracing::error!(last = %range.last(), %heal_start, "Daily bars from this session on are the nightly heal's to write");
             return ExitCode::from(REFUSED_TO_START);
         }
         BarFile::Daily | BarFile::Minute => {}
@@ -491,7 +463,7 @@ async fn parse_bars(
         interval,
         session,
     };
-    let series = bars_key(first).series();
+    let series = bars_key(range.first()).series();
     let (raw, parsed) = match (held(&archive, dataset).await, archive.list(&series).await) {
         (Ok(raw), Ok(parsed)) => (
             raw,
@@ -508,14 +480,14 @@ async fn parse_bars(
     };
     let offered: Vec<SessionDate> = raw
         .into_iter()
-        .filter(|session| (first..=last).contains(session))
+        .filter(|session| range.contains(*session))
         .collect();
     let (already, owed): (Vec<SessionDate>, Vec<SessionDate>) =
         offered.iter().partition(|session| parsed.contains(session));
     tracing::info!(
         %dataset,
-        %first,
-        %last,
+        first = %range.first(),
+        last = %range.last(),
         offered = offered.len(),
         offered_first = ?offered.first().map(ToString::to_string),
         offered_last = ?offered.last().map(ToString::to_string),
@@ -733,7 +705,7 @@ impl std::fmt::Display for FoldFailure {
     }
 }
 
-/// Streams each listed `dataset` file of a trading session in `[first, last]` whose daily file under `daily` is not
+/// Streams each listed `dataset` file of a trading session in `range` whose daily file under `daily` is not
 /// yet written, and hands it to `fold`; `noun` names the bars in the log.
 #[allow(clippy::too_many_arguments)]
 async fn fold_sessions<Fold, Folding>(
@@ -742,8 +714,7 @@ async fn fold_sessions<Fold, Folding>(
     calendar: &TradingCalendar,
     dataset: FlatFileDataset,
     daily: Key,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     concurrency: usize,
     noun: &'static str,
     mut fold: Fold,
@@ -774,7 +745,7 @@ where
         .collect();
     let offered: Vec<_> = listing
         .into_iter()
-        .filter(|listed| (first..=last).contains(&listed.session()))
+        .filter(|listed| range.contains(listed.session()))
         .collect();
     let untraded: Vec<SessionDate> = offered
         .iter()
@@ -789,8 +760,8 @@ where
         .cloned()
         .collect();
     tracing::info!(
-        %first,
-        %last,
+        first = %range.first(),
+        last = %range.last(),
         offered = offered.len(),
         already_folded = offered.len() - owed.len() - untraded.len(),
         not_trading_days = listed(&untraded),
@@ -860,28 +831,26 @@ async fn fold_quotes(
     archive: &Archive,
     flat_files: &FlatFiles,
     alpaca: &Alpaca,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     concurrency: usize,
     run_id: RunId,
     commit: Option<Commit>,
 ) -> ExitCode {
-    let calendar = match alpaca.calendar(first, last).await {
+    let calendar = match alpaca.calendar(range).await {
         Ok(calendar) => calendar,
         Err(error) => {
             tracing::error!(%error, "Calendar not fetched");
             return ExitCode::FAILURE;
         }
     };
-    let [_, _, daily] = quote_keys(first);
+    let [_, _, daily] = quote_keys(range.first());
     fold_sessions(
         archive,
         flat_files,
         &calendar,
         FlatFileDataset::Quotes,
         daily,
-        first,
-        last,
+        range,
         concurrency,
         "quote",
         |session, stream| {
@@ -1077,8 +1046,7 @@ async fn fold_trades(
     archive: &Archive,
     flat_files: &FlatFiles,
     alpaca: &Alpaca,
-    first: SessionDate,
-    last: SessionDate,
+    range: SessionRange,
     concurrency: usize,
     run_id: RunId,
     commit: Option<Commit>,
@@ -1095,22 +1063,21 @@ async fn fold_trades(
         codes = conditions.conditions().len(),
         "Read the conditions table"
     );
-    let calendar = match alpaca.calendar(first, last).await {
+    let calendar = match alpaca.calendar(range).await {
         Ok(calendar) => calendar,
         Err(error) => {
             tracing::error!(%error, "Calendar not fetched");
             return ExitCode::FAILURE;
         }
     };
-    let [_, _, daily] = trade_keys(first);
+    let [_, _, daily] = trade_keys(range.first());
     fold_sessions(
         archive,
         flat_files,
         &calendar,
         FlatFileDataset::Trades,
         daily,
-        first,
-        last,
+        range,
         concurrency,
         "trade",
         |session, stream| {
@@ -1233,24 +1200,19 @@ impl std::fmt::Display for RollUpFailure {
 }
 
 /// Writes derived five-minute bars for each session whose Massive minute bars are held and five-minute bars are not.
-async fn roll_up(
-    archive: Archive,
-    first: SessionDate,
-    last: SessionDate,
-    concurrency: usize,
-) -> ExitCode {
+async fn roll_up(archive: Archive, range: SessionRange, concurrency: usize) -> ExitCode {
     let sessions = |origin, interval| {
         let archive = archive.clone();
         async move {
             archive
-                .list(&massive_bars_key(origin, interval, first).series())
+                .list(&massive_bars_key(origin, interval, range.first()).series())
                 .await
                 .map(|paths| {
                     paths
                         .iter()
                         .filter_map(|path| Key::parse(path).ok())
                         .map(|key| key.session())
-                        .filter(|session| (first..=last).contains(session))
+                        .filter(|session| range.contains(*session))
                         .collect::<BTreeSet<SessionDate>>()
                 })
         }
@@ -1267,8 +1229,8 @@ async fn roll_up(
     };
     let owed: Vec<SessionDate> = minutes.difference(&rolled).copied().collect();
     tracing::info!(
-        %first,
-        %last,
+        first = %range.first(),
+        last = %range.last(),
         minute_sessions = minutes.len(),
         already_rolled = minutes.len() - owed.len(),
         owed = owed.len(),
@@ -1383,6 +1345,25 @@ mod tests {
         assert!(folding("2021-08-23", "2021-08-23", "9").is_some());
         assert!(folding("2021-08-24", "2021-08-23", "9").is_none());
         assert!(folding("2021-08-23", "2021-08-24", "0").is_none());
+        let day = |text: &str| SessionDate::from_date(text.parse().unwrap());
+        for command in ["roll-up", "fold-trades", "fold-quotes"] {
+            let ranged = |first: &str, last: &str| {
+                parse(&[command, first, last, "2"].map(String::from)).map(|command| match command {
+                    Command::RollUp { range, .. }
+                    | Command::FoldTrades { range, .. }
+                    | Command::FoldQuotes { range, .. }
+                    | Command::Copy { range, .. }
+                    | Command::Parse { range, .. } => Some((range.first(), range.last())),
+                    Command::FetchConditions | Command::Delete { .. } => None,
+                })
+            };
+            assert_eq!(
+                ranged("2021-08-23", "2021-08-27"),
+                Some(Some((day("2021-08-23"), day("2021-08-27")))),
+                "{command}"
+            );
+            assert_eq!(ranged("2021-08-27", "2021-08-23"), None, "{command}");
+        }
     }
 
     #[test]

@@ -229,7 +229,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::common::heal::{Leg, SessionOutcome};
+    use crate::common::heal::{Leg, SessionOutcome, Window};
     use crate::common::journal::{
         Commit, ConfigurationResolved, HealFinished, Observation, Record, RunId, read,
     };
@@ -260,7 +260,7 @@ mod tests {
     /// A session file as the journal writes one, with a torn line a crash left behind.
     fn session_file() -> String {
         let finished = HealFinished::new(
-            vec![session().plus_calendar_days(-1)],
+            Window::try_from(vec![session().plus_calendar_days(-1)]).unwrap(),
             BTreeMap::from([(
                 Leg::MassiveDailyBars,
                 BTreeMap::from([(session().plus_calendar_days(-1), SessionOutcome::Unreached)]),

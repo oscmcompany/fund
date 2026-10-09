@@ -3,6 +3,8 @@
 
 pub mod calendar;
 
+use std::num::NonZeroU16;
+
 use chrono::{
     DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Utc, Weekday,
 };
@@ -87,6 +89,91 @@ impl SessionDate {
 impl std::fmt::Display for SessionDate {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+/// The inclusive sessions `[first, last]`, whose first never follows its last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct SessionRange {
+    first: SessionDate,
+    last: SessionDate,
+}
+
+/// Why a range was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRangeRefusal {
+    Inverted {
+        first: SessionDate,
+        last: SessionDate,
+    },
+}
+
+impl std::fmt::Display for SessionRangeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inverted { first, last } => {
+                write!(
+                    formatter,
+                    "the range {first} to {last} ends before it starts"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionRangeRefusal {}
+
+impl SessionRange {
+    pub fn new(first: SessionDate, last: SessionDate) -> Result<Self, SessionRangeRefusal> {
+        match first <= last {
+            true => Ok(Self { first, last }),
+            false => Err(SessionRangeRefusal::Inverted { first, last }),
+        }
+    }
+
+    /// The range of `session` alone.
+    pub fn single(session: SessionDate) -> Self {
+        Self {
+            first: session,
+            last: session,
+        }
+    }
+
+    pub fn first(self) -> SessionDate {
+        self.first
+    }
+
+    pub fn last(self) -> SessionDate {
+        self.last
+    }
+
+    pub fn contains(self, session: SessionDate) -> bool {
+        self.first <= session && session <= self.last
+    }
+
+    /// Whether every session of `other` is in this range.
+    pub fn encloses(self, other: Self) -> bool {
+        self.contains(other.first) && self.contains(other.last)
+    }
+
+    /// This range with its first moved back to `session` when that is earlier.
+    pub fn reaching_back_to(self, session: SessionDate) -> Self {
+        Self {
+            first: self.first.min(session),
+            last: self.last,
+        }
+    }
+
+    /// Consecutive ranges of at most `days` calendar days that tile this one, earliest first.
+    pub fn spans(self, days: NonZeroU16) -> impl Iterator<Item = Self> {
+        let step = i64::from(days.get());
+        std::iter::successors(Some(self.first), move |first| {
+            Some(first.plus_calendar_days(step)).filter(|next| self.contains(*next))
+        })
+        .map(move |first| Self {
+            first,
+            last: first.plus_calendar_days(step - 1).min(self.last),
+        })
     }
 }
 
@@ -232,6 +319,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_a_range_refuses_a_last_before_its_first() {
+        assert_eq!(
+            SessionRange::new(session(2026, 11, 30), session(2026, 11, 23)),
+            Err(SessionRangeRefusal::Inverted {
+                first: session(2026, 11, 30),
+                last: session(2026, 11, 23),
+            })
+        );
+        let one = SessionRange::new(session(2026, 11, 23), session(2026, 11, 23)).unwrap();
+        assert!(one.contains(session(2026, 11, 23)));
+        assert!(!one.contains(session(2026, 11, 24)));
+    }
+
+    #[test]
+    fn test_spans_cut_a_range_at_whole_spans_and_end_on_its_last() {
+        let range = SessionRange::new(session(2026, 1, 1), session(2026, 1, 12)).unwrap();
+        let spans: Vec<String> = range
+            .spans(NonZeroU16::new(5).unwrap())
+            .map(|span| format!("{}..{}", span.first(), span.last()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                "2026-01-01..2026-01-05",
+                "2026-01-06..2026-01-10",
+                "2026-01-11..2026-01-12"
+            ]
+        );
+    }
+
     /// Instants from 1970 to 2100, the span the timezone database carries rules for.
     fn any_instant() -> impl Strategy<Value = DateTime<Utc>> {
         (0_i64..4_102_444_800).prop_map(|seconds| DateTime::from_timestamp(seconds, 0).unwrap())
@@ -296,6 +414,42 @@ mod tests {
                 session.plus_calendar_days(first + second)
             );
             prop_assert_eq!(session.plus_calendar_days(0), session);
+        }
+
+        /// A range is built exactly when it is ordered, and holds exactly the sessions between its ends.
+        #[test]
+        fn property_a_range_holds_what_lies_between_its_ends(
+            first in any_session(),
+            last in any_session(),
+            probe in any_session(),
+        ) {
+            let range = SessionRange::new(first, last);
+            prop_assert_eq!(range.is_ok(), first <= last);
+            if let Ok(range) = range {
+                prop_assert_eq!((range.first(), range.last()), (first, last));
+                prop_assert_eq!(range.contains(probe), first <= probe && probe <= last);
+                prop_assert!(range.encloses(range));
+            }
+        }
+
+        /// The spans start on the range's first, end on its last, abut one another, and none is longer than asked.
+        #[test]
+        fn property_spans_tile_the_range(
+            first in any_session(),
+            length in 0_i64..2_000,
+            days in 1_u16..400,
+        ) {
+            let range = SessionRange::new(first, first.plus_calendar_days(length)).unwrap();
+            let spans: Vec<SessionRange> = range.spans(NonZeroU16::new(days).unwrap()).collect();
+            prop_assert_eq!(spans.first().map(|span| span.first()), Some(range.first()));
+            prop_assert_eq!(spans.last().map(|span| span.last()), Some(range.last()));
+            for pair in spans.windows(2) {
+                prop_assert_eq!(pair[0].last().plus_calendar_days(1), pair[1].first());
+            }
+            for span in &spans {
+                prop_assert!(range.encloses(*span));
+                prop_assert!(span.first().plus_calendar_days(i64::from(days)) > span.last());
+            }
         }
     }
 }

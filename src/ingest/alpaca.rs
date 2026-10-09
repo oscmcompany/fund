@@ -17,8 +17,8 @@ use crate::common::market::record::{Bar, BarInterval, Ohlc, Quote};
 use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
-use crate::common::time::SessionDate;
 use crate::common::time::calendar::{TradingCalendar, TradingSession};
+use crate::common::time::{SessionDate, SessionRange};
 
 const BARS_URL: &str = "https://data.alpaca.markets/v2/stocks/bars";
 const QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes";
@@ -258,15 +258,11 @@ impl Alpaca {
         )
     }
 
-    /// The published sessions over `[first, last]`. A row that does not read refuses the whole calendar, since
-    /// dropping it would turn a trading day into a holiday that no heal ever owes.
-    pub async fn calendar(
-        &self,
-        first: SessionDate,
-        last: SessionDate,
-    ) -> Result<TradingCalendar, FetchError> {
+    /// The published sessions over `range`. A row that does not read refuses the whole calendar, since dropping it
+    /// would turn a trading day into a holiday that no heal ever owes.
+    pub async fn calendar(&self, range: SessionRange) -> Result<TradingCalendar, FetchError> {
         let url = format!("{}/v2/calendar", self.account.trading_url());
-        let (start, end) = (first.to_string(), last.to_string());
+        let (start, end) = (range.first().to_string(), range.last().to_string());
         let body = with_retries(|| {
             send(
                 self.credentials
@@ -275,7 +271,7 @@ impl Alpaca {
             )
         })
         .await?;
-        parse_calendar(&body, first, last)
+        parse_calendar(&body, range)
     }
 
     /// Raw one-minute SIP bars across the whole Eastern day of `session`, with symbols resolved as of that session so
@@ -638,11 +634,7 @@ fn account(is_paper: String) -> Result<Account, VariableRefusal> {
     }
 }
 
-fn parse_calendar(
-    body: &[u8],
-    first: SessionDate,
-    last: SessionDate,
-) -> Result<TradingCalendar, FetchError> {
+fn parse_calendar(body: &[u8], range: SessionRange) -> Result<TradingCalendar, FetchError> {
     let malformed = |reason: String| FetchError::Malformed { reason };
     let rows: Vec<CalendarRow> =
         serde_json::from_slice(body).map_err(|error| malformed(error.to_string()))?;
@@ -653,7 +645,7 @@ fn parse_calendar(
                 .map_err(|refusal| malformed(format!("{refusal:?}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    TradingCalendar::new(sessions, first, last).map_err(|refusal| malformed(format!("{refusal:?}")))
+    TradingCalendar::new(sessions, range).map_err(|refusal| malformed(format!("{refusal:?}")))
 }
 
 /// Fetches `symbols`, and whenever Alpaca names one invalid (which fails the whole request) drops it and fetches the
@@ -1134,11 +1126,15 @@ mod tests {
         }
     }
 
+    fn range(first: &str, last: &str) -> SessionRange {
+        SessionRange::new(day(first), day(last)).unwrap()
+    }
+
     #[test]
     fn test_the_calendar_reads_holidays_and_early_closes() {
-        let calendar = parse_calendar(CALENDAR, day("2026-11-25"), day("2026-11-30")).unwrap();
+        let calendar = parse_calendar(CALENDAR, range("2026-11-25", "2026-11-30")).unwrap();
         let trading: Vec<String> = calendar
-            .trading_days_in_range(day("2026-11-25"), day("2026-11-30"))
+            .trading_days_in_range(range("2026-11-25", "2026-11-30"))
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -1156,12 +1152,12 @@ mod tests {
             .unwrap()
             .replace(r#""close":"13:00""#, r#""close":"1300""#);
         assert!(matches!(
-            parse_calendar(unreadable.as_bytes(), day("2026-11-25"), day("2026-11-30")),
+            parse_calendar(unreadable.as_bytes(), range("2026-11-25", "2026-11-30")),
             Err(FetchError::Malformed { .. })
         ));
         // A range narrower than the answer is a row outside the calendar, never a row silently dropped.
         assert!(matches!(
-            parse_calendar(CALENDAR, day("2026-11-25"), day("2026-11-27")),
+            parse_calendar(CALENDAR, range("2026-11-25", "2026-11-27")),
             Err(FetchError::Malformed { .. })
         ));
     }
