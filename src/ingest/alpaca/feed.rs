@@ -337,6 +337,8 @@ impl<Source: TapeSource> Feed<Source> {
             StreamMessage::Connected
             | StreamMessage::Authenticated
             | StreamMessage::Subscribed(_)
+            | StreamMessage::Corrected { .. }
+            | StreamMessage::Canceled { .. }
             | StreamMessage::Quote(_)
             | StreamMessage::Refused { .. }
             | StreamMessage::Unrecognized { .. }
@@ -566,6 +568,8 @@ mod tests {
             StreamMessage::Trade { id, outcome } => (id, outcome),
             other @ (StreamMessage::Connected
             | StreamMessage::Authenticated
+            | StreamMessage::Corrected { .. }
+            | StreamMessage::Canceled { .. }
             | StreamMessage::Subscribed(_)
             | StreamMessage::Quote(_)
             | StreamMessage::Refused { .. }

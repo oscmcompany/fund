@@ -10,7 +10,9 @@ use crate::common::book::{Book, Cash, Fill};
 use crate::common::journal::Observation;
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState};
-use crate::common::market::trade_bars::{BarBuilt, TradeBar, TradeConditions, TradeFold};
+use crate::common::market::trade_bars::{
+    BarBuilt, LiveTradeFold, TradeBar, TradeConditions, Withdrawal,
+};
 use crate::common::market::{Price, StampedPrice, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::order::{BrokerFailure, OrderSequence};
@@ -29,7 +31,7 @@ use crate::execution::{
 };
 use crate::ingest::alpaca::AlpacaTradeOutcome;
 use crate::ingest::alpaca::feed::FeedEvent;
-use crate::ingest::alpaca::stream::StreamMessage;
+use crate::ingest::alpaca::stream::{StreamMessage, TradeId};
 use crate::journal::Journal;
 
 /// How long after a minute ends its bar waits for prints still on their way before it is folded in.
@@ -152,7 +154,7 @@ pub struct Session<S: Strategy> {
     strategy: Played<S>,
     settings: SessionSettings,
     calendar: TradingCalendar,
-    fold: TradeFold,
+    fold: LiveTradeFold<(Symbol, TradeId)>,
     state: MarketState,
     book: Book,
     /// The book's worth when the session opened, from which the daily loss is measured.
@@ -218,7 +220,7 @@ impl<S: Strategy> Session<S> {
             strategy,
             settings,
             calendar,
-            fold: TradeFold::new(session, conditions),
+            fold: LiveTradeFold::new(session, conditions),
             state: warm,
             book,
             opening,
@@ -266,8 +268,40 @@ impl<S: Strategy> Session<S> {
                         letters,
                         correction,
                     },
-                ..
-            }) => self.fold.push_lettered(print, *tape, letters, *correction),
+                id,
+            }) => self.fold.push(
+                (print.symbol().clone(), *id),
+                print.clone(),
+                *tape,
+                letters.clone(),
+                *correction,
+            ),
+            FeedEvent::Message(StreamMessage::Corrected {
+                symbol,
+                original,
+                replacement,
+                outcome,
+            }) => {
+                self.withdraw(symbol, *original);
+                match outcome {
+                    AlpacaTradeOutcome::Print {
+                        print,
+                        tape,
+                        letters,
+                        correction,
+                    } => self.fold.push(
+                        (symbol.clone(), *replacement),
+                        print.clone(),
+                        *tape,
+                        letters.clone(),
+                        *correction,
+                    ),
+                    AlpacaTradeOutcome::Refused(_) => {}
+                }
+            }
+            FeedEvent::Message(StreamMessage::Canceled {
+                symbol, original, ..
+            }) => self.withdraw(symbol, *original),
             FeedEvent::Message(
                 StreamMessage::Trade {
                     outcome: AlpacaTradeOutcome::Refused(_),
@@ -287,6 +321,16 @@ impl<S: Strategy> Session<S> {
             | FeedEvent::BackfillFailed { .. } => {}
         }
         Ok(())
+    }
+
+    /// Withdraws the print a correction or cancel names, logging one whose bar was already built, which stays as built.
+    fn withdraw(&mut self, symbol: &Symbol, original: TradeId) {
+        match self.fold.withdraw(&(symbol.clone(), original)) {
+            Withdrawal::Applied => {}
+            Withdrawal::NotHeld => {
+                tracing::warn!(%symbol, ?original, "Withdrawal arrived after its print's bar");
+            }
+        }
     }
 
     /// Folds in every minute settled by `now`, and once a decision bar has settled, trades the book toward the
@@ -514,6 +558,7 @@ mod tests {
     use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::Trade;
+    use crate::common::market::trade_bars::TradeFold;
     use crate::common::market::trade_bars::{
         ConditionLetter, Correction, OpenClose, Print, Tape, TradeSums,
     };
@@ -524,7 +569,8 @@ mod tests {
     use crate::common::strategy::Target;
     use crate::common::time::SessionRange;
     use crate::common::time::calendar::TradingSession;
-    use crate::ingest::alpaca::stream::TradeId;
+    use crate::ingest::alpaca::stream::{TradeId, messages};
+    use crate::ingest::alpaca::trade_page;
 
     const DOLLAR: i128 = 1_000_000_000_000;
 
@@ -1481,5 +1527,146 @@ mod tests {
             })]
         );
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The QQQ correction and a SPY cancel of 2026-10-08 moved onto the test session, as the stream sent them.
+    const CORRECTED_PRINT: &str = r#"{"T":"t","S":"QQQ","i":6779,"x":"D","p":747.1571,"s":3500,"c":["@","7","Z","V"],"t":"2026-10-07T17:07:28.379388955Z","z":"C"}"#;
+    const CORRECTION: &str = r#"{"S":"QQQ","T":"c","cc":["@","7","Z","V"],"ci":8271,"cp":747.1571,"cs":3500,"oc":["?"],"oi":6779,"op":747.1571,"os":3500,"t":"2026-10-07T18:36:51.447795025Z","x":"D","z":"C"}"#;
+    const STANDING_PRINT: &str = r#"{"T":"t","S":"SPY","i":1,"x":"P","p":772.95,"s":100,"c":[" "],"t":"2026-10-07T18:50:10Z","z":"B"}"#;
+    const CANCELED_PRINT: &str = r#"{"T":"t","S":"SPY","i":71757381915470,"x":"D","p":772.94,"s":14050,"c":[" ","7","V"],"t":"2026-10-07T18:50:30.0518858Z","z":"B"}"#;
+    const CANCEL: &str = r#"{"S":"SPY","T":"x","a":"C","i":71757381915470,"p":772.94,"s":14050,"t":"2026-10-07T18:52:00Z","x":"D","z":"B"}"#;
+
+    /// The same prints as Alpaca's REST history labelled them on 2026-10-08, folded as the archive folds them.
+    fn archive_bars() -> Vec<serde_json::Value> {
+        let pages = [
+            (
+                "QQQ",
+                r#"[{"c":["@","7","Z","V"],"i":6779,"p":747.1571,"s":3500,"t":"2026-10-07T17:07:28.379388955Z","u":"corrected","x":"D","z":"C"},{"c":["@","7","V"],"i":6779,"p":747.1571,"s":3500,"t":"2026-10-07T18:36:51.447795025Z","u":"incorrect","x":"D","z":"C"}]"#,
+            ),
+            (
+                "SPY",
+                r#"[{"c":[" "],"i":1,"p":772.95,"s":100,"t":"2026-10-07T18:50:10Z","x":"P","z":"B"},{"c":[" ","7","V"],"i":71757381915470,"p":772.94,"s":14050,"t":"2026-10-07T18:50:30.0518858Z","u":"canceled","x":"D","z":"B"}]"#,
+            ),
+        ];
+        let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
+        let mut fold = TradeFold::new(date, TradeConditions::new(BTreeMap::new()));
+        for (ticker, rows) in pages {
+            let body = format!(r#"{{"trades":{{"{ticker}":{rows}}},"next_page_token":null}}"#);
+            let (outcomes, _) = trade_page(&Symbol::new(ticker).unwrap(), body.as_bytes()).unwrap();
+            for outcome in outcomes {
+                match outcome {
+                    AlpacaTradeOutcome::Print {
+                        print,
+                        tape,
+                        letters,
+                        correction,
+                    } => fold.push_lettered(&print, tape, &letters, correction),
+                    AlpacaTradeOutcome::Refused(row) => panic!("{row:?}"),
+                }
+            }
+        }
+        let (bars, counts) = fold.finish();
+        assert_eq!(counts.withdrawn(), 2);
+        bars.iter()
+            .map(|bar| {
+                serde_json::to_value(Observation::BarBuilt(BarBuilt::of(bar))).unwrap()["payload"]
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// The bars a session journals from `steps`, each frame observed after advancing to the instant beside it, if any.
+    async fn live_bars(steps: &[(Option<&str>, &str)]) -> Vec<serde_json::Value> {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        for (advance_to, frame) in steps {
+            if let Some(advance_to) = advance_to {
+                session
+                    .advance(at(advance_to), &broker, &mut journal)
+                    .await
+                    .unwrap();
+            }
+            for message in messages(&format!("[{frame}]")).unwrap() {
+                session
+                    .observe(at("14:00:00"), &FeedEvent::Message(message), &mut journal)
+                    .unwrap();
+            }
+        }
+        session
+            .advance(at("19:00:00"), &broker, &mut journal)
+            .await
+            .unwrap();
+        let bars = records(&directory)
+            .iter()
+            .filter(|record| record.observation().event_type() == "bar_built")
+            .map(|record| serde_json::to_value(record.observation()).unwrap()["payload"].clone())
+            .collect();
+        std::fs::remove_dir_all(&directory).unwrap();
+        bars
+    }
+
+    /// A correction and a cancel arriving while their prints' minutes are open leave the live bars the archive's: the
+    /// original withdrawn, its replacement standing at the correction's instant, and the canceled print gone.
+    #[tokio::test(start_paused = true)]
+    async fn test_live_bars_agree_with_the_archive_on_a_correction_and_a_cancel() {
+        let live = live_bars(&[
+            (None, CORRECTED_PRINT),
+            (None, CORRECTION),
+            (None, STANDING_PRINT),
+            (None, CANCELED_PRINT),
+            (None, CANCEL),
+        ])
+        .await;
+        let minutes: Vec<(&str, &str)> = live
+            .iter()
+            .map(|bar| {
+                (
+                    bar["symbol"].as_str().unwrap(),
+                    bar["timestamp"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            minutes,
+            [
+                ("QQQ", "2026-10-07T18:36:00Z"),
+                ("SPY", "2026-10-07T18:50:00Z")
+            ]
+        );
+        assert_eq!(live, archive_bars());
+    }
+
+    /// A correction or cancel arriving after its print's bar was built leaves that bar as built; the replacement still
+    /// stands at the correction's instant.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_late_correction_or_cancel_leaves_the_built_bar() {
+        let live = live_bars(&[
+            (None, CORRECTED_PRINT),
+            (Some("17:09:00"), CORRECTION),
+            (None, STANDING_PRINT),
+            (None, CANCELED_PRINT),
+            (Some("18:52:00"), CANCEL),
+        ])
+        .await;
+        let volumes: Vec<(&str, &str, i64)> = live
+            .iter()
+            .map(|bar| {
+                (
+                    bar["symbol"].as_str().unwrap(),
+                    bar["timestamp"].as_str().unwrap(),
+                    bar["volume"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            volumes,
+            [
+                ("QQQ", "2026-10-07T17:07:00Z", 3_500_000_000),
+                ("QQQ", "2026-10-07T18:36:00Z", 3_500_000_000),
+                ("SPY", "2026-10-07T18:50:00Z", 14_150_000_000),
+            ]
+        );
     }
 }

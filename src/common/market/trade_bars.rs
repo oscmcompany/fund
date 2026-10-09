@@ -879,10 +879,9 @@ impl TradeFold {
                 return;
             }
         }
-        let minute = BarInterval::OneMinute.bucket(print.timestamp());
         if self
             .drained_through
-            .is_some_and(|drained| BarInterval::OneMinute.ends(minute) <= drained)
+            .is_some_and(|drained| minute_ended_by(print, drained))
         {
             self.counts.late += 1;
             return;
@@ -903,7 +902,7 @@ impl TradeFold {
         let key = BarKey {
             symbol: print.symbol().clone(),
             interval: BarInterval::OneMinute,
-            timestamp: minute,
+            timestamp: BarInterval::OneMinute.bucket(print.timestamp()),
         };
         self.minutes.add(key, TradeSums::of(print, allowed));
     }
@@ -921,6 +920,100 @@ impl TradeFold {
     /// The one-minute bars not yet handed out and what the fold did with every print.
     pub fn finish(self) -> (Vec<TradeBar>, TradeFoldCounts) {
         (self.minutes.into_bars(), self.counts)
+    }
+}
+
+/// Whether `print`'s minute has ended by `through`, the one test of a minute being closed to further prints.
+fn minute_ended_by(print: &Print, through: DateTime<Utc>) -> bool {
+    BarInterval::OneMinute.ends(BarInterval::OneMinute.bucket(print.timestamp())) <= through
+}
+
+/// A print held whole until its minute is drained, so a correction or cancel can still withdraw it.
+#[derive(Debug, Clone)]
+struct HeldPrint {
+    print: Print,
+    tape: Tape,
+    letters: Vec<ConditionLetter>,
+}
+
+/// What a correction or cancel did to the print it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// The print's minute was still open, so no bar holds it.
+    Applied,
+    /// No open minute holds the print: its bar was already handed out, or the fold never saw it, so no bar changes.
+    NotHeld,
+}
+
+/// A `TradeFold` fed from a live tape, where a correction or cancel names an earlier print by `Identity` rather than
+/// arriving as a labelled record beside it.
+pub struct LiveTradeFold<Identity> {
+    fold: TradeFold,
+    held: BTreeMap<Identity, HeldPrint>,
+}
+
+impl<Identity: Ord> LiveTradeFold<Identity> {
+    pub fn new(session: SessionDate, conditions: TradeConditions) -> Self {
+        Self {
+            fold: TradeFold::new(session, conditions),
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// Holds a standing print until its minute drains, and folds a withdrawn one at once, as `TradeFold` counts it.
+    pub fn push(
+        &mut self,
+        identity: Identity,
+        print: Print,
+        tape: Tape,
+        letters: Vec<ConditionLetter>,
+        correction: Correction,
+    ) {
+        match correction {
+            Correction::Stands => {
+                self.held.insert(
+                    identity,
+                    HeldPrint {
+                        print,
+                        tape,
+                        letters,
+                    },
+                );
+            }
+            Correction::Withdrawn => {
+                self.fold
+                    .push_lettered(&print, tape, &letters, Correction::Withdrawn);
+            }
+        }
+    }
+
+    /// Withdraws the print `identity` names, as a correction's original or a cancel's print is withdrawn.
+    pub fn withdraw(&mut self, identity: &Identity) -> Withdrawal {
+        match self.held.remove(identity) {
+            Some(held) => {
+                self.fold.push_lettered(
+                    &held.print,
+                    held.tape,
+                    &held.letters,
+                    Correction::Withdrawn,
+                );
+                Withdrawal::Applied
+            }
+            None => Withdrawal::NotHeld,
+        }
+    }
+
+    /// Folds every held print whose minute has ended by `through`, then hands out the bars `TradeFold` would.
+    pub fn drain_through(&mut self, through: DateTime<Utc>) -> Vec<TradeBar> {
+        let (due, open): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|(_, held)| minute_ended_by(&held.print, through));
+        self.held = open;
+        for held in due.values() {
+            self.fold
+                .push_lettered(&held.print, held.tape, &held.letters, Correction::Stands);
+        }
+        self.fold.drain_through(through)
     }
 }
 
@@ -1585,6 +1678,35 @@ mod tests {
             handed_out.sort_by_key(TradeBar::timestamp);
             prop_assert_eq!(counts.late(), 0);
             prop_assert_eq!(handed_out, whole.finish().0);
+        }
+
+        /// With nothing withdrawn, the live fold hands out at every drain exactly the bars the plain fold does, late
+        /// prints included, and holds nothing once the clock has passed every print's minute.
+        #[test]
+        fn property_the_live_fold_hands_out_the_plain_folds_bars(
+            offsets in prop::collection::vec(0..600i64, 0..40),
+            drains in prop::collection::btree_map(0..40usize, 0..600i64, 0..10),
+        ) {
+            let open = instant("2026-10-02T13:30:00Z");
+            let mut plain = session();
+            let mut live = LiveTradeFold::new(october_second(), conditions());
+            for (index, offset) in offsets.iter().enumerate() {
+                if let Some(drain) = drains.get(&index) {
+                    let through = open + TimeDelta::seconds(*drain);
+                    prop_assert_eq!(live.drain_through(through), plain.drain_through(through));
+                }
+                let print = Print::Trade(Trade::new(
+                    Symbol::new("AAPL").unwrap(),
+                    open + TimeDelta::seconds(*offset),
+                    Price::from_ticks(100_000_000 + offset).unwrap(),
+                    Shares::whole(100).unwrap(),
+                ).unwrap());
+                plain.push_lettered(&print, Tape::UnlistedTrading, &[], Correction::Stands);
+                live.push(index, print, Tape::UnlistedTrading, vec![], Correction::Stands);
+            }
+            let close = open + TimeDelta::minutes(11);
+            prop_assert_eq!(live.drain_through(close), plain.drain_through(close));
+            prop_assert_eq!(live.held.len(), 0);
         }
 
         #[test]
