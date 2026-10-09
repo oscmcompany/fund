@@ -21,7 +21,7 @@ use fund::archive::{quote_bars, reference, trade_bars};
 use fund::common::journal::{ObjectDeleted, ObjectWritten, Observation};
 use fund::common::market::aggregate::{self, session_bars};
 use fund::common::market::quote_bars::QuoteFold;
-use fund::common::market::record::BarInterval;
+use fund::common::market::record::{BarInterval, BarPartition, BarPartitionRefusal};
 use fund::common::market::trade_bars::{TradeConditions, TradeFold};
 use fund::common::monoid::{Monoid, Tally};
 use fund::common::storage::{
@@ -707,18 +707,20 @@ async fn parse_one(
         .ok_or(ParseFailure::Missing)?;
     let provenance = provenance(Subscription::StocksAdvanced, fetched_at, journal);
     // Decompressing, parsing and encoding a minute file is seconds of CPU, which belongs off the async workers.
-    let (parsed, body) = tokio::task::spawn_blocking(move || {
+    let (count, test_tickers, refused, by_cause, body) = tokio::task::spawn_blocking(move || {
         let parsed = file
             .parse_bars(&gzipped, session)
             .map_err(ParseFailure::Parse)?;
-        if parsed.bars().is_empty() {
-            return Err(ParseFailure::Empty {
-                test_tickers: parsed.test_tickers().len(),
-                refused: parsed.refused().len(),
-            });
-        }
-        let body = encode(&key, parsed.bars(), &provenance).map_err(ParseFailure::Encode)?;
-        Ok((parsed, body))
+        let (test_tickers, refused) = (parsed.test_tickers().len(), parsed.refused().len());
+        let by_cause = refused_by_cause(parsed.refused());
+        let bars = BarPartition::try_from(parsed.into_bars()).map_err(|refusal| match refusal {
+            BarPartitionRefusal::Empty => ParseFailure::Empty {
+                test_tickers,
+                refused,
+            },
+        })?;
+        let body = encode(&key, &bars, &provenance).map_err(ParseFailure::Encode)?;
+        Ok((bars.bars().len(), test_tickers, refused, by_cause, body))
     })
     .await
     .map_err(|error| ParseFailure::Interrupted(error.to_string()))??;
@@ -730,10 +732,10 @@ async fn parse_one(
     written(journal, key.into(), bytes).map_err(ParseFailure::Journal)?;
     tracing::info!(
         session = %session,
-        bars = parsed.bars().len(),
-        test_tickers = parsed.test_tickers().len(),
-        refused = parsed.refused().len(),
-        refused_by_cause = %refused_by_cause(parsed.refused()),
+        bars = count,
+        test_tickers,
+        refused,
+        refused_by_cause = %by_cause,
         "Parsed a raw file"
     );
     Ok(())
@@ -1358,10 +1360,12 @@ async fn roll_up_one(
     let (count, body) = tokio::task::spawn_blocking(move || {
         let (minutes, provenance) =
             bars::decode(&minute_key, bytes).map_err(RollUpFailure::Decode)?;
-        let five_minutes = aggregate::roll_up(&minutes, BarInterval::FiveMinute)
+        let five_minutes = aggregate::roll_up(minutes.bars(), BarInterval::FiveMinute)
             .expect("minutes roll up to five minutes");
+        let five_minutes = BarPartition::try_from(five_minutes)
+            .expect("a minute or more rolls up to a five-minute bar or more");
         let body = bars::encode(&key, &five_minutes, &provenance).map_err(RollUpFailure::Encode)?;
-        Ok::<_, RollUpFailure>((five_minutes.len(), body))
+        Ok::<_, RollUpFailure>((five_minutes.bars().len(), body))
     })
     .await
     .map_err(|error| RollUpFailure::Interrupted(error.to_string()))??;

@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 
 use crate::common::journal::{Commit, RunId};
-use crate::common::market::record::{Bar, BarPrices};
+use crate::common::market::record::{Bar, BarPartition, BarPartitionRefusal, BarPrices};
 use crate::common::market::{DollarVolume, Shares, Symbol, TradeCount};
 use crate::common::storage::{BarsKey, Provider};
 
@@ -169,6 +169,7 @@ pub enum DecodeRefusal {
         provenance: Provenance,
         key: Provider,
     },
+    Partition(BarPartitionRefusal),
 }
 
 impl From<ReadRefusal> for DecodeRefusal {
@@ -199,7 +200,7 @@ fn schema() -> Schema {
 /// The file for `key`, rows ordered by symbol and then timestamp so the same bars always make the same bytes.
 pub fn encode(
     key: &BarsKey,
-    bars: &[Bar],
+    bars: &BarPartition,
     provenance: &Provenance,
 ) -> Result<Vec<u8>, EncodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
@@ -209,7 +210,7 @@ pub fn encode(
             key: provider,
         });
     }
-    let ordered = parquet::place(bars, interval, session, |bar| {
+    let ordered = parquet::place(bars.bars(), interval, session, |bar| {
         (bar.symbol(), bar.interval(), bar.timestamp())
     })
     .map_err(EncodeRefusal::Placement)?;
@@ -266,7 +267,7 @@ pub fn encode(
 
 /// The bars and provenance a file written by `encode` under `key` holds, each row rebuilt through the domain's own
 /// constructors so a file edited out of band cannot hand back an invalid bar.
-pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
+pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(BarPartition, Provenance), DecodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
@@ -319,6 +320,7 @@ pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), D
             bars.push(read(row).map_err(|cause| DecodeRefusal::Row { index, cause })?);
         }
     }
+    let bars = BarPartition::try_from(bars).map_err(DecodeRefusal::Partition)?;
     Ok((bars, provenance))
 }
 
@@ -437,6 +439,15 @@ mod tests {
         .unwrap()
     }
 
+    fn partition(bars: &[Bar]) -> BarPartition {
+        BarPartition::try_from(bars.to_vec()).unwrap()
+    }
+
+    /// One bar inside the minute key, for a test about the file rather than its rows.
+    fn one_bar() -> BarPartition {
+        partition(&[bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None)])
+    }
+
     #[test]
     fn test_bars_read_back_sorted_with_their_provenance() {
         let bars = [
@@ -450,13 +461,19 @@ mod tests {
             bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None),
         ];
         let written = provenance(Subscription::AlgoTraderPlus);
-        let bytes = encode(&minute_key(), &bars, &written).unwrap();
+        let bytes = encode(&minute_key(), &partition(&bars), &written).unwrap();
         let (read, provenance) = decode(&minute_key(), bytes.clone()).unwrap();
         assert_eq!(provenance, written);
-        assert_eq!(read, [bars[2].clone(), bars[1].clone(), bars[0].clone()]);
+        assert_eq!(
+            read.bars(),
+            [bars[2].clone(), bars[1].clone(), bars[0].clone()]
+        );
         // The same bars in any order make the same bytes, so a rerun overwrites with an identical object.
         let reordered = [bars[1].clone(), bars[0].clone(), bars[2].clone()];
-        assert_eq!(encode(&minute_key(), &reordered, &written).unwrap(), bytes);
+        assert_eq!(
+            encode(&minute_key(), &partition(&reordered), &written).unwrap(),
+            bytes
+        );
     }
 
     /// What DuckDB sees: the stored integers read as dollars and shares at their declared scale.
@@ -473,7 +490,7 @@ mod tests {
         )];
         let bytes = encode(
             &minute_key(),
-            &bars,
+            &partition(&bars),
             &provenance(Subscription::AlgoTraderPlus),
         )
         .unwrap();
@@ -499,7 +516,7 @@ mod tests {
         let written = provenance(Subscription::AlgoTraderPlus);
         let next_day = bar("AAPL", "2026-09-26T14:30:00Z", 10.0, None);
         assert_eq!(
-            encode(&minute_key(), &[next_day], &written),
+            encode(&minute_key(), &partition(&[next_day]), &written),
             Err(EncodeRefusal::Placement(PlacementRefusal::OutsideKey {
                 symbol: Symbol::new("AAPL").unwrap(),
                 timestamp: "2026-09-26T14:30:00Z".parse().unwrap()
@@ -507,7 +524,7 @@ mod tests {
         );
         let twice = bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None);
         assert_eq!(
-            encode(&minute_key(), &[twice.clone(), twice], &written),
+            encode(&minute_key(), &partition(&[twice.clone(), twice]), &written),
             Err(EncodeRefusal::Placement(PlacementRefusal::Duplicate {
                 symbol: Symbol::new("AAPL").unwrap(),
                 timestamp: "2026-09-25T14:30:00Z".parse().unwrap()
@@ -518,7 +535,11 @@ mod tests {
     #[test]
     fn test_a_subscription_must_belong_to_the_keys_provider() {
         assert_eq!(
-            encode(&minute_key(), &[], &provenance(Subscription::StocksStarter)),
+            encode(
+                &minute_key(),
+                &one_bar(),
+                &provenance(Subscription::StocksStarter)
+            ),
             Err(EncodeRefusal::SubscriptionProvider {
                 provenance: provenance(Subscription::StocksStarter),
                 key: Provider::Alpaca
@@ -537,7 +558,7 @@ mod tests {
     #[test]
     fn test_a_file_without_its_layout_or_from_another_is_refused() {
         let written = provenance(Subscription::AlgoTraderPlus);
-        let bytes = encode(&minute_key(), &[], &written).unwrap();
+        let bytes = encode(&minute_key(), &one_bar(), &written).unwrap();
         let unnamed = replace(&bytes, b"fund.layout_version", b"fund.layout_versioX");
         assert_eq!(
             decode(&minute_key(), unnamed).map(|_| ()),
@@ -643,7 +664,14 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(decode(&minute_key(), file_with(schema())).is_ok());
+    }
+
+    #[test]
+    fn test_a_file_with_no_rows_is_refused() {
+        assert_eq!(
+            decode(&minute_key(), file_with(schema())).map(|_| ()),
+            Err(DecodeRefusal::Partition(BarPartitionRefusal::Empty))
+        );
     }
 
     #[test]
@@ -651,7 +679,7 @@ mod tests {
         let bars = [bar("AAPL", "2026-09-25T14:30:00Z", 10.0, None)];
         let bytes = encode(
             &minute_key(),
-            &bars,
+            &partition(&bars),
             &provenance(Subscription::AlgoTraderPlus),
         )
         .unwrap();
@@ -724,9 +752,10 @@ mod tests {
             prop_assert_eq!(provenance_from(&provenance.metadata()), Ok(provenance));
         }
 
+        /// Any bars a partition admits survive it and the file, in key order.
         #[test]
         fn property_bars_survive_the_file(
-            bars in prop::collection::vec(any_bar(), 0..40),
+            bars in prop::collection::vec(any_bar(), 1..40),
             written in any_provenance(Subscription::AlgoTraderPlus),
         ) {
             let mut unique: Vec<Bar> = Vec::new();
@@ -736,8 +765,10 @@ mod tests {
                 }
             }
             unique.sort_by(|left, right| (left.symbol(), left.timestamp()).cmp(&(right.symbol(), right.timestamp())));
-            let bytes = encode(&minute_key(), &unique, &written).unwrap();
-            prop_assert_eq!(decode(&minute_key(), bytes).unwrap(), (unique, written));
+            let partition = BarPartition::try_from(unique.clone()).unwrap();
+            prop_assert_eq!(partition.clone().into_bars(), unique);
+            let bytes = encode(&minute_key(), &partition, &written).unwrap();
+            prop_assert_eq!(decode(&minute_key(), bytes).unwrap(), (partition, written));
         }
     }
 }
