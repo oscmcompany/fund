@@ -3,12 +3,12 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Utc};
 
+use super::aggregate::{BarKey, RollsUp, Rollup};
 use super::record::{BarInterval, Quote};
 use super::{Price, QuoteCount, Shares, Symbol};
-use crate::common::monoid::Monoid;
-use crate::common::time::SessionDate;
+use crate::common::monoid::{Monoid, Semigroup};
 
 /// Relative spreads are held in millionths of the midpoint, so one unit is a hundredth of a basis point.
 pub const RELATIVE_SPREAD_SCALE: u128 = 1_000_000;
@@ -244,20 +244,6 @@ impl QuoteSums {
         })
     }
 
-    fn combine(self, other: Self) -> Self {
-        Self {
-            quote_count: self.quote_count.plus(other.quote_count),
-            covered_nanoseconds: self
-                .covered_nanoseconds
-                .checked_add(other.covered_nanoseconds)
-                .expect("covered nanoseconds fit u64"),
-            time_weighted: self.time_weighted.combine(other.time_weighted),
-            narrowest: self.narrowest.min(other.narrowest),
-            widest: self.widest.max(other.widest),
-            closing: self.closing.max(other.closing),
-        }
-    }
-
     pub fn quote_count(&self) -> QuoteCount {
         self.quote_count
     }
@@ -280,6 +266,22 @@ impl QuoteSums {
 
     pub fn closing(&self) -> &StandingQuote {
         &self.closing
+    }
+}
+
+impl Semigroup for QuoteSums {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            quote_count: self.quote_count.plus(other.quote_count),
+            covered_nanoseconds: self
+                .covered_nanoseconds
+                .checked_add(other.covered_nanoseconds)
+                .expect("covered nanoseconds fit u64"),
+            time_weighted: self.time_weighted.combine(other.time_weighted),
+            narrowest: self.narrowest.min(other.narrowest),
+            widest: self.widest.max(other.widest),
+            closing: self.closing.max(other.closing),
+        }
     }
 }
 
@@ -330,7 +332,7 @@ impl QuoteBar {
         timestamp: DateTime<Utc>,
         sums: QuoteSums,
     ) -> Result<Self, QuoteBarRefusal> {
-        if bucket(timestamp, interval) != timestamp {
+        if interval.bucket(timestamp) != timestamp {
             return Err(QuoteBarRefusal::Misaligned {
                 interval,
                 timestamp,
@@ -373,87 +375,22 @@ impl QuoteBar {
     }
 }
 
-/// The bucket an instant falls in at `interval`; a daily bucket is its session's close.
-fn bucket(instant: DateTime<Utc>, interval: BarInterval) -> DateTime<Utc> {
-    let minute = instant
-        .with_second(0)
-        .and_then(|instant| instant.with_nanosecond(0))
-        .expect("zero seconds and nanoseconds exist in every minute");
-    match interval {
-        BarInterval::OneMinute => minute,
-        BarInterval::FiveMinute => minute - TimeDelta::minutes(i64::from(minute.minute() % 5)),
-        BarInterval::OneDay => SessionDate::at(instant).regular_close(),
-    }
-}
+impl RollsUp for QuoteBar {
+    type Sums = QuoteSums;
 
-/// Quote bars built so far, one per symbol, interval and bucket.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct QuoteRollup(BTreeMap<(Symbol, BarInterval, DateTime<Utc>), QuoteSums>);
-
-/// Why a quote bar could not be rolled up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuoteRollupRefusal {
-    Finer { from: BarInterval, to: BarInterval },
-}
-
-impl std::fmt::Display for QuoteRollupRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Finer { from, to } => write!(
-                formatter,
-                "a {from} quote bar cannot roll up into the finer {to}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for QuoteRollupRefusal {}
-
-impl QuoteRollup {
-    /// The fragment `bar` contributes to the `interval` bar containing it.
-    pub fn of(bar: &QuoteBar, interval: BarInterval) -> Result<Self, QuoteRollupRefusal> {
-        if interval < bar.interval {
-            return Err(QuoteRollupRefusal::Finer {
-                from: bar.interval,
-                to: interval,
-            });
-        }
-        let key = (
-            bar.symbol.clone(),
-            interval,
-            bucket(bar.timestamp, interval),
-        );
-        Ok(Self(BTreeMap::from([(key, bar.sums.clone())])))
+    fn parts(&self) -> (BarKey, QuoteSums) {
+        let key = BarKey {
+            symbol: self.symbol.clone(),
+            interval: self.interval,
+            timestamp: self.timestamp,
+        };
+        (key, self.sums.clone())
     }
 
-    /// Every bar built, ordered by symbol, interval and timestamp.
-    pub fn into_bars(self) -> Vec<QuoteBar> {
-        self.0
-            .into_iter()
-            .map(|((symbol, interval, timestamp), sums)| QuoteBar {
-                symbol,
-                interval,
-                timestamp,
-                sums,
-            })
-            .collect()
-    }
-}
-
-impl Monoid for QuoteRollup {
-    fn empty() -> Self {
-        Self::default()
-    }
-
-    fn combine(mut self, other: Self) -> Self {
-        for (key, sums) in other.0 {
-            let merged = match self.0.remove(&key) {
-                Some(existing) => existing.combine(sums),
-                None => sums,
-            };
-            self.0.insert(key, merged);
-        }
-        self
+    fn from_parts(key: BarKey, sums: QuoteSums) -> Self {
+        Self::new(key.symbol, key.interval, key.timestamp, sums).expect(
+            "a rolled-up bucket sits on its grid and is covered no longer than its interval",
+        )
     }
 }
 
@@ -481,9 +418,9 @@ pub struct QuoteFold {
     open: DateTime<Utc>,
     close: DateTime<Utc>,
     standing: BTreeMap<Symbol, StandingQuote>,
-    minutes: QuoteRollup,
+    minutes: Rollup<QuoteBar>,
     /// Quotes that began in each minute, added once every minute's coverage is known.
-    began: BTreeMap<(Symbol, DateTime<Utc>), u64>,
+    began: BTreeMap<BarKey, u64>,
     counts: QuoteFoldCounts,
 }
 
@@ -517,7 +454,7 @@ impl QuoteFold {
             open,
             close,
             standing: BTreeMap::new(),
-            minutes: QuoteRollup::empty(),
+            minutes: Rollup::empty(),
             began: BTreeMap::new(),
             counts: QuoteFoldCounts::default(),
         })
@@ -535,8 +472,12 @@ impl QuoteFold {
         }
         self.counts.accepted += 1;
         if (self.open..self.close).contains(&quote.timestamp()) {
-            let minute = bucket(quote.timestamp(), BarInterval::OneMinute);
-            *self.began.entry((symbol.clone(), minute)).or_insert(0) += 1;
+            let key = BarKey {
+                symbol: symbol.clone(),
+                interval: BarInterval::OneMinute,
+                timestamp: BarInterval::OneMinute.bucket(quote.timestamp()),
+            };
+            *self.began.entry(key).or_insert(0) += 1;
         }
         self.standing
             .insert(symbol.clone(), StandingQuote::of(quote));
@@ -548,13 +489,9 @@ impl QuoteFold {
         for (symbol, quote) in &standing {
             self.stand(symbol, quote, self.close);
         }
-        for ((symbol, minute), count) in std::mem::take(&mut self.began) {
+        for (key, count) in std::mem::take(&mut self.began) {
             // A quote replaced within its own nanosecond covers nothing, and its minute holds the one that replaced it.
-            if let Some(sums) = self
-                .minutes
-                .0
-                .get_mut(&(symbol, BarInterval::OneMinute, minute))
-            {
+            if let Some(sums) = self.minutes.get_mut(&key) {
                 sums.quote_count = sums.quote_count.plus(QuoteCount::new(count));
             }
         }
@@ -567,31 +504,21 @@ impl QuoteFold {
         let mut from = quote.since.max(self.open);
         let until = until.min(self.close);
         while from < until {
-            let minute = bucket(from, BarInterval::OneMinute);
+            let minute = BarInterval::OneMinute.bucket(from);
             let end = BarInterval::OneMinute.ends(minute).min(until);
             let nanoseconds = (end - from)
                 .num_nanoseconds()
                 .and_then(|nanoseconds| u64::try_from(nanoseconds).ok())
                 .expect("a span inside one minute is a positive count of nanoseconds");
-            self.add(symbol, quote, minute, nanoseconds);
+            let key = BarKey {
+                symbol: symbol.clone(),
+                interval: BarInterval::OneMinute,
+                timestamp: minute,
+            };
+            self.minutes
+                .add(key, QuoteSums::standing(quote, nanoseconds));
             from = end;
         }
-    }
-
-    fn add(
-        &mut self,
-        symbol: &Symbol,
-        quote: &StandingQuote,
-        minute: DateTime<Utc>,
-        nanoseconds: u64,
-    ) {
-        let key = (symbol.clone(), BarInterval::OneMinute, minute);
-        let sums = QuoteSums::standing(quote, nanoseconds);
-        let merged = match self.minutes.0.remove(&key) {
-            Some(existing) => existing.combine(sums),
-            None => sums,
-        };
-        self.minutes.0.insert(key, merged);
     }
 }
 
@@ -599,8 +526,11 @@ impl QuoteFold {
 mod tests {
     use proptest::prelude::*;
 
+    use chrono::TimeDelta;
+
     use super::*;
-    use crate::common::monoid::{concatenate, laws};
+    use crate::common::market::aggregate::{check_rollups_compose, roll_up};
+    use crate::common::monoid::laws;
 
     fn instant(text: &str) -> DateTime<Utc> {
         text.parse().unwrap()
@@ -889,14 +819,16 @@ mod tests {
             })
     }
 
-    fn any_rollup() -> impl Strategy<Value = QuoteRollup> {
+    fn any_rollup() -> impl Strategy<Value = Rollup<QuoteBar>> {
         (any_sums(), 0_i64..3).prop_map(|(sums, minute)| {
-            let key = (
+            let bar = QuoteBar::new(
                 Symbol::new("AAPL").unwrap(),
                 BarInterval::OneMinute,
                 instant("2026-10-02T13:30:00Z") + TimeDelta::minutes(minute),
-            );
-            QuoteRollup(BTreeMap::from([(key, sums)]))
+                sums,
+            )
+            .unwrap();
+            Rollup::of(&bar, BarInterval::OneMinute).unwrap()
         })
     }
 
@@ -910,7 +842,7 @@ mod tests {
             laws::check(first, second, third)?;
         }
 
-        /// Rolling minutes up to the day keeps every sum: the daily bar is the minutes' total.
+        /// Rolling minutes up to the day keeps every sum, the daily bar being the minutes' total, and in stages or at once.
         #[test]
         fn property_a_daily_bar_holds_the_sum_of_its_minutes(
             quotes in prop::collection::vec((0_i64..23_400, 1_i64..2_000, 0_i64..400), 1..40),
@@ -926,7 +858,8 @@ mod tests {
             }
             let (minutes, counts) = fold.finish();
             let total_covered: u64 = minutes.iter().map(|bar| bar.sums().covered_nanoseconds()).sum();
-            let daily = concatenate(minutes.iter().map(|bar| QuoteRollup::of(bar, BarInterval::OneDay).unwrap())).into_bars();
+            check_rollups_compose(&minutes)?;
+            let daily = roll_up(&minutes, BarInterval::OneDay).unwrap();
             prop_assert_eq!(daily.len(), 1);
             prop_assert_eq!(daily[0].timestamp(), instant("2026-10-02T20:00:00Z"));
             prop_assert_eq!(daily[0].sums().covered_nanoseconds(), total_covered);

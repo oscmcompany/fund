@@ -18,11 +18,11 @@ use fund::archive::raw::CopyError;
 use fund::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use fund::archive::{quote_bars, reference, trade_bars};
 use fund::common::journal::{Commit, RunId};
-use fund::common::market::aggregate::BarRollup;
-use fund::common::market::quote_bars::{QuoteFold, QuoteRollup};
+use fund::common::market::aggregate::{self, session_bars};
+use fund::common::market::quote_bars::QuoteFold;
 use fund::common::market::record::BarInterval;
-use fund::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
-use fund::common::monoid::{Monoid, Tally, concatenate};
+use fund::common::market::trade_bars::{TradeConditions, TradeFold};
+use fund::common::monoid::{Monoid, Tally};
 use fund::common::storage::{Key, Origin, Provider};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
@@ -641,19 +641,14 @@ async fn parse_one(
     Ok(())
 }
 
-/// Quote bars at every interval for a session, minutes first, keyed where each is written.
-fn quote_keys(session: SessionDate) -> [Key; 3] {
-    [
-        BarInterval::OneMinute,
-        BarInterval::FiveMinute,
-        BarInterval::OneDay,
-    ]
-    .map(|interval| Key::Quotes {
+/// Where a session's quote bars at `interval` are written.
+fn quote_key(interval: BarInterval, session: SessionDate) -> Key {
+    Key::Quotes {
         provider: Provider::Massive,
         origin: Origin::Derived,
         interval,
         session,
-    })
+    }
 }
 
 /// The flat files to stream and the calendar to plan by, or `None` once the refusal is logged.
@@ -843,7 +838,7 @@ async fn fold_quotes(
             return ExitCode::FAILURE;
         }
     };
-    let [_, _, daily] = quote_keys(range.first());
+    let daily = quote_key(BarInterval::OneDay, range.first());
     fold_sessions(
         archive,
         flat_files,
@@ -898,21 +893,11 @@ async fn fold_quotes_one(
     if minutes.is_empty() {
         return Err(FoldFailure::Empty);
     }
-    let [minute_key, five_minute_key, daily_key] = quote_keys(session);
-    let rollup =
-        |interval| {
-            concatenate(minutes.iter().map(|bar| {
-                QuoteRollup::of(bar, interval).expect("minutes roll up to coarser bars")
-            }))
-            .into_bars()
-        };
-    let files = [
-        (minute_key, minutes.clone()),
-        (five_minute_key, rollup(BarInterval::FiveMinute)),
-        (daily_key, rollup(BarInterval::OneDay)),
-    ];
+    let minute_bars = minutes.len();
+    let files = session_bars(minutes);
     let symbols = files[2].1.len();
-    for (key, bars) in files {
+    for (interval, bars) in files {
+        let key = quote_key(interval, session);
         let body = quote_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
         create_or_confirm(archive, &key, body, |held| {
@@ -923,7 +908,7 @@ async fn fold_quotes_one(
     tracing::info!(
         session = %session,
         symbols,
-        minute_bars = minutes.len(),
+        minute_bars,
         quotes = counts.accepted(),
         out_of_order = counts.out_of_order(),
         one_sided = rows.one_sided,
@@ -1020,19 +1005,14 @@ async fn fetch_conditions(
     }
 }
 
-/// Trade bars at every interval for a session, minutes first, keyed where each is written.
-fn trade_keys(session: SessionDate) -> [Key; 3] {
-    [
-        BarInterval::OneMinute,
-        BarInterval::FiveMinute,
-        BarInterval::OneDay,
-    ]
-    .map(|interval| Key::Trades {
+/// Where a session's trade bars at `interval` are written.
+fn trade_key(interval: BarInterval, session: SessionDate) -> Key {
+    Key::Trades {
         provider: Provider::Massive,
         origin: Origin::Derived,
         interval,
         session,
-    })
+    }
 }
 
 /// Streams each listed trade file not yet folded from Massive and writes its one-minute, five-minute and daily bars.
@@ -1065,7 +1045,7 @@ async fn fold_trades(
             return ExitCode::FAILURE;
         }
     };
-    let [_, _, daily] = trade_keys(range.first());
+    let daily = trade_key(BarInterval::OneDay, range.first());
     fold_sessions(
         archive,
         flat_files,
@@ -1121,21 +1101,11 @@ async fn fold_trades_one(
     if minutes.is_empty() {
         return Err(FoldFailure::Empty);
     }
-    let [minute_key, five_minute_key, daily_key] = trade_keys(session);
-    let rollup =
-        |interval| {
-            concatenate(minutes.iter().map(|bar| {
-                TradeRollup::of(bar, interval).expect("minutes roll up to coarser bars")
-            }))
-            .into_bars()
-        };
-    let files = [
-        (minute_key, minutes.clone()),
-        (five_minute_key, rollup(BarInterval::FiveMinute)),
-        (daily_key, rollup(BarInterval::OneDay)),
-    ];
+    let minute_bars = minutes.len();
+    let files = session_bars(minutes);
     let symbols = files[2].1.len();
-    for (key, bars) in files {
+    for (interval, bars) in files {
+        let key = trade_key(interval, session);
         let body = trade_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
         create_or_confirm(archive, &key, body, |held| {
@@ -1146,7 +1116,7 @@ async fn fold_trades_one(
     tracing::info!(
         session = %session,
         symbols,
-        minute_bars = minutes.len(),
+        minute_bars,
         folded = counts.folded(),
         other_session = counts.other_session(),
         withdrawn = counts.withdrawn(),
@@ -1293,10 +1263,8 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
     let (count, body) = tokio::task::spawn_blocking(move || {
         let (minutes, provenance) =
             bars::decode(&minute_key, bytes).map_err(RollUpFailure::Decode)?;
-        let five_minutes = concatenate(minutes.iter().map(|bar| {
-            BarRollup::of(bar, BarInterval::FiveMinute).expect("minutes roll up to five minutes")
-        }))
-        .into_bars();
+        let five_minutes = aggregate::roll_up(&minutes, BarInterval::FiveMinute)
+            .expect("minutes roll up to five minutes");
         let body = bars::encode(&encoded_key, &five_minutes, &provenance)
             .map_err(RollUpFailure::Encode)?;
         Ok::<_, RollUpFailure>((five_minutes.len(), body))

@@ -10,6 +10,11 @@ pub trait Monoid: Sized {
     fn combine(self, other: Self) -> Self;
 }
 
+/// An associative combine with no empty value, such as one bar's sums, which exist only once something was seen.
+pub trait Semigroup: Sized {
+    fn combine(self, other: Self) -> Self;
+}
+
 /// How many times each key was seen; a key never seen is absent, so no count is zero.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent, bound(deserialize = "Key: Ord + serde::Deserialize<'de>"))]

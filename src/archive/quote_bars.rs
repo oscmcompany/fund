@@ -448,11 +448,9 @@ mod tests {
         ) {
             let bars: Vec<QuoteBar> = match interval {
                 BarInterval::OneMinute => bars,
-                BarInterval::FiveMinute | BarInterval::OneDay => bars
-                    .iter()
-                    .map(|bar| crate::common::market::quote_bars::QuoteRollup::of(bar, interval).unwrap())
-                    .fold(<crate::common::market::quote_bars::QuoteRollup as crate::common::monoid::Monoid>::empty(), crate::common::monoid::Monoid::combine)
-                    .into_bars(),
+                BarInterval::FiveMinute | BarInterval::OneDay => {
+                    crate::common::market::aggregate::roll_up(&bars, interval).unwrap()
+                }
             };
             let mut unique: Vec<QuoteBar> = Vec::new();
             for bar in bars {
