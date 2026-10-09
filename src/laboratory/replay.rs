@@ -319,6 +319,10 @@ mod tests {
                     | Observation::TargetDecided(_)
                     | Observation::SessionOpened(_)
                     | Observation::BarBuilt(_)
+                    | Observation::TradabilityRead(_)
+                    | Observation::FeedChanged(_)
+                    | Observation::SessionHalted(_)
+                    | Observation::SessionClosed(_)
                     | Observation::PlaybookRead(_) => None,
                 },
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
@@ -343,7 +347,7 @@ mod tests {
         let metrics: Vec<_> = ran
             .metrics()
             .iter()
-            .map(|(name, value)| (name.as_str(), *value))
+            .map(|(name, value)| (name.as_str(), value.value()))
             .collect();
         assert_eq!(
             metrics,

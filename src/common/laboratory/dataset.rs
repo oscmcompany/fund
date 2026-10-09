@@ -192,10 +192,25 @@ impl Fingerprint {
 /// A partition read under one version that now holds another, or is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contamination {
-    pub session: SessionDate,
-    pub read: EntityTag,
-    /// `None` when the partition is gone.
-    pub now: Option<EntityTag>,
+    session: SessionDate,
+    read: EntityTag,
+    now: Option<EntityTag>,
+}
+
+impl Contamination {
+    pub fn session(&self) -> SessionDate {
+        self.session
+    }
+
+    /// The version the partition was read under.
+    pub fn read(&self) -> &EntityTag {
+        &self.read
+    }
+
+    /// The version the partition holds now, `None` when it is gone.
+    pub fn now(&self) -> Option<&EntityTag> {
+        self.now.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -292,19 +307,22 @@ mod tests {
         assert_eq!(fingerprint.contaminated(&current), []);
         current.insert(session(22), EntityTag::new("\"rewritten\""));
         current.remove(&session(24));
+        let contaminations = fingerprint.contaminated(&current);
+        let contaminated: Vec<(SessionDate, &str, Option<&str>)> = contaminations
+            .iter()
+            .map(|contamination| {
+                (
+                    contamination.session(),
+                    contamination.read().as_str(),
+                    contamination.now().map(EntityTag::as_str),
+                )
+            })
+            .collect();
         assert_eq!(
-            fingerprint.contaminated(&current),
+            contaminated,
             [
-                Contamination {
-                    session: session(22),
-                    read: EntityTag::new("\"tag-22\""),
-                    now: Some(EntityTag::new("\"rewritten\""))
-                },
-                Contamination {
-                    session: session(24),
-                    read: EntityTag::new("\"tag-24\""),
-                    now: None
-                }
+                (session(22), "\"tag-22\"", Some("\"rewritten\"")),
+                (session(24), "\"tag-24\"", None)
             ]
         );
     }

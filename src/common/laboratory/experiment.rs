@@ -68,6 +68,50 @@ impl Elapsed {
 #[serde(try_from = "String", into = "String")]
 pub struct Name(String);
 
+/// A metric's value, finite by construction since JSON holds no NaN or infinity.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct Metric(f64);
+
+/// A metric value that is not finite, with the value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NotFinite {
+    value: f64,
+}
+
+impl std::fmt::Display for NotFinite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} is not finite", self.value)
+    }
+}
+
+impl Metric {
+    pub fn new(value: f64) -> Result<Self, NotFinite> {
+        match value.is_finite() {
+            true => Ok(Self(value)),
+            false => Err(NotFinite { value }),
+        }
+    }
+
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for Metric {
+    type Error = NotFinite;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Metric> for f64 {
+    fn from(metric: Metric) -> Self {
+        metric.0
+    }
+}
+
 /// One experiment's settings, by name.
 ///
 /// Strings to strings on purpose: whether two runs tried the same variant is answered by equality, and strings
@@ -265,7 +309,7 @@ pub struct ExperimentRan {
     parameters: Parameters,
     fingerprints: Vec<Fingerprint>,
     estimates: BTreeMap<Name, Estimate>,
-    metrics: BTreeMap<Name, f64>,
+    metrics: BTreeMap<Name, Metric>,
     /// Cumulative from the study's opening, not this experiment's own time, which is the difference from the
     /// experiment recorded before it.
     since_opened: Elapsed,
@@ -275,7 +319,7 @@ pub struct ExperimentRan {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Outputs {
     estimates: BTreeMap<Name, Estimate>,
-    metrics: BTreeMap<Name, f64>,
+    metrics: BTreeMap<Name, Metric>,
 }
 
 impl Outputs {
@@ -298,16 +342,19 @@ impl Outputs {
         value: f64,
     ) -> Result<Self, ExperimentRefusal> {
         let name = Name::new(name)?;
-        if !value.is_finite() {
-            return Err(ExperimentRefusal::NotFinite {
-                metric: name.0,
-                value,
-            });
-        }
+        let metric = match Metric::new(value) {
+            Ok(metric) => metric,
+            Err(NotFinite { value }) => {
+                return Err(ExperimentRefusal::NotFinite {
+                    metric: name.0,
+                    value,
+                });
+            }
+        };
         if self.metrics.contains_key(&name) {
             return Err(ExperimentRefusal::Duplicate { name: name.0 });
         }
-        self.metrics.insert(name, value);
+        self.metrics.insert(name, metric);
         Ok(self)
     }
 }
@@ -352,7 +399,7 @@ impl ExperimentRan {
         &self.estimates
     }
 
-    pub fn metrics(&self) -> &BTreeMap<Name, f64> {
+    pub fn metrics(&self) -> &BTreeMap<Name, Metric> {
         &self.metrics
     }
 
@@ -455,6 +502,20 @@ mod tests {
         assert!(serde_json::from_str::<Label>("\" \"").is_err());
         assert!(serde_json::from_str::<Parameters>(r#"{"":"1"}"#).is_err());
         assert!(serde_json::from_str::<Name>("\"net\\nreturn\"").is_err());
+    }
+
+    #[test]
+    fn test_a_metric_is_finite_and_written_as_its_number() {
+        assert_eq!(
+            Metric::new(f64::NAN)
+                .map(Metric::value)
+                .map_err(|refusal| refusal.to_string()),
+            Err("NaN is not finite".to_string())
+        );
+        assert!(Metric::try_from(f64::NEG_INFINITY).is_err());
+        let metric = Metric::new(-0.25).unwrap();
+        assert_eq!(serde_json::to_string(&metric).unwrap(), "-0.25");
+        assert_eq!(serde_json::from_str::<Metric>("-0.25").unwrap(), metric);
     }
 
     /// A name given twice is refused with itself, for a setting, an estimate and a metric alike, rather than the
