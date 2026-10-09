@@ -34,7 +34,7 @@ pub struct Patience {
 pub enum PatienceRefusal {
     /// A zero poll would read an open order back to back.
     ZeroPoll,
-    /// A poll longer than `open_for` would leave an order open past it before its cancel.
+    /// A poll longer than `open_for` would never read an order back before its cancel.
     PollPastOpen { poll: Duration, open_for: Duration },
 }
 
@@ -366,7 +366,14 @@ async fn follow(
                 }
             }
         }
-        tokio::time::sleep(patience.poll()).await;
+        // Before the cancel a poll stops at the window's end, so the cancel is not put off to the next whole poll.
+        let delay = match waiting {
+            Waiting::BeforeCancel => patience
+                .poll()
+                .min(patience.open_for().saturating_sub(started.elapsed())),
+            Waiting::AfterCancel { .. } => patience.poll(),
+        };
+        tokio::time::sleep(delay).await;
         // A cancel can race a fill, so the order is always read back rather than assumed canceled.
         match broker.order(id).await {
             Ok(read) => report = Some(read.report()),
@@ -419,6 +426,8 @@ mod tests {
         /// The books reported, the last repeating.
         books: Mutex<VecDeque<Book>>,
         calls: Mutex<Vec<&'static str>>,
+        /// When each cancel was asked for.
+        cancels: Mutex<Vec<Instant>>,
     }
 
     impl Scripted {
@@ -432,6 +441,7 @@ mod tests {
                 tradability_fails: false,
                 books: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
+                cancels: Mutex::new(Vec::new()),
             }
         }
 
@@ -493,6 +503,7 @@ mod tests {
 
         async fn cancel(&self, _: &BrokerOrderId) -> Result<Cancel, BrokerError> {
             self.calls.lock().unwrap().push("cancel");
+            self.cancels.lock().unwrap().push(Instant::now());
             match self.cancel_fails {
                 true => Err(BrokerError::Fetch(FetchError::Exhausted {
                     attempts: 3,
@@ -817,6 +828,37 @@ mod tests {
         let (outcomes, _) = run(&broker, &buying(&["SPY"], 1), patience).await;
         assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
         assert_eq!(broker.calls(), ["submit", "order", "cancel", "order"]);
+    }
+
+    /// A window that is not a whole number of polls is cut short: reads at twenty and thirty seconds, the cancel at
+    /// thirty, and a full poll before the read after it.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_order_is_canceled_when_its_window_ends_between_polls() {
+        let broker = Scripted::new(
+            &[Answer::Stands(OPEN, 0)],
+            &[
+                Answer::Stands(OPEN, 0),
+                Answer::Stands(OPEN, 0),
+                Answer::Stands(CANCELED, 0),
+            ],
+        );
+        let started = Instant::now();
+        let patience = patience((20_000, 30_000));
+        let (outcomes, _) = run(&broker, &buying(&["SPY"], 1), patience).await;
+        assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
+        assert_eq!(
+            broker.calls(),
+            ["submit", "order", "order", "cancel", "order"]
+        );
+        let cancels = broker.cancels.lock().unwrap();
+        assert_eq!(
+            cancels
+                .iter()
+                .map(|cancel| cancel.duration_since(started))
+                .collect::<Vec<_>>(),
+            [Duration::from_secs(30)]
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(50));
     }
 
     /// A report the order's state refuses, here an execution that shrank, spends its patience like a failed read.
