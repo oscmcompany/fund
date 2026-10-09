@@ -122,9 +122,7 @@ impl Provenance {
             (MetadataEntry::RunId, Some(self.run_id.to_string())),
             (
                 MetadataEntry::Commit,
-                self.commit
-                    .as_ref()
-                    .map(|commit| commit.as_str().to_string()),
+                self.commit.as_ref().map(Commit::to_string),
             ),
         ]
     }

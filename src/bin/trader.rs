@@ -3,28 +3,22 @@
 //! or found none, and every record shipped; 1 when it halted, stopped or did not ship; 2 when it could not start.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::Instrument;
-use tracing_subscriber::Layer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
 
 use fund::archive::reference::{SnapshotError, latest_conditions};
 use fund::archive::trade_bars::{DecodeRefusal, decode};
 use fund::archive::{Archive, ArchiveError};
 use fund::broker::{Broker, BrokerError, PaperAccount};
 use fund::common::book::ValuationRefusal;
-use fund::common::journal::{Commit, Observation, RunId, SessionOpened};
+use fund::common::journal::{Observation, SessionOpened};
 use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
@@ -37,15 +31,12 @@ use fund::ingest::alpaca::Alpaca;
 use fund::ingest::alpaca::feed::{Feed, FeedEvent};
 use fund::ingest::alpaca::stream::StreamMessage;
 use fund::ingest::{FetchError, VariableRefusal};
-use fund::journal::{Journal, built_commit, lock};
-use fund::parameter::log_directory_from_environment;
-use fund::records::{log_file_name, ship, shipped_filter};
+use fund::journal::Journal;
+use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 use fund::trader::parameters::Parameters;
 use fund::trader::{Session, SessionError, Standing, last_closes, warm};
-use uuid::Uuid;
 
 const SERVICE: &str = "trader";
-const REFUSED_TO_START: u8 = 2;
 /// Calendar days read back for the previous session, past any run of holidays and a weekend.
 const CALENDAR_DAYS_BACK: i64 = 14;
 /// Feed events held while the session is busy trading, so the socket keeps being read.
@@ -56,79 +47,23 @@ const TICK: Duration = Duration::from_secs(1);
 async fn main() -> ExitCode {
     let today = SessionDate::at(Utc::now());
     let service = Service::new(SERVICE).expect("the service name is one path segment");
-    let resolved = Parameters::from_environment();
-    let log_file = log_directory_from_environment().map(|directory| {
-        std::fs::create_dir_all(&directory).and_then(|()| {
-            File::options()
-                .create(true)
-                .append(true)
-                .open(directory.join(log_file_name(&service, today)))
-        })
-    });
-    // A refused log directory is reported with the other parameters; only a directory that resolved can fail to open.
-    let (log_writer, log_file_error) = match log_file {
-        Ok(Ok(file)) => (Some(Mutex::new(file)), None),
-        Ok(Err(error)) => (None, Some(error)),
-        Err(_) => (None, None),
-    };
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(
-            fmt::layer()
-                .json()
-                .with_current_span(true)
-                .with_span_list(false),
-        )
-        .with(log_writer.map(|writer| {
-            fmt::layer()
-                .json()
-                .with_current_span(true)
-                .with_span_list(false)
-                .with_writer(writer)
-                .with_filter(shipped_filter())
-        }))
-        .init();
-    let run_id = RunId::new(Uuid::new_v4());
-    let commit = built_commit();
-    let span = tracing::info_span!(
-        "run",
-        %run_id,
-        commit = commit.as_ref().map_or("unknown", Commit::as_str),
-    );
+    let parameters = Parameters::from_environment();
+    let started = start(service.clone(), today);
+    let span = started.span();
     async move {
-        let (parameters, configuration) = match resolved {
+        let (parameters, configuration) = match resolved(parameters) {
             Ok(resolved) => resolved,
-            Err(refusal) => {
-                tracing::error!(%refusal, "Parameters refused");
-                return ExitCode::from(REFUSED_TO_START);
-            }
-        };
-        if let Some(error) = log_file_error {
-            tracing::error!(%error, "Log file did not open");
-            return ExitCode::from(REFUSED_TO_START);
-        }
-        let mut journal = match Journal::open(parameters.journal_directory(), run_id) {
-            Ok(journal) => journal,
-            Err(error) => {
-                tracing::error!(%error, "Journal did not open");
-                return ExitCode::from(REFUSED_TO_START);
-            }
+            Err(refused) => return refused.into(),
         };
         // Held until the process exits, so two traders never send orders against one account.
-        let _lock = match lock(parameters.journal_directory(), &service) {
-            Ok(file) => file,
-            Err(refusal) => {
-                tracing::error!(%refusal, "Another run is under way or the lock is unavailable");
-                return ExitCode::from(REFUSED_TO_START);
-            }
-        };
-        if let Err(error) = journal.append(
-            Utc::now(),
-            Observation::ConfigurationResolved(configuration),
+        let (mut journal, _lock) = match started.open(
+            parameters.journal_directory(),
+            configuration,
+            Exclusion::Exclusive,
         ) {
-            tracing::error!(%error, "Configuration was not journaled");
-            return ExitCode::from(REFUSED_TO_START);
-        }
+            Ok(opened) => opened,
+            Err(refused) => return refused.into(),
+        };
         // From here every exit runs through the closing step below, so the journal always holds the session's end.
         let sdk_configuration = aws_config::load_from_env().await;
         let records = Archive::records(&sdk_configuration);
@@ -160,7 +95,7 @@ async fn main() -> ExitCode {
             }
             Err(Stopped::BeforeTheOpen(refusal)) => {
                 tracing::error!(%refusal, "Session did not start");
-                ExitCode::from(REFUSED_TO_START)
+                RefusedToStart.into()
             }
             Err(Stopped::Trading(refusal)) => {
                 tracing::error!(%refusal, "Session stopped");
@@ -183,26 +118,14 @@ async fn main() -> ExitCode {
             // The refusal was logged as the reason the session did not start.
             Err(_) => return outcome,
         };
-        // Shipped whatever the session did, since a failed session's records are the ones most worth reading.
-        let shipped = ship(
+        let all_shipped = ship_logged(
             &records,
             Host::Trader,
             &service,
             parameters.journal_directory(),
             parameters.log_directory(),
-            SessionDate::at(Utc::now()),
         )
         .await;
-        let mut all_shipped = true;
-        for (key, outcome) in &shipped {
-            match outcome {
-                Ok(()) => tracing::info!(path = key.path(), "Records shipped"),
-                Err(cause) => {
-                    all_shipped = false;
-                    tracing::error!(path = key.path(), %cause, "Records not shipped");
-                }
-            }
-        }
         match (outcome == ExitCode::SUCCESS, all_shipped) {
             (true, false) => ExitCode::FAILURE,
             (true, true) | (false, true | false) => outcome,

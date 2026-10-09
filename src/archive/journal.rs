@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::DateTime;
 
 use super::parquet::{self, ReadRefusal};
-use crate::common::journal::{ReadLine, read_one};
+use crate::common::journal::{Commit, ReadLine, read_one};
 use crate::common::storage::JournalKey;
 use crate::common::time::SessionDate;
 
@@ -102,7 +102,7 @@ pub fn encode(key: &JournalKey, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRef
                 run_ids.append_value(record.run_id().to_string());
                 sequences.append_value(record.sequence());
                 timestamps.append_value(nanoseconds);
-                commits.append_option(record.commit().map(|commit| commit.as_str()));
+                commits.append_option(record.commit().map(Commit::to_string));
                 event_types.append_value(record.observation().event_type());
                 payloads.append_value(tagged["payload"].to_string());
                 unreadables.append_null();

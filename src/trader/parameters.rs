@@ -18,7 +18,7 @@ use crate::common::parameter::{
 };
 use crate::common::risk::{Limits, LimitsRefusal};
 use crate::execution::{Patience, PatienceRefusal};
-use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
+use crate::parameter::{Directories, environment_variable};
 use crate::trader::{DecisionInterval, SessionSettings, SettingsRefusal};
 
 const DEFAULT_DECISION_INTERVAL: DecisionInterval = DecisionInterval::FiveMinute;
@@ -220,8 +220,7 @@ pub struct Parameters {
     universe: Universe,
     playbook: PathBuf,
     settings: SessionSettings,
-    journal_directory: PathBuf,
-    log_directory: PathBuf,
+    directories: Directories,
 }
 
 impl Parameters {
@@ -280,16 +279,7 @@ impl Parameters {
             universe,
             playbook,
             settings,
-            journal_directory: PathBuf::from(record(
-                read(Parameter::JournalDirectory)?,
-                DEFAULT_JOURNAL_DIRECTORY.to_string(),
-                &mut resolved,
-            )?),
-            log_directory: PathBuf::from(record(
-                read(Parameter::LogDirectory)?,
-                DEFAULT_LOG_DIRECTORY.to_string(),
-                &mut resolved,
-            )?),
+            directories: Directories::resolved(supplied, &mut resolved)?,
         };
         Ok((parameters, ConfigurationResolved::new(resolved)))
     }
@@ -306,12 +296,12 @@ impl Parameters {
         self.settings
     }
 
-    pub fn journal_directory(&self) -> &PathBuf {
-        &self.journal_directory
+    pub fn journal_directory(&self) -> &Path {
+        self.directories.journal()
     }
 
-    pub fn log_directory(&self) -> &PathBuf {
-        &self.log_directory
+    pub fn log_directory(&self) -> &Path {
+        self.directories.log()
     }
 }
 
@@ -380,6 +370,28 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn test_each_directory_is_read_from_its_own_variable() {
+        let directories = [
+            ("FUND_JOURNAL_DIRECTORY", "/tmp/journal"),
+            ("FUND_LOG_DIRECTORY", "/tmp/logs"),
+        ];
+        let supplied = |parameter: Parameter| {
+            let directory = directories
+                .iter()
+                .find(|(variable, _)| *variable == parameter.variable())
+                .map(|(_, raw)| *raw);
+            let required = REQUIRED
+                .iter()
+                .find(|(required, _)| *required == parameter)
+                .map(|(_, raw)| *raw);
+            Ok::<_, ParameterRefusal>(directory.or(required).map(str::to_string))
+        };
+        let (parameters, _) = Parameters::resolved(&supplied).unwrap();
+        assert_eq!(parameters.journal_directory(), Path::new("/tmp/journal"));
+        assert_eq!(parameters.log_directory(), Path::new("/tmp/logs"));
     }
 
     #[test]

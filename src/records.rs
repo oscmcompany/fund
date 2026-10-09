@@ -16,7 +16,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
 
 use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journal, logs};
-use crate::common::journal::{Commit, ConfigurationResolved, Observation, RunId, read};
+use crate::common::journal::{ConfigurationResolved, Observation, RunId, read};
 use crate::common::storage::{Host, JournalKey, Key, LogsKey, Service};
 use crate::common::time::SessionDate;
 use crate::journal::{Journal, UNKNOWN_COMMIT, built_commit, lock};
@@ -88,7 +88,7 @@ pub fn start(service: Service, today: SessionDate) -> Started {
     let span = tracing::info_span!(
         "run",
         %run_id,
-        commit = built_commit().as_ref().map_or(UNKNOWN_COMMIT, Commit::as_str),
+        commit = built_commit().map_or_else(|| UNKNOWN_COMMIT.to_string(), |commit| commit.to_string()),
     );
     Started {
         service,
