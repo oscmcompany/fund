@@ -388,11 +388,35 @@ pub enum Key {
     Logs(LogsKey),
 }
 
+/// The version of an object a read or listing saw, as the store's entity tag names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EntityTag(String);
+
+impl EntityTag {
+    pub fn new(raw: &str) -> Self {
+        Self(raw.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn reference_series(provider: Provider, table: ReferenceTable) -> String {
+    format!("{DATA_ROOT}/stage=parsed/reference/provider={provider}/table={table}/")
+}
+
 /// The prefix every session of one series shares, so listing it finds what is held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesPrefix(String);
 
 impl SeriesPrefix {
+    /// Every snapshot of `provider`'s `table`, whatever its date.
+    pub fn reference(provider: Provider, table: ReferenceTable) -> Self {
+        Self(reference_series(provider, table))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -455,10 +479,7 @@ impl Key {
             Self::Bars(key) => parsed_series(key),
             Self::Quotes(key) => parsed_series(key),
             Self::Trades(key) => parsed_series(key),
-            Self::Reference(key) => format!(
-                "{DATA_ROOT}/stage=parsed/reference/provider={}/table={}/",
-                key.provider, key.table
-            ),
+            Self::Reference(key) => reference_series(key.provider, key.table),
             Self::RawBars {
                 provider, interval, ..
             } => format!("{DATA_ROOT}/stage=raw/bars/provider={provider}/interval={interval}/"),

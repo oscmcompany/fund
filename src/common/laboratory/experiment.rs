@@ -370,6 +370,7 @@ mod tests {
     use crate::common::laboratory::dataset::DatasetLeg;
     use crate::common::laboratory::estimate::summarize;
     use crate::common::laboratory::series::Series;
+    use crate::common::storage::EntityTag;
     use crate::common::time::calendar::{TradingCalendar, TradingSession};
     use crate::common::time::{SessionDate, SessionRange};
 
@@ -390,7 +391,7 @@ mod tests {
         )
         .unwrap();
         let read = [0, 2]
-            .map(|day| (session(day), format!("\"tag-{day}\"")))
+            .map(|day| (session(day), EntityTag::new(&format!("\"tag-{day}\""))))
             .into();
         Fingerprint::new(
             DatasetLeg::MassiveDailyBars,

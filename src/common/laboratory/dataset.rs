@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::storage::EntityTag;
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange, SessionRangeRefusal};
 
@@ -40,7 +41,7 @@ pub struct Fingerprint {
     leg: DatasetLeg,
     #[serde(flatten)]
     range: SessionRange,
-    partitions: BTreeMap<SessionDate, String>,
+    partitions: BTreeMap<SessionDate, EntityTag>,
     /// Trading sessions in the window with no partition, so an absence is read as one rather than as a short window.
     missing: Vec<SessionDate>,
 }
@@ -50,7 +51,7 @@ struct FingerprintFields {
     leg: DatasetLeg,
     first: SessionDate,
     last: SessionDate,
-    partitions: BTreeMap<SessionDate, String>,
+    partitions: BTreeMap<SessionDate, EntityTag>,
     missing: Vec<SessionDate>,
 }
 
@@ -137,7 +138,7 @@ impl Fingerprint {
         leg: DatasetLeg,
         range: SessionRange,
         calendar: &TradingCalendar,
-        partitions: BTreeMap<SessionDate, String>,
+        partitions: BTreeMap<SessionDate, EntityTag>,
     ) -> Result<Self, FingerprintRefusal> {
         if !calendar.covers(range) {
             return Err(FingerprintRefusal::CalendarShort { range });
@@ -165,7 +166,7 @@ impl Fingerprint {
         self.leg
     }
 
-    pub fn partitions(&self) -> &BTreeMap<SessionDate, String> {
+    pub fn partitions(&self) -> &BTreeMap<SessionDate, EntityTag> {
         &self.partitions
     }
 
@@ -175,7 +176,7 @@ impl Fingerprint {
 
     /// Every partition read whose version is no longer the one read; `current` holds each partition's tag now, and a
     /// partition absent from it is gone. A study reading one of these rests on data that has since been rewritten.
-    pub fn contaminated(&self, current: &BTreeMap<SessionDate, String>) -> Vec<Contamination> {
+    pub fn contaminated(&self, current: &BTreeMap<SessionDate, EntityTag>) -> Vec<Contamination> {
         self.partitions
             .iter()
             .filter(|(session, read)| current.get(session) != Some(read))
@@ -192,9 +193,9 @@ impl Fingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contamination {
     pub session: SessionDate,
-    pub read: String,
+    pub read: EntityTag,
     /// `None` when the partition is gone.
-    pub now: Option<String>,
+    pub now: Option<EntityTag>,
 }
 
 #[cfg(test)]
@@ -226,9 +227,9 @@ mod tests {
         SessionRange::new(session(first), session(last)).unwrap()
     }
 
-    fn tags(days: &[u32]) -> BTreeMap<SessionDate, String> {
+    fn tags(days: &[u32]) -> BTreeMap<SessionDate, EntityTag> {
         days.iter()
-            .map(|day| (session(*day), format!("\"tag-{day}\"")))
+            .map(|day| (session(*day), EntityTag::new(&format!("\"tag-{day}\""))))
             .collect()
     }
 
@@ -289,19 +290,19 @@ mod tests {
         .unwrap();
         let mut current = tags(&[21, 22, 24, 25]);
         assert_eq!(fingerprint.contaminated(&current), []);
-        current.insert(session(22), "\"rewritten\"".to_string());
+        current.insert(session(22), EntityTag::new("\"rewritten\""));
         current.remove(&session(24));
         assert_eq!(
             fingerprint.contaminated(&current),
             [
                 Contamination {
                     session: session(22),
-                    read: "\"tag-22\"".to_string(),
-                    now: Some("\"rewritten\"".to_string())
+                    read: EntityTag::new("\"tag-22\""),
+                    now: Some(EntityTag::new("\"rewritten\""))
                 },
                 Contamination {
                     session: session(24),
-                    read: "\"tag-24\"".to_string(),
+                    read: EntityTag::new("\"tag-24\""),
                     now: None
                 }
             ]

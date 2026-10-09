@@ -93,17 +93,19 @@ impl Journal {
     /// skipped, since a crash can tear the last line it wrote; a complete record this build cannot read is an error,
     /// so a reader never acts on a history with a record silently missing.
     pub fn history(&self) -> Result<Vec<Record>, HistoryError> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&self.directory)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<io::Result<_>>()?;
-        files.retain(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("session-") && name.ends_with(".jsonl"))
-        });
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            let session = path
+                .file_name()
+                .and_then(|name| session_of_file_name(name.to_str()?));
+            if let Some(session) = session {
+                files.push((session, path));
+            }
+        }
         files.sort();
         let mut records = Vec::new();
-        for file in files {
+        for (_, file) in files {
             for line in read(&std::fs::read_to_string(&file)?) {
                 match line {
                     ReadLine::Read(record) => records.push(*record),
@@ -239,6 +241,16 @@ pub fn lock(directory: &Path, service: &Service) -> Result<File, LockRefusal> {
 pub fn file_name(session: SessionDate) -> String {
     format!("session-{}.jsonl", session.date())
 }
+
+/// The session whose records `name` holds, as `file_name` writes it; `None` for any other file.
+fn session_of_file_name(name: &str) -> Option<SessionDate> {
+    let date = name.strip_prefix("session-")?.strip_suffix(".jsonl")?;
+    let session = SessionDate::from_date(date.parse().ok()?);
+    (file_name(session) == name).then_some(session)
+}
+
+/// What a run's span records as its commit when `built_commit` is `None`.
+pub const UNKNOWN_COMMIT: &str = "unknown";
 
 /// The commit `build.rs` stamped, or `None` when the build could not ask git.
 pub fn built_commit() -> Option<Commit> {
@@ -424,5 +436,34 @@ mod tests {
             .collect();
         assert_eq!(sequences, [2]);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Only a name `file_name` writes is a session's file, so a stray look-alike is never read as history.
+    #[test]
+    fn test_history_reads_only_files_named_for_a_session() {
+        let directory = temporary_directory();
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        journal
+            .append("2026-07-31T14:30:00Z".parse().unwrap(), observation())
+            .unwrap();
+        for stray in [
+            "session-garbage.jsonl",
+            "session-2026-7-31.jsonl",
+            "session-2026-07-31.jsonl.bak",
+        ] {
+            std::fs::write(directory.join(stray), "{\"schema_version\":99}\n").unwrap();
+        }
+        assert_eq!(journal.history().unwrap().len(), 1);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    proptest::proptest! {
+        /// Every session's file name reads back as that session.
+        #[test]
+        fn property_a_file_name_reads_back_as_its_session(days in -40_000_i64..40_000) {
+            let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap())
+                .plus_calendar_days(days);
+            proptest::prop_assert_eq!(session_of_file_name(&file_name(session)), Some(session));
+        }
     }
 }

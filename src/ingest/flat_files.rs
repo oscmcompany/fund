@@ -16,7 +16,7 @@ use super::{Accepted, RefusedRow, RowRefusal, SessionBars, VariableRefusal, one_
 use crate::common::market::record::{Bar, BarInterval, BarPrices, Quote};
 use crate::common::market::trade_bars::{ConditionCode, Correction, Print};
 use crate::common::market::{Price, Shares, Symbol, TradeCount};
-use crate::common::storage::{Key, Provider};
+use crate::common::storage::{EntityTag, Key, Provider};
 use crate::common::time::SessionDate;
 
 const BUCKET: &str = "flatfiles";
@@ -85,7 +85,7 @@ pub struct Listed {
     session: SessionDate,
     length: u64,
     /// The version listed, which every ranged read must still match so one copy never mixes two versions.
-    tag: String,
+    tag: EntityTag,
 }
 
 impl Listed {
@@ -198,10 +198,11 @@ impl FlatFiles {
                     .size()
                     .and_then(|size| u64::try_from(size).ok())
                     .ok_or_else(|| failed(format!("{path} has no length")))?;
-                let tag = object
-                    .e_tag()
-                    .ok_or_else(|| failed(format!("{path} has no entity tag")))?
-                    .to_string();
+                let tag = EntityTag::new(
+                    object
+                        .e_tag()
+                        .ok_or_else(|| failed(format!("{path} has no entity tag")))?,
+                );
                 listed.push(Listed {
                     session,
                     length,
@@ -232,7 +233,7 @@ impl FlatFiles {
             .bucket(BUCKET)
             .key(&path)
             .range(format!("bytes={start}-{}", start + length.get() - 1))
-            .if_match(&listed.tag)
+            .if_match(listed.tag.as_str())
             .send()
             .await
             .map_err(|error| failed(aws_sdk_s3::error::DisplayErrorContext(error).to_string()))?;

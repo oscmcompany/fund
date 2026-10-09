@@ -13,7 +13,7 @@ pub mod trade_bars;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 
-use crate::common::storage::{Key, SeriesPrefix, StorageClass};
+use crate::common::storage::{EntityTag, Key, SeriesPrefix, StorageClass};
 use crate::ingest::VariableRefusal;
 
 /// One S3 bucket the fund writes: the shared market data or a profile's records.
@@ -56,6 +56,11 @@ pub enum ArchiveError {
         written: usize,
         read: usize,
     },
+    /// Written, then found absent when read back.
+    VanishedAfterWrite {
+        path: String,
+        written: usize,
+    },
 }
 
 impl std::fmt::Display for ArchiveError {
@@ -85,6 +90,12 @@ impl std::fmt::Display for ArchiveError {
                 formatter,
                 "{path} read back {read} bytes where {written} were written"
             ),
+            Self::VanishedAfterWrite { path, written } => {
+                write!(
+                    formatter,
+                    "{path} was absent when read back after {written} bytes were written"
+                )
+            }
         }
     }
 }
@@ -202,7 +213,12 @@ impl Archive {
     }
 
     /// Writes `body` only if `key` still holds the version `tag` names.
-    pub async fn replace(&self, key: &Key, body: Vec<u8>, tag: &Tag) -> Result<(), ArchiveError> {
+    pub async fn replace(
+        &self,
+        key: &Key,
+        body: Vec<u8>,
+        tag: &EntityTag,
+    ) -> Result<(), ArchiveError> {
         self.write(key, body, Condition::Unchanged(tag)).await
     }
 
@@ -253,7 +269,7 @@ impl Archive {
         let request = match condition {
             Condition::Any => request,
             Condition::Absent => request.if_none_match("*"),
-            Condition::Unchanged(tag) => request.if_match(&tag.0),
+            Condition::Unchanged(tag) => request.if_match(tag.as_str()),
         };
         request.send().await.map_err(|error| {
             // 412 is a precondition that failed; 409 is a conditional write that raced another.
@@ -268,14 +284,7 @@ impl Archive {
                 },
             }
         })?;
-        match self.get(key).await? {
-            Some(read) if read == body => Ok(()),
-            read => Err(ArchiveError::ReadBackMismatch {
-                path,
-                written: body.len(),
-                read: read.map_or(0, |read| read.len()),
-            }),
-        }
+        read_back(path, &body, self.get(key).await?)
     }
 
     /// Deletes the object under `key`; deleting one already gone succeeds, as S3 answers it.
@@ -334,7 +343,7 @@ impl Archive {
     }
 
     /// The tag of the version under `key` now, without reading it; `None` when the object is gone.
-    pub async fn tag(&self, key: &Key) -> Result<Option<Tag>, ArchiveError> {
+    pub async fn tag(&self, key: &Key) -> Result<Option<EntityTag>, ArchiveError> {
         let path = key.path();
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
@@ -348,10 +357,11 @@ impl Archive {
             .send()
             .await
         {
-            Ok(response) => Ok(Some(Tag(response
-                .e_tag()
-                .ok_or_else(|| failed("no entity tag".to_string()))?
-                .to_string()))),
+            Ok(response) => Ok(Some(EntityTag::new(
+                response
+                    .e_tag()
+                    .ok_or_else(|| failed("no entity tag".to_string()))?,
+            ))),
             Err(error)
                 if error
                     .as_service_error()
@@ -366,7 +376,10 @@ impl Archive {
     }
 
     /// The object under `key` with the tag of the version read, which a `replace` must still match.
-    pub async fn get_tagged(&self, key: &Key) -> Result<Option<(Vec<u8>, Tag)>, ArchiveError> {
+    pub async fn get_tagged(
+        &self,
+        key: &Key,
+    ) -> Result<Option<(Vec<u8>, EntityTag)>, ArchiveError> {
         let path = key.path();
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
@@ -395,10 +408,11 @@ impl Archive {
                 ));
             }
         };
-        let tag = Tag(response
-            .e_tag()
-            .ok_or_else(|| failed("no entity tag".to_string()))?
-            .to_string());
+        let tag = EntityTag::new(
+            response
+                .e_tag()
+                .ok_or_else(|| failed("no entity tag".to_string()))?,
+        );
         let body = response
             .body
             .collect()
@@ -408,18 +422,19 @@ impl Archive {
     }
 }
 
-/// The version of an object a read saw.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tag(String);
-
-impl Tag {
-    /// The entity tag S3 answered for a version.
-    pub fn new(raw: &str) -> Self {
-        Self(raw.to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+/// Whether `read` is the `written` body, with an absent object told apart from a short one.
+fn read_back(path: String, written: &[u8], read: Option<Vec<u8>>) -> Result<(), ArchiveError> {
+    match read {
+        Some(read) if read == written => Ok(()),
+        Some(read) => Err(ArchiveError::ReadBackMismatch {
+            path,
+            written: written.len(),
+            read: read.len(),
+        }),
+        None => Err(ArchiveError::VanishedAfterWrite {
+            path,
+            written: written.len(),
+        }),
     }
 }
 
@@ -428,7 +443,7 @@ impl Tag {
 enum Condition<'a> {
     Any,
     Absent,
-    Unchanged(&'a Tag),
+    Unchanged(&'a EntityTag),
 }
 
 #[cfg(test)]
@@ -462,6 +477,27 @@ mod tests {
             Err(ArchiveError::Unverifiable {
                 path: "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz"
                     .to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_an_absent_read_back_is_not_an_empty_one() {
+        let path = || "data/a.parquet".to_string();
+        assert_eq!(read_back(path(), &[1, 2], Some(vec![1, 2])), Ok(()));
+        assert_eq!(
+            read_back(path(), &[1, 2], Some(vec![])),
+            Err(ArchiveError::ReadBackMismatch {
+                path: path(),
+                written: 2,
+                read: 0
+            })
+        );
+        assert_eq!(
+            read_back(path(), &[1, 2], None),
+            Err(ArchiveError::VanishedAfterWrite {
+                path: path(),
+                written: 2
             })
         );
     }

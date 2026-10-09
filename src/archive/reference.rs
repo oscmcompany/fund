@@ -25,7 +25,7 @@ use crate::common::market::trade_bars::{
     Condition, ConditionCode, ConditionLetter, ConditionStatus, TradeConditions, UpdateRules,
 };
 use crate::common::market::{Dollars, Shares, Symbol};
-use crate::common::storage::{Key, Provider, ReferenceKey, ReferenceTable};
+use crate::common::storage::{Key, Provider, ReferenceKey, ReferenceTable, SeriesPrefix};
 use crate::common::time::SessionDate;
 use chrono::NaiveDate;
 
@@ -216,22 +216,28 @@ pub fn conditions_key(as_of: SessionDate) -> ReferenceKey {
     ReferenceKey::new(Provider::Massive, ReferenceTable::Conditions, as_of)
 }
 
-/// The newest snapshot of `provider`'s `table` dated before `before`, if the archive holds one.
+/// The newest snapshot of `provider`'s `table` dated before `before`, or of any date when `before` is `None`, if the
+/// archive holds one.
 pub async fn latest_snapshot(
     archive: &Archive,
     provider: Provider,
     table: ReferenceTable,
-    before: SessionDate,
+    before: Option<SessionDate>,
 ) -> Result<Option<ReferenceKey>, ArchiveError> {
-    let series = Key::from(ReferenceKey::new(provider, table, before)).series();
-    Ok(archive
-        .list(&series)
-        .await?
+    let paths = archive
+        .list(&SeriesPrefix::reference(provider, table))
+        .await?;
+    Ok(newest_before(&paths, before))
+}
+
+/// The newest reference key among `paths` dated before `before`, when there is one.
+fn newest_before(paths: &[String], before: Option<SessionDate>) -> Option<ReferenceKey> {
+    paths
         .iter()
         .filter_map(|path| Key::parse(path).ok())
         .filter_map(|key| ReferenceKey::try_from(key).ok())
-        .filter(|key| key.as_of() < before)
-        .max_by_key(ReferenceKey::as_of))
+        .filter(|key| before.is_none_or(|before| key.as_of() < before))
+        .max_by_key(ReferenceKey::as_of)
 }
 
 /// Why no conditions table was read.
@@ -265,15 +271,10 @@ impl std::error::Error for SnapshotError {}
 pub async fn latest_conditions(
     archive: &Archive,
 ) -> Result<(ReferenceKey, TradeConditions), SnapshotError> {
-    let latest = latest_snapshot(
-        archive,
-        Provider::Massive,
-        ReferenceTable::Conditions,
-        SessionDate::from_date(NaiveDate::MAX),
-    )
-    .await
-    .map_err(SnapshotError::Archive)?
-    .ok_or(SnapshotError::Absent)?;
+    let latest = latest_snapshot(archive, Provider::Massive, ReferenceTable::Conditions, None)
+        .await
+        .map_err(SnapshotError::Archive)?
+        .ok_or(SnapshotError::Absent)?;
     let bytes = archive
         .get(&latest.into())
         .await
@@ -690,6 +691,34 @@ mod tests {
     }
 
     #[test]
+    fn test_the_newest_snapshot_is_bounded_only_when_asked() {
+        let dated = |day: u32| {
+            let as_of = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, day).unwrap());
+            Key::from(conditions_key(as_of)).path()
+        };
+        let paths = [
+            dated(1),
+            dated(7),
+            dated(3),
+            "data/equity/elsewhere".to_string(),
+        ];
+        let as_of = |key: Option<ReferenceKey>| key.map(|key| key.as_of().to_string());
+        assert_eq!(
+            as_of(newest_before(&paths, None)),
+            Some("2026-10-07".to_string())
+        );
+        assert_eq!(
+            as_of(newest_before(
+                &paths,
+                Some(key(ReferenceTable::Conditions).as_of())
+            )),
+            Some("2026-10-03".to_string())
+        );
+        let first = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert_eq!(as_of(newest_before(&paths, Some(first))), None);
+    }
+
+    #[test]
     fn test_conditions_read_back_exactly_and_only_from_their_table() {
         let conditions = TradeConditions::new(BTreeMap::from([
             (
@@ -840,13 +869,7 @@ mod tests {
                 nulls(DataType::UInt64),
             ],
             LAYOUT_VERSION,
-            snapshot_provenance()
-                .entries()
-                .into_iter()
-                .map(|(name, value)| {
-                    ::parquet::file::metadata::KeyValue::new(name.to_string(), value)
-                })
-                .collect(),
+            snapshot_provenance().metadata(),
         )
         .unwrap();
         assert_eq!(

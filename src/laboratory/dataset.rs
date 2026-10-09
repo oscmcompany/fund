@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::archive::bars::{DecodeRefusal, decode};
-use crate::archive::{Archive, ArchiveError, Tag};
+use crate::archive::{Archive, ArchiveError};
 use crate::common::heal::massive_daily_bars;
 use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{
@@ -11,6 +11,7 @@ use crate::common::laboratory::dataset::{
 };
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::Bar;
+use crate::common::storage::EntityTag;
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 use crate::laboratory::Study;
@@ -124,7 +125,7 @@ async fn load(
             continue;
         };
         bars.insert(*session, admit(*session, read)?);
-        tags.insert(*session, tag.as_str().to_string());
+        tags.insert(*session, tag);
     }
     let fingerprint = Fingerprint::new(leg, range, calendar, tags).map_err(DatasetError::Window)?;
     study.read(&fingerprint).map_err(DatasetError::Journal)?;
@@ -140,7 +141,7 @@ async fn partition(
     archive: &Archive,
     leg: DatasetLeg,
     session: SessionDate,
-) -> Result<Option<(Vec<Bar>, Tag)>, DatasetError> {
+) -> Result<Option<(Vec<Bar>, EntityTag)>, DatasetError> {
     match leg {
         DatasetLeg::MassiveDailyBars => {
             let key = massive_daily_bars(session);
@@ -174,7 +175,7 @@ pub async fn lineage(
             DatasetLeg::LegacyDailyBars => None,
         };
         if let Some(tag) = tag {
-            current.insert(*session, tag.as_str().to_string());
+            current.insert(*session, tag);
         }
     }
     Ok(fingerprint.contaminated(&current))
@@ -233,7 +234,7 @@ pub(crate) mod tests {
             (session(day), vec![bar; count])
         };
         let read = [0, 1, 3]
-            .map(|day| (session(day), format!("\"tag-{day}\"")))
+            .map(|day| (session(day), EntityTag::new(&format!("\"tag-{day}\""))))
             .into();
         Dataset {
             bars: [bars(0, 1), bars(1, 2), bars(3, 3)].into(),
