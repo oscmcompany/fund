@@ -9,6 +9,8 @@ pub mod security_details;
 pub mod state;
 pub mod trade_bars;
 
+use chrono::{DateTime, Utc};
+
 use crate::common::monoid::Monoid;
 
 /// Millionths of a dollar per dollar: consolidated prints reach six decimals (midpoint and average-price trades), so
@@ -220,6 +222,27 @@ impl std::fmt::Display for Price {
     }
 }
 
+/// A price and the instant it was set, ordered by instant and then price so equal instants still order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StampedPrice {
+    at: DateTime<Utc>,
+    price: Price,
+}
+
+impl StampedPrice {
+    pub fn new(at: DateTime<Utc>, price: Price) -> Self {
+        Self { at, price }
+    }
+
+    pub fn at(self) -> DateTime<Utc> {
+        self.at
+    }
+
+    pub fn price(self) -> Price {
+        self.price
+    }
+}
+
 /// Millionths of a share per share: fractional-share trades report to six decimals, so every share count is an
 /// integer scaled by this.
 pub const SHARE_SCALE: u64 = 1_000_000;
@@ -297,6 +320,19 @@ impl Shares {
     /// more. The tolerance is twice the float's spacing at that magnitude, so half a millionth off the grid is caught
     /// below about 1.1 billion shares; above that a float cannot place a millionth, and the count is rounded.
     pub fn from_float(shares: f64) -> Result<Self, SharesRefusal> {
+        match snap(Self::scaled(shares)?) {
+            Some(units) => Ok(Self(units as u64)),
+            None => Err(SharesRefusal::OffGrid { shares }),
+        }
+    }
+
+    /// A vendor's float share count rounded to the nearest millionth, for a count that may be finer than the grid.
+    pub fn rounded(shares: f64) -> Result<Self, SharesRefusal> {
+        Ok(Self(Self::scaled(shares)?.round() as u64))
+    }
+
+    /// `shares` in millionths, refused when not finite, negative, or past `u64`.
+    fn scaled(shares: f64) -> Result<f64, SharesRefusal> {
         if !shares.is_finite() {
             return Err(SharesRefusal::NotFinite { shares });
         }
@@ -305,10 +341,7 @@ impl Shares {
         if shares < 0.0 || scaled >= u64::MAX as f64 {
             return Err(SharesRefusal::OutOfRange { shares });
         }
-        match snap(scaled) {
-            Some(units) => Ok(Self(units as u64)),
-            None => Err(SharesRefusal::OffGrid { shares }),
-        }
+        Ok(scaled)
     }
 
     pub fn units(self) -> u64 {
@@ -405,6 +438,24 @@ impl Monoid for TradeCount {
 impl std::fmt::Display for TradeCount {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.0)
+    }
+}
+
+/// A number of quotes, kept apart from `TradeCount` so the two counts cannot be swapped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuoteCount(u64);
+
+impl QuoteCount {
+    pub fn new(count: u64) -> Self {
+        Self(count)
+    }
+
+    pub fn count(self) -> u64 {
+        self.0
+    }
+
+    pub fn plus(self, other: Self) -> Self {
+        Self(self.0.checked_add(other.0).expect("quote count fits u64"))
     }
 }
 
@@ -662,6 +713,24 @@ mod tests {
 
     use super::*;
     use crate::common::monoid::laws;
+
+    /// An earlier instant orders first whatever its price, and a tie on the instant orders by price.
+    #[test]
+    fn test_stamped_prices_order_by_instant_then_price() {
+        let stamped = |at: &str, ticks| {
+            StampedPrice::new(at.parse().unwrap(), Price::from_ticks(ticks).unwrap())
+        };
+        let mut sorted = [
+            stamped("2026-10-08T14:00:01Z", 1),
+            stamped("2026-10-08T14:00:00Z", 3),
+            stamped("2026-10-08T14:00:00Z", 2),
+        ];
+        sorted.sort();
+        assert_eq!(
+            sorted.map(|point| (point.at().timestamp() % 60, point.price().ticks())),
+            [(0, 2), (0, 3), (1, 1)]
+        );
+    }
 
     #[test]
     fn test_dollars_are_exact_millionths() {

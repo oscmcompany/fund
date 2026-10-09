@@ -16,8 +16,10 @@ use crate::common::market::corporate_actions::{
     ActionIdRefusal, BoundaryChangeRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
 };
 use crate::common::market::quote_bars::{QuoteBarRefusal, QuoteSumsRefusal};
-use crate::common::market::record::{BarInterval, BarRefusal, OhlcRefusal};
-use crate::common::market::security_details::{IndustryCodeRefusal, MarketIdentifierCodeRefusal};
+use crate::common::market::record::{BarInterval, BarPricesRefusal, BarRefusal};
+use crate::common::market::security_details::{
+    CentralIndexKeyRefusal, IndustryCodeRefusal, MarketIdentifierCodeRefusal,
+};
 use crate::common::market::trade_bars::{HighLowRefusal, OpenCloseRefusal, TradeBarRefusal};
 use crate::common::market::{Price, PriceRefusal, Symbol, SymbolRefusal};
 use crate::common::time::SessionDate;
@@ -184,7 +186,7 @@ pub enum RowCause {
     },
     Symbol(SymbolRefusal),
     Price(PriceRefusal),
-    Ohlc(OhlcRefusal),
+    BarPrices(BarPricesRefusal),
     Bar(BarRefusal),
     QuoteSums(QuoteSumsRefusal),
     QuoteBar(QuoteBarRefusal),
@@ -197,6 +199,7 @@ pub enum RowCause {
     SeriesBoundary(SeriesBoundaryRefusal),
     IndustryCode(IndustryCodeRefusal),
     MarketIdentifierCode(MarketIdentifierCodeRefusal),
+    CentralIndexKey(CentralIndexKeyRefusal),
 }
 
 impl std::fmt::Display for RowCause {
@@ -212,7 +215,7 @@ impl std::fmt::Display for RowCause {
             Self::Unparsable { column, raw } => write!(formatter, "{column} holds `{raw}`"),
             Self::Symbol(refusal) => refusal.fmt(formatter),
             Self::Price(refusal) => refusal.fmt(formatter),
-            Self::Ohlc(refusal) => refusal.fmt(formatter),
+            Self::BarPrices(refusal) => refusal.fmt(formatter),
             Self::Bar(refusal) => refusal.fmt(formatter),
             Self::QuoteSums(refusal) => refusal.fmt(formatter),
             Self::QuoteBar(refusal) => refusal.fmt(formatter),
@@ -225,6 +228,7 @@ impl std::fmt::Display for RowCause {
             Self::SeriesBoundary(refusal) => refusal.fmt(formatter),
             Self::IndustryCode(refusal) => refusal.fmt(formatter),
             Self::MarketIdentifierCode(refusal) => refusal.fmt(formatter),
+            Self::CentralIndexKey(refusal) => refusal.fmt(formatter),
         }
     }
 }

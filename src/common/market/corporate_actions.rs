@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{SHARE_SCALE, Shares, SharesRefusal, Symbol};
+use super::{Shares, SharesRefusal, Symbol};
 use crate::common::time::{SessionDate, SessionRange};
 
 /// The vendor's identifier for one corporate action.
@@ -76,21 +76,7 @@ impl SplitRatio {
     /// The vendor's float sides, each rounded to the millionth of a share: a stock dividend's side such as
     /// 1.0392706872370265 is finer, and the rounding moves the ratio by under five parts in ten million.
     pub fn from_floats(from: f64, to: f64) -> Result<Self, SplitRatioRefusal> {
-        let side = |shares: f64| {
-            let scaled = (shares * SHARE_SCALE as f64).round();
-            match (
-                shares.is_finite(),
-                shares >= 0.0 && scaled < u64::MAX as f64,
-            ) {
-                (false, _) => Err(SplitRatioRefusal::Shares(SharesRefusal::NotFinite {
-                    shares,
-                })),
-                (true, false) => Err(SplitRatioRefusal::Shares(SharesRefusal::OutOfRange {
-                    shares,
-                })),
-                (true, true) => Ok(Shares::from_units(scaled as u64)),
-            }
-        };
+        let side = |shares| Shares::rounded(shares).map_err(SplitRatioRefusal::Shares);
         Self::new(side(from)?, side(to)?)
     }
 

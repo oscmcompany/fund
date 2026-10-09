@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::common::market::corporate_actions::{
     ActionIdRefusal, SeriesBoundaryRefusal, SplitRatioRefusal,
 };
-use crate::common::market::record::{Bar, BarRefusal, OhlcRefusal, QuoteRefusal};
+use crate::common::market::record::{Bar, BarPricesRefusal, BarRefusal, QuoteRefusal};
 use crate::common::market::security_details::{IndustryCodeRefusal, MarketIdentifierCodeRefusal};
 use crate::common::market::{
     DollarVolumeRefusal, DollarsRefusal, PriceRefusal, SharesRefusal, SymbolRefusal,
@@ -108,7 +108,7 @@ pub enum RowRefusal {
         timestamp: String,
     },
     Price(PriceRefusal),
-    Prices(OhlcRefusal),
+    Prices(BarPricesRefusal),
     Shares(SharesRefusal),
     DollarVolume(DollarVolumeRefusal),
     Bar(BarRefusal),
@@ -141,7 +141,7 @@ pub enum RowRefusal {
     IndustryCode(IndustryCodeRefusal),
     Exchange(MarketIdentifierCodeRefusal),
     Dollars(DollarsRefusal),
-    /// A Central Index Key that is not a number.
+    /// A Central Index Key that is not a number, or is zero, which the SEC never issues.
     CentralIndexKey {
         raw: String,
     },

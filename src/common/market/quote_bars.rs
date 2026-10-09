@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
 use super::record::{BarInterval, Quote};
-use super::{Price, Shares, Symbol};
+use super::{Price, QuoteCount, Shares, Symbol};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
 
@@ -54,6 +54,13 @@ pub enum QuoteSumsRefusal {
         narrowest: Spread,
         widest: Spread,
     },
+    /// The time-weighted spread is outside the narrowest and widest spreads standing for the covered time.
+    SpreadOutsideRange {
+        spread: u128,
+        narrowest: Spread,
+        widest: Spread,
+        covered_nanoseconds: u64,
+    },
 }
 
 impl std::fmt::Display for QuoteSumsRefusal {
@@ -63,6 +70,17 @@ impl std::fmt::Display for QuoteSumsRefusal {
             Self::Inverted { narrowest, widest } => write!(
                 formatter,
                 "the narrowest spread of {} ticks is wider than the widest of {}",
+                narrowest.ticks(),
+                widest.ticks()
+            ),
+            Self::SpreadOutsideRange {
+                spread,
+                narrowest,
+                widest,
+                covered_nanoseconds,
+            } => write!(
+                formatter,
+                "a time-weighted spread of {spread} is outside {} to {} ticks over {covered_nanoseconds} nanoseconds",
                 narrowest.ticks(),
                 widest.ticks()
             ),
@@ -125,16 +143,45 @@ impl StandingQuote {
     }
 }
 
-/// The exact sums of one bar; every `_time` field is a quantity multiplied by the nanoseconds it stood.
+/// A bar's quantities, each multiplied by the nanoseconds it stood; over the covered time, each is its mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeWeighted {
+    /// Spread ticks.
+    pub spread: u128,
+    /// Spread over midpoint in `RELATIVE_SPREAD_SCALE` units.
+    pub relative_spread: u128,
+    /// Bid size in share units.
+    pub bid_size: u128,
+    /// Ask size in share units.
+    pub ask_size: u128,
+}
+
+impl TimeWeighted {
+    fn combine(self, other: Self) -> Self {
+        let sum = |left: u128, right: u128, name: &str| {
+            left.checked_add(right)
+                .unwrap_or_else(|| panic!("{name} fits u128"))
+        };
+        Self {
+            spread: sum(self.spread, other.spread, "spread time"),
+            relative_spread: sum(
+                self.relative_spread,
+                other.relative_spread,
+                "relative spread time",
+            ),
+            bid_size: sum(self.bid_size, other.bid_size, "bid size time"),
+            ask_size: sum(self.ask_size, other.ask_size, "ask size time"),
+        }
+    }
+}
+
+/// The exact sums of one bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuoteSums {
     /// Quotes that began inside the bar; a bar can be covered by a quote that began before it and count none.
-    quote_count: u64,
+    quote_count: QuoteCount,
     covered_nanoseconds: u64,
-    spread_time: u128,
-    relative_spread_time: u128,
-    bid_size_time: u128,
-    ask_size_time: u128,
+    time_weighted: TimeWeighted,
     narrowest: Spread,
     widest: Spread,
     /// The latest quote standing in the bar; ties on start break on the quote so the combine stays commutative.
@@ -149,24 +196,27 @@ impl QuoteSums {
             u128::from(quote.bid.ticks_unsigned()) + u128::from(quote.ask.ticks_unsigned());
         let time = u128::from(nanoseconds);
         Self {
-            quote_count: 0,
+            quote_count: QuoteCount::default(),
             covered_nanoseconds: nanoseconds,
-            spread_time: u128::from(spread.0) * time,
-            // Weighted before dividing, so a tight spread keeps its precision; the one floor loses under a unit.
-            relative_spread_time: u128::from(spread.0) * 2 * RELATIVE_SPREAD_SCALE * time
-                / midpoint_doubled,
-            bid_size_time: u128::from(quote.bid_size.units()) * time,
-            ask_size_time: u128::from(quote.ask_size.units()) * time,
+            time_weighted: TimeWeighted {
+                spread: u128::from(spread.0) * time,
+                // Weighted before dividing, so a tight spread keeps its precision; the one floor loses under a unit.
+                relative_spread: u128::from(spread.0) * 2 * RELATIVE_SPREAD_SCALE * time
+                    / midpoint_doubled,
+                bid_size: u128::from(quote.bid_size.units()) * time,
+                ask_size: u128::from(quote.ask_size.units()) * time,
+            },
             narrowest: spread,
             widest: spread,
             closing: quote.clone(),
         }
     }
 
+    /// Sums whose time-weighted spread lies between the narrowest and widest spreads standing for the covered time.
     pub fn new(
-        quote_count: u64,
+        quote_count: QuoteCount,
         covered_nanoseconds: u64,
-        time_weighted: [u128; 4],
+        time_weighted: TimeWeighted,
         narrowest: Spread,
         widest: Spread,
         closing: StandingQuote,
@@ -174,19 +224,20 @@ impl QuoteSums {
         if narrowest > widest {
             return Err(QuoteSumsRefusal::Inverted { narrowest, widest });
         }
-        let [
-            spread_time,
-            relative_spread_time,
-            bid_size_time,
-            ask_size_time,
-        ] = time_weighted;
+        let covered = u128::from(covered_nanoseconds);
+        let spread = time_weighted.spread;
+        if !(u128::from(narrowest.0) * covered..=u128::from(widest.0) * covered).contains(&spread) {
+            return Err(QuoteSumsRefusal::SpreadOutsideRange {
+                spread,
+                narrowest,
+                widest,
+                covered_nanoseconds,
+            });
+        }
         Ok(Self {
             quote_count,
             covered_nanoseconds,
-            spread_time,
-            relative_spread_time,
-            bid_size_time,
-            ask_size_time,
+            time_weighted,
             narrowest,
             widest,
             closing,
@@ -194,34 +245,20 @@ impl QuoteSums {
     }
 
     fn combine(self, other: Self) -> Self {
-        let time = |left: u128, right: u128, name: &str| {
-            left.checked_add(right)
-                .unwrap_or_else(|| panic!("{name} fits u128"))
-        };
         Self {
-            quote_count: self
-                .quote_count
-                .checked_add(other.quote_count)
-                .expect("quote count fits u64"),
+            quote_count: self.quote_count.plus(other.quote_count),
             covered_nanoseconds: self
                 .covered_nanoseconds
                 .checked_add(other.covered_nanoseconds)
                 .expect("covered nanoseconds fit u64"),
-            spread_time: time(self.spread_time, other.spread_time, "spread time"),
-            relative_spread_time: time(
-                self.relative_spread_time,
-                other.relative_spread_time,
-                "relative spread time",
-            ),
-            bid_size_time: time(self.bid_size_time, other.bid_size_time, "bid size time"),
-            ask_size_time: time(self.ask_size_time, other.ask_size_time, "ask size time"),
+            time_weighted: self.time_weighted.combine(other.time_weighted),
             narrowest: self.narrowest.min(other.narrowest),
             widest: self.widest.max(other.widest),
             closing: self.closing.max(other.closing),
         }
     }
 
-    pub fn quote_count(&self) -> u64 {
+    pub fn quote_count(&self) -> QuoteCount {
         self.quote_count
     }
 
@@ -229,24 +266,8 @@ impl QuoteSums {
         self.covered_nanoseconds
     }
 
-    /// Spread ticks multiplied by nanoseconds; over `covered_nanoseconds` it is the time-weighted mean spread.
-    pub fn spread_time(&self) -> u128 {
-        self.spread_time
-    }
-
-    /// Spread over midpoint in `RELATIVE_SPREAD_SCALE` units, multiplied by nanoseconds.
-    pub fn relative_spread_time(&self) -> u128 {
-        self.relative_spread_time
-    }
-
-    /// Bid size in share units multiplied by nanoseconds.
-    pub fn bid_size_time(&self) -> u128 {
-        self.bid_size_time
-    }
-
-    /// Ask size in share units multiplied by nanoseconds.
-    pub fn ask_size_time(&self) -> u128 {
-        self.ask_size_time
+    pub fn time_weighted(&self) -> TimeWeighted {
+        self.time_weighted
     }
 
     pub fn narrowest(&self) -> Spread {
@@ -534,7 +555,7 @@ impl QuoteFold {
                 .0
                 .get_mut(&(symbol, BarInterval::OneMinute, minute))
             {
-                sums.quote_count += count;
+                sums.quote_count = sums.quote_count.plus(QuoteCount::new(count));
             }
         }
         let bars = self.minutes.into_bars();
@@ -607,7 +628,7 @@ mod tests {
             (
                 "quote count fits u64",
                 QuoteSums {
-                    quote_count: u64::MAX,
+                    quote_count: QuoteCount::new(u64::MAX),
                     ..one.clone()
                 },
             ),
@@ -621,35 +642,47 @@ mod tests {
             (
                 "spread time fits u128",
                 QuoteSums {
-                    spread_time: u128::MAX,
+                    time_weighted: TimeWeighted {
+                        spread: u128::MAX,
+                        ..one.time_weighted
+                    },
                     ..one.clone()
                 },
             ),
             (
                 "relative spread time fits u128",
                 QuoteSums {
-                    relative_spread_time: u128::MAX,
+                    time_weighted: TimeWeighted {
+                        relative_spread: u128::MAX,
+                        ..one.time_weighted
+                    },
                     ..one.clone()
                 },
             ),
             (
                 "bid size time fits u128",
                 QuoteSums {
-                    bid_size_time: u128::MAX,
+                    time_weighted: TimeWeighted {
+                        bid_size: u128::MAX,
+                        ..one.time_weighted
+                    },
                     ..one.clone()
                 },
             ),
             (
                 "ask size time fits u128",
                 QuoteSums {
-                    ask_size_time: u128::MAX,
+                    time_weighted: TimeWeighted {
+                        ask_size: u128::MAX,
+                        ..one.time_weighted
+                    },
                     ..one.clone()
                 },
             ),
         ];
         for (expected, full) in cases {
             let addend = QuoteSums {
-                quote_count: 1,
+                quote_count: QuoteCount::new(1),
                 ..one.clone()
             };
             let panicked = std::panic::catch_unwind(|| full.combine(addend)).expect_err(expected);
@@ -682,11 +715,20 @@ mod tests {
         assert_eq!(counts.accepted(), 1);
         for bar in &bars {
             assert_eq!(bar.sums().covered_nanoseconds(), MINUTE);
-            assert_eq!(bar.sums().quote_count(), 0);
-            assert_eq!(bar.sums().spread_time(), 20_000 * u128::from(MINUTE));
+            assert_eq!(bar.sums().quote_count().count(), 0);
+            assert_eq!(
+                bar.sums().time_weighted().spread,
+                20_000 * u128::from(MINUTE)
+            );
             // 0.02 over a 100.01 midpoint is 1.99980 basis points, 199.98 hundredths, kept to the nanosecond.
-            assert_eq!(bar.sums().relative_spread_time(), 11_998_800_119_988);
-            assert_eq!(bar.sums().bid_size_time(), 3_000_000 * u128::from(MINUTE));
+            assert_eq!(
+                bar.sums().time_weighted().relative_spread,
+                11_998_800_119_988
+            );
+            assert_eq!(
+                bar.sums().time_weighted().bid_size,
+                3_000_000 * u128::from(MINUTE)
+            );
         }
         assert_eq!(bars[0].timestamp(), instant("2026-10-02T13:30:00Z"));
         assert_eq!(bars[389].timestamp(), instant("2026-10-02T19:59:00Z"));
@@ -703,13 +745,13 @@ mod tests {
         let first = &bars[0];
         assert_eq!(first.timestamp(), instant("2026-10-02T13:30:00Z"));
         assert_eq!(first.sums().covered_nanoseconds(), MINUTE / 2);
-        assert_eq!(first.sums().quote_count(), 1);
+        assert_eq!(first.sums().quote_count().count(), 1);
         let second = &bars[1];
         assert_eq!(second.sums().covered_nanoseconds(), MINUTE);
-        assert_eq!(second.sums().quote_count(), 1);
+        assert_eq!(second.sums().quote_count().count(), 1);
         // 15 seconds at four cents, then 45 at two.
         assert_eq!(
-            second.sums().spread_time(),
+            second.sums().time_weighted().spread,
             40_000 * 15_000_000_000 + 20_000 * 45_000_000_000
         );
         assert_eq!(second.sums().narrowest(), Spread::from_ticks(20_000));
@@ -733,11 +775,14 @@ mod tests {
         ));
         let (bars, _) = fold.finish();
         // 0.01 over a 1,000.005 midpoint is 0.0999995 basis points: 9.99995 hundredths, not the 9 a floor leaves.
-        assert_eq!(bars[0].sums().relative_spread_time(), 599_997_000_014);
+        assert_eq!(
+            bars[0].sums().time_weighted().relative_spread,
+            599_997_000_014
+        );
     }
 
     #[test]
-    fn test_a_crossed_quote_or_inverted_spreads_are_refused() {
+    fn test_a_crossed_quote_inverted_spreads_or_a_spread_outside_them_are_refused() {
         let price = |dollars| Price::from_dollars(dollars).unwrap();
         let at = instant("2026-10-02T13:30:00Z");
         assert_eq!(
@@ -763,18 +808,51 @@ mod tests {
         .unwrap();
         assert_eq!(
             QuoteSums::new(
+                QuoteCount::new(1),
                 1,
-                1,
-                [0; 4],
+                weighted(0),
                 Spread::from_ticks(2),
                 Spread::from_ticks(1),
-                closing
+                closing.clone()
             ),
             Err(QuoteSumsRefusal::Inverted {
                 narrowest: Spread::from_ticks(2),
                 widest: Spread::from_ticks(1)
             })
         );
+        // Spreads of one to three ticks standing for ten nanoseconds weigh between 10 and 30.
+        let sums = |spread| {
+            QuoteSums::new(
+                QuoteCount::new(1),
+                10,
+                weighted(spread),
+                Spread::from_ticks(1),
+                Spread::from_ticks(3),
+                closing.clone(),
+            )
+            .map(|sums| sums.time_weighted().spread)
+        };
+        let outside = |spread| {
+            Err(QuoteSumsRefusal::SpreadOutsideRange {
+                spread,
+                narrowest: Spread::from_ticks(1),
+                widest: Spread::from_ticks(3),
+                covered_nanoseconds: 10,
+            })
+        };
+        assert_eq!(
+            [9, 10, 30, 31].map(sums),
+            [outside(9), Ok(10), Ok(30), outside(31)]
+        );
+    }
+
+    fn weighted(spread: u128) -> TimeWeighted {
+        TimeWeighted {
+            spread,
+            relative_spread: 0,
+            bid_size: 0,
+            ask_size: 0,
+        }
     }
 
     #[test]
@@ -806,7 +884,7 @@ mod tests {
                 )
                 .unwrap();
                 let mut sums = QuoteSums::standing(&quote, covered);
-                sums.quote_count = count;
+                sums.quote_count = QuoteCount::new(count);
                 sums
             })
     }
@@ -852,7 +930,7 @@ mod tests {
             prop_assert_eq!(daily.len(), 1);
             prop_assert_eq!(daily[0].timestamp(), instant("2026-10-02T20:00:00Z"));
             prop_assert_eq!(daily[0].sums().covered_nanoseconds(), total_covered);
-            prop_assert_eq!(daily[0].sums().quote_count(), counts.accepted());
+            prop_assert_eq!(daily[0].sums().quote_count().count(), counts.accepted());
             // The first quote stands from its start to the close, so coverage is exactly that span.
             let first = sorted[0].0;
             prop_assert_eq!(total_covered, (23_400 - first as u64) * 1_000_000_000);

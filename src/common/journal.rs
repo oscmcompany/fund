@@ -471,6 +471,10 @@ mod tests {
 
     use super::*;
     use crate::common::heal::PartitionFailureKind;
+    use crate::common::market::aggregate::TradeTotals;
+    use crate::common::market::record::BarInterval;
+    use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
+    use crate::common::market::{DollarVolume, Price, Shares, StampedPrice, TradeCount};
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1186,6 +1190,50 @@ mod tests {
         })
     }
 
+    /// A one-minute bar with each price pair present or absent, the open at or before the close.
+    fn any_bar_built() -> impl Strategy<Value = BarBuilt> {
+        (
+            0_i64..1_440,
+            (any::<u64>(), any::<u64>(), any::<u128>()),
+            prop::option::of((
+                0_i64..60_000_000_000,
+                0_i64..60_000_000_000,
+                1_i64..2_000_000,
+                1_i64..2_000_000,
+            )),
+            prop::option::of((1_i64..2_000_000, 1_i64..2_000_000)),
+        )
+            .prop_map(|(minute, (count, volume, dollars), open_close, high_low)| {
+                let start = DateTime::from_timestamp(1_791_000_000 + minute * 60, 0).unwrap();
+                let price = |ticks| Price::from_ticks(ticks).unwrap();
+                let open_close = open_close.map(|(first, second, open, close)| {
+                    let at = |nanoseconds| start + chrono::TimeDelta::nanoseconds(nanoseconds);
+                    let (open, close) = (
+                        StampedPrice::new(at(first), price(open)),
+                        StampedPrice::new(at(second), price(close)),
+                    );
+                    OpenClose::new(open.min(close), open.max(close)).unwrap()
+                });
+                let high_low = high_low.map(|(first, second)| {
+                    HighLow::new(price(first.max(second)), price(first.min(second))).unwrap()
+                });
+                let totals = TradeTotals::new(
+                    TradeCount::new(count),
+                    Shares::from_units(volume),
+                    DollarVolume::from_units(dollars),
+                );
+                BarBuilt::of(
+                    &TradeBar::new(
+                        Symbol::new("AAPL").unwrap(),
+                        BarInterval::OneMinute,
+                        start,
+                        TradeSums::new(totals, open_close, high_low),
+                    )
+                    .unwrap(),
+                )
+            })
+    }
+
     fn any_observation() -> impl Strategy<Value = Observation> {
         let parameter = prop::sample::select(Parameter::iter().collect::<Vec<_>>());
         let source = prop::sample::select(ParameterSource::iter().collect::<Vec<_>>());
@@ -1238,6 +1286,7 @@ mod tests {
                     let window = Window::try_from(window.into_iter().collect::<Vec<_>>()).unwrap();
                     Observation::HealFinished(HealFinished::new(window, outcomes))
                 }),
+            any_bar_built().prop_map(Observation::BarBuilt),
         ]
     }
 

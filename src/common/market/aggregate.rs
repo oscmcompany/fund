@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
-use super::record::{Bar, BarInterval, Ohlc, Trade};
-use super::{DollarVolume, Price, Shares, Symbol, TradeCount};
+use super::record::{Bar, BarInterval, BarPrices, Trade};
+use super::{DollarVolume, Price, Shares, StampedPrice, Symbol, TradeCount};
 use crate::common::monoid::Monoid;
 use crate::common::time::SessionDate;
 
@@ -83,8 +83,8 @@ struct BarKey {
 /// break the tie on price so the combine stays commutative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span {
-    first: (DateTime<Utc>, Price),
-    last: (DateTime<Utc>, Price),
+    first: StampedPrice,
+    last: StampedPrice,
     high: Price,
     low: Price,
     volume: Shares,
@@ -153,8 +153,8 @@ impl BarRollup {
         };
         let prices = bar.prices();
         let span = Span {
-            first: (start, prices.open()),
-            last: (start, prices.close()),
+            first: StampedPrice::new(start, prices.open()),
+            last: StampedPrice::new(start, prices.close()),
             high: prices.high(),
             low: prices.low(),
             volume: bar.volume(),
@@ -169,8 +169,9 @@ impl BarRollup {
         self.0
             .into_iter()
             .map(|(key, span)| {
-                let prices = Ohlc::new(span.first.1, span.high, span.low, span.last.1)
-                    .expect("every combined open and close lies within the combined range");
+                let prices =
+                    BarPrices::new(span.first.price(), span.high, span.low, span.last.price())
+                        .expect("every combined open and close lies within the combined range");
                 Bar::new(
                     key.symbol,
                     key.interval,
@@ -237,7 +238,7 @@ mod tests {
             symbol(),
             BarInterval::OneMinute,
             instant(timestamp),
-            Ohlc::new(price(open), price(high), price(low), price(close)).unwrap(),
+            BarPrices::new(price(open), price(high), price(low), price(close)).unwrap(),
             Shares::whole(volume).unwrap(),
             Some(TradeCount::new(volume / 10)),
             Some(DollarVolume::of(
@@ -272,7 +273,7 @@ mod tests {
             Symbol::new("MSFT").unwrap(),
             BarInterval::OneMinute,
             instant("2026-07-31T14:31:00Z"),
-            Ohlc::new(price(400.0), price(401.0), price(399.0), price(400.5)).unwrap(),
+            BarPrices::new(price(400.0), price(401.0), price(399.0), price(400.5)).unwrap(),
             Shares::whole(10).unwrap(),
             None,
             None,
@@ -332,7 +333,7 @@ mod tests {
             symbol(),
             BarInterval::OneMinute,
             instant("2026-07-31T14:31:00Z"),
-            Ohlc::new(price(10.2), price(10.4), price(9.5), price(10.3)).unwrap(),
+            BarPrices::new(price(10.2), price(10.4), price(9.5), price(10.3)).unwrap(),
             Shares::whole(70).unwrap(),
             None,
             None,
@@ -426,7 +427,7 @@ mod tests {
                         instant("2026-07-30T14:30:00Z")
                             + TimeDelta::days(day)
                             + TimeDelta::minutes(minute),
-                        Ohlc::new(first, high, low, second).unwrap(),
+                        BarPrices::new(first, high, low, second).unwrap(),
                         Shares::whole(volume).unwrap(),
                         trades.map(TradeCount::new),
                         dollar_units.map(DollarVolume::from_units),

@@ -19,7 +19,7 @@ use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 use crate::common::market::aggregate::TradeTotals;
 use crate::common::market::record::BarInterval;
 use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
-use crate::common::market::{DollarVolume, Shares, Symbol, TradeCount};
+use crate::common::market::{DollarVolume, Shares, StampedPrice, Symbol, TradeCount};
 use crate::common::storage::{Key, Provider};
 use crate::common::time::SessionDate;
 
@@ -155,8 +155,8 @@ pub fn encode(
         let open_close = sums.open_close();
         let (open_instant, close_instant) = match open_close {
             Some(pair) => (
-                Some(nanoseconds(pair.open().0).ok_or_else(unrepresentable)?),
-                Some(nanoseconds(pair.close().0).ok_or_else(unrepresentable)?),
+                Some(nanoseconds(pair.open().at()).ok_or_else(unrepresentable)?),
+                Some(nanoseconds(pair.close().at()).ok_or_else(unrepresentable)?),
             ),
             None => (None, None),
         };
@@ -169,8 +169,8 @@ pub fn encode(
         closed_at.append_option(close_instant);
         let high_low = sums.high_low();
         for (builder, price) in prices.iter_mut().zip([
-            open_close.map(|pair| pair.open().1),
-            open_close.map(|pair| pair.close().1),
+            open_close.map(|pair| pair.open().price()),
+            open_close.map(|pair| pair.close().price()),
             high_low.map(|pair| pair.high()),
             high_low.map(|pair| pair.low()),
         ]) {
@@ -237,8 +237,8 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<TradeBar>, Provenance), 
             let open_close = match pair.map(|(_, valid)| valid) {
                 [true, true, true, true] => Some(
                     OpenClose::new(
-                        (instant(&opened_at), open.price(row)?),
-                        (instant(&closed_at), close.price(row)?),
+                        StampedPrice::new(instant(&opened_at), open.price(row)?),
+                        StampedPrice::new(instant(&closed_at), close.price(row)?),
                     )
                     .map_err(RowCause::OpenClose)?,
                 ),
@@ -436,8 +436,8 @@ mod tests {
                     let open_close = open_close.map(|(ticks, step, span)| {
                         let first = open + chrono::TimeDelta::nanoseconds(span / 2);
                         OpenClose::new(
-                            (first, price(ticks)),
-                            (first + chrono::TimeDelta::nanoseconds(span / 2), price(ticks + step)),
+                            StampedPrice::new(first, price(ticks)),
+                            StampedPrice::new(first + chrono::TimeDelta::nanoseconds(span / 2), price(ticks + step)),
                         )
                         .unwrap()
                     });
