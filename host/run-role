@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Builds and runs one role's work under the `FUND_PROFILE` secrets, the same on any box: `devenv shell -- host/run-role
+# <role>`. Run inside devenv, which supplies every tool; `run-host` is the EC2 wrapper around it.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+role="${1:-}"
+case "$role" in
+  archiver) binary=archive_nightly ;;
+  trader)
+    echo "Error: the trader role is not built yet"
+    exit 1
+    ;;
+  researcher)
+    echo "The researcher role is reserved: studies run on demand and nothing schedules one yet"
+    exit 0
+    ;;
+  *)
+    echo "Error: the role is \"$role\", not archiver, trader or researcher"
+    exit 1
+    ;;
+esac
+
+if [[ -z "${FUND_PROFILE:-}" ]]; then
+  echo "Error: FUND_PROFILE is not set; it names the profile whose secrets the $role reads"
+  exit 1
+fi
+
+if ! cargo build -q --release --bin "$binary"; then
+  if [[ ! -x "target/release/$binary" ]]; then
+    echo "Error: building $binary at $(git rev-parse --short HEAD) failed and no earlier build exists"
+    exit 1
+  fi
+  echo "Error: building $binary at $(git rev-parse --short HEAD) failed; running the previous build"
+fi
+
+with_secrets() {
+  secretspec run --profile "$FUND_PROFILE" --reason "Running the $role role" -- "$@"
+}
+
+case "$role" in
+  archiver)
+    status=0
+    with_secrets "target/release/$binary" || status=$?
+    views=0
+    with_secrets ./check-views || views=$?
+    echo "Archiver finished with status $status, its views with $views"
+    [[ "$status" -ne 0 ]] && exit "$status"
+    exit "$views"
+    ;;
+esac

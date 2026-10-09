@@ -59,6 +59,7 @@ in {
     git
     jq
     markdownlint-cli
+    secretspec # run-role reads each profile's secrets through it on every host
     statix
     taplo
     yamllint

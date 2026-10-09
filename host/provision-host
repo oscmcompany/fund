@@ -5,6 +5,8 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
 ARCHIVE_BUCKET="oscm-fund-archive"
+# The devenv release a box installs; it then supplies the toolchain pinned in devenv.lock.
+DEVENV_VERSION="2.1.2"
 ROLE=""
 PROFILE=""
 APPLY=false
@@ -65,11 +67,6 @@ if [[ ${#NAME} -gt 54 ]]; then
   echo "Error: \"$NAME\" is ${#NAME} characters; ${NAME}-scheduler would exceed IAM's 64" >&2
   exit 1
 fi
-
-case "$ARCHITECTURE" in
-  amd64) AWS_CLI_ARCHITECTURE="x86_64" ;;
-  arm64) AWS_CLI_ARCHITECTURE="aarch64" ;;
-esac
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 DRIFT=0
@@ -203,34 +200,27 @@ else
     --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/${ARCHITECTURE}/hvm/ebs-gp3/ami-id" \
     --query 'Parameter.Value' --output text)"
 
-  if [[ "$ROLE" == archiver ]]; then
-    INSTALL_DUCKDB="bash /home/ubuntu/fund/host/install-duckdb"
-  else
-    INSTALL_DUCKDB=":"
-  fi
-
-  # First boot only, as root; it powers off at the end so the first run is the first scheduled start.
+  # First boot only, as root: git and curl, then Nix and devenv for the toolchain, then a warm build; it powers off at
+  # the end so the first run is the first scheduled start.
   USER_DATA="$(cat <<CLOUDINIT
 #!/bin/bash
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y git curl unzip build-essential pkg-config libssl-dev cmake
-curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-${AWS_CLI_ARCHITECTURE}.zip -o /tmp/awscli.zip
-unzip -q /tmp/awscli.zip -d /tmp
-/tmp/aws/install --update
+apt-get install -y git curl xz-utils
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
+echo "trusted-users = root ubuntu" >> /etc/nix/nix.custom.conf
+systemctl restart nix-daemon
 mkdir -p /var/log/fund /var/journal/fund
 chown ubuntu:ubuntu /var/log/fund /var/journal/fund
 sudo -u ubuntu -H bash -c '
   set -euxo pipefail
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-  export PATH="\$HOME/.cargo/bin:\$PATH"
-  cargo install secretspec --version 0.10.1 --locked --no-default-features --features cli,awssm
+  export PATH="/nix/var/nix/profiles/default/bin:\$HOME/.nix-profile/bin:\$PATH"
+  nix profile install --accept-flake-config github:cachix/devenv/v${DEVENV_VERSION}
   git clone --branch master https://github.com/oscmcompany/fund.git "\$HOME/fund"
   cd "\$HOME/fund"
-  cargo build --release --bin ${BINARY}
+  FUND_PROFILE=${PROFILE} SECRETSPEC_PROFILE=${PROFILE} devenv shell -- cargo build --release --bin ${BINARY}
 '
-${INSTALL_DUCKDB}
 install -m 0644 /home/ubuntu/fund/host/fund-host.service /etc/systemd/system/fund-host.service
 systemctl daemon-reload
 systemctl enable fund-host.service
