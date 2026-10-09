@@ -191,10 +191,25 @@ impl Fingerprint {
 /// A partition read under one version that now holds another, or is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contamination {
-    pub session: SessionDate,
-    pub read: String,
-    /// `None` when the partition is gone.
-    pub now: Option<String>,
+    session: SessionDate,
+    read: String,
+    now: Option<String>,
+}
+
+impl Contamination {
+    pub fn session(&self) -> SessionDate {
+        self.session
+    }
+
+    /// The version the partition was read under.
+    pub fn read(&self) -> &str {
+        &self.read
+    }
+
+    /// The version the partition holds now, `None` when it is gone.
+    pub fn now(&self) -> Option<&str> {
+        self.now.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -291,19 +306,22 @@ mod tests {
         assert_eq!(fingerprint.contaminated(&current), []);
         current.insert(session(22), "\"rewritten\"".to_string());
         current.remove(&session(24));
+        let contaminations = fingerprint.contaminated(&current);
+        let contaminated: Vec<(SessionDate, &str, Option<&str>)> = contaminations
+            .iter()
+            .map(|contamination| {
+                (
+                    contamination.session(),
+                    contamination.read(),
+                    contamination.now(),
+                )
+            })
+            .collect();
         assert_eq!(
-            fingerprint.contaminated(&current),
+            contaminated,
             [
-                Contamination {
-                    session: session(22),
-                    read: "\"tag-22\"".to_string(),
-                    now: Some("\"rewritten\"".to_string())
-                },
-                Contamination {
-                    session: session(24),
-                    read: "\"tag-24\"".to_string(),
-                    now: None
-                }
+                (session(22), "\"tag-22\"", Some("\"rewritten\"")),
+                (session(24), "\"tag-24\"", None)
             ]
         );
     }

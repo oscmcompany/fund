@@ -5,6 +5,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 
 use crate::common::journal::{ParameterSource, ResolvedParameter};
 
@@ -45,9 +46,9 @@ pub enum Parameter {
     Universe,
     /// How often the trader decides: `one_minute` or `five_minute`.
     DecisionInterval,
-    /// Retired: the playbook sets the noise strategy's shares.
+    /// Retired, as the playbook sets the noise strategy's shares.
     NoiseShares,
-    /// Retired: the playbook sets the noise strategy's seed.
+    /// Retired, as the playbook sets the noise strategy's seed.
     NoiseSeed,
     /// Dollars the trader may hold across every name at once.
     GrossLimit,
@@ -72,6 +73,42 @@ impl Parameter {
     pub fn variable(self) -> String {
         format!("FUND_{}", self.to_string().to_ascii_uppercase())
     }
+
+    /// Whether nothing reads it any more, so supplying it is refused rather than silently ignored.
+    pub fn retired(self) -> bool {
+        match self {
+            Self::NoiseShares | Self::NoiseSeed => true,
+            Self::LookbackSessions
+            | Self::BudgetMinutes
+            | Self::JournalDirectory
+            | Self::LogDirectory
+            | Self::MinuteBatchSymbols
+            | Self::MinuteConcurrency
+            | Self::TickConcurrency
+            | Self::Universe
+            | Self::DecisionInterval
+            | Self::GrossLimit
+            | Self::PerNameLimit
+            | Self::DailyLossLimit
+            | Self::FlatBeforeCloseMinutes
+            | Self::StaleAfterSeconds
+            | Self::OrderPollMilliseconds
+            | Self::OrderOpenSeconds
+            | Self::Playbook => false,
+        }
+    }
+}
+
+/// Refused with the first retired parameter `supplied` returns a value for.
+pub fn refuse_retired(
+    supplied: &impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal>,
+) -> Result<(), ParameterRefusal> {
+    for parameter in Parameter::iter().filter(|parameter| parameter.retired()) {
+        if supplied(parameter)?.is_some() {
+            return Err(ParameterRefusal::Retired { parameter });
+        }
+    }
+    Ok(())
 }
 
 /// Why a supplied value was not used.
@@ -79,6 +116,8 @@ impl Parameter {
 pub enum ParameterRefusal {
     /// Not supplied, and the parameter has no default.
     Missing { parameter: Parameter },
+    /// Supplied, though nothing reads it any more.
+    Retired { parameter: Parameter },
     Unparsable {
         parameter: Parameter,
         raw: String,
@@ -99,6 +138,13 @@ impl Display for ParameterRefusal {
                 write!(
                     formatter,
                     "{} is not set and has no default",
+                    parameter.variable()
+                )
+            }
+            Self::Retired { parameter } => {
+                write!(
+                    formatter,
+                    "{} is retired and must not be set",
                     parameter.variable()
                 )
             }
@@ -211,8 +257,6 @@ where
 mod tests {
     use std::num::NonZeroUsize;
 
-    use strum::IntoEnumIterator;
-
     use super::*;
 
     #[test]
@@ -241,6 +285,31 @@ mod tests {
                 "FUND_ORDER_OPEN_SECONDS",
                 "FUND_PLAYBOOK",
             ]
+        );
+    }
+
+    #[test]
+    fn test_a_supplied_retired_parameter_is_refused() {
+        let retired: Vec<Parameter> = Parameter::iter()
+            .filter(|parameter| parameter.retired())
+            .collect();
+        assert_eq!(retired, [Parameter::NoiseShares, Parameter::NoiseSeed]);
+        let supplying = |only: Parameter| {
+            move |parameter: Parameter| Ok((parameter == only).then(|| "1".to_string()))
+        };
+        assert_eq!(refuse_retired(&supplying(Parameter::Universe)), Ok(()));
+        assert_eq!(
+            refuse_retired(&supplying(Parameter::NoiseSeed)),
+            Err(ParameterRefusal::Retired {
+                parameter: Parameter::NoiseSeed
+            })
+        );
+        assert_eq!(
+            ParameterRefusal::Retired {
+                parameter: Parameter::NoiseShares
+            }
+            .to_string(),
+            "FUND_NOISE_SHARES is retired and must not be set"
         );
     }
 

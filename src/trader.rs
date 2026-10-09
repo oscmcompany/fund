@@ -13,13 +13,19 @@ use crate::common::market::state::{MarketEvent, MarketState};
 use crate::common::market::trade_bars::{BarBuilt, TradeBar, TradeConditions, TradeFold};
 use crate::common::market::{Price, StampedPrice, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
+use crate::common::order::{BrokerFailure, OrderSequence};
+use crate::common::playbook::Played;
 use crate::common::reconcile::rounding_allowance;
 use crate::common::risk::{Limits, TargetDecided, risk};
+use crate::common::standing::{
+    FeedChanged, FeedContinuity, FeedTransition, HaltCause, SessionHalted,
+};
 use crate::common::strategy::Strategy;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 use crate::execution::{
-    JournalFailed, OrderOutcome, Patience, ReconcileFailed, execute, reconcile_and_close,
+    JournalFailed, OrderOutcome, Patience, ReconcileFailed, Reconciliation, execute,
+    reconcile_and_close,
 };
 use crate::ingest::alpaca::AlpacaTradeOutcome;
 use crate::ingest::alpaca::feed::FeedEvent;
@@ -84,6 +90,18 @@ pub enum SettingsRefusal {
     StalenessUnderAMinute { stale_after: TimeDelta },
 }
 
+impl std::fmt::Display for SettingsRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StalenessUnderAMinute { stale_after } => {
+                write!(formatter, "a staleness of {stale_after} is under a minute")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SettingsRefusal {}
+
 impl SessionSettings {
     pub fn new(
         decision: DecisionInterval,
@@ -110,9 +128,28 @@ pub enum SessionError {
     Reconcile(ReconcileFailed),
 }
 
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal(failed) | Self::Reconcile(ReconcileFailed::Journal(failed)) => write!(
+                formatter,
+                "the journal refused a write after {} orders: {}",
+                failed.outcomes().len(),
+                failed.error()
+            ),
+            Self::Reconcile(ReconcileFailed::Unread(error)) => {
+                write!(
+                    formatter,
+                    "the broker's book was not read to reconcile: {error}"
+                )
+            }
+        }
+    }
+}
+
 /// One session's trading state; `observe` folds the tape in and `advance` moves the session to an instant.
 pub struct Session<S: Strategy> {
-    strategy: S,
+    strategy: Played<S>,
     settings: SessionSettings,
     calendar: TradingCalendar,
     fold: TradeFold,
@@ -123,39 +160,38 @@ pub struct Session<S: Strategy> {
     /// Fills since the last reconciliation, which bound how far the broker's cash may stray from the book's.
     fills: Vec<Fill>,
     next_decision: DateTime<Utc>,
-    next_sequence: u32,
+    sequence: OrderSequence,
     /// Whether the tape is whole: draining and deciding wait out a gap until a backfill after a reopen covers it.
-    tape: Tape,
-    /// Set once a reconciliation diverges, an order is left unresolved or a step fails; the session then decides
-    /// nothing more.
-    halted: bool,
+    continuity: FeedContinuity,
+    standing: Standing,
 }
 
-/// Where the feed stands, so bars are drained only from a whole tape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tape {
-    Whole,
-    /// The stream was lost; prints may be missing until a reopen and a backfill behind it.
-    Interrupted,
-    /// The stream is open but the tape has a gap before it, at startup or after a reopen; the next backfill closes it.
-    Reopened,
+/// Whether a session still decides, or the cause of its first halt, after which it decides nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    Trading,
+    Halted(HaltCause),
 }
 
-impl Tape {
-    fn after(self, event: &FeedEvent) -> Self {
-        match (self, event) {
-            (Self::Whole | Self::Interrupted | Self::Reopened, FeedEvent::Lost { .. }) => {
-                Self::Interrupted
-            }
-            (Self::Interrupted | Self::Reopened, FeedEvent::Reopened { .. }) => Self::Reopened,
-            (Self::Reopened, FeedEvent::Backfilled { .. }) => Self::Whole,
-            (Self::Whole, FeedEvent::Reopened { .. })
-            | (Self::Whole | Self::Interrupted, FeedEvent::Backfilled { .. })
-            | (
-                Self::Whole | Self::Interrupted | Self::Reopened,
-                FeedEvent::BackfillFailed { .. } | FeedEvent::Message(_),
-            ) => self,
-        }
+/// A halt on a journal write refused with `error`.
+fn journal_refused(error: &std::io::Error) -> HaltCause {
+    HaltCause::JournalRefused {
+        error: error.to_string(),
+    }
+}
+
+/// The transition a feed event makes, for the events that can move the continuity.
+fn transition(event: &FeedEvent) -> Option<FeedTransition> {
+    match event {
+        FeedEvent::Lost { .. } => Some(FeedTransition::Lost),
+        FeedEvent::Reopened { attempts } => Some(FeedTransition::Reopened {
+            attempts: *attempts,
+        }),
+        FeedEvent::Backfilled { since, fresh } => Some(FeedTransition::Backfilled {
+            since: *since,
+            fresh: *fresh,
+        }),
+        FeedEvent::BackfillFailed { .. } | FeedEvent::Message(_) => None,
     }
 }
 
@@ -167,7 +203,7 @@ impl<S: Strategy> Session<S> {
         reason = "each is one independent input a session starts from"
     )]
     pub fn new(
-        strategy: S,
+        strategy: Played<S>,
         settings: SessionSettings,
         calendar: TradingCalendar,
         session: SessionDate,
@@ -187,10 +223,10 @@ impl<S: Strategy> Session<S> {
             book,
             opening,
             fills: Vec::new(),
-            next_sequence: 0,
+            sequence: OrderSequence::default(),
             // The feed's first backfill, from where the tape is wanted, makes it whole.
-            tape: Tape::Reopened,
-            halted: false,
+            continuity: FeedContinuity::Reopened,
+            standing: Standing::Trading,
         }
     }
 
@@ -198,14 +234,29 @@ impl<S: Strategy> Session<S> {
         &self.book
     }
 
-    pub fn halted(&self) -> bool {
-        self.halted
+    pub fn standing(&self) -> &Standing {
+        &self.standing
     }
 
-    /// Folds one feed event in: a print goes to the fold, which decides what it may set, and the feed's own events say
-    /// whether the tape is whole.
-    pub fn observe(&mut self, event: &FeedEvent) {
-        self.tape = self.tape.after(event);
+    /// Folds one feed event in at `now`: a print goes to the fold, which decides what it may set, and the feed's own
+    /// events say whether the tape is whole, each change journaled as `feed_changed`.
+    pub fn observe(
+        &mut self,
+        now: DateTime<Utc>,
+        event: &FeedEvent,
+        journal: &mut Journal,
+    ) -> Result<(), SessionError> {
+        if let Some(changed) =
+            transition(event).and_then(|transition| FeedChanged::of(self.continuity, transition))
+        {
+            self.continuity = changed.to();
+            if let Err(error) = journal.append(now, Observation::FeedChanged(changed)) {
+                self.halt(journal, journal_refused(&error));
+                return Err(SessionError::Journal(JournalFailed::before_any_order(
+                    error,
+                )));
+            }
+        }
         match event {
             FeedEvent::Message(StreamMessage::Trade {
                 outcome:
@@ -235,6 +286,7 @@ impl<S: Strategy> Session<S> {
             | FeedEvent::Backfilled { .. }
             | FeedEvent::BackfillFailed { .. } => {}
         }
+        Ok(())
     }
 
     /// Folds in every minute settled by `now`, and once a decision bar has settled, trades the book toward the
@@ -247,22 +299,25 @@ impl<S: Strategy> Session<S> {
         journal: &mut Journal,
     ) -> Result<(), SessionError> {
         self.fold_in(MarketEvent::Clock(now));
-        match self.tape {
-            Tape::Whole => {}
-            Tape::Interrupted | Tape::Reopened => return Ok(()),
+        match self.continuity {
+            FeedContinuity::Whole => {}
+            FeedContinuity::Interrupted | FeedContinuity::Reopened => return Ok(()),
         }
         let settled = now - SETTLING;
         for bar in self.fold.drain_through(settled) {
             if let Err(error) = journal.append(now, Observation::BarBuilt(BarBuilt::of(&bar))) {
-                self.halted = true;
-                return Err(SessionError::Journal(JournalFailed {
-                    outcomes: Vec::new(),
+                self.halt(journal, journal_refused(&error));
+                return Err(SessionError::Journal(JournalFailed::before_any_order(
                     error,
-                }));
+                )));
             }
             self.fold_in(MarketEvent::Trades(bar));
         }
-        if self.halted || settled < self.next_decision {
+        match self.standing {
+            Standing::Trading => {}
+            Standing::Halted(_) => return Ok(()),
+        }
+        if settled < self.next_decision {
             return Ok(());
         }
         let bar = decision_before(settled, self.settings.decision);
@@ -277,17 +332,17 @@ impl<S: Strategy> Session<S> {
             |symbol| self.fresh_price(symbol, now),
             wanted.clone(),
         );
-        let decided = TargetDecided::new(bar, wanted, restrained.clone());
+        let stretch = self.strategy.stretch_at(&self.state);
+        let decided = TargetDecided::new(bar, stretch, wanted, restrained.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
-            self.halted = true;
-            return Err(SessionError::Journal(JournalFailed {
-                outcomes: Vec::new(),
+            self.halt(journal, journal_refused(&error));
+            return Err(SessionError::Journal(JournalFailed::before_any_order(
                 error,
-            }));
+            )));
         }
         let restrained = match restrained {
             Ok(restrained) => restrained,
-            // An unpriced exposure cannot be capped, so the book is left as it stands until the price returns.
+            // An unpriced exposure cannot be capped, so the book is left as it stands; the refusal is journaled above.
             Err(_) => return Ok(()),
         };
         let prices: BTreeMap<Symbol, Price> = self
@@ -300,7 +355,7 @@ impl<S: Strategy> Session<S> {
         let executed = execute(
             broker,
             journal,
-            &mut self.next_sequence,
+            &mut self.sequence,
             &self.book,
             restrained.target(),
             &prices,
@@ -311,16 +366,16 @@ impl<S: Strategy> Session<S> {
             Ok(outcomes) => outcomes,
             Err(failed) => {
                 // The orders already followed are real, so their fills reach the book before the session halts.
-                self.take(&failed.outcomes);
-                self.halted = true;
+                self.take(failed.outcomes(), journal);
+                self.halt(journal, journal_refused(failed.error()));
                 return Err(SessionError::Journal(failed));
             }
         };
-        self.take(&outcomes);
+        self.take(&outcomes, journal);
         let reconciliation = match reconcile_and_close(
             broker,
             journal,
-            &mut self.next_sequence,
+            &mut self.sequence,
             &self.book,
             rounding_allowance(&self.fills),
             &prices,
@@ -330,29 +385,61 @@ impl<S: Strategy> Session<S> {
         {
             Ok(reconciliation) => reconciliation,
             Err(failed) => {
-                self.halted = true;
+                let cause = match &failed {
+                    ReconcileFailed::Unread(error) => {
+                        HaltCause::ReconcileUnread(BrokerFailure::from(error))
+                    }
+                    ReconcileFailed::Journal(failed) => journal_refused(failed.error()),
+                };
+                self.halt(journal, cause);
                 return Err(SessionError::Reconcile(failed));
             }
         };
-        self.halted |= !reconciliation.reading.agrees();
-        self.book = reconciliation.book;
         self.fills.clear();
+        match reconciliation {
+            Reconciliation::Agreed { book } => self.book = book,
+            Reconciliation::Diverged { book, .. } => {
+                self.book = book;
+                self.halt(journal, HaltCause::Diverged);
+            }
+        }
         Ok(())
     }
 
     /// Folds each closed order's fill into the book, halting on an order left unresolved, which may still be open at
     /// the broker and would overlap the next decision's orders.
-    fn take(&mut self, outcomes: &[OrderOutcome]) {
+    fn take(&mut self, outcomes: &[OrderOutcome], journal: &mut Journal) {
         for outcome in outcomes {
             match outcome {
                 OrderOutcome::Closed(Some(fill)) => {
                     self.book = std::mem::take(&mut self.book).combine(Book::of(fill));
                     self.fills.push(fill.clone());
                 }
-                OrderOutcome::Unresolved(_) => self.halted = true,
+                OrderOutcome::Unresolved {
+                    client_order_id, ..
+                } => self.halt(
+                    journal,
+                    HaltCause::Unresolved {
+                        client_order_id: *client_order_id,
+                    },
+                ),
                 OrderOutcome::Closed(None) | OrderOutcome::Guarded(_) | OrderOutcome::Refused => {}
             }
         }
+    }
+
+    /// Halts the session for `cause` unless it has halted already, journaling the halt best effort at the wall clock,
+    /// since the journal may be what failed; a refused halt record is logged instead.
+    fn halt(&mut self, journal: &mut Journal, cause: HaltCause) {
+        match self.standing {
+            Standing::Trading => {}
+            Standing::Halted(_) => return,
+        }
+        let halted = Observation::SessionHalted(SessionHalted::new(cause.clone()));
+        if let Err(error) = journal.append(Utc::now(), halted) {
+            tracing::error!(%error, ?cause, "Halt was not journaled");
+        }
+        self.standing = Standing::Halted(cause);
     }
 
     fn fold_in(&mut self, event: MarketEvent) {
@@ -424,7 +511,7 @@ mod tests {
     use super::*;
     use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
     use crate::common::guard::Tradability;
-    use crate::common::journal::{ReadLine, RunId, read};
+    use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::Trade;
     use crate::common::market::trade_bars::{
@@ -463,6 +550,8 @@ mod tests {
         ticks: i64,
         /// Whether orders fill; when they do not, each stays open and its cancel never takes.
         fills: bool,
+        /// Whether reading the book fails, as when the broker answers with a malformed cash field.
+        book_unreadable: bool,
         book: Mutex<Book>,
         last: Mutex<Option<BrokerOrder>>,
     }
@@ -472,6 +561,7 @@ mod tests {
             Self {
                 ticks,
                 fills: true,
+                book_unreadable: false,
                 book: Mutex::new(book),
                 last: Mutex::new(None),
             }
@@ -537,6 +627,12 @@ mod tests {
         }
 
         async fn book(&self) -> Result<Book, BrokerError> {
+            if self.book_unreadable {
+                return Err(BrokerError::Malformed {
+                    field: "cash",
+                    raw: "unreadable".to_string(),
+                });
+            }
             Ok(self.book.lock().unwrap().clone())
         }
     }
@@ -568,15 +664,12 @@ mod tests {
             TimeDelta::minutes(15),
         )
         .unwrap();
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::from_secs(30),
-        };
+        let patience = Patience::new(Duration::from_secs(1), Duration::from_secs(30)).unwrap();
         let settings =
             SessionSettings::new(DecisionInterval::FiveMinute, limits, patience, stale_after)
                 .unwrap();
         let mut session = Session::new(
-            OneShare,
+            Played::throughout(OneShare),
             settings,
             calendar,
             date,
@@ -586,10 +679,19 @@ mod tests {
             dollars(10_000),
             at("14:00:00"),
         );
-        session.observe(&FeedEvent::Backfilled {
-            since: at("13:59:00"),
-            fresh: 0,
-        });
+        // The startup backfill's record goes to a journal of its own, so each test's journal holds only its own steps.
+        let (mut journal, directory) = journal();
+        session
+            .observe(
+                at("14:00:00"),
+                &FeedEvent::Backfilled {
+                    since: at("13:59:00"),
+                    fresh: 0,
+                },
+                &mut journal,
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
         session
     }
 
@@ -616,6 +718,14 @@ mod tests {
     /// Every record's event type in the order the journal wrote them, across its session files, since the session's fixed
     /// clock and execution's wall clock can file one run under two dates.
     fn journaled(directory: &std::path::Path) -> Vec<&'static str> {
+        records(directory)
+            .iter()
+            .map(|record| record.observation().event_type())
+            .collect()
+    }
+
+    /// Every record in the order the journal wrote them.
+    fn records(directory: &std::path::Path) -> Vec<Record> {
         let mut records: Vec<_> = std::fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -625,14 +735,19 @@ mod tests {
             })
             .flat_map(|path| read(&std::fs::read_to_string(path).unwrap()))
             .map(|line| match line {
-                ReadLine::Read(record) => record,
+                ReadLine::Read(record) => *record,
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
             .collect();
         records.sort_by_key(|record| record.sequence());
         records
+    }
+
+    /// Every record's payload in the order the journal wrote them.
+    fn payloads(directory: &std::path::Path) -> Vec<serde_json::Value> {
+        records(directory)
             .iter()
-            .map(|record| record.observation().event_type())
+            .map(|record| serde_json::to_value(record.observation()).unwrap()["payload"].clone())
             .collect()
     }
 
@@ -652,13 +767,25 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:01:10", 700_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:01:10", 700_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:03:00"), &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
-        session.observe(&print(2, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(2, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:01"), &broker, &mut journal)
             .await
@@ -674,6 +801,7 @@ mod tests {
                 "bar_built",
                 "bar_built",
                 "target_decided",
+                "tradability_read",
                 "order_submitted",
                 "order_closed",
                 "book_reconciled"
@@ -684,12 +812,12 @@ mod tests {
             session.book().cash(),
             Cash::from_units(10_000 * DOLLAR - 701 * DOLLAR)
         );
-        assert!(!session.halted());
+        assert_eq!(session.standing(), &Standing::Trading);
         session
             .advance(at("14:09:00"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory).len(), 6);
+        assert_eq!(journaled(&directory).len(), 7);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -701,12 +829,22 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let mut session = session(TimeDelta::minutes(1), funded.clone());
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:01:10", 700_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:01:10", 700_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "target_decided"]);
+        assert_eq!(
+            payloads(&directory)[1]["stretch"],
+            serde_json::json!({"from": "09:30:00", "progress": 1_000_000})
+        );
         assert_eq!(session.book(), &funded);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -719,25 +857,39 @@ mod tests {
         let broker = Filling::new(701_000_000, strayed);
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
             .unwrap();
-        assert!(session.halted());
-        let decisions = |directory| {
+        assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
+        let count = |directory, wanted: &str| {
             journaled(directory)
                 .into_iter()
-                .filter(|event_type| *event_type == "target_decided")
+                .filter(|event_type| *event_type == wanted)
                 .count()
         };
-        assert_eq!(decisions(&directory), 1);
-        session.observe(&print(2, "14:09:30", 701_000_000));
+        assert_eq!(count(&directory, "target_decided"), 1);
+        assert_eq!(journaled(&directory).last(), Some(&"session_halted"));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(2, "14:09:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:10:02"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(decisions(&directory), 1);
+        assert_eq!(count(&directory, "target_decided"), 1);
+        assert_eq!(count(&directory, "session_halted"), 1);
         assert_eq!(
             session.book().cash(),
             Cash::from_units(9_000 * DOLLAR - 701 * DOLLAR)
@@ -752,7 +904,13 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let mut session = session(TimeDelta::minutes(1), funded);
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:04:59", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:59", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
@@ -769,29 +927,71 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
-        session.observe(&FeedEvent::Lost {
-            cause: crate::ingest::alpaca::stream::StreamError::Ended,
-        });
-        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &FeedEvent::Lost {
+                    cause: crate::ingest::alpaca::stream::StreamError::Ended,
+                },
+                &mut journal,
+            )
+            .unwrap();
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
             .unwrap();
-        session.observe(&FeedEvent::Reopened { attempts: 1 });
+        session
+            .observe(
+                at("14:00:00"),
+                &FeedEvent::Reopened { attempts: 1 },
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:03"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory), Vec::<&str>::new());
-        session.observe(&FeedEvent::Backfilled {
-            since: at("14:04:00"),
-            fresh: 0,
-        });
+        assert_eq!(journaled(&directory), ["feed_changed", "feed_changed"]);
+        session
+            .observe(
+                at("14:00:00"),
+                &FeedEvent::Backfilled {
+                    since: at("14:04:00"),
+                    fresh: 0,
+                },
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:04"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory)[..2], ["bar_built", "target_decided"]);
+        assert_eq!(
+            journaled(&directory)[..5],
+            [
+                "feed_changed",
+                "feed_changed",
+                "feed_changed",
+                "bar_built",
+                "target_decided"
+            ]
+        );
+        let changes: Vec<serde_json::Value> = payloads(&directory)[..3].to_vec();
+        assert_eq!(
+            changes,
+            [
+                serde_json::json!({"from": "whole", "transition": "lost"}),
+                serde_json::json!({"from": "interrupted", "transition": {"reopened": {"attempts": 1}}}),
+                serde_json::json!({"from": "reopened", "transition": {"backfilled": {"since": "2026-10-07T14:04:00Z", "fresh": 0}}}),
+            ]
+        );
         assert_eq!(session.book().position(&spy()).units(), 1_000_000);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -804,13 +1004,34 @@ mod tests {
         broker.fills = false;
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
             .unwrap();
-        assert!(session.halted());
-        assert!(journaled(&directory).contains(&"order_unresolved"));
+        let Standing::Halted(HaltCause::Unresolved { client_order_id }) = session.standing() else {
+            panic!("expected an unresolved halt: {:?}", session.standing());
+        };
+        let events = journaled(&directory);
+        assert_eq!(
+            events[events.len() - 3..],
+            ["order_unresolved", "session_halted", "book_reconciled"]
+        );
+        let records = payloads(&directory);
+        assert_eq!(
+            records[records.len() - 3]["client_order_id"],
+            serde_json::json!(client_order_id)
+        );
+        assert_eq!(
+            records[records.len() - 2]["cause"]["unresolved"]["client_order_id"],
+            serde_json::json!(client_order_id)
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -822,7 +1043,7 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let started = session(TimeDelta::minutes(5), funded.clone());
         let mut session = Session::new(
-            OneShare,
+            Played::throughout(OneShare),
             started.settings,
             started.calendar,
             date,
@@ -833,21 +1054,36 @@ mod tests {
             at("14:00:00"),
         );
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), Vec::<&str>::new());
-        session.observe(&FeedEvent::Backfilled {
-            since: at("14:00:00"),
-            fresh: 0,
-        });
+        session
+            .observe(
+                at("14:00:00"),
+                &FeedEvent::Backfilled {
+                    since: at("14:00:00"),
+                    fresh: 0,
+                },
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:03"), &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory)[..2], ["bar_built", "target_decided"]);
+        assert_eq!(
+            journaled(&directory)[..3],
+            ["feed_changed", "bar_built", "target_decided"]
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -859,10 +1095,127 @@ mod tests {
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
         std::fs::remove_dir_all(&directory).unwrap();
-        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         let failed = session.advance(at("14:05:02"), &broker, &mut journal).await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
-        assert!(session.halted());
+        assert!(matches!(
+            session.standing(),
+            Standing::Halted(HaltCause::JournalRefused { .. })
+        ));
+    }
+
+    /// A journal that refuses a feed change halts the session and fails the call.
+    #[test]
+    fn test_a_refused_feed_change_halts_the_session() {
+        let mut session = session(TimeDelta::minutes(5), Book::default());
+        let (mut journal, directory) = journal();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let failed = session.observe(
+            at("14:00:00"),
+            &FeedEvent::Lost {
+                cause: crate::ingest::alpaca::stream::StreamError::Ended,
+            },
+            &mut journal,
+        );
+        assert!(matches!(failed, Err(SessionError::Journal(_))));
+        assert!(matches!(
+            session.standing(),
+            Standing::Halted(HaltCause::JournalRefused { .. })
+        ));
+    }
+
+    /// A broker book that cannot be read at reconciliation halts the session on that cause, journaled with it.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_unread_book_at_reconciliation_halts_the_session() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let mut broker = Filling::new(701_000_000, funded.clone());
+        broker.book_unreadable = true;
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
+        let failed = session.advance(at("14:05:02"), &broker, &mut journal).await;
+        assert!(matches!(
+            failed,
+            Err(SessionError::Reconcile(ReconcileFailed::Unread(_)))
+        ));
+        assert_eq!(
+            session.standing(),
+            &Standing::Halted(HaltCause::ReconcileUnread(BrokerFailure::Malformed {
+                field: "cash".to_string(),
+                raw: "unreadable".to_string(),
+            }))
+        );
+        assert_eq!(journaled(&directory).last(), Some(&"session_halted"));
+        assert_eq!(
+            payloads(&directory).last(),
+            Some(&serde_json::json!({
+                "cause": {"reconcile_unread": {"malformed": {"field": "cash", "raw": "unreadable"}}}
+            }))
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A halt is stamped when it happens, so it never precedes the records written while the decision traded.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_halt_is_stamped_after_the_records_that_caused_it() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let strayed = Book::funded(Cash::from_units(9_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, strayed);
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
+        session
+            .advance(at("14:05:02"), &broker, &mut journal)
+            .await
+            .unwrap();
+        let records = records(&directory);
+        let stamped = |wanted: &str| {
+            records
+                .iter()
+                .find(|record| record.observation().event_type() == wanted)
+                .map(|record| record.timestamp())
+                .unwrap()
+        };
+        assert!(stamped("session_halted") >= stamped("book_reconciled"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Only the first halt is journaled and kept, so a later failure cannot replace the cause that stopped the session.
+    #[test]
+    fn test_a_session_halts_once_on_its_first_cause() {
+        let mut session = session(TimeDelta::minutes(5), Book::default());
+        let (mut journal, directory) = journal();
+        session.halt(&mut journal, HaltCause::Diverged);
+        session.halt(
+            &mut journal,
+            HaltCause::JournalRefused {
+                error: "disk full".to_string(),
+            },
+        );
+        assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
+        assert_eq!(
+            payloads(&directory),
+            [serde_json::json!({"cause": "diverged"})]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// A journal that refuses the decision itself, with every bar already journaled, halts the session too.
@@ -873,7 +1226,13 @@ mod tests {
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut refusing, gone) = journal();
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:01:10", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:01:10", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:03:00"), &broker, &mut journal)
             .await
@@ -884,7 +1243,10 @@ mod tests {
             .advance(at("14:05:02"), &broker, &mut refusing)
             .await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
-        assert!(session.halted());
+        assert!(matches!(
+            session.standing(),
+            Standing::Halted(HaltCause::JournalRefused { .. })
+        ));
         assert_eq!(session.next_decision, at("14:10:00"));
         assert_eq!(session.book().position(&spy()).units(), 0);
         std::fs::remove_dir_all(&directory).unwrap();
@@ -927,10 +1289,7 @@ mod tests {
             TimeDelta::zero(),
         )
         .unwrap();
-        let patience = Patience {
-            poll: Duration::from_secs(1),
-            open_for: Duration::from_secs(1),
-        };
+        let patience = Patience::new(Duration::from_secs(1), Duration::from_secs(1)).unwrap();
         let settings = |seconds| {
             SessionSettings::new(
                 DecisionInterval::OneMinute,
@@ -1036,7 +1395,13 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let mut session = session_capped(TimeDelta::minutes(5), funded.clone(), DOLLAR / 100);
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:04:30", 701_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:04:30", 701_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:05:02"), &broker, &mut journal)
             .await
@@ -1046,12 +1411,13 @@ mod tests {
             [
                 "bar_built",
                 "target_decided",
+                "tradability_read",
                 "order_guarded",
                 "book_reconciled"
             ]
         );
         assert_eq!(session.book(), &funded);
-        assert!(!session.halted());
+        assert_eq!(session.standing(), &Standing::Trading);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1062,8 +1428,20 @@ mod tests {
         let broker = Filling::new(701_000_000, funded.clone());
         let mut session = session(TimeDelta::minutes(5), funded);
         let (mut journal, directory) = journal();
-        session.observe(&print(1, "14:01:10", 700_000_000));
-        session.observe(&print(2, "14:01:40", 702_000_000));
+        session
+            .observe(
+                at("14:00:00"),
+                &print(1, "14:01:10", 700_000_000),
+                &mut journal,
+            )
+            .unwrap();
+        session
+            .observe(
+                at("14:00:00"),
+                &print(2, "14:01:40", 702_000_000),
+                &mut journal,
+            )
+            .unwrap();
         session
             .advance(at("14:03:00"), &broker, &mut journal)
             .await
