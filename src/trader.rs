@@ -224,7 +224,7 @@ impl<S: Strategy> Session<S> {
                 }
                 | StreamMessage::Connected
                 | StreamMessage::Authenticated
-                | StreamMessage::Subscribed { .. }
+                | StreamMessage::Subscribed(_)
                 | StreamMessage::Quote(_)
                 | StreamMessage::Refused { .. }
                 | StreamMessage::Unrecognized { .. }

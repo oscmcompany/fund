@@ -198,11 +198,43 @@ pub enum FeedEvent {
     },
 }
 
+/// Whether the stream is up, and the stretch of the tape it has not covered until a backfill closes it.
+enum FeedState<Stream> {
+    /// The stream is down and REST carries the tape from `since` between attempts to reopen it.
+    Down {
+        since: DateTime<Utc>,
+        failed_backfills: u32,
+    },
+    /// The stream is up over a gap from `since`, whose backfill runs again at `retry_at`.
+    Gapped {
+        stream: Stream,
+        since: DateTime<Utc>,
+        failed_backfills: u32,
+        retry_at: Instant,
+    },
+    /// The stream is up and the tape before it is backfilled.
+    Whole { stream: Stream },
+}
+
+/// What moves the feed between states.
+enum FeedTransition<Stream> {
+    /// The stream reopened at `at`, which is when the backfill over its gap is due.
+    Opened {
+        stream: Stream,
+        at: Instant,
+    },
+    Lost,
+    Backfilled,
+    BackfillFailed {
+        at: Instant,
+    },
+}
+
 /// The tape for `symbols`, reopened and backfilled whenever the stream drops.
 pub struct Feed<Source: TapeSource> {
     source: Source,
     symbols: Vec<Symbol>,
-    stream: Option<Source::Stream>,
+    state: FeedState<Source::Stream>,
     seen: Seen,
     /// Where the tape is wanted from, which anchors a loss before any print is handed out.
     from: DateTime<Utc>,
@@ -210,13 +242,8 @@ pub struct Feed<Source: TapeSource> {
     latest: Option<DateTime<Utc>>,
     /// The latest print the stream delivered, which bounds what it may yet repeat, so forgetting keys off it.
     latest_streamed: Option<DateTime<Utc>>,
-    /// Where the stretch the stream has not covered begins, until a backfill closes it.
-    gap: Option<DateTime<Utc>>,
     /// Opens since the stream last delivered a message, so one that opens and closes at once still backs off.
     attempts: u32,
-    /// Backfills failed since the last that succeeded, and when the next may run.
-    failed_backfills: u32,
-    retry_at: Option<Instant>,
     pending: VecDeque<FeedEvent>,
 }
 
@@ -226,15 +253,15 @@ impl<Source: TapeSource> Feed<Source> {
         Self {
             source,
             symbols,
-            stream: None,
+            state: FeedState::Down {
+                since: from,
+                failed_backfills: 0,
+            },
             seen: Seen::default(),
             from,
             latest: None,
             latest_streamed: None,
-            gap: Some(from),
             attempts: 0,
-            failed_backfills: 0,
-            retry_at: None,
             pending: VecDeque::new(),
         }
     }
@@ -246,19 +273,21 @@ impl<Source: TapeSource> Feed<Source> {
             if let Some(event) = self.pending.pop_front() {
                 return event;
             }
-            let Some(stream) = self.stream.as_mut() else {
-                self.reopen().await;
-                continue;
-            };
-            let read = match (self.gap, self.retry_at) {
-                (Some(_), Some(retry_at)) => match timeout_at(retry_at, stream.next()).await {
+            let read = match &mut self.state {
+                FeedState::Down { .. } => {
+                    self.reopen().await;
+                    continue;
+                }
+                FeedState::Gapped {
+                    stream, retry_at, ..
+                } => match timeout_at(*retry_at, stream.next()).await {
                     Ok(read) => read,
                     Err(_) => {
                         self.backfill().await;
                         continue;
                     }
                 },
-                (None, Some(_) | None) | (Some(_), None) => stream.next().await,
+                FeedState::Whole { stream } => stream.next().await,
             };
             match read {
                 Some(Ok(message)) => {
@@ -307,7 +336,7 @@ impl<Source: TapeSource> Feed<Source> {
             }
             StreamMessage::Connected
             | StreamMessage::Authenticated
-            | StreamMessage::Subscribed { .. }
+            | StreamMessage::Subscribed(_)
             | StreamMessage::Quote(_)
             | StreamMessage::Refused { .. }
             | StreamMessage::Unrecognized { .. }
@@ -325,12 +354,104 @@ impl<Source: TapeSource> Feed<Source> {
     }
 
     fn lost(&mut self, cause: StreamError) -> FeedEvent {
-        self.stream = None;
-        let start = self
-            .latest
-            .map_or(self.from, |latest| latest - BACKFILL_MARGIN);
-        self.gap = Some(self.gap.map_or(start, |gap| gap.min(start)));
+        self.apply(FeedTransition::Lost);
         FeedEvent::Lost { cause }
+    }
+
+    /// Moves to the state `transition` leads to; a loss reaches the gap back to just before the latest print, and a
+    /// backfill with the stream down moves it up to there.
+    fn apply(&mut self, transition: FeedTransition<Source::Stream>) {
+        let resume = self.latest.map(|latest| latest - BACKFILL_MARGIN);
+        let lost_from = resume.unwrap_or(self.from);
+        let placeholder = FeedState::Down {
+            since: self.from,
+            failed_backfills: 0,
+        };
+        self.state = match (std::mem::replace(&mut self.state, placeholder), transition) {
+            (
+                FeedState::Down {
+                    since,
+                    failed_backfills,
+                },
+                FeedTransition::Opened { stream, at },
+            ) => FeedState::Gapped {
+                stream,
+                since,
+                failed_backfills,
+                retry_at: at,
+            },
+            (
+                FeedState::Gapped {
+                    since,
+                    failed_backfills,
+                    retry_at,
+                    ..
+                },
+                FeedTransition::Opened { stream, .. },
+            ) => FeedState::Gapped {
+                stream,
+                since,
+                failed_backfills,
+                retry_at,
+            },
+            (FeedState::Whole { .. }, FeedTransition::Opened { stream, .. }) => {
+                FeedState::Whole { stream }
+            }
+            (
+                FeedState::Down {
+                    since,
+                    failed_backfills,
+                }
+                | FeedState::Gapped {
+                    since,
+                    failed_backfills,
+                    ..
+                },
+                FeedTransition::Lost,
+            ) => FeedState::Down {
+                since: since.min(lost_from),
+                failed_backfills,
+            },
+            (FeedState::Whole { .. }, FeedTransition::Lost) => FeedState::Down {
+                since: lost_from,
+                failed_backfills: 0,
+            },
+            (FeedState::Down { since, .. }, FeedTransition::Backfilled) => FeedState::Down {
+                since: resume.map_or(since, |resume| resume.max(since)),
+                failed_backfills: 0,
+            },
+            (
+                FeedState::Gapped { stream, .. } | FeedState::Whole { stream },
+                FeedTransition::Backfilled,
+            ) => FeedState::Whole { stream },
+            (
+                FeedState::Down {
+                    since,
+                    failed_backfills,
+                },
+                FeedTransition::BackfillFailed { .. },
+            ) => FeedState::Down {
+                since,
+                failed_backfills: failed_backfills + 1,
+            },
+            (
+                FeedState::Gapped {
+                    stream,
+                    since,
+                    failed_backfills,
+                    ..
+                },
+                FeedTransition::BackfillFailed { at },
+            ) => FeedState::Gapped {
+                stream,
+                since,
+                failed_backfills: failed_backfills + 1,
+                retry_at: at + backoff(failed_backfills + 1),
+            },
+            (FeedState::Whole { stream }, FeedTransition::BackfillFailed { .. }) => {
+                FeedState::Whole { stream }
+            }
+        };
     }
 
     /// One attempt to reopen, then a backfill over any open gap whether or not it held: after a reopen it closes the
@@ -342,7 +463,10 @@ impl<Source: TapeSource> Feed<Source> {
         self.attempts += 1;
         match self.source.open(&self.symbols).await {
             Ok(stream) => {
-                self.stream = Some(stream);
+                self.apply(FeedTransition::Opened {
+                    stream,
+                    at: Instant::now(),
+                });
                 if self.attempts > 1 || self.latest.is_some() {
                     self.pending.push_back(FeedEvent::Reopened {
                         attempts: self.attempts,
@@ -357,8 +481,9 @@ impl<Source: TapeSource> Feed<Source> {
     /// Reads REST trades from the gap's start and queues the ones not yet handed out. The gap closes once a backfill
     /// succeeds with the stream up; with it down, the gap moves up to the latest print and stays open.
     async fn backfill(&mut self) {
-        let Some(since) = self.gap else {
-            return;
+        let since = match &self.state {
+            FeedState::Down { since, .. } | FeedState::Gapped { since, .. } => *since,
+            FeedState::Whole { .. } => return,
         };
         match self.source.trades_since(&self.symbols, since).await {
             Ok(trades) => {
@@ -370,14 +495,7 @@ impl<Source: TapeSource> Feed<Source> {
                     }
                 }
                 self.forget();
-                self.gap = match self.stream {
-                    Some(_) => None,
-                    None => Some(
-                        self.latest
-                            .map_or(since, |latest| (latest - BACKFILL_MARGIN).max(since)),
-                    ),
-                };
-                (self.failed_backfills, self.retry_at) = (0, None);
+                self.apply(FeedTransition::Backfilled);
                 let count = fresh.len();
                 self.pending.extend(fresh);
                 self.pending.push_back(FeedEvent::Backfilled {
@@ -386,8 +504,7 @@ impl<Source: TapeSource> Feed<Source> {
                 });
             }
             Err(error) => {
-                self.failed_backfills += 1;
-                self.retry_at = Some(Instant::now() + backoff(self.failed_backfills));
+                self.apply(FeedTransition::BackfillFailed { at: Instant::now() });
                 self.pending
                     .push_back(FeedEvent::BackfillFailed { cause: error });
             }
@@ -449,7 +566,7 @@ mod tests {
             StreamMessage::Trade { id, outcome } => (id, outcome),
             other @ (StreamMessage::Connected
             | StreamMessage::Authenticated
-            | StreamMessage::Subscribed { .. }
+            | StreamMessage::Subscribed(_)
             | StreamMessage::Quote(_)
             | StreamMessage::Refused { .. }
             | StreamMessage::Unrecognized { .. }
@@ -706,6 +823,43 @@ mod tests {
                 FeedEvent::Message(print(2, 100)),
                 backfilled(at(-2), 1),
             ]
+        );
+    }
+
+    /// A gap whose backfill failed outlives a second loss: the next backfill still starts at the gap, not at the
+    /// prints the stream delivered between the losses.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_gap_left_open_survives_a_second_loss() {
+        let mut feed = feed(
+            vec![
+                ScriptedOpen::Closes(vec![print(1, 0)]),
+                ScriptedOpen::Closes(vec![print(5, 300)]),
+                ScriptedOpen::StaysOpen(vec![]),
+            ],
+            vec![Ok(vec![]), Err("timed out"), Ok(vec![print(2, 100)])],
+        );
+        assert_eq!(
+            take(&mut feed, 10).await,
+            [
+                backfilled(at(-60), 0),
+                FeedEvent::Message(print(1, 0)),
+                lost(StreamError::Ended),
+                FeedEvent::Reopened { attempts: 1 },
+                FeedEvent::BackfillFailed {
+                    cause: FetchError::Malformed {
+                        reason: "timed out".to_string()
+                    }
+                },
+                FeedEvent::Message(print(5, 300)),
+                lost(StreamError::Ended),
+                FeedEvent::Reopened { attempts: 1 },
+                FeedEvent::Message(print(2, 100)),
+                backfilled(at(-2), 1),
+            ]
+        );
+        assert_eq!(
+            *feed.source.asked_since.lock().unwrap(),
+            [at(-60), at(-2), at(-2)]
         );
     }
 

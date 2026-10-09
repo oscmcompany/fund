@@ -400,7 +400,7 @@ fn report(event: &FeedEvent) {
         FeedEvent::Message(
             StreamMessage::Connected
             | StreamMessage::Authenticated
-            | StreamMessage::Subscribed { .. }
+            | StreamMessage::Subscribed(_)
             | StreamMessage::Trade { .. }
             | StreamMessage::Quote(_),
         ) => {}
