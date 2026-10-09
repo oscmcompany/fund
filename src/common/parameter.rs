@@ -70,53 +70,24 @@ impl Parameter {
 }
 
 /// Why a supplied value was not used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParameterRefusal {
     /// Not supplied, and the parameter has no default.
+    #[error("{} is not set and has no default", .parameter.variable())]
     Missing { parameter: Parameter },
+    #[error("{} is `{raw}`, which is not a valid {parameter}: {reason}", .parameter.variable())]
     Unparsable {
         parameter: Parameter,
         raw: String,
         reason: String,
     },
     /// Parsed, but past the most the parameter may be.
+    #[error("{} is {value}, past its most of {most}", .parameter.variable())]
     OutOfRange {
         parameter: Parameter,
         value: String,
         most: String,
     },
-}
-
-impl Display for ParameterRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing { parameter } => {
-                write!(
-                    formatter,
-                    "{} is not set and has no default",
-                    parameter.variable()
-                )
-            }
-            Self::Unparsable {
-                parameter,
-                raw,
-                reason,
-            } => write!(
-                formatter,
-                "{} is `{raw}`, which is not a valid {parameter}: {reason}",
-                parameter.variable()
-            ),
-            Self::OutOfRange {
-                parameter,
-                value,
-                most,
-            } => write!(
-                formatter,
-                "{} is {value}, past its most of {most}",
-                parameter.variable()
-            ),
-        }
-    }
 }
 
 /// The supplied value parsed, or `default` when none was supplied, with the text the journal keeps for it.

@@ -18,10 +18,12 @@ use crate::common::time::{REGULAR_CLOSE, REGULAR_OPEN, eastern_time};
 /// The strategy an entry names, with the settings it is built from; the universe comes from the trader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
-    /// Holds nothing.
     Flat,
     /// Holds `shares` of each symbol its seeded coin draws.
-    Noise { shares: Shares, seed: u64 },
+    Noise {
+        shares: Shares,
+        seed: u64,
+    },
 }
 
 /// A `Choice` as written, before its shares are proven to fit a `Shares`.
@@ -75,88 +77,41 @@ pub struct Playbook {
 }
 
 /// Why a playbook was refused, with the times or values that refused it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlaybookRefusal {
     /// The text is not TOML of the playbook's shape.
-    Unreadable {
-        cause: String,
-    },
+    #[error("the playbook is unreadable: {cause}")]
+    Unreadable { cause: String },
     /// A time is not written `HH:MM`.
-    Time {
-        raw: String,
-    },
+    #[error("{raw:?} is not a time written HH:MM")]
+    Time { raw: String },
+    #[error("the playbook has no entries")]
     Empty,
     /// An entry ends at or before it starts.
-    Backward {
-        from: NaiveTime,
-        until: NaiveTime,
-    },
+    #[error("an entry from {from} ends at {until}")]
+    Backward { from: NaiveTime, until: NaiveTime },
     /// No entry trades from `from` until `until`.
-    Uncovered {
-        from: NaiveTime,
-        until: NaiveTime,
-    },
+    #[error("no entry trades from {from} until {until}")]
+    Uncovered { from: NaiveTime, until: NaiveTime },
     /// Two entries both trade at `at`.
-    Overlapping {
-        at: NaiveTime,
-    },
+    #[error("two entries trade at {at}")]
+    Overlapping { at: NaiveTime },
     /// An entry reaches outside the regular session, at `at`.
-    OutsideTheSession {
-        at: NaiveTime,
-    },
-    BlankNote {
-        from: NaiveTime,
-    },
+    #[error("an entry reaches outside the session at {at}")]
+    OutsideTheSession { at: NaiveTime },
+    #[error("the entry from {from} has no note")]
+    BlankNote { from: NaiveTime },
     /// More whole shares than a `Shares` holds.
-    TooManyShares {
-        from: NaiveTime,
-        shares: NonZeroU64,
-    },
+    #[error("the entry from {from} holds {shares} shares, more than a position can")]
+    TooManyShares { from: NaiveTime, shares: NonZeroU64 },
     /// An entry rolled into ends before its roll-off does, so the next switch would jump from a half-rolled target.
+    #[error("the entry from {from} until {until} ends before its {} minute roll-off", .roll_off.num_minutes())]
     ShorterThanTheRollOff {
         from: NaiveTime,
         until: NaiveTime,
         roll_off: TimeDelta,
     },
 }
-
-impl std::fmt::Display for PlaybookRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreadable { cause } => write!(formatter, "the playbook is unreadable: {cause}"),
-            Self::Time { raw } => write!(formatter, "{raw:?} is not a time written HH:MM"),
-            Self::Empty => write!(formatter, "the playbook has no entries"),
-            Self::Backward { from, until } => {
-                write!(formatter, "an entry from {from} ends at {until}")
-            }
-            Self::Uncovered { from, until } => {
-                write!(formatter, "no entry trades from {from} until {until}")
-            }
-            Self::Overlapping { at } => write!(formatter, "two entries trade at {at}"),
-            Self::OutsideTheSession { at } => {
-                write!(formatter, "an entry reaches outside the session at {at}")
-            }
-            Self::BlankNote { from } => write!(formatter, "the entry from {from} has no note"),
-            Self::TooManyShares { from, shares } => {
-                write!(
-                    formatter,
-                    "the entry from {from} holds {shares} shares, more than a position can"
-                )
-            }
-            Self::ShorterThanTheRollOff {
-                from,
-                until,
-                roll_off,
-            } => write!(
-                formatter,
-                "the entry from {from} until {until} ends before its {} minute roll-off",
-                roll_off.num_minutes()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PlaybookRefusal {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -703,7 +658,7 @@ note = "Hold nothing in the afternoon"
         .collect();
         let stretch = |from, parts: u32| Stretch {
             from,
-            progress: Progress::try_from(parts).unwrap(),
+            progress: Progress::new(parts).unwrap(),
         };
         assert_eq!(
             stretches,

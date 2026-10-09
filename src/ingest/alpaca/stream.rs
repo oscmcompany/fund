@@ -95,56 +95,28 @@ impl TradeId {
 }
 
 /// Why one element of a frame, or one REST trade's identity, did not read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamElementRefusal {
+    #[error("no `T`")]
     NoKind,
+    #[error("a trade with no `x`")]
     NoExchange,
-    ExchangeNotOneLetter {
-        raw: String,
-    },
-    NoNumber {
-        field: &'static str,
-    },
-    NumberNotUnsigned {
-        raw: String,
-    },
+    #[error("an exchange `{raw}` that is not one letter")]
+    ExchangeNotOneLetter { raw: String },
+    #[error("a trade with no `{field}`")]
+    NoNumber { field: &'static str },
+    #[error("a trade number that is not an unsigned integer: {raw}")]
+    NumberNotUnsigned { raw: String },
     /// A cancel whose `a` names no action this client reads, refused rather than taken as a withdrawal.
-    CancelAction {
-        raw: String,
-    },
+    #[error("a cancel action `{raw}`")]
+    CancelAction { raw: String },
     /// A correction or cancel under a ticker that is no symbol.
-    Symbol {
-        raw: String,
-    },
+    #[error("a ticker `{raw}` that is no symbol")]
+    Symbol { raw: String },
     /// A payload that did not parse as its kind's.
-    Unreadable {
-        reason: String,
-    },
+    #[error("{reason}")]
+    Unreadable { reason: String },
 }
-
-impl std::fmt::Display for StreamElementRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoKind => write!(formatter, "no `T`"),
-            Self::NoExchange => write!(formatter, "a trade with no `x`"),
-            Self::ExchangeNotOneLetter { raw } => {
-                write!(formatter, "an exchange `{raw}` that is not one letter")
-            }
-            Self::NoNumber { field } => write!(formatter, "a trade with no `{field}`"),
-            Self::NumberNotUnsigned { raw } => {
-                write!(
-                    formatter,
-                    "a trade number that is not an unsigned integer: {raw}"
-                )
-            }
-            Self::CancelAction { raw } => write!(formatter, "a cancel action `{raw}`"),
-            Self::Symbol { raw } => write!(formatter, "a ticker `{raw}` that is no symbol"),
-            Self::Unreadable { reason } => write!(formatter, "{reason}"),
-        }
-    }
-}
-
-impl std::error::Error for StreamElementRefusal {}
 
 /// One message off the stream, in the order Alpaca sent it.
 #[derive(Debug, Clone, PartialEq)]
@@ -293,7 +265,6 @@ pub enum StreamError {
     Closed {
         awaiting: OpeningStep,
     },
-    /// The open stream ended.
     Ended,
 }
 
@@ -717,21 +688,21 @@ mod tests {
         ));
     }
 
-    /// A trade and two quotes as the SIP stream sent them for SPY on 2026-10-06, in one frame, read through the same
-    /// conversion as the REST history.
+    /// An after-hours odd-lot trade with an id past `u32::MAX`, and two quotes a hundred nanoseconds apart, in the frame
+    /// shape the SIP stream sends, read through the same conversion as the REST history.
     #[test]
     fn test_trades_and_quotes_read_as_the_stream_sends_them() {
-        let frame = r#"[{"T":"t","S":"SPY","i":52983625699126,"x":"P","p":779.87,"s":4,"c":[" ","F","T","I"],"z":"B","t":"2026-10-06T22:36:01.216274112Z"},{"T":"q","S":"SPY","bx":"K","bp":779.8,"bs":480,"ax":"P","ap":779.87,"as":1000,"c":["R"],"z":"B","t":"2026-10-06T22:35:56.179976636Z"},{"T":"q","S":"SPY","bx":"M","bp":779.81,"bs":280,"ax":"P","ap":779.87,"as":1000,"c":["R"],"z":"B","t":"2026-10-06T22:35:56.180096716Z"}]"#;
+        let frame = r#"[{"T":"t","S":"ABC","i":9000000000001,"x":"P","p":50.25,"s":4,"c":[" ","F","T","I"],"z":"B","t":"2026-10-07T22:30:01.000000500Z"},{"T":"q","S":"ABC","bx":"K","bp":50.1,"bs":400,"ax":"P","ap":50.25,"as":1000,"c":["R"],"z":"B","t":"2026-10-07T22:30:00.000000100Z"},{"T":"q","S":"ABC","bx":"M","bp":50.2,"bs":200,"ax":"P","ap":50.25,"as":1000,"c":["R"],"z":"B","t":"2026-10-07T22:30:00.000000200Z"}]"#;
         let read = messages(frame).unwrap();
-        let spy = Symbol::new("SPY").unwrap();
+        let abc = Symbol::new("ABC").unwrap();
         let price = |dollars| Price::from_dollars(dollars).unwrap();
         let quote = |bid, bid_size, at: &str| {
             StreamMessage::Quote(AlpacaQuoteOutcome::Quote(
                 Quote::new(
-                    spy.clone(),
+                    abc.clone(),
                     at.parse().unwrap(),
                     price(bid),
-                    price(779.87),
+                    price(50.25),
                     Shares::whole(bid_size).unwrap(),
                     Shares::whole(1000).unwrap(),
                 )
@@ -754,7 +725,7 @@ mod tests {
                     *id,
                     TradeId {
                         exchange: 'P',
-                        number: 52_983_625_699_126
+                        number: 9_000_000_000_001
                     }
                 );
                 assert_eq!(*tape, Tape::ConsolidatedTape);
@@ -770,11 +741,11 @@ mod tests {
                     Print::Trade(trade) => {
                         assert_eq!(
                             (trade.price(), trade.size()),
-                            (price(779.87), Shares::whole(4).unwrap())
+                            (price(50.25), Shares::whole(4).unwrap())
                         );
                         assert_eq!(
                             trade.timestamp(),
-                            "2026-10-06T22:36:01.216274112Z"
+                            "2026-10-07T22:30:01.000000500Z"
                                 .parse::<chrono::DateTime<chrono::Utc>>()
                                 .unwrap()
                         );
@@ -796,11 +767,8 @@ mod tests {
             | StreamMessage::Unrecognized { .. }
             | StreamMessage::Malformed { .. }) => panic!("{other:?}"),
         }
-        assert_eq!(read[1], quote(779.8, 480, "2026-10-06T22:35:56.179976636Z"));
-        assert_eq!(
-            read[2],
-            quote(779.81, 280, "2026-10-06T22:35:56.180096716Z")
-        );
+        assert_eq!(read[1], quote(50.1, 400, "2026-10-07T22:30:00.000000100Z"));
+        assert_eq!(read[2], quote(50.2, 200, "2026-10-07T22:30:00.000000200Z"));
     }
 
     proptest::proptest! {
@@ -819,16 +787,16 @@ mod tests {
             ),
         ) {
             let element = serde_json::json!({
-                "T": "t", "S": "SPY", "i": 7, "x": "P", "p": ticks as f64 / 1_000_000.0, "s": size,
-                "c": conditions, "z": tape, "u": update, "t": "2026-10-06T22:36:01.216274112Z",
+                "T": "t", "S": "ABC", "i": 7, "x": "P", "p": ticks as f64 / 1_000_000.0, "s": size,
+                "c": conditions, "z": tape, "u": update, "t": "2026-10-07T22:30:01.000000500Z",
             });
             let live = match message(&element) {
                 Ok(StreamMessage::Trade { outcome, .. }) => outcome,
                 other => panic!("{other:?}"),
             };
-            let page = serde_json::json!({"next_page_token": null, "trades": {"SPY": [element]}});
+            let page = serde_json::json!({"next_page_token": null, "trades": {"ABC": [element]}});
             let (archived, answered) =
-                trade_page(&Symbol::new("SPY").unwrap(), page.to_string().as_bytes()).unwrap();
+                trade_page(&Symbol::new("ABC").unwrap(), page.to_string().as_bytes()).unwrap();
             proptest::prop_assert!(answered);
             proptest::prop_assert_eq!(archived, vec![live]);
         }
@@ -842,16 +810,16 @@ mod tests {
             ask_size in proptest::sample::select(vec![1.0, 1_000.0]),
         ) {
             let element = serde_json::json!({
-                "T": "q", "S": "SPY", "bx": "K", "bp": bid, "bs": bid_size, "ax": "P", "ap": ask,
-                "as": ask_size, "c": ["R"], "z": "B", "t": "2026-10-06T22:35:56.179976636Z",
+                "T": "q", "S": "ABC", "bx": "K", "bp": bid, "bs": bid_size, "ax": "P", "ap": ask,
+                "as": ask_size, "c": ["R"], "z": "B", "t": "2026-10-07T22:30:00.000000100Z",
             });
             let live = match message(&element) {
                 Ok(StreamMessage::Quote(outcome)) => outcome,
                 other => panic!("{other:?}"),
             };
-            let page = serde_json::json!({"next_page_token": null, "quotes": {"SPY": [element]}});
+            let page = serde_json::json!({"next_page_token": null, "quotes": {"ABC": [element]}});
             let (archived, answered) =
-                quote_page(&Symbol::new("SPY").unwrap(), page.to_string().as_bytes()).unwrap();
+                quote_page(&Symbol::new("ABC").unwrap(), page.to_string().as_bytes()).unwrap();
             proptest::prop_assert!(answered);
             proptest::prop_assert_eq!(archived, vec![live]);
         }

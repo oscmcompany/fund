@@ -2,17 +2,16 @@
 //! from separate chunks of one stream combine into the state of the whole.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 
 use chrono::{DateTime, Utc};
 
 use super::record::{Bar, BarInterval};
 use super::trade_bars::TradeBar;
-use super::{Price, Shares, StampedPrice, Symbol};
+use super::{Price, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
 use crate::common::time::calendar::{SessionPhase, TradingCalendar};
 
-/// The latest bars a state keeps for each symbol and interval, so a `VolumeDepth` reads at most this many.
+/// The latest bars a state keeps for each symbol and interval.
 pub const RETAINED_BARS: usize = 100;
 
 /// One input to the fold: time arrives as an event like any other, never from a clock the fold reads.
@@ -24,78 +23,12 @@ pub enum MarketEvent {
     Clock(DateTime<Utc>),
 }
 
-/// How many of a series' latest bars a rolling volume sums.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VolumeDepth(NonZeroUsize);
-
-/// Why a depth was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolumeDepthRefusal {
-    Zero,
-    BeyondRetained { depth: usize },
-}
-
-impl std::fmt::Display for VolumeDepthRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero => formatter.write_str("a depth of zero bars"),
-            Self::BeyondRetained { depth } => write!(
-                formatter,
-                "a depth of {depth} bars is past the {RETAINED_BARS} retained"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for VolumeDepthRefusal {}
-
-impl VolumeDepth {
-    pub fn new(depth: usize) -> Result<Self, VolumeDepthRefusal> {
-        match NonZeroUsize::new(depth) {
-            None => Err(VolumeDepthRefusal::Zero),
-            Some(_) if depth > RETAINED_BARS => Err(VolumeDepthRefusal::BeyondRetained { depth }),
-            Some(depth) => Ok(Self(depth)),
-        }
-    }
-
-    pub fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-/// Why a rolling volume was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RollingVolumeRefusal {
-    /// The series holds fewer bars than the depth, `held` of them.
-    ShortOfDepth { held: usize },
-    /// The latest `depth` volumes sum past what `Shares` holds.
-    BeyondRange { depth: usize },
-}
-
-impl std::fmt::Display for RollingVolumeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ShortOfDepth { held } => write!(
-                formatter,
-                "the series holds {held} bars, fewer than the depth"
-            ),
-            Self::BeyondRange { depth } => write!(
-                formatter,
-                "the latest {depth} volumes sum past what a share count holds"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RollingVolumeRefusal {}
-
 /// What one bar leaves in the state; ordered so a repeated timestamp keeps the greater and the combine commutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Retained {
     /// The close and the instant it was set: the closing print's for a trade bar, the bar's end for a vendor bar;
     /// `None` for a trade bar no print was allowed to price, such as a minute of odd lots.
     close: Option<StampedPrice>,
-    volume: Shares,
 }
 
 /// The latest clock and each series' latest `RETAINED_BARS` bars.
@@ -120,7 +53,6 @@ impl MarketState {
                 bar.timestamp(),
                 Retained {
                     close: Some(StampedPrice::new(bar.ends(), bar.prices().close())),
-                    volume: bar.volume(),
                 },
             ),
             MarketEvent::Trades(bar) => Self::retaining(
@@ -129,7 +61,6 @@ impl MarketState {
                 bar.timestamp(),
                 Retained {
                     close: bar.sums().open_close().map(|prices| prices.close()),
-                    volume: bar.sums().totals().volume(),
                 },
             ),
         }
@@ -166,28 +97,6 @@ impl MarketState {
             .values()
             .rev()
             .find_map(|retained| retained.close)
-    }
-
-    /// The volume of the series' latest `depth` bars, refused until that many are held.
-    pub fn rolling_volume(
-        &self,
-        symbol: &Symbol,
-        interval: BarInterval,
-        depth: VolumeDepth,
-    ) -> Result<Shares, RollingVolumeRefusal> {
-        let bars = self.bars(symbol, interval);
-        let held = bars.map_or(0, BTreeMap::len);
-        if held < depth.get() {
-            return Err(RollingVolumeRefusal::ShortOfDepth { held });
-        }
-        bars.into_iter()
-            .flat_map(BTreeMap::values)
-            .rev()
-            .take(depth.get())
-            .try_fold(Shares::empty(), |total, retained| {
-                total.checked_plus(retained.volume)
-            })
-            .ok_or(RollingVolumeRefusal::BeyondRange { depth: depth.get() })
     }
 
     /// Where the clock falls in `calendar`'s sessions, `None` before any clock event.
@@ -235,7 +144,7 @@ mod tests {
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::BarPrices;
     use crate::common::market::trade_bars::{OpenClose, TradeSums};
-    use crate::common::market::{DollarVolume, TradeCount};
+    use crate::common::market::{DollarVolume, Shares, TradeCount};
     use crate::common::monoid::{concatenate, laws};
     use crate::common::time::calendar::TradingSession;
     use crate::common::time::{SessionDate, SessionRange};
@@ -303,21 +212,6 @@ mod tests {
         concatenate(events.into_iter().map(MarketState::of))
     }
 
-    fn depth(depth: usize) -> VolumeDepth {
-        VolumeDepth::new(depth).unwrap()
-    }
-
-    #[test]
-    fn test_a_depth_is_between_one_and_the_bars_retained() {
-        assert_eq!(VolumeDepth::new(0), Err(VolumeDepthRefusal::Zero));
-        assert_eq!(VolumeDepth::new(1).map(VolumeDepth::get), Ok(1));
-        assert_eq!(VolumeDepth::new(100).map(VolumeDepth::get), Ok(100));
-        assert_eq!(
-            VolumeDepth::new(101),
-            Err(VolumeDepthRefusal::BeyondRetained { depth: 101 })
-        );
-    }
-
     /// 150 bars of one series keep the latest 100: the state equals one folded from minutes 50 to 149 alone.
     #[test]
     fn test_a_series_keeps_its_latest_bars() {
@@ -330,9 +224,6 @@ mod tests {
             ))
         }));
         let aapl = symbol("AAPL");
-        let volume = |depth| state.rolling_volume(&aapl, BarInterval::OneMinute, depth);
-        assert_eq!(volume(self::depth(100)), Ok(Shares::whole(9_950).unwrap()));
-        assert_eq!(volume(self::depth(1)), Ok(Shares::whole(149).unwrap()));
         assert_eq!(
             state.last_price(&aapl, BarInterval::OneMinute),
             Some(Price::from_ticks(1_000_149).unwrap())
@@ -348,65 +239,9 @@ mod tests {
         assert_eq!(state, latest);
     }
 
-    /// A volume is refused with the count held until the depth is held, and is measured exactly at it.
+    /// A minute of trades with no print allowed to price it leaves the last price where the last priced minute set it.
     #[test]
-    fn test_a_rolling_volume_needs_its_whole_depth() {
-        let state =
-            fold((0..3).map(|minute| MarketEvent::Bar(minute_bar("AAPL", minute, 1_000_000, 10))));
-        let aapl = symbol("AAPL");
-        assert_eq!(
-            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(3)),
-            Ok(Shares::whole(30).unwrap())
-        );
-        assert_eq!(
-            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(4)),
-            Err(RollingVolumeRefusal::ShortOfDepth { held: 3 })
-        );
-        assert_eq!(
-            state.rolling_volume(&aapl, BarInterval::OneDay, depth(1)),
-            Err(RollingVolumeRefusal::ShortOfDepth { held: 0 })
-        );
-        assert_eq!(
-            state.rolling_volume(&symbol("MSFT"), BarInterval::OneMinute, depth(1)),
-            Err(RollingVolumeRefusal::ShortOfDepth { held: 0 })
-        );
-    }
-
-    /// Volumes whose sum passes the share count's range are refused, not summed into a panic.
-    #[test]
-    fn test_a_rolling_volume_past_the_range_is_refused() {
-        let bar = |minute: i64, units: u64| {
-            let price = Price::from_ticks(1_000_000).unwrap();
-            MarketEvent::Bar(
-                Bar::new(
-                    symbol("AAPL"),
-                    BarInterval::OneMinute,
-                    "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap()
-                        + TimeDelta::minutes(minute),
-                    BarPrices::new(price, price, price, price).unwrap(),
-                    Shares::from_units(units),
-                    None,
-                    None,
-                )
-                .unwrap(),
-            )
-        };
-        let state = fold([bar(0, u64::MAX), bar(1, 1)]);
-        let aapl = symbol("AAPL");
-        assert_eq!(
-            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(2)),
-            Err(RollingVolumeRefusal::BeyondRange { depth: 2 })
-        );
-        assert_eq!(
-            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(1)),
-            Ok(Shares::from_units(1))
-        );
-    }
-
-    /// A minute of trades with no print allowed to price it adds volume and leaves the last price where the last
-    /// priced minute set it.
-    #[test]
-    fn test_a_trade_bar_with_no_close_adds_volume_and_keeps_the_last_price() {
+    fn test_a_trade_bar_with_no_close_keeps_the_last_price() {
         let state = fold([
             MarketEvent::Trades(minute_trade_bar("AAPL", 0, Some(150_000_000), 100)),
             MarketEvent::Trades(minute_trade_bar("AAPL", 1, None, 30)),
@@ -415,10 +250,6 @@ mod tests {
         assert_eq!(
             state.last_price(&aapl, BarInterval::OneMinute),
             Some(Price::from_ticks(150_000_000).unwrap())
-        );
-        assert_eq!(
-            state.rolling_volume(&aapl, BarInterval::OneMinute, depth(2)),
-            Ok(Shares::whole(130).unwrap())
         );
         let unpriced = MarketState::of(MarketEvent::Trades(minute_trade_bar("AAPL", 1, None, 30)));
         assert_eq!(unpriced.last_price(&aapl, BarInterval::OneMinute), None);
@@ -453,10 +284,6 @@ mod tests {
             assert_eq!(
                 state.last_price(&aapl, BarInterval::OneMinute),
                 Some(Price::from_ticks(2_000_000).unwrap())
-            );
-            assert_eq!(
-                state.rolling_volume(&aapl, BarInterval::OneMinute, depth(1)),
-                Ok(Shares::whole(1).unwrap())
             );
         }
     }

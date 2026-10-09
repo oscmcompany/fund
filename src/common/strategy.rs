@@ -61,31 +61,31 @@ pub const PROGRESS_SCALE: u32 = 1_000_000;
 pub struct Progress(u32);
 
 /// Parts past `PROGRESS_SCALE`, which no roll-off reaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{parts} parts is past {PROGRESS_SCALE}")]
 pub struct ProgressRefusal {
     parts: u32,
-}
-
-impl std::fmt::Display for ProgressRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} parts is past {PROGRESS_SCALE}", self.parts)
-    }
 }
 
 impl TryFrom<u32> for Progress {
     type Error = ProgressRefusal;
 
     fn try_from(parts: u32) -> Result<Self, Self::Error> {
-        if parts > PROGRESS_SCALE {
-            return Err(ProgressRefusal { parts });
-        }
-        Ok(Self(parts))
+        Self::new(parts)
     }
 }
 
 impl Progress {
     pub const NONE: Self = Self(0);
     pub const WHOLE: Self = Self(PROGRESS_SCALE);
+
+    /// `parts` of `PROGRESS_SCALE` through a roll-off, refused past the whole.
+    pub fn new(parts: u32) -> Result<Self, ProgressRefusal> {
+        if parts > PROGRESS_SCALE {
+            return Err(ProgressRefusal { parts });
+        }
+        Ok(Self(parts))
+    }
 
     /// The share of `window` that `elapsed` covers, held to `[NONE, WHOLE]`; a zero window has already rolled.
     pub fn of(elapsed: TimeDelta, window: TimeDelta) -> Self {
@@ -285,7 +285,7 @@ mod tests {
             Progress::WHOLE
         );
         assert_eq!(
-            Progress::try_from(1_000_001),
+            Progress::new(1_000_001),
             Err(ProgressRefusal { parts: 1_000_001 })
         );
         assert!(serde_json::from_str::<Progress>("1000001").is_err());

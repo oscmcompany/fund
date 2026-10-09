@@ -137,7 +137,7 @@ fn outputs(
         .estimate("session_return_difference", difference)
         .map_err(ReplayStudyError::Experiment)?;
     for (side, replay, returns) in arms {
-        let own = Estimate::try_from(summarize(returns)).map_err(ReplayStudyError::Estimate)?;
+        let own = Estimate::from_summary(summarize(returns)).map_err(ReplayStudyError::Estimate)?;
         outputs = outputs
             .estimate(format!("{side}_session_return"), own)
             .map_err(ReplayStudyError::Experiment)?;

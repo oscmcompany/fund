@@ -88,44 +88,19 @@ impl TryFrom<FingerprintFields> for Fingerprint {
 }
 
 /// Why a fingerprint could not be taken.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FingerprintRefusal {
+    #[error("{0}")]
     Inverted(SessionRangeRefusal),
-    CalendarShort {
-        range: SessionRange,
-    },
+    #[error("the calendar does not cover {} to {}", .range.first(), .range.last())]
+    CalendarShort { range: SessionRange },
     /// A partition for a day the calendar does not trade, or outside the window.
-    NotATradingSession {
-        session: SessionDate,
-    },
-    ReadAndMissing {
-        session: SessionDate,
-    },
+    #[error("a partition for {session}, which is not a trading session in the window")]
+    NotATradingSession { session: SessionDate },
+    #[error("{session} is both read and missing")]
+    ReadAndMissing { session: SessionDate },
+    #[error("the missing sessions are out of order")]
     MissingUnordered,
-}
-
-impl std::fmt::Display for FingerprintRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Inverted(refusal) => write!(formatter, "{refusal}"),
-            Self::CalendarShort { range } => write!(
-                formatter,
-                "the calendar does not cover {} to {}",
-                range.first(),
-                range.last()
-            ),
-            Self::ReadAndMissing { session } => {
-                write!(formatter, "{session} is both read and missing")
-            }
-            Self::MissingUnordered => write!(formatter, "the missing sessions are out of order"),
-            Self::NotATradingSession { session } => {
-                write!(
-                    formatter,
-                    "a partition for {session}, which is not a trading session in the window"
-                )
-            }
-        }
-    }
 }
 
 impl Fingerprint {

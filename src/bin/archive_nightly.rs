@@ -12,7 +12,7 @@ use fund::common::heal::is_complete;
 use fund::common::journal::Observation;
 use fund::common::storage::{Host, Service};
 use fund::common::time::SessionDate;
-use fund::heal::{Clients, Parameters, run};
+use fund::heal;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::massive::Massive;
 use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
@@ -23,7 +23,7 @@ const SERVICE: &str = "archive_nightly";
 async fn main() -> ExitCode {
     let today = SessionDate::at(Utc::now());
     let service = Service::new(SERVICE).expect("the service name is one path segment");
-    let parameters = Parameters::from_environment();
+    let parameters = heal::Parameters::from_environment();
     let started = start(service.clone(), today);
     let span = started.span();
     async move {
@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
             Alpaca::from_environment(http_client),
         ) {
             (Ok(archive), Ok(records), Ok(massive), Ok(alpaca)) => {
-                (Clients::new(archive, massive, alpaca), records)
+                (heal::Clients::new(archive, massive, alpaca), records)
             }
             (Err(refusal), _, _, _)
             | (_, Err(refusal), _, _)
@@ -60,7 +60,7 @@ async fn main() -> ExitCode {
             }
         };
         tracing::info!("Starting the archive heal");
-        let complete = match run(&parameters, &clients, &mut journal, today).await {
+        let complete = match heal::run(&parameters, &clients, &mut journal, today).await {
             Ok(finished) => {
                 let complete = is_complete(finished.outcomes());
                 tracing::info!(window = ?finished.window(), outcomes = ?finished.outcomes(), complete, "Heal finished");

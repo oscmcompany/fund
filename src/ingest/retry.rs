@@ -7,26 +7,17 @@ use std::time::Duration;
 const ATTEMPTS: u32 = 6;
 
 /// Why a request produced no body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
     /// A status retrying will not change, with the body the vendor sent.
+    #[error("refused with {status}: {body}")]
     Refused { status: u16, body: String },
     /// Still transient after every attempt, with the last cause.
+    #[error("still failing after {attempts} attempts: {last}")]
     Exhausted { attempts: u32, last: String },
     /// A body that did not parse as the documented payload.
+    #[error("malformed payload: {reason}")]
     Malformed { reason: String },
-}
-
-impl std::fmt::Display for FetchError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused { status, body } => write!(formatter, "refused with {status}: {body}"),
-            Self::Exhausted { attempts, last } => {
-                write!(formatter, "still failing after {attempts} attempts: {last}")
-            }
-            Self::Malformed { reason } => write!(formatter, "malformed payload: {reason}"),
-        }
-    }
 }
 
 /// A request that has not answered in this long is abandoned and retried; the largest body, a full grouped daily,

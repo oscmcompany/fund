@@ -13,7 +13,7 @@ use chrono::Utc;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journal};
+use crate::archive::{self, Archive, ArchiveError};
 use crate::common::journal::{Observation, RunId, merge, read};
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::experiment::{
@@ -36,27 +36,14 @@ pub struct Study {
     opened: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StudyError {
+    #[error("the journal failed: {0}")]
     Journal(io::Error),
     /// The dataset was read by another run, whose journal holds its `dataset_read`.
-    ReadByAnotherRun {
-        run: RunId,
-    },
+    #[error("the dataset was read by run {run}, not this one")]
+    ReadByAnotherRun { run: RunId },
 }
-
-impl std::fmt::Display for StudyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Journal(error) => write!(formatter, "the journal failed: {error}"),
-            Self::ReadByAnotherRun { run } => {
-                write!(formatter, "the dataset was read by run {run}, not this one")
-            }
-        }
-    }
-}
-
-impl std::error::Error for StudyError {}
 
 impl Study {
     /// Opens a run journaling into `directory`, named for this machine's hostname.
@@ -160,14 +147,15 @@ async fn merge_into(records: &Archive, key: JournalKey, text: &str) -> Result<()
             .map_err(ShipFailure::Archive)?
         {
             Some((body, tag)) => (
-                journal::decode(&key, body)
-                    .map_err(|refusal| ShipFailure::Decode(DecodeRefusal::from(refusal)))?,
+                archive::journal::decode(&key, body).map_err(|refusal| {
+                    ShipFailure::Decode(archive::DecodeRefusal::from(refusal))
+                })?,
                 Some(tag),
             ),
             None => (Vec::new(), None),
         };
-        let body = journal::encode(&key, &merge(held, read(text)))
-            .map_err(|refusal| ShipFailure::Encode(EncodeRefusal::from(refusal)))?;
+        let body = archive::journal::encode(&key, &merge(held, read(text)))
+            .map_err(|refusal| ShipFailure::Encode(archive::EncodeRefusal::from(refusal)))?;
         let written = match tag {
             Some(tag) => records.replace(&object, body, &tag).await,
             None => records.create(&object, body).await,
@@ -214,7 +202,8 @@ mod tests {
             std::fs::remove_dir_all(&directory).unwrap();
         }
         let key = JournalKey::new(Host::Researcher, SessionDate::at(Utc::now()));
-        let held = journal::decode(&key, records.get(&key.into()).await.unwrap().unwrap()).unwrap();
+        let held = archive::journal::decode(&key, records.get(&key.into()).await.unwrap().unwrap())
+            .unwrap();
         for run in runs {
             assert!(
                 held.iter().any(|line| matches!(

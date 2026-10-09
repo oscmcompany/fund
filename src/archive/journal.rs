@@ -242,7 +242,7 @@ mod tests {
     /// A session file as the journal writes one, with a torn line a crash left behind.
     fn session_file() -> String {
         let finished = HealFinished::new(
-            Window::try_from(vec![session().plus_calendar_days(-1)]).unwrap(),
+            Window::new(vec![session().plus_calendar_days(-1)]).unwrap(),
             BTreeMap::from([(
                 Leg::MassiveDailyBars,
                 BTreeMap::from([(session().plus_calendar_days(-1), SessionOutcome::Unreached)]),

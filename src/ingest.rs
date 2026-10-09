@@ -16,33 +16,16 @@ use crate::common::market::record::Bar;
 use crate::common::monoid::Tally;
 
 /// Why an environment variable a client needs was not used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VariableRefusal {
-    Missing {
-        name: &'static str,
-    },
+    #[error("{name} is not set")]
+    Missing { name: &'static str },
     /// Set, but not one of the few values it may take.
-    Malformed {
-        name: &'static str,
-        raw: String,
-    },
+    #[error("{name} is `{raw}`")]
+    Malformed { name: &'static str, raw: String },
     /// Set, but not Unicode; the value is left out, since the variable may hold a secret.
-    NotUnicode {
-        name: &'static str,
-        bytes: usize,
-    },
-}
-
-impl std::fmt::Display for VariableRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing { name } => write!(formatter, "{name} is not set"),
-            Self::Malformed { name, raw } => write!(formatter, "{name} is `{raw}`"),
-            Self::NotUnicode { name, bytes } => {
-                write!(formatter, "{name} holds {bytes} bytes that are not Unicode")
-            }
-        }
-    }
+    #[error("{name} holds {bytes} bytes that are not Unicode")]
+    NotUnicode { name: &'static str, bytes: usize },
 }
 
 pub(crate) fn variable(name: &'static str) -> Result<String, VariableRefusal> {

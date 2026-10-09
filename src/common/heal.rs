@@ -133,36 +133,15 @@ pub fn alpaca_series_boundaries(session: SessionDate) -> ReferenceKey {
 }
 
 /// Why a leg's sessions could not be read off the calendar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KeepsRefusal {
+    #[error("the calendar covers {} to {}, short of the quarter's {} to {}", .covered.first(), .covered.last(), .quarter.first(), .quarter.last())]
     CalendarShort {
         quarter: SessionRange,
         covered: SessionRange,
     },
-    NoTradingDay {
-        quarter: SessionRange,
-    },
-}
-
-impl std::fmt::Display for KeepsRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CalendarShort { quarter, covered } => write!(
-                formatter,
-                "the calendar covers {} to {}, short of the quarter's {} to {}",
-                covered.first(),
-                covered.last(),
-                quarter.first(),
-                quarter.last()
-            ),
-            Self::NoTradingDay { quarter } => write!(
-                formatter,
-                "the calendar has no trading day from {} to {}",
-                quarter.first(),
-                quarter.last()
-            ),
-        }
-    }
+    #[error("the calendar has no trading day from {} to {}", .quarter.first(), .quarter.last())]
+    NoTradingDay { quarter: SessionRange },
 }
 
 /// The first day of the calendar quarter `session` falls in.
@@ -238,41 +217,19 @@ pub enum SessionOutcome {
 }
 
 /// Why no window was drawn, or read back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WindowRefusal {
-    NotCovered {
-        range: SessionRange,
-    },
-    TooFewSessions {
-        wanted: usize,
-        found: usize,
-    },
+    #[error("the calendar does not cover {} to {}", .range.first(), .range.last())]
+    NotCovered { range: SessionRange },
+    #[error("the calendar has {found} trading days where {wanted} were wanted")]
+    TooFewSessions { wanted: usize, found: usize },
+    #[error("the window holds no session")]
     Empty,
+    #[error("the window lists {earlier} after {later}")]
     NotAscending {
         earlier: SessionDate,
         later: SessionDate,
     },
-}
-
-impl std::fmt::Display for WindowRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotCovered { range } => write!(
-                formatter,
-                "the calendar does not cover {} to {}",
-                range.first(),
-                range.last()
-            ),
-            Self::TooFewSessions { wanted, found } => write!(
-                formatter,
-                "the calendar has {found} trading days where {wanted} were wanted"
-            ),
-            Self::Empty => write!(formatter, "the window holds no session"),
-            Self::NotAscending { earlier, later } => {
-                write!(formatter, "the window lists {earlier} after {later}")
-            }
-        }
-    }
 }
 
 /// The trading days a heal covers, oldest first: ascending and never empty, and each a trading day before today when
@@ -285,6 +242,18 @@ impl TryFrom<Vec<SessionDate>> for Window {
     type Error = WindowRefusal;
 
     fn try_from(sessions: Vec<SessionDate>) -> Result<Self, Self::Error> {
+        Self::new(sessions)
+    }
+}
+
+impl From<Window> for Vec<SessionDate> {
+    fn from(window: Window) -> Self {
+        window.0
+    }
+}
+
+impl Window {
+    pub fn new(sessions: Vec<SessionDate>) -> Result<Self, WindowRefusal> {
         if sessions.is_empty() {
             return Err(WindowRefusal::Empty);
         }
@@ -296,15 +265,7 @@ impl TryFrom<Vec<SessionDate>> for Window {
         }
         Ok(Self(sessions))
     }
-}
 
-impl From<Window> for Vec<SessionDate> {
-    fn from(window: Window) -> Self {
-        window.0
-    }
-}
-
-impl Window {
     pub fn sessions(&self) -> &[SessionDate] {
         &self.0
     }
@@ -353,7 +314,7 @@ pub fn window(
             wanted: sessions.get(),
             found: trading.len(),
         })?;
-    Window::try_from(trading[skip..].to_vec())
+    Window::new(trading[skip..].to_vec())
 }
 
 /// The sessions of `window` a series does not hold, oldest first.
@@ -382,7 +343,6 @@ pub fn owed(window: &[SessionDate], held: &BTreeSet<SessionDate>) -> Vec<Session
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Unrecognized {
-    /// Not a path any key writes.
     NotAKey,
     /// A key, but of another series, as a sibling sharing the prefix writes.
     AnotherSeries,
@@ -400,7 +360,7 @@ impl Held {
     pub fn of(leg: Leg, paths: impl IntoIterator<Item = String>) -> Self {
         let mut held = Self::default();
         for path in paths {
-            match Key::parse(&path) {
+            match path.parse::<Key>() {
                 Ok(key) if key == leg.key(key.session()) => {
                     held.sessions.insert(key.session());
                 }
@@ -719,17 +679,17 @@ mod tests {
 
     #[test]
     fn test_a_window_is_ascending_and_never_empty() {
-        assert_eq!(Window::try_from(vec![]), Err(WindowRefusal::Empty));
+        assert_eq!(Window::new(vec![]), Err(WindowRefusal::Empty));
         for repeated_or_reversed in ["2026-09-29", "2026-09-28"] {
             assert_eq!(
-                Window::try_from(vec![date("2026-09-29"), date(repeated_or_reversed)]),
+                Window::new(vec![date("2026-09-29"), date(repeated_or_reversed)]),
                 Err(WindowRefusal::NotAscending {
                     earlier: date(repeated_or_reversed),
                     later: date("2026-09-29"),
                 })
             );
         }
-        let window = Window::try_from(vec![date("2026-09-28"), date("2026-09-29")]).unwrap();
+        let window = Window::new(vec![date("2026-09-28"), date("2026-09-29")]).unwrap();
         assert_eq!(window.last(), date("2026-09-29"));
         let json = serde_json::to_string(&window).unwrap();
         assert_eq!(json, r#"["2026-09-28","2026-09-29"]"#);

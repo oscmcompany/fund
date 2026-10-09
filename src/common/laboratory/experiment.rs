@@ -74,15 +74,10 @@ pub struct Name(String);
 pub struct Metric(f64);
 
 /// A metric value that is not finite, with the value.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("{value} is not finite")]
 pub struct NotFinite {
     value: f64,
-}
-
-impl std::fmt::Display for NotFinite {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} is not finite", self.value)
-    }
 }
 
 impl Metric {
@@ -121,45 +116,24 @@ impl From<Metric> for f64 {
 #[serde(transparent)]
 pub struct Parameters(BTreeMap<Name, String>);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ExperimentRefusal {
+    #[error("a study needs a label")]
     BlankLabel,
+    #[error("a machine needs a hostname, an architecture and an operating system")]
     BlankMachine,
     /// A label or name with a line break would split a catalog line.
-    LineBreak {
-        text: String,
-    },
+    #[error("{text:?} holds a line break")]
+    LineBreak { text: String },
+    #[error("a parameter, estimate or metric needs a name")]
     BlankName,
     /// A parameter, estimate or metric named twice, where keeping either value would hide the other.
-    Duplicate {
-        name: String,
-    },
+    #[error("{name} is named twice")]
+    Duplicate { name: String },
     /// JSON has no NaN or infinity, so a metric that is neither finite nor absent cannot be journaled.
-    NotFinite {
-        metric: String,
-        value: f64,
-    },
+    #[error("metric {metric} is {value}, which is not finite")]
+    NotFinite { metric: String, value: f64 },
 }
-
-impl std::fmt::Display for ExperimentRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BlankLabel => write!(formatter, "a study needs a label"),
-            Self::BlankMachine => write!(
-                formatter,
-                "a machine needs a hostname, an architecture and an operating system"
-            ),
-            Self::LineBreak { text } => write!(formatter, "{text:?} holds a line break"),
-            Self::BlankName => write!(formatter, "a parameter, estimate or metric needs a name"),
-            Self::Duplicate { name } => write!(formatter, "{name} is named twice"),
-            Self::NotFinite { metric, value } => {
-                write!(formatter, "metric {metric} is {value}, which is not finite")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExperimentRefusal {}
 
 fn text(raw: String, blank: ExperimentRefusal) -> Result<String, ExperimentRefusal> {
     match (raw.trim().is_empty(), raw.contains(['\n', '\r'])) {
@@ -512,7 +486,7 @@ mod tests {
                 .map_err(|refusal| refusal.to_string()),
             Err("NaN is not finite".to_string())
         );
-        assert!(Metric::try_from(f64::NEG_INFINITY).is_err());
+        assert!(Metric::new(f64::NEG_INFINITY).is_err());
         let metric = Metric::new(-0.25).unwrap();
         assert_eq!(serde_json::to_string(&metric).unwrap(), "-0.25");
         assert_eq!(serde_json::from_str::<Metric>("-0.25").unwrap(), metric);
@@ -536,7 +510,7 @@ mod tests {
                 .map(|_| ()),
             duplicate
         );
-        let estimate = Estimate::try_from(summarize(
+        let estimate = Estimate::from_summary(summarize(
             &Series::new([(session(0), Some(1.0)), (session(1), Some(2.0))]).unwrap(),
         ))
         .unwrap();
@@ -575,7 +549,7 @@ mod tests {
                 readings.iter().enumerate().map(|(day, value)| (session(day as i64), Some(*value))),
             )
             .unwrap();
-            let estimate = Estimate::try_from(summarize(&series)).unwrap();
+            let estimate = Estimate::from_summary(summarize(&series)).unwrap();
             let ran = ExperimentRan::new(
                 Label::new("overnight gap").unwrap(),
                 Machine::new("laptop", "aarch64", "macos", NonZeroU32::new(8).unwrap()).unwrap(),

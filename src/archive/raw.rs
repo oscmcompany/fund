@@ -86,38 +86,22 @@ impl Checksum {
 }
 
 /// Why a vendor file was not copied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CopyError {
+    #[error("{0}")]
     Source(FlatFileError),
+    #[error("{0}")]
     Archive(ArchiveError),
     /// The vendor lists the file with no bytes, which a multipart upload cannot hold.
-    Empty {
-        path: String,
-    },
+    #[error("{path} is listed with no bytes")]
+    Empty { path: String },
     /// Stored at a different length than the vendor listed.
+    #[error("{path} stored {stored:?} bytes where {listed} were listed")]
     Length {
         path: String,
         listed: u64,
         stored: Option<u64>,
     },
-}
-
-impl std::fmt::Display for CopyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Source(error) => write!(formatter, "{error}"),
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Empty { path } => write!(formatter, "{path} is listed with no bytes"),
-            Self::Length {
-                path,
-                listed,
-                stored,
-            } => write!(
-                formatter,
-                "{path} stored {stored:?} bytes where {listed} were listed"
-            ),
-        }
-    }
 }
 
 impl Archive {

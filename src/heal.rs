@@ -14,13 +14,13 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::archive::bars::{Provenance, Subscription, decode, encode};
+use crate::archive::bars::{Provenance, Subscription};
 use crate::archive::reference::{
     conditions_key, decode_series_boundaries, encode_conditions, encode_security_details,
     encode_series_boundaries, encode_splits, latest_conditions, latest_snapshot,
 };
-use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
-use crate::archive::{quote_bars, trade_bars};
+use crate::archive::{self, Archive, ArchiveError};
+use crate::archive::{bars, quote_bars, trade_bars};
 use crate::common::heal::{
     Held, KeepsRefusal, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal,
     alpaca_minute_bars, alpaca_quotes, alpaca_series_boundaries, alpaca_trades, fetched_range,
@@ -137,56 +137,48 @@ impl Parameters {
 }
 
 /// Why the heal could not decide what it owes, so wrote nothing.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HealError {
+    #[error("fetching the calendar failed: {0}")]
     Calendar(FetchError),
+    #[error("{0}")]
     Window(WindowRefusal),
     /// A leg's sessions could not be read off the calendar, which the run fetched to reach back far enough.
-    Keeps {
-        leg: Leg,
-        refusal: KeepsRefusal,
-    },
+    #[error("the {leg} leg: {refusal}")]
+    Keeps { leg: Leg, refusal: KeepsRefusal },
+    #[error("{0}")]
     List(ArchiveError),
     /// A write or failure went unrecorded, so the run stops rather than go on with what it cannot record.
+    #[error("journaling the heal failed: {0}")]
     Journal(std::io::Error),
 }
 
-impl std::fmt::Display for HealError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Calendar(error) => write!(formatter, "fetching the calendar failed: {error}"),
-            Self::Window(refusal) => write!(formatter, "{refusal}"),
-            Self::Keeps { leg, refusal } => write!(formatter, "the {leg} leg: {refusal}"),
-            Self::List(error) => write!(formatter, "{error}"),
-            Self::Journal(error) => {
-                write!(formatter, "journaling the heal failed: {error}")
-            }
-        }
-    }
-}
-
 /// Why one owed partition was not written.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PartitionFailure {
+    #[error("{0}")]
     Fetch(FetchError),
     /// The vendor answered a trading day with nothing, which written would mark the session held for good.
+    #[error("the vendor answered with no rows")]
     NoRows,
-    NotInCalendar {
-        session: SessionDate,
-    },
-    Encode(EncodeRefusal),
-    Decode(DecodeRefusal),
+    #[error("{session} is not in the calendar")]
+    NotInCalendar { session: SessionDate },
+    #[error("{0}")]
+    Encode(archive::EncodeRefusal),
+    #[error("{0}")]
+    Decode(archive::DecodeRefusal),
+    #[error("{0}")]
     Archive(ArchiveError),
     /// Listed, then gone when read.
-    Vanished {
-        key: Key,
-    },
+    #[error("{} vanished", .key.path())]
+    Vanished { key: Key },
     /// The session's daily bars, which name its symbols, are not written.
-    NoSymbols {
-        key: Key,
-    },
+    #[error("no daily bars at {} to take the symbols from", .key.path())]
+    NoSymbols { key: Key },
+    #[error("{0}")]
     Fold(QuoteFoldRefusal),
     /// A write the partition needed could not be journaled, which stops the run.
+    #[error("journaling a write failed: {0}")]
     Journal(std::io::Error),
 }
 
@@ -220,33 +212,6 @@ impl PartitionFailure {
     }
 }
 
-impl std::fmt::Display for PartitionFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Fetch(error) => write!(formatter, "{error}"),
-            Self::NoRows => write!(formatter, "the vendor answered with no rows"),
-            Self::NotInCalendar { session } => {
-                write!(formatter, "{session} is not in the calendar")
-            }
-            Self::Encode(refusal) => write!(formatter, "{refusal}"),
-            Self::Decode(refusal) => write!(formatter, "{refusal}"),
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Vanished { key } => write!(formatter, "{} vanished", key.path()),
-            Self::NoSymbols { key } => {
-                write!(
-                    formatter,
-                    "no daily bars at {} to take the symbols from",
-                    key.path()
-                )
-            }
-            Self::Fold(refusal) => write!(formatter, "{refusal}"),
-            Self::Journal(error) => write!(formatter, "journaling a write failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for PartitionFailure {}
-
 impl From<FetchError> for PartitionFailure {
     fn from(error: FetchError) -> Self {
         Self::Fetch(error)
@@ -259,14 +224,14 @@ impl From<ArchiveError> for PartitionFailure {
     }
 }
 
-impl From<EncodeRefusal> for PartitionFailure {
-    fn from(refusal: EncodeRefusal) -> Self {
+impl From<archive::EncodeRefusal> for PartitionFailure {
+    fn from(refusal: archive::EncodeRefusal) -> Self {
         Self::Encode(refusal)
     }
 }
 
-impl From<DecodeRefusal> for PartitionFailure {
-    fn from(refusal: DecodeRefusal) -> Self {
+impl From<archive::DecodeRefusal> for PartitionFailure {
+    fn from(refusal: archive::DecodeRefusal) -> Self {
         Self::Decode(refusal)
     }
 }
@@ -425,7 +390,7 @@ fn fetched_now(subscription: Subscription, journal: &Journal) -> Provenance {
 
 /// Encodes `rows` under `key` and writes them with `put`, returning how many were written. An empty answer is refused,
 /// since for a trading day it is a vendor gap that written would mark the session held for good.
-async fn publish<K: Into<Key>, Row, Refusal: Into<EncodeRefusal>>(
+async fn publish<K: Into<Key>, Row, Refusal: Into<archive::EncodeRefusal>>(
     put: impl AsyncFnOnce(&Key, Vec<u8>) -> Result<(), ArchiveError>,
     key: K,
     rows: &[Row],
@@ -451,14 +416,14 @@ async fn publish_bars(
     let bars = BarPartition::try_from(bars).map_err(|refusal| match refusal {
         BarPartitionRefusal::Empty => PartitionFailure::NoRows,
     })?;
-    let body = encode(&key, &bars, provenance).map_err(EncodeRefusal::from)?;
+    let body = bars::encode(&key, &bars, provenance).map_err(archive::EncodeRefusal::from)?;
     put(&key.into(), body).await?;
     Ok(u64::try_from(bars.bars().len()).expect("a partition holds fewer than u64::MAX rows"))
 }
 
 /// Publishes a fold's minute bars and their rollups under `key` at each interval, the daily last so a session reads as
 /// held only once all three are, returning how many minute bars were written.
-async fn publish_ticks<K: Into<Key>, B: RollsUp, Refusal: Into<EncodeRefusal>>(
+async fn publish_ticks<K: Into<Key>, B: RollsUp, Refusal: Into<archive::EncodeRefusal>>(
     put: impl AsyncFn(&Key, Vec<u8>) -> Result<(), ArchiveError>,
     minutes: Vec<B>,
     key: impl Fn(BarInterval) -> K,
@@ -607,7 +572,7 @@ async fn write_series_boundaries(
                 .await?
                 .ok_or(PartitionFailure::Vanished { key: key.into() })?;
             let (held, _) =
-                decode_series_boundaries(&key, bytes).map_err(DecodeRefusal::Reference)?;
+                decode_series_boundaries(&key, bytes).map_err(archive::DecodeRefusal::Reference)?;
             (
                 held,
                 key.as_of()
@@ -847,7 +812,8 @@ async fn write_conditions(
         journal.run_id(),
         journal.commit().cloned(),
     );
-    let body = encode_conditions(&key, &conditions, &provenance).map_err(EncodeRefusal::from)?;
+    let body =
+        encode_conditions(&key, &conditions, &provenance).map_err(archive::EncodeRefusal::from)?;
     put(&key.into(), body).await?;
     let written = ConditionsWritten::new(
         key.as_of(),
@@ -926,7 +892,7 @@ async fn symbol_list(
         .get(&key.into())
         .await?
         .ok_or(PartitionFailure::NoSymbols { key: key.into() })?;
-    let (bars, _) = decode(&key, body).map_err(DecodeRefusal::from)?;
+    let (bars, _) = bars::decode(&key, body).map_err(archive::DecodeRefusal::from)?;
     Ok(bars.bars().iter().map(Bar::symbol).cloned().collect())
 }
 

@@ -528,8 +528,9 @@ mod tests {
     use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
     use crate::common::market::{Price, Shares};
 
-    /// A page of AAPL trades as the REST history returned it for 2026-10-06 19:59:59, trimmed to three rows.
-    const PAGE: &str = r#"{"next_page_token":"QUFQTHwxNzkxMzE2Nzk5MDAyNDE5OTE2fFF8MTE1MDk2","trades":{"AAPL":[{"c":["@","F"],"i":115093,"p":333.675,"s":40,"t":"2026-10-06T19:59:59.002268137Z","x":"Q","z":"C"},{"c":["@","F"],"i":115094,"p":333.69,"s":100,"t":"2026-10-06T19:59:59.002269693Z","x":"Q","z":"C"},{"c":["@","F"],"i":115095,"p":333.69,"s":60,"t":"2026-10-06T19:59:59.002418773Z","x":"Q","z":"C"}]}}"#;
+    /// A page of ABC trades for 2026-10-06 19:59:59 with invented values in the REST history's shape; the token
+    /// encodes the next row as Alpaca's do.
+    const PAGE: &str = r#"{"next_page_token":"QUJDfDE3OTEzMTY3OTkwMDAwMDA0MDB8UXw5MDA0","trades":{"ABC":[{"c":["@","F"],"i":9001,"p":50.255,"s":40,"t":"2026-10-06T19:59:59.000000100Z","x":"Q","z":"C"},{"c":["@","F"],"i":9002,"p":50.26,"s":100,"t":"2026-10-06T19:59:59.000000200Z","x":"Q","z":"C"},{"c":["@","F"],"i":9003,"p":50.26,"s":60,"t":"2026-10-06T19:59:59.000000300Z","x":"Q","z":"C"}]}}"#;
 
     fn id(exchange: &str, number: u64) -> TradeId {
         TradeId::read(&serde_json::json!({"x": exchange, "i": number})).unwrap()
@@ -581,28 +582,28 @@ mod tests {
     /// The page's rows read with their identities, and a repeated page token is refused rather than followed forever.
     #[test]
     fn test_a_rest_page_reads_with_each_trades_identity() {
-        let aapl = [Symbol::new("AAPL").unwrap()];
-        let trades = recent_trades(PAGE.as_bytes(), &aapl).unwrap();
+        let abc = [Symbol::new("ABC").unwrap()];
+        let trades = recent_trades(PAGE.as_bytes(), &abc).unwrap();
         let ids: Vec<TradeId> = trades.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, [id("Q", 115_093), id("Q", 115_094), id("Q", 115_095)]);
+        assert_eq!(ids, [id("Q", 9_001), id("Q", 9_002), id("Q", 9_003)]);
         assert!(
             trades
                 .iter()
                 .all(|(_, outcome)| matches!(outcome, AlpacaTradeOutcome::Print { .. }))
         );
-        let unidentified = PAGE.replace(r#""i":115094,"#, "");
+        let unidentified = PAGE.replace(r#""i":9002,"#, "");
         assert!(matches!(
-            recent_trades(unidentified.as_bytes(), &aapl),
+            recent_trades(unidentified.as_bytes(), &abc),
             Err(FetchError::Malformed { .. })
         ));
         assert_eq!(
-            recent_trades(br#"{"trades":null,"next_page_token":null}"#, &aapl).unwrap(),
+            recent_trades(br#"{"trades":null,"next_page_token":null}"#, &abc).unwrap(),
             vec![]
         );
         let mut tokens = PageTokens::default();
         assert_eq!(
             tokens.next(PAGE.as_bytes()).unwrap().as_deref(),
-            Some("QUFQTHwxNzkxMzE2Nzk5MDAyNDE5OTE2fFF8MTE1MDk2")
+            Some("QUJDfDE3OTEzMTY3OTkwMDAwMDA0MDB8UXw5MDA0")
         );
         assert!(matches!(
             tokens.next(PAGE.as_bytes()),

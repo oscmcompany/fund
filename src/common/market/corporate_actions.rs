@@ -11,20 +11,11 @@ use crate::common::time::{SessionDate, SessionRange};
 pub struct ActionId(String);
 
 /// Why an action identifier was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ActionIdRefusal {
+    #[error("an empty action identifier")]
     Empty,
 }
-
-impl std::fmt::Display for ActionIdRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("an empty action identifier"),
-        }
-    }
-}
-
-impl std::error::Error for ActionIdRefusal {}
 
 impl ActionId {
     pub fn new(raw: &str) -> Result<Self, ActionIdRefusal> {
@@ -47,23 +38,14 @@ pub struct SplitRatio {
 }
 
 /// Why a split ratio was refused.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SplitRatioRefusal {
+    #[error("a split side: {0}")]
     Shares(SharesRefusal),
     /// A side of zero shares, which no split has.
+    #[error("a split side of zero shares")]
     Zero,
 }
-
-impl std::fmt::Display for SplitRatioRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Shares(refusal) => write!(formatter, "a split side: {refusal}"),
-            Self::Zero => formatter.write_str("a split side of zero shares"),
-        }
-    }
-}
-
-impl std::error::Error for SplitRatioRefusal {}
 
 impl SplitRatio {
     pub fn new(from: Shares, to: Shares) -> Result<Self, SplitRatioRefusal> {
@@ -220,21 +202,12 @@ pub struct SeriesBoundary {
 }
 
 /// Why a series boundary was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SeriesBoundaryRefusal {
     /// A rename onto the symbol it already had, which ends nothing.
+    #[error("{symbol} renamed to itself")]
     RenamedToItself { symbol: Symbol },
 }
-
-impl std::fmt::Display for SeriesBoundaryRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RenamedToItself { symbol } => write!(formatter, "{symbol} renamed to itself"),
-        }
-    }
-}
-
-impl std::error::Error for SeriesBoundaryRefusal {}
 
 impl SeriesBoundary {
     pub fn new(

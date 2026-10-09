@@ -796,44 +796,44 @@ mod tests {
             .collect()
     }
 
-    /// The live response for AAPL and BRK.B over 13:30-13:32Z on 2026-09-25, probed with the development key.
+    /// Minute bars for ABE and ABE.B over 13:30-13:32Z on 2026-09-25, invented in Alpaca's shape.
     const FIXTURE: &[u8] = br#"{"bars":{
-        "AAPL":[
-            {"c":335.81,"h":336.8,"l":335.5,"n":9642,"o":336.04,"t":"2026-09-25T13:30:00Z","v":436147,"vw":335.929638},
-            {"c":334.79,"h":335.83,"l":334.53,"n":3622,"o":335.75,"t":"2026-09-25T13:31:00Z","v":151972,"vw":335.145391},
-            {"c":335.1005,"h":335.3702,"l":334.6606,"n":2040,"o":334.765,"t":"2026-09-25T13:32:00Z","v":78018,"vw":335.036579}
+        "ABE":[
+            {"c":50.25,"h":50.5,"l":50.1,"n":9600,"o":50.2,"t":"2026-09-25T13:30:00Z","v":436000,"vw":50.312345},
+            {"c":50.15,"h":50.3,"l":50.05,"n":3600,"o":50.25,"t":"2026-09-25T13:31:00Z","v":152000,"vw":50.175},
+            {"c":50.1225,"h":50.2075,"l":50.0525,"n":2000,"o":50.15,"t":"2026-09-25T13:32:00Z","v":78000,"vw":50.125}
         ],
-        "BRK.B":[
-            {"c":504.61,"h":505.48,"l":504.5,"n":1636,"o":505.25,"t":"2026-09-25T13:30:00Z","v":57776,"vw":505.147324},
-            {"c":505.362,"h":505.362,"l":504.55,"n":454,"o":504.57,"t":"2026-09-25T13:31:00Z","v":15475,"vw":505.097352},
-            {"c":505.1888,"h":505.6,"l":504.6101,"n":238,"o":505.49,"t":"2026-09-25T13:32:00Z","v":5026,"vw":505.025129}
+        "ABE.B":[
+            {"c":100.6,"h":101.48,"l":100.5,"n":1600,"o":101.25,"t":"2026-09-25T13:30:00Z","v":57000,"vw":101.012345},
+            {"c":101.362,"h":101.362,"l":100.55,"n":450,"o":100.57,"t":"2026-09-25T13:31:00Z","v":15500,"vw":101.0975},
+            {"c":101.1888,"h":101.6,"l":100.6101,"n":240,"o":101.49,"t":"2026-09-25T13:32:00Z","v":5000,"vw":101.025}
         ]
     },"next_page_token":null}"#;
 
     #[test]
     fn test_a_page_becomes_minute_bars_and_names_what_is_missing() {
-        let batch = read(&[FIXTURE.to_vec()], &symbols(&["AAPL", "BRK.B", "ZTST"])).unwrap();
+        let batch = read(&[FIXTURE.to_vec()], &symbols(&["ABE", "ABE.B", "ZTST"])).unwrap();
         assert_eq!(batch.bars.len(), 6);
         assert_eq!(batch.missing, symbols(&["ZTST"]));
         assert!(batch.refused.is_empty());
         let first = &batch.bars[0];
-        assert_eq!(first.symbol().as_str(), "AAPL");
+        assert_eq!(first.symbol().as_str(), "ABE");
         assert_eq!(first.timestamp().to_rfc3339(), "2026-09-25T13:30:00+00:00");
-        assert_eq!(first.volume(), Shares::whole(436_147).unwrap());
-        assert_eq!(first.trade_count(), Some(TradeCount::new(9642)));
+        assert_eq!(first.volume(), Shares::whole(436_000).unwrap());
+        assert_eq!(first.trade_count(), Some(TradeCount::new(9600)));
         let average = first.volume_weighted_average_price().unwrap();
-        assert!((average - 335.929_638).abs() < 1e-9, "{average}");
+        assert!((average - 50.312_345).abs() < 1e-9, "{average}");
         // A four-decimal SIP print sits on the grid.
-        assert_eq!(batch.bars[2].prices().close().to_string(), "335.1005");
+        assert_eq!(batch.bars[2].prices().close().to_string(), "50.1225");
     }
 
     #[test]
     fn test_pages_are_read_in_order_and_a_zero_volume_bar_has_no_average() {
-        let first = br#"{"bars":{"AAC.WS":[{"t":"2026-09-25T14:00:00Z","o":0.7201,"h":0.7201,"l":0.7201,"c":0.7201,"v":0,"n":0,"vw":0}]},"next_page_token":"abc"}"#;
+        let first = br#"{"bars":{"ABF.WS":[{"t":"2026-09-25T14:00:00Z","o":0.7125,"h":0.7125,"l":0.7125,"c":0.7125,"v":0,"n":0,"vw":0}]},"next_page_token":"abc"}"#;
         let second = br#"{"bars":null,"next_page_token":null}"#;
         assert_eq!(next_page_token(first), Ok(Some("abc".to_string())));
         assert_eq!(next_page_token(second), Ok(None));
-        let batch = read(&[first.to_vec(), second.to_vec()], &symbols(&["AAC.WS"])).unwrap();
+        let batch = read(&[first.to_vec(), second.to_vec()], &symbols(&["ABF.WS"])).unwrap();
         assert_eq!(batch.bars.len(), 1);
         assert_eq!(batch.bars[0].volume_weighted_average_price(), None);
         assert!(batch.missing.is_empty());
@@ -859,7 +859,7 @@ mod tests {
     fn test_every_requested_symbol_is_accounted_for_once() {
         let batch = MinuteBars::from_pages(
             &[FIXTURE.to_vec()],
-            &symbols(&["AAPL", "BRK.B", "ZTST"]),
+            &symbols(&["ABE", "ABE.B", "ZTST"]),
             symbols(&["BC.PRC"]),
             session(),
         )
@@ -876,7 +876,7 @@ mod tests {
             .chain(batch.invalid().iter().map(Symbol::as_str))
             .collect();
         accounted.sort();
-        assert_eq!(accounted, ["AAPL", "BC.PRC", "BRK.B", "ZTST"]);
+        assert_eq!(accounted, ["ABE", "ABE.B", "BC.PRC", "ZTST"]);
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     fn any_batch() -> impl Strategy<Value = MinuteBars> {
-        let pool = read(&[FIXTURE.to_vec()], &symbols(&["AAPL", "BRK.B"]))
+        let pool = read(&[FIXTURE.to_vec()], &symbols(&["ABE", "ABE.B"]))
             .unwrap()
             .bars;
         let names = symbols(&["ZTST", "BC.PRC", "ABC", "XYZ"]);
@@ -1068,7 +1068,7 @@ mod tests {
         }
     }
 
-    /// The live calendar over Thanksgiving 2026, probed with the development key.
+    /// Alpaca's calendar over Thanksgiving 2026, whose hours are the exchange's published schedule.
     const CALENDAR: &[u8] = br#"[{"close":"16:00","date":"2026-11-25","open":"09:30","session_close":"2000","session_open":"0400","settlement_date":"2026-11-27"},{"close":"13:00","date":"2026-11-27","open":"09:30","session_close":"1700","session_open":"0400","settlement_date":"2026-11-30"},{"close":"16:00","date":"2026-11-30","open":"09:30","session_close":"2000","session_open":"0400","settlement_date":"2026-12-01"}]"#;
 
     fn day(text: &str) -> SessionDate {
@@ -1190,24 +1190,24 @@ mod tests {
         assert!(batch.refused.is_empty(), "{:?}", batch.refused);
     }
 
-    /// Rows from Alpaca's SIP quotes and trades for AAPL and PFE on 2026-10-02, probed with the production key and
-    /// filed under AAPL; the last trade's tape `E` is invented to exercise the refusal.
-    const QUOTES_PAGE: &str = r#"{"next_page_token": null, "quotes": {"AAPL": [{"ap": 333.67, "as": 200, "ax": "Q", "bp": 333.65, "bs": 1520, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.001719242Z", "z": "C"}, {"ap": 0, "as": 0, "ax": "Q", "bp": 333.65, "bs": 100, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.0018Z", "z": "C"}]}}"#;
-    const TRADES_PAGE: &str = r#"{"next_page_token": null, "trades": {"AAPL": [{"c": ["@", "6", "X"], "i": 1, "p": 333.69, "s": 6224093, "t": "2026-10-02T20:00:00.118Z", "x": "Q", "z": "C"}, {"c": ["@", "T", "P"], "i": 335045, "p": 333.69, "s": 819560, "t": "2026-10-02T21:49:13.402977462Z", "u": "canceled", "x": "D", "z": "C"}, {"c": [" ", "9"], "i": 7, "p": 27.81, "s": 0, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "A"}, {"c": ["@"], "i": 8, "p": 1.0, "s": 1, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "E"}]}}"#;
+    /// SIP quotes and trades for ABC on 2026-10-02 with invented values in Alpaca's shape: a one-sided quote, the
+    /// closing cross, a canceled print, a zero-size print and a tape `E` to exercise the refusal.
+    const QUOTES_PAGE: &str = r#"{"next_page_token": null, "quotes": {"ABC": [{"ap": 50.27, "as": 200, "ax": "Q", "bp": 50.25, "bs": 1530, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.000000123Z", "z": "C"}, {"ap": 0, "as": 0, "ax": "Q", "bp": 50.25, "bs": 100, "bx": "Q", "c": ["R"], "t": "2026-10-02T19:59:58.0005Z", "z": "C"}]}}"#;
+    const TRADES_PAGE: &str = r#"{"next_page_token": null, "trades": {"ABC": [{"c": ["@", "6", "X"], "i": 1, "p": 50.26, "s": 6000000, "t": "2026-10-02T20:00:00.125Z", "x": "Q", "z": "C"}, {"c": ["@", "T", "P"], "i": 300001, "p": 50.26, "s": 800000, "t": "2026-10-02T21:45:00.000000456Z", "u": "canceled", "x": "D", "z": "C"}, {"c": [" ", "9"], "i": 7, "p": 25.5, "s": 0, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "A"}, {"c": ["@"], "i": 8, "p": 1.0, "s": 1, "t": "2026-10-02T20:10:00.001Z", "x": "N", "z": "E"}]}}"#;
 
     #[test]
     fn test_alpaca_quotes_keep_the_top_of_book_in_shares() {
-        let symbol = Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("ABC").unwrap();
         let (outcomes, answered) = quote_page(&symbol, QUOTES_PAGE.as_bytes()).unwrap();
         assert!(answered);
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             AlpacaQuoteOutcome::Quote(quote) => {
-                assert_eq!(quote.bid().ticks(), 333_650_000);
-                assert_eq!(quote.bid_size().units(), 1_520_000_000);
+                assert_eq!(quote.bid().ticks(), 50_250_000);
+                assert_eq!(quote.bid_size().units(), 1_530_000_000);
                 assert_eq!(
                     quote.timestamp().to_rfc3339(),
-                    "2026-10-02T19:59:58.001719242+00:00"
+                    "2026-10-02T19:59:58.000000123+00:00"
                 );
             }
             other @ (AlpacaQuoteOutcome::OneSided | AlpacaQuoteOutcome::Refused(_)) => {
@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn test_alpaca_trades_carry_their_tape_letters_and_corrections() {
-        let symbol = Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("ABC").unwrap();
         let (outcomes, answered) = trade_page(&symbol, TRADES_PAGE.as_bytes()).unwrap();
         assert!(answered);
         let summary: Vec<String> = outcomes
@@ -1290,9 +1290,9 @@ mod tests {
 
     #[test]
     fn test_alpaca_ticks_filed_under_another_ticker_are_refused_not_dropped() {
-        let symbol = Symbol::new("PFE").unwrap();
+        let symbol = Symbol::new("ABD").unwrap();
         let unrequested = AlpacaQuoteOutcome::Refused(RefusedRow {
-            ticker: "AAPL".to_string(),
+            ticker: "ABC".to_string(),
             cause: RowRefusal::Unrequested,
         });
         // Rows filed only under another ticker refuse each row and leave the symbol unanswered.

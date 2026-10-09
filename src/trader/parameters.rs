@@ -35,19 +35,12 @@ impl Universe {
 }
 
 /// Why a universe was refused: it names no symbol, or one that is not a ticker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UniverseRefusal {
+    #[error("the universe names no symbol")]
     Empty,
+    #[error("{0}")]
     Symbol(SymbolRefusal),
-}
-
-impl Display for UniverseRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(formatter, "the universe names no symbol"),
-            Self::Symbol(refusal) => write!(formatter, "{refusal}"),
-        }
-    }
 }
 
 impl FromStr for Universe {
@@ -73,21 +66,14 @@ impl Display for Universe {
 }
 
 /// Why a bounded count was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 enum CountRefusal {
+    #[error("not a whole count: {0}")]
     NotACount(ParseIntError),
+    #[error("zero is not allowed")]
     Zero,
+    #[error("past its most of {most}")]
     PastMost { most: u16 },
-}
-
-impl Display for CountRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotACount(error) => write!(formatter, "not a whole count: {error}"),
-            Self::Zero => write!(formatter, "zero is not allowed"),
-            Self::PastMost { most } => write!(formatter, "past its most of {most}"),
-        }
-    }
 }
 
 fn count(raw: &str, most: u16) -> Result<u16, CountRefusal> {
@@ -187,28 +173,21 @@ macro_rules! display_count {
 display_count!(FlatBeforeClose, StaleAfter, OrderPoll, OrderOpen);
 
 /// Why the trader's settings were refused: one parameter, or settings that do not hold together.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParametersRefusal {
+    #[error("{0}")]
     Parameter(ParameterRefusal),
+    #[error("the limits are refused: {0}")]
     Limits(LimitsRefusal),
+    #[error("the patience is refused: {0}")]
     Patience(PatienceRefusal),
+    #[error("the settings are refused: {0}")]
     Settings(SettingsRefusal),
 }
 
 impl From<ParameterRefusal> for ParametersRefusal {
     fn from(refusal: ParameterRefusal) -> Self {
         Self::Parameter(refusal)
-    }
-}
-
-impl Display for ParametersRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parameter(refusal) => write!(formatter, "{refusal}"),
-            Self::Limits(refusal) => write!(formatter, "the limits are refused: {refusal}"),
-            Self::Patience(refusal) => write!(formatter, "the patience is refused: {refusal}"),
-            Self::Settings(refusal) => write!(formatter, "the settings are refused: {refusal}"),
-        }
     }
 }
 

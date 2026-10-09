@@ -63,8 +63,9 @@ pub struct BarPrices {
 }
 
 /// Why a set of bar prices was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BarPricesRefusal {
+    #[error("open {open} and close {close} do not lie within low {low} and high {high}")]
     OutsideRange {
         open: Price,
         high: Price,
@@ -72,24 +73,6 @@ pub enum BarPricesRefusal {
         close: Price,
     },
 }
-
-impl std::fmt::Display for BarPricesRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OutsideRange {
-                open,
-                high,
-                low,
-                close,
-            } => write!(
-                formatter,
-                "open {open} and close {close} do not lie within low {low} and high {high}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BarPricesRefusal {}
 
 impl BarPrices {
     pub fn new(
@@ -148,26 +131,14 @@ pub struct Bar {
 }
 
 /// Why a bar was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BarRefusal {
+    #[error("{timestamp} does not end a {interval} bar")]
     Misaligned {
         interval: BarInterval,
         timestamp: DateTime<Utc>,
     },
 }
-
-impl std::fmt::Display for BarRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Misaligned {
-                interval,
-                timestamp,
-            } => write!(formatter, "{timestamp} does not end a {interval} bar"),
-        }
-    }
-}
-
-impl std::error::Error for BarRefusal {}
 
 impl Bar {
     /// A bar whose timestamp sits on its interval's grid.
@@ -259,20 +230,11 @@ impl Bar {
 pub struct BarPartition(Vec<Bar>);
 
 /// Why bars were refused as a partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BarPartitionRefusal {
+    #[error("a partition holds no bars")]
     Empty,
 }
-
-impl std::fmt::Display for BarPartitionRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(formatter, "a partition holds no bars"),
-        }
-    }
-}
-
-impl std::error::Error for BarPartitionRefusal {}
 
 impl TryFrom<Vec<Bar>> for BarPartition {
     type Error = BarPartitionRefusal;
@@ -307,20 +269,11 @@ pub struct Quote {
 }
 
 /// Why a quote was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteRefusal {
+    #[error("the bid {bid} is above the ask {ask}")]
     Crossed { bid: Price, ask: Price },
 }
-
-impl std::fmt::Display for QuoteRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Crossed { bid, ask } => write!(formatter, "the bid {bid} is above the ask {ask}"),
-        }
-    }
-}
-
-impl std::error::Error for QuoteRefusal {}
 
 impl Quote {
     pub fn new(
@@ -379,20 +332,11 @@ pub struct Trade {
 }
 
 /// Why a trade was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TradeRefusal {
+    #[error("a trade at {price} for no shares")]
     NoShares { price: Price },
 }
-
-impl std::fmt::Display for TradeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoShares { price } => write!(formatter, "a trade at {price} for no shares"),
-        }
-    }
-}
-
-impl std::error::Error for TradeRefusal {}
 
 impl Trade {
     pub fn new(

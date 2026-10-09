@@ -13,11 +13,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use fund::archive::bars;
-use fund::archive::bars::{Provenance, Subscription, encode};
+use fund::archive::bars::{Provenance, Subscription};
 use fund::archive::raw::CopyError;
-use fund::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
-use fund::archive::{quote_bars, reference, trade_bars};
+use fund::archive::{self, Archive, ArchiveError};
+use fund::archive::{bars, parquet, quote_bars, reference, trade_bars};
 use fund::common::journal::{ObjectDeleted, ObjectWritten, Observation};
 use fund::common::market::aggregate::{self, session_bars};
 use fund::common::market::quote_bars::QuoteFold;
@@ -151,7 +150,7 @@ fn parse(arguments: &[String]) -> Option<Command> {
         CommandName::Delete => {
             let keys = rest
                 .iter()
-                .map(|path| Key::parse(path).ok())
+                .map(|path| path.parse::<Key>().ok())
                 .collect::<Option<Vec<_>>>()?;
             (!keys.is_empty()).then_some(Command::Delete { keys })
         }
@@ -340,20 +339,13 @@ async fn delete(archive: &Archive, keys: &[Key], journal: &Mutex<Journal>) -> Ex
 }
 
 /// Why a raw file was not copied and journaled.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum CopyFailure {
+    #[error("{0}")]
     Copy(CopyError),
     /// Copied, but the write went unrecorded.
+    #[error("journaling the copy failed: {0}")]
     Journal(std::io::Error),
-}
-
-impl std::fmt::Display for CopyFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Copy(error) => write!(formatter, "{error}"),
-            Self::Journal(error) => write!(formatter, "journaling the copy failed: {error}"),
-        }
-    }
 }
 
 async fn copy(
@@ -497,51 +489,35 @@ async fn held(
         .list(&series)
         .await?
         .iter()
-        .filter_map(|path| Key::parse(path).ok())
+        .filter_map(|path| path.parse::<Key>().ok())
         .map(|key| key.session())
         .collect())
 }
 
 /// Why a held raw bar file was not written as bars.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum ParseFailure {
+    #[error("{0}")]
     Archive(ArchiveError),
     /// Listed a moment ago, gone now.
+    #[error("the raw file is gone")]
     Missing,
     /// The raw copy records no fetch time, which the bars' provenance needs.
+    #[error("the raw file records no fetch time")]
     Unstamped,
+    #[error("{0}")]
     Parse(ParseRefusal),
     /// No row became a bar, so writing the session would mark it done with nothing in it.
-    Empty {
-        test_tickers: usize,
-        refused: usize,
-    },
-    Encode(bars::EncodeRefusal),
+    #[error("no bars: {test_tickers} test tickers and {refused} refused rows")]
+    Empty { test_tickers: usize, refused: usize },
+    #[error("{0:?}")]
+    Encode(parquet::EncodeRefusal),
     /// The blocking parse did not finish.
+    #[error("the parse did not finish: {0}")]
     Interrupted(String),
     /// Written, but the write went unrecorded.
+    #[error("journaling the write failed: {0}")]
     Journal(std::io::Error),
-}
-
-impl std::fmt::Display for ParseFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Missing => write!(formatter, "the raw file is gone"),
-            Self::Unstamped => write!(formatter, "the raw file records no fetch time"),
-            Self::Parse(refusal) => write!(formatter, "{refusal}"),
-            Self::Empty {
-                test_tickers,
-                refused,
-            } => write!(
-                formatter,
-                "no bars: {test_tickers} test tickers and {refused} refused rows"
-            ),
-            Self::Interrupted(reason) => write!(formatter, "the parse did not finish: {reason}"),
-            Self::Encode(refusal) => write!(formatter, "{refusal:?}"),
-            Self::Journal(error) => write!(formatter, "journaling the write failed: {error}"),
-        }
-    }
 }
 
 async fn parse_bars(
@@ -568,7 +544,7 @@ async fn parse_bars(
             raw,
             parsed
                 .iter()
-                .filter_map(|path| Key::parse(path).ok())
+                .filter_map(|path| path.parse::<Key>().ok())
                 .map(|key| key.session())
                 .collect::<BTreeSet<_>>(),
         ),
@@ -719,7 +695,7 @@ async fn parse_one(
                 refused,
             },
         })?;
-        let body = encode(&key, &bars, &provenance).map_err(ParseFailure::Encode)?;
+        let body = bars::encode(&key, &bars, &provenance).map_err(ParseFailure::Encode)?;
         Ok((bars.bars().len(), test_tickers, refused, by_cause, body))
     })
     .await
@@ -761,41 +737,30 @@ fn fold_clients() -> Option<(FlatFiles, Alpaca)> {
 }
 
 /// Why a session's quotes or trades were not folded and written.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum FoldFailure {
+    #[error("{0}")]
     Parse(ParseRefusal),
-    Encode(EncodeRefusal),
+    #[error("{0}")]
+    Encode(archive::EncodeRefusal),
+    #[error("{0}")]
     Archive(ArchiveError),
+    #[error("the fold did not finish: {0}")]
     Interrupted(String),
+    #[error("nothing the fold could keep fell in the session")]
     Empty,
     /// An earlier run wrote different bars under the key, which this run will not replace.
-    Held {
-        key: Key,
-    },
+    #[error("{} already holds different bars", .key.path())]
+    Held { key: Key },
     /// An earlier run wrote the key, and what it holds does not read back as bars.
+    #[error("{} held but unreadable: {refusal}", .key.path())]
     Unreadable {
         key: Key,
-        refusal: Box<DecodeRefusal>,
+        refusal: Box<archive::DecodeRefusal>,
     },
     /// Written, but the write went unrecorded.
+    #[error("journaling a write failed: {0}")]
     Journal(std::io::Error),
-}
-
-impl std::fmt::Display for FoldFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parse(refusal) => write!(formatter, "{refusal}"),
-            Self::Encode(refusal) => write!(formatter, "{refusal}"),
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Interrupted(reason) => write!(formatter, "the fold did not finish: {reason}"),
-            Self::Empty => write!(formatter, "nothing the fold could keep fell in the session"),
-            Self::Held { key } => write!(formatter, "{} already holds different bars", key.path()),
-            Self::Unreadable { key, refusal } => {
-                write!(formatter, "{} held but unreadable: {refusal}", key.path())
-            }
-            Self::Journal(error) => write!(formatter, "journaling a write failed: {error}"),
-        }
-    }
 }
 
 /// Streams each listed `dataset` file of a trading session in `range` whose daily file under `daily` is not
@@ -833,7 +798,7 @@ where
     // The daily file is written last, so a session holding it holds all three.
     let done: BTreeSet<SessionDate> = written
         .iter()
-        .filter_map(|path| Key::parse(path).ok())
+        .filter_map(|path| path.parse::<Key>().ok())
         .map(|key| key.session())
         .collect();
     let offered: Vec<_> = listing
@@ -1017,7 +982,7 @@ async fn fold_quotes_one(
 
 /// Creates `key` and journals it, or, when an interrupted run already wrote it, accepts it only if it holds the same
 /// bars, so a rerun finishes a session's missing files without replacing what it cannot tell is identical.
-async fn create_or_confirm<Refusal: Into<DecodeRefusal>>(
+async fn create_or_confirm<Refusal: Into<archive::DecodeRefusal>>(
     archive: &Archive,
     key: &Key,
     body: Vec<u8>,
@@ -1078,7 +1043,7 @@ async fn fetch_conditions(
     let object = Key::from(key);
     let provenance = provenance(Subscription::StocksStarter, fetched_at, journal);
     let encoded = reference::encode_conditions(&key, &conditions, &provenance)
-        .map_err(EncodeRefusal::from)
+        .map_err(archive::EncodeRefusal::from)
         .map(|body| (length(&body), archive.create(&object, body)));
     match encoded {
         Ok((bytes, write)) => match write.await {
@@ -1228,29 +1193,22 @@ fn massive_bars_key(origin: Origin, interval: BarInterval, session: SessionDate)
 }
 
 /// Why a session's minutes were not rolled up.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum RollUpFailure {
+    #[error("{0}")]
     Archive(ArchiveError),
+    #[error("the minute bars are gone")]
     Missing,
+    #[error("minute bars not read: {0:?}")]
     Decode(bars::DecodeRefusal),
-    Encode(bars::EncodeRefusal),
+    #[error("five-minute bars not encoded: {0:?}")]
+    Encode(parquet::EncodeRefusal),
     /// The roll-up's task panicked or was canceled before it finished.
+    #[error("the roll-up did not finish: {0}")]
     Interrupted(String),
     /// Written, but the write went unrecorded.
+    #[error("journaling the write failed: {0}")]
     Journal(std::io::Error),
-}
-
-impl std::fmt::Display for RollUpFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Missing => write!(formatter, "the minute bars are gone"),
-            Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal:?}"),
-            Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal:?}"),
-            Self::Interrupted(reason) => write!(formatter, "the roll-up did not finish: {reason}"),
-            Self::Journal(error) => write!(formatter, "journaling the write failed: {error}"),
-        }
-    }
 }
 
 /// Writes derived five-minute bars for each session whose Massive minute bars are held and five-minute bars are not.
@@ -1269,7 +1227,7 @@ async fn roll_up(
                 .map(|paths| {
                     paths
                         .iter()
-                        .filter_map(|path| Key::parse(path).ok())
+                        .filter_map(|path| path.parse::<Key>().ok())
                         .map(|key| key.session())
                         .filter(|session| range.contains(*session))
                         .collect::<BTreeSet<SessionDate>>()
@@ -1462,7 +1420,7 @@ mod tests {
         );
         let path =
             "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz";
-        written(&journal, Key::parse(path).unwrap(), 4_096).unwrap();
+        written(&journal, path.parse::<Key>().unwrap(), 4_096).unwrap();
         let history = journal.into_inner().unwrap().history().unwrap();
         let payloads: Vec<String> = history
             .iter()

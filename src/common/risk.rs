@@ -70,50 +70,16 @@ pub enum Limit {
 }
 
 /// Why limits were refused, naming the value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LimitsRefusal {
-    NotPositive {
-        limit: Limit,
-        value: Cash,
-    },
+    #[error("the {limit} limit is {:.2} dollars, which is not positive", .value.dollars())]
+    NotPositive { limit: Limit, value: Cash },
     /// Past `MAXIMUM_LIMIT`, the most a gross limit can be and still scale a target; held to every dollar limit.
-    BeyondRange {
-        limit: Limit,
-        value: Cash,
-    },
-    NegativeWindow {
-        flat_before_close: TimeDelta,
-    },
+    #[error("the {limit} limit is {:.2} dollars, past the most a limit may be", .value.dollars())]
+    BeyondRange { limit: Limit, value: Cash },
+    #[error("the flat window of {flat_before_close} before the close is negative")]
+    NegativeWindow { flat_before_close: TimeDelta },
 }
-
-impl std::fmt::Display for LimitsRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotPositive { limit, value } => {
-                write!(
-                    formatter,
-                    "the {limit} limit is {:.2} dollars, which is not positive",
-                    value.dollars()
-                )
-            }
-            Self::BeyondRange { limit, value } => {
-                write!(
-                    formatter,
-                    "the {limit} limit is {:.2} dollars, past the most a limit may be",
-                    value.dollars()
-                )
-            }
-            Self::NegativeWindow { flat_before_close } => {
-                write!(
-                    formatter,
-                    "the flat window of {flat_before_close} before the close is negative"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for LimitsRefusal {}
 
 impl Limits {
     /// `gross` caps the target's worth, `per_name` each holding's, `daily_loss` the loss from the session's opening

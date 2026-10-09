@@ -54,9 +54,10 @@ fn write_decimal(
 pub struct Symbol(String);
 
 /// Why a symbol was refused.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolRefusal {
+    #[error("`{raw}` is not a ticker")]
     Malformed { raw: String },
 }
 
@@ -84,16 +85,6 @@ impl Symbol {
         &self.0
     }
 }
-
-impl std::fmt::Display for SymbolRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malformed { raw } => write!(formatter, "`{raw}` is not a ticker"),
-        }
-    }
-}
-
-impl std::error::Error for SymbolRefusal {}
 
 impl TryFrom<String> for Symbol {
     type Error = SymbolRefusal;
@@ -137,39 +128,17 @@ impl From<Price> for i64 {
 }
 
 /// Why a price was refused.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum PriceRefusal {
-    NotFinite {
-        dollars: f64,
-    },
+    #[error("{dollars} dollars is not a finite price")]
+    NotFinite { dollars: f64 },
     /// Not positive, or above ten million dollars.
-    OutOfRange {
-        ticks: i64,
-    },
+    #[error("{ticks} ticks is not above zero and at most ten million dollars")]
+    OutOfRange { ticks: i64 },
     /// Further from the millionth grid than float noise explains.
-    OffGrid {
-        dollars: f64,
-    },
+    #[error("{dollars} dollars is finer than a millionth")]
+    OffGrid { dollars: f64 },
 }
-
-impl std::fmt::Display for PriceRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFinite { dollars } => {
-                write!(formatter, "{dollars} dollars is not a finite price")
-            }
-            Self::OutOfRange { ticks } => write!(
-                formatter,
-                "{ticks} ticks is not above zero and at most ten million dollars"
-            ),
-            Self::OffGrid { dollars } => {
-                write!(formatter, "{dollars} dollars is finer than a millionth")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PriceRefusal {}
 
 impl Price {
     /// A price read back from its stored integer.
@@ -267,39 +236,17 @@ pub const SHARE_SCALE: u64 = 1_000_000;
 pub struct Shares(u64);
 
 /// Why a share count was refused.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum SharesRefusal {
-    NotFinite {
-        shares: f64,
-    },
+    #[error("{shares} shares is not a finite count")]
+    NotFinite { shares: f64 },
     /// Negative, or past `u64` once scaled.
-    OutOfRange {
-        shares: f64,
-    },
+    #[error("{shares} shares is negative or past what millionths in a u64 hold")]
+    OutOfRange { shares: f64 },
     /// Finer than a millionth by more than float precision explains.
-    OffGrid {
-        shares: f64,
-    },
+    #[error("{shares} shares is finer than a millionth")]
+    OffGrid { shares: f64 },
 }
-
-impl std::fmt::Display for SharesRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFinite { shares } => {
-                write!(formatter, "{shares} shares is not a finite count")
-            }
-            Self::OutOfRange { shares } => write!(
-                formatter,
-                "{shares} shares is negative or past what millionths in a u64 hold"
-            ),
-            Self::OffGrid { shares } => {
-                write!(formatter, "{shares} shares is finer than a millionth")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SharesRefusal {}
 
 impl Shares {
     /// Whole shares, as SIP quotes and trades report them.
@@ -436,12 +383,6 @@ impl Monoid for TradeCount {
     }
 }
 
-impl std::fmt::Display for TradeCount {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
 /// A number of quotes, kept apart from `TradeCount` so the two counts cannot be swapped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QuoteCount(u64);
@@ -494,30 +435,15 @@ impl From<DollarVolume> for String {
 }
 
 /// Why a vendor's average price was not turned into a dollar volume.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum DollarVolumeRefusal {
     /// Not finite, or negative.
+    #[error("an average price of {average} is not finite and non-negative")]
     Invalid { average: f64 },
     /// Implies a dollar volume past the integer's range.
+    #[error("an average price of {average} implies a dollar volume past its range")]
     OutOfRange { average: f64 },
 }
-
-impl std::fmt::Display for DollarVolumeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Invalid { average } => write!(
-                formatter,
-                "an average price of {average} is not finite and non-negative"
-            ),
-            Self::OutOfRange { average } => write!(
-                formatter,
-                "an average price of {average} implies a dollar volume past its range"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DollarVolumeRefusal {}
 
 impl DollarVolume {
     pub fn of(price: Price, shares: Shares) -> Self {
@@ -610,37 +536,14 @@ impl std::fmt::Display for DollarVolume {
 pub struct Dollars(u64);
 
 /// Why an amount was refused.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DollarsRefusal {
     /// Negative, not finite, too large, or finer than a millionth.
-    Unrepresentable {
-        dollars: f64,
-    },
-    Unparsable {
-        raw: String,
-    },
+    #[error("{dollars} is not a non-negative whole number of millionths of a dollar")]
+    Unrepresentable { dollars: f64 },
+    #[error("`{raw}` is not dollars with at most six decimal places")]
+    Unparsable { raw: String },
 }
-
-impl std::fmt::Display for DollarsRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unrepresentable { dollars } => {
-                write!(
-                    formatter,
-                    "{dollars} is not a non-negative whole number of millionths of a dollar"
-                )
-            }
-            Self::Unparsable { raw } => {
-                write!(
-                    formatter,
-                    "`{raw}` is not dollars with at most six decimal places"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for DollarsRefusal {}
 
 impl Dollars {
     pub fn from_millionths(millionths: u64) -> Self {
@@ -839,7 +742,7 @@ mod tests {
     #[test]
     fn test_a_stored_price_is_refused_with_its_typed_cause() {
         assert_eq!(
-            Price::try_from(0),
+            Price::from_ticks(0),
             Err(PriceRefusal::OutOfRange { ticks: 0 })
         );
         assert_eq!(

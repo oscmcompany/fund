@@ -251,9 +251,9 @@ mod tests {
     use super::*;
     use crate::common::monoid::laws;
 
-    /// Rows of each category Alpaca answered for 2025-10-07 to 2026-10-07: a rename and one that changes no symbol, a
+    /// Invented rows of each category in Alpaca's shape: a rename and one that changes no symbol, a
     /// spin-off, a rights distribution, a unit separation, and a reorganization beside one filed under a CUSIP.
-    const PAGE: &str = r#"{"corporate_actions": {"name_changes": [{"id": "d28956f4-5474-489c-ae4e-b66e735b0e0b", "new_cusip": "G0R38G104", "new_symbol": "XRPN", "old_cusip": "G0R38G104", "old_symbol": "AACI", "process_date": "2025-10-30"}, {"id": "ff96483e-fe02-4e1c-bc80-e4b9b11a1235", "new_cusip": "44053A424", "new_symbol": "AESR", "old_cusip": "90214Q733", "old_symbol": "AESR", "process_date": "2026-07-02"}], "spin_offs": [{"ex_date": "2026-04-20", "id": "fefc53e6-1dc4-4df2-a823-fac0a217c8a1", "new_cusip": "337185102", "new_rate": 1, "new_symbol": "TRAX", "payable_date": "2026-04-20", "process_date": "2026-04-20", "record_date": "2026-04-06", "source_cusip": "032724106", "source_rate": 1, "source_symbol": "ANAB"}], "rights_distributions": [{"ex_date": "2026-02-10", "expiration_date": "2026-02-27", "id": "ff51bac9-4bf4-42e2-a8e2-93fe930ee1bc", "new_cusip": "009RGT010", "new_symbol": "009RGT010", "payable_date": "2026-02-19", "process_date": "2026-02-19", "rate": 1, "record_date": "2026-02-10", "source_cusip": "00901B303", "source_symbol": "AIM"}], "unit_splits": [{"alternate_cusip": "G0679A118", "alternate_rate": 0.1667, "alternate_symbol": "ACAAW", "effective_date": "2026-04-10", "id": "2a2f13a0-84a3-45d5-9392-04422569eb4f", "new_cusip": "G0679A100", "new_rate": 1, "new_symbol": "ACAA", "old_cusip": "G0679A126", "old_rate": 1, "old_symbol": "ACAAU", "process_date": "2026-04-10"}], "reorganizations": [{"cusip": "75944B106", "effective_date": "2026-07-23", "id": "cdcd1e0c-a057-474a-ad42-0638f8a27c04", "payable_date": "2026-07-24", "process_date": "2026-07-24", "stock_movements": [{"cusip": "G4860C107", "new_rate": 1, "source_rate": 1, "symbol": "BIOT"}], "symbol": "ACQC"}, {"cash_rate": 0.1, "cusip": "004ESC018", "effective_date": "2026-05-06", "id": "ced7f6a2-24d2-4268-b36d-621cbe0ed30d", "payable_date": "2026-05-11", "process_date": "2026-05-11", "symbol": "004ESC018"}]}, "next_page_token": null}"#;
+    const PAGE: &str = r#"{"corporate_actions": {"name_changes": [{"id": "00000000-0000-0000-0000-000000000001", "new_cusip": "00ABC0101", "new_symbol": "ABD", "old_cusip": "00ABC0101", "old_symbol": "ABC", "process_date": "2025-10-30"}, {"id": "00000000-0000-0000-0000-000000000002", "new_cusip": "00ABE0202", "new_symbol": "ABE", "old_cusip": "00ABE0101", "old_symbol": "ABE", "process_date": "2026-07-02"}], "spin_offs": [{"ex_date": "2026-04-20", "id": "00000000-0000-0000-0000-000000000003", "new_cusip": "00ABG0101", "new_rate": 1, "new_symbol": "ABG", "payable_date": "2026-04-20", "process_date": "2026-04-20", "record_date": "2026-04-06", "source_cusip": "00ABF0101", "source_rate": 1, "source_symbol": "ABF"}], "rights_distributions": [{"ex_date": "2026-02-10", "expiration_date": "2026-02-27", "id": "00000000-0000-0000-0000-000000000004", "new_cusip": "00ABHRT01", "new_symbol": "00ABHRT01", "payable_date": "2026-02-19", "process_date": "2026-02-19", "rate": 1, "record_date": "2026-02-10", "source_cusip": "00ABH0101", "source_symbol": "ABH"}], "unit_splits": [{"alternate_cusip": "00ABJ0303", "alternate_rate": 0.3333, "alternate_symbol": "ABJW", "effective_date": "2026-04-10", "id": "00000000-0000-0000-0000-000000000005", "new_cusip": "00ABJ0101", "new_rate": 1, "new_symbol": "ABJ", "old_cusip": "00ABJ0202", "old_rate": 1, "old_symbol": "ABJU", "process_date": "2026-04-10"}], "reorganizations": [{"cusip": "00ABK0101", "effective_date": "2026-07-23", "id": "00000000-0000-0000-0000-000000000006", "payable_date": "2026-07-24", "process_date": "2026-07-24", "stock_movements": [{"cusip": "00ABL0101", "new_rate": 1, "source_rate": 1, "symbol": "ABL"}], "symbol": "ABK"}, {"cash_rate": 0.1, "cusip": "000ESC001", "effective_date": "2026-05-06", "id": "00000000-0000-0000-0000-000000000007", "payable_date": "2026-05-11", "process_date": "2026-05-11", "symbol": "000ESC001"}]}, "next_page_token": null}"#;
 
     #[test]
     fn test_each_category_becomes_the_boundary_it_describes() {
@@ -275,11 +275,11 @@ mod tests {
         assert_eq!(
             boundaries,
             [
-                "AACI 2025-10-30 2025-10-30 renamed Some(\"XRPN\")",
-                "ANAB 2026-04-20 2026-04-20 spun_off Some(\"TRAX\")",
-                "AIM 2026-02-10 2026-02-19 rights_distributed None",
-                "ACAAU 2026-04-10 2026-04-10 unit_separated None",
-                "ACQC 2026-07-23 2026-07-24 reorganized None",
+                "ABC 2025-10-30 2025-10-30 renamed Some(\"ABD\")",
+                "ABF 2026-04-20 2026-04-20 spun_off Some(\"ABG\")",
+                "ABH 2026-02-10 2026-02-19 rights_distributed None",
+                "ABJU 2026-04-10 2026-04-10 unit_separated None",
+                "ABK 2026-07-23 2026-07-24 reorganized None",
             ]
         );
         let refused: Vec<(&str, &str)> = read
@@ -287,12 +287,12 @@ mod tests {
             .iter()
             .map(|row| (row.ticker(), <&str>::from(row.cause().kind())))
             .collect();
-        assert_eq!(refused, [("AESR", "boundary"), ("004ESC018", "symbol")]);
+        assert_eq!(refused, [("ABE", "boundary"), ("000ESC001", "symbol")]);
     }
 
     #[test]
     fn test_an_action_with_no_date_is_refused_and_an_empty_page_reads_as_none() {
-        let undated = r#"{"corporate_actions": {"reorganizations": [{"id": "x", "symbol": "ACQC", "process_date": "2026-07-24"}]}}"#;
+        let undated = r#"{"corporate_actions": {"reorganizations": [{"id": "x", "symbol": "ABK", "process_date": "2026-07-24"}]}}"#;
         let read = parse_boundaries_page(undated.as_bytes()).unwrap();
         assert!(read.boundaries().is_empty());
         assert_eq!(read.refused()[0].cause(), &RowRefusal::Undated);

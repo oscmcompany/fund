@@ -2,8 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::archive::bars::{DecodeRefusal, decode};
-use crate::archive::{Archive, ArchiveError};
+use crate::archive::{Archive, ArchiveError, bars};
 use crate::common::heal::massive_daily_bars;
 use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{
@@ -48,35 +47,21 @@ impl Dataset {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DatasetError {
+    #[error("{0}")]
     Window(FingerprintRefusal),
     /// The read could not be journaled, so it is not returned: a study holds only cataloged data.
+    #[error("the read could not be journaled: {0}")]
     Journal(std::io::Error),
+    #[error("{0}")]
     Archive(ArchiveError),
+    #[error("the partition for {session} did not decode: {refusal:?}")]
     Decode {
         session: SessionDate,
-        refusal: DecodeRefusal,
+        refusal: bars::DecodeRefusal,
     },
 }
-
-impl std::fmt::Display for DatasetError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Window(refusal) => write!(formatter, "{refusal}"),
-            Self::Journal(error) => write!(formatter, "the read could not be journaled: {error}"),
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Decode { session, refusal } => {
-                write!(
-                    formatter,
-                    "the partition for {session} did not decode: {refusal:?}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for DatasetError {}
 
 /// Massive daily bars for every trading session in `range`, journaled to `study` before it is returned; a session with
 /// no partition is recorded missing in the fingerprint rather than refused.
@@ -140,8 +125,8 @@ async fn partition(
             else {
                 return Ok(None);
             };
-            let (bars, _) =
-                decode(&key, body).map_err(|refusal| DatasetError::Decode { session, refusal })?;
+            let (bars, _) = bars::decode(&key, body)
+                .map_err(|refusal| DatasetError::Decode { session, refusal })?;
             Ok(Some((bars, tag)))
         }
     }
@@ -257,7 +242,7 @@ pub(crate) mod tests {
         let dataset = dataset(study.run_id());
         study.read(dataset.fingerprint()).unwrap();
         let series = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
-        let estimate = Estimate::try_from(summarize(&series)).unwrap();
+        let estimate = Estimate::from_summary(summarize(&series)).unwrap();
         for variant in ["all", "none"] {
             study
                 .experiment(

@@ -42,31 +42,14 @@ pub enum SecurityType {
 pub struct IndustryCode(u16);
 
 /// Why an industry code was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IndustryCodeRefusal {
-    Malformed {
-        raw: String,
-    },
+    #[error("`{raw}` is not a four-digit industry code")]
+    Malformed { raw: String },
     /// A stored code past four digits.
-    TooLarge {
-        code: u16,
-    },
+    #[error("{code} is past a four-digit industry code")]
+    TooLarge { code: u16 },
 }
-
-impl std::fmt::Display for IndustryCodeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malformed { raw } => {
-                write!(formatter, "`{raw}` is not a four-digit industry code")
-            }
-            Self::TooLarge { code } => {
-                write!(formatter, "{code} is past a four-digit industry code")
-            }
-        }
-    }
-}
-
-impl std::error::Error for IndustryCodeRefusal {}
 
 impl IndustryCode {
     /// Exactly four digits, as the SEC writes them.
@@ -102,23 +85,11 @@ impl IndustryCode {
 pub struct MarketIdentifierCode(String);
 
 /// Why a market identifier code was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarketIdentifierCodeRefusal {
+    #[error("`{raw}` is not a four-character market identifier code")]
     Malformed { raw: String },
 }
-
-impl std::fmt::Display for MarketIdentifierCodeRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malformed { raw } => write!(
-                formatter,
-                "`{raw}` is not a four-character market identifier code"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MarketIdentifierCodeRefusal {}
 
 impl MarketIdentifierCode {
     pub fn new(raw: &str) -> Result<Self, MarketIdentifierCodeRefusal> {
@@ -141,20 +112,11 @@ impl MarketIdentifierCode {
 pub struct CentralIndexKey(NonZeroU64);
 
 /// Why a Central Index Key was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CentralIndexKeyRefusal {
+    #[error("0 is not a Central Index Key")]
     Zero,
 }
-
-impl std::fmt::Display for CentralIndexKeyRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Zero => formatter.write_str("0 is not a Central Index Key"),
-        }
-    }
-}
-
-impl std::error::Error for CentralIndexKeyRefusal {}
 
 impl CentralIndexKey {
     pub fn new(value: u64) -> Result<Self, CentralIndexKeyRefusal> {

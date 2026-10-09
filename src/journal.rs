@@ -12,31 +12,18 @@ use crate::common::time::SessionDate;
 use chrono::{DateTime, Utc};
 
 /// Why a journal's history was not read whole.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
+    #[error("{0}")]
     Io(io::Error),
     /// A complete record this build cannot read.
+    #[error("{} line {line} is a record this build cannot read: {cause:?}", .file.display())]
     Unreadable {
         file: PathBuf,
         line: usize,
         cause: UnreadableCause,
     },
 }
-
-impl std::fmt::Display for HistoryError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "{error}"),
-            Self::Unreadable { file, line, cause } => write!(
-                formatter,
-                "{} line {line} is a record this build cannot read: {cause:?}",
-                file.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for HistoryError {}
 
 impl From<io::Error> for HistoryError {
     fn from(error: io::Error) -> Self {
@@ -199,21 +186,12 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 /// Why a run did not start: another holds the lock, or the lock could not be taken at all.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LockRefusal {
+    #[error("another run holds {}", .path.display())]
     Held { path: PathBuf },
+    #[error("locking {} failed: {error}", .path.display())]
     Unavailable { path: PathBuf, error: io::Error },
-}
-
-impl std::fmt::Display for LockRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Held { path } => write!(formatter, "another run holds {}", path.display()),
-            Self::Unavailable { path, error } => {
-                write!(formatter, "locking {} failed: {error}", path.display())
-            }
-        }
-    }
 }
 
 /// Takes the lock each run of `service` must hold, so two runs never act at once; the operating system releases it

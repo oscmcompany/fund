@@ -234,38 +234,25 @@ pub async fn latest_snapshot(
 fn newest_before(paths: &[String], before: Option<SessionDate>) -> Option<ReferenceKey> {
     paths
         .iter()
-        .filter_map(|path| Key::parse(path).ok())
+        .filter_map(|path| path.parse::<Key>().ok())
         .filter_map(|key| ReferenceKey::try_from(key).ok())
         .filter(|key| before.is_none_or(|before| key.as_of() < before))
         .max_by_key(ReferenceKey::as_of)
 }
 
 /// Why no conditions table was read.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SnapshotError {
+    #[error("{0}")]
     Archive(ArchiveError),
+    #[error("no conditions table in the archive")]
     Absent,
     /// Listed, then gone when read.
-    Vanished {
-        key: ReferenceKey,
-    },
+    #[error("{} vanished", Key::from(*.key).path())]
+    Vanished { key: ReferenceKey },
+    #[error("the conditions table did not read: {0:?}")]
     Decode(ReferenceRefusal),
 }
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Absent => write!(formatter, "no conditions table in the archive"),
-            Self::Vanished { key } => write!(formatter, "{} vanished", Key::from(*key).path()),
-            Self::Decode(refusal) => {
-                write!(formatter, "the conditions table did not read: {refusal:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
 
 /// The newest conditions snapshot the archive holds, with its key.
 pub async fn latest_conditions(

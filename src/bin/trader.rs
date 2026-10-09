@@ -14,8 +14,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::Instrument;
 
 use fund::archive::reference::{SnapshotError, latest_conditions};
-use fund::archive::trade_bars::{DecodeRefusal, decode};
-use fund::archive::{Archive, ArchiveError};
+use fund::archive::{Archive, ArchiveError, parquet, trade_bars};
 use fund::broker::{Broker, BrokerError, PaperAccount};
 use fund::common::book::ValuationRefusal;
 use fund::common::journal::{Observation, SessionOpened};
@@ -154,105 +153,63 @@ enum Stopped {
 }
 
 /// Why a session did not start, kept as the refused step's own cause.
+#[derive(Debug, thiserror::Error)]
 enum StartRefusal {
+    #[error("the archive client refused: {0}")]
     Archive(VariableRefusal),
+    #[error("the Alpaca client refused: {0}")]
     Alpaca(VariableRefusal),
-    PlaybookUnread {
-        path: PathBuf,
-        error: io::Error,
-    },
+    #[error("playbook {} unread: {error}", .path.display())]
+    PlaybookUnread { path: PathBuf, error: io::Error },
+    #[error("playbook {} refused: {refusal}", .path.display())]
     Playbook {
         path: PathBuf,
         refusal: PlaybookRefusal,
     },
+    #[error("the paper account refused: {0}")]
     NotPaper(BrokerError),
+    #[error("the calendar was not read: {0}")]
     Calendar(FetchError),
-    AfterClose {
-        close: DateTime<Utc>,
-    },
+    #[error("the session closed at {close}")]
+    AfterClose { close: DateTime<Utc> },
+    #[error("the conditions were not read: {0}")]
     Conditions(SnapshotError),
+    #[error("the book was not read: {0}")]
     Book(BrokerError),
+    #[error("{0}")]
     PreviousSession(PreviousRefusal),
+    #[error("the opening was not valued: {0}")]
     Opening(ValuationRefusal),
+    #[error("the journal refused a write: {0}")]
     Journal(io::Error),
 }
 
-impl std::fmt::Display for StartRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Archive(refusal) => write!(formatter, "the archive client refused: {refusal}"),
-            Self::Alpaca(refusal) => write!(formatter, "the Alpaca client refused: {refusal}"),
-            Self::PlaybookUnread { path, error } => {
-                write!(formatter, "playbook {} unread: {error}", path.display())
-            }
-            Self::Playbook { path, refusal } => {
-                write!(formatter, "playbook {} refused: {refusal}", path.display())
-            }
-            Self::NotPaper(error) => write!(formatter, "the paper account refused: {error}"),
-            Self::Calendar(error) => write!(formatter, "the calendar was not read: {error}"),
-            Self::AfterClose { close } => write!(formatter, "the session closed at {close}"),
-            Self::Conditions(error) => write!(formatter, "the conditions were not read: {error}"),
-            Self::Book(error) => write!(formatter, "the book was not read: {error}"),
-            Self::PreviousSession(refusal) => write!(formatter, "{refusal}"),
-            Self::Opening(refusal) => write!(formatter, "the opening was not valued: {refusal}"),
-            Self::Journal(error) => write!(formatter, "the journal refused a write: {error}"),
-        }
-    }
-}
-
 /// Why the previous session's bars did not warm the state.
+#[derive(Debug, thiserror::Error)]
 enum PreviousRefusal {
-    NoTradingDay {
-        today: SessionDate,
-    },
+    #[error("no trading day in the {CALENDAR_DAYS_BACK} days before {today}")]
+    NoTradingDay { today: SessionDate },
+    #[error("the previous session was not read: {0}")]
     Archive(ArchiveError),
-    NotArchived {
-        key: TradesKey,
-    },
+    #[error("{} is not archived", Key::from(*.key).path())]
+    NotArchived { key: TradesKey },
+    #[error("{} not decoded: {refusal}", Key::from(*.key).path())]
     Decode {
         key: TradesKey,
-        refusal: DecodeRefusal,
+        refusal: parquet::DecodeRefusal,
     },
-}
-
-impl std::fmt::Display for PreviousRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoTradingDay { today } => write!(
-                formatter,
-                "no trading day in the {CALENDAR_DAYS_BACK} days before {today}"
-            ),
-            Self::Archive(error) => write!(formatter, "the previous session was not read: {error}"),
-            Self::NotArchived { key } => {
-                write!(formatter, "{} is not archived", Key::from(*key).path())
-            }
-            Self::Decode { key, refusal } => {
-                write!(
-                    formatter,
-                    "{} not decoded: {refusal}",
-                    Key::from(*key).path()
-                )
-            }
-        }
-    }
 }
 
 /// Why a session that had opened stopped trading.
+#[derive(Debug, thiserror::Error)]
 enum TradingStop {
+    #[error("{0}")]
     Session(SessionError),
     /// The feed never ends, so a closed channel means its task panicked.
+    #[error("the feed task ended")]
     FeedEnded,
+    #[error("the book was not read at the close: {0}")]
     Book(BrokerError),
-}
-
-impl std::fmt::Display for TradingStop {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Session(error) => write!(formatter, "{error}"),
-            Self::FeedEnded => write!(formatter, "the feed task ended"),
-            Self::Book(error) => write!(formatter, "the book was not read at the close: {error}"),
-        }
-    }
 }
 
 /// How a session ended, as journaled; a halt's cause is journaled when it happens, and a stop's reason is logged.
@@ -439,7 +396,7 @@ async fn previous_bars(
         Some(bytes) => bytes,
         None => return Err(PreviousRefusal::NotArchived { key }),
     };
-    let (bars, _) = match decode(&key, bytes) {
+    let (bars, _) = match trade_bars::decode(&key, bytes) {
         Ok(decoded) => decoded,
         Err(refusal) => return Err(PreviousRefusal::Decode { key, refusal }),
     };
@@ -493,8 +450,7 @@ async fn sleep_until(instant: DateTime<Utc>) {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
-    use fund::archive::parquet::ReadRefusal;
-    use fund::execution::{JournalFailed, ReconcileFailed};
+    use fund::execution::{JournalFailure, ReconcileFailure};
 
     fn disk_full() -> io::Error {
         io::Error::other("disk full")
@@ -577,7 +533,7 @@ mod tests {
             },
             PreviousRefusal::Decode {
                 key: previous_key(),
-                refusal: DecodeRefusal::File(ReadRefusal::Layout {
+                refusal: parquet::DecodeRefusal::File(parquet::ReadRefusal::Layout {
                     version: "9".to_string(),
                 }),
             },
@@ -597,13 +553,13 @@ mod tests {
     #[test]
     fn test_each_trading_stop_displays_its_cause() {
         let displayed = [
-            TradingStop::Session(SessionError::Journal(JournalFailed::before_any_order(
+            TradingStop::Session(SessionError::Journal(JournalFailure::before_any_order(
                 disk_full(),
             ))),
-            TradingStop::Session(SessionError::Reconcile(ReconcileFailed::Journal(
-                JournalFailed::before_any_order(disk_full()),
+            TradingStop::Session(SessionError::Reconcile(ReconcileFailure::Journal(
+                JournalFailure::before_any_order(disk_full()),
             ))),
-            TradingStop::Session(SessionError::Reconcile(ReconcileFailed::Unread(
+            TradingStop::Session(SessionError::Reconcile(ReconcileFailure::Unread(
                 BrokerError::NotPaper,
             ))),
             TradingStop::FeedEnded,

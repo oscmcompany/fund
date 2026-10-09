@@ -667,23 +667,24 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap())
     }
 
-    /// Rows trimmed from the live grouped daily for 2026-09-25, probed with the development key.
+    /// A grouped daily for 2026-09-25 with invented values in Massive's shape: every notation the mapper meets,
+    /// fractional volumes, rows without `vw` or `n`, and two exchange test tickers.
     const FIXTURE: &str = r#"{"results":[
-        {"T":"INEO","v":51938,"vw":0.6123,"o":0.59,"c":0.6356,"h":0.6536,"l":0.59,"t":1790366400000,"n":203},
-        {"T":"PEBpF","v":16902.906,"vw":19.6913,"o":19.79,"c":19.66,"h":19.79,"l":19.48,"t":1790366400000,"n":175},
-        {"T":"GTOQ","v":2577.8477,"vw":21.7639,"o":21.8,"c":21.775,"h":21.8,"l":21.7301,"t":1790366400000,"n":51},
-        {"T":"CRVL","v":213849.305802,"vw":74.6122,"o":73.73,"c":74.33,"h":75,"l":73.73,"t":1790366400000,"n":7494},
-        {"T":"PHXEp","v":16951.6951,"vw":28.1291,"o":28.5,"c":28.0713,"h":28.5,"l":27.8101,"t":1790366400000,"n":114},
-        {"T":"BRK.B","v":2994434.093355,"vw":504.8007,"o":505.25,"c":505.48,"h":505.87,"l":502.24,"t":1790366400000,"n":88853},
-        {"T":"BCpC","v":3328,"vw":23.5217,"o":23.45,"c":23.97,"h":23.97,"l":23.4001,"t":1790366400000,"n":43},
-        {"T":"AAPL","v":30002507.354057,"vw":339.4037,"o":336.04,"c":341.07,"h":341.67,"l":334.53,"t":1790366400000,"n":606476},
-        {"T":"NE.WS.A","v":389,"vw":21.3059,"o":21.36,"c":21.36,"h":21.36,"l":21.36,"t":1790366400000,"n":6},
-        {"T":"SBXD.U","v":2117,"vw":11.3604,"o":11.13,"c":11.52,"h":11.52,"l":11.13,"t":1790366400000,"n":16},
-        {"T":"BCATrw","v":1869.1711,"vw":0.01837,"o":0.02,"c":0.0158,"h":0.02,"l":0.0157,"t":1790366400000,"n":143},
-        {"T":"AIIAr","v":744,"vw":0.155,"o":0.155,"c":0.155,"h":0.155,"l":0.155,"t":1790366400000,"n":6},
+        {"T":"ABE","v":52000,"vw":0.6125,"o":0.59,"c":0.635,"h":0.655,"l":0.59,"t":1790366400000,"n":200},
+        {"T":"ABFpF","v":16900.5,"vw":19.625,"o":19.75,"c":19.6,"h":19.75,"l":19.5,"t":1790366400000,"n":175},
+        {"T":"ABG","v":2577.75,"vw":21.75,"o":21.8,"c":21.775,"h":21.8,"l":21.7301,"t":1790366400000,"n":50},
+        {"T":"ABD","v":210482.125375,"vw":74.5,"o":73.75,"c":74.25,"h":75,"l":73.5,"t":1790366400000,"n":7500},
+        {"T":"ABHp","v":16950.25,"vw":28.125,"o":28.5,"c":28.05,"h":28.5,"l":27.8101,"t":1790366400000,"n":110},
+        {"T":"ABC.B","v":3000000.125,"vw":500.25,"o":500.5,"c":501,"h":502,"l":499.5,"t":1790366400000,"n":90000},
+        {"T":"ABIpC","v":3300,"vw":23.5,"o":23.45,"c":23.9,"h":23.9,"l":23.4001,"t":1790366400000,"n":40},
+        {"T":"ABC","v":30000000.25,"vw":340.5,"o":336,"c":341,"h":342,"l":335,"t":1790366400000,"n":600000},
+        {"T":"ABJ.WS.A","v":400,"vw":21.25,"o":21.25,"c":21.25,"h":21.25,"l":21.25,"t":1790366400000,"n":6},
+        {"T":"ABK.U","v":2100,"vw":11.25,"o":11.1,"c":11.5,"h":11.5,"l":11.1,"t":1790366400000,"n":16},
+        {"T":"ABLrw","v":1870.5,"vw":0.01825,"o":0.02,"c":0.0158,"h":0.02,"l":0.0157,"t":1790366400000,"n":140},
+        {"T":"ABMr","v":750,"vw":0.155,"o":0.155,"c":0.155,"h":0.155,"l":0.155,"t":1790366400000,"n":6},
         {"T":"ZBZX","v":0,"o":25,"c":25,"h":25,"l":25,"t":1790366400000},
         {"T":"ZTST","v":0,"o":12345,"c":12345,"h":12345,"l":12345,"t":1790366400000}
-    ],"queryCount":14,"resultsCount":14,"adjusted":false,"status":"OK","request_id":"34b9c2486d430c6996d16b5cc67afae0","count":14}"#;
+    ],"queryCount":14,"resultsCount":14,"adjusted":false,"status":"OK","request_id":"00000000000000000000000000000001","count":14}"#;
 
     fn fixture() -> SessionBars {
         parse_grouped_daily(FIXTURE.as_bytes(), session()).unwrap()
@@ -729,7 +730,7 @@ mod tests {
         assert_eq!(
             bars,
             [
-                "AAPL", "AIIA.RT", "BC.PRC", "BRK.B", "CRVL", "GTOQ", "INEO", "PEB.PRF", "SBXD.U"
+                "ABC", "ABC.B", "ABD", "ABE", "ABF.PRF", "ABG", "ABI.PRC", "ABK.U", "ABM.RT"
             ]
         );
         assert_eq!(daily.test_tickers, ["ZBZX", "ZTST"]);
@@ -789,17 +790,17 @@ mod tests {
     #[test]
     fn test_a_grouped_row_becomes_a_daily_bar_at_the_close() {
         let daily = fixture();
-        let crvl = daily
+        let abd = daily
             .bars
             .iter()
-            .find(|bar| bar.symbol().as_str() == "CRVL")
+            .find(|bar| bar.symbol().as_str() == "ABD")
             .unwrap();
-        assert_eq!(crvl.timestamp().to_rfc3339(), "2026-09-25T20:00:00+00:00");
-        assert_eq!(crvl.volume().to_string(), "213849.305802");
-        assert_eq!(crvl.trade_count(), Some(TradeCount::new(7494)));
-        let average = crvl.volume_weighted_average_price().unwrap();
-        assert!((average - 74.6122).abs() < 1e-9, "{average}");
-        assert_eq!(crvl.prices().open().to_string(), "73.73");
+        assert_eq!(abd.timestamp().to_rfc3339(), "2026-09-25T20:00:00+00:00");
+        assert_eq!(abd.volume().to_string(), "210482.125375");
+        assert_eq!(abd.trade_count(), Some(TradeCount::new(7500)));
+        let average = abd.volume_weighted_average_price().unwrap();
+        assert!((average - 74.5).abs() < 1e-9, "{average}");
+        assert_eq!(abd.prices().open().to_string(), "73.75");
     }
 
     #[test]
@@ -965,15 +966,15 @@ mod tests {
         }
     }
 
-    /// Massive's splits endpoint on 2026-10-07: its first row, a fractional ratio and the cursor, plus a zero side.
-    const SPLITS_PAGE: &str = r#"{"results":[{"execution_date":"2026-12-17","id":"Ee311332e3f60ade13ccbf987b2d89b2085533e7db481fe8b311b5d167e949c8e","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-10-23","id":"E3366d86694dc48ac06cd3a951a03c211a348540830849916066a920737090ee3","split_from":1,"split_to":0.7137,"ticker":"VSEAX"},{"execution_date":"2026-11-02","id":"Eabc","split_from":1,"split_to":0,"ticker":"ZERO"}],"status":"OK","request_id":"191409f29929687bb8cc5810c2fa7054","next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU"}"#;
+    /// A splits page with invented values in Massive's shape: a reverse split, a fractional ratio, a zero side and a cursor.
+    const SPLITS_PAGE: &str = r#"{"results":[{"execution_date":"2026-12-17","id":"E0000000000000000000000000000000000000000000000000000000000000001","split_from":50,"split_to":1,"ticker":"ABC"},{"execution_date":"2026-10-23","id":"E0000000000000000000000000000000000000000000000000000000000000002","split_from":1,"split_to":0.625,"ticker":"ABD"},{"execution_date":"2026-11-02","id":"Eabc","split_from":1,"split_to":0,"ticker":"ZERO"}],"status":"OK","request_id":"00000000000000000000000000000002","next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MiZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU"}"#;
 
     #[test]
     fn test_a_splits_page_keeps_fractional_ratios_and_answers_only_its_cursor() {
         let (splits, cursor) = parse_splits_page(SPLITS_PAGE.as_bytes()).unwrap();
         assert_eq!(
             cursor.as_deref(),
-            Some("YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU")
+            Some("YXA9MiZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU")
         );
         let read: Vec<(String, String, u64, u64)> = splits
             .splits
@@ -991,16 +992,16 @@ mod tests {
             read,
             [
                 (
-                    "DPU".to_string(),
+                    "ABC".to_string(),
                     "2026-12-17".to_string(),
                     50_000_000,
                     1_000_000
                 ),
                 (
-                    "VSEAX".to_string(),
+                    "ABD".to_string(),
                     "2026-10-23".to_string(),
                     1_000_000,
-                    713_700
+                    625_000
                 ),
             ]
         );
@@ -1010,7 +1011,7 @@ mod tests {
             "split_ratio"
         );
         let last = SPLITS_PAGE.replace(
-            r#""next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU""#,
+            r#""next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MiZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU""#,
             r#""next_url":null"#,
         );
         assert_eq!(
@@ -1025,7 +1026,7 @@ mod tests {
             .map(|split| split.symbol().as_str())
             .collect();
         kept.sort_unstable();
-        assert_eq!(kept, ["DPU", "VSEAX"]);
+        assert_eq!(kept, ["ABC", "ABD"]);
         assert!(
             unique
                 .refused()
@@ -1033,7 +1034,7 @@ mod tests {
                 .all(|row| row.cause() != &RowRefusal::Duplicate)
         );
         // Two copies that disagree on the ratio: nothing says which is true, so neither is kept.
-        let conflicting = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":40,"split_to":1,"ticker":"DPU"}],"next_url":null}"#;
+        let conflicting = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"ABC"},{"execution_date":"2026-12-17","id":"E1","split_from":40,"split_to":1,"ticker":"ABC"}],"next_url":null}"#;
         let unique = parse_splits_page(conflicting.as_bytes())
             .unwrap()
             .0
@@ -1082,8 +1083,8 @@ mod tests {
 
     #[test]
     fn test_an_action_repeated_beside_a_refused_copy_is_refused_too() {
-        // DPU's action filed again under a ticker no symbol holds: the valid copy cannot be trusted either.
-        let page = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU.WARRANTS"}],"next_url":null}"#;
+        // ABC's action filed again under a ticker no symbol holds: the valid copy cannot be trusted either.
+        let page = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"ABC"},{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"ABC.WARRANTS"}],"next_url":null}"#;
         let unique = parse_splits_page(page.as_bytes()).unwrap().0.unique();
         assert!(unique.splits().is_empty());
         let causes: Vec<&str> = unique
@@ -1096,44 +1097,45 @@ mod tests {
 
     #[test]
     fn test_details_read_every_field_and_refuse_an_answer_about_another_ticker() {
-        // AAPL and BACpL as Massive answered for 2026-10-01, trimmed to the fields kept.
-        let apple = r#"{"results":{"ticker":"AAPL","type":"CS","sic_code":"3571","sic_description":"ELECTRONIC COMPUTERS","share_class_shares_outstanding":14594180000,"market_cap":4820749537600.0,"primary_exchange":"XNAS","cik":"0000320193"},"status":"OK"}"#;
-        let preferred = r#"{"results":{"ticker":"BACpL","type":"PFD","sic_code":"6021","sic_description":"NATIONAL COMMERCIAL BANKS","share_class_shares_outstanding":3080000,"primary_exchange":"XNYS","cik":"0000070858"},"status":"OK"}"#;
-        let aapl = Symbol::new("AAPL").unwrap();
+        // Invented values in Massive's shape: a common stock whose capitalization nears the millionths width, and a
+        // preferred share in Massive's `p` notation without one.
+        let common = r#"{"results":{"ticker":"ABC","type":"CS","sic_code":"3571","sic_description":"ELECTRONIC COMPUTERS","share_class_shares_outstanding":15000000000,"market_cap":5100000000000.0,"primary_exchange":"XNAS","cik":"0000012345"},"status":"OK"}"#;
+        let preferred = r#"{"results":{"ticker":"ABDpL","type":"PFD","sic_code":"6021","sic_description":"NATIONAL COMMERCIAL BANKS","share_class_shares_outstanding":3000000,"primary_exchange":"XNYS","cik":"0000054321"},"status":"OK"}"#;
+        let abc = Symbol::new("ABC").unwrap();
         let DetailsAnswer::Details(details) =
-            parse_security_details(apple.as_bytes(), &aapl, "AAPL").unwrap()
+            parse_security_details(common.as_bytes(), &abc, "ABC").unwrap()
         else {
-            panic!("AAPL did not read");
+            panic!("ABC did not read");
         };
         assert_eq!(details.security_type(), Some(SecurityType::CommonStock));
         assert_eq!(details.industry_code().map(IndustryCode::code), Some(3571));
         assert_eq!(
             details.shares_outstanding().map(Shares::units),
-            Some(14_594_180_000_000_000)
+            Some(15_000_000_000_000_000)
         );
         assert_eq!(
             details.market_capitalization().map(Dollars::millionths),
-            Some(4_820_749_537_600_000_000)
+            Some(5_100_000_000_000_000_000)
         );
         assert_eq!(
             details.central_index_key().map(CentralIndexKey::value),
-            Some(320_193)
+            Some(12_345)
         );
-        let bac = Symbol::new("BAC.PRL").unwrap();
-        assert_eq!(massive_ticker(&bac), "BACpL");
+        let abd = Symbol::new("ABD.PRL").unwrap();
+        assert_eq!(massive_ticker(&abd), "ABDpL");
         let DetailsAnswer::Details(details) =
-            parse_security_details(preferred.as_bytes(), &bac, "BACpL").unwrap()
+            parse_security_details(preferred.as_bytes(), &abd, "ABDpL").unwrap()
         else {
-            panic!("BACpL did not read");
+            panic!("ABDpL did not read");
         };
-        assert_eq!(details.symbol(), &bac);
+        assert_eq!(details.symbol(), &abd);
         assert_eq!(details.market_capitalization(), None);
         assert!(matches!(
-            parse_security_details(apple.as_bytes(), &bac, "BACpL"),
+            parse_security_details(common.as_bytes(), &abd, "ABDpL"),
             Ok(DetailsAnswer::Refused(row)) if row.cause() == &RowRefusal::Unrequested
         ));
         assert_eq!(
-            parse_security_details(br#"{"status":"OK"}"#, &aapl, "AAPL"),
+            parse_security_details(br#"{"status":"OK"}"#, &abc, "ABC"),
             Ok(DetailsAnswer::Missing)
         );
     }
