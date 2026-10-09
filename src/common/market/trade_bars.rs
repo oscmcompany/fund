@@ -33,9 +33,15 @@ impl UpdateRules {
         high_low: false,
         open_close: false,
     };
+}
 
-    /// The updates both rules allow.
-    fn and(self, other: Self) -> Self {
+/// Rules combine to the updates both allow, so a print's conditions fold to what all of them allow.
+impl Monoid for UpdateRules {
+    fn empty() -> Self {
+        Self::EVERYTHING
+    }
+
+    fn combine(self, other: Self) -> Self {
         Self {
             volume: self.volume && other.volume,
             high_low: self.high_low && other.high_low,
@@ -190,6 +196,18 @@ pub enum Eligibility {
     Unresolved(Unplaced),
 }
 
+impl Eligibility {
+    /// What every placed rule allows together, or the first condition that could not be placed.
+    fn of(mut placed: impl Iterator<Item = Result<UpdateRules, Unplaced>>) -> Self {
+        match placed.try_fold(UpdateRules::empty(), |allowed, rules| {
+            rules.map(|rules| allowed.combine(rules))
+        }) {
+            Ok(allowed) => Self::Resolved(allowed),
+            Err(unplaced) => Self::Unresolved(unplaced),
+        }
+    }
+}
+
 /// Why a print's condition could not be placed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Unplaced {
@@ -254,40 +272,29 @@ impl TradeConditions {
 
     /// The rules a print with numeric `codes` falls under: each update allowed only if every code allows it.
     pub fn eligibility(&self, codes: &[ConditionCode]) -> Eligibility {
-        let mut allowed = UpdateRules::EVERYTHING;
-        for code in codes {
-            match self.conditions.get(code) {
-                Some(condition) => allowed = allowed.and(condition.rules),
-                None => return Eligibility::Unresolved(Unplaced::UnknownCode { code: *code }),
-            }
-        }
-        Eligibility::Resolved(allowed)
+        Eligibility::of(codes.iter().map(|code| match self.conditions.get(code) {
+            Some(condition) => Ok(condition.rules),
+            None => Err(Unplaced::UnknownCode { code: *code }),
+        }))
     }
 
     /// The rules a print reported on `tape` with condition `letters` falls under; the regular-sale letter adds none.
     pub fn eligibility_of_letters(&self, tape: Tape, letters: &[ConditionLetter]) -> Eligibility {
-        let mut allowed = UpdateRules::EVERYTHING;
-        for letter in letters
+        let placed = letters
             .iter()
             .filter(|letter| **letter != tape.regular_sale())
-        {
-            match self.letters.get(&(tape, *letter)) {
-                Some(Some(rules)) => allowed = allowed.and(*rules),
-                Some(None) => {
-                    return Eligibility::Unresolved(Unplaced::AmbiguousLetter {
-                        tape,
-                        letter: *letter,
-                    });
-                }
-                None => {
-                    return Eligibility::Unresolved(Unplaced::UnknownLetter {
-                        tape,
-                        letter: *letter,
-                    });
-                }
-            }
-        }
-        Eligibility::Resolved(allowed)
+            .map(|letter| match self.letters.get(&(tape, *letter)) {
+                Some(Some(rules)) => Ok(*rules),
+                Some(None) => Err(Unplaced::AmbiguousLetter {
+                    tape,
+                    letter: *letter,
+                }),
+                None => Err(Unplaced::UnknownLetter {
+                    tape,
+                    letter: *letter,
+                }),
+            });
+        Eligibility::of(placed)
     }
 }
 
@@ -1244,6 +1251,21 @@ mod tests {
                 letter: ConditionLetter::of('Z')
             })
         );
+        // A narrowing letter before them changes nothing, and the first letter that cannot be placed is the one named.
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::UnlistedTrading, &letters(&['I', 'Z', 'X'])),
+            Eligibility::Unresolved(Unplaced::UnknownLetter {
+                tape: Tape::UnlistedTrading,
+                letter: ConditionLetter::of('Z')
+            })
+        );
+        assert_eq!(
+            conditions.eligibility_of_letters(Tape::UnlistedTrading, &letters(&['X', 'Z'])),
+            Eligibility::Unresolved(Unplaced::AmbiguousLetter {
+                tape: Tape::UnlistedTrading,
+                letter: ConditionLetter::of('X')
+            })
+        );
     }
 
     #[test]
@@ -1503,7 +1525,26 @@ mod tests {
         assert_eq!((counts.folded(), counts.late()), (3, 1));
     }
 
+    fn any_rules() -> impl Strategy<Value = UpdateRules> {
+        any::<(bool, bool, bool)>().prop_map(|(volume, high_low, open_close)| UpdateRules {
+            volume,
+            high_low,
+            open_close,
+        })
+    }
+
     proptest! {
+        /// Rules narrow in any order and any grouping, and a condition repeated narrows nothing further.
+        #[test]
+        fn property_update_rules_are_an_idempotent_commutative_monoid(
+            first in any_rules(),
+            second in any_rules(),
+            third in any_rules(),
+        ) {
+            laws::check(first, second, third)?;
+            prop_assert_eq!(first.combine(first), first);
+        }
+
         /// Bars handed out minute by minute as the clock passes them, then by `finish`, are the bars folding the same
         /// prints whole gives, whatever the drain points, when prints arrive in time order.
         #[test]

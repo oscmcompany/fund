@@ -9,6 +9,7 @@ use super::super::{RefusedRow, RowRefusal};
 use super::{Alpaca, paginate};
 use crate::common::market::Symbol;
 use crate::common::market::corporate_actions::{ActionId, BoundaryChange, SeriesBoundary};
+use crate::common::monoid::{Monoid, concatenate};
 use crate::common::time::{SessionDate, SessionRange};
 
 const CORPORATE_ACTIONS_URL: &str = "https://data.alpaca.markets/v1/corporate-actions";
@@ -20,7 +21,7 @@ const BOUNDARY_TYPES: &str = "name_change,spin_off,rights_distribution,unit_spli
 const PAGE_LIMIT: &str = "1000";
 
 /// The boundaries Alpaca processed over a window, with every row that did not become one.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SeriesBoundaries {
     boundaries: Vec<SeriesBoundary>,
     refused: Vec<RefusedRow>,
@@ -33,6 +34,22 @@ impl SeriesBoundaries {
 
     pub fn refused(&self) -> &[RefusedRow] {
         &self.refused
+    }
+}
+
+/// Pages and windows concatenate in the order they were read.
+impl Monoid for SeriesBoundaries {
+    fn empty() -> Self {
+        Self {
+            boundaries: Vec::new(),
+            refused: Vec::new(),
+        }
+    }
+
+    fn combine(mut self, other: Self) -> Self {
+        self.boundaries.extend(other.boundaries);
+        self.refused.extend(other.refused);
+        self
     }
 }
 
@@ -64,11 +81,11 @@ impl Alpaca {
             .await
         })
         .await?;
-        let mut read = SeriesBoundaries::default();
-        for page in pages {
-            parse_boundaries_page(&page, &mut read)?;
-        }
-        Ok(read)
+        let read = pages
+            .iter()
+            .map(|page| parse_boundaries_page(page))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(concatenate(read))
     }
 }
 
@@ -145,9 +162,9 @@ struct Action {
     change: Result<BoundaryChange, RowRefusal>,
 }
 
-/// Adds one page's boundaries to `read`. The feed fills symbol fields with CUSIP placeholders and reports renames that
-/// change no symbol, so most refusals are routine.
-fn parse_boundaries_page(body: &[u8], read: &mut SeriesBoundaries) -> Result<(), FetchError> {
+/// One page's boundaries. The feed fills symbol fields with CUSIP placeholders and reports renames that change no
+/// symbol, so most refusals are routine.
+fn parse_boundaries_page(body: &[u8]) -> Result<SeriesBoundaries, FetchError> {
     let page: CorporateActionsPage =
         serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
             reason: error.to_string(),
@@ -196,6 +213,7 @@ fn parse_boundaries_page(body: &[u8], read: &mut SeriesBoundaries) -> Result<(),
             processed_on: row.process_date,
             change: Ok(BoundaryChange::Reorganized),
         }));
+    let mut read = SeriesBoundaries::empty();
     for action in actions {
         let ticker = action.symbol.clone();
         match boundary(action) {
@@ -203,7 +221,7 @@ fn parse_boundaries_page(body: &[u8], read: &mut SeriesBoundaries) -> Result<(),
             Err(cause) => read.refused.push(RefusedRow { ticker, cause }),
         }
     }
-    Ok(())
+    Ok(read)
 }
 
 fn related(raw: &str) -> Result<Symbol, RowRefusal> {
@@ -228,7 +246,10 @@ fn boundary(action: Action) -> Result<SeriesBoundary, RowRefusal> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::common::monoid::laws;
 
     /// Rows of each category Alpaca answered for 2025-10-07 to 2026-10-07: a rename and one that changes no symbol, a
     /// spin-off, a rights distribution, a unit separation, and a reorganization beside one filed under a CUSIP.
@@ -236,8 +257,7 @@ mod tests {
 
     #[test]
     fn test_each_category_becomes_the_boundary_it_describes() {
-        let mut read = SeriesBoundaries::default();
-        parse_boundaries_page(PAGE.as_bytes(), &mut read).unwrap();
+        let read = parse_boundaries_page(PAGE.as_bytes()).unwrap();
         let boundaries: Vec<String> = read
             .boundaries()
             .iter()
@@ -273,20 +293,40 @@ mod tests {
     #[test]
     fn test_an_action_with_no_date_is_refused_and_an_empty_page_reads_as_none() {
         let undated = r#"{"corporate_actions": {"reorganizations": [{"id": "x", "symbol": "ACQC", "process_date": "2026-07-24"}]}}"#;
-        let mut read = SeriesBoundaries::default();
-        parse_boundaries_page(undated.as_bytes(), &mut read).unwrap();
+        let read = parse_boundaries_page(undated.as_bytes()).unwrap();
         assert!(read.boundaries().is_empty());
         assert_eq!(read.refused()[0].cause(), &RowRefusal::Undated);
-        let mut empty = SeriesBoundaries::default();
-        parse_boundaries_page(
-            br#"{"corporate_actions": {}, "next_page_token": null}"#,
-            &mut empty,
-        )
-        .unwrap();
-        assert_eq!(empty, SeriesBoundaries::default());
+        assert_eq!(
+            parse_boundaries_page(br#"{"corporate_actions": {}, "next_page_token": null}"#),
+            Ok(SeriesBoundaries::empty())
+        );
         assert!(matches!(
-            parse_boundaries_page(br#"{"next_page_token": null}"#, &mut empty),
+            parse_boundaries_page(br#"{"next_page_token": null}"#),
             Err(FetchError::Malformed { .. })
         ));
+    }
+
+    /// Fragments cut from one page's boundaries and refusals, so the law test does not lean on `combine`.
+    fn any_fragment() -> impl Strategy<Value = SeriesBoundaries> {
+        let read = parse_boundaries_page(PAGE.as_bytes()).unwrap();
+        (
+            prop::sample::subsequence(read.boundaries, 0..=5),
+            prop::sample::subsequence(read.refused, 0..=2),
+        )
+            .prop_map(|(boundaries, refused)| SeriesBoundaries {
+                boundaries,
+                refused,
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn property_boundary_pages_concatenate_as_a_monoid(
+            first in any_fragment(),
+            second in any_fragment(),
+            third in any_fragment(),
+        ) {
+            laws::check_ordered(first, second, third)?;
+        }
     }
 }

@@ -32,7 +32,7 @@ use crate::common::journal::{
 };
 use crate::common::market::Symbol;
 use crate::common::market::aggregate::session_bars;
-use crate::common::market::corporate_actions::{SeriesBoundary, refresh_boundaries};
+use crate::common::market::corporate_actions::refresh_boundaries;
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
 use crate::common::market::record::Bar;
 use crate::common::market::security_details::SecurityDetails;
@@ -42,6 +42,7 @@ use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record, ref
 use crate::common::storage::{Key, Provider, ReferenceTable};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
+use crate::ingest::alpaca::corporate_actions::SeriesBoundaries;
 use crate::ingest::alpaca::{
     Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
 };
@@ -559,15 +560,12 @@ async fn write_series_boundaries(
             (Vec::new(), SessionDate::from_date(since))
         }
     };
-    let mut fetched: Vec<SeriesBoundary> = Vec::new();
-    let mut refused: Vec<RefusedRow> = Vec::new();
     let window = SessionRange::single(session).reaching_back_to(first);
+    let mut read = SeriesBoundaries::empty();
     for span in window.spans(BOUNDARY_REFRESH_DAYS) {
-        let read = clients.alpaca.series_boundaries(span).await?;
-        fetched.extend_from_slice(read.boundaries());
-        refused.extend_from_slice(read.refused());
+        read = read.combine(clients.alpaca.series_boundaries(span).await?);
     }
-    let boundaries = refresh_boundaries(&held, &fetched, window);
+    let boundaries = refresh_boundaries(&held, read.boundaries(), window);
     if boundaries.is_empty() {
         return Err(PartitionFailure::NoRows);
     }
@@ -580,14 +578,14 @@ async fn write_series_boundaries(
         Leg::AlpacaSeriesBoundaries,
         session,
         u64::try_from(boundaries.len()).expect("a table holds fewer than u64::MAX rows"),
-        refused_by_cause(&refused),
+        refused_by_cause(read.refused()),
         BTreeMap::new(),
         BTreeMap::new(),
     ))
 }
 
 /// What the details requests for a session answered, gathered across symbols.
-#[derive(Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct DetailsGathered {
     details: Vec<SecurityDetails>,
     missing: Vec<Symbol>,
@@ -923,7 +921,8 @@ mod tests {
     use crate::common::market::trade_bars::{
         Condition, ConditionCode, ConditionStatus, UpdateRules,
     };
-    use crate::common::monoid::Tally;
+    use crate::common::monoid::{Tally, laws};
+    use crate::ingest::RowRefusal;
 
     /// The batches' symbols in the order they were concatenated.
     #[derive(Debug, Clone, PartialEq)]
@@ -1438,6 +1437,46 @@ mod tests {
             .unwrap();
         assert_eq!(rows, [0, 1, 2, 3, 4]);
         assert!(unanswered.is_empty());
+    }
+
+    /// Built field by field rather than through `combine`, so the law test does not lean on what it checks.
+    fn any_gathered() -> impl proptest::strategy::Strategy<Value = DetailsGathered> {
+        use proptest::prelude::*;
+        let symbol = || {
+            prop::sample::select(vec!["AAA", "BBB", "CCC"])
+                .prop_map(|name| Symbol::new(name).unwrap())
+        };
+        let refusal = prop::sample::select(vec![RowRefusal::Duplicate, RowRefusal::Unrequested]);
+        (
+            prop::collection::vec(symbol(), 0..4),
+            prop::collection::vec(symbol(), 0..4),
+            prop::collection::vec(("[A-Z]{1,3}", refusal), 0..4),
+        )
+            .prop_map(|(details, missing, refused)| DetailsGathered {
+                details: details
+                    .into_iter()
+                    .map(|symbol| {
+                        SecurityDetails::new(symbol, None, None, None, None, None, None, None)
+                    })
+                    .collect(),
+                missing,
+                refused: refused
+                    .into_iter()
+                    .map(|(ticker, cause)| RefusedRow::new(&ticker, cause))
+                    .collect(),
+            })
+    }
+
+    proptest::proptest! {
+        /// Batches gather in the order they were asked, whatever grouping the concurrency happened to merge them in.
+        #[test]
+        fn property_gathered_details_concatenate_as_a_monoid(
+            first in any_gathered(),
+            second in any_gathered(),
+            third in any_gathered(),
+        ) {
+            laws::check_ordered(first, second, third)?;
+        }
     }
 
     #[tokio::test]

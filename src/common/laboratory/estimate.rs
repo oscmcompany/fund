@@ -835,25 +835,38 @@ mod tests {
                 <= 1e-6 * left.squared_deviations.max(1.0)
     }
 
+    /// Built from its fields rather than through `combine`: no deviation while fewer than two are measured, and no mean
+    /// while none is, as `combine` itself leaves them.
+    fn any_summary() -> impl Strategy<Value = Summary> {
+        (0_u64..30, 0_u64..30, -1000.0..1000.0f64, 0.0..1e6f64).prop_map(
+            |(measured, undefined, mean, squared_deviations)| Summary {
+                measured,
+                undefined,
+                mean: if measured == 0 { 0.0 } else { mean },
+                squared_deviations: if measured < 2 {
+                    0.0
+                } else {
+                    squared_deviations
+                },
+            },
+        )
+    }
+
     proptest! {
         #[test]
-        fn test_empty_is_the_identity_of_combine(readings in readings()) {
-            let summary = summarize(&series(0, &readings));
+        fn test_empty_is_the_identity_of_combine(summary in any_summary()) {
             prop_assert_eq!(Summary::EMPTY.combine(summary), summary);
             prop_assert_eq!(summary.combine(Summary::EMPTY), summary);
         }
 
+        /// Exact on the counts, and on the moments up to the rounding Chan's update carries.
         #[test]
-        fn test_combine_is_associative(first in readings(), second in readings(), third in readings()) {
-            let (first, second, third) = (
-                summarize(&series(0, &first)),
-                summarize(&series(0, &second)),
-                summarize(&series(0, &third)),
-            );
+        fn test_combine_is_associative_and_commutes(first in any_summary(), second in any_summary(), third in any_summary()) {
             prop_assert!(agree(
                 first.combine(second).combine(third),
                 first.combine(second.combine(third))
             ));
+            prop_assert!(agree(first.combine(second), second.combine(first)));
         }
 
         /// Summarizing joined partitions is combining their summaries, so a dataset read in pieces summarizes whole.

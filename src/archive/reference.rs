@@ -858,6 +858,44 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// A conditions table reads back exactly, any letter and every absence of one kept, retired or current.
+        #[test]
+        fn property_conditions_round_trip(
+            rows in proptest::collection::btree_map(
+                proptest::prelude::any::<u16>(),
+                (
+                    proptest::prelude::any::<(bool, bool, bool, bool)>(),
+                    proptest::option::of(proptest::prelude::any::<char>()),
+                    proptest::option::of(proptest::prelude::any::<char>()),
+                ),
+                0..20,
+            ),
+        ) {
+            let conditions = TradeConditions::new(
+                rows.into_iter()
+                    .map(|(code, ((volume, high_low, open_close, retired), consolidated, unlisted))| {
+                        let status = match retired {
+                            false => ConditionStatus::Current,
+                            true => ConditionStatus::Retired,
+                        };
+                        let condition = Condition::new(
+                            UpdateRules { volume, high_low, open_close },
+                            consolidated.map(ConditionLetter::of),
+                            unlisted.map(ConditionLetter::of),
+                            status,
+                        );
+                        (ConditionCode::new(code), condition)
+                    })
+                    .collect(),
+            );
+            let key = key(ReferenceTable::Conditions);
+            let written = encode_conditions(&key, &conditions, &snapshot_provenance()).unwrap();
+            proptest::prop_assert_eq!(
+                decode_conditions(&key, written),
+                Ok((conditions, snapshot_provenance()))
+            );
+        }
+
         /// A snapshot of unique symbols reads back exactly, every absence kept, in symbol order.
         #[test]
         fn property_security_details_round_trip(

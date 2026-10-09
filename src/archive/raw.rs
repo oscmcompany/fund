@@ -426,6 +426,8 @@ impl Part {
 
 #[cfg(test)]
 mod tests {
+    use proptest::strategy::Strategy;
+
     use super::*;
 
     const MEBIBYTE: u64 = 1024 * 1024;
@@ -461,5 +463,33 @@ mod tests {
                 (3, 128 * MEBIBYTE, 1),
             ]
         );
+    }
+
+    proptest::proptest! {
+        /// Parts are numbered from one, each starts where the last ended, every part but the last is a full 64 MiB, and
+        /// together they are the file.
+        #[test]
+        fn property_parts_tile_the_file(
+            length in proptest::prop_oneof![
+                0_u64..=20 * 64 * MEBIBYTE + 3,
+                (0_u64..=20, 0_u64..=2).prop_map(|(parts, offset)| (parts * 64 * MEBIBYTE + offset).saturating_sub(1)),
+            ],
+        ) {
+            let parts: Vec<(i32, u64, u64)> = ranges(length)
+                .map(|(number, start, part)| (number, start, part.get()))
+                .collect();
+            proptest::prop_assert_eq!(parts.len() as u64, length.div_ceil(64 * MEBIBYTE));
+            let mut end = 0;
+            for (index, (number, start, part)) in parts.iter().enumerate() {
+                proptest::prop_assert_eq!(*number as usize, index + 1);
+                proptest::prop_assert_eq!(*start, end);
+                proptest::prop_assert!(*part <= 64 * MEBIBYTE);
+                if index + 1 < parts.len() {
+                    proptest::prop_assert_eq!(*part, 64 * MEBIBYTE);
+                }
+                end = start + part;
+            }
+            proptest::prop_assert_eq!(end, length);
+        }
     }
 }

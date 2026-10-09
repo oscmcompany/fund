@@ -7,7 +7,7 @@ use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
 
 use super::retry::{FetchError, send, with_retries};
-use super::{Accepted, RefusedRow, RowRefusal, Secret, VariableRefusal, variable};
+use super::{Accepted, RefusedRow, RowRefusal, Secret, SessionBars, VariableRefusal, variable};
 use crate::common::market::corporate_actions::{ActionId, Split, SplitRatio};
 use crate::common::market::record::{Bar, BarInterval, BarPrices};
 use crate::common::market::security_details::{
@@ -19,6 +19,7 @@ use crate::common::market::trade_bars::{
 use crate::common::market::{
     DollarVolume, Dollars, DollarsRefusal, Price, Shares, Symbol, SymbolRefusal, TradeCount,
 };
+use crate::common::monoid::{Monoid, Tally};
 use crate::common::time::SessionDate;
 
 /// Exchange test tickers, which print in the grouped daily but are not securities. An exact list rather than a pattern,
@@ -39,30 +40,6 @@ pub struct Massive {
     http_client: reqwest::Client,
     base_url: String,
     api_key: Secret,
-}
-
-/// One session's daily bars, with every ticker that did not become one: each row of the response is exactly one of a
-/// bar, a test ticker or a refusal.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DailyBars {
-    bars: Vec<Bar>,
-    test_tickers: Vec<String>,
-    refused: Vec<RefusedRow>,
-}
-
-impl DailyBars {
-    /// One bar per symbol, in symbol order.
-    pub fn bars(&self) -> &[Bar] {
-        &self.bars
-    }
-
-    pub fn test_tickers(&self) -> &[String] {
-        &self.test_tickers
-    }
-
-    pub fn refused(&self) -> &[RefusedRow] {
-        &self.refused
-    }
 }
 
 #[derive(Deserialize)]
@@ -121,7 +98,7 @@ impl Massive {
     }
 
     /// Unadjusted daily bars for every exchange-listed ticker that traded on `session`.
-    pub async fn grouped_daily(&self, session: SessionDate) -> Result<DailyBars, FetchError> {
+    pub async fn grouped_daily(&self, session: SessionDate) -> Result<SessionBars, FetchError> {
         let url = format!(
             "{}/v2/aggs/grouped/locale/us/market/stocks/{session}",
             self.base_url
@@ -139,9 +116,9 @@ impl Massive {
     }
 
     /// Every split Massive has published, past and announced, as one table.
-    pub async fn splits(&self) -> Result<Splits, FetchError> {
+    pub async fn splits(&self) -> Result<SplitTable, FetchError> {
         let url = format!("{}/v3/reference/splits", self.base_url);
-        let mut splits = Splits::default();
+        let mut read = SplitPages::empty();
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
         for _ in 0..SPLITS_PAGES_AT_MOST {
@@ -158,8 +135,10 @@ impl Massive {
                 )
             })
             .await?;
-            match parse_splits_page(&body, &mut splits)? {
-                None => return Ok(splits.unique()),
+            let (page, next) = parse_splits_page(&body)?;
+            read = read.combine(page);
+            match next {
+                None => return Ok(read.unique()),
                 Some(next) if !seen.insert(next.clone()) => {
                     return Err(FetchError::Malformed {
                         reason: format!("splits cursor {next} repeated"),
@@ -203,20 +182,54 @@ const SPLITS_PAGE_LIMIT: &str = "1000";
 /// Far past the table's 29 pages, so a cursor that never ends is caught.
 const SPLITS_PAGES_AT_MOST: usize = 200;
 
-/// Massive's split table, with every row that did not become a split.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Splits {
+/// Massive's split table, one copy of each action, with every row that did not become a split.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitTable {
+    splits: Vec<Split>,
+    refused: Vec<RefusedRow>,
+}
+
+impl SplitTable {
+    pub fn splits(&self) -> &[Split] {
+        &self.splits
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
+}
+
+/// Split pages as read, an action Massive lists twice still listed twice.
+#[derive(Debug, Clone, PartialEq)]
+struct SplitPages {
     splits: Vec<Split>,
     refused: Vec<RefusedRow>,
     /// How often each identifier was listed, refused rows included.
-    listed: BTreeMap<String, usize>,
+    listed: Tally<String>,
 }
 
-impl Splits {
+/// Pages concatenate in the order they were read.
+impl Monoid for SplitPages {
+    fn empty() -> Self {
+        Self {
+            splits: Vec::new(),
+            refused: Vec::new(),
+            listed: Tally::empty(),
+        }
+    }
+
+    fn combine(mut self, other: Self) -> Self {
+        self.splits.extend(other.splits);
+        self.refused.extend(other.refused);
+        self.listed = self.listed.combine(other.listed);
+        self
+    }
+}
+
+impl SplitPages {
     /// The table with one copy of an action Massive lists more than once identically; copies that disagree, or a copy
     /// beside one refused, refuse every copy, since nothing says which is true.
-    fn unique(self) -> Self {
-        let listed = self.listed;
+    fn unique(self) -> SplitTable {
         let mut copies: BTreeMap<ActionId, Vec<Split>> = BTreeMap::new();
         for split in self.splits {
             copies.entry(split.id().clone()).or_default().push(split);
@@ -224,7 +237,12 @@ impl Splits {
         let mut splits = Vec::new();
         let mut refused = self.refused;
         for (id, mut copies) in copies {
-            let whole = listed.get(id.as_str()) == Some(&copies.len());
+            let listed = self
+                .listed
+                .counts()
+                .get(id.as_str())
+                .map(|count| count.get());
+            let whole = listed == Some(copies.len() as u64);
             if whole && copies.windows(2).all(|pair| pair[0] == pair[1]) {
                 copies.truncate(1);
                 splits.extend(copies);
@@ -235,19 +253,7 @@ impl Splits {
                 }));
             }
         }
-        Self {
-            splits,
-            refused,
-            listed,
-        }
-    }
-
-    pub fn splits(&self) -> &[Split] {
-        &self.splits
-    }
-
-    pub fn refused(&self) -> &[RefusedRow] {
-        &self.refused
+        SplitTable { splits, refused }
     }
 }
 
@@ -267,14 +273,15 @@ struct SplitRow {
     split_to: f64,
 }
 
-/// Adds one page's splits to `splits` and answers the cursor for the next page. Only the cursor is taken from
-/// `next_url`, so the key is never sent to a host the response named.
-fn parse_splits_page(body: &[u8], splits: &mut Splits) -> Result<Option<String>, FetchError> {
+/// One page's splits and the cursor for the next page. Only the cursor is taken from `next_url`, so the key is never
+/// sent to a host the response named.
+fn parse_splits_page(body: &[u8]) -> Result<(SplitPages, Option<String>), FetchError> {
     let page: SplitsPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
         reason: error.to_string(),
     })?;
+    let mut splits = SplitPages::empty();
     for row in page.results {
-        *splits.listed.entry(row.id.clone()).or_insert(0) += 1;
+        splits.listed.add(row.id.clone());
         let split = ActionId::new(&row.id)
             .map_err(RowRefusal::ActionId)
             .and_then(|id| {
@@ -296,7 +303,8 @@ fn parse_splits_page(body: &[u8], splits: &mut Splits) -> Result<Option<String>,
             }),
         }
     }
-    page.next_url
+    let next = page
+        .next_url
         .map(|next| {
             reqwest::Url::parse(&next)
                 .ok()
@@ -309,7 +317,8 @@ fn parse_splits_page(body: &[u8], splits: &mut Splits) -> Result<Option<String>,
                     reason: format!("next_url without a cursor: {next}"),
                 })
         })
-        .transpose()
+        .transpose()?;
+    Ok((splits, next))
 }
 
 /// What Massive answered about one symbol's details.
@@ -404,7 +413,7 @@ pub(crate) fn capitalization_to_the_cent(dollars: f64) -> Result<Dollars, Dollar
     Dollars::from_float((dollars * 100.0).round() / 100.0)
 }
 
-fn parse_grouped_daily(body: &[u8], session: SessionDate) -> Result<DailyBars, FetchError> {
+fn parse_grouped_daily(body: &[u8], session: SessionDate) -> Result<SessionBars, FetchError> {
     let response: GroupedResponse =
         serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
             reason: error.to_string(),
@@ -422,12 +431,7 @@ fn parse_grouped_daily(body: &[u8], session: SessionDate) -> Result<DailyBars, F
             Err(cause) => accepted.refuse(row.ticker, cause),
         }
     }
-    let (bars, refused) = accepted.finish();
-    Ok(DailyBars {
-        bars,
-        test_tickers,
-        refused,
-    })
+    Ok(SessionBars::new(accepted, test_tickers))
 }
 
 fn daily_bar(row: &GroupedRow, session: SessionDate) -> Result<Bar, RowRefusal> {
@@ -681,7 +685,7 @@ mod tests {
         {"T":"ZTST","v":0,"o":12345,"c":12345,"h":12345,"l":12345,"t":1790366400000}
     ],"queryCount":14,"resultsCount":14,"adjusted":false,"status":"OK","request_id":"34b9c2486d430c6996d16b5cc67afae0","count":14}"#;
 
-    fn fixture() -> DailyBars {
+    fn fixture() -> SessionBars {
         parse_grouped_daily(FIXTURE.as_bytes(), session()).unwrap()
     }
 
@@ -966,14 +970,13 @@ mod tests {
 
     #[test]
     fn test_a_splits_page_keeps_fractional_ratios_and_answers_only_its_cursor() {
-        let mut splits = Splits::default();
-        let cursor = parse_splits_page(SPLITS_PAGE.as_bytes(), &mut splits).unwrap();
+        let (splits, cursor) = parse_splits_page(SPLITS_PAGE.as_bytes()).unwrap();
         assert_eq!(
             cursor.as_deref(),
             Some("YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU")
         );
         let read: Vec<(String, String, u64, u64)> = splits
-            .splits()
+            .splits
             .iter()
             .map(|split| {
                 (
@@ -1001,9 +1004,9 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(splits.refused().len(), 1);
+        assert_eq!(splits.refused.len(), 1);
         assert_eq!(
-            <&str>::from(splits.refused()[0].cause().kind()),
+            <&str>::from(splits.refused[0].cause().kind()),
             "split_ratio"
         );
         let last = SPLITS_PAGE.replace(
@@ -1011,12 +1014,11 @@ mod tests {
             r#""next_url":null"#,
         );
         assert_eq!(
-            parse_splits_page(last.as_bytes(), &mut Splits::default()),
+            parse_splits_page(last.as_bytes()).map(|(_, cursor)| cursor),
             Ok(None)
         );
         // The same page read twice, as Massive lists CTPVF's 2024-04-29 split twice: identical copies are one action.
-        parse_splits_page(SPLITS_PAGE.as_bytes(), &mut splits).unwrap();
-        let unique = splits.unique();
+        let unique = splits.clone().combine(splits).unique();
         let mut kept: Vec<&str> = unique
             .splits()
             .iter()
@@ -1032,9 +1034,10 @@ mod tests {
         );
         // Two copies that disagree on the ratio: nothing says which is true, so neither is kept.
         let conflicting = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":40,"split_to":1,"ticker":"DPU"}],"next_url":null}"#;
-        let mut splits = Splits::default();
-        parse_splits_page(conflicting.as_bytes(), &mut splits).unwrap();
-        let unique = splits.unique();
+        let unique = parse_splits_page(conflicting.as_bytes())
+            .unwrap()
+            .0
+            .unique();
         assert!(unique.splits().is_empty());
         let causes: Vec<&str> = unique
             .refused()
@@ -1044,13 +1047,44 @@ mod tests {
         assert_eq!(causes, ["duplicate", "duplicate"]);
     }
 
+    /// Pages cut from one read page's rows and listings, so the law test does not lean on `combine`.
+    fn any_pages() -> impl proptest::strategy::Strategy<Value = SplitPages> {
+        use proptest::prelude::*;
+        let (read, _) = parse_splits_page(SPLITS_PAGE.as_bytes()).unwrap();
+        (
+            prop::sample::subsequence(read.splits, 0..=2),
+            prop::sample::subsequence(read.refused, 0..=1),
+            prop::collection::vec(prop::sample::select(vec!["E1", "E2", "E3"]), 0..5),
+        )
+            .prop_map(|(splits, refused, ids)| {
+                let mut listed = Tally::default();
+                for id in ids {
+                    listed.add(id.to_string());
+                }
+                SplitPages {
+                    splits,
+                    refused,
+                    listed,
+                }
+            })
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn property_split_pages_concatenate_as_a_monoid(
+            first in any_pages(),
+            second in any_pages(),
+            third in any_pages(),
+        ) {
+            crate::common::monoid::laws::check_ordered(first, second, third)?;
+        }
+    }
+
     #[test]
     fn test_an_action_repeated_beside_a_refused_copy_is_refused_too() {
         // DPU's action filed again under a ticker no symbol holds: the valid copy cannot be trusted either.
         let page = r#"{"results":[{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU"},{"execution_date":"2026-12-17","id":"E1","split_from":50,"split_to":1,"ticker":"DPU.WARRANTS"}],"next_url":null}"#;
-        let mut splits = Splits::default();
-        parse_splits_page(page.as_bytes(), &mut splits).unwrap();
-        let unique = splits.unique();
+        let unique = parse_splits_page(page.as_bytes()).unwrap().0.unique();
         assert!(unique.splits().is_empty());
         let causes: Vec<&str> = unique
             .refused()

@@ -1581,6 +1581,22 @@ mod tests {
             prop_assert_eq!(&merged[..held.len()], &held[..]);
         }
 
+        /// On files of distinct lines, an empty file changes nothing on either side, and three writers' files merge
+        /// to the same object whichever pair ships first.
+        #[test]
+        fn property_merge_has_an_identity_and_is_associative(
+            first in lines(),
+            second in lines(),
+            third in lines(),
+        ) {
+            prop_assert_eq!(merge(Vec::new(), first.clone()), first.clone());
+            prop_assert_eq!(merge(first.clone(), Vec::new()), first.clone());
+            prop_assert_eq!(
+                merge(merge(first.clone(), second.clone()), third.clone()),
+                merge(first, merge(second, third))
+            );
+        }
+
         #[test]
         fn property_a_record_reads_back_as_itself(record in any_record()) {
             prop_assert_eq!(read(&record.encode()), vec![ReadLine::Read(Box::new(record))]);

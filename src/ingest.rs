@@ -86,6 +86,14 @@ pub struct RefusedRow {
 }
 
 impl RefusedRow {
+    #[cfg(test)]
+    pub(crate) fn new(ticker: &str, cause: RowRefusal) -> Self {
+        Self {
+            ticker: ticker.to_string(),
+            cause,
+        }
+    }
+
     pub fn ticker(&self) -> &str {
         &self.ticker
     }
@@ -102,6 +110,39 @@ pub fn refused_by_cause(rows: &[RefusedRow]) -> Tally<RowRefusalKind> {
         tally.add(row.cause().kind());
     }
     tally
+}
+
+/// One session's bars from a vendor's report, with every row that did not become one: each row is exactly one of a bar,
+/// a test ticker or a refusal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionBars {
+    bars: Vec<Bar>,
+    test_tickers: Vec<String>,
+    refused: Vec<RefusedRow>,
+}
+
+impl SessionBars {
+    fn new<Key: Ord + Clone>(accepted: Accepted<Key>, test_tickers: Vec<String>) -> Self {
+        let (bars, refused) = accepted.finish();
+        Self {
+            bars,
+            test_tickers,
+            refused,
+        }
+    }
+
+    /// In symbol, then timestamp, order.
+    pub fn bars(&self) -> &[Bar] {
+        &self.bars
+    }
+
+    pub fn test_tickers(&self) -> &[String] {
+        &self.test_tickers
+    }
+
+    pub fn refused(&self) -> &[RefusedRow] {
+        &self.refused
+    }
 }
 
 /// Collects a report's bars by the record each claims to be, so a key claimed twice keeps neither row.
