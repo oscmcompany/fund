@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ use crate::ingest::alpaca::{
 use crate::ingest::massive::{DetailsAnswer, Massive};
 use crate::ingest::{FetchError, RefusedRow, refused_by_cause};
 use crate::journal::Journal;
-use crate::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
+use crate::parameter::{Directories, environment_variable};
 
 const DEFAULT_LOOKBACK_SESSIONS: NonZeroUsize = NonZeroUsize::new(5).expect("5 is not zero");
 const DEFAULT_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(240).expect("240 is not zero");
@@ -69,8 +69,7 @@ const MAXIMUM_BUDGET_MINUTES: NonZeroU64 = NonZeroU64::new(1_440).expect("1,440 
 pub struct Parameters {
     lookback_sessions: NonZeroUsize,
     budget: Duration,
-    journal_directory: PathBuf,
-    log_directory: PathBuf,
+    directories: Directories,
     minute_batch_symbols: NonZeroUsize,
     minute_concurrency: NonZeroUsize,
     tick_concurrency: NonZeroUsize,
@@ -109,16 +108,7 @@ impl Parameters {
                 MAXIMUM_LOOKBACK_SESSIONS,
             )?,
             budget: Duration::from_secs(budget_minutes.get() * 60),
-            journal_directory: PathBuf::from(record(
-                read(Parameter::JournalDirectory)?,
-                DEFAULT_JOURNAL_DIRECTORY.to_string(),
-                &mut resolved,
-            )?),
-            log_directory: PathBuf::from(record(
-                read(Parameter::LogDirectory)?,
-                DEFAULT_LOG_DIRECTORY.to_string(),
-                &mut resolved,
-            )?),
+            directories: Directories::resolved(supplied, &mut resolved)?,
             minute_batch_symbols: record(
                 read(Parameter::MinuteBatchSymbols)?,
                 DEFAULT_MINUTE_BATCH_SYMBOLS,
@@ -138,12 +128,12 @@ impl Parameters {
         Ok((parameters, ConfigurationResolved::new(resolved)))
     }
 
-    pub fn journal_directory(&self) -> &PathBuf {
-        &self.journal_directory
+    pub fn journal_directory(&self) -> &Path {
+        self.directories.journal()
     }
 
-    pub fn log_directory(&self) -> &PathBuf {
-        &self.log_directory
+    pub fn log_directory(&self) -> &Path {
+        self.directories.log()
     }
 }
 
@@ -591,7 +581,7 @@ async fn write_series_boundaries(
         &clients.archive,
         Provider::Alpaca,
         ReferenceTable::SeriesBoundaries,
-        session,
+        Some(session),
     )
     .await?;
     let (held, first) = match previous {
@@ -1071,7 +1061,7 @@ mod tests {
     }
 
     /// A journal of its own in a fresh directory, which the caller removes.
-    fn temporary_journal() -> (Journal, PathBuf) {
+    fn temporary_journal() -> (Journal, std::path::PathBuf) {
         let directory = std::env::temp_dir().join(format!("fund-heal-{}", uuid::Uuid::new_v4()));
         let journal = Journal::open(&directory, RunId::new(uuid::Uuid::new_v4())).unwrap();
         (journal, directory)

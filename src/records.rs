@@ -19,7 +19,7 @@ use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journa
 use crate::common::journal::{Commit, ConfigurationResolved, Observation, RunId, read};
 use crate::common::storage::{Host, JournalKey, Key, LogsKey, Service};
 use crate::common::time::SessionDate;
-use crate::journal::{Journal, built_commit, lock};
+use crate::journal::{Journal, UNKNOWN_COMMIT, built_commit, lock};
 use crate::parameter::log_directory_from_environment;
 
 /// The exit code of a run that could not start.
@@ -88,7 +88,7 @@ pub fn start(service: Service, today: SessionDate) -> Started {
     let span = tracing::info_span!(
         "run",
         %run_id,
-        commit = built_commit().as_ref().map_or("unknown", Commit::as_str),
+        commit = built_commit().as_ref().map_or(UNKNOWN_COMMIT, Commit::as_str),
     );
     Started {
         service,

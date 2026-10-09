@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::parquet::{self, ReadRefusal};
 use crate::common::journal::{Commit, RunId};
+use crate::journal::UNKNOWN_COMMIT;
 
 const LAYOUT_VERSION: &str = "1";
 
@@ -28,11 +29,56 @@ pub enum LogLine {
         /// Absent on a line logged outside a run.
         run_id: Option<RunId>,
         commit: Option<Commit>,
-        /// The line's other fields as a JSON object, keys sorted.
-        fields: String,
+        fields: Fields,
     },
     /// Not a line this service writes, kept as written.
-    Unreadable { line: u64, text: String },
+    Unreadable {
+        line: u64,
+        text: String,
+        cause: LogUnreadableCause,
+    },
+}
+
+/// A line's fields other than the ones `LogLine::Read` types, as one JSON object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fields(Map<String, Value>);
+
+/// The object as JSON text, keys sorted.
+impl std::fmt::Display for Fields {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = serde_json::to_string(&self.0).map_err(|_| std::fmt::Error)?;
+        formatter.write_str(&text)
+    }
+}
+
+/// Why a line was not read as one this service writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogUnreadableCause {
+    NotJson {
+        reason: String,
+    },
+    NotAnObject,
+    Missing {
+        field: LogField,
+    },
+    /// Present, but not what the formatter writes there.
+    Malformed {
+        field: LogField,
+    },
+}
+
+/// A field `tracing-subscriber`'s JSON formatter writes, by the name it writes it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum LogField {
+    Timestamp,
+    Level,
+    Target,
+    Fields,
+    Message,
+    Span,
+    RunId,
+    Commit,
 }
 
 /// Why lines were not written under a key.
@@ -65,64 +111,57 @@ pub fn parse(contents: &str) -> Vec<LogLine> {
     contents
         .lines()
         .zip(1_u64..)
-        .map(|(text, line)| {
-            parse_line(line, text).unwrap_or_else(|| LogLine::Unreadable {
-                line,
-                text: text.to_string(),
-            })
-        })
+        .map(|(text, line)| read_one(line, text))
         .collect()
 }
 
+/// Line `line` of a log file, as `parse` would give it.
+fn read_one(line: u64, text: &str) -> LogLine {
+    parse_line(line, text).unwrap_or_else(|cause| LogLine::Unreadable {
+        line,
+        text: text.to_string(),
+        cause,
+    })
+}
+
 /// A line as `tracing-subscriber`'s JSON formatter writes it, with the run's span current.
-fn parse_line(line: u64, text: &str) -> Option<LogLine> {
-    let Value::Object(mut object) = serde_json::from_str(text).ok()? else {
-        return None;
+fn parse_line(line: u64, text: &str) -> Result<LogLine, LogUnreadableCause> {
+    use LogUnreadableCause::Malformed;
+    let value = serde_json::from_str(text).map_err(|error| LogUnreadableCause::NotJson {
+        reason: error.to_string(),
+    })?;
+    let Value::Object(mut object) = value else {
+        return Err(LogUnreadableCause::NotAnObject);
     };
-    let text_of = |value: Option<Value>| match value {
-        Some(Value::String(text)) => Some(text),
-        Some(
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_),
-        )
-        | None => None,
-    };
-    // `Some(None)` when absent, which is no value; `None` when present but not text, which is not our line.
-    let optional_text = |value: Option<Value>| match value {
-        None => Some(None),
-        Some(Value::String(text)) => Some(Some(text)),
-        Some(
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_),
-        ) => None,
-    };
-    let timestamp = text_of(object.remove("timestamp"))?.parse().ok()?;
-    let level = text_of(object.remove("level"))?.parse().ok()?;
-    let target = text_of(object.remove("target"))?;
-    let Some(Value::Object(mut fields)) = object.remove("fields") else {
-        return None;
-    };
-    let message = text_of(fields.remove("message"))?;
+    let timestamp = parsed(&mut object, LogField::Timestamp)?;
+    let level = parsed(&mut object, LogField::Level)?;
+    let target = text_of(&mut object, LogField::Target)?;
+    let mut fields =
+        optional_object_of(&mut object, LogField::Fields)?.ok_or(LogUnreadableCause::Missing {
+            field: LogField::Fields,
+        })?;
+    let message = text_of(&mut fields, LogField::Message)?;
     // A span other than the run's, such as a library's, carries neither field.
-    let (run_id, commit) = match object.remove("span") {
+    let (run_id, commit) = match optional_object_of(&mut object, LogField::Span)? {
         None => (None, None),
-        Some(Value::Object(mut span)) => {
-            let run_id = match optional_text(span.remove("run_id"))? {
+        Some(mut span) => {
+            let run_id = optional_text_of(&mut span, LogField::RunId)?
+                .map(|raw| Uuid::parse_str(&raw).map(RunId::new))
+                .transpose()
+                .map_err(|_| Malformed {
+                    field: LogField::RunId,
+                })?;
+            let commit = match optional_text_of(&mut span, LogField::Commit)? {
                 None => None,
-                Some(raw) => Some(RunId::new(Uuid::parse_str(&raw).ok()?)),
-            };
-            let commit = match optional_text(span.remove("commit"))? {
-                None => None,
-                Some(unknown) if unknown == "unknown" => None,
-                Some(sha) => Some(Commit::new(&sha).ok()?),
+                Some(raw) if raw == UNKNOWN_COMMIT => None,
+                Some(raw) => Some(Commit::new(&raw).map_err(|_| Malformed {
+                    field: LogField::Commit,
+                })?),
             };
             (run_id, commit)
         }
-        Some(
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
-        ) => {
-            return None;
-        }
     };
-    Some(LogLine::Read {
+    Ok(LogLine::Read {
         line,
         timestamp,
         level,
@@ -130,8 +169,51 @@ fn parse_line(line: u64, text: &str) -> Option<LogLine> {
         message,
         run_id,
         commit,
-        fields: Value::Object(fields).to_string(),
+        fields: Fields(fields),
     })
+}
+
+/// The text under `field` parsed as what the formatter writes there.
+fn parsed<Parsed: std::str::FromStr>(
+    object: &mut Map<String, Value>,
+    field: LogField,
+) -> Result<Parsed, LogUnreadableCause> {
+    text_of(object, field)?
+        .parse()
+        .map_err(|_| LogUnreadableCause::Malformed { field })
+}
+
+/// The text under `field`, which the formatter always writes.
+fn text_of(object: &mut Map<String, Value>, field: LogField) -> Result<String, LogUnreadableCause> {
+    optional_text_of(object, field)?.ok_or(LogUnreadableCause::Missing { field })
+}
+
+/// The object under `field`, `None` when absent; present as anything but an object, it is not our line.
+fn optional_object_of(
+    object: &mut Map<String, Value>,
+    field: LogField,
+) -> Result<Option<Map<String, Value>>, LogUnreadableCause> {
+    match object.remove(<&str>::from(field)) {
+        None => Ok(None),
+        Some(Value::Object(inner)) => Ok(Some(inner)),
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_),
+        ) => Err(LogUnreadableCause::Malformed { field }),
+    }
+}
+
+/// The text under `field`, `None` when absent; present as anything but text, it is not our line.
+fn optional_text_of(
+    object: &mut Map<String, Value>,
+    field: LogField,
+) -> Result<Option<String>, LogUnreadableCause> {
+    match object.remove(<&str>::from(field)) {
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_),
+        ) => Err(LogUnreadableCause::Malformed { field }),
+    }
 }
 
 /// Every column but `line` is null on an unreadable line, which keeps its text instead.
@@ -181,14 +263,14 @@ pub fn encode(lines: &[LogLine]) -> Result<Vec<u8>, EncodeRefusal> {
                     Some(message.clone()),
                     run_id.map(|run_id| run_id.to_string()),
                     commit.as_ref().map(|commit| commit.as_str().to_string()),
-                    Some(fields.clone()),
+                    Some(fields.to_string()),
                     None,
                 ];
                 for (builder, value) in texts.iter_mut().zip(values) {
                     builder.append_option(value);
                 }
             }
-            LogLine::Unreadable { line, text } => {
+            LogLine::Unreadable { line, text, .. } => {
                 numbers.append_value(*line);
                 timestamps.append_null();
                 for builder in texts.iter_mut().take(6) {
@@ -225,21 +307,26 @@ pub fn decode(bytes: Vec<u8>) -> Result<Vec<LogLine>, DecodeRefusal> {
                 reason: reason.to_string(),
             };
             let text = |index: usize| texts[index].is_valid(row).then(|| texts[index].value(row));
+            // Read again, so the cause is this build's and a row edited out of band reads as what it now says.
             if let Some(unreadable) = text(6) {
-                lines.push(LogLine::Unreadable {
-                    line,
-                    text: unreadable.to_string(),
-                });
+                lines.push(read_one(line, unreadable));
                 continue;
             }
             let required = |index: usize| text(index).ok_or_else(|| refused("a column is null"));
             if !timestamps.is_valid(row) {
                 return Err(refused("the timestamp is null"));
             }
-            let fields = required(5)?;
-            if !matches!(serde_json::from_str(fields), Ok(Value::Object(Map { .. }))) {
-                return Err(refused("the fields are not a JSON object"));
-            }
+            let fields = match serde_json::from_str(required(5)?) {
+                Ok(Value::Object(fields)) => Fields(fields),
+                Ok(
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::String(_)
+                    | Value::Array(_),
+                )
+                | Err(_) => return Err(refused("the fields are not a JSON object")),
+            };
             lines.push(LogLine::Read {
                 line,
                 timestamp: DateTime::from_timestamp_nanos(timestamps.value(row)),
@@ -254,7 +341,7 @@ pub fn decode(bytes: Vec<u8>) -> Result<Vec<LogLine>, DecodeRefusal> {
                     .map(Commit::new)
                     .transpose()
                     .map_err(|_| refused("commit is not a sha"))?,
-                fields: fields.to_string(),
+                fields,
             });
         }
     }
@@ -302,7 +389,7 @@ mod tests {
                 );
                 assert!(commit.as_ref().is_some_and(Commit::is_dirty));
                 assert_eq!(
-                    fields,
+                    fields.to_string(),
                     r#"{"bars":12533,"leg":"massive_daily_bars","refused":"{\"symbol\": 7}","session":"2026-09-28","unanswered":0}"#
                 );
             }
@@ -333,7 +420,50 @@ mod tests {
         let malformed = parse(
             r#"{"timestamp":"2026-09-30T18:45:05Z","level":"INFO","fields":{"message":"Sent"},"target":"archive_nightly","span":{"run_id":"not-a-uuid"}}"#,
         );
-        assert!(matches!(&malformed[..], [LogLine::Unreadable { .. }]));
+        assert!(matches!(
+            &malformed[..],
+            [LogLine::Unreadable {
+                cause: LogUnreadableCause::Malformed {
+                    field: LogField::RunId
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn test_an_unreadable_line_names_why() {
+        let cause = |text: &str| match parse(text).as_slice() {
+            [LogLine::Unreadable { cause, .. }] => cause.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            cause(r#"{"timestamp":"2026-09-30T20:49"#),
+            LogUnreadableCause::NotJson { .. }
+        ));
+        assert_eq!(cause("[1]"), LogUnreadableCause::NotAnObject);
+        assert_eq!(
+            cause(r#"{"timestamp":"2026-09-30T18:45:05Z","level":"INFO","target":"t"}"#),
+            LogUnreadableCause::Missing {
+                field: LogField::Fields
+            }
+        );
+        assert_eq!(
+            cause(
+                r#"{"timestamp":"2026-09-30T18:45:05Z","level":"LOUD","fields":{"message":"m"},"target":"t"}"#
+            ),
+            LogUnreadableCause::Malformed {
+                field: LogField::Level
+            }
+        );
+        assert_eq!(
+            cause(
+                r#"{"timestamp":"2026-09-30T18:45:05Z","level":"INFO","fields":{},"target":"t"}"#
+            ),
+            LogUnreadableCause::Missing {
+                field: LogField::Message
+            }
+        );
     }
 
     #[test]

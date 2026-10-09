@@ -20,7 +20,7 @@ pub enum ReplayStudyError {
     },
     /// A strategy parameter names a setting the replay journals itself.
     ReservedParameter {
-        name: String,
+        setting: ReplaySetting,
     },
     Replay(ReplayRefusal),
     Series(SeriesRefusal),
@@ -38,10 +38,10 @@ impl std::fmt::Display for ReplayStudyError {
                     "the dataset holds no {decision} bar to decide on"
                 )
             }
-            Self::ReservedParameter { name } => {
+            Self::ReservedParameter { setting } => {
                 write!(
                     formatter,
-                    "the parameter {name} is one the replay journals itself"
+                    "the parameter {setting} is one the replay journals itself"
                 )
             }
             Self::Replay(refusal) => write!(formatter, "the replay was refused: {refusal:?}"),
@@ -54,6 +54,33 @@ impl std::fmt::Display for ReplayStudyError {
 }
 
 impl std::error::Error for ReplayStudyError {}
+
+/// A setting every replay journals itself, by the name it is journaled under.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum ReplaySetting {
+    DecisionInterval,
+    FillStyle,
+    OpeningCashUnits,
+    QuotedSpreadBasisPoints,
+}
+
+/// A measurement every replay journals, by the name it is journaled under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum ReplayMetric {
+    Fills,
+    Unfilled,
+    Marks,
+    MarksUnpriced,
+    CostsDollars,
+    TradedDollars,
+    Turnover,
+    NetReturn,
+    GrossReturn,
+}
 
 /// The cash a replay opens with, positive so a return and a turnover are measurable against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +136,8 @@ pub fn replay<S: Strategy>(
     let replay = run(dataset, replayer, opening)?;
     let outputs = metrics(&replay, opening)
         .into_iter()
-        .try_fold(Outputs::default(), |outputs, (name, value)| {
-            outputs.metric(name, value)
+        .try_fold(Outputs::default(), |outputs, (metric, value)| {
+            outputs.metric(<&str>::from(metric), value)
         })
         .map_err(ReplayStudyError::Experiment)?;
     study
@@ -124,32 +151,31 @@ pub(crate) fn settings(
     fill_model: FillModel,
     decision: BarInterval,
     opening: Opening,
-) -> [(&'static str, String); 4] {
+) -> [(ReplaySetting, String); 4] {
     [
-        ("decision_interval", decision.to_string()),
-        ("fill_style", fill_model.style().to_string()),
-        ("opening_cash_units", opening.cash().units().to_string()),
+        (ReplaySetting::DecisionInterval, decision.to_string()),
+        (ReplaySetting::FillStyle, fill_model.style().to_string()),
         (
-            "quoted_spread_basis_points",
+            ReplaySetting::OpeningCashUnits,
+            opening.cash().units().to_string(),
+        ),
+        (
+            ReplaySetting::QuotedSpreadBasisPoints,
             fill_model.quoted_spread().value().to_string(),
         ),
     ]
 }
 
-/// `settings` with the replay's `own`, refused where one of them names an `own` setting.
+/// `settings` with the replay's `own`, refused where one of them names a `ReplaySetting`.
 pub(crate) fn beside<'a>(
     settings: impl IntoIterator<Item = (&'a str, String)>,
-    own: [(&'static str, String); 4],
+    own: [(ReplaySetting, String); 4],
 ) -> Result<Parameters, ReplayStudyError> {
     let settings: Vec<(&str, String)> = settings.into_iter().collect();
-    if let Some((name, _)) = own
-        .iter()
-        .find(|(name, _)| settings.iter().any(|(setting, _)| setting == name))
-    {
-        return Err(ReplayStudyError::ReservedParameter {
-            name: name.to_string(),
-        });
+    if let Some(setting) = settings.iter().find_map(|(name, _)| name.parse().ok()) {
+        return Err(ReplayStudyError::ReservedParameter { setting });
     }
+    let own = own.map(|(setting, value)| (<&str>::from(setting), value));
     Parameters::new(settings.into_iter().chain(own)).map_err(ReplayStudyError::Experiment)
 }
 
@@ -172,19 +198,19 @@ pub(crate) fn run<S: Strategy>(
 
 /// Counts, dollars traded and paid, and turnover; the final mark's return net and gross of costs only when that mark
 /// was priced, every fill having landed before it.
-pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(&'static str, f64)> {
+pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(ReplayMetric, f64)> {
     let opening = opening.cash();
     let costs = concatenate(replay.fills().iter().map(|fill| fill.cost()));
     let traded = concatenate(replay.fills().iter().map(|fill| fill.notional()));
     let unpriced = replay.marks().values().filter(|mark| mark.is_err()).count();
     let mut metrics = vec![
-        ("fills", replay.fills().len() as f64),
-        ("unfilled", replay.unfilled().len() as f64),
-        ("marks", replay.marks().len() as f64),
-        ("marks_unpriced", unpriced as f64),
-        ("costs_dollars", costs.dollars()),
-        ("traded_dollars", traded.dollars()),
-        ("turnover", traded.dollars() / opening.dollars()),
+        (ReplayMetric::Fills, replay.fills().len() as f64),
+        (ReplayMetric::Unfilled, replay.unfilled().len() as f64),
+        (ReplayMetric::Marks, replay.marks().len() as f64),
+        (ReplayMetric::MarksUnpriced, unpriced as f64),
+        (ReplayMetric::CostsDollars, costs.dollars()),
+        (ReplayMetric::TradedDollars, traded.dollars()),
+        (ReplayMetric::Turnover, traded.dollars() / opening.dollars()),
     ];
     match replay.marks().last_key_value() {
         Some((_, Ok(last))) => {
@@ -192,9 +218,12 @@ pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(&'static str, f
             let gain = last.units() - opening.units();
             let paid = i128::try_from(costs.units()).expect("costs fit i128");
             metrics.extend([
-                ("net_return", gain as f64 / opening.units() as f64),
                 (
-                    "gross_return",
+                    ReplayMetric::NetReturn,
+                    gain as f64 / opening.units() as f64,
+                ),
+                (
+                    ReplayMetric::GrossReturn,
                     (gain + paid) as f64 / opening.units() as f64,
                 ),
             ]);
@@ -228,6 +257,19 @@ mod tests {
                 Shares::whole(1).unwrap(),
             )]))
         }
+    }
+
+    #[test]
+    fn test_a_replay_setting_reads_back_from_the_name_it_is_journaled_under() {
+        for name in [
+            "decision_interval",
+            "fill_style",
+            "opening_cash_units",
+            "quoted_spread_basis_points",
+        ] {
+            assert_eq!(name.parse::<ReplaySetting>().unwrap().to_string(), name);
+        }
+        assert!("FillStyle".parse::<ReplaySetting>().is_err());
     }
 
     /// One share bought at session 1's $10 open for a 5bp charge, marked at the $11 closes: the journal names the
@@ -355,7 +397,9 @@ mod tests {
         let clashing = Parameters::new([("fill_style", "mine")]).unwrap();
         assert!(matches!(
             replay(&mut study, &dataset, &daily, opening, &clashing),
-            Err(ReplayStudyError::ReservedParameter { name }) if name == "fill_style"
+            Err(ReplayStudyError::ReservedParameter {
+                setting: ReplaySetting::FillStyle
+            })
         ));
         assert!(
             !directory.exists()

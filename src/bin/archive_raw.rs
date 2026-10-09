@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -19,13 +18,12 @@ use fund::archive::bars::{Provenance, Subscription, encode};
 use fund::archive::raw::CopyError;
 use fund::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use fund::archive::{quote_bars, reference, trade_bars};
-use fund::common::journal::{ConfigurationResolved, ObjectDeleted, ObjectWritten, Observation};
+use fund::common::journal::{ObjectDeleted, ObjectWritten, Observation};
 use fund::common::market::aggregate::{self, session_bars};
 use fund::common::market::quote_bars::QuoteFold;
 use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold};
 use fund::common::monoid::{Monoid, Tally};
-use fund::common::parameter::{Parameter, ParameterRefusal, record as resolve};
 use fund::common::storage::{
     BarsKey, Family, Host, Key, Origin, ParsedKey, Provider, QuotesKey, Service, TradesKey,
 };
@@ -40,7 +38,7 @@ use fund::ingest::flat_files::{
 use fund::ingest::massive::Massive;
 use fund::ingest::refused_by_cause;
 use fund::journal::Journal;
-use fund::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
+use fund::parameter::Directories;
 use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 
 const SERVICE: &str = "archive_raw";
@@ -177,25 +175,6 @@ fn usage() -> String {
         .join(" | ")
 }
 
-/// Where the run's journal and logs go, with the configuration the journal records for them.
-fn directories() -> Result<((PathBuf, PathBuf), ConfigurationResolved), ParameterRefusal> {
-    let mut resolved = BTreeMap::new();
-    let mut directory = |parameter, default: &str| {
-        resolve(
-            (parameter, environment_variable(parameter)?),
-            default.to_string(),
-            &mut resolved,
-        )
-        .map(PathBuf::from)
-    };
-    let journal_directory = directory(Parameter::JournalDirectory, DEFAULT_JOURNAL_DIRECTORY)?;
-    let log_directory = directory(Parameter::LogDirectory, DEFAULT_LOG_DIRECTORY)?;
-    Ok((
-        (journal_directory, log_directory),
-        ConfigurationResolved::new(resolved),
-    ))
-}
-
 /// The run's journal, shared by the concurrent sessions so each object is recorded as it lands.
 type SharedJournal = Arc<Mutex<Journal>>;
 
@@ -238,7 +217,7 @@ fn provenance(
 #[tokio::main]
 async fn main() -> ExitCode {
     let service = Service::new(SERVICE).expect("the service name is one path segment");
-    let parameters = directories();
+    let parameters = Directories::from_environment();
     let started = start(service.clone(), SessionDate::at(Utc::now()));
     let span = started.span();
     async move {
@@ -247,15 +226,16 @@ async fn main() -> ExitCode {
             tracing::error!(?arguments, usage = usage(), "Usage refused");
             return RefusedToStart.into();
         };
-        let ((journal_directory, log_directory), configuration) = match resolved(parameters) {
+        let (directories, configuration) = match resolved(parameters) {
             Ok(resolved) => resolved,
             Err(refused) => return refused.into(),
         };
         // Several commands may run at once; each only creates or deletes the keys it names.
-        let journal = match started.open(&journal_directory, configuration, Exclusion::Concurrent) {
-            Ok((journal, _)) => Arc::new(Mutex::new(journal)),
-            Err(refused) => return refused.into(),
-        };
+        let journal =
+            match started.open(directories.journal(), configuration, Exclusion::Concurrent) {
+                Ok((journal, _)) => Arc::new(Mutex::new(journal)),
+                Err(refused) => return refused.into(),
+            };
         let sdk_configuration = aws_config::load_from_env().await;
         let (archive, records) = match (
             Archive::market_data(&sdk_configuration),
@@ -272,8 +252,8 @@ async fn main() -> ExitCode {
             &records,
             Host::Archiver,
             &service,
-            &journal_directory,
-            &log_directory,
+            directories.journal(),
+            directories.log(),
         )
         .await;
         match (outcome == ExitCode::SUCCESS, all_shipped) {

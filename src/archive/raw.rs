@@ -14,9 +14,9 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::bars::{FETCHED_AT, Provenance};
-use super::{Archive, ArchiveError, Tag};
-use crate::common::storage::{Key, StorageClass};
+use super::bars::{MetadataEntry, Provenance};
+use super::{Archive, ArchiveError};
+use crate::common::storage::{EntityTag, Key, StorageClass};
 use crate::ingest::flat_files::{FlatFileDataset, FlatFileError, FlatFiles, Listed};
 
 /// The largest quote file, about 19 GB, is under three hundred parts of this size.
@@ -25,33 +25,19 @@ const PART_LENGTH: u64 = 64 * 1024 * 1024;
 /// Attempts at one part, each fetching and uploading it afresh, before the file is abandoned.
 const PART_ATTEMPTS: u32 = 5;
 
-/// What the archive holds under a key: its length and, where S3 computed one, its full-object CRC64.
+/// What the archive holds under a key: its length and the checksum S3 holds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
     length: u64,
-    checksum: Option<String>,
+    checksum: Checksum,
     /// When the vendor's bytes were fetched, from the object's metadata; `None` on a copy that never recorded it.
     fetched_at: Option<DateTime<Utc>>,
     /// The version read, which a conditional delete must still match.
-    tag: Tag,
+    tag: EntityTag,
 }
 
 impl Stored {
-    pub fn new(
-        length: u64,
-        checksum: Option<String>,
-        fetched_at: Option<DateTime<Utc>>,
-        tag: Tag,
-    ) -> Self {
-        Self {
-            length,
-            checksum,
-            fetched_at,
-            tag,
-        }
-    }
-
-    pub fn tag(&self) -> &Tag {
+    pub fn tag(&self) -> &EntityTag {
         &self.tag
     }
 
@@ -63,9 +49,39 @@ impl Stored {
         self.length
     }
 
-    /// Base64 of the CRC64/NVME over the whole object, the same whatever part size wrote it.
-    pub fn checksum(&self) -> Option<&str> {
-        self.checksum.as_deref()
+    pub fn checksum(&self) -> &Checksum {
+        &self.checksum
+    }
+}
+
+/// Base64 of the CRC64/NVME over a whole object, the same whatever part size wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crc64(String);
+
+impl Crc64 {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The checksum S3 holds for an object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checksum {
+    FullObject(Crc64),
+    /// A checksum S3 did not name as over the whole object, such as one over the parts, so no other copy can match it.
+    Composite,
+    Absent,
+}
+
+impl Checksum {
+    fn of(checksum_type: Option<&ChecksumType>, crc64: Option<&str>) -> Self {
+        match (checksum_type, crc64) {
+            (Some(ChecksumType::FullObject), Some(crc64)) => {
+                Self::FullObject(Crc64(crc64.to_string()))
+            }
+            (Some(_) | None, Some(_)) => Self::Composite,
+            (Some(_) | None, None) => Self::Absent,
+        }
     }
 }
 
@@ -129,7 +145,7 @@ impl Archive {
         let metadata = provenance
             .entries()
             .into_iter()
-            .filter_map(|(name, value)| value.map(|value| (name.to_string(), value)))
+            .filter_map(|(name, value)| value.map(|value| (<&str>::from(name).to_string(), value)))
             .collect();
         let created = self
             .s3_client
@@ -194,15 +210,13 @@ impl Archive {
     ) -> Result<Vec<CompletedPart>, CopyError> {
         let path = dataset.key(listed.session()).path();
         let mut tasks = JoinSet::new();
-        for (number, start, length) in ranges(listed.length()) {
+        for range in ranges(listed.length()) {
             let part = Part {
                 s3_client: self.s3_client.clone(),
                 bucket_name: self.bucket_name.clone(),
                 path: path.clone(),
                 upload_id: upload_id.to_string(),
-                number,
-                start,
-                length,
+                range,
             };
             let flat_files = flat_files.clone();
             let listed = listed.clone();
@@ -290,9 +304,8 @@ impl Archive {
                     .content_length()
                     .and_then(|length| u64::try_from(length).ok())
                     .ok_or_else(|| failed("no length".to_string()))?;
-                let full_object = response.checksum_type() == Some(&ChecksumType::FullObject);
                 let fetched_at = fetched_at(response.metadata()).map_err(failed)?;
-                let tag = Tag::new(
+                let tag = EntityTag::new(
                     response
                         .e_tag()
                         .ok_or_else(|| failed("no entity tag".to_string()))?,
@@ -300,10 +313,10 @@ impl Archive {
                 Ok(Some(Stored {
                     tag,
                     length,
-                    checksum: response
-                        .checksum_crc64_nvme()
-                        .filter(|_| full_object)
-                        .map(String::from),
+                    checksum: Checksum::of(
+                        response.checksum_type(),
+                        response.checksum_crc64_nvme(),
+                    ),
                     fetched_at,
                 }))
             }
@@ -324,23 +337,32 @@ impl Archive {
 /// The fetch time an object's metadata records, refusing a stamp that is present but unreadable.
 fn fetched_at(metadata: Option<&HashMap<String, String>>) -> Result<Option<DateTime<Utc>>, String> {
     metadata
-        .and_then(|metadata| metadata.get(FETCHED_AT))
+        .and_then(|metadata| metadata.get(<&str>::from(MetadataEntry::FetchedAt)))
         .map(|raw| {
             DateTime::parse_from_rfc3339(raw)
                 .map(|instant| instant.with_timezone(&Utc))
-                .map_err(|error| format!("{FETCHED_AT} {raw:?} unreadable: {error}"))
+                .map_err(|error| format!("fetch time {raw:?} unreadable: {error}"))
         })
         .transpose()
 }
 
-/// The part number, first byte and length of each part a file of `length` bytes is uploaded in, numbered from one.
-fn ranges(length: u64) -> impl Iterator<Item = (i32, u64, NonZeroU64)> {
+/// One part of an upload: its number, counted from one, its first byte, and how many bytes it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartRange {
+    number: i32,
+    start: u64,
+    length: NonZeroU64,
+}
+
+/// The parts a file of `length` bytes is uploaded in.
+fn ranges(length: u64) -> impl Iterator<Item = PartRange> {
     (1..)
         .zip((0..length).step_by(PART_LENGTH as usize))
-        .map(move |(number, start)| {
-            let part = NonZeroU64::new(PART_LENGTH.min(length - start))
-                .expect("a part starts before the file ends");
-            (number, start, part)
+        .map(move |(number, start)| PartRange {
+            number,
+            start,
+            length: NonZeroU64::new(PART_LENGTH.min(length - start))
+                .expect("a part starts before the file ends"),
         })
 }
 
@@ -357,9 +379,7 @@ struct Part {
     bucket_name: String,
     path: String,
     upload_id: String,
-    number: i32,
-    start: u64,
-    length: NonZeroU64,
+    range: PartRange,
 }
 
 impl Part {
@@ -376,7 +396,7 @@ impl Part {
                 Err(error) if attempt < PART_ATTEMPTS => {
                     tracing::warn!(
                         path = self.path,
-                        part = self.number,
+                        part = self.range.number,
                         attempt,
                         %error,
                         "Retrying a part"
@@ -396,7 +416,7 @@ impl Part {
         listed: &Listed,
     ) -> Result<CompletedPart, CopyError> {
         let body = flat_files
-            .range(dataset, listed, self.start, self.length)
+            .range(dataset, listed, self.range.start, self.range.length)
             .await
             .map_err(CopyError::Source)?;
         let uploaded = self
@@ -405,7 +425,7 @@ impl Part {
             .bucket(&self.bucket_name)
             .key(&self.path)
             .upload_id(&self.upload_id)
-            .part_number(self.number)
+            .part_number(self.range.number)
             .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
             .body(ByteStream::from(body))
             .send()
@@ -417,7 +437,7 @@ impl Part {
                 })
             })?;
         Ok(CompletedPart::builder()
-            .part_number(self.number)
+            .part_number(self.range.number)
             .set_e_tag(uploaded.e_tag().map(String::from))
             .set_checksum_crc64_nvme(uploaded.checksum_crc64_nvme().map(String::from))
             .build())
@@ -434,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_a_fetch_stamp_is_read_absent_or_refused_never_dropped() {
-        let stamped = |raw: &str| HashMap::from([(FETCHED_AT.to_string(), raw.to_string())]);
+        let stamped = |raw: &str| HashMap::from([("fund.fetched_at".to_string(), raw.to_string())]);
         assert_eq!(
             fetched_at(Some(&stamped("2026-10-02T20:00:00-04:00")))
                 .map(|instant| instant.map(|instant| instant.to_rfc3339())),
@@ -446,10 +466,30 @@ mod tests {
     }
 
     #[test]
+    fn test_only_a_full_object_checksum_is_kept_as_one() {
+        assert_eq!(
+            Checksum::of(Some(&ChecksumType::FullObject), Some("AAAAAAAAAAA=")),
+            Checksum::FullObject(Crc64("AAAAAAAAAAA=".to_string()))
+        );
+        assert_eq!(
+            Checksum::of(Some(&ChecksumType::Composite), Some("AAAAAAAAAAA=-3")),
+            Checksum::Composite
+        );
+        assert_eq!(
+            Checksum::of(None, Some("AAAAAAAAAAA=")),
+            Checksum::Composite
+        );
+        assert_eq!(
+            Checksum::of(Some(&ChecksumType::FullObject), None),
+            Checksum::Absent
+        );
+    }
+
+    #[test]
     fn test_parts_cover_every_byte_once_numbered_from_one() {
         let ranges = |length| {
             ranges(length)
-                .map(|(number, start, part)| (number, start, part.get()))
+                .map(|range| (range.number, range.start, range.length.get()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(ranges(0), vec![]);
@@ -476,7 +516,7 @@ mod tests {
             ],
         ) {
             let parts: Vec<(i32, u64, u64)> = ranges(length)
-                .map(|(number, start, part)| (number, start, part.get()))
+                .map(|range| (range.number, range.start, range.length.get()))
                 .collect();
             proptest::prop_assert_eq!(parts.len() as u64, length.div_ceil(64 * MEBIBYTE));
             let mut end = 0;

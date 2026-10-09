@@ -11,6 +11,14 @@ use crate::laboratory::Study;
 use crate::laboratory::dataset::Dataset;
 use crate::laboratory::replay::{Opening, ReplayStudyError, beside, metrics, run, settings};
 
+/// Which arm of a comparison a setting or output belongs to, by the name it is journaled under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum ArmSide {
+    Candidate,
+    Baseline,
+}
+
 /// One side of a comparison: a strategy and the name that says what it is and the settings that make it so.
 pub struct Arm<S> {
     strategy: S,
@@ -75,8 +83,11 @@ pub fn compare<C: Strategy, B: Strategy>(
 ) -> Result<Comparison, ReplayStudyError> {
     let parameters = beside(
         [
-            ("candidate", candidate.name.as_str().to_string()),
-            ("baseline", baseline.name.as_str().to_string()),
+            (
+                ArmSide::Candidate.into(),
+                candidate.name.as_str().to_string(),
+            ),
+            (ArmSide::Baseline.into(), baseline.name.as_str().to_string()),
         ],
         settings(fill_model, decision, opening),
     )?;
@@ -100,8 +111,8 @@ pub fn compare<C: Strategy, B: Strategy>(
         .map_err(ReplayStudyError::Estimate)?;
     let outputs = outputs(
         [
-            ("candidate", &candidate, &candidate_returns),
-            ("baseline", &baseline, &baseline_returns),
+            (ArmSide::Candidate, &candidate, &candidate_returns),
+            (ArmSide::Baseline, &baseline, &baseline_returns),
         ],
         opening,
         difference,
@@ -118,7 +129,7 @@ pub fn compare<C: Strategy, B: Strategy>(
 
 /// The difference, each arm's own session return, and each arm's replay metrics under its side's prefix.
 fn outputs(
-    arms: [(&str, &Replay, &Series); 2],
+    arms: [(ArmSide, &Replay, &Series); 2],
     opening: Opening,
     difference: Estimate,
 ) -> Result<Outputs, ReplayStudyError> {
@@ -130,9 +141,9 @@ fn outputs(
         outputs = outputs
             .estimate(format!("{side}_session_return"), own)
             .map_err(ReplayStudyError::Experiment)?;
-        for (name, value) in metrics(replay, opening) {
+        for (metric, value) in metrics(replay, opening) {
             outputs = outputs
-                .metric(format!("{side}_{name}"), value)
+                .metric(format!("{side}_{metric}"), value)
                 .map_err(ReplayStudyError::Experiment)?;
         }
     }
