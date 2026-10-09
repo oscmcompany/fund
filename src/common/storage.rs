@@ -2,6 +2,7 @@
 //! columns, each parses back to the parts that built it, and each has exactly one host allowed to write it.
 
 use chrono::{Datelike, NaiveDate};
+use serde::{Deserialize, Serialize};
 
 use crate::common::market::record::BarInterval;
 use crate::common::time::SessionDate;
@@ -359,8 +360,9 @@ impl From<LogsKey> for Key {
     }
 }
 
-/// One object's place in the bucket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One object's place in the bucket, serialized as its path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum Key {
     Bars(BarsKey),
     Quotes(QuotesKey),
@@ -406,6 +408,28 @@ impl std::fmt::Display for SeriesPrefix {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyRefusal {
     Unrecognized { path: String },
+}
+
+impl std::fmt::Display for KeyRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unrecognized { path } => write!(formatter, "`{path}` is not a key"),
+        }
+    }
+}
+
+impl TryFrom<String> for Key {
+    type Error = KeyRefusal;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        Self::parse(&path)
+    }
+}
+
+impl From<Key> for String {
+    fn from(key: Key) -> Self {
+        key.path()
+    }
 }
 
 impl Key {
@@ -661,7 +685,7 @@ fn session(year: &str, month: &str, day: &str) -> Option<SessionDate> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use proptest::prelude::*;
     use strum::IntoEnumIterator;
 
@@ -788,6 +812,8 @@ mod tests {
                 }),
                 "{path}"
             );
+            let refused = serde_json::from_str::<Key>(&format!("\"{path}\""));
+            assert!(refused.is_err(), "{path}");
         }
     }
 
@@ -850,7 +876,7 @@ mod tests {
         }
     }
 
-    fn any_key() -> impl Strategy<Value = Key> {
+    pub(crate) fn any_key() -> impl Strategy<Value = Key> {
         let provider = prop::sample::select(Provider::iter().collect::<Vec<_>>());
         let origin = prop::sample::select(Origin::iter().collect::<Vec<_>>());
         let interval = prop::sample::select(BarInterval::iter().collect::<Vec<_>>());
@@ -906,6 +932,14 @@ mod tests {
         #[test]
         fn property_a_path_parses_back_to_its_key(key in any_key()) {
             prop_assert_eq!(Key::parse(&key.path()), Ok(key));
+        }
+
+        /// A key serializes as its path string and deserializes back to itself.
+        #[test]
+        fn property_a_key_serializes_as_its_path(key in any_key()) {
+            let json = serde_json::to_string(&key).unwrap();
+            prop_assert_eq!(&json, &format!("\"{}\"", key.path()));
+            prop_assert_eq!(serde_json::from_str::<Key>(&json).unwrap(), key);
         }
 
         #[test]

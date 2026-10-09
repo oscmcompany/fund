@@ -23,6 +23,7 @@ use crate::common::playbook::PlaybookRead;
 use crate::common::reconcile::BookReconciled;
 use crate::common::risk::TargetDecided;
 use crate::common::standing::{FeedChanged, SessionClosed, SessionHalted};
+use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 
 /// Stamped on every record this build writes; it only goes up, and a reader maps old versions forward.
@@ -190,6 +191,8 @@ pub enum Observation {
     PartitionWritten(PartitionWritten),
     PartitionFailed(PartitionFailed),
     ConditionsWritten(ConditionsWritten),
+    ObjectWritten(ObjectWritten),
+    ObjectDeleted(ObjectDeleted),
     HealFinished(HealFinished),
     DatasetRead(Box<DatasetRead>),
     ExperimentRan(Box<ExperimentRan>),
@@ -398,6 +401,31 @@ pub struct ConditionsWritten {
 impl ConditionsWritten {
     pub fn new(as_of: SessionDate, conditions: u64) -> Self {
         Self { as_of, conditions }
+    }
+}
+
+/// One archive object an operator command wrote, and its size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectWritten {
+    key: Key,
+    bytes: u64,
+}
+
+impl ObjectWritten {
+    pub fn new(key: Key, bytes: u64) -> Self {
+        Self { key, bytes }
+    }
+}
+
+/// One archive object an operator command deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectDeleted {
+    key: Key,
+}
+
+impl ObjectDeleted {
+    pub fn new(key: Key) -> Self {
+        Self { key }
     }
 }
 
@@ -683,6 +711,12 @@ mod tests {
             "the vendor answered with no rows".to_string(),
         );
         let conditions = ConditionsWritten::new(session, 70);
+        let raw_trades = Key::RawTrades {
+            provider: crate::common::storage::Provider::Massive,
+            session,
+        };
+        let object_written = ObjectWritten::new(raw_trades.clone(), 4_096);
+        let object_deleted = ObjectDeleted::new(raw_trades);
         let finished = HealFinished::new(
             Window::try_from(vec![session]).unwrap(),
             BTreeMap::from([(
@@ -740,6 +774,18 @@ mod tests {
                     r#""payload":{"as_of":"2026-09-29","conditions":70}}"#,
                 )
             )
+        );
+        let raw_path =
+            "data/equity/stage=raw/trades/provider=massive/year=2026/month=09/day=29/data.csv.gz";
+        assert_eq!(
+            envelope(Observation::ObjectWritten(object_written)),
+            format!(
+                r#"{prefix}"event_type":"object_written","payload":{{"key":"{raw_path}","bytes":4096}}}}"#
+            )
+        );
+        assert_eq!(
+            envelope(Observation::ObjectDeleted(object_deleted)),
+            format!(r#"{prefix}"event_type":"object_deleted","payload":{{"key":"{raw_path}"}}}}"#)
         );
         assert_eq!(
             envelope(Observation::HealFinished(finished)),
@@ -1516,6 +1562,11 @@ mod tests {
             (any_session(), any::<u64>()).prop_map(|(as_of, conditions)| {
                 Observation::ConditionsWritten(ConditionsWritten::new(as_of, conditions))
             }),
+            (crate::common::storage::tests::any_key(), any::<u64>()).prop_map(|(key, bytes)| {
+                Observation::ObjectWritten(ObjectWritten::new(key, bytes))
+            }),
+            crate::common::storage::tests::any_key()
+                .prop_map(|key| Observation::ObjectDeleted(ObjectDeleted::new(key))),
             (
                 prop::collection::btree_set(any_session(), 1..6),
                 prop::collection::btree_map(

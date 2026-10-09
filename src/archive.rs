@@ -127,11 +127,13 @@ wrap_refusal!(
     EncodeRefusal::Bars(bars::EncodeRefusal),
     EncodeRefusal::QuoteBars(quote_bars::EncodeRefusal),
     EncodeRefusal::TradeBars(trade_bars::EncodeRefusal),
+    EncodeRefusal::Reference(reference::ReferenceRefusal),
     EncodeRefusal::Journal(journal::EncodeRefusal),
     EncodeRefusal::Logs(logs::EncodeRefusal),
     DecodeRefusal::Bars(bars::DecodeRefusal),
     DecodeRefusal::QuoteBars(quote_bars::DecodeRefusal),
     DecodeRefusal::TradeBars(trade_bars::DecodeRefusal),
+    DecodeRefusal::Reference(reference::ReferenceRefusal),
     DecodeRefusal::Journal(journal::DecodeRefusal),
 );
 

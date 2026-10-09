@@ -1,30 +1,33 @@
-//! Massive's flat files into the archive while the Advanced keys last: `copy` fetches each raw session not held, `parse`,
-//! `fold-quotes`, `fold-trades` and `roll-up` derive bars from them, `fetch-conditions` stores the trade conditions and
-//! `delete` removes keyed objects. Exits 0 when everything succeeded, 1 when not, 2 on bad usage.
+//! Massive's flat files into the archive while the Advanced keys last: `copy`, `parse`, `fold-quotes`, `fold-trades`,
+//! `roll-up`, `fetch-conditions` and `delete`, each object journaled and shipped. Exits 0 when everything succeeded and
+//! shipped, 1 when not, 2 when the run could not start.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use strum::IntoEnumIterator;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
-use uuid::Uuid;
 
 use fund::archive::bars;
 use fund::archive::bars::{Provenance, Subscription, encode};
 use fund::archive::raw::CopyError;
 use fund::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use fund::archive::{quote_bars, reference, trade_bars};
-use fund::common::journal::{Commit, RunId};
+use fund::common::journal::{ConfigurationResolved, ObjectDeleted, ObjectWritten, Observation};
 use fund::common::market::aggregate::{self, session_bars};
 use fund::common::market::quote_bars::QuoteFold;
 use fund::common::market::record::BarInterval;
 use fund::common::market::trade_bars::{TradeConditions, TradeFold};
 use fund::common::monoid::{Monoid, Tally};
+use fund::common::parameter::{Parameter, ParameterRefusal, record as resolve};
 use fund::common::storage::{
-    BarsKey, Family, Key, Origin, ParsedKey, Provider, QuotesKey, TradesKey,
+    BarsKey, Family, Host, Key, Origin, ParsedKey, Provider, QuotesKey, Service, TradesKey,
 };
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
@@ -36,9 +39,11 @@ use fund::ingest::flat_files::{
 };
 use fund::ingest::massive::Massive;
 use fund::ingest::refused_by_cause;
-use fund::journal::built_commit;
+use fund::journal::Journal;
+use fund::parameter::{DEFAULT_JOURNAL_DIRECTORY, DEFAULT_LOG_DIRECTORY, environment_variable};
+use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 
-const REFUSED_TO_START: u8 = 2;
+const SERVICE: &str = "archive_raw";
 
 /// The first session the nightly heal writes Massive's REST daily bars for, which carry the dollar volume a flat
 /// file lacks; a create-only parse written first would hold that session against them.
@@ -53,20 +58,45 @@ const LISTED_SESSIONS: usize = 50;
 /// Ranged reads queued ahead of the parser per streamed file; at sixteen mebibytes each, roughly the bytes held ahead of it.
 const STREAM_AHEAD: usize = 8;
 
+/// The subcommand named first on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::EnumString, strum::EnumIter)]
+#[strum(serialize_all = "kebab-case")]
+enum CommandName {
+    Copy,
+    Parse,
+    FoldQuotes,
+    FetchConditions,
+    Delete,
+    RollUp,
+    FoldTrades,
+}
+
+impl CommandName {
+    /// The arguments the subcommand takes after its name, as the usage line shows them.
+    fn arguments(self) -> &'static str {
+        match self {
+            Self::Copy | Self::Parse => " <dataset> <first> <last> <concurrency>",
+            Self::FoldQuotes | Self::RollUp | Self::FoldTrades => " <first> <last> <concurrency>",
+            Self::FetchConditions => "",
+            Self::Delete => " <path>...",
+        }
+    }
+}
+
 enum Command {
     Copy {
         dataset: FlatFileDataset,
         range: SessionRange,
-        concurrency: usize,
+        concurrency: NonZeroUsize,
     },
     Parse {
         file: BarFile,
         range: SessionRange,
-        concurrency: usize,
+        concurrency: NonZeroUsize,
     },
     FoldQuotes {
         range: SessionRange,
-        concurrency: usize,
+        concurrency: NonZeroUsize,
     },
     FetchConditions,
     /// Deletes the objects at paths that each parse as a key.
@@ -75,11 +105,11 @@ enum Command {
     },
     RollUp {
         range: SessionRange,
-        concurrency: usize,
+        concurrency: NonZeroUsize,
     },
     FoldTrades {
         range: SessionRange,
-        concurrency: usize,
+        concurrency: NonZeroUsize,
     },
 }
 
@@ -90,192 +120,269 @@ fn parse(arguments: &[String]) -> Option<Command> {
             .map(SessionDate::from_date)
     };
     let range = |first: &str, last: &str| SessionRange::new(date(first)?, date(last)?).ok();
-    match arguments {
-        [command, dataset, first, last, concurrency] if command == "copy" => Some(Command::Copy {
-            dataset: dataset.parse().ok()?,
-            range: range(first, last)?,
-            concurrency: concurrency
-                .parse()
-                .ok()
-                .filter(|count: &usize| *count > 0)?,
-        }),
-        [command, dataset, first, last, concurrency] if command == "parse" => {
+    let concurrency = |raw: &str| raw.parse::<NonZeroUsize>().ok();
+    let ranged = |rest: &[String]| {
+        let [first, last, count] = rest else {
+            return None;
+        };
+        Some((range(first, last)?, concurrency(count)?))
+    };
+    let (name, rest) = arguments.split_first()?;
+    match name.parse::<CommandName>().ok()? {
+        CommandName::Copy => {
+            let [dataset, first, last, count] = rest else {
+                return None;
+            };
+            Some(Command::Copy {
+                dataset: dataset.parse().ok()?,
+                range: range(first, last)?,
+                concurrency: concurrency(count)?,
+            })
+        }
+        CommandName::Parse => {
+            let [file, first, last, count] = rest else {
+                return None;
+            };
             Some(Command::Parse {
-                file: dataset.parse().ok()?,
+                file: file.parse().ok()?,
                 range: range(first, last)?,
-                concurrency: concurrency
-                    .parse()
-                    .ok()
-                    .filter(|count: &usize| *count > 0)?,
+                concurrency: concurrency(count)?,
             })
         }
-        [command] if command == "fetch-conditions" => Some(Command::FetchConditions),
-        [command, paths @ ..] if command == "delete" && !paths.is_empty() => {
-            Some(Command::Delete {
-                keys: paths
-                    .iter()
-                    .map(|path| Key::parse(path).ok())
-                    .collect::<Option<_>>()?,
-            })
+        CommandName::FetchConditions => rest.is_empty().then_some(Command::FetchConditions),
+        CommandName::Delete => {
+            let keys = rest
+                .iter()
+                .map(|path| Key::parse(path).ok())
+                .collect::<Option<Vec<_>>>()?;
+            (!keys.is_empty()).then_some(Command::Delete { keys })
         }
-        [command, first, last, concurrency] if command == "roll-up" => Some(Command::RollUp {
-            range: range(first, last)?,
-            concurrency: concurrency
-                .parse()
-                .ok()
-                .filter(|count: &usize| *count > 0)?,
-        }),
-        [command, first, last, concurrency] if command == "fold-trades" => {
-            Some(Command::FoldTrades {
-                range: range(first, last)?,
-                concurrency: concurrency
-                    .parse()
-                    .ok()
-                    .filter(|count: &usize| *count > 0)?,
-            })
+        CommandName::RollUp => {
+            ranged(rest).map(|(range, concurrency)| Command::RollUp { range, concurrency })
         }
-        [command, first, last, concurrency] if command == "fold-quotes" => {
-            Some(Command::FoldQuotes {
-                range: range(first, last)?,
-                concurrency: concurrency
-                    .parse()
-                    .ok()
-                    .filter(|count: &usize| *count > 0)?,
-            })
+        CommandName::FoldTrades => {
+            ranged(rest).map(|(range, concurrency)| Command::FoldTrades { range, concurrency })
         }
-        _ => None,
+        CommandName::FoldQuotes => {
+            ranged(rest).map(|(range, concurrency)| Command::FoldQuotes { range, concurrency })
+        }
     }
+}
+
+/// Every subcommand with its arguments, one alternative each.
+fn usage() -> String {
+    CommandName::iter()
+        .map(|name| format!("{name}{}", name.arguments()))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Where the run's journal and logs go, with the configuration the journal records for them.
+fn directories() -> Result<((PathBuf, PathBuf), ConfigurationResolved), ParameterRefusal> {
+    let mut resolved = BTreeMap::new();
+    let mut directory = |parameter, default: &str| {
+        resolve(
+            (parameter, environment_variable(parameter)?),
+            default.to_string(),
+            &mut resolved,
+        )
+        .map(PathBuf::from)
+    };
+    let journal_directory = directory(Parameter::JournalDirectory, DEFAULT_JOURNAL_DIRECTORY)?;
+    let log_directory = directory(Parameter::LogDirectory, DEFAULT_LOG_DIRECTORY)?;
+    Ok((
+        (journal_directory, log_directory),
+        ConfigurationResolved::new(resolved),
+    ))
+}
+
+/// The run's journal, shared by the concurrent sessions so each object is recorded as it lands.
+type SharedJournal = Arc<Mutex<Journal>>;
+
+/// Journals `observation` now.
+fn journaled(journal: &Mutex<Journal>, observation: Observation) -> std::io::Result<()> {
+    journal
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .append(Utc::now(), observation)
+}
+
+/// Journals the object of `bytes` written under `key`.
+fn written(journal: &Mutex<Journal>, key: Key, bytes: u64) -> std::io::Result<()> {
+    journaled(
+        journal,
+        Observation::ObjectWritten(ObjectWritten::new(key, bytes)),
+    )
+}
+
+/// A body's length as the journal counts it.
+fn length(body: &[u8]) -> u64 {
+    u64::try_from(body.len()).expect("a body holds fewer than u64::MAX bytes")
+}
+
+/// The provenance of rows `subscription` answered at `fetched_at`, written by this run.
+fn provenance(
+    subscription: Subscription,
+    fetched_at: DateTime<Utc>,
+    journal: &Mutex<Journal>,
+) -> Provenance {
+    let journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+    Provenance::new(
+        subscription,
+        fetched_at,
+        journal.run_id(),
+        journal.commit().cloned(),
+    )
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .json()
-        .with_current_span(true)
-        .init();
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let Some(command) = parse(&arguments) else {
-        tracing::error!(
-            ?arguments,
-            "Usage: copy <dataset> <first> <last> <concurrency> | parse <dataset> <first> <last> <concurrency> | fold-quotes <first> <last> <concurrency> | fetch-conditions | delete <path>... | roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>"
-        );
-        return ExitCode::from(REFUSED_TO_START);
-    };
-    let run_id = RunId::new(Uuid::new_v4());
-    let commit = built_commit();
-    let span = tracing::info_span!(
-        "run",
-        %run_id,
-        commit = commit.as_ref().map_or("unknown", Commit::as_str),
-    );
+    let service = Service::new(SERVICE).expect("the service name is one path segment");
+    let parameters = directories();
+    let started = start(service.clone(), SessionDate::at(Utc::now()));
+    let span = started.span();
     async move {
-        let configuration = aws_config::load_from_env().await;
-        let archive = match Archive::market_data(&configuration) {
-            Ok(archive) => archive,
-            Err(refusal) => {
+        let arguments: Vec<String> = std::env::args().skip(1).collect();
+        let Some(command) = parse(&arguments) else {
+            tracing::error!(?arguments, usage = usage(), "Usage refused");
+            return RefusedToStart.into();
+        };
+        let ((journal_directory, log_directory), configuration) = match resolved(parameters) {
+            Ok(resolved) => resolved,
+            Err(refused) => return refused.into(),
+        };
+        // Several commands may run at once; each only creates or deletes the keys it names.
+        let journal = match started.open(&journal_directory, configuration, Exclusion::Concurrent) {
+            Ok((journal, _)) => Arc::new(Mutex::new(journal)),
+            Err(refused) => return refused.into(),
+        };
+        let sdk_configuration = aws_config::load_from_env().await;
+        let (archive, records) = match (
+            Archive::market_data(&sdk_configuration),
+            Archive::records(&sdk_configuration),
+        ) {
+            (Ok(archive), Ok(records)) => (archive, records),
+            (Err(refusal), _) | (_, Err(refusal)) => {
                 tracing::error!(%refusal, "Archive configuration refused");
-                return ExitCode::from(REFUSED_TO_START);
+                return RefusedToStart.into();
             }
         };
-        match command {
-            Command::Copy {
-                dataset,
-                range,
-                concurrency,
-            } => {
-                let flat_files = match FlatFiles::from_environment() {
-                    Ok(flat_files) => flat_files,
-                    Err(refusal) => {
-                        tracing::error!(%refusal, "Flat-file configuration refused");
-                        return ExitCode::from(REFUSED_TO_START);
-                    }
-                };
-                copy(
-                    &archive,
-                    &flat_files,
-                    dataset,
-                    range,
-                    concurrency,
-                    run_id,
-                    commit,
-                )
-                .await
-            }
-            Command::RollUp { range, concurrency } => roll_up(archive, range, concurrency).await,
-            Command::Delete { keys } => {
-                let mut failed = 0;
-                for key in &keys {
-                    match archive.delete(key).await {
-                        Ok(()) => tracing::info!(path = key.path(), "Deleted an object"),
-                        Err(error) => {
-                            failed += 1;
-                            tracing::error!(%error, "Object not deleted");
-                        }
-                    }
-                }
-                if failed == 0 {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            }
-            Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
-                Ok(massive) => fetch_conditions(&archive, &massive, run_id, commit).await,
-                Err(refusal) => {
-                    tracing::error!(%refusal, "Client configuration refused");
-                    ExitCode::from(REFUSED_TO_START)
-                }
-            },
-            Command::FoldTrades { range, concurrency } => {
-                let Some((flat_files, alpaca)) = fold_clients() else {
-                    return ExitCode::from(REFUSED_TO_START);
-                };
-                fold_trades(
-                    &archive,
-                    &flat_files,
-                    &alpaca,
-                    range,
-                    concurrency,
-                    run_id,
-                    commit,
-                )
-                .await
-            }
-            Command::FoldQuotes { range, concurrency } => {
-                let Some((flat_files, alpaca)) = fold_clients() else {
-                    return ExitCode::from(REFUSED_TO_START);
-                };
-                fold_quotes(
-                    &archive,
-                    &flat_files,
-                    &alpaca,
-                    range,
-                    concurrency,
-                    run_id,
-                    commit,
-                )
-                .await
-            }
-            Command::Parse {
-                file,
-                range,
-                concurrency,
-            } => parse_bars(archive, file, range, concurrency, run_id, commit).await,
+        let outcome = run(command, archive, &journal).await;
+        let all_shipped = ship_logged(
+            &records,
+            Host::Archiver,
+            &service,
+            &journal_directory,
+            &log_directory,
+        )
+        .await;
+        match (outcome == ExitCode::SUCCESS, all_shipped) {
+            (true, false) => ExitCode::FAILURE,
+            (true, true) | (false, true | false) => outcome,
         }
     }
     .instrument(span)
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Runs one command, journaling every object it writes or deletes.
+async fn run(command: Command, archive: Archive, journal: &SharedJournal) -> ExitCode {
+    match command {
+        Command::Copy {
+            dataset,
+            range,
+            concurrency,
+        } => {
+            let flat_files = match FlatFiles::from_environment() {
+                Ok(flat_files) => flat_files,
+                Err(refusal) => {
+                    tracing::error!(%refusal, "Flat-file configuration refused");
+                    return RefusedToStart.into();
+                }
+            };
+            copy(&archive, &flat_files, dataset, range, concurrency, journal).await
+        }
+        Command::RollUp { range, concurrency } => {
+            roll_up(archive, range, concurrency, journal).await
+        }
+        Command::Delete { keys } => delete(&archive, &keys, journal).await,
+        Command::FetchConditions => match Massive::from_environment(reqwest::Client::new()) {
+            Ok(massive) => fetch_conditions(&archive, &massive, journal).await,
+            Err(refusal) => {
+                tracing::error!(%refusal, "Client configuration refused");
+                RefusedToStart.into()
+            }
+        },
+        Command::FoldTrades { range, concurrency } => {
+            let Some((flat_files, alpaca)) = fold_clients() else {
+                return RefusedToStart.into();
+            };
+            fold_trades(&archive, &flat_files, &alpaca, range, concurrency, journal).await
+        }
+        Command::FoldQuotes { range, concurrency } => {
+            let Some((flat_files, alpaca)) = fold_clients() else {
+                return RefusedToStart.into();
+            };
+            fold_quotes(&archive, &flat_files, &alpaca, range, concurrency, journal).await
+        }
+        Command::Parse {
+            file,
+            range,
+            concurrency,
+        } => parse_bars(archive, file, range, concurrency, journal).await,
+    }
+}
+
+/// Deletes each key in turn, journaling each deletion as it lands.
+async fn delete(archive: &Archive, keys: &[Key], journal: &Mutex<Journal>) -> ExitCode {
+    let mut failed = 0;
+    for key in keys {
+        match archive.delete(key).await {
+            Ok(()) => {
+                tracing::info!(path = key.path(), "Deleted an object");
+                let deleted = Observation::ObjectDeleted(ObjectDeleted::new(key.clone()));
+                if let Err(error) = journaled(journal, deleted) {
+                    failed += 1;
+                    tracing::error!(path = key.path(), %error, "Deletion not journaled");
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::error!(%error, "Object not deleted");
+            }
+        }
+    }
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Why a raw file was not copied and journaled.
+#[derive(Debug)]
+enum CopyFailure {
+    Copy(CopyError),
+    /// Copied, but the write went unrecorded.
+    Journal(std::io::Error),
+}
+
+impl std::fmt::Display for CopyFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Copy(error) => write!(formatter, "{error}"),
+            Self::Journal(error) => write!(formatter, "journaling the copy failed: {error}"),
+        }
+    }
+}
+
 async fn copy(
     archive: &Archive,
     flat_files: &FlatFiles,
     dataset: FlatFileDataset,
     range: SessionRange,
-    concurrency: usize,
-    run_id: RunId,
-    commit: Option<Commit>,
+    concurrency: NonZeroUsize,
+    journal: &SharedJournal,
 ) -> ExitCode {
     let listing = match flat_files.listing(dataset).await {
         Ok(listing) => listing,
@@ -314,13 +421,13 @@ async fn copy(
         series = %dataset.key(range.first()).series(),
         "Planned a raw copy"
     );
-    let permits = Arc::new(Semaphore::new(concurrency));
+    let permits = Arc::new(Semaphore::new(concurrency.get()));
     let mut tasks = JoinSet::new();
     let mut outcomes = BTreeMap::new();
     let mut panicked = 0;
     for listed in owed {
         // At most `concurrency` sessions are in flight, so small files overlap while a large one fills every permit.
-        while tasks.len() >= concurrency {
+        while tasks.len() >= concurrency.get() {
             if let Some(joined) = tasks.join_next().await {
                 record(joined, &mut outcomes, &mut panicked);
             }
@@ -328,15 +435,20 @@ async fn copy(
         let archive = archive.clone();
         let flat_files = flat_files.clone();
         let permits = Arc::clone(&permits);
-        let commit = commit.clone();
+        let journal = Arc::clone(journal);
         tasks.spawn(
             async move {
                 let started = tokio::time::Instant::now();
-                let provenance =
-                    Provenance::new(Subscription::StocksAdvanced, Utc::now(), run_id, commit);
-                let outcome = archive
+                let provenance = provenance(Subscription::StocksAdvanced, Utc::now(), &journal);
+                let outcome = match archive
                     .copy_flat_file(&flat_files, dataset, &listed, &provenance, permits)
-                    .await;
+                    .await
+                {
+                    Ok(stored) => written(&journal, dataset.key(listed.session()), stored.length())
+                        .map(|()| stored)
+                        .map_err(CopyFailure::Journal),
+                    Err(error) => Err(CopyFailure::Copy(error)),
+                };
                 let seconds = started.elapsed().as_secs_f64();
                 match &outcome {
                     Ok(stored) => tracing::info!(
@@ -346,9 +458,14 @@ async fn copy(
                         megabytes_per_second = stored.length() as f64 / 1e6 / seconds,
                         "Copied a raw file"
                     ),
-                    Err(error) => {
+                    Err(error @ CopyFailure::Copy(_)) => {
                         tracing::error!(session = %listed.session(), %error, "Raw file not copied")
                     }
+                    Err(error @ CopyFailure::Journal(_)) => tracing::error!(
+                        session = %listed.session(),
+                        %error,
+                        "Raw file copied but not journaled"
+                    ),
                 }
                 (listed.session(), outcome)
             }
@@ -368,7 +485,9 @@ async fn copy(
         .filter(|outcome| {
             matches!(
                 outcome,
-                Err(CopyError::Archive(ArchiveError::Contended { .. }))
+                Err(CopyFailure::Copy(CopyError::Archive(
+                    ArchiveError::Contended { .. }
+                )))
             )
         })
         .count();
@@ -420,6 +539,8 @@ enum ParseFailure {
     Encode(bars::EncodeRefusal),
     /// The blocking parse did not finish.
     Interrupted(String),
+    /// Written, but the write went unrecorded.
+    Journal(std::io::Error),
 }
 
 impl std::fmt::Display for ParseFailure {
@@ -438,6 +559,7 @@ impl std::fmt::Display for ParseFailure {
             ),
             Self::Interrupted(reason) => write!(formatter, "the parse did not finish: {reason}"),
             Self::Encode(refusal) => write!(formatter, "{refusal:?}"),
+            Self::Journal(error) => write!(formatter, "journaling the write failed: {error}"),
         }
     }
 }
@@ -446,16 +568,15 @@ async fn parse_bars(
     archive: Archive,
     file: BarFile,
     range: SessionRange,
-    concurrency: usize,
-    run_id: RunId,
-    commit: Option<Commit>,
+    concurrency: NonZeroUsize,
+    journal: &SharedJournal,
 ) -> ExitCode {
     let (dataset, interval) = (file.dataset(), file.interval());
     let heal_start = SessionDate::from_date(HEAL_DAILY_BARS_FROM);
     match file {
         BarFile::Daily if range.last() >= heal_start => {
             tracing::error!(last = %range.last(), %heal_start, "Daily bars from this session on are the nightly heal's to write");
-            return ExitCode::from(REFUSED_TO_START);
+            return RefusedToStart.into();
         }
         BarFile::Daily | BarFile::Minute => {}
     }
@@ -500,17 +621,17 @@ async fn parse_bars(
     let mut outcomes = BTreeMap::new();
     let mut panicked = 0;
     for session in owed {
-        while tasks.len() >= concurrency {
+        while tasks.len() >= concurrency.get() {
             if let Some(joined) = tasks.join_next().await {
                 record(joined, &mut outcomes, &mut panicked);
             }
         }
         let archive = archive.clone();
-        let commit = commit.clone();
+        let journal = Arc::clone(journal);
         let key = bars_key(session);
         tasks.spawn(
             async move {
-                let outcome = parse_one(&archive, file, key, run_id, commit).await;
+                let outcome = parse_one(&archive, file, key, &journal).await;
                 match &outcome {
                     Ok(()) => {}
                     Err(failure) => {
@@ -588,8 +709,7 @@ async fn parse_one(
     archive: &Archive,
     file: BarFile,
     key: BarsKey,
-    run_id: RunId,
-    commit: Option<Commit>,
+    journal: &Mutex<Journal>,
 ) -> Result<(), ParseFailure> {
     let session = key.session();
     let raw_key = file.dataset().key(session);
@@ -605,7 +725,7 @@ async fn parse_one(
         .await
         .map_err(ParseFailure::Archive)?
         .ok_or(ParseFailure::Missing)?;
-    let provenance = Provenance::new(Subscription::StocksAdvanced, fetched_at, run_id, commit);
+    let provenance = provenance(Subscription::StocksAdvanced, fetched_at, journal);
     // Decompressing, parsing and encoding a minute file is seconds of CPU, which belongs off the async workers.
     let (parsed, body) = tokio::task::spawn_blocking(move || {
         let parsed = file
@@ -622,10 +742,12 @@ async fn parse_one(
     })
     .await
     .map_err(|error| ParseFailure::Interrupted(error.to_string()))??;
+    let bytes = length(&body);
     archive
         .create(&key.into(), body)
         .await
         .map_err(ParseFailure::Archive)?;
+    written(journal, key.into(), bytes).map_err(ParseFailure::Journal)?;
     tracing::info!(
         session = %session,
         bars = parsed.bars().len(),
@@ -673,6 +795,8 @@ enum FoldFailure {
         key: Key,
         refusal: Box<DecodeRefusal>,
     },
+    /// Written, but the write went unrecorded.
+    Journal(std::io::Error),
 }
 
 impl std::fmt::Display for FoldFailure {
@@ -687,6 +811,7 @@ impl std::fmt::Display for FoldFailure {
             Self::Unreadable { key, refusal } => {
                 write!(formatter, "{} held but unreadable: {refusal}", key.path())
             }
+            Self::Journal(error) => write!(formatter, "journaling a write failed: {error}"),
         }
     }
 }
@@ -701,7 +826,7 @@ async fn fold_sessions<Fold, Folding>(
     dataset: FlatFileDataset,
     daily: Key,
     range: SessionRange,
-    concurrency: usize,
+    concurrency: NonZeroUsize,
     noun: &'static str,
     mut fold: Fold,
 ) -> ExitCode
@@ -760,7 +885,7 @@ where
     let mut outcomes = BTreeMap::new();
     let mut panicked = 0;
     for listed_file in owed {
-        while tasks.len() >= concurrency {
+        while tasks.len() >= concurrency.get() {
             if let Some(joined) = tasks.join_next().await {
                 record(joined, &mut outcomes, &mut panicked);
             }
@@ -812,15 +937,13 @@ where
 }
 
 /// Streams each listed quote file not yet folded from Massive and writes its one-minute, five-minute and daily bars.
-#[allow(clippy::too_many_arguments)]
 async fn fold_quotes(
     archive: &Archive,
     flat_files: &FlatFiles,
     alpaca: &Alpaca,
     range: SessionRange,
-    concurrency: usize,
-    run_id: RunId,
-    commit: Option<Commit>,
+    concurrency: NonZeroUsize,
+    journal: &SharedJournal,
 ) -> ExitCode {
     let calendar = match alpaca.calendar(range).await {
         Ok(calendar) => calendar,
@@ -845,13 +968,11 @@ async fn fold_quotes(
                 .map(|trading| trading.hours())
                 .expect("owed sessions are trading days");
             let archive = archive.clone();
-            let provenance = Provenance::new(
-                Subscription::StocksAdvanced,
-                Utc::now(),
-                run_id,
-                commit.clone(),
-            );
-            async move { fold_quotes_one(&archive, stream, session, hours, &provenance).await }
+            let journal = Arc::clone(journal);
+            let provenance = provenance(Subscription::StocksAdvanced, Utc::now(), &journal);
+            async move {
+                fold_quotes_one(&archive, stream, session, hours, &provenance, &journal).await
+            }
         },
     )
     .await
@@ -863,6 +984,7 @@ async fn fold_quotes_one(
     session: SessionDate,
     (open, close): (DateTime<Utc>, DateTime<Utc>),
     provenance: &Provenance,
+    journal: &Mutex<Journal>,
 ) -> Result<(), FoldFailure> {
     let folded = tokio::task::spawn_blocking(move || {
         let mut fold =
@@ -891,7 +1013,7 @@ async fn fold_quotes_one(
         let key = massive_derived(interval, session);
         let body = quote_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
-        create_or_confirm(archive, &key.into(), body, |held| {
+        create_or_confirm(archive, &key.into(), body, journal, |held| {
             quote_bars::decode(&key, held).map(|(held, _)| held == bars)
         })
         .await?;
@@ -911,16 +1033,18 @@ async fn fold_quotes_one(
     Ok(())
 }
 
-/// Creates `key`, or, when an interrupted run already wrote it, accepts it only if it holds the same bars, so a
-/// rerun finishes a session's missing files without replacing what it cannot tell is identical.
+/// Creates `key` and journals it, or, when an interrupted run already wrote it, accepts it only if it holds the same
+/// bars, so a rerun finishes a session's missing files without replacing what it cannot tell is identical.
 async fn create_or_confirm<Refusal: Into<DecodeRefusal>>(
     archive: &Archive,
     key: &Key,
     body: Vec<u8>,
+    journal: &Mutex<Journal>,
     same_bars: impl FnOnce(Vec<u8>) -> Result<bool, Refusal>,
 ) -> Result<(), FoldFailure> {
+    let bytes = length(&body);
     match archive.create(key, body).await {
-        Ok(()) => Ok(()),
+        Ok(()) => written(journal, key.clone(), bytes).map_err(FoldFailure::Journal),
         Err(ArchiveError::Contended { path }) => {
             let held = archive
                 .get(key)
@@ -958,8 +1082,7 @@ struct QuoteRowCounts {
 async fn fetch_conditions(
     archive: &Archive,
     massive: &Massive,
-    run_id: RunId,
-    commit: Option<Commit>,
+    journal: &Mutex<Journal>,
 ) -> ExitCode {
     let fetched_at = Utc::now();
     let conditions = match massive.trade_conditions().await {
@@ -971,19 +1094,25 @@ async fn fetch_conditions(
     };
     let key = reference::conditions_key(SessionDate::at(fetched_at));
     let object = Key::from(key);
-    let provenance = Provenance::new(Subscription::StocksStarter, fetched_at, run_id, commit);
-    let written = reference::encode_conditions(&key, &conditions, &provenance)
-        .map_err(EncodeRefusal::Reference)
-        .map(|body| archive.create(&object, body));
-    match written {
-        Ok(write) => match write.await {
+    let provenance = provenance(Subscription::StocksStarter, fetched_at, journal);
+    let encoded = reference::encode_conditions(&key, &conditions, &provenance)
+        .map_err(EncodeRefusal::from)
+        .map(|body| (length(&body), archive.create(&object, body)));
+    match encoded {
+        Ok((bytes, write)) => match write.await {
             Ok(()) => {
                 tracing::info!(
                     path = object.path(),
                     codes = conditions.conditions().len(),
                     "Wrote the conditions table"
                 );
-                ExitCode::SUCCESS
+                match written(journal, object.clone(), bytes) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        tracing::error!(%error, "Conditions table write not journaled");
+                        ExitCode::FAILURE
+                    }
+                }
             }
             Err(error) => {
                 tracing::error!(%error, "Conditions table not written");
@@ -998,15 +1127,13 @@ async fn fetch_conditions(
 }
 
 /// Streams each listed trade file not yet folded from Massive and writes its one-minute, five-minute and daily bars.
-#[allow(clippy::too_many_arguments)]
 async fn fold_trades(
     archive: &Archive,
     flat_files: &FlatFiles,
     alpaca: &Alpaca,
     range: SessionRange,
-    concurrency: usize,
-    run_id: RunId,
-    commit: Option<Commit>,
+    concurrency: NonZeroUsize,
+    journal: &SharedJournal,
 ) -> ExitCode {
     let (conditions_key, conditions) = match reference::latest_conditions(archive).await {
         Ok(latest) => latest,
@@ -1040,13 +1167,11 @@ async fn fold_trades(
         |session, stream| {
             let archive = archive.clone();
             let conditions = conditions.clone();
-            let provenance = Provenance::new(
-                Subscription::StocksAdvanced,
-                Utc::now(),
-                run_id,
-                commit.clone(),
-            );
-            async move { fold_trades_one(&archive, stream, session, conditions, &provenance).await }
+            let journal = Arc::clone(journal);
+            let provenance = provenance(Subscription::StocksAdvanced, Utc::now(), &journal);
+            async move {
+                fold_trades_one(&archive, stream, session, conditions, &provenance, &journal).await
+            }
         },
     )
     .await
@@ -1059,6 +1184,7 @@ async fn fold_trades_one(
     session: SessionDate,
     conditions: TradeConditions,
     provenance: &Provenance,
+    journal: &Mutex<Journal>,
 ) -> Result<(), FoldFailure> {
     let folded = tokio::task::spawn_blocking(move || {
         let mut fold = TradeFold::new(session, conditions);
@@ -1090,7 +1216,7 @@ async fn fold_trades_one(
         let key = massive_derived(interval, session);
         let body = trade_bars::encode(&key, &bars, provenance)
             .map_err(|refusal| FoldFailure::Encode(refusal.into()))?;
-        create_or_confirm(archive, &key.into(), body, |held| {
+        create_or_confirm(archive, &key.into(), body, journal, |held| {
             trade_bars::decode(&key, held).map(|(held, _)| held == bars)
         })
         .await?;
@@ -1128,6 +1254,8 @@ enum RollUpFailure {
     Encode(bars::EncodeRefusal),
     /// The roll-up's task panicked or was canceled before it finished.
     Interrupted(String),
+    /// Written, but the write went unrecorded.
+    Journal(std::io::Error),
 }
 
 impl std::fmt::Display for RollUpFailure {
@@ -1138,12 +1266,18 @@ impl std::fmt::Display for RollUpFailure {
             Self::Decode(refusal) => write!(formatter, "minute bars not read: {refusal:?}"),
             Self::Encode(refusal) => write!(formatter, "five-minute bars not encoded: {refusal:?}"),
             Self::Interrupted(reason) => write!(formatter, "the roll-up did not finish: {reason}"),
+            Self::Journal(error) => write!(formatter, "journaling the write failed: {error}"),
         }
     }
 }
 
 /// Writes derived five-minute bars for each session whose Massive minute bars are held and five-minute bars are not.
-async fn roll_up(archive: Archive, range: SessionRange, concurrency: usize) -> ExitCode {
+async fn roll_up(
+    archive: Archive,
+    range: SessionRange,
+    concurrency: NonZeroUsize,
+    journal: &SharedJournal,
+) -> ExitCode {
     let sessions = |origin, interval| {
         let archive = archive.clone();
         async move {
@@ -1185,15 +1319,16 @@ async fn roll_up(archive: Archive, range: SessionRange, concurrency: usize) -> E
     let mut outcomes = BTreeMap::new();
     let mut panicked = 0;
     for session in owed {
-        while tasks.len() >= concurrency {
+        while tasks.len() >= concurrency.get() {
             if let Some(joined) = tasks.join_next().await {
                 record(joined, &mut outcomes, &mut panicked);
             }
         }
         let archive = archive.clone();
+        let journal = Arc::clone(journal);
         tasks.spawn(
             async move {
-                let outcome = roll_up_one(&archive, session).await;
+                let outcome = roll_up_one(&archive, session, &journal).await;
                 match &outcome {
                     Ok(bars) => tracing::info!(session = %session, bars, "Rolled up a session"),
                     Err(failure) => {
@@ -1228,7 +1363,11 @@ async fn roll_up(archive: Archive, range: SessionRange, concurrency: usize) -> E
 }
 
 /// Rolls one session's minute bars up to five-minute bars under the minutes' own provenance.
-async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, RollUpFailure> {
+async fn roll_up_one(
+    archive: &Archive,
+    session: SessionDate,
+    journal: &Mutex<Journal>,
+) -> Result<usize, RollUpFailure> {
     let minute_key = massive_bars_key(Origin::Vendor, BarInterval::OneMinute, session);
     let bytes = archive
         .get(&minute_key.into())
@@ -1246,10 +1385,12 @@ async fn roll_up_one(archive: &Archive, session: SessionDate) -> Result<usize, R
     })
     .await
     .map_err(|error| RollUpFailure::Interrupted(error.to_string()))??;
+    let bytes = length(&body);
     archive
         .create(&key.into(), body)
         .await
         .map_err(RollUpFailure::Archive)?;
+    written(journal, key.into(), bytes).map_err(RollUpFailure::Journal)?;
     Ok(count)
 }
 
@@ -1303,6 +1444,53 @@ mod tests {
             );
             assert_eq!(ranged("2021-08-27", "2021-08-23"), None, "{command}");
         }
+    }
+
+    #[test]
+    fn test_the_usage_names_every_command_with_its_arguments() {
+        assert_eq!(
+            usage(),
+            concat!(
+                "copy <dataset> <first> <last> <concurrency> | parse <dataset> <first> <last> <concurrency> | ",
+                "fold-quotes <first> <last> <concurrency> | fetch-conditions | delete <path>... | ",
+                "roll-up <first> <last> <concurrency> | fold-trades <first> <last> <concurrency>",
+            )
+        );
+        for name in CommandName::iter() {
+            assert_eq!(name.to_string().parse::<CommandName>(), Ok(name));
+        }
+        assert!(parse(&["fetch-conditions".to_string()]).is_some());
+        assert!(parse(&["fetch-conditions", "extra"].map(String::from)).is_none());
+        assert!(
+            parse(&["fold_quotes", "2021-08-23", "2021-08-24", "2"].map(String::from)).is_none()
+        );
+    }
+
+    #[test]
+    fn test_a_written_object_is_journaled_under_its_key() {
+        let directory = std::env::temp_dir().join(format!("fund-raw-{}", uuid::Uuid::new_v4()));
+        let journal = Mutex::new(
+            Journal::open(
+                &directory,
+                fund::common::journal::RunId::new(uuid::Uuid::new_v4()),
+            )
+            .unwrap(),
+        );
+        let path =
+            "data/equity/stage=raw/quotes/provider=massive/year=2021/month=08/day=23/data.csv.gz";
+        written(&journal, Key::parse(path).unwrap(), 4_096).unwrap();
+        let history = journal.into_inner().unwrap().history().unwrap();
+        let payloads: Vec<String> = history
+            .iter()
+            .map(|record| serde_json::to_string(record.observation()).unwrap())
+            .collect();
+        assert_eq!(
+            payloads,
+            [format!(
+                r#"{{"event_type":"object_written","payload":{{"key":"{path}","bytes":4096}}}}"#
+            )]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

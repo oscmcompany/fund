@@ -263,6 +263,8 @@ mod tests {
                     | Observation::PartitionWritten(_)
                     | Observation::PartitionFailed(_)
                     | Observation::ConditionsWritten(_)
+                    | Observation::ObjectWritten(_)
+                    | Observation::ObjectDeleted(_)
                     | Observation::HealFinished(_)
                     | Observation::DatasetRead(_)
                     | Observation::OrderSubmitted(_)
