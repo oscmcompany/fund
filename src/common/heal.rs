@@ -133,12 +133,42 @@ pub fn quarter_opening(calendar: &TradingCalendar, session: SessionDate) -> Opti
     }
 }
 
+/// What kind of failure kept an owed partition unwritten.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PartitionFailureKind {
+    Fetch,
+    NoRows,
+    NotInCalendar,
+    Encode,
+    Decode,
+    Archive,
+    Vanished,
+    NoSymbols,
+    Fold,
+}
+
 /// How one owed session ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SessionOutcome {
     Written,
+    /// `failure` is the kind to group by; `cause` is the failure's text.
     Failed {
+        failure: PartitionFailureKind,
         cause: String,
     },
     /// The time budget ran out before the session was started.
@@ -380,6 +410,7 @@ mod tests {
         assert!(is_complete(&night(SessionOutcome::Written)));
         assert!(!is_complete(&night(SessionOutcome::Unreached)));
         assert!(!is_complete(&night(SessionOutcome::Failed {
+            failure: PartitionFailureKind::Fetch,
             cause: "refused".to_string()
         })));
         assert!(is_complete(&BTreeMap::new()));
@@ -392,6 +423,36 @@ mod tests {
             assert_eq!(json, format!("\"{leg}\""));
             assert_eq!(serde_json::from_str::<Leg>(&json).unwrap(), leg);
         }
+    }
+
+    #[test]
+    fn test_serde_and_strum_agree_on_every_failure_kind() {
+        let names: Vec<String> = PartitionFailureKind::iter()
+            .map(|kind| {
+                let json = serde_json::to_string(&kind).unwrap();
+                assert_eq!(json, format!("\"{kind}\""));
+                assert_eq!(kind.to_string().parse::<PartitionFailureKind>(), Ok(kind));
+                assert_eq!(
+                    serde_json::from_str::<PartitionFailureKind>(&json).unwrap(),
+                    kind
+                );
+                json
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                r#""fetch""#,
+                r#""no_rows""#,
+                r#""not_in_calendar""#,
+                r#""encode""#,
+                r#""decode""#,
+                r#""archive""#,
+                r#""vanished""#,
+                r#""no_symbols""#,
+                r#""fold""#,
+            ]
+        );
     }
 
     #[test]

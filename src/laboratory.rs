@@ -13,7 +13,7 @@ use chrono::Utc;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::archive::{Archive, ArchiveError, journal};
+use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journal};
 use crate::common::journal::{Observation, RunId, merge, read};
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::experiment::{
@@ -23,7 +23,7 @@ use crate::common::storage::{Host, Key};
 use crate::common::time::SessionDate;
 use crate::journal::{Journal, file_name};
 use crate::laboratory::dataset::Dataset;
-use crate::records::RESHIPPED_DAYS;
+use crate::records::{RESHIPPED_DAYS, ShipFailure, contents};
 
 /// Attempts at merging into a session's object before giving up to whoever keeps rewriting it.
 const MERGE_ATTEMPTS: u32 = 5;
@@ -133,7 +133,7 @@ impl Study {
 
     /// Merges each recent session file in the journal directory into its researcher object in `records`, so studies
     /// from other directories or machines that shipped the same session keep their records.
-    pub async fn finish(self, records: &Archive) -> Vec<(Key, Result<(), String>)> {
+    pub async fn finish(self, records: &Archive) -> Vec<(Key, Result<(), ShipFailure>)> {
         let today = SessionDate::at(Utc::now());
         let mut shipped = Vec::new();
         for days in 0..RESHIPPED_DAYS {
@@ -142,12 +142,11 @@ impl Study {
                 host: Host::Researcher,
                 session,
             };
-            let outcome =
-                match std::fs::read_to_string(self.journal.directory().join(file_name(session))) {
-                    Ok(text) => merge_into(records, &key, &text).await,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => Err(error.to_string()),
-                };
+            let outcome = match contents(&self.journal.directory().join(file_name(session))) {
+                Some(Ok(text)) => merge_into(records, &key, &text).await,
+                Some(Err(failure)) => Err(failure),
+                None => continue,
+            };
             shipped.push((key, outcome));
         }
         shipped
@@ -155,21 +154,22 @@ impl Study {
 }
 
 /// Reads `key`'s object, adds the lines of `text` it lacks, and writes it back only over the version read.
-async fn merge_into(records: &Archive, key: &Key, text: &str) -> Result<(), String> {
+async fn merge_into(records: &Archive, key: &Key, text: &str) -> Result<(), ShipFailure> {
     for _ in 0..MERGE_ATTEMPTS {
         let (held, tag) = match records
             .get_tagged(key)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(ShipFailure::Archive)?
         {
             Some((body, tag)) => (
-                journal::decode(key, body).map_err(|refusal| format!("{refusal:?}"))?,
+                journal::decode(key, body)
+                    .map_err(|refusal| ShipFailure::Decode(DecodeRefusal::from(refusal)))?,
                 Some(tag),
             ),
             None => (Vec::new(), None),
         };
         let body = journal::encode(key, &merge(held, read(text)))
-            .map_err(|refusal| format!("{refusal:?}"))?;
+            .map_err(|refusal| ShipFailure::Encode(EncodeRefusal::from(refusal)))?;
         let written = match tag {
             Some(tag) => records.replace(key, body, &tag).await,
             None => records.create(key, body).await,
@@ -177,13 +177,12 @@ async fn merge_into(records: &Archive, key: &Key, text: &str) -> Result<(), Stri
         match written {
             Ok(()) => return Ok(()),
             Err(ArchiveError::Contended { .. }) => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(ShipFailure::Archive(error)),
         }
     }
-    Err(format!(
-        "another writer changed {} on each of {MERGE_ATTEMPTS} attempts",
-        key.path()
-    ))
+    Err(ShipFailure::Contended {
+        attempts: MERGE_ATTEMPTS,
+    })
 }
 
 #[cfg(test)]
@@ -212,7 +211,7 @@ mod tests {
                 .unwrap();
             runs.push(study.run_id());
             for (key, outcome) in study.finish(&records).await {
-                assert_eq!(outcome, Ok(()), "{}", key.path());
+                assert!(outcome.is_ok(), "{}: {outcome:?}", key.path());
             }
             std::fs::remove_dir_all(&directory).unwrap();
         }

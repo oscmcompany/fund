@@ -2,12 +2,12 @@
 //! file that grew since its last shipment replaces its object whole.
 
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::Level;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
-use crate::archive::{Archive, journal, logs};
+use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journal, logs};
 use crate::common::journal::read;
 use crate::common::storage::{Host, Key, Service};
 use crate::common::time::SessionDate;
@@ -28,6 +28,43 @@ pub fn log_file_name(service: &Service, session: SessionDate) -> String {
     format!("{}-{session}.log", service.as_str())
 }
 
+/// Why one records file did not land in the bucket.
+#[derive(Debug)]
+pub enum ShipFailure {
+    Read {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Encode(EncodeRefusal),
+    Decode(DecodeRefusal),
+    Archive(ArchiveError),
+    /// Another writer changed the object on each of this many attempts.
+    Contended {
+        attempts: u32,
+    },
+}
+
+impl std::fmt::Display for ShipFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, error } => {
+                write!(formatter, "reading {} failed: {error}", path.display())
+            }
+            Self::Encode(refusal) => write!(formatter, "{refusal}"),
+            Self::Decode(refusal) => write!(formatter, "{refusal}"),
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Contended { attempts } => {
+                write!(
+                    formatter,
+                    "another writer changed the object on each of {attempts} attempts"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShipFailure {}
+
 /// Each recent journal and log file that exists, encoded under its key, or why it could not be.
 fn shipments(
     host: Host,
@@ -35,7 +72,7 @@ fn shipments(
     journal_directory: &Path,
     log_directory: &Path,
     today: SessionDate,
-) -> Vec<(Key, Result<Vec<u8>, String>)> {
+) -> Vec<(Key, Result<Vec<u8>, ShipFailure>)> {
     let mut shipments = Vec::new();
     for days in 0..RESHIPPED_DAYS {
         let session = today.plus_calendar_days(-days);
@@ -44,7 +81,7 @@ fn shipments(
         if let Some(contents) = contents(&journal_path) {
             let encoded = contents.and_then(|text| {
                 journal::encode(&journal_key, &read(&text))
-                    .map_err(|refusal| format!("{refusal:?}"))
+                    .map_err(|refusal| ShipFailure::Encode(refusal.into()))
             });
             shipments.push((journal_key, encoded));
         }
@@ -56,7 +93,7 @@ fn shipments(
         if let Some(contents) = contents(&log_directory.join(log_file_name(service, session))) {
             let encoded = contents.and_then(|text| {
                 logs::encode(&logs_key, &logs::parse(&text))
-                    .map_err(|refusal| format!("{refusal:?}"))
+                    .map_err(|refusal| ShipFailure::Encode(refusal.into()))
             });
             shipments.push((logs_key, encoded));
         }
@@ -65,11 +102,14 @@ fn shipments(
 }
 
 /// The file's text, or `None` when there is no file, which is nothing to ship rather than a failure.
-fn contents(path: &Path) -> Option<Result<String, String>> {
+pub(crate) fn contents(path: &Path) -> Option<Result<String, ShipFailure>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Some(Ok(text)),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
-        Err(error) => Some(Err(format!("reading {} failed: {error}", path.display()))),
+        Err(error) => Some(Err(ShipFailure::Read {
+            path: path.to_path_buf(),
+            error,
+        })),
     }
 }
 
@@ -81,15 +121,12 @@ pub async fn ship(
     journal_directory: &Path,
     log_directory: &Path,
     today: SessionDate,
-) -> Vec<(Key, Result<(), String>)> {
+) -> Vec<(Key, Result<(), ShipFailure>)> {
     let mut shipped = Vec::new();
     for (key, encoded) in shipments(host, service, journal_directory, log_directory, today) {
         let outcome = match encoded {
-            Ok(body) => archive
-                .put(&key, body)
-                .await
-                .map_err(|error| error.to_string()),
-            Err(reason) => Err(reason),
+            Ok(body) => archive.put(&key, body).await.map_err(ShipFailure::Archive),
+            Err(failure) => Err(failure),
         };
         shipped.push((key, outcome));
     }

@@ -14,22 +14,23 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::archive::Archive;
 use crate::archive::bars::{Provenance, Subscription, decode, encode};
 use crate::archive::reference::{
     conditions_key, decode_series_boundaries, encode_conditions, encode_security_details,
     encode_series_boundaries, encode_splits, latest_conditions, latest_snapshot,
 };
+use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use crate::archive::{quote_bars, trade_bars};
 use crate::common::heal::{
-    Held, Leg, SessionOutcome, WindowRefusal, calendar_range, owed, quarter_start, window,
+    Held, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal, calendar_range, owed,
+    quarter_start, window,
 };
 use crate::common::journal::{
     ConfigurationResolved, HealFinished, Observation, PartitionWritten, Unanswered,
 };
 use crate::common::market::Symbol;
 use crate::common::market::corporate_actions::{SeriesBoundary, refresh_boundaries};
-use crate::common::market::quote_bars::{QuoteFold, QuoteRollup};
+use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal, QuoteRollup};
 use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::security_details::SecurityDetails;
 use crate::common::market::trade_bars::{TradeConditions, TradeFold, TradeRollup};
@@ -37,6 +38,7 @@ use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
 use crate::common::storage::{Key, Provider, ReferenceTable};
 use crate::common::time::SessionDate;
+use crate::common::time::calendar::TradingCalendar;
 use crate::ingest::alpaca::{
     Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, MinuteBars, invalid_symbol,
 };
@@ -145,7 +147,7 @@ impl Parameters {
 pub enum HealError {
     Calendar(FetchError),
     Window(WindowRefusal),
-    List(crate::archive::ArchiveError),
+    List(ArchiveError),
     /// A partition was written but its record was not, so the run stops rather than write what it cannot record.
     Journal(std::io::Error),
 }
@@ -160,6 +162,103 @@ impl std::fmt::Display for HealError {
                 write!(formatter, "journaling a written partition failed: {error}")
             }
         }
+    }
+}
+
+/// Why one owed partition was not written.
+#[derive(Debug)]
+pub enum PartitionFailure {
+    Fetch(FetchError),
+    /// The vendor answered a trading day with nothing, which written would mark the session held for good.
+    NoRows,
+    NotInCalendar {
+        session: SessionDate,
+    },
+    Encode(EncodeRefusal),
+    Decode(DecodeRefusal),
+    Archive(ArchiveError),
+    /// Listed, then gone when read.
+    Vanished {
+        key: Key,
+    },
+    /// The session's daily bars, which name its symbols, are not written.
+    NoSymbols {
+        key: Key,
+    },
+    Fold(QuoteFoldRefusal),
+}
+
+impl PartitionFailure {
+    pub fn kind(&self) -> PartitionFailureKind {
+        match self {
+            Self::Fetch(_) => PartitionFailureKind::Fetch,
+            Self::NoRows => PartitionFailureKind::NoRows,
+            Self::NotInCalendar { .. } => PartitionFailureKind::NotInCalendar,
+            Self::Encode(_) => PartitionFailureKind::Encode,
+            Self::Decode(_) => PartitionFailureKind::Decode,
+            Self::Archive(_) => PartitionFailureKind::Archive,
+            Self::Vanished { .. } => PartitionFailureKind::Vanished,
+            Self::NoSymbols { .. } => PartitionFailureKind::NoSymbols,
+            Self::Fold(_) => PartitionFailureKind::Fold,
+        }
+    }
+
+    /// The outcome the journal records, its kind beside its text.
+    fn outcome(&self) -> SessionOutcome {
+        SessionOutcome::Failed {
+            failure: self.kind(),
+            cause: self.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for PartitionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fetch(error) => write!(formatter, "{error}"),
+            Self::NoRows => write!(formatter, "the vendor answered with no rows"),
+            Self::NotInCalendar { session } => {
+                write!(formatter, "{session} is not in the calendar")
+            }
+            Self::Encode(refusal) => write!(formatter, "{refusal}"),
+            Self::Decode(refusal) => write!(formatter, "{refusal}"),
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Vanished { key } => write!(formatter, "{} vanished", key.path()),
+            Self::NoSymbols { key } => {
+                write!(
+                    formatter,
+                    "no daily bars at {} to take the symbols from",
+                    key.path()
+                )
+            }
+            Self::Fold(refusal) => write!(formatter, "{refusal}"),
+        }
+    }
+}
+
+impl std::error::Error for PartitionFailure {}
+
+impl From<FetchError> for PartitionFailure {
+    fn from(error: FetchError) -> Self {
+        Self::Fetch(error)
+    }
+}
+
+impl From<ArchiveError> for PartitionFailure {
+    fn from(error: ArchiveError) -> Self {
+        Self::Archive(error)
+    }
+}
+
+impl From<EncodeRefusal> for PartitionFailure {
+    fn from(refusal: EncodeRefusal) -> Self {
+        Self::Encode(refusal)
+    }
+}
+
+impl From<DecodeRefusal> for PartitionFailure {
+    fn from(refusal: DecodeRefusal) -> Self {
+        Self::Decode(refusal)
     }
 }
 
@@ -220,11 +319,7 @@ pub async fn run(
             let outcome = if Instant::now() >= deadline {
                 SessionOutcome::Unreached
             } else {
-                let hours = calendar
-                    .session(session)
-                    .map(|trading| trading.hours())
-                    .ok_or_else(|| format!("{session} is not in the calendar"));
-                match write(leg, session, hours, parameters, clients, journal).await {
+                match write(leg, session, &calendar, parameters, clients, journal).await {
                     Ok(written) => {
                         tracing::info!(%leg, %session, bars = written.bars(), refused = ?written.refused(), unanswered = written.unanswered().len(), "Partition written");
                         journal
@@ -232,9 +327,9 @@ pub async fn run(
                             .map_err(HealError::Journal)?;
                         SessionOutcome::Written
                     }
-                    Err(cause) => {
-                        tracing::warn!(%leg, %session, %cause, "Partition not written");
-                        SessionOutcome::Failed { cause }
+                    Err(failure) => {
+                        tracing::warn!(%leg, %session, %failure, "Partition not written");
+                        failure.outcome()
                     }
                 }
             };
@@ -249,15 +344,19 @@ pub async fn run(
 async fn write(
     leg: Leg,
     session: SessionDate,
-    hours: Result<(DateTime<Utc>, DateTime<Utc>), String>,
+    calendar: &TradingCalendar,
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, String> {
+) -> Result<PartitionWritten, PartitionFailure> {
     let key = leg.key(session);
     let (bars, refused, unanswered, subscription) = match leg {
         Leg::AlpacaQuotes => {
-            return write_quotes(session, hours?, parameters, clients, journal).await;
+            let hours = calendar
+                .session(session)
+                .map(|trading| trading.hours())
+                .ok_or(PartitionFailure::NotInCalendar { session })?;
+            return write_quotes(session, hours, parameters, clients, journal).await;
         }
         Leg::AlpacaTrades => return write_trades(session, parameters, clients, journal).await,
         Leg::MassiveSplits => return write_splits(session, clients, journal).await,
@@ -268,11 +367,7 @@ async fn write(
             return write_security_details(session, parameters, clients, journal).await;
         }
         Leg::MassiveDailyBars => {
-            let daily = clients
-                .massive
-                .grouped_daily(session)
-                .await
-                .map_err(|error| error.to_string())?;
+            let daily = clients.massive.grouped_daily(session).await?;
             if !daily.test_tickers().is_empty() {
                 tracing::info!(%session, test_tickers = daily.test_tickers().len(), "Exchange test tickers left out");
             }
@@ -295,8 +390,7 @@ async fn write(
                     async move { alpaca.minute_bars(&batch, session).await }
                 },
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
             let unanswered = minute
                 .missing()
                 .iter()
@@ -319,15 +413,11 @@ async fn write(
     };
     // An empty answer for a trading day is a vendor gap, and writing it would mark the session held for good.
     if bars.is_empty() {
-        return Err("the vendor answered with no bars".to_string());
+        return Err(PartitionFailure::NoRows);
     }
     let provenance = fetched_now(subscription, journal);
-    let body = encode(&key, &bars, &provenance).map_err(|refusal| format!("{refusal:?}"))?;
-    clients
-        .archive
-        .put(&key, body)
-        .await
-        .map_err(|error| error.to_string())?;
+    let body = encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
+    clients.archive.put(&key, body).await?;
     Ok(PartitionWritten::new(
         leg,
         session,
@@ -352,24 +442,16 @@ async fn write_splits(
     session: SessionDate,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, String> {
-    let splits = clients
-        .massive
-        .splits()
-        .await
-        .map_err(|error| error.to_string())?;
+) -> Result<PartitionWritten, PartitionFailure> {
+    let splits = clients.massive.splits().await?;
     if splits.splits().is_empty() {
-        return Err("the vendor answered with no splits".to_string());
+        return Err(PartitionFailure::NoRows);
     }
     let key = Leg::MassiveSplits.key(session);
     let provenance = fetched_now(Subscription::StocksStarter, journal);
-    let body = encode_splits(&key, splits.splits(), &provenance)
-        .map_err(|refusal| format!("{refusal:?}"))?;
-    clients
-        .archive
-        .put(&key, body)
-        .await
-        .map_err(|error| error.to_string())?;
+    let body =
+        encode_splits(&key, splits.splits(), &provenance).map_err(EncodeRefusal::Reference)?;
+    clients.archive.put(&key, body).await?;
     Ok(PartitionWritten::new(
         Leg::MassiveSplits,
         session,
@@ -391,7 +473,7 @@ async fn write_series_boundaries(
     session: SessionDate,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, String> {
+) -> Result<PartitionWritten, PartitionFailure> {
     let previous = latest_snapshot(
         &clients.archive,
         Provider::Alpaca,
@@ -404,11 +486,10 @@ async fn write_series_boundaries(
             let bytes = clients
                 .archive
                 .get(&key)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("{} vanished", key.path()))?;
+                .await?
+                .ok_or_else(|| PartitionFailure::Vanished { key: key.clone() })?;
             let (held, _) =
-                decode_series_boundaries(&key, bytes).map_err(|refusal| format!("{refusal:?}"))?;
+                decode_series_boundaries(&key, bytes).map_err(DecodeRefusal::Reference)?;
             (
                 held,
                 key.session().plus_calendar_days(-BOUNDARY_REFRESH_DAYS),
@@ -428,28 +509,20 @@ async fn write_series_boundaries(
         let end = start
             .plus_calendar_days(BOUNDARY_REFRESH_DAYS - 1)
             .min(session);
-        let read = clients
-            .alpaca
-            .series_boundaries(start, end)
-            .await
-            .map_err(|error| error.to_string())?;
+        let read = clients.alpaca.series_boundaries(start, end).await?;
         fetched.extend_from_slice(read.boundaries());
         refused.extend_from_slice(read.refused());
         start = end.plus_calendar_days(1);
     }
     let boundaries = refresh_boundaries(&held, &fetched, (first, session));
     if boundaries.is_empty() {
-        return Err("the vendor answered with no boundaries".to_string());
+        return Err(PartitionFailure::NoRows);
     }
     let key = Leg::AlpacaSeriesBoundaries.key(session);
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let body = encode_series_boundaries(&key, &boundaries, &provenance)
-        .map_err(|refusal| format!("{refusal:?}"))?;
-    clients
-        .archive
-        .put(&key, body)
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(EncodeRefusal::Reference)?;
+    clients.archive.put(&key, body).await?;
     Ok(PartitionWritten::new(
         Leg::AlpacaSeriesBoundaries,
         session,
@@ -486,7 +559,7 @@ async fn write_security_details(
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, String> {
+) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
     let one = NonZeroUsize::new(1).expect("one is not zero");
     let gathered: DetailsGathered =
@@ -504,20 +577,15 @@ async fn write_security_details(
                 Ok(gathered)
             }
         })
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     if gathered.details.is_empty() {
-        return Err("the vendor answered with no details".to_string());
+        return Err(PartitionFailure::NoRows);
     }
     let key = Leg::MassiveSecurityDetails.key(session);
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let body = encode_security_details(&key, &gathered.details, &provenance)
-        .map_err(|refusal| format!("{refusal:?}"))?;
-    clients
-        .archive
-        .put(&key, body)
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(EncodeRefusal::Reference)?;
+    clients.archive.put(&key, body).await?;
     Ok(PartitionWritten::new(
         Leg::MassiveSecurityDetails,
         session,
@@ -578,9 +646,9 @@ async fn write_quotes(
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, String> {
+) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
-    let mut fold = QuoteFold::new(open, close).map_err(|refusal| format!("{refusal:?}"))?;
+    let mut fold = QuoteFold::new(open, close).map_err(PartitionFailure::Fold)?;
     let mut refused = Vec::new();
     let mut one_sided = 0_u64;
     let unanswered = per_symbol(
@@ -596,11 +664,10 @@ async fn write_quotes(
             AlpacaQuoteOutcome::Refused(row) => refused.push(row),
         },
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     let (minutes, counts) = fold.finish();
     if minutes.is_empty() {
-        return Err("the vendor answered with no quotes".to_string());
+        return Err(PartitionFailure::NoRows);
     }
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaQuotes.key(session));
@@ -616,13 +683,8 @@ async fn write_quotes(
         (five_minute_key, rollup(BarInterval::FiveMinute)),
         (daily_key, rollup(BarInterval::OneDay)),
     ] {
-        let body = quote_bars::encode(&key, &bars, &provenance)
-            .map_err(|refusal| format!("{refusal:?}"))?;
-        clients
-            .archive
-            .put(&key, body)
-            .await
-            .map_err(|error| error.to_string())?;
+        let body = quote_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
+        clients.archive.put(&key, body).await?;
     }
     tracing::info!(%session, quotes = counts.accepted(), out_of_order = counts.out_of_order(), one_sided, "Alpaca quotes folded");
     Ok(PartitionWritten::new(
@@ -640,7 +702,7 @@ async fn write_trades(
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, String> {
+) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
     let conditions = trade_conditions(clients, journal).await?;
     let mut fold = TradeFold::new(session, conditions);
@@ -662,11 +724,10 @@ async fn write_trades(
             AlpacaTradeOutcome::Refused(row) => refused.push(row),
         },
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     let (minutes, counts) = fold.finish();
     if minutes.is_empty() {
-        return Err("the vendor answered with no trades".to_string());
+        return Err(PartitionFailure::NoRows);
     }
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let [minute_key, five_minute_key, daily_key] = tick_keys(&Leg::AlpacaTrades.key(session));
@@ -682,13 +743,8 @@ async fn write_trades(
         (five_minute_key, rollup(BarInterval::FiveMinute)),
         (daily_key, rollup(BarInterval::OneDay)),
     ] {
-        let body = trade_bars::encode(&key, &bars, &provenance)
-            .map_err(|refusal| format!("{refusal:?}"))?;
-        clients
-            .archive
-            .put(&key, body)
-            .await
-            .map_err(|error| error.to_string())?;
+        let body = trade_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
+        clients.archive.put(&key, body).await?;
     }
     tracing::info!(%session, folded = counts.folded(), withdrawn = counts.withdrawn(), unresolved = counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
     Ok(PartitionWritten::new(
@@ -702,17 +758,16 @@ async fn write_trades(
 
 /// The newest conditions snapshot, or, when none reads under this build's layout, today's fetched from Massive and
 /// written first, so the trade leg never waits on an operator.
-async fn trade_conditions(clients: &Clients, journal: &Journal) -> Result<TradeConditions, String> {
+async fn trade_conditions(
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<TradeConditions, PartitionFailure> {
     match latest_conditions(&clients.archive).await {
         Ok((_, conditions)) => Ok(conditions),
-        Err(reason) => {
-            tracing::warn!(reason, "No readable conditions snapshot; fetching today's");
+        Err(error) => {
+            tracing::warn!(%error, "No readable conditions snapshot; fetching today's");
             let fetched_at = Utc::now();
-            let conditions = clients
-                .massive
-                .trade_conditions()
-                .await
-                .map_err(|error| error.to_string())?;
+            let conditions = clients.massive.trade_conditions().await?;
             let key = conditions_key(SessionDate::at(fetched_at));
             let provenance = Provenance::new(
                 Subscription::StocksStarter,
@@ -721,12 +776,8 @@ async fn trade_conditions(clients: &Clients, journal: &Journal) -> Result<TradeC
                 journal.commit().cloned(),
             );
             let body = encode_conditions(&key, &conditions, &provenance)
-                .map_err(|refusal| format!("{refusal:?}"))?;
-            clients
-                .archive
-                .put(&key, body)
-                .await
-                .map_err(|error| error.to_string())?;
+                .map_err(EncodeRefusal::Reference)?;
+            clients.archive.put(&key, body).await?;
             Ok(conditions)
         }
     }
@@ -788,15 +839,17 @@ where
 }
 
 /// The session's symbols, read from its written daily bars, since those name what traded that day.
-async fn symbol_list(clients: &Clients, session: SessionDate) -> Result<Vec<Symbol>, String> {
+async fn symbol_list(
+    clients: &Clients,
+    session: SessionDate,
+) -> Result<Vec<Symbol>, PartitionFailure> {
     let key = Leg::MassiveDailyBars.key(session);
     let body = clients
         .archive
         .get(&key)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("no daily bars at {} to take the symbols from", key.path()))?;
-    let (bars, _) = decode(&key, body).map_err(|refusal| format!("{refusal:?}"))?;
+        .await?
+        .ok_or_else(|| PartitionFailure::NoSymbols { key: key.clone() })?;
+    let (bars, _) = decode(&key, body).map_err(DecodeRefusal::from)?;
     Ok(bars.iter().map(Bar::symbol).cloned().collect())
 }
 
@@ -874,6 +927,47 @@ mod tests {
 
     fn size(count: usize) -> NonZeroUsize {
         NonZeroUsize::new(count).unwrap()
+    }
+
+    /// The journal keeps a failure's kind beside its text, so a night's failures group without matching on prose.
+    #[test]
+    fn test_a_failure_is_journaled_with_its_kind_and_its_text() {
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
+        let outcomes = [
+            PartitionFailure::NotInCalendar { session },
+            PartitionFailure::NoRows,
+            PartitionFailure::Fetch(FetchError::Refused {
+                status: 403,
+                body: "forbidden".to_string(),
+            }),
+            PartitionFailure::NoSymbols {
+                key: Leg::MassiveDailyBars.key(session),
+            },
+        ]
+        .map(|failure| failure.outcome());
+        let cause = |failure, cause: &str| SessionOutcome::Failed {
+            failure,
+            cause: cause.to_string(),
+        };
+        assert_eq!(
+            outcomes,
+            [
+                cause(
+                    PartitionFailureKind::NotInCalendar,
+                    "2026-09-29 is not in the calendar"
+                ),
+                cause(
+                    PartitionFailureKind::NoRows,
+                    "the vendor answered with no rows"
+                ),
+                cause(PartitionFailureKind::Fetch, "refused with 403: forbidden"),
+                cause(
+                    PartitionFailureKind::NoSymbols,
+                    "no daily bars at data/equity/stage=parsed/bars/provider=massive/origin=vendor/interval=one_day/\
+                     year=2026/month=09/day=29/data.parquet to take the symbols from"
+                ),
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]

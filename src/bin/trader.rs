@@ -258,7 +258,9 @@ async fn trade(
     if Utc::now() >= close {
         return Err(refused(format!("the session closed at {close}")));
     }
-    let (_, conditions) = latest_conditions(archive).await.map_err(refused)?;
+    let (_, conditions) = latest_conditions(archive)
+        .await
+        .map_err(|error| refused(error.to_string()))?;
     let book = broker
         .book()
         .await

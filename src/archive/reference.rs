@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use super::bars::{Provenance, provenance_from};
 use super::parquet::{ReadRefusal, RowCause};
-use super::{Archive, parquet};
+use super::{Archive, ArchiveError, parquet};
 use crate::common::market::corporate_actions::{
     ActionId, BoundaryChange, BoundaryKind, SeriesBoundary, Split, SplitRatio,
 };
@@ -228,7 +228,7 @@ pub async fn latest_snapshot(
     provider: Provider,
     table: ReferenceTable,
     before: SessionDate,
-) -> Result<Option<Key>, String> {
+) -> Result<Option<Key>, ArchiveError> {
     let series = Key::Reference {
         provider,
         table,
@@ -237,31 +237,59 @@ pub async fn latest_snapshot(
     .series();
     Ok(archive
         .list(&series)
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
         .iter()
         .filter_map(|path| Key::parse(path).ok())
         .filter(|key| key.session() < before)
         .max_by_key(Key::session))
 }
 
+/// Why no conditions table was read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotError {
+    Archive(ArchiveError),
+    Absent,
+    /// Listed, then gone when read.
+    Vanished {
+        key: Key,
+    },
+    Decode(ReferenceRefusal),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Absent => write!(formatter, "no conditions table in the archive"),
+            Self::Vanished { key } => write!(formatter, "{} vanished", key.path()),
+            Self::Decode(refusal) => {
+                write!(formatter, "the conditions table did not read: {refusal:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
 /// The newest conditions snapshot the archive holds, with its key.
-pub async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), String> {
+pub async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), SnapshotError> {
     let latest = latest_snapshot(
         archive,
         Provider::Massive,
         ReferenceTable::Conditions,
         SessionDate::from_date(NaiveDate::MAX),
     )
-    .await?
-    .ok_or("no conditions table in the archive")?;
+    .await
+    .map_err(SnapshotError::Archive)?
+    .ok_or(SnapshotError::Absent)?;
     let bytes = archive
         .get(&latest)
         .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("{} vanished", latest.path()))?;
-    let (conditions, _) =
-        decode_conditions(&latest, bytes).map_err(|refusal| format!("{refusal:?}"))?;
+        .map_err(SnapshotError::Archive)?
+        .ok_or_else(|| SnapshotError::Vanished {
+            key: latest.clone(),
+        })?;
+    let (conditions, _) = decode_conditions(&latest, bytes).map_err(SnapshotError::Decode)?;
     Ok((latest, conditions))
 }
 

@@ -89,6 +89,85 @@ impl std::fmt::Display for ArchiveError {
     }
 }
 
+impl std::error::Error for ArchiveError {}
+
+/// Why a file of any layout was not encoded, kept as the layout's own refusal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncodeRefusal {
+    Bars(bars::EncodeRefusal),
+    QuoteBars(quote_bars::EncodeRefusal),
+    TradeBars(trade_bars::EncodeRefusal),
+    Reference(reference::ReferenceRefusal),
+    Journal(journal::EncodeRefusal),
+    Logs(logs::EncodeRefusal),
+}
+
+/// Why a file of any layout was not decoded, kept as the layout's own refusal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecodeRefusal {
+    Bars(bars::DecodeRefusal),
+    QuoteBars(quote_bars::DecodeRefusal),
+    TradeBars(trade_bars::DecodeRefusal),
+    Reference(reference::ReferenceRefusal),
+    Journal(journal::DecodeRefusal),
+}
+
+/// Wraps each layout's refusal into the one enum that keeps it, so `?` reaches it through `From`.
+macro_rules! wrap_refusal {
+    ($($outer:ident :: $variant:ident ($inner:ty)),* $(,)?) => {$(
+        impl From<$inner> for $outer {
+            fn from(refusal: $inner) -> Self {
+                Self::$variant(refusal)
+            }
+        }
+    )*};
+}
+
+wrap_refusal!(
+    EncodeRefusal::Bars(bars::EncodeRefusal),
+    EncodeRefusal::QuoteBars(quote_bars::EncodeRefusal),
+    EncodeRefusal::TradeBars(trade_bars::EncodeRefusal),
+    EncodeRefusal::Journal(journal::EncodeRefusal),
+    EncodeRefusal::Logs(logs::EncodeRefusal),
+    DecodeRefusal::Bars(bars::DecodeRefusal),
+    DecodeRefusal::QuoteBars(quote_bars::DecodeRefusal),
+    DecodeRefusal::TradeBars(trade_bars::DecodeRefusal),
+    DecodeRefusal::Journal(journal::DecodeRefusal),
+);
+
+impl std::fmt::Display for EncodeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bars(refusal) => write!(formatter, "bars not encoded: {refusal:?}"),
+            Self::QuoteBars(refusal) => write!(formatter, "quote bars not encoded: {refusal:?}"),
+            Self::TradeBars(refusal) => write!(formatter, "trade bars not encoded: {refusal:?}"),
+            Self::Reference(refusal) => {
+                write!(formatter, "reference table not encoded: {refusal:?}")
+            }
+            Self::Journal(refusal) => write!(formatter, "journal not encoded: {refusal:?}"),
+            Self::Logs(refusal) => write!(formatter, "logs not encoded: {refusal:?}"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeRefusal {}
+
+impl std::fmt::Display for DecodeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bars(refusal) => write!(formatter, "bars not decoded: {refusal:?}"),
+            Self::QuoteBars(refusal) => write!(formatter, "quote bars not decoded: {refusal:?}"),
+            Self::TradeBars(refusal) => write!(formatter, "trade bars not decoded: {refusal:?}"),
+            Self::Reference(refusal) => {
+                write!(formatter, "reference table not decoded: {refusal:?}")
+            }
+            Self::Journal(refusal) => write!(formatter, "journal not decoded: {refusal:?}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeRefusal {}
+
 impl Archive {
     /// The shared market-data archive named by `AWS_S3_ARCHIVE_BUCKET_NAME`, which only the archiver writes.
     pub fn market_data(configuration: &aws_config::SdkConfig) -> Result<Self, VariableRefusal> {

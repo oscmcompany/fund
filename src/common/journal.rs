@@ -465,6 +465,7 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use super::*;
+    use crate::common::heal::PartitionFailureKind;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -557,6 +558,7 @@ mod tests {
                     (
                         session,
                         SessionOutcome::Failed {
+                            failure: PartitionFailureKind::Fetch,
                             cause: "refused with 403".to_string(),
                         },
                     ),
@@ -586,7 +588,8 @@ mod tests {
                 concat!(
                     r#""event_type":"heal_finished","payload":{"window":["2026-09-29"],"#,
                     r#""outcomes":{"massive_daily_bars":{"2026-09-28":{"outcome":"unreached"},"#,
-                    r#""2026-09-29":{"outcome":"failed","cause":"refused with 403"}}}}}"#,
+                    r#""2026-09-29":{"outcome":"failed","failure":"fetch","#,
+                    r#""cause":"refused with 403"}}}}}"#,
                 )
             )
         );
@@ -913,7 +916,11 @@ mod tests {
         let outcome = prop_oneof![
             Just(SessionOutcome::Written),
             Just(SessionOutcome::Unreached),
-            ".{0,20}".prop_map(|cause| SessionOutcome::Failed { cause }),
+            (
+                prop::sample::select(PartitionFailureKind::iter().collect::<Vec<_>>()),
+                ".{0,20}"
+            )
+                .prop_map(|(failure, cause)| SessionOutcome::Failed { failure, cause }),
         ];
         prop_oneof![
             prop::collection::btree_map(parameter, (".{0,20}", source), 0..6).prop_map(
