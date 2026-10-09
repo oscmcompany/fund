@@ -108,7 +108,12 @@ where
         match attempt().await {
             Outcome::Body(body) => return Ok(body),
             Outcome::Refused { status, body } => return Err(FetchError::Refused { status, body }),
-            Outcome::Transient(cause) => last = cause,
+            Outcome::Transient(cause) => {
+                if number + 1 < ATTEMPTS {
+                    tracing::warn!(attempt = number + 1, %cause, "Retrying a request");
+                }
+                last = cause;
+            }
         }
     }
     Err(FetchError::Exhausted {

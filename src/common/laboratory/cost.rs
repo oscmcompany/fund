@@ -9,9 +9,30 @@ use serde::{Deserialize, Serialize};
 #[serde(try_from = "f64")]
 pub struct BasisPoints(f64);
 
+/// A basis-point reading refused for being negative or not finite, with the value read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BasisPointsRefusal {
+    pub value: f64,
+}
+
+impl std::fmt::Display for BasisPointsRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} is not a finite, non-negative basis-point reading",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for BasisPointsRefusal {}
+
 impl BasisPoints {
-    pub fn new(value: f64) -> Option<Self> {
-        (value.is_finite() && value >= 0.0).then_some(Self(value))
+    pub fn new(value: f64) -> Result<Self, BasisPointsRefusal> {
+        match value.is_finite() && value >= 0.0 {
+            true => Ok(Self(value)),
+            false => Err(BasisPointsRefusal { value }),
+        }
     }
 
     pub fn value(self) -> f64 {
@@ -20,11 +41,10 @@ impl BasisPoints {
 }
 
 impl TryFrom<f64> for BasisPoints {
-    type Error = String;
+    type Error = BasisPointsRefusal;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         Self::new(value)
-            .ok_or_else(|| format!("{value} is not a finite, non-negative basis-point reading"))
     }
 }
 
@@ -125,7 +145,7 @@ impl CostModel {
             FillStyle::Aggressive => BasisPoints::new(
                 quoted_spread.value() * f64::from(self.names.get()),
             )
-            .ok_or(CostRefusal::Unrepresentable {
+            .map_err(|_| CostRefusal::Unrepresentable {
                 quoted_spread,
                 names: self.names,
             }),
@@ -198,7 +218,8 @@ mod tests {
     #[test]
     fn test_basis_points_refuse_negative_or_non_finite_readings_even_when_stored() {
         for refused in [-0.01, f64::NAN, f64::INFINITY] {
-            assert_eq!(BasisPoints::new(refused), None, "{refused}");
+            let value = BasisPoints::new(refused).unwrap_err().value;
+            assert_eq!(value.to_bits(), refused.to_bits(), "{refused}");
         }
         assert_eq!(
             serde_json::from_str::<BasisPoints>("2.5").unwrap(),

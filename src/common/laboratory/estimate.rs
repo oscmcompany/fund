@@ -103,7 +103,7 @@ struct EstimateFields {
 }
 
 impl TryFrom<EstimateFields> for Estimate {
-    type Error = String;
+    type Error = EstimateRefusal;
 
     fn try_from(fields: EstimateFields) -> Result<Self, Self::Error> {
         let admitted = fields.mean.is_finite()
@@ -113,10 +113,12 @@ impl TryFrom<EstimateFields> for Estimate {
             // `n - 1` for a matched estimate, at most the arms' `n - 2` together for Welch.
             && fields.degrees_of_freedom.value() <= (fields.sessions - 1) as f64;
         if !admitted {
-            return Err(format!(
-                "mean {}, standard error {} over {} sessions is not an estimate",
-                fields.mean, fields.standard_error, fields.sessions
-            ));
+            return Err(EstimateRefusal::Inadmissible {
+                mean: fields.mean,
+                standard_error: fields.standard_error,
+                sessions: fields.sessions,
+                degrees_of_freedom: fields.degrees_of_freedom,
+            });
         }
         Ok(Self {
             mean: fields.mean,
@@ -143,6 +145,13 @@ pub enum EstimateRefusal {
     TooFewSessions {
         measured: u64,
     },
+    /// Stored fields no summary or Welch comparison could have produced.
+    Inadmissible {
+        mean: f64,
+        standard_error: f64,
+        sessions: u64,
+        degrees_of_freedom: DegreesOfFreedom,
+    },
 }
 
 impl std::fmt::Display for EstimateRefusal {
@@ -167,6 +176,17 @@ impl std::fmt::Display for EstimateRefusal {
                     "{measured} measured sessions cannot carry an error"
                 )
             }
+            Self::Inadmissible {
+                mean,
+                standard_error,
+                sessions,
+                degrees_of_freedom,
+            } => write!(
+                formatter,
+                "mean {mean}, standard error {standard_error} over {sessions} sessions with {} degrees of \
+                 freedom is not an estimate",
+                degrees_of_freedom.value()
+            ),
         }
     }
 }
@@ -786,6 +806,22 @@ mod tests {
                 "{stored}"
             );
         }
+        let degrees_of_freedom = DegreesOfFreedom::new(1000.0).unwrap();
+        assert_eq!(
+            Estimate::try_from(EstimateFields {
+                mean: 1.0,
+                sessions: 2,
+                undefined: 0,
+                standard_error: 0.5,
+                degrees_of_freedom,
+            }),
+            Err(EstimateRefusal::Inadmissible {
+                mean: 1.0,
+                standard_error: 0.5,
+                sessions: 2,
+                degrees_of_freedom,
+            })
+        );
     }
 
     fn readings() -> impl Strategy<Value = Vec<Option<f64>>> {

@@ -13,9 +13,30 @@ pub const FAMILY_WISE_ERROR_RATE: f64 = 0.05;
 #[serde(try_from = "f64")]
 pub struct DegreesOfFreedom(f64);
 
+/// A count of degrees of freedom refused for being below one or not finite, with the value read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DegreesOfFreedomRefusal {
+    pub value: f64,
+}
+
+impl std::fmt::Display for DegreesOfFreedomRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} is not a usable count of degrees of freedom",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for DegreesOfFreedomRefusal {}
+
 impl DegreesOfFreedom {
-    pub fn new(value: f64) -> Option<Self> {
-        (value.is_finite() && value >= 1.0).then_some(Self(value))
+    pub fn new(value: f64) -> Result<Self, DegreesOfFreedomRefusal> {
+        match value.is_finite() && value >= 1.0 {
+            true => Ok(Self(value)),
+            false => Err(DegreesOfFreedomRefusal { value }),
+        }
     }
 
     pub fn value(self) -> f64 {
@@ -24,11 +45,10 @@ impl DegreesOfFreedom {
 }
 
 impl TryFrom<f64> for DegreesOfFreedom {
-    type Error = String;
+    type Error = DegreesOfFreedomRefusal;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         Self::new(value)
-            .ok_or_else(|| format!("{value} is not a usable count of degrees of freedom"))
     }
 }
 
@@ -242,7 +262,8 @@ mod tests {
     #[test]
     fn test_degrees_of_freedom_below_one_or_non_finite_are_refused_even_when_stored() {
         for refused in [0.5, 0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(DegreesOfFreedom::new(refused), None, "{refused}");
+            let value = DegreesOfFreedom::new(refused).unwrap_err().value;
+            assert_eq!(value.to_bits(), refused.to_bits(), "{refused}");
         }
         assert_eq!(
             serde_json::from_str::<DegreesOfFreedom>("4.5").unwrap(),
