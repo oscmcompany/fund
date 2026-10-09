@@ -1090,7 +1090,7 @@ mod tests {
         let failed = session.observe(
             at("14:00:00"),
             &FeedEvent::Lost {
-                cause: "the stream closed".to_string(),
+                cause: crate::ingest::alpaca::stream::StreamError::Ended,
             },
             &mut journal,
         );
