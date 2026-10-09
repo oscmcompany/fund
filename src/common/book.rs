@@ -105,6 +105,16 @@ impl Position {
     }
 }
 
+impl Monoid for Position {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self(self.0.checked_add(other.0).expect("a position fits i128"))
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -208,6 +218,16 @@ pub enum ValuationRefusal {
     Unpriced { symbol: Symbol },
 }
 
+impl std::fmt::Display for ValuationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unpriced { symbol } => write!(formatter, "the book holds {symbol} with no price"),
+        }
+    }
+}
+
+impl std::error::Error for ValuationRefusal {}
+
 /// Cash and every non-zero position; a zero position is dropped, so equal holdings are equal books.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Book {
@@ -303,10 +323,7 @@ impl Monoid for Book {
         self.cash = self.cash.combine(other.cash);
         for (symbol, position) in other.positions {
             let held = self.positions.entry(symbol).or_default();
-            held.0 = held
-                .0
-                .checked_add(position.0)
-                .expect("a position fits i128");
+            *held = held.combine(position);
         }
         self.canonical()
     }
@@ -454,6 +471,14 @@ mod tests {
         assert_eq!(Book::empty().value(|_| None), Ok(Cash::empty()));
     }
 
+    #[test]
+    fn test_a_valuation_refusal_names_the_unpriced_symbol() {
+        let refusal = ValuationRefusal::Unpriced {
+            symbol: symbol("AAPL"),
+        };
+        assert_eq!(refusal.to_string(), "the book holds AAPL with no price");
+    }
+
     proptest! {
         #[test]
         fn property_books_are_a_commutative_monoid(
@@ -471,6 +496,26 @@ mod tests {
             third in -(1i128 << 100)..(1i128 << 100),
         ) {
             laws::check(Cash(first), Cash(second), Cash(third))?;
+        }
+
+        #[test]
+        fn property_positions_are_a_commutative_monoid(
+            first in -(1i128 << 100)..(1i128 << 100),
+            second in -(1i128 << 100)..(1i128 << 100),
+            third in -(1i128 << 100)..(1i128 << 100),
+        ) {
+            laws::check(Position(first), Position(second), Position(third))?;
+        }
+
+        /// Cash and a position are written as their units' decimal string and read back unchanged.
+        #[test]
+        fn property_cash_and_positions_round_trip_through_their_decimal_string(units in any::<i128>()) {
+            let written = serde_json::to_string(&Cash(units)).unwrap();
+            prop_assert_eq!(&written, &format!("\"{units}\""));
+            prop_assert_eq!(serde_json::from_str::<Cash>(&written).unwrap(), Cash(units));
+            let written = serde_json::to_string(&Position(units)).unwrap();
+            prop_assert_eq!(&written, &format!("\"{units}\""));
+            prop_assert_eq!(serde_json::from_str::<Position>(&written).unwrap(), Position(units));
         }
 
         /// Marking at fixed prices sends a combined book to the sum of the marks.

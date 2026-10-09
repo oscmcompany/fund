@@ -54,7 +54,8 @@ fn write_decimal(
 pub struct Symbol(String);
 
 /// Why a symbol was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SymbolRefusal {
     Malformed { raw: String },
 }
@@ -196,6 +197,11 @@ impl Price {
 
     pub fn ticks(self) -> i64 {
         self.0
+    }
+
+    /// The ticks unsigned, which a positive price always fits.
+    pub fn ticks_unsigned(self) -> u64 {
+        self.0.unsigned_abs()
     }
 
     /// The price in dollars, for presentation only: sums and comparisons belong on `ticks`.
@@ -345,6 +351,11 @@ impl Shares {
 
     pub fn is_zero(self) -> bool {
         self.0 == 0
+    }
+
+    /// Whether the count is a whole number of shares.
+    pub fn is_whole(self) -> bool {
+        self.0.is_multiple_of(SHARE_SCALE)
     }
 
     pub fn plus(self, other: Self) -> Self {
@@ -510,7 +521,7 @@ impl std::error::Error for DollarVolumeRefusal {}
 
 impl DollarVolume {
     pub fn of(price: Price, shares: Shares) -> Self {
-        Self(u128::from(price.0.unsigned_abs()) * u128::from(shares.0))
+        Self(u128::from(price.ticks_unsigned()) * u128::from(shares.0))
     }
 
     /// The dollar volume a vendor's volume-weighted average price implies. It is exact to the float precision of the
@@ -785,6 +796,7 @@ mod tests {
         assert_eq!(Price::from_ticks(73_730_000).unwrap().to_string(), "73.73");
         // A midpoint print at half a sub-penny, from the 2026-09-25 grouped daily.
         assert_eq!(Price::from_dollars(0.18205).unwrap().ticks(), 182_050);
+        assert_eq!(price.ticks_unsigned(), 123_456_700);
     }
 
     #[test]
@@ -853,6 +865,9 @@ mod tests {
         assert_eq!(fractional.to_string(), "213849.305802");
         assert_eq!(Shares::whole(100).unwrap().to_string(), "100");
         assert_eq!(Shares::from_units(1_500_000).to_string(), "1.5");
+        let whole = [0, 1, 999_999, 1_000_000, 2_000_001, 3_000_000]
+            .map(|units| Shares::from_units(units).is_whole());
+        assert_eq!(whole, [true, false, false, true, false, true]);
     }
 
     #[test]

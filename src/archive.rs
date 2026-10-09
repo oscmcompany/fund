@@ -157,7 +157,7 @@ impl std::fmt::Display for DecodeRefusal {
         match self {
             Self::Bars(refusal) => write!(formatter, "bars not decoded: {refusal:?}"),
             Self::QuoteBars(refusal) => write!(formatter, "quote bars not decoded: {refusal:?}"),
-            Self::TradeBars(refusal) => write!(formatter, "trade bars not decoded: {refusal:?}"),
+            Self::TradeBars(refusal) => write!(formatter, "trade bars not decoded: {refusal}"),
             Self::Reference(refusal) => {
                 write!(formatter, "reference table not decoded: {refusal:?}")
             }

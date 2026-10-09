@@ -53,9 +53,35 @@ impl Target {
 /// The parts of `PROGRESS_SCALE` a switch has rolled from its outgoing target to its incoming one.
 pub const PROGRESS_SCALE: u32 = 1_000_000;
 
-/// How far a roll-off has gone, from none to all of the way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// How far a roll-off has gone, from none to all of the way, journaled as its parts of `PROGRESS_SCALE`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u32")]
 pub struct Progress(u32);
+
+/// Parts past `PROGRESS_SCALE`, which no roll-off reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressRefusal {
+    parts: u32,
+}
+
+impl std::fmt::Display for ProgressRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} parts is past {PROGRESS_SCALE}", self.parts)
+    }
+}
+
+impl TryFrom<u32> for Progress {
+    type Error = ProgressRefusal;
+
+    fn try_from(parts: u32) -> Result<Self, Self::Error> {
+        if parts > PROGRESS_SCALE {
+            return Err(ProgressRefusal { parts });
+        }
+        Ok(Self(parts))
+    }
+}
 
 impl Progress {
     pub const NONE: Self = Self(0);
@@ -152,7 +178,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        BTreeMap, Book, Order, Progress, Shares, Side, Symbol, Target, TimeDelta, orders, roll,
+        BTreeMap, Book, Order, Progress, ProgressRefusal, Shares, Side, Symbol, Target, TimeDelta,
+        orders, roll,
     };
     use crate::common::book::Fill;
     use crate::common::market::{DollarVolume, Price};
@@ -243,6 +270,25 @@ mod tests {
             Progress::of(TimeDelta::microseconds(100), TimeDelta::microseconds(400)),
             Progress(250_000)
         );
+    }
+
+    #[test]
+    fn test_progress_reads_back_and_refuses_parts_past_the_scale() {
+        let half = Progress::of(TimeDelta::seconds(30), TimeDelta::minutes(1));
+        assert_eq!(serde_json::to_string(&half).unwrap(), "500000");
+        assert_eq!(
+            serde_json::from_str::<Progress>("500000").unwrap(),
+            Progress(500_000)
+        );
+        assert_eq!(
+            serde_json::from_str::<Progress>("1000000").unwrap(),
+            Progress::WHOLE
+        );
+        assert_eq!(
+            Progress::try_from(1_000_001),
+            Err(ProgressRefusal { parts: 1_000_001 })
+        );
+        assert!(serde_json::from_str::<Progress>("1000001").is_err());
     }
 
     /// A quarter of the way from 4 SPY to 0 SPY and 8 AAPL holds 3 SPY and 2 AAPL.
