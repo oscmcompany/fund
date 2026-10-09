@@ -475,6 +475,8 @@ fn report(event: &FeedEvent) {
             | StreamMessage::Authenticated
             | StreamMessage::Subscribed(_)
             | StreamMessage::Trade { .. }
+            | StreamMessage::Corrected { .. }
+            | StreamMessage::Canceled { .. }
             | StreamMessage::Quote(_),
         ) => {}
     }

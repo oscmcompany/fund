@@ -551,7 +551,10 @@ fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
 }
 
 /// One page of `symbol`'s trades, refusing any row filed under a ticker that was not asked for.
-fn trade_page(symbol: &Symbol, body: &[u8]) -> Result<(Vec<AlpacaTradeOutcome>, bool), FetchError> {
+pub(crate) fn trade_page(
+    symbol: &Symbol,
+    body: &[u8],
+) -> Result<(Vec<AlpacaTradeOutcome>, bool), FetchError> {
     let page: TradesPage = serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
         reason: error.to_string(),
     })?;

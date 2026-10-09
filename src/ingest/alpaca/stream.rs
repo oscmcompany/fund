@@ -64,6 +64,11 @@ impl TradeId {
 
     /// Reads `x` and `i` from a trade element, as the stream and the REST history both spell them.
     pub(crate) fn read(element: &Value) -> Result<Self, StreamElementRefusal> {
+        Self::read_numbered(element, "i")
+    }
+
+    /// Reads `x` and the number in `field`, which a correction spells `oi` for its original and `ci` for its replacement.
+    fn read_numbered(element: &Value, field: &'static str) -> Result<Self, StreamElementRefusal> {
         let exchange = element
             .get("x")
             .and_then(Value::as_str)
@@ -74,7 +79,9 @@ impl TradeId {
                 raw: exchange.to_string(),
             });
         };
-        let number = element.get("i").ok_or(StreamElementRefusal::NoNumber)?;
+        let number = element
+            .get(field)
+            .ok_or(StreamElementRefusal::NoNumber { field })?;
         let number = number
             .as_u64()
             .ok_or_else(|| StreamElementRefusal::NumberNotUnsigned {
@@ -95,8 +102,18 @@ pub enum StreamElementRefusal {
     ExchangeNotOneLetter {
         raw: String,
     },
-    NoNumber,
+    NoNumber {
+        field: &'static str,
+    },
     NumberNotUnsigned {
+        raw: String,
+    },
+    /// A cancel whose `a` names no action this client reads, refused rather than taken as a withdrawal.
+    CancelAction {
+        raw: String,
+    },
+    /// A correction or cancel under a ticker that is no symbol.
+    Symbol {
         raw: String,
     },
     /// A payload that did not parse as its kind's.
@@ -113,10 +130,15 @@ impl std::fmt::Display for StreamElementRefusal {
             Self::ExchangeNotOneLetter { raw } => {
                 write!(formatter, "an exchange `{raw}` that is not one letter")
             }
-            Self::NoNumber => write!(formatter, "a trade with no `i`"),
+            Self::NoNumber { field } => write!(formatter, "a trade with no `{field}`"),
             Self::NumberNotUnsigned { raw } => {
-                write!(formatter, "an `i` that is not an unsigned integer: {raw}")
+                write!(
+                    formatter,
+                    "a trade number that is not an unsigned integer: {raw}"
+                )
             }
+            Self::CancelAction { raw } => write!(formatter, "a cancel action `{raw}`"),
+            Self::Symbol { raw } => write!(formatter, "a ticker `{raw}` that is no symbol"),
             Self::Unreadable { reason } => write!(formatter, "{reason}"),
         }
     }
@@ -135,6 +157,20 @@ pub enum StreamMessage {
         id: TradeId,
         outcome: AlpacaTradeOutcome,
     },
+    /// A correction: the print `original` names is withdrawn, and `replacement`, stamped at the correction's own
+    /// instant, stands in its place.
+    Corrected {
+        symbol: Symbol,
+        original: TradeId,
+        replacement: TradeId,
+        outcome: AlpacaTradeOutcome,
+    },
+    /// A cancel or error report, which withdraws the print `original` names.
+    Canceled {
+        symbol: Symbol,
+        original: TradeId,
+        action: CancelAction,
+    },
     Quote(AlpacaQuoteOutcome),
     /// Alpaca's error message, such as an invalid request or a second connection past the plan's limit.
     Refused {
@@ -151,6 +187,40 @@ pub enum StreamMessage {
         cause: StreamElementRefusal,
         raw: String,
     },
+}
+
+/// Why a cancel frame withdraws its print, as its `a` spells it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+pub enum CancelAction {
+    #[strum(serialize = "C")]
+    Cancel,
+    #[strum(serialize = "E")]
+    Error,
+}
+
+/// A correction's replacement record, read into the same row a trade is.
+#[derive(Deserialize)]
+struct CorrectionPayload {
+    #[serde(rename = "t")]
+    timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(rename = "cp")]
+    price: f64,
+    #[serde(rename = "cs")]
+    size: f64,
+    #[serde(rename = "cc", default)]
+    conditions: Vec<String>,
+    #[serde(rename = "z")]
+    tape: String,
 }
 
 /// A step of opening the stream, named as a refusal awaiting it reads.
@@ -189,6 +259,8 @@ impl OpeningStep {
                 | StreamMessage::Authenticated
                 | StreamMessage::Subscribed(_)
                 | StreamMessage::Trade { .. }
+                | StreamMessage::Corrected { .. }
+                | StreamMessage::Canceled { .. }
                 | StreamMessage::Quote(_)
                 | StreamMessage::Refused { .. }
                 | StreamMessage::Unrecognized { .. }
@@ -388,6 +460,8 @@ fn unconfirmed(asked: &[Symbol], confirmed: &StreamMessage) -> Vec<(Symbol, Chan
         StreamMessage::Connected
         | StreamMessage::Authenticated
         | StreamMessage::Trade { .. }
+        | StreamMessage::Corrected { .. }
+        | StreamMessage::Canceled { .. }
         | StreamMessage::Quote(_)
         | StreamMessage::Refused { .. }
         | StreamMessage::Unrecognized { .. }
@@ -408,7 +482,7 @@ fn unconfirmed(asked: &[Symbol], confirmed: &StreamMessage) -> Vec<(Symbol, Chan
 
 /// One frame, a JSON array of messages each tagged by its `T`; only a frame that is no array is refused whole, so
 /// one bad element never costs the others.
-fn messages(text: &str) -> Result<Vec<StreamMessage>, StreamError> {
+pub(crate) fn messages(text: &str) -> Result<Vec<StreamMessage>, StreamError> {
     let elements: Vec<Value> =
         serde_json::from_str(text).map_err(|error| StreamError::Malformed {
             reason: error.to_string(),
@@ -473,6 +547,37 @@ fn message(element: &Value) -> Result<StreamMessage, StreamElementRefusal> {
             };
             StreamMessage::Trade { id, outcome }
         }
+        "c" => {
+            let payload: CorrectionPayload =
+                Deserialize::deserialize(element).map_err(unreadable)?;
+            let symbol = correction_symbol(element)?;
+            let row = AlpacaTrade {
+                timestamp: payload.timestamp,
+                price: payload.price,
+                size: payload.size,
+                conditions: payload.conditions,
+                tape: payload.tape,
+                update: None,
+            };
+            StreamMessage::Corrected {
+                original: TradeId::read_numbered(element, "oi")?,
+                replacement: TradeId::read_numbered(element, "ci")?,
+                outcome: trade_outcome(&symbol, &row),
+                symbol,
+            }
+        }
+        "x" => {
+            let action = element.get("a").and_then(Value::as_str).unwrap_or_default();
+            StreamMessage::Canceled {
+                original: TradeId::read(element)?,
+                action: action
+                    .parse()
+                    .map_err(|_| StreamElementRefusal::CancelAction {
+                        raw: action.to_string(),
+                    })?,
+                symbol: correction_symbol(element)?,
+            }
+        }
         "q" => StreamMessage::Quote(match symbol(element) {
             Ok(symbol) => {
                 let row: AlpacaQuote = Deserialize::deserialize(element).map_err(unreadable)?;
@@ -496,11 +601,18 @@ fn symbol(element: &Value) -> Result<Symbol, RefusedRow> {
     })
 }
 
+/// A correction's or cancel's `S`, which must name a symbol, since a print under any other ticker was refused.
+fn correction_symbol(element: &Value) -> Result<Symbol, StreamElementRefusal> {
+    symbol(element).map_err(|refused| StreamElementRefusal::Symbol {
+        raw: refused.ticker().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::market::record::Quote;
-    use crate::common::market::trade_bars::{Correction, Print, Tape};
+    use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
     use crate::common::market::{Price, Shares};
     use crate::ingest::Secret;
     use crate::ingest::alpaca::{quote_page, trade_page};
@@ -537,6 +649,72 @@ mod tests {
                 message: "invalid syntax".to_string()
             }]
         );
+    }
+
+    /// A correction whose replacement differs from its original in price and size, and a cancel, shaped as the stream
+    /// sends them; a cancel action this client does not read is refused, never taken as a withdrawal.
+    #[test]
+    fn test_corrections_and_cancels_read_as_the_stream_sends_them() {
+        let abc = Symbol::new("ABC").unwrap();
+        let correction = r#"[{"S":"ABC","T":"c","cc":["@","I"],"ci":4188,"cp":50.3,"cs":250,"oc":["@"],"oi":4101,"op":50.25,"os":200,"t":"2026-10-07T16:40:02.25Z","x":"Q","z":"C"}]"#;
+        assert_eq!(
+            messages(correction).unwrap(),
+            [StreamMessage::Corrected {
+                symbol: abc.clone(),
+                original: TradeId {
+                    exchange: 'Q',
+                    number: 4101
+                },
+                replacement: TradeId {
+                    exchange: 'Q',
+                    number: 4188
+                },
+                outcome: AlpacaTradeOutcome::Print {
+                    print: Print::new(
+                        abc.clone(),
+                        "2026-10-07T16:40:02.25Z".parse().unwrap(),
+                        Price::from_dollars(50.3).unwrap(),
+                        Shares::whole(250).unwrap(),
+                    ),
+                    tape: Tape::UnlistedTrading,
+                    letters: ['@', 'I'].into_iter().map(ConditionLetter::of).collect(),
+                    correction: Correction::Stands,
+                },
+            }]
+        );
+        let cancel = |action: &str| {
+            messages(&format!(
+                r#"[{{"S":"ABC","T":"x","a":"{action}","i":4101,"p":50.25,"s":200,"t":"2026-10-07T16:41:00Z","x":"Q","z":"C"}}]"#
+            ))
+            .unwrap()
+        };
+        let original = TradeId {
+            exchange: 'Q',
+            number: 4101,
+        };
+        assert_eq!(
+            cancel("C"),
+            [StreamMessage::Canceled {
+                symbol: abc.clone(),
+                original,
+                action: CancelAction::Cancel,
+            }]
+        );
+        assert_eq!(
+            cancel("E"),
+            [StreamMessage::Canceled {
+                symbol: abc,
+                original,
+                action: CancelAction::Error,
+            }]
+        );
+        assert!(matches!(
+            cancel("Q").as_slice(),
+            [StreamMessage::Malformed {
+                cause: StreamElementRefusal::CancelAction { raw },
+                ..
+            }] if raw == "Q"
+        ));
     }
 
     /// A trade and two quotes as the SIP stream sent them for SPY on 2026-10-06, in one frame, read through the same
@@ -609,6 +787,8 @@ mod tests {
                 ..
             }
             | StreamMessage::Connected
+            | StreamMessage::Corrected { .. }
+            | StreamMessage::Canceled { .. }
             | StreamMessage::Authenticated
             | StreamMessage::Subscribed(_)
             | StreamMessage::Quote(_)
@@ -780,6 +960,8 @@ mod tests {
                 | StreamMessage::Authenticated
                 | StreamMessage::Subscribed(_)
                 | StreamMessage::Trade { .. }
+                | StreamMessage::Corrected { .. }
+                | StreamMessage::Canceled { .. }
                 | StreamMessage::Quote(_)
                 | StreamMessage::Refused { .. }
                 | StreamMessage::Unrecognized { .. } => None,
@@ -792,7 +974,7 @@ mod tests {
                 &StreamElementRefusal::NumberNotUnsigned {
                     raw: r#""x""#.to_string()
                 },
-                &StreamElementRefusal::NoNumber,
+                &StreamElementRefusal::NoNumber { field: "i" },
             ]
         );
         assert_eq!(read[3], StreamMessage::Connected);
