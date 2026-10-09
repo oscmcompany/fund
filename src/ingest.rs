@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub use crate::common::market::refusal::{RowRefusal, RowRefusalKind};
 
 use crate::common::market::record::Bar;
-use crate::common::monoid::{Tally, concatenate};
+use crate::common::monoid::Tally;
 
 /// Why an environment variable a client needs was not used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +97,11 @@ impl RefusedRow {
 
 /// Refused rows counted by the kind of their cause.
 pub fn refused_by_cause(rows: &[RefusedRow]) -> Tally<RowRefusalKind> {
-    concatenate(rows.iter().map(|row| Tally::of(row.cause().kind())))
+    let mut tally = Tally::default();
+    for row in rows {
+        tally.add(row.cause().kind());
+    }
+    tally
 }
 
 /// Collects a report's bars by the record each claims to be, so a key claimed twice keeps neither row.

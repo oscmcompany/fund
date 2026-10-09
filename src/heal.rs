@@ -332,37 +332,59 @@ pub async fn run(
         let kept = leg
             .keeps(&window, &calendar)
             .map_err(|refusal| HealError::Keeps { leg, refusal })?;
-        let mut sessions = BTreeMap::new();
-        for session in owed(&kept, held.sessions()) {
-            let outcome = if Instant::now() >= deadline {
-                SessionOutcome::Unreached
-            } else {
-                match write(leg, session, &calendar, parameters, clients, journal).await {
-                    Ok(written) => {
-                        tracing::info!(%leg, %session, bars = written.bars(), refused = %written.refused(), unanswered = written.unanswered().len(), "Partition written");
-                        journal
-                            .append(Utc::now(), Observation::PartitionWritten(written))
-                            .map_err(HealError::Journal)?;
-                        SessionOutcome::Written
-                    }
-                    Err(PartitionFailure::Journal(error)) => return Err(HealError::Journal(error)),
-                    Err(failure) => {
-                        tracing::warn!(%leg, %session, %failure, "Partition not written");
-                        journal
-                            .append(
-                                Utc::now(),
-                                Observation::PartitionFailed(failure.failed(leg, session)),
-                            )
-                            .map_err(HealError::Journal)?;
-                        failure.outcome()
-                    }
-                }
-            };
-            sessions.insert(session, outcome);
-        }
+        let sessions = heal_leg(
+            leg,
+            owed(&kept, held.sessions()),
+            deadline,
+            journal,
+            async |session, journal: &mut Journal| {
+                write(leg, session, &calendar, parameters, clients, journal).await
+            },
+        )
+        .await?;
         outcomes.insert(leg, sessions);
     }
     Ok(HealFinished::new(window, outcomes, unrecognized))
+}
+
+/// Writes each of `leg`'s owed sessions with `write` until `deadline`, journaling each outcome as it lands; a journal
+/// error, from the append or from inside `write`, stops the run before another session starts.
+async fn heal_leg(
+    leg: Leg,
+    owed: impl IntoIterator<Item = SessionDate>,
+    deadline: Instant,
+    journal: &mut Journal,
+    mut write: impl AsyncFnMut(SessionDate, &mut Journal) -> Result<PartitionWritten, PartitionFailure>,
+) -> Result<BTreeMap<SessionDate, SessionOutcome>, HealError> {
+    let mut sessions = BTreeMap::new();
+    for session in owed {
+        let outcome = if Instant::now() >= deadline {
+            SessionOutcome::Unreached
+        } else {
+            match write(session, journal).await {
+                Ok(written) => {
+                    tracing::info!(%leg, %session, bars = written.bars(), refused = %written.refused(), unanswered = written.unanswered().len(), "Partition written");
+                    journal
+                        .append(Utc::now(), Observation::PartitionWritten(written))
+                        .map_err(HealError::Journal)?;
+                    SessionOutcome::Written
+                }
+                Err(PartitionFailure::Journal(error)) => return Err(HealError::Journal(error)),
+                Err(failure) => {
+                    tracing::warn!(%leg, %session, %failure, "Partition not written");
+                    journal
+                        .append(
+                            Utc::now(),
+                            Observation::PartitionFailed(failure.failed(leg, session)),
+                        )
+                        .map_err(HealError::Journal)?;
+                    failure.outcome()
+                }
+            }
+        };
+        sessions.insert(session, outcome);
+    }
+    Ok(sessions)
 }
 
 /// Fetches one leg's session and writes it, returning its record, or why it was not written.
@@ -797,29 +819,43 @@ async fn trade_conditions(
         Ok((_, conditions)) => Ok(conditions),
         Err(error) => {
             tracing::warn!(%error, "No readable conditions snapshot; fetching today's");
-            let fetched_at = Utc::now();
-            let conditions = clients.massive.trade_conditions().await?;
-            let key = conditions_key(SessionDate::at(fetched_at));
-            let provenance = Provenance::new(
-                Subscription::StocksStarter,
-                fetched_at,
-                journal.run_id(),
-                journal.commit().cloned(),
-            );
-            let body = encode_conditions(&key, &conditions, &provenance)
-                .map_err(EncodeRefusal::Reference)?;
-            clients.archive.put(&key, body).await?;
-            let written = ConditionsWritten::new(
-                key.session(),
-                u64::try_from(conditions.conditions().len())
-                    .expect("a table holds fewer than u64::MAX rows"),
-            );
-            journal
-                .append(Utc::now(), Observation::ConditionsWritten(written))
-                .map_err(PartitionFailure::Journal)?;
-            Ok(conditions)
+            write_conditions(
+                journal,
+                async || clients.massive.trade_conditions().await,
+                async |key: &Key, body| clients.archive.put(key, body).await,
+            )
+            .await
         }
     }
+}
+
+/// Fetches today's conditions with `fetch`, writes them with `put` and journals the write before returning them.
+async fn write_conditions(
+    journal: &mut Journal,
+    fetch: impl AsyncFnOnce() -> Result<TradeConditions, FetchError>,
+    put: impl AsyncFnOnce(&Key, Vec<u8>) -> Result<(), ArchiveError>,
+) -> Result<TradeConditions, PartitionFailure> {
+    let fetched_at = Utc::now();
+    let conditions = fetch().await?;
+    let key = conditions_key(SessionDate::at(fetched_at));
+    let provenance = Provenance::new(
+        Subscription::StocksStarter,
+        fetched_at,
+        journal.run_id(),
+        journal.commit().cloned(),
+    );
+    let body =
+        encode_conditions(&key, &conditions, &provenance).map_err(EncodeRefusal::Reference)?;
+    put(&key, body).await?;
+    let written = ConditionsWritten::new(
+        key.session(),
+        u64::try_from(conditions.conditions().len())
+            .expect("a table holds fewer than u64::MAX rows"),
+    );
+    journal
+        .append(Utc::now(), Observation::ConditionsWritten(written))
+        .map_err(PartitionFailure::Journal)?;
+    Ok(conditions)
 }
 
 /// Fetches each symbol's rows with at most `concurrency` in flight, handing every row to `each` a page at a time as
@@ -935,7 +971,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::common::journal::ParameterSource;
+    use crate::common::journal::{ParameterSource, RunId};
+    use crate::common::market::trade_bars::{
+        Condition, ConditionCode, ConditionStatus, UpdateRules,
+    };
+    use crate::common::monoid::Tally;
 
     /// The batches' symbols in the order they were concatenated.
     #[derive(Debug, Clone, PartialEq)]
@@ -1030,6 +1070,219 @@ mod tests {
             PartitionFailure::Journal(std::io::Error::other("disk full")).kind(),
             PartitionFailureKind::Journal
         );
+    }
+
+    /// A journal of its own in a fresh directory, which the caller removes.
+    fn temporary_journal() -> (Journal, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("fund-heal-{}", uuid::Uuid::new_v4()));
+        let journal = Journal::open(&directory, RunId::new(uuid::Uuid::new_v4())).unwrap();
+        (journal, directory)
+    }
+
+    fn event_types(journal: &Journal) -> Vec<&'static str> {
+        journal
+            .history()
+            .unwrap()
+            .iter()
+            .map(|record| record.observation().event_type())
+            .collect()
+    }
+
+    fn sessions() -> [SessionDate; 2] {
+        [29, 30].map(|day| {
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, day).unwrap())
+        })
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(3_600)
+    }
+
+    /// A failed partition is in the journal before the leg starts its next session, not gathered for the end.
+    #[tokio::test]
+    async fn test_a_failed_partition_is_journaled_before_the_next_session_starts() {
+        let [first, second] = sessions();
+        let (mut journal, directory) = temporary_journal();
+        let mut seen = Vec::new();
+        let outcomes = heal_leg(
+            Leg::MassiveDailyBars,
+            [first, second],
+            far_deadline(),
+            &mut journal,
+            async |session, journal: &mut Journal| {
+                seen.push((session, event_types(journal)));
+                if session == first {
+                    Err(PartitionFailure::NoRows)
+                } else {
+                    Ok(PartitionWritten::new(
+                        Leg::MassiveDailyBars,
+                        session,
+                        1,
+                        Tally::default(),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                    ))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen, [(first, vec![]), (second, vec!["partition_failed"])]);
+        assert_eq!(
+            event_types(&journal),
+            ["partition_failed", "partition_written"]
+        );
+        assert_eq!(
+            outcomes,
+            BTreeMap::from([
+                (
+                    first,
+                    SessionOutcome::Failed {
+                        failure: PartitionFailureKind::NoRows,
+                        cause: "the vendor answered with no rows".to_string(),
+                    }
+                ),
+                (second, SessionOutcome::Written),
+            ])
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// An outcome the journal refuses, or a write the partition could not journal, stops the leg before its next
+    /// session.
+    #[tokio::test]
+    async fn test_a_refused_journal_append_stops_further_partition_work() {
+        let [first, second] = sessions();
+        let (mut refusing, directory) = temporary_journal();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let mut attempted = Vec::new();
+        let refused = heal_leg(
+            Leg::MassiveDailyBars,
+            [first, second],
+            far_deadline(),
+            &mut refusing,
+            async |session, _journal: &mut Journal| {
+                attempted.push(session);
+                Err(PartitionFailure::NoRows)
+            },
+        )
+        .await;
+        assert!(matches!(refused, Err(HealError::Journal(_))));
+        assert_eq!(attempted, [first]);
+
+        let (mut journal, directory) = temporary_journal();
+        let mut attempted = Vec::new();
+        let refused = heal_leg(
+            Leg::AlpacaTrades,
+            [first, second],
+            far_deadline(),
+            &mut journal,
+            async |session, _journal: &mut Journal| {
+                attempted.push(session);
+                Err(PartitionFailure::Journal(std::io::Error::other(
+                    "disk full",
+                )))
+            },
+        )
+        .await;
+        assert!(matches!(refused, Err(HealError::Journal(_))));
+        assert_eq!(attempted, [first]);
+        assert_eq!(event_types(&journal), Vec::<&str>::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Sessions owed past the deadline are marked unreached without a write or a journal record.
+    #[tokio::test]
+    async fn test_sessions_past_the_deadline_are_unreached_and_unjournaled() {
+        let [first, second] = sessions();
+        let (mut journal, directory) = temporary_journal();
+        let mut attempted = Vec::new();
+        let outcomes = heal_leg(
+            Leg::MassiveDailyBars,
+            [first, second],
+            Instant::now(),
+            &mut journal,
+            async |session, _journal: &mut Journal| {
+                attempted.push(session);
+                Err(PartitionFailure::NoRows)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempted, Vec::<SessionDate>::new());
+        assert_eq!(
+            outcomes,
+            BTreeMap::from([
+                (first, SessionOutcome::Unreached),
+                (second, SessionOutcome::Unreached),
+            ])
+        );
+        assert_eq!(event_types(&journal), Vec::<&str>::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A fetched conditions snapshot is journaled once written, and one never fetched is neither written nor journaled.
+    #[tokio::test]
+    async fn test_a_conditions_snapshot_is_journaled_once_it_is_written() {
+        let (mut journal, directory) = temporary_journal();
+        let mut written = Vec::new();
+        let conditions = write_conditions(
+            &mut journal,
+            async || {
+                Ok(TradeConditions::new(BTreeMap::from([(
+                    ConditionCode::new(37),
+                    Condition::new(
+                        UpdateRules::VOLUME_ONLY,
+                        None,
+                        None,
+                        ConditionStatus::Current,
+                    ),
+                )])))
+            },
+            async |key: &Key, _body| {
+                written.push(key.clone());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(conditions.conditions().len(), 1);
+        assert_eq!(written.len(), 1);
+        let observations: Vec<Observation> = journal
+            .history()
+            .unwrap()
+            .iter()
+            .map(|record| record.observation().clone())
+            .collect();
+        assert_eq!(
+            observations,
+            [Observation::ConditionsWritten(ConditionsWritten::new(
+                written[0].session(),
+                1
+            ))]
+        );
+
+        let (mut journal, unfetched_directory) = temporary_journal();
+        let mut written = Vec::new();
+        let refused = write_conditions(
+            &mut journal,
+            async || {
+                Err(FetchError::Refused {
+                    status: 403,
+                    body: "forbidden".to_string(),
+                })
+            },
+            async |key: &Key, _body| {
+                written.push(key.clone());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(refused, Err(PartitionFailure::Fetch(_))));
+        assert_eq!(written, Vec::<Key>::new());
+        assert_eq!(event_types(&journal), Vec::<&str>::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&unfetched_directory).unwrap();
     }
 
     #[tokio::test(start_paused = true)]

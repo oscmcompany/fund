@@ -23,7 +23,14 @@ impl<Key: Ord> Tally<Key> {
 
     /// Counts one more sighting of `key`, as combining with `Tally::of(key)` would.
     pub fn add(&mut self, key: Key) {
-        *self = std::mem::take(self).combine(Self::of(key));
+        self.0
+            .entry(key)
+            .and_modify(|count| {
+                *count = count
+                    .checked_add(1)
+                    .expect("a tally counts fewer than u64::MAX sightings");
+            })
+            .or_insert(NonZeroU64::MIN);
     }
 
     pub fn counts(&self) -> &BTreeMap<Key, NonZeroU64> {
@@ -164,6 +171,14 @@ mod tests {
             third in any_tally(),
         ) {
             laws::check(first, second, third)?;
+        }
+
+        /// Adding in place agrees with combining with a one-sighting tally, so `add` stays inside the monoid.
+        #[test]
+        fn property_adding_a_key_equals_combining_with_its_tally(tally in any_tally(), key in 0_u8..8) {
+            let mut added = tally.clone();
+            added.add(key);
+            prop_assert_eq!(added, tally.combine(Tally::of(key)));
         }
 
         #[test]
