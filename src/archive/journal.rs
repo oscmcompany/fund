@@ -161,15 +161,17 @@ pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeR
             };
             let number = usize::try_from(line).map_err(|_| refused("line number overflows"))?;
             // A record from another session contradicts the key, however the row came to hold it.
-            let in_session = |read: ReadLine| match read {
-                ReadLine::Read(record) if record.session() != session => Err(refused(&format!(
-                    "a record from {} under {session}",
-                    record.session()
-                ))),
-                ReadLine::Read(_) | ReadLine::Unreadable { .. } => Ok(read),
+            let stamped_in_session = |stamped: SessionDate| match stamped == session {
+                true => Ok(()),
+                false => Err(refused(&format!("a record from {stamped} under {session}"))),
             };
             if unreadables.is_valid(row) {
-                lines.push(in_session(read_one(number, unreadables.value(row)))?);
+                let read = read_one(number, unreadables.value(row));
+                match &read {
+                    ReadLine::Read(record) => stamped_in_session(record.session())?,
+                    ReadLine::Unreadable { .. } => {}
+                }
+                lines.push(read);
                 continue;
             }
             let present = [versions.is_valid(row), run_ids.is_valid(row)]
@@ -180,7 +182,9 @@ pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeR
             if !present {
                 return Err(refused("an envelope column is null on a readable line"));
             }
+            // Checked on the typed column, so a row this build cannot type is held to the key too.
             let timestamp = DateTime::from_timestamp_nanos(timestamps.value(row));
+            stamped_in_session(SessionDate::at(timestamp))?;
             let payload: serde_json::Value = serde_json::from_str(payloads.value(row))
                 .map_err(|error| refused(&error.to_string()))?;
             let text = serde_json::json!({
@@ -193,7 +197,7 @@ pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeR
                 "payload": payload,
             })
             .to_string();
-            lines.push(in_session(read_one(number, &text))?);
+            lines.push(read_one(number, &text));
         }
     }
     Ok(lines)
@@ -307,7 +311,12 @@ mod tests {
 
     /// A one-row file in typed columns, as an older build may have written it.
     fn file_with_row(event_type: Option<&str>, payload: &str) -> Vec<u8> {
-        let nanoseconds = session().midnight().timestamp_nanos_opt().unwrap();
+        file_with_row_on(session(), event_type, payload)
+    }
+
+    /// `file_with_row` stamped at the start of `stamped`.
+    fn file_with_row_on(stamped: SessionDate, event_type: Option<&str>, payload: &str) -> Vec<u8> {
+        let nanoseconds = stamped.midnight().timestamp_nanos_opt().unwrap();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(UInt64Array::from(vec![1_u64])),
             Arc::new(UInt64Array::from(vec![1_u64])),
@@ -338,6 +347,18 @@ mod tests {
         // Written back, the line keeps its text, so a merge over it loses nothing.
         let bytes = encode(&key(), &lines).unwrap();
         assert_eq!(decode(&key(), bytes).unwrap(), lines);
+    }
+
+    #[test]
+    fn test_a_row_this_build_cannot_type_from_another_session_refuses_the_file() {
+        let next = session().plus_calendar_days(1);
+        assert_eq!(
+            decode(&key(), file_with_row_on(next, Some("retired_event"), "{}")),
+            Err(DecodeRefusal::Row {
+                line: 1,
+                reason: "a record from 2026-10-01 under 2026-09-30".to_string(),
+            })
+        );
     }
 
     #[test]
