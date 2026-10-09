@@ -51,7 +51,8 @@ fn write_decimal(
 pub struct Symbol(String);
 
 /// Why a symbol was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SymbolRefusal {
     Malformed { raw: String },
 }

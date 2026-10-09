@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::Side;
 use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
+use crate::common::order::BrokerFailure;
 use crate::common::strategy::Order;
 
 /// The least a fractional buy may be worth, one dollar, under which Alpaca refuses it; a fractional sell has no floor.
@@ -64,11 +65,11 @@ impl OrderGuarded {
 /// A tradability read that failed, journaled with its cause once before every order it leaves unvouched is held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradabilityUnread {
-    cause: String,
+    cause: BrokerFailure,
 }
 
 impl TradabilityUnread {
-    pub fn new(cause: String) -> Self {
+    pub fn new(cause: BrokerFailure) -> Self {
         Self { cause }
     }
 }

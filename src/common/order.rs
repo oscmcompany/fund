@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::common::book::{Fill, Side};
 use crate::common::journal::RunId;
-use crate::common::market::{DollarVolume, Price, Shares, Symbol};
+use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal};
 use crate::common::strategy::Order;
 
 /// Alpaca's limit, measured against the paper account on 2026-09-25: 128 characters accepted, 129 refused.
@@ -35,20 +35,35 @@ impl ClientOrderId {
         Self { run, sequence }
     }
 
-    /// Reads an identifier back, `None` for any string other than exactly what `Display` writes, so another spelling
-    /// of one of ours is not ours.
-    pub fn parse(raw: &str) -> Option<Self> {
+    /// Reads an identifier back, refusing any string other than exactly what `Display` writes, so another spelling of
+    /// one of ours is not ours.
+    pub fn parse(raw: &str) -> Result<Self, ClientOrderIdRefusal> {
         let mut fields = raw.split(':');
         let (Some(CLIENT_ORDER_ID_PREFIX), Some(run), Some(sequence), None) =
             (fields.next(), fields.next(), fields.next(), fields.next())
         else {
-            return None;
+            return Err(ClientOrderIdRefusal::Shape {
+                raw: raw.to_string(),
+            });
         };
+        let run = Uuid::parse_str(run).map_err(|_| ClientOrderIdRefusal::Run {
+            raw: raw.to_string(),
+        })?;
+        let sequence = sequence
+            .parse()
+            .map_err(|_| ClientOrderIdRefusal::Sequence {
+                raw: raw.to_string(),
+            })?;
         let parsed = Self {
-            run: RunId::new(Uuid::parse_str(run).ok()?),
-            sequence: sequence.parse().ok()?,
+            run: RunId::new(run),
+            sequence,
         };
-        (parsed.to_string() == raw).then_some(parsed)
+        match parsed.to_string() == raw {
+            true => Ok(parsed),
+            false => Err(ClientOrderIdRefusal::Spelling {
+                raw: raw.to_string(),
+            }),
+        }
     }
 
     pub fn run(self) -> RunId {
@@ -60,12 +75,42 @@ impl ClientOrderId {
     }
 }
 
+/// Why a string is not a client order id this system writes, by the part that failed, with the string refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientOrderIdRefusal {
+    /// Not three colon-separated fields under the `fund` prefix.
+    Shape { raw: String },
+    /// The run field is not a UUID.
+    Run { raw: String },
+    /// The sequence field is not a `u32`.
+    Sequence { raw: String },
+    /// Every field reads, but not in the spelling `Display` writes.
+    Spelling { raw: String },
+}
+
+impl std::fmt::Display for ClientOrderIdRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shape = format!("not `{CLIENT_ORDER_ID_PREFIX}:<run>:<sequence>`");
+        let (part, raw) = match self {
+            Self::Shape { raw } => (shape.as_str(), raw),
+            Self::Run { raw } => ("the run is not a UUID", raw),
+            Self::Sequence { raw } => ("the sequence is not a u32", raw),
+            Self::Spelling { raw } => ("not the spelling written", raw),
+        };
+        write!(
+            formatter,
+            "`{raw}` is not a client order id this system writes: {part}"
+        )
+    }
+}
+
+impl std::error::Error for ClientOrderIdRefusal {}
+
 impl TryFrom<String> for ClientOrderId {
-    type Error = String;
+    type Error = ClientOrderIdRefusal;
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
         Self::parse(&raw)
-            .ok_or_else(|| format!("`{raw}` is not a client order id this system writes"))
     }
 }
 
@@ -86,7 +131,8 @@ impl std::fmt::Display for ClientOrderId {
 }
 
 /// Where the broker says an order stands, collapsed to what a caller acts on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
     /// Accepted, queued or partly filled: the broker still has it.
     Open,
@@ -158,7 +204,7 @@ impl OrderExecution {
 }
 
 /// One reading of an order at the broker; `executed` is `None` while nothing has filled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderReport {
     status: OrderStatus,
     executed: Option<OrderExecution>,
@@ -198,7 +244,8 @@ enum Stage {
 }
 
 /// Why a report could not follow the state before it, with the readings that disagreed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderRefusal {
     /// The broker reported fewer shares executed than an earlier reading had.
     ExecutionShrank { held: Shares, reported: Shares },
@@ -379,14 +426,14 @@ impl OrderRefused {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderUnresolved {
     client_order_id: ClientOrderId,
-    cause: String,
+    cause: UnresolvedCause,
     executed: Option<OrderExecution>,
 }
 
 impl OrderUnresolved {
     pub fn new(
         client_order_id: ClientOrderId,
-        cause: String,
+        cause: UnresolvedCause,
         executed: Option<OrderExecution>,
     ) -> Self {
         Self {
@@ -395,6 +442,59 @@ impl OrderUnresolved {
             executed,
         }
     }
+}
+
+/// Why an order's end could not be established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedCause {
+    /// The submission's answer was lost and the order could not be read back by its id.
+    SubmittedThenUnreadable { failure: BrokerFailure },
+    /// Still open `reads` reads after its cancel, with the last trouble met while it was followed.
+    OpenPastCancel {
+        reads: u32,
+        last: Option<OrderTrouble>,
+    },
+}
+
+/// Trouble met while following an order: a report its state refused, a failed cancel, or a failed read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderTrouble {
+    ReportRefused(OrderRefusal),
+    CancelFailed(BrokerFailure),
+    Unreadable(BrokerFailure),
+}
+
+/// A broker client error as journaled, since the error itself does not serialize; the broker module builds one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerFailure {
+    NotPaper,
+    Unanswered {
+        cause: String,
+    },
+    Refused {
+        status: u16,
+        body: String,
+    },
+    Exhausted {
+        attempts: u32,
+        last: String,
+    },
+    /// A body that did not parse as the documented payload.
+    Unparsed {
+        reason: String,
+    },
+    Malformed {
+        field: String,
+        raw: String,
+    },
+    Symbol(SymbolRefusal),
+    /// A status the broker documents that this client does not map.
+    UnmappedStatus {
+        status: String,
+    },
 }
 
 /// An order as sent: what to trade and the identifier it goes under, filled at market for the day.
@@ -508,18 +608,45 @@ mod tests {
             id.to_string(),
             "fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42"
         );
-        assert_eq!(ClientOrderId::parse(&id.to_string()), Some(id));
+        assert_eq!(ClientOrderId::parse(&id.to_string()), Ok(id));
         assert_eq!((id.run(), id.sequence()), (run, 42));
-        for foreign in [
-            "fund:67E55044-10B1-426F-9247-BB680E5FE0C8:42",
-            "fund:67e55044-10b1-426f-9247-bb680e5fe0c8:042",
-            "fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42:extra",
-            "pair:67e55044-10b1-426f-9247-bb680e5fe0c8:42",
-            "67e55044-10b1-426f-9247-bb680e5fe0c8",
-            "",
+        let shape = |raw: &str| ClientOrderIdRefusal::Shape {
+            raw: raw.to_string(),
+        };
+        let spelling = |raw: &str| ClientOrderIdRefusal::Spelling {
+            raw: raw.to_string(),
+        };
+        for (foreign, refusal) in [
+            (
+                "fund:67E55044-10B1-426F-9247-BB680E5FE0C8:42",
+                spelling as fn(&str) -> ClientOrderIdRefusal,
+            ),
+            ("fund:67e55044-10b1-426f-9247-bb680e5fe0c8:042", spelling),
+            ("fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42:extra", shape),
+            ("pair:67e55044-10b1-426f-9247-bb680e5fe0c8:42", shape),
+            ("67e55044-10b1-426f-9247-bb680e5fe0c8", shape),
+            ("", shape),
+            ("fund:67e55044:42", |raw| ClientOrderIdRefusal::Run {
+                raw: raw.to_string(),
+            }),
+            ("fund:67e55044-10b1-426f-9247-bb680e5fe0c8:-1", |raw| {
+                ClientOrderIdRefusal::Sequence {
+                    raw: raw.to_string(),
+                }
+            }),
         ] {
-            assert_eq!(ClientOrderId::parse(foreign), None, "{foreign}");
+            assert_eq!(
+                ClientOrderId::parse(foreign),
+                Err(refusal(foreign)),
+                "{foreign}"
+            );
         }
+        assert_eq!(
+            serde_json::from_str::<ClientOrderId>(r#""fund:x:1""#)
+                .unwrap_err()
+                .to_string(),
+            "`fund:x:1` is not a client order id this system writes: the run is not a UUID"
+        );
         let longest = ClientOrderId::new(run, u32::MAX).to_string();
         assert_eq!(CLIENT_ORDER_ID_MAXIMUM_LENGTH, 128);
         assert_eq!(longest.len(), 52);
@@ -770,7 +897,7 @@ mod tests {
         #[test]
         fn property_a_client_order_id_round_trips(bytes in any::<[u8; 16]>(), sequence in any::<u32>()) {
             let id = ClientOrderId::new(RunId::new(Uuid::from_bytes(bytes)), sequence);
-            prop_assert_eq!(ClientOrderId::parse(&id.to_string()), Some(id));
+            prop_assert_eq!(ClientOrderId::parse(&id.to_string()), Ok(id));
         }
     }
 }
