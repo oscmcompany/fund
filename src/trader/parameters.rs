@@ -13,9 +13,7 @@ use chrono::TimeDelta;
 use crate::common::book::Cash;
 use crate::common::journal::ConfigurationResolved;
 use crate::common::market::{Dollars, Symbol, SymbolRefusal};
-use crate::common::parameter::{
-    Parameter, ParameterRefusal, record, record_required, refuse_retired,
-};
+use crate::common::parameter::{Parameter, ParameterRefusal, record, record_required};
 use crate::common::risk::{Limits, LimitsRefusal};
 use crate::execution::{Patience, PatienceRefusal};
 use crate::parameter::{Directories, environment_variable};
@@ -232,7 +230,6 @@ impl Parameters {
     fn resolved(
         supplied: &impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal>,
     ) -> Result<(Self, ConfigurationResolved), ParametersRefusal> {
-        refuse_retired(supplied)?;
         let mut resolved = BTreeMap::new();
         let read = |parameter| Ok::<_, ParameterRefusal>((parameter, supplied(parameter)?));
         let universe: Universe = record_required(read(Parameter::Universe)?, &mut resolved)?;
@@ -407,18 +404,6 @@ mod tests {
                 "{missing}"
             );
         }
-    }
-
-    #[test]
-    fn test_a_supplied_retired_parameter_refuses_to_start() {
-        let mut values = REQUIRED.to_vec();
-        values.push((Parameter::NoiseShares, "1"));
-        assert_eq!(
-            Parameters::resolved(&supplied(&values)).map(|_| ()),
-            Err(ParametersRefusal::Parameter(ParameterRefusal::Retired {
-                parameter: Parameter::NoiseShares
-            }))
-        );
     }
 
     #[test]

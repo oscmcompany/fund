@@ -58,10 +58,6 @@ pub enum DatasetError {
         session: SessionDate,
         refusal: DecodeRefusal,
     },
-    /// A leg retired with its data, which only journals still name.
-    Retired {
-        leg: DatasetLeg,
-    },
 }
 
 impl std::fmt::Display for DatasetError {
@@ -70,7 +66,6 @@ impl std::fmt::Display for DatasetError {
             Self::Window(refusal) => write!(formatter, "{refusal}"),
             Self::Journal(error) => write!(formatter, "the read could not be journaled: {error}"),
             Self::Archive(error) => write!(formatter, "{error}"),
-            Self::Retired { leg } => write!(formatter, "{leg} was retired with its data"),
             Self::Decode { session, refusal } => {
                 write!(
                     formatter,
@@ -149,7 +144,6 @@ async fn partition(
                 decode(&key, body).map_err(|refusal| DatasetError::Decode { session, refusal })?;
             Ok(Some((bars, tag)))
         }
-        DatasetLeg::LegacyDailyBars => Err(DatasetError::Retired { leg }),
     }
 }
 
@@ -164,8 +158,6 @@ pub async fn lineage(
             DatasetLeg::MassiveDailyBars => {
                 archive.tag(&massive_daily_bars(*session).into()).await?
             }
-            // Never looked up, so every partition such a read held is reported gone.
-            DatasetLeg::LegacyDailyBars => None,
         };
         if let Some(tag) = tag {
             current.insert(*session, tag);

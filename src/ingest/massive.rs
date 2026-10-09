@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_every_security_type_code_seen_maps_to_one_of_ours() {
-        // The thirteen codes the legacy snapshots hold, 2021-08-23 to 2026-10-01.
+        // The thirteen codes Massive's security details named, 2021-08-23 to 2026-10-01.
         let codes = [
             "CS", "ETF", "WARRANT", "ADRC", "FUND", "UNIT", "SP", "PFD", "ETS", "ETN", "ETV",
             "RIGHT", "INDEX",

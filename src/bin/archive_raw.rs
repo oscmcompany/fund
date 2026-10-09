@@ -1481,9 +1481,9 @@ mod tests {
     fn test_a_delete_names_only_paths_that_parse_as_keys() {
         let key = "data/equity/stage=parsed/trades/provider=massive/origin=derived/interval=one_day/year=2021/month=08/day=23/data.parquet";
         assert!(parse(&["delete".to_string(), key.to_string()]).is_some());
-        let legacy =
+        let outside =
             "data/derived/equity/trades/interval=one_day/year=2021/month=08/day=23/data.parquet";
-        assert!(parse(&["delete".to_string(), key.to_string(), legacy.to_string()]).is_none());
+        assert!(parse(&["delete".to_string(), key.to_string(), outside.to_string()]).is_none());
         assert!(parse(&["delete".to_string()]).is_none());
     }
 }

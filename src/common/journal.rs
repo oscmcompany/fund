@@ -26,7 +26,7 @@ use crate::common::standing::{FeedChanged, SessionClosed, SessionHalted};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 
-/// Stamped on every record this build writes; it only goes up, and a reader maps old versions forward.
+/// Stamped on every record this build writes; a line under another version reads back unreadable.
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// One process's run, within which `sequence` orders records.
@@ -284,12 +284,12 @@ impl SessionOpened {
     }
 }
 
-/// One leg's session written to the archive and read back, with every symbol and row that did not become a bar.
+/// One leg's session written to the archive and read back as `rows` rows, with every symbol and row that was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionWritten {
     leg: Leg,
     session: SessionDate,
-    bars: u64,
+    rows: u64,
     refused: Tally<RowRefusalKind>,
     unanswered: BTreeMap<Symbol, Unanswered>,
     /// What a tick leg's fold did with each row it was offered; empty for a leg that folds nothing.
@@ -300,7 +300,7 @@ impl PartitionWritten {
     pub fn new(
         leg: Leg,
         session: SessionDate,
-        bars: u64,
+        rows: u64,
         refused: Tally<RowRefusalKind>,
         unanswered: BTreeMap<Symbol, Unanswered>,
         folded: BTreeMap<FoldCount, u64>,
@@ -308,7 +308,7 @@ impl PartitionWritten {
         Self {
             leg,
             session,
-            bars,
+            rows,
             refused,
             unanswered,
             folded,
@@ -323,8 +323,8 @@ impl PartitionWritten {
         self.session
     }
 
-    pub fn bars(&self) -> u64 {
-        self.bars
+    pub fn rows(&self) -> u64 {
+        self.rows
     }
 
     pub fn refused(&self) -> &Tally<RowRefusalKind> {
@@ -774,7 +774,7 @@ mod tests {
                 "{prefix}{}",
                 concat!(
                     r#""event_type":"partition_written","payload":{"leg":"alpaca_minute_bars","#,
-                    r#""session":"2026-09-29","bars":1872987,"#,
+                    r#""session":"2026-09-29","rows":1872987,"#,
                     r#""refused":{"dollar_volume":1,"duplicate":2},"#,
                     r#""unanswered":{"ABC":"missing","BC.PRC":"invalid"},"#,
                     r#""folded":{"accepted":0,"out_of_order":0,"one_sided":3}}}"#,
@@ -1601,11 +1601,11 @@ mod tests {
                 prop::collection::btree_map(symbol, unanswered, 0..6),
                 prop::collection::btree_map(fold_count, any::<u64>(), 0..4),
             )
-                .prop_map(|(leg, session, bars, refused, unanswered, folded)| {
+                .prop_map(|(leg, session, rows, refused, unanswered, folded)| {
                     Observation::PartitionWritten(PartitionWritten::new(
                         leg,
                         session,
-                        bars,
+                        rows,
                         concatenate(refused.into_iter().map(Tally::of)),
                         unanswered,
                         folded,

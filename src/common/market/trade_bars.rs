@@ -191,8 +191,7 @@ pub struct TradeConditions {
 pub enum Eligibility {
     /// Every condition is known; a print updates what all of them allow.
     Resolved(UpdateRules),
-    /// A condition the table does not place: the print still counts toward volume, as the legacy fold counted it,
-    /// but sets no price, since nothing says it may.
+    /// A condition the table does not place: the print still counts toward volume but sets no price.
     Unresolved(Unplaced),
 }
 
