@@ -10,7 +10,7 @@ use chrono::DateTime;
 
 use super::parquet::{self, ReadRefusal};
 use crate::common::journal::{ReadLine, read_one};
-use crate::common::storage::Key;
+use crate::common::storage::JournalKey;
 use crate::common::time::SessionDate;
 
 const LAYOUT_VERSION: &str = "1";
@@ -18,7 +18,6 @@ const LAYOUT_VERSION: &str = "1";
 /// Why lines were not written under a key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeRefusal {
-    NotAJournalKey,
     /// A record from another session than the key's.
     OutsideKey {
         line: usize,
@@ -36,7 +35,6 @@ pub enum EncodeRefusal {
 /// Why a file was not read as a journal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
-    NotAJournalKey,
     File(ReadRefusal),
     /// A row that does not read back as the line it was written from.
     Row {
@@ -48,20 +46,6 @@ pub enum DecodeRefusal {
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
-    }
-}
-
-fn session_of(key: &Key) -> Option<SessionDate> {
-    match key {
-        Key::Journal { session, .. } => Some(*session),
-        Key::Bars { .. }
-        | Key::Quotes { .. }
-        | Key::Trades { .. }
-        | Key::Reference { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Logs { .. } => None,
     }
 }
 
@@ -86,8 +70,8 @@ fn schema() -> Schema {
 
 /// The file for `key` from its session's lines in file order, unreadable lines kept so the export is never a shorter
 /// run than the one that happened.
-pub fn encode(key: &Key, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRefusal> {
-    let session = session_of(key).ok_or(EncodeRefusal::NotAJournalKey)?;
+pub fn encode(key: &JournalKey, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRefusal> {
+    let session = key.session();
     let mut numbers = UInt64Builder::new();
     let mut versions = UInt64Builder::new();
     let mut run_ids = StringBuilder::new();
@@ -153,8 +137,8 @@ pub fn encode(key: &Key, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRefusal> {
 
 /// The lines a file written by `encode` under `key` holds, each read again through the journal's own reader, so a
 /// row edited out of band reads back as what it now says rather than what it was.
-pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal> {
-    let session = session_of(key).ok_or(DecodeRefusal::NotAJournalKey)?;
+pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal> {
+    let session = key.session();
     let (batches, _) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let mut lines = Vec::new();
     for batch in batches {
@@ -239,11 +223,8 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap())
     }
 
-    fn key() -> Key {
-        Key::Journal {
-            host: Host::Archiver,
-            session: session(),
-        }
+    fn key() -> JournalKey {
+        JournalKey::new(Host::Archiver, session())
     }
 
     fn record(sequence: u64, timestamp: &str, observation: Observation) -> String {
@@ -301,10 +282,7 @@ mod tests {
     #[test]
     fn test_a_file_read_under_another_session_is_refused() {
         let bytes = encode(&key(), &read(&session_file())).unwrap();
-        let next = Key::Journal {
-            host: Host::Archiver,
-            session: session().plus_calendar_days(1),
-        };
+        let next = JournalKey::new(Host::Archiver, session().plus_calendar_days(1));
         assert!(matches!(
             decode(&next, bytes),
             Err(DecodeRefusal::Row { line: 1, .. })
@@ -329,22 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn test_a_bars_key_is_refused_both_ways() {
-        let bars = Leg::MassiveDailyBars.key(session());
-        assert_eq!(
-            encode(&bars, &[]).map(|_| ()),
-            Err(EncodeRefusal::NotAJournalKey)
-        );
-        assert_eq!(
-            decode(&bars, encode(&key(), &[]).unwrap()),
-            Err(DecodeRefusal::NotAJournalKey)
-        );
-    }
-
-    #[test]
     fn test_a_bars_file_is_refused_by_its_schema() {
         let bars = crate::archive::bars::encode(
-            &Leg::MassiveDailyBars.key(session()),
+            &crate::common::heal::massive_daily_bars(session()),
             &[],
             &crate::archive::bars::Provenance::new(
                 crate::archive::bars::Subscription::StocksStarter,

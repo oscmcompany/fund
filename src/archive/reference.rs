@@ -25,7 +25,7 @@ use crate::common::market::trade_bars::{
     Condition, ConditionCode, ConditionLetter, ConditionStatus, TradeConditions, UpdateRules,
 };
 use crate::common::market::{Dollars, Shares, Symbol};
-use crate::common::storage::{Key, Provider, ReferenceTable};
+use crate::common::storage::{Key, Provider, ReferenceKey, ReferenceTable};
 use crate::common::time::SessionDate;
 use chrono::NaiveDate;
 
@@ -42,9 +42,10 @@ const DOLLARS_TYPE: DataType = DataType::Decimal128(20, 6);
 /// Why a reference table was not written or read.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReferenceRefusal {
-    /// The key names another table, or is not a reference key at all.
+    /// The key names another table than the codec's.
     NotTheTable {
-        path: String,
+        named: ReferenceTable,
+        expected: ReferenceTable,
     },
     SubscriptionProvider {
         provenance: Provenance,
@@ -78,22 +79,13 @@ impl From<ReadRefusal> for ReferenceRefusal {
 }
 
 /// The provider of a key naming `table`.
-fn table_provider(key: &Key, table: ReferenceTable) -> Result<Provider, ReferenceRefusal> {
-    match key {
-        Key::Reference {
-            provider,
-            table: named,
-            ..
-        } if *named == table => Ok(*provider),
-        Key::Reference { .. }
-        | Key::Bars { .. }
-        | Key::Quotes { .. }
-        | Key::Trades { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Journal { .. }
-        | Key::Logs { .. } => Err(ReferenceRefusal::NotTheTable { path: key.path() }),
+fn table_provider(key: &ReferenceKey, table: ReferenceTable) -> Result<Provider, ReferenceRefusal> {
+    match key.table() == table {
+        true => Ok(key.provider()),
+        false => Err(ReferenceRefusal::NotTheTable {
+            named: key.table(),
+            expected: table,
+        }),
     }
 }
 
@@ -111,7 +103,7 @@ fn conditions_schema() -> Schema {
 
 /// The conditions table's file for `key`, rows in code order.
 pub fn encode_conditions(
-    key: &Key,
+    key: &ReferenceKey,
     conditions: &TradeConditions,
     provenance: &Provenance,
 ) -> Result<Vec<u8>, ReferenceRefusal> {
@@ -163,7 +155,7 @@ pub fn encode_conditions(
 
 /// The conditions table a file written by `encode_conditions` under `key` holds, with its provenance.
 pub fn decode_conditions(
-    key: &Key,
+    key: &ReferenceKey,
     bytes: Vec<u8>,
 ) -> Result<(TradeConditions, Provenance), ReferenceRefusal> {
     table_provider(key, ReferenceTable::Conditions)?;
@@ -220,12 +212,8 @@ pub fn decode_conditions(
 }
 
 /// Massive's conditions snapshot taken on `as_of`.
-pub fn conditions_key(as_of: SessionDate) -> Key {
-    Key::Reference {
-        provider: Provider::Massive,
-        table: ReferenceTable::Conditions,
-        as_of,
-    }
+pub fn conditions_key(as_of: SessionDate) -> ReferenceKey {
+    ReferenceKey::new(Provider::Massive, ReferenceTable::Conditions, as_of)
 }
 
 /// The newest snapshot of `provider`'s `table` dated before `before`, if the archive holds one.
@@ -234,20 +222,16 @@ pub async fn latest_snapshot(
     provider: Provider,
     table: ReferenceTable,
     before: SessionDate,
-) -> Result<Option<Key>, ArchiveError> {
-    let series = Key::Reference {
-        provider,
-        table,
-        as_of: before,
-    }
-    .series();
+) -> Result<Option<ReferenceKey>, ArchiveError> {
+    let series = Key::from(ReferenceKey::new(provider, table, before)).series();
     Ok(archive
         .list(&series)
         .await?
         .iter()
         .filter_map(|path| Key::parse(path).ok())
-        .filter(|key| key.session() < before)
-        .max_by_key(Key::session))
+        .filter_map(|key| ReferenceKey::try_from(key).ok())
+        .filter(|key| key.as_of() < before)
+        .max_by_key(ReferenceKey::as_of))
 }
 
 /// Why no conditions table was read.
@@ -257,7 +241,7 @@ pub enum SnapshotError {
     Absent,
     /// Listed, then gone when read.
     Vanished {
-        key: Key,
+        key: ReferenceKey,
     },
     Decode(ReferenceRefusal),
 }
@@ -267,7 +251,7 @@ impl std::fmt::Display for SnapshotError {
         match self {
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Absent => write!(formatter, "no conditions table in the archive"),
-            Self::Vanished { key } => write!(formatter, "{} vanished", key.path()),
+            Self::Vanished { key } => write!(formatter, "{} vanished", Key::from(*key).path()),
             Self::Decode(refusal) => {
                 write!(formatter, "the conditions table did not read: {refusal:?}")
             }
@@ -278,7 +262,9 @@ impl std::fmt::Display for SnapshotError {
 impl std::error::Error for SnapshotError {}
 
 /// The newest conditions snapshot the archive holds, with its key.
-pub async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeConditions), SnapshotError> {
+pub async fn latest_conditions(
+    archive: &Archive,
+) -> Result<(ReferenceKey, TradeConditions), SnapshotError> {
     let latest = latest_snapshot(
         archive,
         Provider::Massive,
@@ -289,12 +275,10 @@ pub async fn latest_conditions(archive: &Archive) -> Result<(Key, TradeCondition
     .map_err(SnapshotError::Archive)?
     .ok_or(SnapshotError::Absent)?;
     let bytes = archive
-        .get(&latest)
+        .get(&latest.into())
         .await
         .map_err(SnapshotError::Archive)?
-        .ok_or_else(|| SnapshotError::Vanished {
-            key: latest.clone(),
-        })?;
+        .ok_or(SnapshotError::Vanished { key: latest })?;
     let (conditions, _) = decode_conditions(&latest, bytes).map_err(SnapshotError::Decode)?;
     Ok((latest, conditions))
 }
@@ -314,7 +298,7 @@ fn security_details_schema() -> Schema {
 
 /// A snapshot's file for `key`, rows in symbol order; a symbol listed twice is refused.
 pub fn encode_security_details(
-    key: &Key,
+    key: &ReferenceKey,
     details: &[SecurityDetails],
     provenance: &Provenance,
 ) -> Result<Vec<u8>, ReferenceRefusal> {
@@ -373,7 +357,7 @@ pub fn encode_security_details(
 
 /// The snapshot a file written by `encode_security_details` under `key` holds, every value rebuilt through its type.
 pub fn decode_security_details(
-    key: &Key,
+    key: &ReferenceKey,
     bytes: Vec<u8>,
 ) -> Result<(Vec<SecurityDetails>, Provenance), ReferenceRefusal> {
     table_provider(key, ReferenceTable::SecurityDetails)?;
@@ -468,7 +452,7 @@ fn session_at(
 
 /// The provider `key` names for `table`, checked against the subscription the provenance says fetched it.
 fn snapshot_provider(
-    key: &Key,
+    key: &ReferenceKey,
     table: ReferenceTable,
     provenance: &Provenance,
 ) -> Result<Provider, ReferenceRefusal> {
@@ -500,7 +484,7 @@ fn splits_schema() -> Schema {
 
 /// A splits snapshot's file for `key`, rows in symbol and date order; an action listed twice is refused.
 pub fn encode_splits(
-    key: &Key,
+    key: &ReferenceKey,
     splits: &[Split],
     provenance: &Provenance,
 ) -> Result<Vec<u8>, ReferenceRefusal> {
@@ -545,7 +529,7 @@ pub fn encode_splits(
 
 /// The snapshot a file written by `encode_splits` under `key` holds, every value rebuilt through its type.
 pub fn decode_splits(
-    key: &Key,
+    key: &ReferenceKey,
     bytes: Vec<u8>,
 ) -> Result<(Vec<Split>, Provenance), ReferenceRefusal> {
     let (batches, entries) = parquet::read(bytes, &splits_schema(), LAYOUT_VERSION)?;
@@ -598,7 +582,7 @@ fn series_boundaries_schema() -> Schema {
 
 /// A series boundaries snapshot's file for `key`, rows in symbol and date order; an action listed twice is refused.
 pub fn encode_series_boundaries(
-    key: &Key,
+    key: &ReferenceKey,
     boundaries: &[SeriesBoundary],
     provenance: &Provenance,
 ) -> Result<Vec<u8>, ReferenceRefusal> {
@@ -642,7 +626,7 @@ pub fn encode_series_boundaries(
 
 /// The snapshot a file written by `encode_series_boundaries` under `key` holds, every value rebuilt through its type.
 pub fn decode_series_boundaries(
-    key: &Key,
+    key: &ReferenceKey,
     bytes: Vec<u8>,
 ) -> Result<(Vec<SeriesBoundary>, Provenance), ReferenceRefusal> {
     let (batches, entries) = parquet::read(bytes, &series_boundaries_schema(), LAYOUT_VERSION)?;
@@ -701,12 +685,8 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap())
     }
 
-    fn key(table: ReferenceTable) -> Key {
-        Key::Reference {
-            provider: Provider::Massive,
-            table,
-            as_of: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap()),
-        }
+    fn key(table: ReferenceTable) -> ReferenceKey {
+        ReferenceKey::new(Provider::Massive, table, session())
     }
 
     #[test]
@@ -770,10 +750,14 @@ mod tests {
             Ok((conditions.clone(), provenance.clone()))
         );
         assert_eq!(
-            encode_conditions(&key(ReferenceTable::SecurityDetails), &conditions, &provenance),
+            encode_conditions(
+                &key(ReferenceTable::SecurityDetails),
+                &conditions,
+                &provenance
+            ),
             Err(ReferenceRefusal::NotTheTable {
-                path: "data/equity/stage=parsed/reference/provider=massive/table=security_details/as_of=2026-10-05/data.parquet"
-                    .to_string()
+                named: ReferenceTable::SecurityDetails,
+                expected: ReferenceTable::Conditions,
             })
         );
     }
@@ -933,7 +917,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let key = Key::Reference { provider: Provider::Massive, table: ReferenceTable::Splits, as_of: session() };
+            let key = ReferenceKey::new(Provider::Massive, ReferenceTable::Splits, session());
             let written = encode_splits(&key, &splits, &snapshot_provenance()).unwrap();
             let (mut read, provenance) = decode_splits(&key, written).unwrap();
             let mut expected = splits.clone();
@@ -971,7 +955,7 @@ mod tests {
                     .unwrap()
                 })
                 .collect();
-            let key = Key::Reference { provider: Provider::Alpaca, table: ReferenceTable::SeriesBoundaries, as_of: session() };
+            let key = ReferenceKey::new(Provider::Alpaca, ReferenceTable::SeriesBoundaries, session());
             let provenance = Provenance::new(
                 Subscription::AlgoTraderPlus,
                 "2026-10-08T11:00:00Z".parse().unwrap(),
@@ -998,11 +982,7 @@ mod tests {
                 SplitRatio::from_floats(50.0, 1.0).unwrap(),
             )
         };
-        let key = Key::Reference {
-            provider: Provider::Massive,
-            table: ReferenceTable::Splits,
-            as_of: session(),
-        };
+        let key = ReferenceKey::new(Provider::Massive, ReferenceTable::Splits, session());
         assert_eq!(
             encode_splits(&key, &[split("E1"), split("E1")], &snapshot_provenance()),
             Err(ReferenceRefusal::DuplicateAction {

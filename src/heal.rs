@@ -22,8 +22,9 @@ use crate::archive::reference::{
 use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal};
 use crate::archive::{quote_bars, trade_bars};
 use crate::common::heal::{
-    Held, KeepsRefusal, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal, fetched_range,
-    owed, window,
+    Held, KeepsRefusal, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal,
+    alpaca_minute_bars, alpaca_quotes, alpaca_series_boundaries, alpaca_trades, fetched_range,
+    massive_daily_bars, massive_security_details, massive_splits, owed, window,
 };
 use crate::common::journal::{
     ConditionsWritten, ConfigurationResolved, HealFinished, Observation, PartitionFailed,
@@ -33,7 +34,7 @@ use crate::common::market::Symbol;
 use crate::common::market::aggregate::session_bars;
 use crate::common::market::corporate_actions::{SeriesBoundary, refresh_boundaries};
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
-use crate::common::market::record::{Bar, BarInterval};
+use crate::common::market::record::Bar;
 use crate::common::market::security_details::SecurityDetails;
 use crate::common::market::trade_bars::{TradeConditions, TradeFold};
 use crate::common::monoid::{Monoid, concatenate};
@@ -398,8 +399,7 @@ async fn write(
     clients: &Clients,
     journal: &mut Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
-    let key = leg.key(session);
-    let (bars, refused, unanswered, subscription) = match leg {
+    let (key, bars, refused, unanswered, subscription) = match leg {
         Leg::AlpacaQuotes => {
             let hours = calendar
                 .session(session)
@@ -422,6 +422,7 @@ async fn write(
             }
             let refused = refused_by_cause(daily.refused());
             (
+                massive_daily_bars(session),
                 daily.bars().to_vec(),
                 refused,
                 BTreeMap::new(),
@@ -453,6 +454,7 @@ async fn write(
                 .collect();
             let refused = refused_by_cause(minute.refused());
             (
+                alpaca_minute_bars(session),
                 minute.bars().to_vec(),
                 refused,
                 unanswered,
@@ -466,7 +468,7 @@ async fn write(
     }
     let provenance = fetched_now(subscription, journal);
     let body = encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
-    clients.archive.put(&key, body).await?;
+    clients.archive.put(&key.into(), body).await?;
     Ok(PartitionWritten::new(
         leg,
         session,
@@ -497,11 +499,11 @@ async fn write_splits(
     if splits.splits().is_empty() {
         return Err(PartitionFailure::NoRows);
     }
-    let key = Leg::MassiveSplits.key(session);
+    let key = massive_splits(session);
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let body =
         encode_splits(&key, splits.splits(), &provenance).map_err(EncodeRefusal::Reference)?;
-    clients.archive.put(&key, body).await?;
+    clients.archive.put(&key.into(), body).await?;
     Ok(PartitionWritten::new(
         Leg::MassiveSplits,
         session,
@@ -539,14 +541,14 @@ async fn write_series_boundaries(
         Some(key) => {
             let bytes = clients
                 .archive
-                .get(&key)
+                .get(&key.into())
                 .await?
-                .ok_or_else(|| PartitionFailure::Vanished { key: key.clone() })?;
+                .ok_or(PartitionFailure::Vanished { key: key.into() })?;
             let (held, _) =
                 decode_series_boundaries(&key, bytes).map_err(DecodeRefusal::Reference)?;
             (
                 held,
-                key.session()
+                key.as_of()
                     .plus_calendar_days(-i64::from(BOUNDARY_REFRESH_DAYS.get())),
             )
         }
@@ -569,11 +571,11 @@ async fn write_series_boundaries(
     if boundaries.is_empty() {
         return Err(PartitionFailure::NoRows);
     }
-    let key = Leg::AlpacaSeriesBoundaries.key(session);
+    let key = alpaca_series_boundaries(session);
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let body = encode_series_boundaries(&key, &boundaries, &provenance)
         .map_err(EncodeRefusal::Reference)?;
-    clients.archive.put(&key, body).await?;
+    clients.archive.put(&key.into(), body).await?;
     Ok(PartitionWritten::new(
         Leg::AlpacaSeriesBoundaries,
         session,
@@ -633,11 +635,11 @@ async fn write_security_details(
     if gathered.details.is_empty() {
         return Err(PartitionFailure::NoRows);
     }
-    let key = Leg::MassiveSecurityDetails.key(session);
+    let key = massive_security_details(session);
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let body = encode_security_details(&key, &gathered.details, &provenance)
         .map_err(EncodeRefusal::Reference)?;
-    clients.archive.put(&key, body).await?;
+    clients.archive.put(&key.into(), body).await?;
     Ok(PartitionWritten::new(
         Leg::MassiveSecurityDetails,
         session,
@@ -650,41 +652,6 @@ async fn write_security_details(
             .collect(),
         BTreeMap::new(),
     ))
-}
-
-/// The key of a tick leg's bars at `interval`.
-fn tick_key(leg_key: &Key, interval: BarInterval) -> Key {
-    match leg_key {
-        Key::Quotes {
-            provider,
-            origin,
-            session,
-            ..
-        } => Key::Quotes {
-            provider: *provider,
-            origin: *origin,
-            interval,
-            session: *session,
-        },
-        Key::Trades {
-            provider,
-            origin,
-            session,
-            ..
-        } => Key::Trades {
-            provider: *provider,
-            origin: *origin,
-            interval,
-            session: *session,
-        },
-        Key::Bars { .. }
-        | Key::Reference { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Journal { .. }
-        | Key::Logs { .. } => unreachable!("a tick leg's key is a quotes or trades key"),
-    }
 }
 
 /// Folds Alpaca's quotes for every symbol of the session and writes its quote bars.
@@ -722,9 +689,9 @@ async fn write_quotes(
         u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars");
     // The daily file is written last, so a session reads as held only once all three are.
     for (interval, bars) in session_bars(minutes) {
-        let key = tick_key(&Leg::AlpacaQuotes.key(session), interval);
+        let key = alpaca_quotes(session).at_interval(interval);
         let body = quote_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
-        clients.archive.put(&key, body).await?;
+        clients.archive.put(&key.into(), body).await?;
     }
     tracing::info!(%session, quotes = counts.accepted(), out_of_order = counts.out_of_order(), one_sided, "Alpaca quotes folded");
     Ok(PartitionWritten::new(
@@ -775,9 +742,9 @@ async fn write_trades(
         u64::try_from(minutes.len()).expect("a partition holds fewer than u64::MAX bars");
     // The daily file is written last, so a session reads as held only once all three are.
     for (interval, bars) in session_bars(minutes) {
-        let key = tick_key(&Leg::AlpacaTrades.key(session), interval);
+        let key = alpaca_trades(session).at_interval(interval);
         let body = trade_bars::encode(&key, &bars, &provenance).map_err(EncodeRefusal::from)?;
-        clients.archive.put(&key, body).await?;
+        clients.archive.put(&key.into(), body).await?;
     }
     tracing::info!(%session, folded = counts.folded(), withdrawn = counts.withdrawn(), unresolved = counts.unresolved().total(), unresolved_by_cause = %counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
     Ok(PartitionWritten::new(
@@ -827,9 +794,9 @@ async fn write_conditions(
     );
     let body =
         encode_conditions(&key, &conditions, &provenance).map_err(EncodeRefusal::Reference)?;
-    put(&key, body).await?;
+    put(&key.into(), body).await?;
     let written = ConditionsWritten::new(
-        key.session(),
+        key.as_of(),
         u64::try_from(conditions.conditions().len())
             .expect("a table holds fewer than u64::MAX rows"),
     );
@@ -899,12 +866,12 @@ async fn symbol_list(
     clients: &Clients,
     session: SessionDate,
 ) -> Result<Vec<Symbol>, PartitionFailure> {
-    let key = Leg::MassiveDailyBars.key(session);
+    let key = massive_daily_bars(session);
     let body = clients
         .archive
-        .get(&key)
+        .get(&key.into())
         .await?
-        .ok_or_else(|| PartitionFailure::NoSymbols { key: key.clone() })?;
+        .ok_or(PartitionFailure::NoSymbols { key: key.into() })?;
     let (bars, _) = decode(&key, body).map_err(DecodeRefusal::from)?;
     Ok(bars.iter().map(Bar::symbol).cloned().collect())
 }

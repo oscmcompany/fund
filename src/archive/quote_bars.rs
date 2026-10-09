@@ -17,10 +17,8 @@ use chrono::DateTime;
 use super::bars::{Provenance, provenance_from};
 use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 use crate::common::market::quote_bars::{QuoteBar, QuoteSums, Spread, StandingQuote, TimeWeighted};
-use crate::common::market::record::BarInterval;
 use crate::common::market::{QuoteCount, Shares, Symbol};
-use crate::common::storage::{Key, Provider};
-use crate::common::time::SessionDate;
+use crate::common::storage::{Provider, QuotesKey};
 
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
@@ -33,7 +31,6 @@ const TIME_WEIGHTED_TYPE: DataType = DataType::Decimal128(38, 6);
 /// Why quote bars were not written under a key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeRefusal {
-    NotAQuotesKey,
     SubscriptionProvider {
         provenance: Provenance,
         key: Provider,
@@ -52,7 +49,6 @@ pub enum EncodeRefusal {
 /// Why a file was not read as quote bars.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
-    NotAQuotesKey,
     File(ReadRefusal),
     Row {
         index: usize,
@@ -67,25 +63,6 @@ pub enum DecodeRefusal {
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
-    }
-}
-
-fn quotes_key(key: &Key) -> Option<(Provider, BarInterval, SessionDate)> {
-    match key {
-        Key::Quotes {
-            provider,
-            interval,
-            session,
-            ..
-        } => Some((*provider, *interval, *session)),
-        Key::Bars { .. }
-        | Key::Trades { .. }
-        | Key::Reference { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Journal { .. }
-        | Key::Logs { .. } => None,
     }
 }
 
@@ -122,11 +99,11 @@ fn schema() -> Schema {
 
 /// The file for `key`, rows ordered by symbol and then timestamp so the same bars always make the same bytes.
 pub fn encode(
-    key: &Key,
+    key: &QuotesKey,
     bars: &[QuoteBar],
     provenance: &Provenance,
 ) -> Result<Vec<u8>, EncodeRefusal> {
-    let (provider, interval, session) = quotes_key(key).ok_or(EncodeRefusal::NotAQuotesKey)?;
+    let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     if provenance.subscription().provider() != provider {
         return Err(EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
@@ -217,8 +194,11 @@ pub fn encode(
 }
 
 /// The quote bars and provenance a file written by `encode` under `key` holds, each rebuilt through `QuoteBar::new`.
-pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<QuoteBar>, Provenance), DecodeRefusal> {
-    let (provider, interval, session) = quotes_key(key).ok_or(DecodeRefusal::NotAQuotesKey)?;
+pub fn decode(
+    key: &QuotesKey,
+    bytes: Vec<u8>,
+) -> Result<(Vec<QuoteBar>, Provenance), DecodeRefusal> {
+    let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription().provider() != provider {
@@ -288,20 +268,22 @@ mod tests {
     use crate::common::journal::{Commit, RunId};
     use crate::common::market::Price;
     use crate::common::market::quote_bars::QuoteFold;
+    use crate::common::market::record::BarInterval;
     use crate::common::market::record::Quote;
     use crate::common::storage::Origin;
+    use crate::common::time::SessionDate;
 
     fn session() -> SessionDate {
         SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap())
     }
 
-    fn key() -> Key {
-        Key::Quotes {
-            provider: Provider::Massive,
-            origin: Origin::Derived,
-            interval: BarInterval::OneMinute,
-            session: session(),
-        }
+    fn key() -> QuotesKey {
+        QuotesKey::new(
+            Provider::Massive,
+            Origin::Derived,
+            BarInterval::OneMinute,
+            session(),
+        )
     }
 
     fn provenance() -> Provenance {
@@ -350,29 +332,19 @@ mod tests {
     }
 
     #[test]
-    fn test_a_bar_from_another_session_or_key_kind_is_refused() {
-        let other = Key::Quotes {
-            provider: Provider::Massive,
-            origin: Origin::Derived,
-            interval: BarInterval::OneMinute,
-            session: session().plus_calendar_days(1),
-        };
+    fn test_a_bar_from_another_session_is_refused() {
+        let other = QuotesKey::new(
+            Provider::Massive,
+            Origin::Derived,
+            BarInterval::OneMinute,
+            session().plus_calendar_days(1),
+        );
         assert!(matches!(
             encode(&other, &bars(), &provenance()),
             Err(EncodeRefusal::Placement(
                 PlacementRefusal::OutsideKey { .. }
             ))
         ));
-        let bars_key = Key::Bars {
-            provider: Provider::Massive,
-            origin: Origin::Vendor,
-            interval: BarInterval::OneMinute,
-            session: session(),
-        };
-        assert_eq!(
-            encode(&bars_key, &bars(), &provenance()),
-            Err(EncodeRefusal::NotAQuotesKey)
-        );
     }
 
     /// A valid bar of `interval` in session 2026-10-02, its bucket chosen by `slot`.
@@ -458,7 +430,7 @@ mod tests {
                     unique.push(bar);
                 }
             }
-            let key = Key::Quotes { provider: Provider::Massive, origin: Origin::Derived, interval, session: session() };
+            let key = QuotesKey::new(Provider::Massive, Origin::Derived, interval, session());
             let (read, read_provenance) = decode(&key, encode(&key, &unique, &provenance()).unwrap()).unwrap();
             unique.sort_by(|left, right| (left.symbol(), left.timestamp()).cmp(&(right.symbol(), right.timestamp())));
             proptest::prop_assert_eq!(read, unique);

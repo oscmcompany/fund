@@ -9,7 +9,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 
 use crate::archive::{Archive, ArchiveError, DecodeRefusal, EncodeRefusal, journal, logs};
 use crate::common::journal::read;
-use crate::common::storage::{Host, Key, Service};
+use crate::common::storage::{Host, JournalKey, Key, LogsKey, Service};
 use crate::common::time::SessionDate;
 
 /// Calendar days of local files shipped each run, today included, so a week of failed shipments heals by itself.
@@ -76,26 +76,22 @@ fn shipments(
     let mut shipments = Vec::new();
     for days in 0..RESHIPPED_DAYS {
         let session = today.plus_calendar_days(-days);
-        let journal_key = Key::Journal { host, session };
+        let journal_key = JournalKey::new(host, session);
         let journal_path = journal_directory.join(crate::journal::file_name(session));
         if let Some(contents) = contents(&journal_path) {
             let encoded = contents.and_then(|text| {
                 journal::encode(&journal_key, &read(&text))
                     .map_err(|refusal| ShipFailure::Encode(refusal.into()))
             });
-            shipments.push((journal_key, encoded));
+            shipments.push((journal_key.into(), encoded));
         }
-        let logs_key = Key::Logs {
-            host,
-            service: service.clone(),
-            session,
-        };
+        let logs_key = LogsKey::new(host, service.clone(), session);
         if let Some(contents) = contents(&log_directory.join(log_file_name(service, session))) {
             let encoded = contents.and_then(|text| {
-                logs::encode(&logs_key, &logs::parse(&text))
+                logs::encode(&logs::parse(&text))
                     .map_err(|refusal| ShipFailure::Encode(refusal.into()))
             });
-            shipments.push((logs_key, encoded));
+            shipments.push((logs_key.into(), encoded));
         }
     }
     shipments

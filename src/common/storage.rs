@@ -134,32 +134,238 @@ impl Service {
     }
 }
 
+/// Which parsed series a key belongs to, named in its path.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum ParsedKind {
+    Bars,
+    Quotes,
+    Trades,
+}
+
+mod sealed {
+    pub trait Sealed {}
+
+    impl Sealed for super::Bars {}
+    impl Sealed for super::Quotes {}
+    impl Sealed for super::Trades {}
+}
+
+/// A parsed kind as a type, so a codec's key admits only the kind it reads; sealed to the three below.
+pub trait Family: sealed::Sealed + Copy + Default {
+    const KIND: ParsedKind;
+
+    fn wrap(key: ParsedKey<Self>) -> Key;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Bars;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Quotes;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Trades;
+
+impl Family for Bars {
+    const KIND: ParsedKind = ParsedKind::Bars;
+
+    fn wrap(key: ParsedKey<Self>) -> Key {
+        Key::Bars(key)
+    }
+}
+
+impl Family for Quotes {
+    const KIND: ParsedKind = ParsedKind::Quotes;
+
+    fn wrap(key: ParsedKey<Self>) -> Key {
+        Key::Quotes(key)
+    }
+}
+
+impl Family for Trades {
+    const KIND: ParsedKind = ParsedKind::Trades;
+
+    fn wrap(key: ParsedKey<Self>) -> Key {
+        Key::Trades(key)
+    }
+}
+
+/// One session of a parsed series of family `F`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedKey<F> {
+    provider: Provider,
+    origin: Origin,
+    interval: BarInterval,
+    session: SessionDate,
+    family: F,
+}
+
+pub type BarsKey = ParsedKey<Bars>;
+pub type QuotesKey = ParsedKey<Quotes>;
+pub type TradesKey = ParsedKey<Trades>;
+
+impl<F: Family> ParsedKey<F> {
+    pub fn new(
+        provider: Provider,
+        origin: Origin,
+        interval: BarInterval,
+        session: SessionDate,
+    ) -> Self {
+        Self {
+            provider,
+            origin,
+            interval,
+            session,
+            family: F::default(),
+        }
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub fn interval(&self) -> BarInterval {
+        self.interval
+    }
+
+    pub fn session(&self) -> SessionDate {
+        self.session
+    }
+
+    /// The same provider, origin, kind and session at another interval, which names another series.
+    pub fn at_interval(self, interval: BarInterval) -> Self {
+        Self { interval, ..self }
+    }
+}
+
+impl<F: Family> From<ParsedKey<F>> for Key {
+    fn from(key: ParsedKey<F>) -> Self {
+        F::wrap(key)
+    }
+}
+
+/// One snapshot of a reference table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceKey {
+    provider: Provider,
+    table: ReferenceTable,
+    as_of: SessionDate,
+}
+
+impl ReferenceKey {
+    pub fn new(provider: Provider, table: ReferenceTable, as_of: SessionDate) -> Self {
+        Self {
+            provider,
+            table,
+            as_of,
+        }
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub fn table(&self) -> ReferenceTable {
+        self.table
+    }
+
+    pub fn as_of(&self) -> SessionDate {
+        self.as_of
+    }
+}
+
+impl From<ReferenceKey> for Key {
+    fn from(key: ReferenceKey) -> Self {
+        Self::Reference(key)
+    }
+}
+
+impl TryFrom<Key> for ReferenceKey {
+    type Error = Key;
+
+    fn try_from(key: Key) -> Result<Self, Key> {
+        match key {
+            Key::Reference(key) => Ok(key),
+            Key::Bars(..)
+            | Key::Quotes(..)
+            | Key::Trades(..)
+            | Key::RawBars { .. }
+            | Key::RawQuotes { .. }
+            | Key::RawTrades { .. }
+            | Key::Journal(..)
+            | Key::Logs(..) => Err(key),
+        }
+    }
+}
+
+/// One session of a host's journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalKey {
+    host: Host,
+    session: SessionDate,
+}
+
+impl JournalKey {
+    pub fn new(host: Host, session: SessionDate) -> Self {
+        Self { host, session }
+    }
+
+    pub fn session(&self) -> SessionDate {
+        self.session
+    }
+}
+
+impl From<JournalKey> for Key {
+    fn from(key: JournalKey) -> Self {
+        Self::Journal(key)
+    }
+}
+
+/// One session of one service's log on a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsKey {
+    host: Host,
+    service: Service,
+    session: SessionDate,
+}
+
+impl LogsKey {
+    pub fn new(host: Host, service: Service, session: SessionDate) -> Self {
+        Self {
+            host,
+            service,
+            session,
+        }
+    }
+}
+
+impl From<LogsKey> for Key {
+    fn from(key: LogsKey) -> Self {
+        Self::Logs(key)
+    }
+}
+
 /// One object's place in the bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
-    Bars {
-        provider: Provider,
-        origin: Origin,
-        interval: BarInterval,
-        session: SessionDate,
-    },
-    Quotes {
-        provider: Provider,
-        origin: Origin,
-        interval: BarInterval,
-        session: SessionDate,
-    },
-    Trades {
-        provider: Provider,
-        origin: Origin,
-        interval: BarInterval,
-        session: SessionDate,
-    },
-    Reference {
-        provider: Provider,
-        table: ReferenceTable,
-        as_of: SessionDate,
-    },
+    Bars(BarsKey),
+    Quotes(QuotesKey),
+    Trades(TradesKey),
+    Reference(ReferenceKey),
     /// A vendor's bar file exactly as served.
     RawBars {
         provider: Provider,
@@ -176,21 +382,24 @@ pub enum Key {
         provider: Provider,
         session: SessionDate,
     },
-    Journal {
-        host: Host,
-        session: SessionDate,
-    },
-    Logs {
-        host: Host,
-        service: Service,
-        session: SessionDate,
-    },
+    Journal(JournalKey),
+    Logs(LogsKey),
 }
 
-/// Who may write a key: the one host whose grant covers its prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Writer {
-    Host(Host),
+/// The prefix every session of one series shares, so listing it finds what is held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesPrefix(String);
+
+impl SeriesPrefix {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SeriesPrefix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// Why a path was not read as a key.
@@ -203,52 +412,29 @@ impl Key {
     pub fn path(&self) -> String {
         let series = self.series();
         match self {
-            Self::Reference { as_of, .. } => format!("{series}as_of={as_of}/data.parquet"),
-            Self::Bars { session, .. }
-            | Self::Quotes { session, .. }
-            | Self::Trades { session, .. }
-            | Self::Journal { session, .. }
-            | Self::Logs { session, .. } => {
-                format!("{series}{}/data.parquet", date_partition(*session))
+            Self::Reference(key) => format!("{series}as_of={}/data.parquet", key.as_of),
+            Self::Bars(..)
+            | Self::Quotes(..)
+            | Self::Trades(..)
+            | Self::Journal(..)
+            | Self::Logs(..) => {
+                format!("{series}{}/data.parquet", date_partition(self.session()))
             }
-            Self::RawBars { session, .. }
-            | Self::RawQuotes { session, .. }
-            | Self::RawTrades { session, .. } => {
-                format!("{series}{}/data.csv.gz", date_partition(*session))
+            Self::RawBars { .. } | Self::RawQuotes { .. } | Self::RawTrades { .. } => {
+                format!("{series}{}/data.csv.gz", date_partition(self.session()))
             }
         }
     }
 
-    /// The prefix every session of this key's series shares, so listing it finds what is held.
-    pub fn series(&self) -> String {
-        match self {
-            Self::Bars {
-                provider,
-                origin,
-                interval,
-                ..
-            } => format!(
-                "{DATA_ROOT}/stage=parsed/bars/provider={provider}/origin={origin}/interval={interval}/"
+    pub fn series(&self) -> SeriesPrefix {
+        SeriesPrefix(match self {
+            Self::Bars(key) => parsed_series(key),
+            Self::Quotes(key) => parsed_series(key),
+            Self::Trades(key) => parsed_series(key),
+            Self::Reference(key) => format!(
+                "{DATA_ROOT}/stage=parsed/reference/provider={}/table={}/",
+                key.provider, key.table
             ),
-            Self::Quotes {
-                provider,
-                origin,
-                interval,
-                ..
-            } => format!(
-                "{DATA_ROOT}/stage=parsed/quotes/provider={provider}/origin={origin}/interval={interval}/"
-            ),
-            Self::Trades {
-                provider,
-                origin,
-                interval,
-                ..
-            } => format!(
-                "{DATA_ROOT}/stage=parsed/trades/provider={provider}/origin={origin}/interval={interval}/"
-            ),
-            Self::Reference {
-                provider, table, ..
-            } => format!("{DATA_ROOT}/stage=parsed/reference/provider={provider}/table={table}/"),
             Self::RawBars {
                 provider, interval, ..
             } => format!("{DATA_ROOT}/stage=raw/bars/provider={provider}/interval={interval}/"),
@@ -258,40 +444,42 @@ impl Key {
             Self::RawTrades { provider, .. } => {
                 format!("{DATA_ROOT}/stage=raw/trades/provider={provider}/")
             }
-            Self::Journal { host, .. } => format!("{RECORDS_ROOT}/journal/producer={host}/"),
-            Self::Logs { host, service, .. } => format!(
-                "{RECORDS_ROOT}/logs/producer={host}/service={}/",
-                service.as_str()
+            Self::Journal(key) => format!("{RECORDS_ROOT}/journal/producer={}/", key.host),
+            Self::Logs(key) => format!(
+                "{RECORDS_ROOT}/logs/producer={}/service={}/",
+                key.host,
+                key.service.as_str()
             ),
-        }
+        })
     }
 
     /// The session a key is for.
     pub fn session(&self) -> SessionDate {
         match self {
-            Self::Reference { as_of, .. } => *as_of,
-            Self::Bars { session, .. }
-            | Self::Quotes { session, .. }
-            | Self::Trades { session, .. }
-            | Self::RawBars { session, .. }
+            Self::Bars(key) => key.session,
+            Self::Quotes(key) => key.session,
+            Self::Trades(key) => key.session,
+            Self::Reference(key) => key.as_of,
+            Self::Journal(key) => key.session,
+            Self::Logs(key) => key.session,
+            Self::RawBars { session, .. }
             | Self::RawQuotes { session, .. }
-            | Self::RawTrades { session, .. }
-            | Self::Journal { session, .. }
-            | Self::Logs { session, .. } => *session,
+            | Self::RawTrades { session, .. } => *session,
         }
     }
 
-    /// The one writer of this object: the archiver for data, the producer for a record.
-    pub fn writer(&self) -> Writer {
+    /// The one host that may write this object: the archiver for data, the producer for a record.
+    pub fn writer(&self) -> Host {
         match self {
-            Self::Bars { .. }
-            | Self::Quotes { .. }
-            | Self::Trades { .. }
-            | Self::Reference { .. }
+            Self::Bars(..)
+            | Self::Quotes(..)
+            | Self::Trades(..)
+            | Self::Reference(..)
             | Self::RawBars { .. }
             | Self::RawQuotes { .. }
-            | Self::RawTrades { .. } => Writer::Host(Host::Archiver),
-            Self::Journal { host, .. } | Self::Logs { host, .. } => Writer::Host(*host),
+            | Self::RawTrades { .. } => Host::Archiver,
+            Self::Journal(key) => key.host,
+            Self::Logs(key) => key.host,
         }
     }
 
@@ -299,13 +487,13 @@ impl Key {
     pub fn storage_class(&self) -> StorageClass {
         match self {
             Self::RawQuotes { .. } | Self::RawTrades { .. } => StorageClass::DeepArchive,
-            Self::Bars { .. }
-            | Self::Quotes { .. }
-            | Self::Trades { .. }
-            | Self::Reference { .. }
+            Self::Bars(..)
+            | Self::Quotes(..)
+            | Self::Trades(..)
+            | Self::Reference(..)
             | Self::RawBars { .. }
-            | Self::Journal { .. }
-            | Self::Logs { .. } => StorageClass::Standard,
+            | Self::Journal(..)
+            | Self::Logs(..) => StorageClass::Standard,
         }
     }
 
@@ -348,7 +536,7 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             "data",
             "equity",
             "stage=parsed",
-            "bars",
+            kind,
             provider,
             origin,
             interval,
@@ -356,48 +544,19 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             month,
             day,
             "data.parquet",
-        ] => Some(Key::Bars {
-            provider: hive(provider, "provider")?,
-            origin: hive(origin, "origin")?,
-            interval: hive(interval, "interval")?,
-            session: session(year, month, day)?,
-        }),
-        [
-            "data",
-            "equity",
-            "stage=parsed",
-            "quotes",
-            provider,
-            origin,
-            interval,
-            year,
-            month,
-            day,
-            "data.parquet",
-        ] => Some(Key::Quotes {
-            provider: hive(provider, "provider")?,
-            origin: hive(origin, "origin")?,
-            interval: hive(interval, "interval")?,
-            session: session(year, month, day)?,
-        }),
-        [
-            "data",
-            "equity",
-            "stage=parsed",
-            "trades",
-            provider,
-            origin,
-            interval,
-            year,
-            month,
-            day,
-            "data.parquet",
-        ] => Some(Key::Trades {
-            provider: hive(provider, "provider")?,
-            origin: hive(origin, "origin")?,
-            interval: hive(interval, "interval")?,
-            session: session(year, month, day)?,
-        }),
+        ] => {
+            let (provider, origin, interval, session) = (
+                hive(provider, "provider")?,
+                hive(origin, "origin")?,
+                hive(interval, "interval")?,
+                session(year, month, day)?,
+            );
+            Some(match kind.parse::<ParsedKind>().ok()? {
+                ParsedKind::Bars => BarsKey::new(provider, origin, interval, session).into(),
+                ParsedKind::Quotes => QuotesKey::new(provider, origin, interval, session).into(),
+                ParsedKind::Trades => TradesKey::new(provider, origin, interval, session).into(),
+            })
+        }
         [
             "data",
             "equity",
@@ -407,11 +566,11 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             table,
             as_of,
             "data.parquet",
-        ] => Some(Key::Reference {
-            provider: hive(provider, "provider")?,
-            table: hive(table, "table")?,
-            as_of: hive::<NaiveDate>(as_of, "as_of").map(SessionDate::from_date)?,
-        }),
+        ] => Some(Key::Reference(ReferenceKey::new(
+            hive(provider, "provider")?,
+            hive(table, "table")?,
+            hive::<NaiveDate>(as_of, "as_of").map(SessionDate::from_date)?,
+        ))),
         [
             "data",
             "equity",
@@ -456,10 +615,9 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             provider: hive(provider, "provider")?,
             session: session(year, month, day)?,
         }),
-        ["records", "journal", host, year, month, day, "data.parquet"] => Some(Key::Journal {
-            host: hive(host, "producer")?,
-            session: session(year, month, day)?,
-        }),
+        ["records", "journal", host, year, month, day, "data.parquet"] => Some(Key::Journal(
+            JournalKey::new(hive(host, "producer")?, session(year, month, day)?),
+        )),
         [
             "records",
             "logs",
@@ -469,13 +627,23 @@ fn parse_segments(segments: &[&str]) -> Option<Key> {
             month,
             day,
             "data.parquet",
-        ] => Some(Key::Logs {
-            host: hive(host, "producer")?,
-            service: Service::new(service.strip_prefix("service=")?).ok()?,
-            session: session(year, month, day)?,
-        }),
+        ] => Some(Key::Logs(LogsKey::new(
+            hive(host, "producer")?,
+            Service::new(service.strip_prefix("service=")?).ok()?,
+            session(year, month, day)?,
+        ))),
         _ => None,
     }
+}
+
+fn parsed_series<F: Family>(key: &ParsedKey<F>) -> String {
+    format!(
+        "{DATA_ROOT}/stage=parsed/{}/provider={}/origin={}/interval={}/",
+        F::KIND,
+        key.provider,
+        key.origin,
+        key.interval
+    )
 }
 
 /// The value of a `name=value` segment.
@@ -507,46 +675,51 @@ mod tests {
     fn test_each_key_has_its_path() {
         let cases = [
             (
-                Key::Bars {
-                    provider: Provider::Alpaca,
-                    origin: Origin::Vendor,
-                    interval: BarInterval::OneMinute,
-                    session: session(),
-                },
+                BarsKey::new(
+                    Provider::Alpaca,
+                    Origin::Vendor,
+                    BarInterval::OneMinute,
+                    session(),
+                )
+                .into(),
                 "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/year=2026/month=08/day=03/data.parquet",
             ),
             (
-                Key::Quotes {
-                    provider: Provider::Alpaca,
-                    origin: Origin::Derived,
-                    interval: BarInterval::FiveMinute,
-                    session: session(),
-                },
+                QuotesKey::new(
+                    Provider::Alpaca,
+                    Origin::Derived,
+                    BarInterval::FiveMinute,
+                    session(),
+                )
+                .into(),
                 "data/equity/stage=parsed/quotes/provider=alpaca/origin=derived/interval=five_minute/year=2026/month=08/day=03/data.parquet",
             ),
             (
-                Key::Trades {
-                    provider: Provider::Massive,
-                    origin: Origin::Derived,
-                    interval: BarInterval::OneDay,
-                    session: session(),
-                },
+                TradesKey::new(
+                    Provider::Massive,
+                    Origin::Derived,
+                    BarInterval::OneDay,
+                    session(),
+                )
+                .into(),
                 "data/equity/stage=parsed/trades/provider=massive/origin=derived/interval=one_day/year=2026/month=08/day=03/data.parquet",
             ),
             (
-                Key::Reference {
-                    provider: Provider::Massive,
-                    table: ReferenceTable::SecurityDetails,
-                    as_of: session(),
-                },
+                ReferenceKey::new(
+                    Provider::Massive,
+                    ReferenceTable::SecurityDetails,
+                    session(),
+                )
+                .into(),
                 "data/equity/stage=parsed/reference/provider=massive/table=security_details/as_of=2026-08-03/data.parquet",
             ),
             (
-                Key::Reference {
-                    provider: Provider::Alpaca,
-                    table: ReferenceTable::SeriesBoundaries,
-                    as_of: session(),
-                },
+                ReferenceKey::new(
+                    Provider::Alpaca,
+                    ReferenceTable::SeriesBoundaries,
+                    session(),
+                )
+                .into(),
                 "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/as_of=2026-08-03/data.parquet",
             ),
             (
@@ -572,18 +745,11 @@ mod tests {
                 "data/equity/stage=raw/trades/provider=massive/year=2026/month=08/day=03/data.csv.gz",
             ),
             (
-                Key::Journal {
-                    host: Host::Trader,
-                    session: session(),
-                },
+                JournalKey::new(Host::Trader, session()).into(),
                 "records/journal/producer=trader/year=2026/month=08/day=03/data.parquet",
             ),
             (
-                Key::Logs {
-                    host: Host::Archiver,
-                    service: Service::new("archiver").unwrap(),
-                    session: session(),
-                },
+                LogsKey::new(Host::Archiver, Service::new("archiver").unwrap(), session()).into(),
                 "records/logs/producer=archiver/service=archiver/year=2026/month=08/day=03/data.parquet",
             ),
         ];
@@ -604,6 +770,9 @@ mod tests {
             "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_day/year=2026/month=02/day=30/data.parquet",
             "data/equity/stage=parsed/bars/origin=vendor/provider=alpaca/interval=one_day/year=2026/month=08/day=03/data.parquet",
             "data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_day/year=2026/month=08/day=03/data.csv.gz",
+            "data/equity/stage=parsed/options/provider=alpaca/origin=vendor/interval=one_day/year=2026/month=08/day=03/data.parquet",
+            "data/equity/stage=parsed/Bars/provider=alpaca/origin=vendor/interval=one_day/year=2026/month=08/day=03/data.parquet",
+            "data/equity/stage=parsed/reference/provider=alpaca/origin=vendor/interval=one_day/year=2026/month=08/day=03/data.parquet",
             "data/equity/stage=raw/bars/provider=massive/interval=one_day/year=2026/month=08/day=03/data.parquet",
             "data/equity/stage=raw/quotes/provider=massive/interval=one_day/year=2026/month=08/day=03/data.csv.gz",
             "data/equity/stage=raw/reference/provider=massive/table=conditions/as_of=2026-08-03/data.parquet",
@@ -660,46 +829,13 @@ mod tests {
     fn moved(key: &Key, to: &Key) -> Key {
         let session = to.session();
         match key.clone() {
-            Key::Bars {
-                provider,
-                origin,
-                interval,
-                ..
-            } => Key::Bars {
-                provider,
-                origin,
-                interval,
-                session,
-            },
-            Key::Quotes {
-                provider,
-                origin,
-                interval,
-                ..
-            } => Key::Quotes {
-                provider,
-                origin,
-                interval,
-                session,
-            },
-            Key::Trades {
-                provider,
-                origin,
-                interval,
-                ..
-            } => Key::Trades {
-                provider,
-                origin,
-                interval,
-                session,
-            },
-            Key::Reference {
-                provider, table, ..
-            } => Key::Reference {
-                provider,
-                table,
+            Key::Bars(key) => Key::Bars(ParsedKey { session, ..key }),
+            Key::Quotes(key) => Key::Quotes(ParsedKey { session, ..key }),
+            Key::Trades(key) => Key::Trades(ParsedKey { session, ..key }),
+            Key::Reference(key) => Key::Reference(ReferenceKey {
                 as_of: session,
-            },
+                ..key
+            }),
             Key::RawBars {
                 provider, interval, ..
             } => Key::RawBars {
@@ -709,12 +845,8 @@ mod tests {
             },
             Key::RawQuotes { provider, .. } => Key::RawQuotes { provider, session },
             Key::RawTrades { provider, .. } => Key::RawTrades { provider, session },
-            Key::Journal { host, .. } => Key::Journal { host, session },
-            Key::Logs { host, service, .. } => Key::Logs {
-                host,
-                service,
-                session,
-            },
+            Key::Journal(key) => Key::Journal(JournalKey { session, ..key }),
+            Key::Logs(key) => Key::Logs(LogsKey { session, ..key }),
         }
     }
 
@@ -730,45 +862,26 @@ mod tests {
             )
         });
         let service = "[a-z][a-z0-9_-]{0,15}".prop_map(|raw| Service::new(&raw).unwrap());
+        let kind = prop::sample::select(ParsedKind::iter().collect::<Vec<_>>());
         prop_oneof![
             (
+                kind,
                 provider.clone(),
-                origin.clone(),
+                origin,
                 interval.clone(),
                 session.clone()
             )
-                .prop_map(|(provider, origin, interval, session)| Key::Bars {
-                    provider,
-                    origin,
-                    interval,
-                    session
+                .prop_map(|(kind, provider, origin, interval, session)| match kind {
+                    ParsedKind::Bars => BarsKey::new(provider, origin, interval, session).into(),
+                    ParsedKind::Quotes => {
+                        QuotesKey::new(provider, origin, interval, session).into()
+                    }
+                    ParsedKind::Trades => {
+                        TradesKey::new(provider, origin, interval, session).into()
+                    }
                 }),
-            (
-                provider.clone(),
-                origin.clone(),
-                interval.clone(),
-                session.clone()
-            )
-                .prop_map(|(provider, origin, interval, session)| Key::Quotes {
-                    provider,
-                    origin,
-                    interval,
-                    session
-                }),
-            (provider.clone(), origin, interval.clone(), session.clone()).prop_map(
-                |(provider, origin, interval, session)| Key::Trades {
-                    provider,
-                    origin,
-                    interval,
-                    session
-                }
-            ),
             (provider.clone(), table, session.clone()).prop_map(|(provider, table, as_of)| {
-                Key::Reference {
-                    provider,
-                    table,
-                    as_of,
-                }
+                ReferenceKey::new(provider, table, as_of).into()
             }),
             (provider.clone(), interval, session.clone()).prop_map(
                 |(provider, interval, session)| Key::RawBars {
@@ -782,12 +895,9 @@ mod tests {
             (provider, session.clone())
                 .prop_map(|(provider, session)| Key::RawTrades { provider, session }),
             (host.clone(), session.clone())
-                .prop_map(|(host, session)| Key::Journal { host, session }),
-            (host, service, session).prop_map(|(host, service, session)| Key::Logs {
-                host,
-                service,
-                session
-            }),
+                .prop_map(|(host, session)| JournalKey::new(host, session).into()),
+            (host, service, session)
+                .prop_map(|(host, service, session)| LogsKey::new(host, service, session).into()),
         ]
     }
 
@@ -810,7 +920,7 @@ mod tests {
         #[test]
         fn property_a_path_lies_under_its_series(key in any_key()) {
             let path = key.path();
-            let rest = path.strip_prefix(&key.series());
+            let rest = path.strip_prefix(key.series().as_str());
             prop_assert!(rest.is_some(), "{} outside {}", path, key.series());
             prop_assert!(!rest.unwrap().contains("provider="), "{}", path);
             prop_assert_eq!(Key::parse(&path).map(|parsed| parsed.session()), Ok(key.session()));
@@ -834,7 +944,7 @@ mod tests {
                     .writable_prefixes()
                     .iter()
                     .any(|prefix| path.starts_with(prefix));
-                prop_assert_eq!(allowed, Writer::Host(host) == key.writer(), "{} {}", host, path);
+                prop_assert_eq!(allowed, host == key.writer(), "{} {}", host, path);
             }
         }
     }

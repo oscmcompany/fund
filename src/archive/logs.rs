@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 use super::parquet::{self, ReadRefusal};
 use crate::common::journal::{Commit, RunId};
-use crate::common::storage::Key;
 
 const LAYOUT_VERSION: &str = "1";
 
@@ -39,7 +38,6 @@ pub enum LogLine {
 /// Why lines were not written under a key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeRefusal {
-    NotALogsKey,
     /// A timestamp past what nanoseconds since the epoch hold, the year 2262.
     Unrepresentable {
         line: u64,
@@ -52,7 +50,6 @@ pub enum EncodeRefusal {
 /// Why a file was not read as a log.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
-    NotALogsKey,
     File(ReadRefusal),
     Row { line: u64, reason: String },
 }
@@ -60,20 +57,6 @@ pub enum DecodeRefusal {
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
-    }
-}
-
-fn is_logs_key(key: &Key) -> bool {
-    match key {
-        Key::Logs { .. } => true,
-        Key::Bars { .. }
-        | Key::Quotes { .. }
-        | Key::Trades { .. }
-        | Key::Reference { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Journal { .. } => false,
     }
 }
 
@@ -170,10 +153,7 @@ fn schema() -> Schema {
     ])
 }
 
-pub fn encode(key: &Key, lines: &[LogLine]) -> Result<Vec<u8>, EncodeRefusal> {
-    if !is_logs_key(key) {
-        return Err(EncodeRefusal::NotALogsKey);
-    }
+pub fn encode(lines: &[LogLine]) -> Result<Vec<u8>, EncodeRefusal> {
     let mut numbers = UInt64Builder::new();
     let mut timestamps = TimestampNanosecondBuilder::new().with_timezone("UTC");
     let mut texts: [StringBuilder; 7] = std::array::from_fn(|_| StringBuilder::new());
@@ -229,10 +209,7 @@ pub fn encode(key: &Key, lines: &[LogLine]) -> Result<Vec<u8>, EncodeRefusal> {
         .map_err(|reason| EncodeRefusal::Parquet { reason })
 }
 
-pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<Vec<LogLine>, DecodeRefusal> {
-    if !is_logs_key(key) {
-        return Err(DecodeRefusal::NotALogsKey);
-    }
+pub fn decode(bytes: Vec<u8>) -> Result<Vec<LogLine>, DecodeRefusal> {
     let (batches, _) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let mut lines = Vec::new();
     for batch in batches {
@@ -286,20 +263,9 @@ pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<Vec<LogLine>, DecodeRefusal> 
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
     use proptest::prelude::*;
 
     use super::*;
-    use crate::common::storage::{Host, Service};
-    use crate::common::time::SessionDate;
-
-    fn key() -> Key {
-        Key::Logs {
-            host: Host::Archiver,
-            service: Service::new("archive_nightly").unwrap(),
-            session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()),
-        }
-    }
 
     /// Lines the binary wrote on 2026-09-30: a run's partition line, a startup refusal and a torn tail.
     const LOG: &str = concat!(
@@ -373,24 +339,8 @@ mod tests {
     #[test]
     fn test_a_log_file_reads_back_line_for_line() {
         let lines = parse(LOG);
-        let bytes = encode(&key(), &lines).unwrap();
-        assert_eq!(decode(&key(), bytes).unwrap(), lines);
-    }
-
-    #[test]
-    fn test_a_journal_key_is_refused_both_ways() {
-        let journal = Key::Journal {
-            host: Host::Archiver,
-            session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()),
-        };
-        assert_eq!(
-            encode(&journal, &[]).map(|_| ()),
-            Err(EncodeRefusal::NotALogsKey)
-        );
-        assert_eq!(
-            decode(&journal, encode(&key(), &[]).unwrap()),
-            Err(DecodeRefusal::NotALogsKey)
-        );
+        let bytes = encode(&lines).unwrap();
+        assert_eq!(decode(bytes).unwrap(), lines);
     }
 
     proptest! {
@@ -405,8 +355,8 @@ mod tests {
             texts.extend(noise);
             let lines = parse(&texts.join("\n"));
             prop_assert_eq!(lines.len(), texts.len());
-            let bytes = encode(&key(), &lines).unwrap();
-            prop_assert_eq!(decode(&key(), bytes).unwrap(), lines);
+            let bytes = encode(&lines).unwrap();
+            prop_assert_eq!(decode(bytes).unwrap(), lines);
         }
     }
 }

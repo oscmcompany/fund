@@ -30,7 +30,7 @@ use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
 use fund::common::playbook::{Playbook, PlaybookRead, PlaybookRefusal, Played};
 use fund::common::standing::{HaltCause, SessionClosed, SessionEnding};
-use fund::common::storage::{Host, Key, Origin, Provider, Service};
+use fund::common::storage::{Host, Key, Origin, Provider, Service, TradesKey};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::alpaca::Alpaca;
@@ -279,10 +279,17 @@ impl std::fmt::Display for StartRefusal {
 
 /// Why the previous session's bars did not warm the state.
 enum PreviousRefusal {
-    NoTradingDay { today: SessionDate },
+    NoTradingDay {
+        today: SessionDate,
+    },
     Archive(ArchiveError),
-    NotArchived { key: Key },
-    Decode { key: Key, refusal: DecodeRefusal },
+    NotArchived {
+        key: TradesKey,
+    },
+    Decode {
+        key: TradesKey,
+        refusal: DecodeRefusal,
+    },
 }
 
 impl std::fmt::Display for PreviousRefusal {
@@ -293,9 +300,15 @@ impl std::fmt::Display for PreviousRefusal {
                 "no trading day in the {CALENDAR_DAYS_BACK} days before {today}"
             ),
             Self::Archive(error) => write!(formatter, "the previous session was not read: {error}"),
-            Self::NotArchived { key } => write!(formatter, "{} is not archived", key.path()),
+            Self::NotArchived { key } => {
+                write!(formatter, "{} is not archived", Key::from(*key).path())
+            }
             Self::Decode { key, refusal } => {
-                write!(formatter, "{} not decoded: {refusal}", key.path())
+                write!(
+                    formatter,
+                    "{} not decoded: {refusal}",
+                    Key::from(*key).path()
+                )
             }
         }
     }
@@ -489,13 +502,17 @@ async fn previous_bars(
     let previous = calendar
         .previous_trading_day(today)
         .ok_or(PreviousRefusal::NoTradingDay { today })?;
-    let key = Key::Trades {
-        provider: Provider::Alpaca,
-        origin: Origin::Derived,
-        interval: BarInterval::OneMinute,
-        session: previous,
-    };
-    let bytes = match archive.get(&key).await.map_err(PreviousRefusal::Archive)? {
+    let key = TradesKey::new(
+        Provider::Alpaca,
+        Origin::Derived,
+        BarInterval::OneMinute,
+        previous,
+    );
+    let bytes = match archive
+        .get(&key.into())
+        .await
+        .map_err(PreviousRefusal::Archive)?
+    {
         Some(bytes) => bytes,
         None => return Err(PreviousRefusal::NotArchived { key }),
     };
@@ -551,19 +568,20 @@ async fn sleep_until(instant: DateTime<Utc>) {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+    use fund::archive::parquet::ReadRefusal;
     use fund::execution::{JournalFailed, ReconcileFailed};
 
     fn disk_full() -> io::Error {
         io::Error::other("disk full")
     }
 
-    fn previous_key() -> Key {
-        Key::Trades {
-            provider: Provider::Alpaca,
-            origin: Origin::Derived,
-            interval: BarInterval::OneMinute,
-            session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap()),
-        }
+    fn previous_key() -> TradesKey {
+        TradesKey::new(
+            Provider::Alpaca,
+            Origin::Derived,
+            BarInterval::OneMinute,
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap()),
+        )
     }
 
     const PREVIOUS_PATH: &str = "data/equity/stage=parsed/trades/provider=alpaca/origin=derived/interval=one_minute/year=2026/month=10/day=07/data.parquet";
@@ -634,7 +652,9 @@ mod tests {
             },
             PreviousRefusal::Decode {
                 key: previous_key(),
-                refusal: DecodeRefusal::NotATradesKey,
+                refusal: DecodeRefusal::File(ReadRefusal::Layout {
+                    version: "9".to_string(),
+                }),
             },
         ]
         .map(|refusal| refusal.to_string());
@@ -644,7 +664,7 @@ mod tests {
                 "no trading day in the 14 days before 2026-10-08",
                 "the previous session was not read: reading a/b failed: timed out",
                 &format!("{PREVIOUS_PATH} is not archived"),
-                &format!("{PREVIOUS_PATH} not decoded: the key does not name trade bars"),
+                &format!("{PREVIOUS_PATH} not decoded: the file is written under layout 9"),
             ]
         );
     }

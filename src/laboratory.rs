@@ -19,7 +19,7 @@ use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::experiment::{
     DatasetRead, Elapsed, ExperimentRan, Label, Machine, Outputs, Parameters,
 };
-use crate::common::storage::{Host, Key};
+use crate::common::storage::{Host, JournalKey, Key};
 use crate::common::time::SessionDate;
 use crate::journal::{Journal, file_name};
 use crate::laboratory::dataset::Dataset;
@@ -138,41 +138,39 @@ impl Study {
         let mut shipped = Vec::new();
         for days in 0..RESHIPPED_DAYS {
             let session = today.plus_calendar_days(-days);
-            let key = Key::Journal {
-                host: Host::Researcher,
-                session,
-            };
+            let key = JournalKey::new(Host::Researcher, session);
             let outcome = match contents(&self.journal.directory().join(file_name(session))) {
-                Some(Ok(text)) => merge_into(records, &key, &text).await,
+                Some(Ok(text)) => merge_into(records, key, &text).await,
                 Some(Err(failure)) => Err(failure),
                 None => continue,
             };
-            shipped.push((key, outcome));
+            shipped.push((key.into(), outcome));
         }
         shipped
     }
 }
 
 /// Reads `key`'s object, adds the lines of `text` it lacks, and writes it back only over the version read.
-async fn merge_into(records: &Archive, key: &Key, text: &str) -> Result<(), ShipFailure> {
+async fn merge_into(records: &Archive, key: JournalKey, text: &str) -> Result<(), ShipFailure> {
+    let object = Key::from(key);
     for _ in 0..MERGE_ATTEMPTS {
         let (held, tag) = match records
-            .get_tagged(key)
+            .get_tagged(&object)
             .await
             .map_err(ShipFailure::Archive)?
         {
             Some((body, tag)) => (
-                journal::decode(key, body)
+                journal::decode(&key, body)
                     .map_err(|refusal| ShipFailure::Decode(DecodeRefusal::from(refusal)))?,
                 Some(tag),
             ),
             None => (Vec::new(), None),
         };
-        let body = journal::encode(key, &merge(held, read(text)))
+        let body = journal::encode(&key, &merge(held, read(text)))
             .map_err(|refusal| ShipFailure::Encode(EncodeRefusal::from(refusal)))?;
         let written = match tag {
-            Some(tag) => records.replace(key, body, &tag).await,
-            None => records.create(key, body).await,
+            Some(tag) => records.replace(&object, body, &tag).await,
+            None => records.create(&object, body).await,
         };
         match written {
             Ok(()) => return Ok(()),
@@ -215,11 +213,8 @@ mod tests {
             }
             std::fs::remove_dir_all(&directory).unwrap();
         }
-        let key = Key::Journal {
-            host: Host::Researcher,
-            session: SessionDate::at(Utc::now()),
-        };
-        let held = journal::decode(&key, records.get(&key).await.unwrap().unwrap()).unwrap();
+        let key = JournalKey::new(Host::Researcher, SessionDate::at(Utc::now()));
+        let held = journal::decode(&key, records.get(&key.into()).await.unwrap().unwrap()).unwrap();
         for run in runs {
             assert!(
                 held.iter().any(|line| matches!(

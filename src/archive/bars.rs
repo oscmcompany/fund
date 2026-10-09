@@ -16,10 +16,9 @@ use chrono::{DateTime, Utc};
 use super::parquet::{self, PlacementRefusal, ReadRefusal, RowCause};
 
 use crate::common::journal::{Commit, RunId};
-use crate::common::market::record::{Bar, BarInterval, BarPrices};
+use crate::common::market::record::{Bar, BarPrices};
 use crate::common::market::{DollarVolume, Shares, Symbol, TradeCount};
-use crate::common::storage::{Key, Provider};
-use crate::common::time::SessionDate;
+use crate::common::storage::{BarsKey, Provider};
 
 /// The metadata name a file's fetch time is written under, in Parquet and in S3 alike.
 pub(crate) const FETCHED_AT: &str = "fund.fetched_at";
@@ -129,7 +128,6 @@ impl Provenance {
 /// Why bars were not written under a key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeRefusal {
-    NotABarsKey,
     /// The subscription belongs to another provider than the key's.
     SubscriptionProvider {
         provenance: Provenance,
@@ -149,7 +147,6 @@ pub enum EncodeRefusal {
 /// Why a file was not read as bars.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
-    NotABarsKey,
     File(ReadRefusal),
     /// A row that no longer passes the domain's own checks.
     Row {
@@ -166,26 +163,6 @@ pub enum DecodeRefusal {
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
-    }
-}
-
-/// The key's interval and session, refused unless it is a bars key.
-fn bars_key(key: &Key) -> Option<(Provider, BarInterval, SessionDate)> {
-    match key {
-        Key::Bars {
-            provider,
-            interval,
-            session,
-            ..
-        } => Some((*provider, *interval, *session)),
-        Key::Quotes { .. }
-        | Key::Trades { .. }
-        | Key::Reference { .. }
-        | Key::RawBars { .. }
-        | Key::RawQuotes { .. }
-        | Key::RawTrades { .. }
-        | Key::Journal { .. }
-        | Key::Logs { .. } => None,
     }
 }
 
@@ -209,8 +186,12 @@ fn schema() -> Schema {
 }
 
 /// The file for `key`, rows ordered by symbol and then timestamp so the same bars always make the same bytes.
-pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8>, EncodeRefusal> {
-    let (provider, interval, session) = bars_key(key).ok_or(EncodeRefusal::NotABarsKey)?;
+pub fn encode(
+    key: &BarsKey,
+    bars: &[Bar],
+    provenance: &Provenance,
+) -> Result<Vec<u8>, EncodeRefusal> {
+    let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     if provenance.subscription.provider() != provider {
         return Err(EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
@@ -274,8 +255,8 @@ pub fn encode(key: &Key, bars: &[Bar], provenance: &Provenance) -> Result<Vec<u8
 
 /// The bars and provenance a file written by `encode` under `key` holds, each row rebuilt through the domain's own
 /// constructors so a file edited out of band cannot hand back an invalid bar.
-pub fn decode(key: &Key, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
-    let (provider, interval, session) = bars_key(key).ok_or(DecodeRefusal::NotABarsKey)?;
+pub fn decode(key: &BarsKey, bytes: Vec<u8>) -> Result<(Vec<Bar>, Provenance), DecodeRefusal> {
+    let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
     if provenance.subscription.provider() != provider {
@@ -362,19 +343,21 @@ mod tests {
 
     use super::*;
     use crate::common::market::Price;
+    use crate::common::market::record::BarInterval;
     use crate::common::storage::Origin;
+    use crate::common::time::SessionDate;
 
     fn session() -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap())
     }
 
-    fn minute_key() -> Key {
-        Key::Bars {
-            provider: Provider::Alpaca,
-            origin: Origin::Vendor,
-            interval: BarInterval::OneMinute,
-            session: session(),
-        }
+    fn minute_key() -> BarsKey {
+        BarsKey::new(
+            Provider::Alpaca,
+            Origin::Vendor,
+            BarInterval::OneMinute,
+            session(),
+        )
     }
 
     fn provenance(subscription: Subscription) -> Provenance {
@@ -486,14 +469,6 @@ mod tests {
                 provenance: provenance(Subscription::StocksStarter),
                 key: Provider::Alpaca
             })
-        );
-        let journal = Key::Journal {
-            host: crate::common::storage::Host::Archiver,
-            session: session(),
-        };
-        assert_eq!(
-            encode(&journal, &[], &provenance(Subscription::AlgoTraderPlus)),
-            Err(EncodeRefusal::NotABarsKey)
         );
     }
 
@@ -626,12 +601,12 @@ mod tests {
             &provenance(Subscription::AlgoTraderPlus),
         )
         .unwrap();
-        let next_day = Key::Bars {
-            provider: Provider::Alpaca,
-            origin: Origin::Vendor,
-            interval: BarInterval::OneMinute,
-            session: SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()),
-        };
+        let next_day = BarsKey::new(
+            Provider::Alpaca,
+            Origin::Vendor,
+            BarInterval::OneMinute,
+            session().plus_calendar_days(1),
+        );
         assert_eq!(
             decode(&next_day, bytes.clone()).map(|_| ()),
             Err(DecodeRefusal::Row {
@@ -642,12 +617,12 @@ mod tests {
                 },
             })
         );
-        let massive = Key::Bars {
-            provider: Provider::Massive,
-            origin: Origin::Vendor,
-            interval: BarInterval::OneMinute,
-            session: session(),
-        };
+        let massive = BarsKey::new(
+            Provider::Massive,
+            Origin::Vendor,
+            BarInterval::OneMinute,
+            session(),
+        );
         assert_eq!(
             decode(&massive, bytes).map(|_| ()),
             Err(DecodeRefusal::Provider {
