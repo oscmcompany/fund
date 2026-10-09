@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::market::record::BarInterval;
 use crate::common::time::SessionDate;
 
-/// Everything this layout writes lives under these roots; legacy's `data/derived/` and `exports/` are never among
-/// them, so no glob reads the two together and no key is written by both.
+/// Everything this layout writes lives under these roots.
 const DATA_ROOT: &str = "data/equity";
 const RECORDS_ROOT: &str = "records";
 
