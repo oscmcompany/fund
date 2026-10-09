@@ -34,7 +34,7 @@ pub struct Patience {
 pub enum PatienceRefusal {
     /// A zero poll would read an open order back to back.
     ZeroPoll,
-    /// A poll longer than `open_for` would leave an order open past it before its cancel.
+    /// A poll longer than `open_for` would never read an order back before its cancel.
     PollPastOpen { poll: Duration, open_for: Duration },
 }
 
@@ -366,7 +366,14 @@ async fn follow(
                 }
             }
         }
-        tokio::time::sleep(patience.poll()).await;
+        // Before the cancel a poll stops at the window's end, so the cancel is not put off to the next whole poll.
+        let delay = match waiting {
+            Waiting::BeforeCancel => patience
+                .poll()
+                .min(patience.open_for().saturating_sub(started.elapsed())),
+            Waiting::AfterCancel { .. } => patience.poll(),
+        };
+        tokio::time::sleep(delay).await;
         // A cancel can race a fill, so the order is always read back rather than assumed canceled.
         match broker.order(id).await {
             Ok(read) => report = Some(read.report()),
@@ -391,9 +398,10 @@ mod tests {
     use super::*;
     use crate::broker::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
     use crate::common::book::{Cash, Position, Side};
-    use crate::common::guard::Tradability;
+    use crate::common::guard::{OrderGuarded, Tradability};
     use crate::common::journal::{ReadLine, Record, RunId, read};
-    use crate::common::market::{Price, Shares, Symbol};
+    use crate::common::market::{DollarVolume, Price, Shares, Symbol};
+    use crate::common::monoid::{Monoid, concatenate};
     use crate::common::order::{OrderEnding, OrderReport, OrderStatus};
     use crate::ingest::alpaca::Alpaca;
 
@@ -418,6 +426,8 @@ mod tests {
         /// The books reported, the last repeating.
         books: Mutex<VecDeque<Book>>,
         calls: Mutex<Vec<&'static str>>,
+        /// When each cancel was asked for.
+        cancels: Mutex<Vec<Instant>>,
     }
 
     impl Scripted {
@@ -431,6 +441,7 @@ mod tests {
                 tradability_fails: false,
                 books: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
+                cancels: Mutex::new(Vec::new()),
             }
         }
 
@@ -492,6 +503,7 @@ mod tests {
 
         async fn cancel(&self, _: &BrokerOrderId) -> Result<Cancel, BrokerError> {
             self.calls.lock().unwrap().push("cancel");
+            self.cancels.lock().unwrap().push(Instant::now());
             match self.cancel_fails {
                 true => Err(BrokerError::Fetch(FetchError::Exhausted {
                     attempts: 3,
@@ -816,6 +828,37 @@ mod tests {
         let (outcomes, _) = run(&broker, &buying(&["SPY"], 1), patience).await;
         assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
         assert_eq!(broker.calls(), ["submit", "order", "cancel", "order"]);
+    }
+
+    /// A window that is not a whole number of polls is cut short: reads at twenty and thirty seconds, the cancel at
+    /// thirty, and a full poll before the read after it.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_order_is_canceled_when_its_window_ends_between_polls() {
+        let broker = Scripted::new(
+            &[Answer::Stands(OPEN, 0)],
+            &[
+                Answer::Stands(OPEN, 0),
+                Answer::Stands(OPEN, 0),
+                Answer::Stands(CANCELED, 0),
+            ],
+        );
+        let started = Instant::now();
+        let patience = patience((20_000, 30_000));
+        let (outcomes, _) = run(&broker, &buying(&["SPY"], 1), patience).await;
+        assert_eq!(outcomes, [OrderOutcome::Closed(None)]);
+        assert_eq!(
+            broker.calls(),
+            ["submit", "order", "order", "cancel", "order"]
+        );
+        let cancels = broker.cancels.lock().unwrap();
+        assert_eq!(
+            cancels
+                .iter()
+                .map(|cancel| cancel.duration_since(started))
+                .collect::<Vec<_>>(),
+            [Duration::from_secs(30)]
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(50));
     }
 
     /// A report the order's state refuses, here an execution that shrank, spends its patience like a failed read.
@@ -1209,5 +1252,151 @@ mod tests {
         );
         assert_eq!(account.book().await.unwrap(), before);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A broker that fills every order whole at its symbol's price on submit, and reads only the symbols it was given.
+    struct Exact {
+        prices: BTreeMap<Symbol, Price>,
+        readings: BTreeMap<Symbol, Tradability>,
+    }
+
+    impl Broker for Exact {
+        async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
+            let order = request.order();
+            Ok(BrokerOrder::new(
+                BrokerOrderId::new(request.client_order_id().to_string()),
+                OrderReport::new(
+                    FILLED,
+                    OrderExecution::new(order.shares(), self.prices[order.symbol()]),
+                    "2026-10-08T15:00:00Z".parse().unwrap(),
+                ),
+            ))
+        }
+
+        async fn order(&self, _: ClientOrderId) -> Result<BrokerOrder, BrokerError> {
+            unreachable!("an order filled on submit is never read back")
+        }
+
+        async fn cancel(&self, _: &BrokerOrderId) -> Result<Cancel, BrokerError> {
+            unreachable!("an order filled on submit is never canceled")
+        }
+
+        async fn book(&self) -> Result<Book, BrokerError> {
+            unreachable!("execute never reads the book")
+        }
+
+        async fn tradability(
+            &self,
+            symbols: &[Symbol],
+        ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
+            Ok(symbols
+                .iter()
+                .filter_map(|symbol| Some((symbol.clone(), *self.readings.get(symbol)?)))
+                .collect())
+        }
+    }
+
+    const NAMES: [&str; 4] = ["AAPL", "MSFT", "SPY", "QQQ"];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Against a broker that fills each order whole, the book `execute`'s fills reach, and the causes it holds,
+        /// equal the guard's verdict on `orders` at the same prices, filled directly.
+        #[test]
+        fn property_execute_reaches_what_the_guard_passes(
+            held in proptest::collection::btree_map(
+                proptest::sample::select(NAMES.to_vec()),
+                0..20_000_000i128,
+                0..5,
+            ),
+            wanted in proptest::collection::btree_map(
+                proptest::sample::select(NAMES.to_vec()),
+                0..20_000_000u64,
+                0..5,
+            ),
+            // Half the prices under a dollar, so a fractional buy can fall under the minimum.
+            ticks in proptest::collection::vec(
+                proptest::prop_oneof![100_000..1_000_000i64, 1_000_000..500_000_000i64],
+                4,
+            ),
+            // Mostly fractionable, so most runs send several orders.
+            readings in proptest::collection::vec(
+                proptest::prop_oneof![
+                    4 => proptest::strategy::Just(Some(Tradability::Fractionable)),
+                    1 => proptest::option::of(proptest::sample::select(vec![
+                        Tradability::WholeSharesOnly,
+                        Tradability::Untradable,
+                        Tradability::Unlisted,
+                    ])),
+                ],
+                4,
+            ),
+        ) {
+            let symbol = |raw: &str| Symbol::new(raw).unwrap();
+            let book = holding(0, &held.into_iter().collect::<Vec<_>>());
+            let target = Target::new(
+                wanted.into_iter().map(|(raw, units)| (symbol(raw), Shares::from_units(units))).collect(),
+            );
+            let prices: BTreeMap<Symbol, Price> = NAMES
+                .iter()
+                .zip(ticks)
+                .map(|(raw, ticks)| (symbol(raw), Price::from_ticks(ticks).unwrap()))
+                .collect();
+            let readings: BTreeMap<Symbol, Tradability> = NAMES
+                .iter()
+                .zip(readings)
+                .filter_map(|(raw, reading)| Some((symbol(raw), reading?)))
+                .collect();
+            let broker = Exact { prices: prices.clone(), readings: readings.clone() };
+            let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+            let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+            let outcomes = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(execute(
+                    &broker,
+                    &mut journal,
+                    &mut OrderSequence::default(),
+                    &book,
+                    &target,
+                    &prices,
+                    patient(),
+                ))
+                .unwrap();
+            std::fs::remove_dir_all(&directory).unwrap();
+            let mut reached = book.clone();
+            let mut causes = Vec::new();
+            for outcome in outcomes {
+                match outcome {
+                    OrderOutcome::Closed(Some(fill)) => reached = reached.combine(Book::of(&fill)),
+                    OrderOutcome::Guarded(cause) => causes.push(cause),
+                    OrderOutcome::Closed(None) | OrderOutcome::Refused | OrderOutcome::Unresolved { .. } => {
+                        proptest::prop_assert!(false, "an exact broker fills every order it is sent");
+                    }
+                }
+            }
+            let guarded = guard(orders(&book, &target), &readings, |symbol| prices.get(symbol).copied());
+            let direct = book.combine(concatenate(guarded.passed().iter().map(|order| {
+                Book::of(
+                    &Fill::new(
+                        "2026-10-08T15:00:00Z".parse().unwrap(),
+                        order.symbol().clone(),
+                        order.side(),
+                        order.shares(),
+                        prices[order.symbol()],
+                        DollarVolume::default(),
+                    )
+                    .unwrap(),
+                )
+            })));
+            proptest::prop_assert_eq!(
+                reached.positions().keys().collect::<Vec<_>>(),
+                direct.positions().keys().collect::<Vec<_>>()
+            );
+            proptest::prop_assert_eq!(reached, direct);
+            proptest::prop_assert_eq!(causes, guarded.held().iter().map(OrderGuarded::cause).collect::<Vec<_>>());
+        }
     }
 }
