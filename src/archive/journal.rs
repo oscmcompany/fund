@@ -36,7 +36,7 @@ pub enum EncodeRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
     File(ReadRefusal),
-    /// A row that does not read back as the line it was written from.
+    /// A row no line could have been written as, such as a record from another session than the key's.
     Row {
         line: u64,
         reason: String,
@@ -136,7 +136,8 @@ pub fn encode(key: &JournalKey, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRef
 }
 
 /// The lines a file written by `encode` under `key` holds, each read again through the journal's own reader, so a
-/// row edited out of band reads back as what it now says rather than what it was.
+/// row edited out of band reads back as what it now says rather than what it was. A row this build no longer types,
+/// such as one naming a retired variant, reads back unreadable with its rebuilt text rather than refusing the file.
 pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal> {
     let session = key.session();
     let (batches, _) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
@@ -192,12 +193,7 @@ pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeR
                 "payload": payload,
             })
             .to_string();
-            match read_one(number, &text) {
-                ReadLine::Read(record) => lines.push(in_session(ReadLine::Read(record))?),
-                ReadLine::Unreadable { cause, .. } => {
-                    return Err(refused(&format!("{cause:?}")));
-                }
-            }
+            lines.push(in_session(read_one(number, &text))?);
         }
     }
     Ok(lines)
@@ -215,7 +211,8 @@ mod tests {
     use super::*;
     use crate::common::heal::{Leg, SessionOutcome, Window};
     use crate::common::journal::{
-        Commit, ConfigurationResolved, HealFinished, Observation, Record, RunId, read,
+        Commit, ConfigurationResolved, HealFinished, Observation, Record, RunId, UnreadableCause,
+        read,
     };
     use crate::common::storage::Host;
 
@@ -280,6 +277,25 @@ mod tests {
     }
 
     #[test]
+    fn test_a_row_missing_its_envelope_or_holding_a_non_json_payload_refuses_the_file() {
+        let reason = |bytes| match decode(&key(), bytes) {
+            Err(DecodeRefusal::Row { line, reason }) => (line, reason),
+            other => panic!("not refused by row: {other:?}"),
+        };
+        assert_eq!(
+            reason(file_with_row(None, "{}")),
+            (
+                1,
+                "an envelope column is null on a readable line".to_string()
+            )
+        );
+        assert_eq!(
+            reason(file_with_row(Some("retired_event"), "not json")).0,
+            1
+        );
+    }
+
+    #[test]
     fn test_a_file_read_under_another_session_is_refused() {
         let bytes = encode(&key(), &read(&session_file())).unwrap();
         let next = JournalKey::new(Host::Archiver, session().plus_calendar_days(1));
@@ -287,6 +303,41 @@ mod tests {
             decode(&next, bytes),
             Err(DecodeRefusal::Row { line: 1, .. })
         ));
+    }
+
+    /// A one-row file in typed columns, as an older build may have written it.
+    fn file_with_row(event_type: Option<&str>, payload: &str) -> Vec<u8> {
+        let nanoseconds = session().midnight().timestamp_nanos_opt().unwrap();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vec![1_u64])),
+            Arc::new(UInt64Array::from(vec![1_u64])),
+            Arc::new(StringArray::from(vec![Uuid::from_u128(7).to_string()])),
+            Arc::new(UInt64Array::from(vec![1_u64])),
+            Arc::new(TimestampNanosecondArray::from(vec![nanoseconds]).with_timezone("UTC")),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(StringArray::from(vec![event_type])),
+            Arc::new(StringArray::from(vec![payload])),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        ];
+        parquet::write(schema(), columns, LAYOUT_VERSION, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn test_a_row_this_build_cannot_type_reads_back_unreadable() {
+        let lines = decode(&key(), file_with_row(Some("retired_event"), "{}")).unwrap();
+        assert_eq!(lines.len(), 1);
+        let ReadLine::Unreadable { line, text, cause } = &lines[0] else {
+            panic!("read as a record: {lines:?}");
+        };
+        assert_eq!(*line, 1);
+        assert!(text.contains(r#""event_type":"retired_event""#), "{text}");
+        assert!(matches!(
+            cause,
+            UnreadableCause::Malformed { event_type: Some(event_type), .. } if event_type == "retired_event"
+        ));
+        // Written back, the line keeps its text, so a merge over it loses nothing.
+        let bytes = encode(&key(), &lines).unwrap();
+        assert_eq!(decode(&key(), bytes).unwrap(), lines);
     }
 
     #[test]
