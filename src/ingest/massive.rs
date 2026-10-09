@@ -1002,7 +1002,10 @@ mod tests {
             ]
         );
         assert_eq!(splits.refused().len(), 1);
-        assert_eq!(<&str>::from(splits.refused()[0].cause()), "split_ratio");
+        assert_eq!(
+            <&str>::from(splits.refused()[0].cause().kind()),
+            "split_ratio"
+        );
         let last = SPLITS_PAGE.replace(
             r#""next_url":"https://api.massive.com/v3/reference/splits?cursor=YXA9MyZhcz0mbGltaXQ9MyZvcmRlcj1kZXNjJnNvcnQ9ZXhlY3V0aW9uX2RhdGU""#,
             r#""next_url":null"#,
@@ -1036,7 +1039,7 @@ mod tests {
         let causes: Vec<&str> = unique
             .refused()
             .iter()
-            .map(|row| row.cause().into())
+            .map(|row| row.cause().kind().into())
             .collect();
         assert_eq!(causes, ["duplicate", "duplicate"]);
     }
@@ -1052,7 +1055,7 @@ mod tests {
         let causes: Vec<&str> = unique
             .refused()
             .iter()
-            .map(|row| row.cause().into())
+            .map(|row| row.cause().kind().into())
             .collect();
         assert_eq!(causes, ["symbol", "duplicate"]);
     }

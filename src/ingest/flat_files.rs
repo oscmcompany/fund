@@ -809,7 +809,7 @@ MSFT,1.0,1.0,1.0,1.0,1.0,1790827200000000000,1
         let causes: Vec<(&str, &'static str)> = parsed
             .refused()
             .iter()
-            .map(|row| (row.ticker(), row.cause().into()))
+            .map(|row| (row.ticker(), row.cause().kind().into()))
             .collect();
         assert_eq!(
             causes,
@@ -899,7 +899,7 @@ ZTST,11,10.0,100,8,9.0,100,\"1,81\",,1629716446119912192,81265,16297164461199464
         assert!(matches!(
             &outcomes[3],
             QuoteRowOutcome::Refused(row)
-                if row.ticker() == "A" && <&'static str>::from(row.cause()) == "price"
+                if row.ticker() == "A" && <&'static str>::from(row.cause().kind()) == "price"
         ));
         assert_eq!(outcomes[4], QuoteRowOutcome::TestTicker);
     }
@@ -941,7 +941,7 @@ A,,,4,71675225257545,1789706368198859000,156.340000,3612,1789718406372684563,0,1
         ));
         assert!(matches!(
             &outcomes[2],
-            TradeRowOutcome::Refused(row) if <&'static str>::from(row.cause()) == "conditions"
+            TradeRowOutcome::Refused(row) if <&'static str>::from(row.cause().kind()) == "conditions"
         ));
         assert!(matches!(
             &outcomes[3],

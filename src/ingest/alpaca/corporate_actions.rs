@@ -265,7 +265,7 @@ mod tests {
         let refused: Vec<(&str, &str)> = read
             .refused()
             .iter()
-            .map(|row| (row.ticker(), <&str>::from(row.cause())))
+            .map(|row| (row.ticker(), <&str>::from(row.cause().kind())))
             .collect();
         assert_eq!(refused, [("AESR", "boundary"), ("004ESC018", "symbol")]);
     }

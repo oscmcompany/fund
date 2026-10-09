@@ -8,7 +8,7 @@ use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::common::market::record::BarInterval;
-use crate::common::storage::{Key, Origin, Provider, ReferenceTable};
+use crate::common::storage::{Key, KeyRefusal, Origin, Provider, ReferenceTable};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 
@@ -198,6 +198,8 @@ pub enum PartitionFailureKind {
     Vanished,
     NoSymbols,
     Fold,
+    /// A write the partition needed went unrecorded, which stops the run.
+    Journal,
 }
 
 /// How one owed session ended.
@@ -342,11 +344,34 @@ pub fn owed(window: &[SessionDate], held: &BTreeSet<SessionDate>) -> Vec<Session
         .collect()
 }
 
+/// Why a path under a leg's series was not taken as one of its sessions.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Unrecognized {
+    /// Not a path any key writes.
+    NotAKey,
+    /// A key, but of another series, as a sibling sharing the prefix writes.
+    AnotherSeries,
+}
+
 /// What a listing under `leg`'s series holds: the sessions of its own keys, and every path that is not one of them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Held {
     sessions: BTreeSet<SessionDate>,
-    unrecognized: Vec<String>,
+    unrecognized: BTreeMap<String, Unrecognized>,
 }
 
 impl Held {
@@ -354,15 +379,16 @@ impl Held {
     pub fn of(leg: Leg, paths: impl IntoIterator<Item = String>) -> Self {
         let mut held = Self::default();
         for path in paths {
-            let session = Key::parse(&path)
-                .ok()
-                .filter(|key| *key == leg.key(key.session()))
-                .map(|key| key.session());
-            match session {
-                Some(session) => {
-                    held.sessions.insert(session);
+            match Key::parse(&path) {
+                Ok(key) if key == leg.key(key.session()) => {
+                    held.sessions.insert(key.session());
                 }
-                None => held.unrecognized.push(path),
+                Ok(_) => {
+                    held.unrecognized.insert(path, Unrecognized::AnotherSeries);
+                }
+                Err(KeyRefusal::Unrecognized { .. }) => {
+                    held.unrecognized.insert(path, Unrecognized::NotAKey);
+                }
             }
         }
         held
@@ -372,7 +398,7 @@ impl Held {
         &self.sessions
     }
 
-    pub fn unrecognized(&self) -> &[String] {
+    pub fn unrecognized(&self) -> &BTreeMap<String, Unrecognized> {
         &self.unrecognized
     }
 }
@@ -481,7 +507,14 @@ mod tests {
             held.sessions(),
             &BTreeSet::from([date("2026-09-28"), date("2026-09-29")])
         );
-        assert_eq!(held.unrecognized(), &paths[2..]);
+        assert_eq!(
+            held.unrecognized(),
+            &BTreeMap::from([
+                (paths[2].clone(), Unrecognized::AnotherSeries),
+                (paths[3].clone(), Unrecognized::AnotherSeries),
+                (paths[4].clone(), Unrecognized::NotAKey),
+            ])
+        );
     }
 
     #[test]
@@ -545,8 +578,23 @@ mod tests {
                 r#""vanished""#,
                 r#""no_symbols""#,
                 r#""fold""#,
+                r#""journal""#,
             ]
         );
+    }
+
+    #[test]
+    fn test_serde_and_strum_agree_on_every_unrecognized_cause() {
+        let names: Vec<String> = Unrecognized::iter()
+            .map(|cause| {
+                let json = serde_json::to_string(&cause).unwrap();
+                assert_eq!(json, format!("\"{cause}\""));
+                assert_eq!(cause.to_string().parse::<Unrecognized>(), Ok(cause));
+                assert_eq!(serde_json::from_str::<Unrecognized>(&json).unwrap(), cause);
+                json
+            })
+            .collect();
+        assert_eq!(names, [r#""not_a_key""#, r#""another_series""#]);
     }
 
     #[test]

@@ -192,6 +192,8 @@ mod tests {
                         Observation::ExperimentRan(experiment) => ran.push((**experiment).clone()),
                         Observation::ConfigurationResolved(_)
                         | Observation::PartitionWritten(_)
+                        | Observation::PartitionFailed(_)
+                        | Observation::ConditionsWritten(_)
                         | Observation::HealFinished(_)
                         | Observation::DatasetRead(_)
                         | Observation::OrderSubmitted(_)
