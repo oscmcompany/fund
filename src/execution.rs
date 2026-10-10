@@ -1222,6 +1222,7 @@ mod tests {
                 | Observation::ObjectWritten(_)
                 | Observation::ObjectDeleted(_)
                 | Observation::HealFinished(_)
+                | Observation::ArchiveSurveyed(_)
                 | Observation::ViewsChecked(_)
                 | Observation::DatasetRead(_)
                 | Observation::ExperimentRan(_)

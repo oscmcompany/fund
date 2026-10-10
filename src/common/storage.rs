@@ -450,6 +450,11 @@ fn reference_series(provider: Provider, table: ReferenceTable) -> String {
 pub struct SeriesPrefix(String);
 
 impl SeriesPrefix {
+    /// Every series of market data, raw and parsed.
+    pub fn market_data() -> Self {
+        Self(format!("{DATA_ROOT}/"))
+    }
+
     /// Every snapshot of `provider`'s `table`, whatever its date.
     pub fn reference(provider: Provider, table: ReferenceTable) -> Self {
         Self(reference_series(provider, table))

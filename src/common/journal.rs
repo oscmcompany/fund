@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::common::book::{Book, Cash, Position};
 use crate::common::guard::{OrderGuarded, TradabilityRead, TradabilityUnread};
-use crate::common::heal::{Leg, PartitionFailureKind, SessionOutcome, Unrecognized, Window};
+use crate::common::heal::{
+    Coverage, Leg, PartitionFailureKind, SessionOutcome, Unrecognized, Window,
+};
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
 use crate::common::market::Symbol;
 use crate::common::market::quote_bars::QuoteFoldCounts;
@@ -212,6 +214,7 @@ pub enum Observation {
     ObjectWritten(ObjectWritten),
     ObjectDeleted(ObjectDeleted),
     HealFinished(HealFinished),
+    ArchiveSurveyed(ArchiveSurveyed),
     ViewsChecked(ViewsChecked),
     DatasetRead(Box<DatasetRead>),
     ExperimentRan(Box<ExperimentRan>),
@@ -486,6 +489,31 @@ impl HealFinished {
 
     pub fn outcomes(&self) -> &BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>> {
         &self.outcomes
+    }
+}
+
+/// Every dated archive series' coverage against the trading calendar, keyed by its prefix, and how many listed paths
+/// were not read as keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveSurveyed {
+    series: BTreeMap<String, Coverage>,
+    unrecognized: u64,
+}
+
+impl ArchiveSurveyed {
+    pub fn new(series: BTreeMap<String, Coverage>, unrecognized: u64) -> Self {
+        Self {
+            series,
+            unrecognized,
+        }
+    }
+
+    pub fn series(&self) -> &BTreeMap<String, Coverage> {
+        &self.series
+    }
+
+    pub fn unrecognized(&self) -> u64 {
+        self.unrecognized
     }
 }
 
@@ -1374,6 +1402,15 @@ mod tests {
                 observation
             );
         }
+    }
+
+    /// The survey's wire format reads back to itself, one series with one gap and nothing off the calendar.
+    #[test]
+    fn test_an_archive_survey_encodes_to_its_wire_format() {
+        let line = r#"{"event_type":"archive_surveyed","payload":{"series":{"data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/":{"first":"2026-09-28","last":"2026-10-09","held":9,"gaps":["2026-10-01"],"off_calendar":[]}},"unrecognized":2}}"#;
+        let observation: Observation = serde_json::from_str(line).unwrap();
+        assert_eq!(observation.event_type(), "archive_surveyed");
+        assert_eq!(serde_json::to_string(&observation).unwrap(), line);
     }
 
     #[test]
