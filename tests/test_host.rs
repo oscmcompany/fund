@@ -502,11 +502,6 @@ fn test_a_new_trader_reads_its_playbook_and_writes_only_its_own_records() {
                 r#"{"StringLike":{"s3:prefix":["data/equity/*"]}}"#.to_string()
             ),
             (
-                "s3:ListBucket".to_string(),
-                records.to_string(),
-                unconditioned.clone()
-            ),
-            (
                 "s3:PutObject".to_string(),
                 format!("{records}/records/journal/producer=trader/*"),
                 unconditioned.clone()

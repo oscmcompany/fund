@@ -251,6 +251,7 @@ JSON
 )"
     ;;
   trader)
+    # No ListBucket on the records bucket, so on a host S3 answers a missing playbook 403 and the trader reports it unread.
     ROLE_STATEMENTS="$(cat <<JSON
     {"Sid": "ReadArchiveData", "Effect": "Allow", "Action": ["s3:GetObject"],
      "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/data/equity/*"},
@@ -259,8 +260,6 @@ JSON
      "Condition": {"StringLike": {"s3:prefix": ["data/equity/*"]}}},
     {"Sid": "ReadPlaybook", "Effect": "Allow", "Action": ["s3:GetObject"],
      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/configuration/playbook.toml"},
-    {"Sid": "ListRecordsSoAMissingPlaybookReadsAsAbsent", "Effect": "Allow", "Action": ["s3:ListBucket"],
-     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}"},
     {"Sid": "ReadBackOwnRecords", "Effect": "Allow", "Action": ["s3:GetObject"],
      "Resource": ["arn:aws:s3:::${RECORDS_BUCKET}/records/journal/producer=${ROLE}/*",
                   "arn:aws:s3:::${RECORDS_BUCKET}/records/logs/producer=${ROLE}/*"]},
