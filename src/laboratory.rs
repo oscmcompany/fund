@@ -202,8 +202,9 @@ mod tests {
             std::fs::remove_dir_all(&directory).unwrap();
         }
         let key = JournalKey::new(Host::Researcher, SessionDate::at(Utc::now()));
-        let held = archive::journal::decode(&key, records.get(&key.into()).await.unwrap().unwrap())
-            .unwrap();
+        let held =
+            archive::journal::decode(&key, records.get(&Key::from(key)).await.unwrap().unwrap())
+                .unwrap();
         for run in runs {
             assert!(
                 held.iter().any(|line| matches!(

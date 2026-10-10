@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -23,7 +22,9 @@ use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
 use fund::common::playbook::{Playbook, PlaybookRead, PlaybookRefusal, Played};
 use fund::common::standing::{HaltCause, SessionClosed, SessionEnding};
-use fund::common::storage::{Host, Key, Origin, Provider, Service, TradesKey};
+use fund::common::storage::{
+    ConfigurationKey, Host, Key, ObjectKey, Origin, Provider, Service, TradesKey,
+};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::alpaca::Alpaca;
@@ -68,7 +69,9 @@ async fn main() -> ExitCode {
         let records = Archive::records(&sdk_configuration);
         let archive = Archive::market_data(&sdk_configuration);
         let traded = match (&records, &archive) {
-            (Ok(_), Ok(archive)) => trade(&parameters, archive, &mut journal, today).await,
+            (Ok(records), Ok(archive)) => {
+                trade(&parameters, records, archive, &mut journal, today).await
+            }
             (Err(refusal), _) | (_, Err(refusal)) => Err(Stopped::BeforeTheOpen(
                 StartRefusal::Archive(refusal.clone()),
             )),
@@ -159,13 +162,14 @@ enum StartRefusal {
     Archive(VariableRefusal),
     #[error("the Alpaca client refused: {0}")]
     Alpaca(VariableRefusal),
-    #[error("playbook {} unread: {error}", .path.display())]
-    PlaybookUnread { path: PathBuf, error: io::Error },
-    #[error("playbook {} refused: {refusal}", .path.display())]
-    Playbook {
-        path: PathBuf,
-        refusal: PlaybookRefusal,
-    },
+    #[error("the playbook was not read: {0}")]
+    PlaybookUnread(ArchiveError),
+    #[error("no playbook is uploaded at {}", .key.path())]
+    PlaybookAbsent { key: ConfigurationKey },
+    #[error("the playbook is not UTF-8 text: {0}")]
+    PlaybookNotText(std::string::FromUtf8Error),
+    #[error("the playbook was refused: {0}")]
+    Playbook(PlaybookRefusal),
     #[error("the paper account refused: {0}")]
     NotPaper(BrokerError),
     #[error("the calendar was not read: {0}")]
@@ -226,17 +230,20 @@ fn ending(traded: &Result<Ran, Stopped>) -> SessionEnding {
     }
 }
 
-/// Reads and journals the playbook, so the session's records name the playbook it traded under.
-fn read_playbook(parameters: &Parameters, journal: &mut Journal) -> Result<Played, StartRefusal> {
-    let path = parameters.playbook().to_path_buf();
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) => return Err(StartRefusal::PlaybookUnread { path, error }),
+/// Reads the profile's uploaded playbook and journals it, so the session's records name the playbook it traded under.
+async fn read_playbook(
+    parameters: &Parameters,
+    records: &Archive,
+    journal: &mut Journal,
+) -> Result<Played, StartRefusal> {
+    let key = ConfigurationKey::Playbook;
+    let bytes = match records.get(&key).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(StartRefusal::PlaybookAbsent { key }),
+        Err(error) => return Err(StartRefusal::PlaybookUnread(error)),
     };
-    let playbook = match Playbook::parse(&contents) {
-        Ok(playbook) => playbook,
-        Err(refusal) => return Err(StartRefusal::Playbook { path, refusal }),
-    };
+    let contents = String::from_utf8(bytes).map_err(StartRefusal::PlaybookNotText)?;
+    let playbook = Playbook::parse(&contents).map_err(StartRefusal::Playbook)?;
     journal
         .append(
             Utc::now(),
@@ -248,12 +255,15 @@ fn read_playbook(parameters: &Parameters, journal: &mut Journal) -> Result<Playe
 
 async fn trade(
     parameters: &Parameters,
+    records: &Archive,
     archive: &Archive,
     journal: &mut Journal,
     today: SessionDate,
 ) -> Result<Ran, Stopped> {
     let refused = Stopped::BeforeTheOpen;
-    let strategy = read_playbook(parameters, journal).map_err(refused)?;
+    let strategy = read_playbook(parameters, records, journal)
+        .await
+        .map_err(refused)?;
     let http_client = reqwest::Client::new();
     let (tape, account) = match (
         Alpaca::from_environment(http_client.clone()),
@@ -389,7 +399,7 @@ async fn previous_bars(
         previous,
     );
     let bytes = match archive
-        .get(&key.into())
+        .get(&Key::from(key))
         .await
         .map_err(PreviousRefusal::Archive)?
     {
@@ -470,18 +480,18 @@ mod tests {
     #[test]
     fn test_each_start_refusal_displays_its_cause() {
         let close: DateTime<Utc> = "2026-10-08T20:00:00Z".parse().unwrap();
-        let path = PathBuf::from("playbook.toml");
         let displayed = [
             StartRefusal::Archive(VariableRefusal::Missing { name: "BUCKET" }),
             StartRefusal::Alpaca(VariableRefusal::Missing { name: "KEY" }),
-            StartRefusal::PlaybookUnread {
-                path: path.clone(),
-                error: disk_full(),
+            StartRefusal::PlaybookUnread(ArchiveError::Get {
+                path: "configuration/playbook.toml".to_string(),
+                reason: "throttled".to_string(),
+            }),
+            StartRefusal::PlaybookAbsent {
+                key: ConfigurationKey::Playbook,
             },
-            StartRefusal::Playbook {
-                path,
-                refusal: PlaybookRefusal::Empty,
-            },
+            StartRefusal::PlaybookNotText(String::from_utf8(vec![0xff]).unwrap_err()),
+            StartRefusal::Playbook(PlaybookRefusal::Empty),
             StartRefusal::NotPaper(BrokerError::NotPaper),
             StartRefusal::Calendar(FetchError::Refused {
                 status: 503,
@@ -504,8 +514,10 @@ mod tests {
             [
                 "the archive client refused: BUCKET is not set",
                 "the Alpaca client refused: KEY is not set",
-                "playbook playbook.toml unread: disk full",
-                "playbook playbook.toml refused: the playbook has no entries",
+                "the playbook was not read: reading configuration/playbook.toml failed: throttled",
+                "no playbook is uploaded at configuration/playbook.toml",
+                "the playbook is not UTF-8 text: invalid utf-8 sequence of 1 bytes from index 0",
+                "the playbook was refused: the playbook has no entries",
                 "the paper account refused: the Alpaca keys trade live, not on paper",
                 "the calendar was not read: refused with 503: busy",
                 "the session closed at 2026-10-08 20:00:00 UTC",

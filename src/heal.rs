@@ -568,7 +568,7 @@ async fn write_series_boundaries(
         Some(key) => {
             let bytes = clients
                 .archive
-                .get(&key.into())
+                .get(&Key::from(key))
                 .await?
                 .ok_or(PartitionFailure::Vanished { key: key.into() })?;
             let (held, _) =
@@ -889,7 +889,7 @@ async fn symbol_list(
     let key = massive_daily_bars(session);
     let body = clients
         .archive
-        .get(&key.into())
+        .get(&Key::from(key))
         .await?
         .ok_or(PartitionFailure::NoSymbols { key: key.into() })?;
     let (bars, _) = bars::decode(&key, body).map_err(archive::DecodeRefusal::from)?;

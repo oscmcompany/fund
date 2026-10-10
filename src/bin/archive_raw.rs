@@ -702,7 +702,7 @@ async fn parse_one(
     .map_err(|error| ParseFailure::Interrupted(error.to_string()))??;
     let bytes = length(&body);
     archive
-        .create(&key.into(), body)
+        .create(&Key::from(key), body)
         .await
         .map_err(ParseFailure::Archive)?;
     written(journal, key.into(), bytes).map_err(ParseFailure::Journal)?;
@@ -1310,7 +1310,7 @@ async fn roll_up_one(
 ) -> Result<usize, RollUpFailure> {
     let minute_key = massive_bars_key(Origin::Vendor, BarInterval::OneMinute, session);
     let bytes = archive
-        .get(&minute_key.into())
+        .get(&Key::from(minute_key))
         .await
         .map_err(RollUpFailure::Archive)?
         .ok_or(RollUpFailure::Missing)?;
@@ -1329,7 +1329,7 @@ async fn roll_up_one(
     .map_err(|error| RollUpFailure::Interrupted(error.to_string()))??;
     let bytes = length(&body);
     archive
-        .create(&key.into(), body)
+        .create(&Key::from(key), body)
         .await
         .map_err(RollUpFailure::Archive)?;
     written(journal, key.into(), bytes).map_err(RollUpFailure::Journal)?;

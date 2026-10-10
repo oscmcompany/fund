@@ -13,7 +13,7 @@ pub mod trade_bars;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 
-use crate::common::storage::{EntityTag, Key, SeriesPrefix, StorageClass};
+use crate::common::storage::{EntityTag, ObjectKey, SeriesPrefix, StorageClass};
 use crate::ingest::VariableRefusal;
 
 /// One S3 bucket the fund writes: the shared market data or a profile's records.
@@ -126,19 +126,19 @@ impl Archive {
     }
 
     /// Writes `body` under `key` and returns once the same bytes have been read back.
-    pub async fn put(&self, key: &Key, body: Vec<u8>) -> Result<(), ArchiveError> {
+    pub async fn put(&self, key: &impl ObjectKey, body: Vec<u8>) -> Result<(), ArchiveError> {
         self.write(key, body, Condition::Any).await
     }
 
     /// Writes `body` only if nothing is under `key` yet, so two writers can never both take it.
-    pub async fn create(&self, key: &Key, body: Vec<u8>) -> Result<(), ArchiveError> {
+    pub async fn create(&self, key: &impl ObjectKey, body: Vec<u8>) -> Result<(), ArchiveError> {
         self.write(key, body, Condition::Absent).await
     }
 
     /// Writes `body` only if `key` still holds the version `tag` names.
     pub async fn replace(
         &self,
-        key: &Key,
+        key: &impl ObjectKey,
         body: Vec<u8>,
         tag: &EntityTag,
     ) -> Result<(), ArchiveError> {
@@ -148,7 +148,7 @@ impl Archive {
     /// Writes and verifies `body`, logging the outcome here so no caller has to.
     async fn write(
         &self,
-        key: &Key,
+        key: &impl ObjectKey,
         body: Vec<u8>,
         condition: Condition<'_>,
     ) -> Result<(), ArchiveError> {
@@ -173,7 +173,7 @@ impl Archive {
 
     async fn write_verified(
         &self,
-        key: &Key,
+        key: &impl ObjectKey,
         body: Vec<u8>,
         condition: Condition<'_>,
     ) -> Result<(), ArchiveError> {
@@ -211,7 +211,7 @@ impl Archive {
     }
 
     /// Deletes the object under `key`; deleting one already gone succeeds, as S3 answers it.
-    pub async fn delete(&self, key: &Key) -> Result<(), ArchiveError> {
+    pub async fn delete(&self, key: &impl ObjectKey) -> Result<(), ArchiveError> {
         let path = key.path();
         match self
             .s3_client
@@ -261,12 +261,12 @@ impl Archive {
     }
 
     /// The object under `key`, or `None` when nothing is there; S3 verifies the stored checksum as it streams.
-    pub async fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, ArchiveError> {
+    pub async fn get(&self, key: &impl ObjectKey) -> Result<Option<Vec<u8>>, ArchiveError> {
         Ok(self.get_tagged(key).await?.map(|(body, _)| body))
     }
 
     /// The tag of the version under `key` now, without reading it; `None` when the object is gone.
-    pub async fn tag(&self, key: &Key) -> Result<Option<EntityTag>, ArchiveError> {
+    pub async fn tag(&self, key: &impl ObjectKey) -> Result<Option<EntityTag>, ArchiveError> {
         let path = key.path();
         let failed = |reason: String| ArchiveError::Get {
             path: path.clone(),
@@ -301,7 +301,7 @@ impl Archive {
     /// The object under `key` with the tag of the version read, which a `replace` must still match.
     pub async fn get_tagged(
         &self,
-        key: &Key,
+        key: &impl ObjectKey,
     ) -> Result<Option<(Vec<u8>, EntityTag)>, ArchiveError> {
         let path = key.path();
         let failed = |reason: String| ArchiveError::Get {
@@ -377,7 +377,7 @@ mod tests {
     use super::bars::{Provenance, Subscription};
     use super::*;
     use crate::common::journal::RunId;
-    use crate::common::storage::Provider;
+    use crate::common::storage::{Key, Provider};
     use crate::common::time::SessionDate;
     use crate::ingest::massive::Massive;
 
@@ -447,9 +447,9 @@ mod tests {
         let body = bars::encode(&key, &written, &provenance).unwrap();
         let configuration = aws_config::load_from_env().await;
         let archive = Archive::market_data(&configuration).unwrap();
-        archive.put(&key.into(), body.clone()).await.unwrap();
+        archive.put(&Key::from(key), body.clone()).await.unwrap();
         let (bars, read) =
-            bars::decode(&key, archive.get(&key.into()).await.unwrap().unwrap()).unwrap();
+            bars::decode(&key, archive.get(&Key::from(key)).await.unwrap().unwrap()).unwrap();
         println!(
             "{} bars, {} bytes, {}",
             bars.bars().len(),

@@ -10,7 +10,7 @@ use crate::common::laboratory::dataset::{
 };
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::{Bar, BarPartition};
-use crate::common::storage::EntityTag;
+use crate::common::storage::{EntityTag, Key};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 use crate::laboratory::Study;
@@ -119,7 +119,7 @@ async fn partition(
         DatasetLeg::MassiveDailyBars => {
             let key = massive_daily_bars(session);
             let Some((body, tag)) = archive
-                .get_tagged(&key.into())
+                .get_tagged(&Key::from(key))
                 .await
                 .map_err(DatasetError::Archive)?
             else {
@@ -141,7 +141,9 @@ pub async fn lineage(
     for session in fingerprint.partitions().keys() {
         let tag = match fingerprint.leg() {
             DatasetLeg::MassiveDailyBars => {
-                archive.tag(&massive_daily_bars(*session).into()).await?
+                archive
+                    .tag(&Key::from(massive_daily_bars(*session)))
+                    .await?
             }
         };
         if let Some(tag) = tag {

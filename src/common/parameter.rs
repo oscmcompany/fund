@@ -58,8 +58,6 @@ pub enum Parameter {
     OrderPollMilliseconds,
     /// Seconds an order may stay open before it is canceled.
     OrderOpenSeconds,
-    /// The path of the playbook the trader reads at startup.
-    Playbook,
 }
 
 impl Parameter {
@@ -203,7 +201,6 @@ mod tests {
                 "FUND_STALE_AFTER_SECONDS",
                 "FUND_ORDER_POLL_MILLISECONDS",
                 "FUND_ORDER_OPEN_SECONDS",
-                "FUND_PLAYBOOK",
             ]
         );
     }

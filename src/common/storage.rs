@@ -1,5 +1,6 @@
-//! Object keys for the archive and the records. Each key is a hive path whose partition values a reader surfaces as
-//! columns, each parses back to the parts that built it, and each has exactly one host allowed to write it.
+//! Object keys for the archive and the records. Each `Key` is a hive path whose partition values a reader surfaces as
+//! columns, each parses back to the parts that built it, and each has exactly one host allowed to write it; a
+//! `ConfigurationKey` is a host's configuration, which an operator writes outside any session.
 
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use crate::common::time::SessionDate;
 /// Everything this layout writes lives under these roots.
 const DATA_ROOT: &str = "data/equity";
 const RECORDS_ROOT: &str = "records";
+const CONFIGURATION_ROOT: &str = "configuration";
 
 #[derive(
     Debug,
@@ -80,6 +82,43 @@ pub enum ReferenceTable {
 pub enum StorageClass {
     Standard,
     DeepArchive,
+}
+
+/// What the archive client needs of any key: where the object lives and the class it is written in.
+pub trait ObjectKey {
+    fn path(&self) -> String;
+    fn storage_class(&self) -> StorageClass;
+}
+
+/// A host's configuration in the profile's records bucket, written by an operator rather than a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationKey {
+    /// The trader's playbook, as TOML.
+    Playbook,
+}
+
+impl ObjectKey for ConfigurationKey {
+    fn path(&self) -> String {
+        match self {
+            Self::Playbook => format!("{CONFIGURATION_ROOT}/playbook.toml"),
+        }
+    }
+
+    fn storage_class(&self) -> StorageClass {
+        match self {
+            Self::Playbook => StorageClass::Standard,
+        }
+    }
+}
+
+impl ObjectKey for Key {
+    fn path(&self) -> String {
+        Key::path(self)
+    }
+
+    fn storage_class(&self) -> StorageClass {
+        Key::storage_class(self)
+    }
 }
 
 #[derive(
@@ -710,6 +749,14 @@ pub(crate) mod tests {
 
     fn session() -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap())
+    }
+
+    #[test]
+    fn test_the_playbook_lives_beside_the_records() {
+        assert_eq!(
+            ObjectKey::path(&ConfigurationKey::Playbook),
+            "configuration/playbook.toml"
+        );
     }
 
     #[test]

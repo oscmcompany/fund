@@ -1,10 +1,10 @@
-//! The trader's settings, each resolved once at startup. The universe, the playbook and the limits have no default, so a
-//! run trades only what was deliberately configured.
+//! The trader's settings, each resolved once at startup. The universe and the limits have no default, so a run trades
+//! only what was deliberately configured.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::num::{NonZeroU16, ParseIntError};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -195,7 +195,6 @@ impl From<ParameterRefusal> for ParametersRefusal {
 #[derive(Debug, Clone)]
 pub struct Parameters {
     universe: Universe,
-    playbook: PathBuf,
     settings: SessionSettings,
     directories: Directories,
 }
@@ -212,10 +211,6 @@ impl Parameters {
         let mut resolved = BTreeMap::new();
         let read = |parameter| Ok::<_, ParameterRefusal>((parameter, supplied(parameter)?));
         let universe: Universe = record_required(read(Parameter::Universe)?, &mut resolved)?;
-        let playbook = PathBuf::from(record_required::<String>(
-            read(Parameter::Playbook)?,
-            &mut resolved,
-        )?);
         let mut limit =
             |parameter| record_required::<Dollars>(read(parameter)?, &mut resolved).map(Cash::from);
         let (gross, per_name, daily_loss) = (
@@ -253,7 +248,6 @@ impl Parameters {
             .map_err(ParametersRefusal::Settings)?;
         let parameters = Self {
             universe,
-            playbook,
             settings,
             directories: Directories::resolved(supplied, &mut resolved)?,
         };
@@ -262,10 +256,6 @@ impl Parameters {
 
     pub fn universe(&self) -> &Universe {
         &self.universe
-    }
-
-    pub fn playbook(&self) -> &Path {
-        &self.playbook
     }
 
     pub fn settings(&self) -> SessionSettings {
@@ -288,14 +278,21 @@ mod tests {
     use super::*;
     use crate::common::journal::ParameterSource;
 
-    const REQUIRED: [(Parameter, &str); 6] = [
+    const REQUIRED: [(Parameter, &str); 5] = [
         (Parameter::Universe, "SPY, QQQ"),
-        (Parameter::Playbook, "/etc/fund/playbook.toml"),
         (Parameter::GrossLimit, "1000"),
         (Parameter::PerNameLimit, "500.5"),
         (Parameter::DailyLossLimit, "50"),
         (Parameter::FlatBeforeCloseMinutes, "15"),
     ];
+
+    /// The required values with `parameter`'s replaced by `value`.
+    fn replaced(parameter: Parameter, value: &'static str) -> Vec<(Parameter, &'static str)> {
+        REQUIRED
+            .iter()
+            .map(|&(each, held)| (each, if each == parameter { value } else { held }))
+            .collect()
+    }
 
     fn supplied(
         values: &[(Parameter, &str)],
@@ -311,7 +308,6 @@ mod tests {
     fn test_the_required_parameters_resolve_and_the_rest_default() {
         let (parameters, configuration) = Parameters::resolved(&supplied(&REQUIRED)).unwrap();
         assert_eq!(parameters.universe().to_string(), "QQQ,SPY");
-        assert_eq!(parameters.playbook(), Path::new("/etc/fund/playbook.toml"));
         let journaled: Vec<(&str, &str, ParameterSource)> = configuration
             .parameters()
             .iter()
@@ -339,11 +335,6 @@ mod tests {
                 ("stale_after_seconds", "120", ParameterSource::Default),
                 ("order_poll_milliseconds", "500", ParameterSource::Default),
                 ("order_open_seconds", "30", ParameterSource::Default),
-                (
-                    "playbook",
-                    "/etc/fund/playbook.toml",
-                    ParameterSource::Environment
-                ),
             ]
         );
     }
@@ -491,8 +482,7 @@ mod tests {
 
     #[test]
     fn test_a_zero_limit_is_refused_by_the_limits() {
-        let mut values = REQUIRED.to_vec();
-        values[4] = (Parameter::DailyLossLimit, "0");
+        let values = replaced(Parameter::DailyLossLimit, "0");
         assert!(matches!(
             Parameters::resolved(&supplied(&values)),
             Err(ParametersRefusal::Limits(LimitsRefusal::NotPositive { .. }))
@@ -501,8 +491,7 @@ mod tests {
 
     #[test]
     fn test_a_flat_window_past_a_session_is_refused() {
-        let mut values = REQUIRED.to_vec();
-        values[5] = (Parameter::FlatBeforeCloseMinutes, "391");
+        let values = replaced(Parameter::FlatBeforeCloseMinutes, "391");
         assert_eq!(
             Parameters::resolved(&supplied(&values)).map(|_| ()),
             Err(ParametersRefusal::Parameter(ParameterRefusal::Unparsable {

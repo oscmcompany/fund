@@ -263,7 +263,7 @@ pub async fn latest_conditions(
         .map_err(SnapshotError::Archive)?
         .ok_or(SnapshotError::Absent)?;
     let bytes = archive
-        .get(&latest.into())
+        .get(&Key::from(latest))
         .await
         .map_err(SnapshotError::Archive)?
         .ok_or(SnapshotError::Vanished { key: latest })?;
