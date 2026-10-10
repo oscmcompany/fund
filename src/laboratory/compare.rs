@@ -5,7 +5,7 @@ use crate::common::laboratory::estimate::{Control, Estimate, Treatment, paired, 
 use crate::common::laboratory::experiment::{ExperimentRefusal, Name, Outputs, Parameters};
 use crate::common::laboratory::series::Series;
 use crate::common::market::record::BarInterval;
-use crate::common::replay::{FillModel, Replay, Replayer};
+use crate::common::replay::{Controls, FillModel, Replay, Replayer};
 use crate::common::strategy::Strategy;
 use crate::laboratory::Study;
 use crate::laboratory::dataset::Dataset;
@@ -70,8 +70,12 @@ impl Comparison {
     }
 }
 
-/// Replays both arms over `dataset` with one fill model, decision interval and opening, so they differ only in the
-/// strategy, and journals one experiment naming both arms.
+/// Replays both arms over `dataset` with one fill model, decision interval, opening and controls, so they differ only
+/// in the strategy, and journals one experiment naming both arms.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one condition both arms share, named at the call so none is mistaken for another"
+)]
 pub fn compare<C: Strategy, B: Strategy>(
     study: &mut Study,
     dataset: &Dataset,
@@ -80,6 +84,7 @@ pub fn compare<C: Strategy, B: Strategy>(
     fill_model: FillModel,
     decision: BarInterval,
     opening: Opening,
+    controls: Controls,
 ) -> Result<Comparison, ReplayStudyError> {
     let parameters = beside(
         [
@@ -89,18 +94,15 @@ pub fn compare<C: Strategy, B: Strategy>(
             ),
             (ArmSide::Baseline.into(), baseline.name.as_str().to_string()),
         ],
-        settings(fill_model, decision, opening),
+        settings(fill_model, decision, &controls, opening),
     )?;
-    let candidate = run(
-        dataset,
-        &Replayer::new(candidate.strategy, fill_model, decision),
-        opening,
-    )?;
-    let baseline = run(
-        dataset,
-        &Replayer::new(baseline.strategy, fill_model, decision),
-        opening,
-    )?;
+    let candidate =
+        Replayer::controlled(candidate.strategy, fill_model, decision, controls.clone())
+            .map_err(ReplayStudyError::Controls)?;
+    let baseline = Replayer::controlled(baseline.strategy, fill_model, decision, controls.clone())
+        .map_err(ReplayStudyError::Controls)?;
+    let candidate = run(dataset, &candidate, opening)?;
+    let baseline = run(dataset, &baseline, opening)?;
     let returns = |replay: &Replay| {
         replay
             .session_returns(opening.cash())
@@ -114,6 +116,7 @@ pub fn compare<C: Strategy, B: Strategy>(
             (ArmSide::Candidate, &candidate, &candidate_returns),
             (ArmSide::Baseline, &baseline, &baseline_returns),
         ],
+        &controls,
         opening,
         difference,
     )?;
@@ -130,6 +133,7 @@ pub fn compare<C: Strategy, B: Strategy>(
 /// The difference, each arm's own session return, and each arm's replay metrics under its side's prefix.
 fn outputs(
     arms: [(ArmSide, &Replay, &Series); 2],
+    controls: &Controls,
     opening: Opening,
     difference: Estimate,
 ) -> Result<Outputs, ReplayStudyError> {
@@ -141,7 +145,7 @@ fn outputs(
         outputs = outputs
             .estimate(format!("{side}_session_return"), own)
             .map_err(ReplayStudyError::Experiment)?;
-        for (metric, value) in metrics(replay, opening) {
+        for (metric, value) in metrics(replay, controls, opening) {
             outputs = outputs
                 .metric(format!("{side}_{metric}"), value)
                 .map_err(ReplayStudyError::Experiment)?;
@@ -208,6 +212,7 @@ mod tests {
                         | Observation::ObjectWritten(_)
                         | Observation::ObjectDeleted(_)
                         | Observation::HealFinished(_)
+                        | Observation::ViewsChecked(_)
                         | Observation::DatasetRead(_)
                         | Observation::OrderSubmitted(_)
                         | Observation::OrderClosed(_)
@@ -255,6 +260,7 @@ mod tests {
             fill_model(),
             BarInterval::OneDay,
             opening(),
+            Controls::Unrestrained,
         )
         .unwrap();
         assert_eq!(comparison.candidate().fills().len(), 1);
@@ -272,6 +278,7 @@ mod tests {
             [
                 ("baseline", "flat()"),
                 ("candidate", r#"one_share("symbol"="AAPL")"#),
+                ("controls", "unrestrained"),
                 ("decision_interval", "one_day"),
                 ("fill_style", "aggressive"),
                 ("opening_cash_units", "100000000000000"),
@@ -355,6 +362,7 @@ mod tests {
             fill_model(),
             BarInterval::OneDay,
             opening(),
+            Controls::Unrestrained,
         )
         .unwrap();
         std::fs::remove_dir_all(&directory).unwrap();
@@ -384,6 +392,7 @@ mod tests {
             fill_model(),
             BarInterval::OneMinute,
             opening(),
+            Controls::Unrestrained,
         );
         assert!(matches!(
             refused,

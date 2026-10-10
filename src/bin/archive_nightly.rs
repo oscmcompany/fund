@@ -1,15 +1,15 @@
-//! Heals the market-data archive over the last trading days, journals how each owed session ended, and ships the
-//! journal and logs to the records bucket. Exits 0 when every owed session was written and every file shipped, 1 when
-//! anything was not, and 2 when the run could not start.
+//! Heals the market-data archive over the last trading days, journals how each owed session ended and how its views
+//! read, and ships the journal and logs to the records bucket. Exits 0 when every owed session was written and every
+//! file shipped, 1 when anything was not, and 2 when the run could not start; the views only warn.
 
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use chrono::Utc;
 use tracing::Instrument;
 
 use fund::archive::Archive;
 use fund::common::heal::is_complete;
-use fund::common::journal::Observation;
+use fund::common::journal::{Observation, ViewsCheck, ViewsChecked};
 use fund::common::storage::{Host, Service};
 use fund::common::time::SessionDate;
 use fund::heal;
@@ -18,6 +18,32 @@ use fund::ingest::massive::Massive;
 use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 
 const SERVICE: &str = "archive_nightly";
+const CHECK_VIEWS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/check-views");
+
+/// Runs `check-views` from the checkout this binary was built in, keeping each line it printed.
+async fn check_views() -> ViewsChecked {
+    let ran = tokio::task::spawn_blocking(|| Command::new(CHECK_VIEWS).output()).await;
+    match ran {
+        Ok(Ok(output)) => {
+            let report = [&output.stdout, &output.stderr]
+                .into_iter()
+                .flat_map(|stream| {
+                    String::from_utf8_lossy(stream)
+                        .lines()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ViewsChecked::new(ViewsCheck::from_exit(output.status.code()), report)
+        }
+        Ok(Err(error)) => {
+            ViewsChecked::new(ViewsCheck::Stopped { code: None }, vec![error.to_string()])
+        }
+        Err(error) => {
+            ViewsChecked::new(ViewsCheck::Stopped { code: None }, vec![error.to_string()])
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -77,6 +103,16 @@ async fn main() -> ExitCode {
                 false
             }
         };
+        let views = check_views().await;
+        match views.check() {
+            ViewsCheck::Expected => tracing::info!(?views, "Views checked"),
+            ViewsCheck::Unexpected | ViewsCheck::NotMade | ViewsCheck::Stopped { .. } => {
+                tracing::warn!(?views, "Views not as expected")
+            }
+        }
+        if let Err(error) = journal.append(Utc::now(), Observation::ViewsChecked(views)) {
+            tracing::warn!(%error, "Views check was not journaled");
+        }
         let all_shipped = ship_logged(
             &records,
             Host::Archiver,

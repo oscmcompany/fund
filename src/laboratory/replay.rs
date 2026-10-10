@@ -7,7 +7,10 @@ use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs, Paramete
 use crate::common::laboratory::series::SeriesRefusal;
 use crate::common::market::record::{BarInterval, BarPartition};
 use crate::common::monoid::concatenate;
-use crate::common::replay::{FillModel, Replay, ReplayRefusal, Replayer};
+use crate::common::replay::{
+    Controls, ControlsRefusal, FillModel, Replay, ReplayRefusal, Replayer,
+};
+use crate::common::risk::Limit;
 use crate::common::strategy::Strategy;
 use crate::laboratory::dataset::Dataset;
 use crate::laboratory::{Study, StudyError};
@@ -22,6 +25,8 @@ pub enum ReplayStudyError {
     ReservedParameter { setting: ReplaySetting },
     #[error("the replay was refused: {0:?}")]
     Replay(ReplayRefusal),
+    #[error("the controls were refused: {0}")]
+    Controls(ControlsRefusal),
     #[error("the returns were refused: {0}")]
     Series(SeriesRefusal),
     #[error("the estimate was refused: {0}")]
@@ -42,6 +47,12 @@ pub enum ReplaySetting {
     FillStyle,
     OpeningCashUnits,
     QuotedSpreadBasisPoints,
+    Controls,
+    GrossLimitUnits,
+    PerNameLimitUnits,
+    DailyLossLimitUnits,
+    FlatBeforeCloseMinutes,
+    Tradability,
 }
 
 /// A measurement every replay journals, by the name it is journaled under.
@@ -57,6 +68,9 @@ pub(crate) enum ReplayMetric {
     Turnover,
     NetReturn,
     GrossReturn,
+    RiskCuts,
+    RiskRefusals,
+    OrdersHeld,
 }
 
 /// The cash a replay opens with, positive so a return and a turnover are measurable against it.
@@ -91,7 +105,12 @@ pub fn replay<S: Strategy>(
     opening: Opening,
     parameters: &Parameters,
 ) -> Result<Replay, ReplayStudyError> {
-    let own = settings(replayer.fill_model(), replayer.decision(), opening);
+    let own = settings(
+        replayer.fill_model(),
+        replayer.decision(),
+        replayer.controls(),
+        opening,
+    );
     let parameters = beside(
         parameters
             .settings()
@@ -100,7 +119,7 @@ pub fn replay<S: Strategy>(
         own,
     )?;
     let replay = run(dataset, replayer, opening)?;
-    let outputs = metrics(&replay, opening)
+    let outputs = metrics(&replay, replayer.controls(), opening)
         .into_iter()
         .try_fold(Outputs::default(), |outputs, (metric, value)| {
             outputs.metric(<&str>::from(metric), value)
@@ -112,13 +131,15 @@ pub fn replay<S: Strategy>(
     Ok(replay)
 }
 
-/// The settings every replay journals itself: the decision interval, the fill model and the opening cash.
+/// The settings every replay journals itself: the decision interval, the fill model, the opening cash and its
+/// controls, with the limits and tradability a restrained replay applies.
 pub(crate) fn settings(
     fill_model: FillModel,
     decision: BarInterval,
+    controls: &Controls,
     opening: Opening,
-) -> [(ReplaySetting, String); 4] {
-    [
+) -> Vec<(ReplaySetting, String)> {
+    let mut settings = vec![
         (ReplaySetting::DecisionInterval, decision.to_string()),
         (ReplaySetting::FillStyle, fill_model.style().to_string()),
         (
@@ -129,19 +150,44 @@ pub(crate) fn settings(
             ReplaySetting::QuotedSpreadBasisPoints,
             fill_model.quoted_spread().value().to_string(),
         ),
-    ]
+    ];
+    settings.push((ReplaySetting::Controls, <&str>::from(controls).to_string()));
+    match controls {
+        Controls::Unrestrained => {}
+        Controls::Restrained(restraint) => {
+            let limits = restraint.limits();
+            let units = |limit| limits.dollars(limit).units().to_string();
+            settings.extend([
+                (ReplaySetting::GrossLimitUnits, units(Limit::Gross)),
+                (ReplaySetting::PerNameLimitUnits, units(Limit::PerName)),
+                (ReplaySetting::DailyLossLimitUnits, units(Limit::DailyLoss)),
+                (
+                    ReplaySetting::FlatBeforeCloseMinutes,
+                    limits.flat_before_close().num_minutes().to_string(),
+                ),
+                (
+                    ReplaySetting::Tradability,
+                    serde_json::to_string(restraint.tradability())
+                        .expect("a tradability map has only string keys"),
+                ),
+            ]);
+        }
+    }
+    settings
 }
 
 /// `settings` with the replay's `own`, refused where one of them names a `ReplaySetting`.
 pub(crate) fn beside<'a>(
     settings: impl IntoIterator<Item = (&'a str, String)>,
-    own: [(ReplaySetting, String); 4],
+    own: Vec<(ReplaySetting, String)>,
 ) -> Result<Parameters, ReplayStudyError> {
     let settings: Vec<(&str, String)> = settings.into_iter().collect();
     if let Some(setting) = settings.iter().find_map(|(name, _)| name.parse().ok()) {
         return Err(ReplayStudyError::ReservedParameter { setting });
     }
-    let own = own.map(|(setting, value)| (<&str>::from(setting), value));
+    let own = own
+        .into_iter()
+        .map(|(setting, value)| (<&str>::from(setting), value));
     Parameters::new(settings.into_iter().chain(own)).map_err(ReplayStudyError::Experiment)
 }
 
@@ -164,7 +210,11 @@ pub(crate) fn run<S: Strategy>(
 
 /// Counts, dollars traded and paid, and turnover; the final mark's return net and gross of costs only when that mark
 /// was priced, every fill having landed before it.
-pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(ReplayMetric, f64)> {
+pub(crate) fn metrics(
+    replay: &Replay,
+    controls: &Controls,
+    opening: Opening,
+) -> Vec<(ReplayMetric, f64)> {
     let opening = opening.cash();
     let costs = concatenate(replay.fills().iter().map(|fill| fill.cost()));
     let traded = concatenate(replay.fills().iter().map(|fill| fill.notional()));
@@ -196,6 +246,22 @@ pub(crate) fn metrics(replay: &Replay, opening: Opening) -> Vec<(ReplayMetric, f
         }
         Some((_, Err(_))) | None => {}
     }
+    match controls {
+        Controls::Unrestrained => {}
+        Controls::Restrained(_) => {
+            let cuts: usize = replay.restraints().values().flatten().map(Vec::len).sum();
+            let refusals = replay
+                .restraints()
+                .values()
+                .filter(|judged| judged.is_err())
+                .count();
+            metrics.extend([
+                (ReplayMetric::RiskCuts, cuts as f64),
+                (ReplayMetric::RiskRefusals, refusals as f64),
+                (ReplayMetric::OrdersHeld, replay.held().len() as f64),
+            ]);
+        }
+    }
     metrics
 }
 
@@ -225,6 +291,74 @@ mod tests {
         }
     }
 
+    /// A restrained replay journals its limits and tradability as settings and its restraints as metrics.
+    #[test]
+    fn test_a_restrained_replay_journals_its_controls() {
+        use crate::common::book::{Book, Cash};
+        use crate::common::guard::Tradability;
+        use crate::common::replay::Restraint;
+        use crate::common::risk::Limits;
+        use crate::common::time::calendar::{TradingCalendar, TradingSession};
+        use crate::common::time::{SessionDate, SessionRange};
+        let monday = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap());
+        let session = TradingSession::new(
+            monday,
+            chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let calendar =
+            TradingCalendar::new(vec![session], SessionRange::new(monday, monday).unwrap())
+                .unwrap();
+        let limits = Limits::new(
+            Cash::from_units(3),
+            Cash::from_units(2),
+            Cash::from_units(1),
+            chrono::TimeDelta::minutes(15),
+        )
+        .unwrap();
+        let tradability = BTreeMap::from([(Symbol::new("AAPL").unwrap(), Tradability::Untradable)]);
+        let controls = Controls::Restrained(Restraint::new(limits, calendar, tradability));
+        let fill_model =
+            FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap();
+        let opening = Opening::new(Cash::from_units(1)).unwrap();
+        let settings: Vec<(&str, String)> =
+            settings(fill_model, BarInterval::OneMinute, &controls, opening)
+                .into_iter()
+                .filter(|(setting, _)| {
+                    !matches!(
+                        setting,
+                        ReplaySetting::DecisionInterval
+                            | ReplaySetting::FillStyle
+                            | ReplaySetting::OpeningCashUnits
+                            | ReplaySetting::QuotedSpreadBasisPoints
+                    )
+                })
+                .map(|(setting, value)| (<&str>::from(setting), value))
+                .collect();
+        assert_eq!(
+            settings,
+            [
+                ("controls", "restrained".to_string()),
+                ("gross_limit_units", "3".to_string()),
+                ("per_name_limit_units", "2".to_string()),
+                ("daily_loss_limit_units", "1".to_string()),
+                ("flat_before_close_minutes", "15".to_string()),
+                ("tradability", r#"{"AAPL":"untradable"}"#.to_string()),
+            ]
+        );
+        let names: Vec<&str> = metrics(
+            &Replay::open(Book::funded(Cash::from_units(1))),
+            &controls,
+            opening,
+        )
+        .into_iter()
+        .map(|(metric, _)| <&str>::from(metric))
+        .filter(|name| ["risk_cuts", "risk_refusals", "orders_held"].contains(name))
+        .collect();
+        assert_eq!(names, ["risk_cuts", "risk_refusals", "orders_held"]);
+    }
+
     #[test]
     fn test_a_replay_setting_reads_back_from_the_name_it_is_journaled_under() {
         for name in [
@@ -232,6 +366,12 @@ mod tests {
             "fill_style",
             "opening_cash_units",
             "quoted_spread_basis_points",
+            "controls",
+            "gross_limit_units",
+            "per_name_limit_units",
+            "daily_loss_limit_units",
+            "flat_before_close_minutes",
+            "tradability",
         ] {
             assert_eq!(name.parse::<ReplaySetting>().unwrap().to_string(), name);
         }
@@ -274,6 +414,7 @@ mod tests {
                     | Observation::ObjectWritten(_)
                     | Observation::ObjectDeleted(_)
                     | Observation::HealFinished(_)
+                    | Observation::ViewsChecked(_)
                     | Observation::DatasetRead(_)
                     | Observation::OrderSubmitted(_)
                     | Observation::OrderClosed(_)
@@ -303,6 +444,7 @@ mod tests {
         assert_eq!(
             settings,
             [
+                ("controls", "unrestrained"),
                 ("decision_interval", "one_day"),
                 ("fill_style", "aggressive"),
                 ("opening_cash_units", "100000000000000"),
