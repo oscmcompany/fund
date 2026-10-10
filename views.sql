@@ -50,6 +50,10 @@ CREATE OR REPLACE MACRO trillionths(value) AS CAST(value AS DECIMAL(38, 0)) * 0.
 CREATE OR REPLACE VIEW alpaca_minute_bars AS
 SELECT * FROM sessions('market_data_bucket', 'data/equity/stage=parsed/bars/provider=alpaca/origin=vendor/interval=one_minute/');
 
+-- Five-minute bars the nightly rolls up from Alpaca's one-minute bars.
+CREATE OR REPLACE VIEW alpaca_five_minute_bars AS
+SELECT * FROM sessions('market_data_bucket', 'data/equity/stage=parsed/bars/provider=alpaca/origin=derived/interval=five_minute/');
+
 -- One-minute quote bars the nightly folds from Alpaca's SIP quotes.
 CREATE OR REPLACE VIEW alpaca_minute_quote_bars AS
 SELECT * FROM sessions('market_data_bucket', 'data/equity/stage=parsed/quotes/provider=alpaca/origin=derived/interval=one_minute/');

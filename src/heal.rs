@@ -1,7 +1,7 @@
 //! The nightly heal: each leg's owed sessions fetched and written to the archive, oldest first, until done or out of
 //! time, with each partition journaled once it has been read back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::path::Path;
@@ -22,16 +22,17 @@ use crate::archive::reference::{
 use crate::archive::{self, Archive, ArchiveError};
 use crate::archive::{bars, quote_bars, trade_bars};
 use crate::common::heal::{
-    Held, KeepsRefusal, Leg, PartitionFailureKind, SessionOutcome, WindowRefusal,
-    alpaca_minute_bars, alpaca_quotes, alpaca_series_boundaries, alpaca_trades, fetched_range,
-    massive_daily_bars, massive_security_details, massive_splits, owed, window,
+    Coverage, CoverageRefusal, Held, KeepsRefusal, Leg, PartitionFailureKind, SessionOutcome,
+    WindowRefusal, alpaca_five_minute_bars, alpaca_minute_bars, alpaca_quotes,
+    alpaca_series_boundaries, alpaca_trades, fetched_range, massive_daily_bars,
+    massive_security_details, massive_splits, owed, window,
 };
 use crate::common::journal::{
-    ConditionsWritten, ConfigurationResolved, HealFinished, Observation, PartitionFailed,
-    PartitionWritten, Unanswered, quotes_folded, trades_folded,
+    ArchiveSurveyed, ConditionsWritten, ConfigurationResolved, HealFinished, Observation,
+    PartitionFailed, PartitionWritten, Unanswered, quotes_folded, trades_folded,
 };
 use crate::common::market::Symbol;
-use crate::common::market::aggregate::{RollsUp, session_bars};
+use crate::common::market::aggregate::{self, RollsUp, session_bars};
 use crate::common::market::corporate_actions::refresh_boundaries;
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
 use crate::common::market::record::{Bar, BarInterval, BarPartition, BarPartitionRefusal};
@@ -39,7 +40,7 @@ use crate::common::market::security_details::SecurityDetails;
 use crate::common::market::trade_bars::{TradeConditions, TradeFold};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
-use crate::common::storage::{BarsKey, Key, Provider, ReferenceTable};
+use crate::common::storage::{BarsKey, Key, Provider, ReferenceTable, SeriesPrefix};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 use crate::ingest::alpaca::corporate_actions::SeriesBoundaries;
@@ -148,6 +149,12 @@ pub enum HealError {
     Keeps { leg: Leg, refusal: KeepsRefusal },
     #[error("{0}")]
     List(ArchiveError),
+    /// A series spans sessions the fetched calendar does not reach.
+    #[error("the {series} series: {refusal}")]
+    Coverage {
+        series: String,
+        refusal: CoverageRefusal,
+    },
     /// A write or failure went unrecorded, so the run stops rather than go on with what it cannot record.
     #[error("journaling the heal failed: {0}")]
     Journal(std::io::Error),
@@ -175,6 +182,9 @@ pub enum PartitionFailure {
     /// The session's daily bars, which name its symbols, are not written.
     #[error("no daily bars at {} to take the symbols from", .key.path())]
     NoSymbols { key: Key },
+    /// The session's minute bars, which roll up into its five-minute bars, are not written.
+    #[error("no minute bars at {} to roll up", .key.path())]
+    NoMinutes { key: Key },
     #[error("{0}")]
     Fold(QuoteFoldRefusal),
     /// A write the partition needed could not be journaled, which stops the run.
@@ -193,6 +203,7 @@ impl PartitionFailure {
             Self::Archive(_) => PartitionFailureKind::Archive,
             Self::Vanished { .. } => PartitionFailureKind::Vanished,
             Self::NoSymbols { .. } => PartitionFailureKind::NoSymbols,
+            Self::NoMinutes { .. } => PartitionFailureKind::NoMinutes,
             Self::Fold(_) => PartitionFailureKind::Fold,
             Self::Journal(_) => PartitionFailureKind::Journal,
         }
@@ -310,6 +321,58 @@ pub async fn run(
     Ok(HealFinished::new(window, outcomes, unrecognized))
 }
 
+/// Measures every dated series of market data, raw and parsed, against the trading calendar from its first session.
+/// Reference snapshots are left out, since a snapshot leg keeps only some sessions by design.
+pub async fn survey(clients: &Clients, today: SessionDate) -> Result<ArchiveSurveyed, HealError> {
+    let paths = clients
+        .archive
+        .list(&SeriesPrefix::market_data())
+        .await
+        .map_err(HealError::List)?;
+    let mut series: BTreeMap<String, BTreeSet<SessionDate>> = BTreeMap::new();
+    let mut unrecognized = 0_u64;
+    for path in &paths {
+        match path.parse::<Key>() {
+            Ok(Key::Reference(_)) => {}
+            Ok(
+                key @ (Key::Bars(_)
+                | Key::Quotes(_)
+                | Key::Trades(_)
+                | Key::RawBars { .. }
+                | Key::RawQuotes { .. }
+                | Key::RawTrades { .. }
+                | Key::Journal(_)
+                | Key::Logs(_)),
+            ) => {
+                series
+                    .entry(key.series().to_string())
+                    .or_default()
+                    .insert(key.session());
+            }
+            Err(_) => unrecognized += 1,
+        }
+    }
+    let Some(first) = series.values().filter_map(BTreeSet::first).min() else {
+        return Ok(ArchiveSurveyed::new(BTreeMap::new(), unrecognized));
+    };
+    // A session dated after today is left for `Coverage::of` to refuse, as the calendar will not reach it.
+    let reach = SessionRange::new(*first, (*first).max(today))
+        .expect("the reach ends no earlier than it starts");
+    let calendar = clients
+        .alpaca
+        .calendar(reach)
+        .await
+        .map_err(HealError::Calendar)?;
+    let coverage = series
+        .into_iter()
+        .map(|(series, held)| match Coverage::of(&held, &calendar) {
+            Ok(coverage) => Ok((series, coverage)),
+            Err(refusal) => Err(HealError::Coverage { series, refusal }),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ArchiveSurveyed::new(coverage, unrecognized))
+}
+
 /// Writes each of `leg`'s owed sessions with `write` until `deadline`, journaling each outcome as it lands; a journal
 /// error, from the append or from inside `write`, stops the run before another session starts.
 async fn heal_leg(
@@ -362,6 +425,7 @@ async fn write(
     match leg {
         Leg::MassiveDailyBars => write_daily_bars(session, clients, journal).await,
         Leg::AlpacaMinuteBars => write_minute_bars(session, parameters, clients, journal).await,
+        Leg::AlpacaFiveMinuteBars => write_five_minute_bars(session, clients).await,
         Leg::AlpacaQuotes => {
             let hours = calendar
                 .session(session)
@@ -511,6 +575,41 @@ async fn write_minute_bars(
         bars,
         refused,
         unanswered,
+        BTreeMap::new(),
+    ))
+}
+
+/// Rolls the session's written Alpaca minute bars up to five minutes, under the minutes' own provenance.
+async fn write_five_minute_bars(
+    session: SessionDate,
+    clients: &Clients,
+) -> Result<PartitionWritten, PartitionFailure> {
+    let minute_key = alpaca_minute_bars(session);
+    let body =
+        clients
+            .archive
+            .get(&Key::from(minute_key))
+            .await?
+            .ok_or(PartitionFailure::NoMinutes {
+                key: minute_key.into(),
+            })?;
+    let (minutes, provenance) =
+        bars::decode(&minute_key, body).map_err(archive::DecodeRefusal::from)?;
+    let five_minutes = aggregate::roll_up(minutes.bars(), BarInterval::FiveMinute)
+        .expect("minutes roll up to five minutes");
+    let bars = publish_bars(
+        clients.put(),
+        alpaca_five_minute_bars(session),
+        five_minutes,
+        &provenance,
+    )
+    .await?;
+    Ok(PartitionWritten::new(
+        Leg::AlpacaFiveMinuteBars,
+        session,
+        bars,
+        refused_by_cause(&[]),
+        BTreeMap::new(),
         BTreeMap::new(),
     ))
 }

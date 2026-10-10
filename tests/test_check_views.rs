@@ -79,6 +79,7 @@ fn real(answers: &[(&str, Answer)], profile: &str) -> (i32, String) {
 fn bars(daily: Answer, minute: Answer) -> Vec<(&'static str, Answer)> {
     vec![
         ("alpaca_minute_bars", minute),
+        ("alpaca_five_minute_bars", minute),
         ("alpaca_minute_quote_bars", minute),
         ("alpaca_five_minute_quote_bars", minute),
         ("alpaca_daily_quote_bars", daily),
@@ -123,6 +124,7 @@ fn test_every_view_in_views_sql_is_checked() {
         reported(&output),
         [
             "alpaca_minute_bars",
+            "alpaca_five_minute_bars",
             "alpaca_minute_quote_bars",
             "alpaca_five_minute_quote_bars",
             "alpaca_daily_quote_bars",
@@ -339,7 +341,7 @@ fn test_every_view_ends_on_its_first_line_ending_in_a_semicolon() {
         );
         ended.push(view);
     }
-    assert_eq!(ended.len(), 24, "{ended:?}");
+    assert_eq!(ended.len(), 25, "{ended:?}");
 }
 
 /// Each `(bucket, series)` passed to the `sessions` and `snapshots` macros in `views.sql`, in file order.
@@ -372,6 +374,7 @@ fn archive_keys() -> Vec<Key> {
         |provider, origin, interval| Key::from(BarsKey::new(provider, origin, interval, session));
     let mut keys = vec![
         bars(Provider::Alpaca, Origin::Vendor, BarInterval::OneMinute),
+        bars(Provider::Alpaca, Origin::Derived, BarInterval::FiveMinute),
         bars(Provider::Massive, Origin::Vendor, BarInterval::OneMinute),
         bars(Provider::Massive, Origin::Derived, BarInterval::FiveMinute),
         bars(Provider::Massive, Origin::Vendor, BarInterval::OneDay),
@@ -418,8 +421,8 @@ fn test_every_series_views_sql_reads_is_a_key_series() {
         keys.push(LogsKey::new(host, Service::new("archive_nightly").unwrap(), session).into());
     }
     let called = macro_series();
-    // 20 archive views, `journal`, `logs`, `experiments`, and `bar_seam`'s two reads.
-    assert_eq!(called.len(), 25, "{called:?}");
+    // 21 archive views, `journal`, `logs`, `experiments`, and `bar_seam`'s two reads.
+    assert_eq!(called.len(), 26, "{called:?}");
     for (bucket, series) in &called {
         let expected_bucket = if series.starts_with("records/") {
             "records_bucket"

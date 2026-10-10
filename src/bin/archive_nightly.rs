@@ -1,6 +1,7 @@
-//! Heals the market-data archive over the last trading days, journals how each owed session ended and how its views
-//! read, and ships the journal and logs to the records bucket. Exits 0 when every owed session was written and every
-//! file shipped, 1 when anything was not, and 2 when the run could not start; the views only warn.
+//! Heals the market-data archive over the last trading days, journals how each owed session ended, every series' gaps
+//! and how its views read, and ships the journal and logs to the records bucket. Exits 0 when every owed session was
+//! written and every file shipped, 1 when anything was not, and 2 when the run could not start; gaps and views only
+//! warn.
 
 use std::process::{Command, ExitCode};
 
@@ -103,6 +104,25 @@ async fn main() -> ExitCode {
                 false
             }
         };
+        match heal::survey(&clients, today).await {
+            Ok(surveyed) => {
+                let broken: Vec<&String> = surveyed
+                    .series()
+                    .iter()
+                    .filter(|(_, coverage)| !coverage.is_whole())
+                    .map(|(series, _)| series)
+                    .collect();
+                if broken.is_empty() && surveyed.unrecognized() == 0 {
+                    tracing::info!(series = surveyed.series().len(), "Archive surveyed");
+                } else {
+                    tracing::warn!(?broken, unrecognized = surveyed.unrecognized(), "Archive has gaps");
+                }
+                if let Err(error) = journal.append(Utc::now(), Observation::ArchiveSurveyed(surveyed)) {
+                    tracing::warn!(%error, "Archive survey was not journaled");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "Archive not surveyed"),
+        }
         let views = check_views().await;
         match views.check() {
             ViewsCheck::Expected => tracing::info!(?views, "Views checked"),
