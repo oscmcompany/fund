@@ -51,7 +51,7 @@ pub enum ReplaySetting {
     GrossLimitUnits,
     PerNameLimitUnits,
     DailyLossLimitUnits,
-    FlatBeforeCloseMinutes,
+    FlatBeforeCloseSeconds,
     Tradability,
 }
 
@@ -162,8 +162,8 @@ pub(crate) fn settings(
                 (ReplaySetting::PerNameLimitUnits, units(Limit::PerName)),
                 (ReplaySetting::DailyLossLimitUnits, units(Limit::DailyLoss)),
                 (
-                    ReplaySetting::FlatBeforeCloseMinutes,
-                    limits.flat_before_close().num_minutes().to_string(),
+                    ReplaySetting::FlatBeforeCloseSeconds,
+                    limits.flat_before_close().num_seconds().to_string(),
                 ),
                 (
                     ReplaySetting::Tradability,
@@ -266,18 +266,78 @@ pub(crate) fn metrics(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::common::journal::{Observation, ReadLine, read};
+    use crate::common::guard::Tradability;
+    use crate::common::journal::{Observation, ReadLine, RunId, read};
     use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::Label;
     use crate::common::market::record::BarInterval;
     use crate::common::market::state::MarketState;
     use crate::common::market::{Shares, Symbol};
+    use crate::common::replay::Restraint;
+    use crate::common::risk::Limits;
     use crate::common::strategy::Target;
-    use crate::laboratory::dataset::tests::dataset;
+    use crate::laboratory::dataset::tests::{calendar, dataset, minute_dataset};
+
+    /// $1,000 on every dollar limit over the test dataset's calendar, flat `flat_before_close_minutes` before the close.
+    pub(crate) fn restrained(
+        flat_before_close_minutes: i64,
+        tradability: BTreeMap<Symbol, Tradability>,
+    ) -> Controls {
+        let thousand = Cash::from_units(1_000 * 1_000_000_000_000);
+        let limits = Limits::new(
+            thousand,
+            thousand,
+            thousand,
+            chrono::TimeDelta::minutes(flat_before_close_minutes),
+        )
+        .unwrap();
+        Controls::Restrained(Restraint::new(limits, calendar(), tradability))
+    }
+
+    /// Flat all session, risk cuts each of the six decisions; with AAPL untradable, the guard holds each buy instead.
+    #[test]
+    fn test_the_restraint_metrics_count_what_risk_and_the_guard_did() {
+        let dataset = minute_dataset(RunId::new(uuid::Uuid::new_v4()));
+        let opening = Opening::new(Cash::from_units(100 * 1_000_000_000_000)).unwrap();
+        let fill_model =
+            FillModel::new(FillStyle::Aggressive, BasisPoints::new(10.0).unwrap()).unwrap();
+        let measured = |controls: Controls| {
+            let replayer = Replayer::controlled(
+                OneShare,
+                fill_model,
+                BarInterval::OneMinute,
+                controls.clone(),
+            )
+            .unwrap();
+            let replay = run(&dataset, &replayer, opening).unwrap();
+            metrics(&replay, &controls, opening)
+                .into_iter()
+                .map(|(metric, value)| (<&str>::from(metric), value))
+                .filter(|(name, _)| ["risk_cuts", "risk_refusals", "orders_held"].contains(name))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            measured(restrained(390, BTreeMap::new())),
+            [
+                ("risk_cuts", 6.0),
+                ("risk_refusals", 0.0),
+                ("orders_held", 0.0)
+            ]
+        );
+        let untradable = BTreeMap::from([(Symbol::new("AAPL").unwrap(), Tradability::Untradable)]);
+        assert_eq!(
+            measured(restrained(15, untradable)),
+            [
+                ("risk_cuts", 0.0),
+                ("risk_refusals", 0.0),
+                ("orders_held", 6.0)
+            ]
+        );
+    }
 
     /// Wants one share of AAPL, whatever it has seen.
     struct OneShare;
@@ -343,7 +403,7 @@ mod tests {
                 ("gross_limit_units", "3".to_string()),
                 ("per_name_limit_units", "2".to_string()),
                 ("daily_loss_limit_units", "1".to_string()),
-                ("flat_before_close_minutes", "15".to_string()),
+                ("flat_before_close_seconds", "900".to_string()),
                 ("tradability", r#"{"AAPL":"untradable"}"#.to_string()),
             ]
         );
@@ -370,7 +430,7 @@ mod tests {
             "gross_limit_units",
             "per_name_limit_units",
             "daily_loss_limit_units",
-            "flat_before_close_minutes",
+            "flat_before_close_seconds",
             "tradability",
         ] {
             assert_eq!(name.parse::<ReplaySetting>().unwrap().to_string(), name);

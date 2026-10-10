@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
 use crate::common::guard::{OrderGuarded, Tradability, guard};
@@ -176,6 +176,14 @@ pub enum ControlsRefusal {
     /// A daily replay decides at the close, where the limits would flatten every target.
     #[error("limits flatten the book before the close, where a daily replay decides")]
     DailyDecision,
+    /// No decision would fall inside the flat window, so a position could be held past the close.
+    #[error(
+        "a flat window of {flat_before_close} before the close is shorter than a {decision} decision"
+    )]
+    WindowShorterThanDecision {
+        flat_before_close: TimeDelta,
+        decision: BarInterval,
+    },
 }
 
 /// A replay so far: the state and book it has reached, the orders awaiting the next bar, and what happened.
@@ -319,15 +327,25 @@ impl<S: Strategy> Replayer<S> {
         }
     }
 
-    /// A replayer under `controls`, refused limits on a daily decision.
+    /// A replayer under `controls`, refused limits on a daily decision or with a flat window no decision falls in.
     pub fn controlled(
         strategy: S,
         fill_model: FillModel,
         decision: BarInterval,
         controls: Controls,
     ) -> Result<Self, ControlsRefusal> {
+        // An intraday bar's length, read off the bar's own end rule.
+        let interval = decision.ends(DateTime::UNIX_EPOCH) - DateTime::UNIX_EPOCH;
         match (&controls, decision) {
             (Controls::Restrained(_), BarInterval::OneDay) => Err(ControlsRefusal::DailyDecision),
+            (Controls::Restrained(restraint), BarInterval::OneMinute | BarInterval::FiveMinute)
+                if restraint.limits.flat_before_close() < interval =>
+            {
+                Err(ControlsRefusal::WindowShorterThanDecision {
+                    flat_before_close: restraint.limits.flat_before_close(),
+                    decision,
+                })
+            }
             (Controls::Restrained(_), BarInterval::OneMinute | BarInterval::FiveMinute)
             | (Controls::Unrestrained, _) => Ok(Self {
                 strategy,
@@ -606,6 +624,14 @@ mod tests {
 
     /// $1,000 on every dollar limit, flat for the last 15 minutes of a 09:30 to 16:00 Monday.
     fn restraint(tradability: BTreeMap<Symbol, Tradability>) -> Controls {
+        restraint_within(TimeDelta::minutes(15), tradability)
+    }
+
+    /// `restraint` going flat `flat_before_close` before the close.
+    fn restraint_within(
+        flat_before_close: TimeDelta,
+        tradability: BTreeMap<Symbol, Tradability>,
+    ) -> Controls {
         let monday = SessionDate::at(day(0));
         let session = crate::common::time::calendar::TradingSession::new(
             monday,
@@ -618,13 +644,7 @@ mod tests {
             crate::common::time::SessionRange::new(monday, monday).unwrap(),
         )
         .unwrap();
-        let limits = Limits::new(
-            cash(1_000),
-            cash(1_000),
-            cash(1_000),
-            TimeDelta::minutes(15),
-        )
-        .unwrap();
+        let limits = Limits::new(cash(1_000), cash(1_000), cash(1_000), flat_before_close).unwrap();
         Controls::Restrained(Restraint::new(limits, calendar, tradability))
     }
 
@@ -655,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_limits_are_refused_on_a_daily_decision() {
+    fn test_limits_are_refused_where_no_decision_falls_in_the_flat_window() {
         let refused = Replayer::controlled(
             Hold(vec![]),
             free(),
@@ -663,6 +683,25 @@ mod tests {
             restraint(BTreeMap::new()),
         );
         assert_eq!(refused.err(), Some(ControlsRefusal::DailyDecision));
+        let five_minute = Replayer::controlled(
+            Hold(vec![]),
+            free(),
+            BarInterval::FiveMinute,
+            restraint(BTreeMap::new()),
+        );
+        assert!(five_minute.is_ok());
+        let exact = restraint_within(TimeDelta::minutes(5), BTreeMap::new());
+        let exact = Replayer::controlled(Hold(vec![]), free(), BarInterval::FiveMinute, exact);
+        assert!(exact.is_ok());
+        let short = restraint_within(TimeDelta::minutes(4), BTreeMap::new());
+        let refused = Replayer::controlled(Hold(vec![]), free(), BarInterval::FiveMinute, short);
+        assert_eq!(
+            refused.err(),
+            Some(ControlsRefusal::WindowShorterThanDecision {
+                flat_before_close: TimeDelta::minutes(4),
+                decision: BarInterval::FiveMinute,
+            })
+        );
         let unrestrained = Replayer::controlled(
             Hold(vec![]),
             free(),

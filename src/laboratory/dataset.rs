@@ -171,19 +171,50 @@ pub(crate) mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
     }
 
-    /// Sessions 0, 1 and 3 read by `run` with one, two and three bars, and session 2 missing.
-    pub(crate) fn dataset(run: RunId) -> Dataset {
+    /// Sessions 0 to 3, each trading 09:30 to 16:00 Eastern.
+    pub(crate) fn calendar() -> TradingCalendar {
         let (open, close) = (
             chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
             chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
         );
-        let calendar = TradingCalendar::new(
+        TradingCalendar::new(
             (0..4)
                 .map(|day| TradingSession::new(session(day), open, close).unwrap())
                 .collect(),
             SessionRange::new(session(0), session(3)).unwrap(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// `dataset` with each session read as two AAPL minute bars an hour before the close, opening at $10.
+    pub(crate) fn minute_dataset(run: RunId) -> Dataset {
+        let mut dataset = dataset(run);
+        let price = |dollars: f64| Price::from_dollars(dollars).unwrap();
+        dataset.bars = dataset
+            .bars
+            .into_keys()
+            .map(|day| {
+                let minutes = [60, 59].map(|before| {
+                    Bar::new(
+                        Symbol::new("AAPL").unwrap(),
+                        BarInterval::OneMinute,
+                        day.regular_close() - chrono::TimeDelta::minutes(before),
+                        BarPrices::new(price(10.0), price(10.0), price(10.0), price(10.0)).unwrap(),
+                        Shares::from_float(100.0).unwrap(),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                });
+                (day, BarPartition::try_from(minutes.to_vec()).unwrap())
+            })
+            .collect();
+        dataset
+    }
+
+    /// Sessions 0, 1 and 3 read by `run` with one, two and three bars, and session 2 missing.
+    pub(crate) fn dataset(run: RunId) -> Dataset {
+        let calendar = calendar();
         let price = |dollars: f64| Price::from_dollars(dollars).unwrap();
         let bars = |day: i64, count: usize| {
             let bar = Bar::new(

@@ -378,6 +378,48 @@ mod tests {
         assert_eq!(comparison.candidate(), comparison.baseline());
     }
 
+    /// Both arms replay under the one set of controls: the guard holds each of the candidate's six buys, and the flat
+    /// baseline is judged by risk at each of its six decisions too.
+    #[test]
+    fn test_a_restrained_comparison_restrains_both_arms() {
+        let directory = std::env::temp_dir().join(format!("fund-compare-{}", uuid::Uuid::new_v4()));
+        let mut study = Study::open(Label::new("compare check").unwrap(), &directory).unwrap();
+        let dataset = crate::laboratory::dataset::tests::minute_dataset(study.run_id());
+        let untradable = BTreeMap::from([(
+            Symbol::new("AAPL").unwrap(),
+            crate::common::guard::Tradability::Untradable,
+        )]);
+        let comparison = compare(
+            &mut study,
+            &dataset,
+            Arm::new(OneShare, "one_share", &Parameters::default()).unwrap(),
+            Arm::new(Flat, "flat", &Parameters::default()).unwrap(),
+            fill_model(),
+            BarInterval::OneMinute,
+            opening(),
+            crate::laboratory::replay::tests::restrained(15, untradable),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let (candidate, baseline) = (comparison.candidate(), comparison.baseline());
+        assert_eq!(
+            [
+                candidate.fills().len(),
+                candidate.held().len(),
+                candidate.restraints().len()
+            ],
+            [0, 6, 6]
+        );
+        assert_eq!(
+            [
+                baseline.fills().len(),
+                baseline.held().len(),
+                baseline.restraints().len()
+            ],
+            [0, 0, 6]
+        );
+    }
+
     /// A comparison with no bar to decide on is refused before anything is journaled.
     #[test]
     fn test_a_comparison_with_nothing_to_decide_on_is_refused() {
