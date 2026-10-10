@@ -84,6 +84,9 @@ This is a collection of guidelines and references.
   compiler flags every site that needs attention when a variant is added, but only if no arm swallows the rest
 - Model state machines with two enums (states and transitions) matched as a tuple:
   `match (current_state, transition) { ... }` — keeps business logic exhaustive and legible
+- Dispatch statically: take a generic or `impl Trait`, and when the type varies at runtime reach for an enum over
+  the closed set; use `dyn` only where a type must be erased at runtime: an open set, a stored callback, or a
+  parameter of a closure, which cannot itself be generic
 - `Option` means unmeasurable, never zero — zero is a measurement and absence is not
 - An absence carries its cause: when something is missing or refused, the type records why, along with the
   number that produced the refusal
