@@ -33,7 +33,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Schedules are UTC: the archiver folds the session that closed the previous Eastern day, and its stop bounds the heal.
+# Schedules are UTC: the archiver folds the session that closed the previous Eastern day, and its stop bounds the heal;
+# the trader starts at least an hour before the 09:30 Eastern open and stops past the 16:00 close in either offset.
 case "$ROLE" in
   archiver)
     INSTANCE_TYPE="r6i.2xlarge"
@@ -44,8 +45,12 @@ case "$ROLE" in
     STOP_EXPRESSION="cron(0 12 * * ? *)"
     ;;
   trader)
-    echo "Error: the trader role is not provisioned by this script yet" >&2
-    exit 1
+    INSTANCE_TYPE="m7g.large"
+    ARCHITECTURE="arm64"
+    VOLUME_SIZE_GB=50
+    BINARY="trader"
+    START_EXPRESSION="cron(30 12 ? * MON-FRI *)"
+    STOP_EXPRESSION="cron(30 21 ? * MON-FRI *)"
     ;;
   researcher)
     echo "The researcher role is reserved: studies run on demand and nothing provisions a box for them yet"
@@ -242,6 +247,22 @@ case "$ROLE" in
     {"Sid": "ListRecordsForTheViewCheck", "Effect": "Allow", "Action": ["s3:ListBucket"],
      "Resource": "arn:aws:s3:::${RECORDS_BUCKET}",
      "Condition": {"StringLike": {"s3:prefix": ["records/*"]}}},
+JSON
+)"
+    ;;
+  trader)
+    # No ListBucket on the records bucket, so on a host S3 answers a missing playbook 403 and the trader reports it unread.
+    ROLE_STATEMENTS="$(cat <<JSON
+    {"Sid": "ReadArchiveData", "Effect": "Allow", "Action": ["s3:GetObject"],
+     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}/data/equity/*"},
+    {"Sid": "ListArchive", "Effect": "Allow", "Action": ["s3:ListBucket"],
+     "Resource": "arn:aws:s3:::${ARCHIVE_BUCKET}",
+     "Condition": {"StringLike": {"s3:prefix": ["data/equity/*"]}}},
+    {"Sid": "ReadPlaybook", "Effect": "Allow", "Action": ["s3:GetObject"],
+     "Resource": "arn:aws:s3:::${RECORDS_BUCKET}/configuration/playbook.toml"},
+    {"Sid": "ReadBackOwnRecords", "Effect": "Allow", "Action": ["s3:GetObject"],
+     "Resource": ["arn:aws:s3:::${RECORDS_BUCKET}/records/journal/producer=${ROLE}/*",
+                  "arn:aws:s3:::${RECORDS_BUCKET}/records/logs/producer=${ROLE}/*"]},
 JSON
 )"
     ;;

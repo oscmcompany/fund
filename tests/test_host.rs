@@ -73,7 +73,8 @@ fn test_each_role_is_answered_before_any_aws_call() {
             (
                 "trader".to_string(),
                 1,
-                "Error: the trader role is not provisioned by this script yet".to_string()
+                "Error: --profile must be production or development/<name>; got \"not-a-profile\""
+                    .to_string()
             ),
             (
                 "researcher".to_string(),
@@ -104,7 +105,8 @@ fn test_each_role_is_answered_before_any_build() {
             (
                 "trader".to_string(),
                 1,
-                "Error: the trader role is not built yet".to_string()
+                "Error: FUND_PROFILE is not set; it names the profile whose secrets the trader reads"
+                    .to_string()
             ),
             (
                 "researcher".to_string(),
@@ -178,6 +180,10 @@ struct Provisioned {
 
 impl Provisioned {
     fn run(profile: &str, environment: &[(&str, &str)]) -> Self {
+        Self::run_role("archiver", profile, environment)
+    }
+
+    fn run_role(role: &str, profile: &str, environment: &[(&str, &str)]) -> Self {
         let directory =
             std::env::temp_dir().join(format!("provision-host-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -194,7 +200,7 @@ impl Provisioned {
         let path = format!("{}:{}", directory.display(), std::env::var("PATH").unwrap());
         let output = Command::new("bash")
             .arg(script("provision-host"))
-            .args(["--role", "archiver", "--profile", profile, "--apply"])
+            .args(["--role", role, "--profile", profile, "--apply"])
             .env("PATH", path)
             .env("STUB_DIRECTORY", &directory)
             .env("BOOTSTRAP_POLL_SECONDS", "0")
@@ -428,4 +434,94 @@ fn test_a_refused_box_is_never_scheduled_and_only_a_bootstrapping_one_is_granted
             );
         }
     }
+}
+
+#[test]
+fn test_a_new_trader_reads_its_playbook_and_writes_only_its_own_records() {
+    let provisioned = Provisioned::run_role("trader", "development/a.b", &[]);
+    assert_eq!(provisioned.code, 0, "{}", provisioned.output);
+    let grant = provisioned.json("policy-trader.json");
+    let records = "arn:aws:s3:::oscm-fund-development-a-b";
+    let mut granted: Vec<(String, String, String)> = grant["Statement"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|statement| {
+            let listed = |field: &str| match &statement[field] {
+                serde_json::Value::Array(values) => values
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_string())
+                    .collect(),
+                serde_json::Value::String(value) => vec![value.clone()],
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Object(_) => panic!("{field} is not a string or a list"),
+            };
+            let condition = statement["Condition"].to_string();
+            listed("Action")
+                .into_iter()
+                .filter(|action| action.starts_with("s3:"))
+                .flat_map(|action| {
+                    listed("Resource")
+                        .into_iter()
+                        .map(move |resource| (action.clone(), resource))
+                })
+                .map(move |(action, resource)| (action, resource, condition.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    granted.sort();
+    let unconditioned = "null".to_string();
+    assert_eq!(
+        granted,
+        [
+            (
+                "s3:GetObject".to_string(),
+                "arn:aws:s3:::oscm-fund-archive/data/equity/*".to_string(),
+                unconditioned.clone()
+            ),
+            (
+                "s3:GetObject".to_string(),
+                format!("{records}/configuration/playbook.toml"),
+                unconditioned.clone()
+            ),
+            (
+                "s3:GetObject".to_string(),
+                format!("{records}/records/journal/producer=trader/*"),
+                unconditioned.clone()
+            ),
+            (
+                "s3:GetObject".to_string(),
+                format!("{records}/records/logs/producer=trader/*"),
+                unconditioned.clone()
+            ),
+            (
+                "s3:ListBucket".to_string(),
+                "arn:aws:s3:::oscm-fund-archive".to_string(),
+                r#"{"StringLike":{"s3:prefix":["data/equity/*"]}}"#.to_string()
+            ),
+            (
+                "s3:PutObject".to_string(),
+                format!("{records}/records/journal/producer=trader/*"),
+                unconditioned.clone()
+            ),
+            (
+                "s3:PutObject".to_string(),
+                format!("{records}/records/logs/producer=trader/*"),
+                unconditioned
+            ),
+        ]
+    );
+    let start = provisioned.json("target-fund-trader-development-a-b-start.json");
+    assert_eq!(
+        start["Arn"],
+        "arn:aws:scheduler:::aws-sdk:ec2:startInstances"
+    );
+    assert!(
+        provisioned.output.contains("cron(30 12 ? * MON-FRI *)")
+            && provisioned.output.contains("cron(30 21 ? * MON-FRI *)"),
+        "{}",
+        provisioned.output
+    );
 }

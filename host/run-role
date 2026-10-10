@@ -7,10 +7,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 role="${1:-}"
 case "$role" in
   archiver) binary=archive_nightly ;;
-  trader)
-    echo "Error: the trader role is not built yet"
-    exit 1
-    ;;
+  trader) binary=trader ;;
   researcher)
     echo "The researcher role is reserved: studies run on demand and nothing schedules one yet"
     exit 0
@@ -48,4 +45,5 @@ case "$role" in
     [[ "$status" -ne 0 ]] && exit "$status"
     exit "$views"
     ;;
+  trader) with_secrets "target/release/$binary" ;;
 esac
