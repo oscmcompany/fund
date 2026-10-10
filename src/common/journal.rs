@@ -212,6 +212,7 @@ pub enum Observation {
     ObjectWritten(ObjectWritten),
     ObjectDeleted(ObjectDeleted),
     HealFinished(HealFinished),
+    ViewsChecked(ViewsChecked),
     DatasetRead(Box<DatasetRead>),
     ExperimentRan(Box<ExperimentRan>),
     OrderSubmitted(OrderSubmitted),
@@ -485,6 +486,48 @@ impl HealFinished {
 
     pub fn outcomes(&self) -> &BTreeMap<Leg, BTreeMap<SessionDate, SessionOutcome>> {
         &self.outcomes
+    }
+}
+
+/// How `check-views` ended, read from its exit status: 0, 3 and 1 are its own answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewsCheck {
+    /// Every view created and read as this profile expects.
+    Expected,
+    /// At least one view did not create, or a required one read no rows.
+    Unexpected,
+    /// No live view could be read, so the check was not made.
+    NotMade,
+    /// The script ended some other way; `code` is absent when a signal stopped it or it never started.
+    Stopped { code: Option<i32> },
+}
+
+impl ViewsCheck {
+    pub fn from_exit(code: Option<i32>) -> Self {
+        match code {
+            Some(0) => Self::Expected,
+            Some(3) => Self::Unexpected,
+            Some(1) => Self::NotMade,
+            code => Self::Stopped { code },
+        }
+    }
+}
+
+/// A run's check of the archive's views, with every line the script printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewsChecked {
+    check: ViewsCheck,
+    report: Vec<String>,
+}
+
+impl ViewsChecked {
+    pub fn new(check: ViewsCheck, report: Vec<String>) -> Self {
+        Self { check, report }
+    }
+
+    pub fn check(&self) -> ViewsCheck {
+        self.check
     }
 }
 
@@ -1029,6 +1072,14 @@ mod tests {
             Observation::PlaybookRead(crate::common::playbook::PlaybookRead::new(
                 "roll_off_minutes = 5\n".to_string(),
             )),
+            Observation::ViewsChecked(ViewsChecked::new(
+                ViewsCheck::Unexpected,
+                vec!["journal: reads no rows".to_string()],
+            )),
+            Observation::ViewsChecked(ViewsChecked::new(
+                ViewsCheck::Stopped { code: None },
+                Vec::new(),
+            )),
         ];
         let payloads: Vec<String> = observations
             .iter()
@@ -1059,6 +1110,8 @@ mod tests {
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","stretch":null,"wanted":{"SPY":5000000},"refused":{"unpriced":{"symbol":"SPY"}}}}"#.to_string(),
                 r#"{"event_type":"session_opened","payload":{"session":"2026-10-07","cash":"-7","positions":{"SPY":"2000000"},"opening":"9"}}"#.to_string(),
                 r#"{"event_type":"playbook_read","payload":{"contents":"roll_off_minutes = 5\n"}}"#.to_string(),
+                r#"{"event_type":"views_checked","payload":{"check":"unexpected","report":["journal: reads no rows"]}}"#.to_string(),
+                r#"{"event_type":"views_checked","payload":{"check":{"stopped":{"code":null}},"report":[]}}"#.to_string(),
             ]
         );
         for (observation, payload) in observations.iter().zip(&payloads) {
@@ -1321,6 +1374,24 @@ mod tests {
                 observation
             );
         }
+    }
+
+    #[test]
+    fn test_a_views_check_reads_the_scripts_exit_status() {
+        let checks: Vec<ViewsCheck> = [Some(0), Some(3), Some(1), Some(2), None]
+            .into_iter()
+            .map(ViewsCheck::from_exit)
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ViewsCheck::Expected,
+                ViewsCheck::Unexpected,
+                ViewsCheck::NotMade,
+                ViewsCheck::Stopped { code: Some(2) },
+                ViewsCheck::Stopped { code: None },
+            ]
+        );
     }
 
     #[test]

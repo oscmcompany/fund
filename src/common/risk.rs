@@ -103,6 +103,18 @@ impl Limits {
             flat_before_close,
         })
     }
+
+    pub fn dollars(&self, limit: Limit) -> Cash {
+        match limit {
+            Limit::Gross => self.gross.cash(),
+            Limit::PerName => self.per_name.cash(),
+            Limit::DailyLoss => self.daily_loss.cash(),
+        }
+    }
+
+    pub fn flat_before_close(&self) -> TimeDelta {
+        self.flat_before_close
+    }
 }
 
 /// A target after risk, with every cut that changed it, in the order they applied.

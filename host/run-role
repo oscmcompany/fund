@@ -31,19 +31,4 @@ if ! cargo build -q --release --bin "$binary"; then
   echo "Error: building $binary at $(git rev-parse --short HEAD) failed; running the previous build"
 fi
 
-with_secrets() {
-  secretspec run --profile "$FUND_PROFILE" --reason "Running the $role role" -- "$@"
-}
-
-case "$role" in
-  archiver)
-    status=0
-    with_secrets "target/release/$binary" || status=$?
-    views=0
-    with_secrets ./check-views || views=$?
-    echo "Archiver finished with status $status, its views with $views"
-    [[ "$status" -ne 0 ]] && exit "$status"
-    exit "$views"
-    ;;
-  trader) with_secrets "target/release/$binary" ;;
-esac
+exec secretspec run --profile "$FUND_PROFILE" --reason "Running the $role role" -- "target/release/$binary"

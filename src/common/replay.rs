@@ -1,20 +1,24 @@
-//! Replays a strategy over archived bars: each decision bar's close is decided on and filled at the next bar's open.
-//! The stream acts on a replay, so replaying two consecutive stretches in turn equals replaying both at once.
+//! Replays a strategy over archived bars: each decision bar's close is decided on and filled at the next bar's open,
+//! through risk and the guard when restrained as the trader is live. The stream acts on a replay, so replaying two
+//! consecutive stretches in turn equals replaying both at once.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
+use crate::common::guard::{OrderGuarded, Tradability, guard};
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::{Bar, BarInterval};
 use crate::common::market::state::{MarketEvent, MarketState};
 use crate::common::market::{DollarVolume, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
+use crate::common::risk::{Cut, Limits, risk};
 use crate::common::strategy::{Order, Strategy, orders};
 use crate::common::time::SessionDate;
+use crate::common::time::calendar::TradingCalendar;
 
 /// The grid a crossing's charge is rounded to: hundred-millionths of the notional, so a basis point is 10,000.
 const RATE_SCALE: u128 = 100_000_000;
@@ -99,11 +103,87 @@ impl Unfilled {
     }
 }
 
-/// The strategy, its fill model and the interval it decides on: what acts on a replay.
+/// The strategy, its fill model, the interval it decides on and what stands between its target and its orders: what
+/// acts on a replay.
 pub struct Replayer<S> {
     strategy: S,
     fill_model: FillModel,
     decision: BarInterval,
+    controls: Controls,
+}
+
+/// What stands between a replayed strategy's target and its orders.
+#[derive(Debug, Clone, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum Controls {
+    /// Every target becomes orders as decided.
+    Unrestrained,
+    /// Risk and then the guard apply, as the trader applies them live.
+    Restrained(Restraint),
+}
+
+/// The limits, calendar and tradability a restrained replay applies. Risk prices off the decision interval's last
+/// close where the trader prices off a fresh one-minute close, a known seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restraint {
+    limits: Limits,
+    calendar: TradingCalendar,
+    tradability: BTreeMap<Symbol, Tradability>,
+}
+
+impl Restraint {
+    /// A symbol `tradability` does not name trades whole and fractional shares.
+    pub fn new(
+        limits: Limits,
+        calendar: TradingCalendar,
+        tradability: BTreeMap<Symbol, Tradability>,
+    ) -> Self {
+        Self {
+            limits,
+            calendar,
+            tradability,
+        }
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    pub fn tradability(&self) -> &BTreeMap<Symbol, Tradability> {
+        &self.tradability
+    }
+
+    /// Every symbol `orders` name, read from the map or else fractionable.
+    fn tradability_of(&self, orders: &[Order]) -> BTreeMap<Symbol, Tradability> {
+        orders
+            .iter()
+            .map(|order| {
+                let symbol = order.symbol().clone();
+                let tradability = self
+                    .tradability
+                    .get(&symbol)
+                    .copied()
+                    .unwrap_or(Tradability::Fractionable);
+                (symbol, tradability)
+            })
+            .collect()
+    }
+}
+
+/// Why a replayer was refused its controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ControlsRefusal {
+    /// A daily replay decides at the close, where the limits would flatten every target.
+    #[error("limits flatten the book before the close, where a daily replay decides")]
+    DailyDecision,
+    /// No decision would fall inside the flat window, so a position could be held past the close.
+    #[error(
+        "a flat window of {flat_before_close} before the close is shorter than a {decision} decision"
+    )]
+    WindowShorterThanDecision {
+        flat_before_close: TimeDelta,
+        decision: BarInterval,
+    },
 }
 
 /// A replay so far: the state and book it has reached, the orders awaiting the next bar, and what happened.
@@ -117,6 +197,9 @@ pub struct Replay {
     fills: Vec<Fill>,
     unfilled: Vec<Unfilled>,
     marks: BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
+    /// Under restraint, what risk cut at each decision, or why it could not judge and nothing was sent.
+    restraints: BTreeMap<DateTime<Utc>, Result<Vec<Cut>, ValuationRefusal>>,
+    held: Vec<(DateTime<Utc>, OrderGuarded)>,
 }
 
 /// Why a stretch of bars was refused.
@@ -146,6 +229,8 @@ impl Replay {
             fills: Vec::new(),
             unfilled: Vec::new(),
             marks: BTreeMap::new(),
+            restraints: BTreeMap::new(),
+            held: Vec::new(),
         }
     }
 
@@ -167,6 +252,16 @@ impl Replay {
         &self.marks
     }
 
+    /// Under restraint, what risk cut at each decision, or why it could not judge it.
+    pub fn restraints(&self) -> &BTreeMap<DateTime<Utc>, Result<Vec<Cut>, ValuationRefusal>> {
+        &self.restraints
+    }
+
+    /// Under restraint, each order the guard held and the decision it came from.
+    pub fn held(&self) -> &[(DateTime<Utc>, OrderGuarded)] {
+        &self.held
+    }
+
     /// Each marked session's return from the previous session's last mark, or `opening` before the first, to its own
     /// last mark.
     pub fn session_returns(&self, opening: Cash) -> Result<Series, SeriesRefusal> {
@@ -185,6 +280,20 @@ impl Replay {
         }
         self
     }
+}
+
+/// The worth a session at `at` opened with: the previous session's last mark, or this session's first before any.
+fn session_opening(
+    marks: &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
+    at: DateTime<Utc>,
+) -> Result<Cash, ValuationRefusal> {
+    let (start, _) = SessionDate::at(at).bounds();
+    marks
+        .range(..start)
+        .next_back()
+        .or_else(|| marks.range(start..).next())
+        .map(|(_, mark)| mark.clone())
+        .expect("the decision at `at` is marked before its session's opening is read")
 }
 
 /// Unmeasured where either end of a session went unpriced or its start was worth nothing or less.
@@ -214,7 +323,41 @@ impl<S: Strategy> Replayer<S> {
             strategy,
             fill_model,
             decision,
+            controls: Controls::Unrestrained,
         }
+    }
+
+    /// A replayer under `controls`, refused limits on a daily decision or with a flat window no decision falls in.
+    pub fn controlled(
+        strategy: S,
+        fill_model: FillModel,
+        decision: BarInterval,
+        controls: Controls,
+    ) -> Result<Self, ControlsRefusal> {
+        // An intraday bar's length, read off the bar's own end rule.
+        let interval = decision.ends(DateTime::UNIX_EPOCH) - DateTime::UNIX_EPOCH;
+        match (&controls, decision) {
+            (Controls::Restrained(_), BarInterval::OneDay) => Err(ControlsRefusal::DailyDecision),
+            (Controls::Restrained(restraint), BarInterval::OneMinute | BarInterval::FiveMinute)
+                if restraint.limits.flat_before_close() < interval =>
+            {
+                Err(ControlsRefusal::WindowShorterThanDecision {
+                    flat_before_close: restraint.limits.flat_before_close(),
+                    decision,
+                })
+            }
+            (Controls::Restrained(_), BarInterval::OneMinute | BarInterval::FiveMinute)
+            | (Controls::Unrestrained, _) => Ok(Self {
+                strategy,
+                fill_model,
+                decision,
+                controls,
+            }),
+        }
+    }
+
+    pub fn controls(&self) -> &Controls {
+        &self.controls
     }
 
     pub fn fill_model(&self) -> FillModel {
@@ -297,7 +440,41 @@ impl<S: Strategy> Replayer<S> {
                 .book
                 .value(|symbol| state.last_price(symbol, self.decision));
             replay.marks.insert(ends, mark);
-            replay.pending = orders(&replay.book, &self.strategy.decide(state, &replay.book));
+            let wanted = self.strategy.decide(state, &replay.book);
+            replay.pending = match &self.controls {
+                Controls::Unrestrained => orders(&replay.book, &wanted),
+                Controls::Restrained(restraint) => {
+                    let price = |symbol: &Symbol| state.last_price(symbol, self.decision);
+                    let restrained = session_opening(&replay.marks, ends).and_then(|opening| {
+                        risk(
+                            &restraint.limits,
+                            restraint.calendar.phase_at(ends),
+                            opening,
+                            &replay.book,
+                            price,
+                            wanted,
+                        )
+                    });
+                    match restrained {
+                        Ok(restrained) => {
+                            replay
+                                .restraints
+                                .insert(ends, Ok(restrained.cuts().to_vec()));
+                            let wanted = orders(&replay.book, restrained.target());
+                            let tradability = restraint.tradability_of(&wanted);
+                            let guarded = guard(wanted, &tradability, price);
+                            replay
+                                .held
+                                .extend(guarded.held().iter().cloned().map(|held| (ends, held)));
+                            guarded.passed().to_vec()
+                        }
+                        Err(refusal) => {
+                            replay.restraints.insert(ends, Err(refusal));
+                            Vec::new()
+                        }
+                    }
+                }
+            };
         }
         replay
     }
@@ -438,6 +615,145 @@ mod tests {
 
     fn replayer<S: Strategy>(strategy: S) -> Replayer<S> {
         Replayer::new(strategy, free(), BarInterval::OneDay)
+    }
+
+    /// Monday 2026-09-21, `minutes` before its 16:00 Eastern close.
+    fn before_close(minutes: i64) -> DateTime<Utc> {
+        day(0) - TimeDelta::minutes(minutes)
+    }
+
+    /// $1,000 on every dollar limit, flat for the last 15 minutes of a 09:30 to 16:00 Monday.
+    fn restraint(tradability: BTreeMap<Symbol, Tradability>) -> Controls {
+        restraint_within(TimeDelta::minutes(15), tradability)
+    }
+
+    /// `restraint` going flat `flat_before_close` before the close.
+    fn restraint_within(
+        flat_before_close: TimeDelta,
+        tradability: BTreeMap<Symbol, Tradability>,
+    ) -> Controls {
+        let monday = SessionDate::at(day(0));
+        let session = crate::common::time::calendar::TradingSession::new(
+            monday,
+            chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let calendar = TradingCalendar::new(
+            vec![session],
+            crate::common::time::SessionRange::new(monday, monday).unwrap(),
+        )
+        .unwrap();
+        let limits = Limits::new(cash(1_000), cash(1_000), cash(1_000), flat_before_close).unwrap();
+        Controls::Restrained(Restraint::new(limits, calendar, tradability))
+    }
+
+    /// One share of AAPL wanted at a minute bar's close and filled at the next one's open.
+    fn one_minute_of(controls: Controls, minutes_before_close: i64) -> Replay {
+        let replayer = Replayer::controlled(
+            Hold(vec![("AAPL", 1)]),
+            free(),
+            BarInterval::OneMinute,
+            controls,
+        )
+        .unwrap();
+        let first = before_close(minutes_before_close);
+        let bars = [
+            bar("AAPL", BarInterval::OneMinute, first, 1000, 1000),
+            bar(
+                "AAPL",
+                BarInterval::OneMinute,
+                first + TimeDelta::minutes(1),
+                1000,
+                1000,
+            ),
+        ];
+        replayer
+            .act(Replay::open(Book::funded(cash(100))), bars)
+            .unwrap()
+            .finish()
+    }
+
+    #[test]
+    fn test_limits_are_refused_where_no_decision_falls_in_the_flat_window() {
+        let refused = Replayer::controlled(
+            Hold(vec![]),
+            free(),
+            BarInterval::OneDay,
+            restraint(BTreeMap::new()),
+        );
+        assert_eq!(refused.err(), Some(ControlsRefusal::DailyDecision));
+        let five_minute = Replayer::controlled(
+            Hold(vec![]),
+            free(),
+            BarInterval::FiveMinute,
+            restraint(BTreeMap::new()),
+        );
+        assert!(five_minute.is_ok());
+        let exact = restraint_within(TimeDelta::minutes(5), BTreeMap::new());
+        let exact = Replayer::controlled(Hold(vec![]), free(), BarInterval::FiveMinute, exact);
+        assert!(exact.is_ok());
+        let short = restraint_within(TimeDelta::minutes(4), BTreeMap::new());
+        let refused = Replayer::controlled(Hold(vec![]), free(), BarInterval::FiveMinute, short);
+        assert_eq!(
+            refused.err(),
+            Some(ControlsRefusal::WindowShorterThanDecision {
+                flat_before_close: TimeDelta::minutes(4),
+                decision: BarInterval::FiveMinute,
+            })
+        );
+        let unrestrained = Replayer::controlled(
+            Hold(vec![]),
+            free(),
+            BarInterval::OneDay,
+            Controls::Unrestrained,
+        );
+        assert!(unrestrained.is_ok());
+    }
+
+    /// Mid-session the wanted share fills as it would unrestrained; inside the flat window risk empties the target.
+    #[test]
+    fn test_a_restrained_replay_goes_flat_before_the_close() {
+        let midday = one_minute_of(restraint(BTreeMap::new()), 240);
+        assert_eq!(midday.fills().len(), 1);
+        assert_eq!(midday.restraints().values().next(), Some(&Ok(Vec::new())));
+        let late = one_minute_of(restraint(BTreeMap::new()), 10);
+        assert_eq!(late.fills().len(), 0);
+        let cuts = late.restraints().values().next().unwrap().as_ref().unwrap();
+        assert!(matches!(
+            cuts.as_slice(),
+            [Cut::OutsideTradingWindow { .. }]
+        ));
+        assert_eq!(one_minute_of(Controls::Unrestrained, 10).fills().len(), 1);
+    }
+
+    /// The guard holds the untradable buy at each decision, as the trader retries it each tick.
+    #[test]
+    fn test_a_restrained_replay_holds_what_the_guard_holds() {
+        let untradable = BTreeMap::from([(symbol("AAPL"), Tradability::Untradable)]);
+        let replay = one_minute_of(restraint(untradable), 240);
+        assert_eq!(replay.fills().len(), 0);
+        let held: Vec<_> = replay.held().iter().map(|(at, _)| *at).collect();
+        assert_eq!(held, [before_close(239), before_close(238)]);
+    }
+
+    /// A session opens at the previous session's last mark, and the first session at its own first mark.
+    #[test]
+    fn test_a_session_opens_at_the_last_mark_before_it() {
+        let units = |units: i128| Ok(Cash::from_units(units));
+        let marks = BTreeMap::from([
+            (day(0) - TimeDelta::hours(5), units(100)),
+            (day(0) - TimeDelta::hours(1), units(90)),
+            (day(1) - TimeDelta::hours(5), units(80)),
+        ]);
+        assert_eq!(
+            session_opening(&marks, day(0) - TimeDelta::hours(1)),
+            units(100)
+        );
+        assert_eq!(
+            session_opening(&marks, day(1) - TimeDelta::hours(5)),
+            units(90)
+        );
     }
 
     /// A session runs from the last mark before it to its own last; an unpriced end leaves it and the next session
