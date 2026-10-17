@@ -29,10 +29,11 @@ pub struct Limits {
 
 /// A dollar limit's cash units, positive and at most `MAXIMUM_LIMIT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DollarLimit(u128);
+pub struct DollarLimit(u128);
 
 impl DollarLimit {
-    fn new(limit: Limit, value: Cash) -> Result<Self, LimitsRefusal> {
+    /// `value` as the limit named `limit`, which a refusal names.
+    pub fn new(limit: Limit, value: Cash) -> Result<Self, LimitsRefusal> {
         match u128::try_from(value.units()) {
             Ok(0) | Err(_) => Err(LimitsRefusal::NotPositive { limit, value }),
             Ok(units) if units > MAXIMUM_LIMIT => Err(LimitsRefusal::BeyondRange { limit, value }),
@@ -40,7 +41,7 @@ impl DollarLimit {
         }
     }
 
-    fn units(self) -> u128 {
+    pub fn units(self) -> u128 {
         self.0
     }
 
