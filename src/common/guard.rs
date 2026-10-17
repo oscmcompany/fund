@@ -174,7 +174,9 @@ mod tests {
     use super::*;
     use crate::common::book::{Book, Cash, Fill, Position};
     use crate::common::monoid::{Monoid, concatenate};
-    use crate::common::risk::{Limits, risk};
+    use crate::common::problem::formulate;
+    use crate::common::risk::Limits;
+    use crate::common::solver::Solver;
     use crate::common::strategy::{Target, orders};
     use crate::common::time::calendar::SessionPhase;
 
@@ -462,15 +464,17 @@ mod tests {
     /// passed order fills at its price.
     fn chain(decision: &Decision) -> (Target, Guarded, Book) {
         let price = |symbol: &Symbol| decision.prices.get(symbol).copied();
-        let restrained = risk(
-            &decision.limits,
-            decision.phase,
-            decision.opening,
-            &decision.book,
-            price,
-            decision.wanted.clone(),
-        )
-        .unwrap();
+        let restrained = Solver::Clip.solve(
+            &formulate(
+                &decision.limits,
+                decision.phase,
+                decision.opening,
+                &decision.book,
+                price,
+                decision.wanted.clone(),
+            )
+            .unwrap(),
+        );
         let guarded = guard(
             orders(&decision.book, restrained.target()),
             &decision.readings,
