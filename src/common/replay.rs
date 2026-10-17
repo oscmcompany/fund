@@ -16,7 +16,9 @@ use crate::common::market::state::{MarketEvent, MarketState, Staleness};
 use crate::common::market::trade_bars::TradeBar;
 use crate::common::market::{DollarVolume, Price, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
-use crate::common::risk::{Cut, Limits, risk};
+use crate::common::problem::formulate;
+use crate::common::risk::{Cut, Limits};
+use crate::common::solver::Solver;
 use crate::common::strategy::{Order, Strategy, orders};
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
@@ -472,7 +474,7 @@ impl<S: Strategy> Replayer<S> {
                         state.fresh_price(symbol, self.decision, ends, restraint.stale_after)
                     };
                     let restrained = session_opening(&replay.marks, ends).and_then(|opening| {
-                        risk(
+                        formulate(
                             &restraint.limits,
                             restraint.calendar.phase_at(ends),
                             opening,
@@ -480,6 +482,7 @@ impl<S: Strategy> Replayer<S> {
                             price,
                             wanted,
                         )
+                        .map(|problem| Solver::Clip.solve(&problem))
                     });
                     match restrained {
                         Ok(restrained) => {

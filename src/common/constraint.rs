@@ -133,7 +133,6 @@ mod tests {
     use crate::common::book::Cash;
     use crate::common::market::Shares;
     use crate::common::monoid::{concatenate, laws};
-    use crate::common::risk::Limit;
 
     const DOLLAR: i128 = 1_000_000_000_000;
 
@@ -142,7 +141,7 @@ mod tests {
     }
 
     fn limit(dollars: i128) -> DollarLimit {
-        DollarLimit::new(Limit::Gross, Cash::from_units(dollars * DOLLAR)).unwrap()
+        DollarLimit::new(Cash::from_units(dollars * DOLLAR)).unwrap()
     }
 
     fn target(wanted: &[(&str, u64)]) -> Target {

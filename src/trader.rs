@@ -16,8 +16,10 @@ use crate::common::market::{Price, StampedPrice, Symbol};
 use crate::common::monoid::{Monoid, Tally, concatenate};
 use crate::common::order::{BrokerFailure, OrderSequence};
 use crate::common::playbook::Played;
+use crate::common::problem::formulate;
 use crate::common::reconcile::rounding_allowance;
-use crate::common::risk::{Limits, TargetDecided, risk};
+use crate::common::risk::{Limits, TargetDecided};
+use crate::common::solver::Solver;
 use crate::common::standing::{HaltCause, SessionHalted};
 use crate::common::strategy::Strategy;
 use crate::common::time::SessionDate;
@@ -449,16 +451,18 @@ impl<S: Strategy> Session<S> {
         }
         let wanted = self.strategy.decide(&self.state, &self.book);
         let phase = self.calendar.phase_at(now);
-        let restrained = risk(
+        let solver = Solver::Clip;
+        let restrained = formulate(
             &self.settings.limits,
             phase,
             self.opening,
             &self.book,
             |symbol| self.fresh_price(symbol, now),
             wanted.clone(),
-        );
+        )
+        .map(|problem| solver.solve(&problem));
         let stretch = self.strategy.stretch_at(&self.state);
-        let decided = TargetDecided::new(bar, stretch, wanted, restrained.clone());
+        let decided = TargetDecided::new(bar, stretch, wanted, solver, restrained.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
             self.halt(journal, journal_refused(&error));
             return Err(SessionError::Journal(JournalFailure::before_any_order(

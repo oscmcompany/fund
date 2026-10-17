@@ -1,19 +1,20 @@
-//! The risk layer a strategy's target passes through: flat outside the session's trading window and past the
-//! daily loss limit, then each name and the whole book capped. It only ever lowers a holding, and is idempotent.
-
-use std::collections::BTreeMap;
+//! The risk a target is held to: flat outside the session's trading window and past the daily loss limit, otherwise
+//! each name and the whole book capped; and the record of a decision made under it.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, ValuationRefusal};
+use crate::common::constraint::{Constraint, Constraints};
 use crate::common::market::{Price, Shares, Symbol};
+use crate::common::monoid::concatenate;
 use crate::common::playbook::Stretch;
+use crate::common::solver::Solver;
 use crate::common::strategy::Target;
 use crate::common::time::calendar::SessionPhase;
 
 /// The grid a gross cut's scale is taken on; flooring onto it keeps a cut target inside the limit.
-const SCALE_GRID: u128 = 100_000_000;
+pub(crate) const SCALE_GRID: u128 = 100_000_000;
 
 /// The largest dollar limit, in cash units, whose gross scale `limit * SCALE_GRID` still fits u128.
 const MAXIMUM_LIMIT: u128 = u128::MAX / SCALE_GRID;
@@ -28,15 +29,38 @@ pub struct Limits {
 }
 
 /// A dollar limit's cash units, positive and at most `MAXIMUM_LIMIT`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Cash", into = "Cash")]
 pub struct DollarLimit(u128);
 
+/// Why an amount cannot be a dollar limit, naming the amount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DollarLimitRefusal {
+    #[error("{:.2} dollars is not positive", .value.dollars())]
+    NotPositive { value: Cash },
+    #[error("{:.2} dollars is past the most a limit may be", .value.dollars())]
+    BeyondRange { value: Cash },
+}
+
+impl TryFrom<Cash> for DollarLimit {
+    type Error = DollarLimitRefusal;
+
+    fn try_from(value: Cash) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<DollarLimit> for Cash {
+    fn from(limit: DollarLimit) -> Self {
+        limit.cash()
+    }
+}
+
 impl DollarLimit {
-    /// `value` as the limit named `limit`, which a refusal names.
-    pub fn new(limit: Limit, value: Cash) -> Result<Self, LimitsRefusal> {
+    pub fn new(value: Cash) -> Result<Self, DollarLimitRefusal> {
         match u128::try_from(value.units()) {
-            Ok(0) | Err(_) => Err(LimitsRefusal::NotPositive { limit, value }),
-            Ok(units) if units > MAXIMUM_LIMIT => Err(LimitsRefusal::BeyondRange { limit, value }),
+            Ok(0) | Err(_) => Err(DollarLimitRefusal::NotPositive { value }),
+            Ok(units) if units > MAXIMUM_LIMIT => Err(DollarLimitRefusal::BeyondRange { value }),
             Ok(units) => Ok(Self(units)),
         }
     }
@@ -82,6 +106,15 @@ pub enum LimitsRefusal {
     NegativeWindow { flat_before_close: TimeDelta },
 }
 
+impl LimitsRefusal {
+    fn of(limit: Limit, refusal: DollarLimitRefusal) -> Self {
+        match refusal {
+            DollarLimitRefusal::NotPositive { value } => Self::NotPositive { limit, value },
+            DollarLimitRefusal::BeyondRange { value } => Self::BeyondRange { limit, value },
+        }
+    }
+}
+
 impl Limits {
     /// `gross` caps the target's worth, `per_name` each holding's, `daily_loss` the loss from the session's opening
     /// equity before going flat, and `flat_before_close` how long before the close the target is emptied.
@@ -91,9 +124,12 @@ impl Limits {
         daily_loss: Cash,
         flat_before_close: TimeDelta,
     ) -> Result<Self, LimitsRefusal> {
-        let gross = DollarLimit::new(Limit::Gross, gross)?;
-        let per_name = DollarLimit::new(Limit::PerName, per_name)?;
-        let daily_loss = DollarLimit::new(Limit::DailyLoss, daily_loss)?;
+        let named = |limit, value| {
+            DollarLimit::new(value).map_err(|refusal| LimitsRefusal::of(limit, refusal))
+        };
+        let gross = named(Limit::Gross, gross)?;
+        let per_name = named(Limit::PerName, per_name)?;
+        let daily_loss = named(Limit::DailyLoss, daily_loss)?;
         if flat_before_close < TimeDelta::zero() {
             return Err(LimitsRefusal::NegativeWindow { flat_before_close });
         }
@@ -116,6 +152,73 @@ impl Limits {
     pub fn flat_before_close(&self) -> TimeDelta {
         self.flat_before_close
     }
+
+    /// The risk a target is held to, given where the session stands, the equity it opened with, and the book now;
+    /// refused when a holding has no price, since the loss cannot be read.
+    pub fn risk(
+        &self,
+        phase: SessionPhase,
+        opening: Cash,
+        book: &Book,
+        price: impl Fn(&Symbol) -> Option<Price>,
+    ) -> Result<Risk, ValuationRefusal> {
+        let trading = match phase {
+            SessionPhase::Open { until_close } => until_close > self.flat_before_close,
+            SessionPhase::NoPublishedSession
+            | SessionPhase::BeforeOpen { .. }
+            | SessionPhase::AfterClose => false,
+        };
+        if !trading {
+            return Ok(Risk::Flat(Flat::OutsideTradingWindow { phase }));
+        }
+        let loss = Cash::from_units(
+            opening
+                .units()
+                .checked_sub(book.value(&price)?.units())
+                .expect("cash fits i128"),
+        );
+        if loss >= self.daily_loss.cash() {
+            return Ok(Risk::Flat(Flat::LossLimit { loss }));
+        }
+        Ok(Risk::Capped {
+            per_name: self.per_name,
+            gross: self.gross,
+        })
+    }
+}
+
+/// What risk allows at one decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Risk {
+    Flat(Flat),
+    Capped {
+        per_name: DollarLimit,
+        gross: DollarLimit,
+    },
+}
+
+/// Why risk allows nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Flat {
+    /// The session is not open with more than the flat window left before its close.
+    OutsideTradingWindow { phase: SessionPhase },
+    /// The book has lost `loss` since the session opened, at least the daily limit.
+    LossLimit { loss: Cash },
+}
+
+impl Risk {
+    /// The targets this risk admits.
+    pub fn constraints(&self) -> Constraints {
+        match *self {
+            Self::Flat(_) => Constraints::from(Constraint::Flat),
+            Self::Capped { per_name, gross } => concatenate([
+                Constraints::from(Constraint::PerName(per_name)),
+                Constraints::from(Constraint::Gross(gross)),
+            ]),
+        }
+    }
 }
 
 /// A target after risk, with every cut that changed it, in the order they applied.
@@ -123,9 +226,19 @@ impl Limits {
 pub struct Restrained {
     target: Target,
     cuts: Vec<Cut>,
+    /// `None` on a decision journaled before risk was.
+    risk: Option<Risk>,
 }
 
 impl Restrained {
+    pub(crate) fn new(target: Target, cuts: Vec<Cut>, risk: Risk) -> Self {
+        Self {
+            target,
+            cuts,
+            risk: Some(risk),
+        }
+    }
+
     pub fn target(&self) -> &Target {
         &self.target
     }
@@ -135,8 +248,8 @@ impl Restrained {
     }
 }
 
-/// A decision as journaled: the playbook stretch that decided, the strategy's target and what risk made of it, or why
-/// risk could not price it.
+/// A decision as journaled: the playbook stretch that decided, the strategy's target, the solver asked, and what
+/// risk made of the target, or why risk could not price it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetDecided {
     /// The end of the decision bar decided at; a bar missed by a late call has no record of its own.
@@ -144,6 +257,8 @@ pub struct TargetDecided {
     /// `None` when the state had no clock, so no stretch decided.
     stretch: Option<Stretch>,
     wanted: Target,
+    /// `None` on a decision journaled before solvers were.
+    solver: Option<Solver>,
     #[serde(flatten)]
     decision: Decision,
 }
@@ -161,6 +276,7 @@ impl TargetDecided {
         bar: DateTime<Utc>,
         stretch: Option<Stretch>,
         wanted: Target,
+        solver: Solver,
         restrained: Result<Restrained, ValuationRefusal>,
     ) -> Self {
         let decision = match restrained {
@@ -171,6 +287,7 @@ impl TargetDecided {
             bar,
             stretch,
             wanted,
+            solver: Some(solver),
             decision,
         }
     }
@@ -194,112 +311,24 @@ pub enum Cut {
     Gross { wanted: Cash },
 }
 
-/// `target` within `limits`, given where the session stands, the equity it opened with, the book now and a price for
-/// every symbol held or wanted; refused when one of them has no price, since an unpriced exposure cannot be capped.
-pub fn risk(
-    limits: &Limits,
-    phase: SessionPhase,
-    opening: Cash,
-    book: &Book,
-    price: impl Fn(&Symbol) -> Option<Price>,
-    target: Target,
-) -> Result<Restrained, ValuationRefusal> {
-    let trading = match phase {
-        SessionPhase::Open { until_close } => until_close > limits.flat_before_close,
-        SessionPhase::NoPublishedSession
-        | SessionPhase::BeforeOpen { .. }
-        | SessionPhase::AfterClose => false,
-    };
-    if !trading {
-        return Ok(flat(Cut::OutsideTradingWindow { phase }));
-    }
-    let loss = Cash::from_units(
-        opening
-            .units()
-            .checked_sub(book.value(&price)?.units())
-            .expect("cash fits i128"),
-    );
-    if loss >= limits.daily_loss.cash() {
-        return Ok(flat(Cut::LossLimit { loss }));
-    }
-    let mut cuts = Vec::new();
-    let mut holdings = BTreeMap::new();
-    let mut worth = 0_u128;
-    for (symbol, wanted) in target.holdings() {
-        let ticks = ticks(&price, symbol)?;
-        let affordable = limits.per_name.units() / ticks;
-        let kept = u128::from(wanted.units()).min(affordable);
-        let kept = Shares::from_units(
-            u64::try_from(kept).expect("a kept holding is at most the wanted one"),
-        );
-        if kept != *wanted {
-            cuts.push(Cut::PerName {
-                symbol: symbol.clone(),
-                wanted: *wanted,
-                kept,
-            });
+impl From<Flat> for Cut {
+    fn from(flat: Flat) -> Self {
+        match flat {
+            Flat::OutsideTradingWindow { phase } => Self::OutsideTradingWindow { phase },
+            Flat::LossLimit { loss } => Self::LossLimit { loss },
         }
-        worth = worth
-            .checked_add(ticks * u128::from(kept.units()))
-            .expect("a target's worth fits u128");
-        holdings.insert(symbol.clone(), (kept, ticks));
     }
-    let gross = limits.gross.units();
-    if worth <= gross {
-        let target = Target::new(
-            holdings
-                .into_iter()
-                .map(|(symbol, (kept, _))| (symbol, kept))
-                .collect(),
-        );
-        return Ok(Restrained { target, cuts });
-    }
-    // Flooring the scale and each holding keeps the cut target's worth at or under the limit.
-    let scale = gross
-        .checked_mul(SCALE_GRID)
-        .expect("a gross limit within MAXIMUM_LIMIT fits u128 on the grid")
-        / worth;
-    cuts.push(Cut::Gross {
-        wanted: Cash::from_units(i128::try_from(worth).expect("a target's worth fits i128")),
-    });
-    let target = Target::new(
-        holdings
-            .into_iter()
-            .map(|(symbol, (kept, _))| {
-                let scaled = u128::from(kept.units()) * scale / SCALE_GRID;
-                (
-                    symbol,
-                    Shares::from_units(u64::try_from(scaled).expect("a cut holding fits u64")),
-                )
-            })
-            .collect(),
-    );
-    Ok(Restrained { target, cuts })
-}
-
-fn flat(cut: Cut) -> Restrained {
-    Restrained {
-        target: Target::default(),
-        cuts: vec![cut],
-    }
-}
-
-fn ticks(
-    price: impl Fn(&Symbol) -> Option<Price>,
-    symbol: &Symbol,
-) -> Result<u128, ValuationRefusal> {
-    let price = price(symbol).ok_or_else(|| ValuationRefusal::Unpriced {
-        symbol: symbol.clone(),
-    })?;
-    Ok(u128::from(price.ticks_unsigned()))
 }
 
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::common::book::Position;
+    use crate::common::problem::formulate;
 
     const DOLLAR: i128 = 1_000_000_000_000;
 
@@ -346,6 +375,132 @@ mod tests {
 
     fn funded(count: i128) -> Book {
         Book::funded(dollars(count))
+    }
+
+    /// Risk as the trader applies it: formulated, then solved by the clip arm, read as its target and cuts.
+    fn risk(
+        limits: &Limits,
+        phase: SessionPhase,
+        opening: Cash,
+        book: &Book,
+        price: impl Fn(&Symbol) -> Option<Price>,
+        target: Target,
+    ) -> Result<(Target, Vec<Cut>), ValuationRefusal> {
+        formulate(limits, phase, opening, book, price, target).map(|problem| {
+            let restrained = Solver::Clip.solve(&problem);
+            (restrained.target().clone(), restrained.cuts().to_vec())
+        })
+    }
+
+    /// `risk` as it stood before formulate and solve split it, frozen as the oracle the split must reproduce.
+    fn risk_before_the_split(
+        limits: &Limits,
+        phase: SessionPhase,
+        opening: Cash,
+        book: &Book,
+        price: impl Fn(&Symbol) -> Option<Price>,
+        target: Target,
+    ) -> Result<(Target, Vec<Cut>), ValuationRefusal> {
+        let trading = match phase {
+            SessionPhase::Open { until_close } => until_close > limits.flat_before_close(),
+            SessionPhase::NoPublishedSession
+            | SessionPhase::BeforeOpen { .. }
+            | SessionPhase::AfterClose => false,
+        };
+        if !trading {
+            return Ok(flat(Cut::OutsideTradingWindow { phase }));
+        }
+        let loss = Cash::from_units(
+            opening
+                .units()
+                .checked_sub(book.value(&price)?.units())
+                .expect("cash fits i128"),
+        );
+        if loss >= limits.dollars(Limit::DailyLoss) {
+            return Ok(flat(Cut::LossLimit { loss }));
+        }
+        let mut cuts = Vec::new();
+        let mut holdings = BTreeMap::new();
+        let mut worth = 0_u128;
+        for (symbol, wanted) in target.holdings() {
+            let ticks = ticks(&price, symbol)?;
+            let affordable = limits.dollars(Limit::PerName).units().cast_unsigned() / ticks;
+            let kept = u128::from(wanted.units()).min(affordable);
+            let kept = Shares::from_units(
+                u64::try_from(kept).expect("a kept holding is at most the wanted one"),
+            );
+            if kept != *wanted {
+                cuts.push(Cut::PerName {
+                    symbol: symbol.clone(),
+                    wanted: *wanted,
+                    kept,
+                });
+            }
+            worth = worth
+                .checked_add(ticks * u128::from(kept.units()))
+                .expect("a target's worth fits u128");
+            holdings.insert(symbol.clone(), (kept, ticks));
+        }
+        let gross = limits.dollars(Limit::Gross).units().cast_unsigned();
+        if worth <= gross {
+            let target = Target::new(
+                holdings
+                    .into_iter()
+                    .map(|(symbol, (kept, _))| (symbol, kept))
+                    .collect(),
+            );
+            return Ok((target, cuts));
+        }
+        // Flooring the scale and each holding keeps the cut target's worth at or under the limit.
+        let scale = gross
+            .checked_mul(SCALE_GRID)
+            .expect("a gross limit within MAXIMUM_LIMIT fits u128 on the grid")
+            / worth;
+        cuts.push(Cut::Gross {
+            wanted: Cash::from_units(i128::try_from(worth).expect("a target's worth fits i128")),
+        });
+        let target = Target::new(
+            holdings
+                .into_iter()
+                .map(|(symbol, (kept, _))| {
+                    let scaled = u128::from(kept.units()) * scale / SCALE_GRID;
+                    (
+                        symbol,
+                        Shares::from_units(u64::try_from(scaled).expect("a cut holding fits u64")),
+                    )
+                })
+                .collect(),
+        );
+        Ok((target, cuts))
+    }
+
+    fn flat(cut: Cut) -> (Target, Vec<Cut>) {
+        (Target::default(), vec![cut])
+    }
+
+    fn ticks(
+        price: impl Fn(&Symbol) -> Option<Price>,
+        symbol: &Symbol,
+    ) -> Result<u128, ValuationRefusal> {
+        let price = price(symbol).ok_or_else(|| ValuationRefusal::Unpriced {
+            symbol: symbol.clone(),
+        })?;
+        Ok(u128::from(price.ticks_unsigned()))
+    }
+
+    /// A capped risk journals its limits as cash and reads back, and a journaled limit that is not one is refused.
+    #[test]
+    fn test_capped_risk_round_trips_and_refuses_an_invalid_limit() {
+        let capped = Risk::Capped {
+            per_name: DollarLimit::new(Cash::from_units(5)).unwrap(),
+            gross: DollarLimit::new(Cash::from_units(7)).unwrap(),
+        };
+        let json = r#"{"capped":{"per_name":"5","gross":"7"}}"#;
+        assert_eq!(serde_json::to_string(&capped).unwrap(), json);
+        assert_eq!(serde_json::from_str::<Risk>(json).unwrap(), capped);
+        assert!(
+            serde_json::from_str::<Risk>(r#"{"capped":{"per_name":"0","gross":"7"}}"#).is_err()
+        );
     }
 
     #[test]
@@ -434,7 +589,7 @@ mod tests {
             wanted,
         )
         .unwrap();
-        assert!(matches!(restrained.cuts().last(), Some(Cut::Gross { .. })));
+        assert!(matches!(restrained.1.last(), Some(Cut::Gross { .. })));
     }
 
     /// Flat unless the session is open with more than fifteen minutes left; exactly fifteen is already flat.
@@ -461,10 +616,7 @@ mod tests {
                     &price,
                     wanted.clone()
                 ),
-                Ok(Restrained {
-                    target: Target::default(),
-                    cuts: vec![Cut::OutsideTradingWindow { phase }]
-                }),
+                Ok((Target::default(), vec![Cut::OutsideTradingWindow { phase }])),
                 "{phase:?}"
             );
         }
@@ -481,7 +633,7 @@ mod tests {
                 wanted.clone()
             )
             .unwrap()
-            .target,
+            .0,
             wanted
         );
     }
@@ -506,12 +658,12 @@ mod tests {
                 &price,
                 wanted.clone()
             ),
-            Ok(Restrained {
-                target: Target::default(),
-                cuts: vec![Cut::LossLimit {
+            Ok((
+                Target::default(),
+                vec![Cut::LossLimit {
                     loss: dollars(1_000)
                 }]
-            })
+            ))
         );
         assert_eq!(
             risk(
@@ -523,10 +675,7 @@ mod tests {
                 wanted.clone()
             )
             .unwrap(),
-            Restrained {
-                target: wanted,
-                cuts: vec![]
-            }
+            (wanted, vec![])
         );
     }
 
@@ -544,14 +693,14 @@ mod tests {
                 &price,
                 wanted
             ),
-            Ok(Restrained {
-                target: target(&[("SPY", 3_333_333), ("AAPL", 5_000_000)]),
-                cuts: vec![Cut::PerName {
+            Ok((
+                target(&[("SPY", 3_333_333), ("AAPL", 5_000_000)]),
+                vec![Cut::PerName {
                     symbol: symbol("SPY"),
                     wanted: Shares::from_units(10_000_000),
                     kept: Shares::from_units(3_333_333),
-                }],
-            })
+                }]
+            ))
         );
     }
 
@@ -569,12 +718,30 @@ mod tests {
                 &price,
                 wanted
             ),
-            Ok(Restrained {
-                target: target(&[("SPY", 1_250_000), ("AAPL", 2_500_000)]),
-                cuts: vec![Cut::Gross {
+            Ok((
+                target(&[("SPY", 1_250_000), ("AAPL", 2_500_000)]),
+                vec![Cut::Gross {
                     wanted: dollars(1_600)
-                }],
-            })
+                }]
+            ))
+        );
+    }
+
+    /// $1,600 wanted against a $1,600 gross limit is already inside it, so nothing is cut.
+    #[test]
+    fn test_a_target_worth_exactly_the_gross_limit_is_not_cut() {
+        let price = prices(&[("SPY", 400_000_000), ("AAPL", 200_000_000)]);
+        let wanted = target(&[("SPY", 2_000_000), ("AAPL", 4_000_000)]);
+        assert_eq!(
+            risk(
+                &limits(1_600, 1_000),
+                open(),
+                dollars(10_000),
+                &funded(10_000),
+                &price,
+                wanted.clone()
+            ),
+            Ok((wanted, vec![]))
         );
     }
 
@@ -632,6 +799,11 @@ mod tests {
         })
     }
 
+    /// One to ten million dollars, spread across scales so per-name and gross each bind alone and together.
+    fn arbitrary_dollar_scale() -> impl Strategy<Value = i128> {
+        (0..7u32, 1..10i128).prop_map(|(exponent, digit)| digit * 10_i128.pow(exponent))
+    }
+
     fn worth(target: &Target, prices: &BTreeMap<Symbol, Price>) -> Vec<u128> {
         target
             .holdings()
@@ -655,14 +827,14 @@ mod tests {
             let limits = limits(gross, per_name);
             let price = |symbol: &Symbol| prices.get(symbol).copied();
             let once = risk(&limits, open(), dollars(10_000), &funded(10_000), price, wanted.clone()).unwrap();
-            for (symbol, kept) in once.target.holdings() {
+            for (symbol, kept) in once.0.holdings() {
                 prop_assert!(*kept <= wanted.holdings()[symbol]);
             }
-            let worths = worth(&once.target, &prices);
+            let worths = worth(&once.0, &prices);
             prop_assert!(worths.iter().all(|value| *value <= dollars(per_name).units().cast_unsigned()));
             prop_assert!(worths.iter().sum::<u128>() <= dollars(gross).units().cast_unsigned());
-            let twice = risk(&limits, open(), dollars(10_000), &funded(10_000), price, once.target.clone()).unwrap();
-            prop_assert_eq!(twice, Restrained { target: once.target, cuts: vec![] });
+            let twice = risk(&limits, open(), dollars(10_000), &funded(10_000), price, once.0.clone()).unwrap();
+            prop_assert_eq!(twice, (once.0, vec![]));
         }
 
         /// A target already within every limit passes untouched.
@@ -677,8 +849,69 @@ mod tests {
             let price = |symbol: &Symbol| prices.get(symbol).copied();
             prop_assert_eq!(
                 risk(&limits(gross, per_name), open(), dollars(10_000), &funded(10_000), price, wanted.clone()),
-                Ok(Restrained { target: wanted, cuts: vec![] })
+                Ok((wanted, vec![]))
             );
+        }
+
+        /// Formulating then solving with the clip arm reproduces the frozen `risk` on every input, refusals included.
+        #[test]
+        fn property_the_clip_arm_reproduces_risk_before_the_split(
+            wanted in arbitrary_target(),
+            listed in prop::collection::vec(prop::option::weighted(0.9, 1..2_000_000_000i64), 4),
+            held in prop::collection::vec(-5_000_000i128..5_000_000, 4),
+            gross in arbitrary_dollar_scale(),
+            per_name in arbitrary_dollar_scale(),
+            daily_loss in 1..2_000i128,
+            opening in 9_000..11_000i128,
+            phase in prop_oneof![
+                1 => Just(SessionPhase::NoPublishedSession),
+                1 => Just(SessionPhase::AfterClose),
+                1 => (0..60i64).prop_map(|minutes| SessionPhase::BeforeOpen { until_open: TimeDelta::minutes(minutes) }),
+                12 => (0..400i64).prop_map(|minutes| SessionPhase::Open { until_close: TimeDelta::minutes(minutes) }),
+            ],
+            window in 0..30i64,
+        ) {
+            let prices: BTreeMap<Symbol, Price> = SYMBOLS
+                .iter()
+                .zip(listed)
+                .filter_map(|(raw, ticks)| Some((symbol(raw), Price::from_ticks(ticks?).unwrap())))
+                .collect();
+            let price = |symbol: &Symbol| prices.get(symbol).copied();
+            let book = Book::reported(
+                dollars(10_000),
+                SYMBOLS.iter().zip(held).map(|(raw, units)| (symbol(raw), Position::from_units(units))),
+            );
+            let limits = Limits::new(
+                dollars(gross),
+                dollars(per_name),
+                dollars(daily_loss),
+                TimeDelta::minutes(window),
+            )
+            .unwrap();
+            prop_assert_eq!(
+                risk(&limits, phase, dollars(opening), &book, price, wanted.clone()),
+                risk_before_the_split(&limits, phase, dollars(opening), &book, price, wanted)
+            );
+        }
+
+        /// The clip arm's target is one the problem's risk admits.
+        #[test]
+        fn property_the_clip_arm_lands_inside_its_risk(
+            wanted in arbitrary_target(),
+            prices in arbitrary_prices(),
+            gross in 1..1_000_000i128,
+            per_name in 1..1_000_000i128,
+            open in prop::bool::ANY,
+        ) {
+            let phase = match open {
+                true => super::tests::open(),
+                false => SessionPhase::AfterClose,
+            };
+            let price = |symbol: &Symbol| prices.get(symbol).copied();
+            let problem = formulate(&limits(gross, per_name), phase, dollars(10_000), &funded(10_000), price, wanted)
+                .unwrap();
+            let solved = Solver::Clip.solve(&problem);
+            prop_assert_eq!(problem.risk().constraints().admits(solved.target(), price), Ok(true));
         }
     }
 }
