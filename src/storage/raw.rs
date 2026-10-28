@@ -1,11 +1,8 @@
-//! Vendor bytes stored as served: flat files copied byte for byte in parts fetched and uploaded in parallel, and fetched
-//! response pages written a line each into one gzip stream, so no file is ever held whole, under a full-object CRC64
-//! that S3 computes and any later copy of the same bytes must match.
+//! Vendor bytes stored as served: fetched response pages written a line each into one gzip stream, so no response set
+//! is ever held whole, under a full-object CRC64 that S3 computes and any later copy of the same bytes must match.
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -13,18 +10,15 @@ use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, ChecksumType, CompletedMultipartUpload, CompletedPart,
 };
 use chrono::{DateTime, Utc};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
 use super::provenance::{MetadataEntry, Provenance};
 use super::{Bucket, BucketError};
 use crate::common::storage::{EntityTag, Key, ReferenceKey, StorageClass};
-use crate::ingest::flat_files::{FlatFileDataset, FlatFileError, FlatFiles, Listed};
 
-/// The largest quote file, about 19 GB, is under three hundred parts of this size.
-const PART_LENGTH: u64 = 64 * 1024 * 1024;
+/// The length a gzip part reaches before it is uploaded.
+const PART_LENGTH: usize = 64 * 1024 * 1024;
 
-/// Attempts at one part, each fetching and uploading it afresh, before the file is abandoned.
+/// Attempts at uploading one part before the upload is abandoned.
 const PART_ATTEMPTS: u32 = 5;
 
 /// What the bucket holds under a key: its length and the checksum S3 holds for it.
@@ -87,66 +81,7 @@ impl Checksum {
     }
 }
 
-/// Why a vendor file was not copied.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CopyError {
-    #[error("{0}")]
-    Source(FlatFileError),
-    #[error("{0}")]
-    Bucket(BucketError),
-    /// The vendor lists the file with no bytes, which a multipart upload cannot hold.
-    #[error("{path} is listed with no bytes")]
-    Empty { path: String },
-    /// Stored at a different length than the vendor listed.
-    #[error("{path} stored {stored:?} bytes where {listed} were listed")]
-    Length {
-        path: String,
-        listed: u64,
-        stored: Option<u64>,
-    },
-}
-
 impl Bucket {
-    /// Copies `dataset`'s file for `listed` under its key, only if nothing is there yet; `permits` bounds the parts in
-    /// flight across every copy sharing it.
-    pub async fn copy_flat_file(
-        &self,
-        flat_files: &FlatFiles,
-        dataset: FlatFileDataset,
-        listed: &Listed,
-        provenance: &Provenance,
-        permits: Arc<Semaphore>,
-    ) -> Result<Stored, CopyError> {
-        let key = dataset.key(listed.session());
-        let path = key.path();
-        if listed.length() == 0 {
-            return Err(CopyError::Empty { path });
-        }
-        let upload_id = self
-            .create_upload(&key, provenance)
-            .await
-            .map_err(CopyError::Bucket)?;
-        let uploaded = self
-            .upload_parts(flat_files, dataset, listed, &upload_id, permits)
-            .await;
-        let completed = match uploaded {
-            Ok(parts) => self.complete(&path, &upload_id, parts).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = completed {
-            self.abort_upload(&path, &upload_id).await;
-            return Err(error);
-        }
-        match self.stored(&key).await.map_err(CopyError::Bucket)? {
-            Some(stored) if stored.length == listed.length() => Ok(stored),
-            stored => Err(CopyError::Length {
-                path,
-                listed: listed.length(),
-                stored: stored.map(|stored| stored.length),
-            }),
-        }
-    }
-
     /// Opens a multipart upload under `key` stamped with `provenance`, returning its id; finish or abort it, or its
     /// parts keep billing.
     async fn create_upload(
@@ -195,89 +130,6 @@ impl Bucket {
                 "Multipart upload not aborted"
             );
         }
-    }
-
-    async fn upload_parts(
-        &self,
-        flat_files: &FlatFiles,
-        dataset: FlatFileDataset,
-        listed: &Listed,
-        upload_id: &str,
-        permits: Arc<Semaphore>,
-    ) -> Result<Vec<CompletedPart>, CopyError> {
-        let path = dataset.key(listed.session()).path();
-        let mut tasks = JoinSet::new();
-        for range in ranges(listed.length()) {
-            let part = Part {
-                s3_client: self.s3_client.clone(),
-                bucket_name: self.bucket_name.clone(),
-                path: path.clone(),
-                upload_id: upload_id.to_string(),
-                range,
-            };
-            let flat_files = flat_files.clone();
-            let listed = listed.clone();
-            let permits = Arc::clone(&permits);
-            tasks.spawn(async move {
-                let _permit = permits
-                    .acquire_owned()
-                    .await
-                    .expect("the semaphore is never closed");
-                part.upload(&flat_files, dataset, &listed).await
-            });
-        }
-        let mut parts = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
-            let part = joined.map_err(|error| {
-                CopyError::Bucket(BucketError::Put {
-                    path: path.clone(),
-                    reason: error.to_string(),
-                })
-            })??;
-            parts.push(part);
-        }
-        parts.sort_by_key(|part| part.part_number());
-        Ok(parts)
-    }
-
-    async fn complete(
-        &self,
-        path: &str,
-        upload_id: &str,
-        parts: Vec<CompletedPart>,
-    ) -> Result<(), CopyError> {
-        self.s3_client
-            .complete_multipart_upload()
-            .bucket(&self.bucket_name)
-            .key(path)
-            .upload_id(upload_id)
-            .checksum_type(ChecksumType::FullObject)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .set_parts(Some(parts))
-                    .build(),
-            )
-            .if_none_match("*")
-            .send()
-            .await
-            .map_err(|error| {
-                // 412 is a key already written; 409 is a conditional write that raced another.
-                CopyError::Bucket(
-                    match error
-                        .raw_response()
-                        .map(|response| response.status().as_u16())
-                    {
-                        Some(409 | 412) => BucketError::Contended {
-                            path: path.to_string(),
-                        },
-                        Some(_) | None => BucketError::Put {
-                            path: path.to_string(),
-                            reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
-                        },
-                    },
-                )
-            })?;
-        Ok(())
     }
 
     /// What is stored under `key`, read from its metadata alone, so a Deep Archive object needs no restore.
@@ -421,7 +273,7 @@ impl Bucket {
             archive: self.clone(),
             key,
             upload_id,
-            lines: GzipLines::new(PART_LENGTH as usize),
+            lines: GzipLines::new(PART_LENGTH),
             parts: Vec::new(),
             written: 0,
         })
@@ -586,101 +438,10 @@ fn fetched_at(metadata: Option<&HashMap<String, String>>) -> Result<Option<DateT
         .transpose()
 }
 
-/// One part of an upload: its number, counted from one, its first byte, and how many bytes it holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PartRange {
-    number: i32,
-    start: u64,
-    length: NonZeroU64,
-}
-
-/// The parts a file of `length` bytes is uploaded in.
-fn ranges(length: u64) -> impl Iterator<Item = PartRange> {
-    (1..)
-        .zip((0..length).step_by(PART_LENGTH as usize))
-        .map(move |(number, start)| PartRange {
-            number,
-            start,
-            length: NonZeroU64::new(PART_LENGTH.min(length - start))
-                .expect("a part starts before the file ends"),
-        })
-}
-
 fn storage_class(key: &Key) -> aws_sdk_s3::types::StorageClass {
     match key.storage_class() {
         StorageClass::Standard => aws_sdk_s3::types::StorageClass::Standard,
         StorageClass::DeepArchive => aws_sdk_s3::types::StorageClass::DeepArchive,
-    }
-}
-
-/// One byte range of a file and the part of the upload it becomes.
-struct Part {
-    s3_client: aws_sdk_s3::Client,
-    bucket_name: String,
-    path: String,
-    upload_id: String,
-    range: PartRange,
-}
-
-impl Part {
-    async fn upload(
-        self,
-        flat_files: &FlatFiles,
-        dataset: FlatFileDataset,
-        listed: &Listed,
-    ) -> Result<CompletedPart, CopyError> {
-        let mut attempt = 1;
-        loop {
-            match self.attempt(flat_files, dataset, listed).await {
-                Ok(part) => return Ok(part),
-                Err(error) if attempt < PART_ATTEMPTS => {
-                    tracing::warn!(
-                        path = self.path,
-                        part = self.range.number,
-                        attempt,
-                        %error,
-                        "Retrying a part"
-                    );
-                    tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt))).await;
-                    attempt += 1;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    async fn attempt(
-        &self,
-        flat_files: &FlatFiles,
-        dataset: FlatFileDataset,
-        listed: &Listed,
-    ) -> Result<CompletedPart, CopyError> {
-        let body = flat_files
-            .range(dataset, listed, self.range.start, self.range.length)
-            .await
-            .map_err(CopyError::Source)?;
-        let uploaded = self
-            .s3_client
-            .upload_part()
-            .bucket(&self.bucket_name)
-            .key(&self.path)
-            .upload_id(&self.upload_id)
-            .part_number(self.range.number)
-            .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(|error| {
-                CopyError::Bucket(BucketError::Put {
-                    path: self.path.clone(),
-                    reason: aws_sdk_s3::error::DisplayErrorContext(error).to_string(),
-                })
-            })?;
-        Ok(CompletedPart::builder()
-            .part_number(self.range.number)
-            .set_e_tag(uploaded.e_tag().map(String::from))
-            .set_checksum_crc64_nvme(uploaded.checksum_crc64_nvme().map(String::from))
-            .build())
     }
 }
 
@@ -689,8 +450,6 @@ mod tests {
     use proptest::strategy::Strategy;
 
     use super::*;
-
-    const MEBIBYTE: u64 = 1024 * 1024;
 
     #[test]
     fn test_a_fetch_stamp_is_read_absent_or_refused_never_dropped() {
@@ -722,26 +481,6 @@ mod tests {
         assert_eq!(
             Checksum::of(Some(&ChecksumType::FullObject), None),
             Checksum::Absent
-        );
-    }
-
-    #[test]
-    fn test_parts_cover_every_byte_once_numbered_from_one() {
-        let ranges = |length| {
-            ranges(length)
-                .map(|range| (range.number, range.start, range.length.get()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ranges(0), vec![]);
-        assert_eq!(ranges(1), vec![(1, 0, 1)]);
-        assert_eq!(ranges(64 * MEBIBYTE), vec![(1, 0, 64 * MEBIBYTE)]);
-        assert_eq!(
-            ranges(128 * MEBIBYTE + 1),
-            vec![
-                (1, 0, 64 * MEBIBYTE),
-                (2, 64 * MEBIBYTE, 64 * MEBIBYTE),
-                (3, 128 * MEBIBYTE, 1),
-            ]
         );
     }
 
@@ -810,32 +549,6 @@ mod tests {
                 expected.push(b'\n');
             }
             proptest::prop_assert_eq!(gunzip(&parts), expected);
-        }
-
-        /// Parts are numbered from one, each starts where the last ended, every part but the last is a full 64 MiB, and
-        /// together they are the file.
-        #[test]
-        fn property_parts_tile_the_file(
-            length in proptest::prop_oneof![
-                0_u64..=20 * 64 * MEBIBYTE + 3,
-                (0_u64..=20, 0_u64..=2).prop_map(|(parts, offset)| (parts * 64 * MEBIBYTE + offset).saturating_sub(1)),
-            ],
-        ) {
-            let parts: Vec<(i32, u64, u64)> = ranges(length)
-                .map(|range| (range.number, range.start, range.length.get()))
-                .collect();
-            proptest::prop_assert_eq!(parts.len() as u64, length.div_ceil(64 * MEBIBYTE));
-            let mut end = 0;
-            for (index, (number, start, part)) in parts.iter().enumerate() {
-                proptest::prop_assert_eq!(*number as usize, index + 1);
-                proptest::prop_assert_eq!(*start, end);
-                proptest::prop_assert!(*part <= 64 * MEBIBYTE);
-                if index + 1 < parts.len() {
-                    proptest::prop_assert_eq!(*part, 64 * MEBIBYTE);
-                }
-                end = start + part;
-            }
-            proptest::prop_assert_eq!(end, length);
         }
     }
 }
