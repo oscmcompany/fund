@@ -1185,11 +1185,7 @@ fn s3_operations(directory: &std::path::Path) -> Vec<(String, String)> {
 /// Each distinct `(file, operation)` the crate's S3 clients call on our own buckets.
 fn our_s3_operations() -> Vec<(String, String)> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut operations: Vec<(String, String)> = s3_operations(&source)
-        .into_iter()
-        // The flat-file client reads Massive's own bucket under Massive's keys, which no role of ours grants.
-        .filter(|(file, _)| file != "src/ingest/flat_files.rs")
-        .collect();
+    let mut operations: Vec<(String, String)> = s3_operations(&source);
     operations.sort();
     operations.dedup();
     operations
