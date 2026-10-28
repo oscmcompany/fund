@@ -146,7 +146,10 @@ This is a collection of guidelines and references.
   through the decision rule and costs, not its information coefficient; an archive by what the trader and studies
   could read in time, not the objects written
 - Assume an automated search or fit has exploited its metric's blind spots, and before reading a winner's score look
-  for how it could have — names with an undefined or zero cost, sessions a filter dropped
+  for how it could have — names with an undefined or zero cost, sessions a filter dropped; for the same reason a
+  performance target is a gate a result passes, never a quantity to optimize toward
+- Read the worst session and the loss tail beside Sharpe for any strategy that supplies liquidity or sells
+  insurance, since its returns are smooth until the session they are not
 - State a new direction's admission criteria before opening it — a returns bar, a reachable size, an underserved
   gap, and a capability we actually hold — and record which of them it fails, because failing three of four is a
   legitimate answer; admit a dataset on the same footing: does it raise the average information, is it
@@ -168,13 +171,16 @@ This is a collection of guidelines and references.
 - A tooling trap or a recurring review comment that a check could detect is owed a check, not a memory — a
   memory is read after the trap fires; only a hazard of a typed command that no check can observe stays a note
 - Standard errors assume independent observations, which financial data never is — aggregate to the level
-  that actually varies and report effective sample size rather than row count
+  that actually varies, found by coarsening (minute, five minutes, hour, session) until the standard error stops
+  growing, a reading that is itself noisy once few blocks remain, and report effective sample size rather than row
+  count
 - Always report the undefined share alongside an estimate; an estimator silently defined on 60% of its
   inputs reads exactly like a complete measurement
 - Print the population and the boundary values beside any difference — `1254 / 1254 / 0 / 0` is a proof and
   a bare `0` is not
 - Screen on the quantity being paid for rather than a correlate of it, and check a screen's units before
-  checking its threshold
+  checking its threshold; a cost charged per share is compared with the spread in cents per share and converted
+  to basis points only to report, since the same fee is five times larger in basis points at $5 than at $25
 - Levels drift and ranks do not — a threshold fixed in absolute units is a moving quantile, so scale
   windows and cutoffs to the distribution's own width
 - Screen first, then average: a subset's cost read off the whole distribution's deciles is the wrong
