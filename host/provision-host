@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reconciles one host's EC2 instance, IAM and security group for a role and a profile, a scheduled role's start and stop
-# schedules, and for the archiver the archive bucket's lifecycle rules.
+# schedules, the archiver's archive bucket lifecycle rules and the researcher's profile bucket lifecycle rules.
 # Dry run unless --apply; a setting that cannot change in place is reported as drift and refused, never adopted.
 set -euo pipefail
 
@@ -342,6 +342,26 @@ if [[ "$ROLE" == archiver ]]; then
     # S3 otherwise skips transitioning objects under 128 KiB, which leaves a small raw response in Standard.
     aws s3api put-bucket-lifecycle-configuration --bucket "$ARCHIVE_BUCKET" --lifecycle-configuration "$LIFECYCLE" \
       --transition-default-minimum-object-size varies_by_storage_class
+  fi
+fi
+
+# The researcher writes scratch, so its run owns the profile bucket's rules: cleaned ticks are kept for reuse but read
+# in bursts, and no rule expires a version under records.
+if [[ "$ROLE" == researcher ]]; then
+  step "Lifecycle rules on $PROFILE_BUCKET"
+  PROFILE_LIFECYCLE='{"Rules":[
+  {"ID":"ticks-to-intelligent-tiering","Filter":{"Prefix":"scratch/ticks/"},"Status":"Enabled",
+   "Transitions":[{"Days":0,"StorageClass":"INTELLIGENT_TIERING"}]},
+  {"ID":"expire-noncurrent-versions","Filter":{"Prefix":"scratch/"},"Status":"Enabled",
+   "NoncurrentVersionExpiration":{"NoncurrentDays":30},"Expiration":{"ExpiredObjectDeleteMarker":true}},
+  {"ID":"abort-incomplete-multipart-uploads","Filter":{"Prefix":""},"Status":"Enabled",
+   "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}
+]}'
+  changed "put lifecycle rules on $PROFILE_BUCKET"
+  if [[ "$APPLY" == true ]]; then
+    # Intelligent-Tiering never moves an object under 128 KiB, so transitioning one only costs a request.
+    aws s3api put-bucket-lifecycle-configuration --bucket "$PROFILE_BUCKET" \
+      --lifecycle-configuration "$PROFILE_LIFECYCLE" --transition-default-minimum-object-size all_storage_classes_128K
   fi
 fi
 
