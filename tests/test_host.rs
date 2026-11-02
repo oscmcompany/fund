@@ -980,7 +980,13 @@ fn test_a_new_researcher_reads_the_archive_writes_its_records_and_scratch_and_is
         .filter(|name| name.ends_with(".json"))
         .collect();
     written.sort();
-    assert_eq!(written, ["policy-researcher.json"]);
+    assert_eq!(
+        written,
+        [
+            "lifecycle-oscm-fund-development-john-forstmeier.json",
+            "policy-researcher.json"
+        ]
+    );
 
     let records = "arn:aws:s3:::oscm-fund-development-john-forstmeier";
     let grant = |action: &str, resource: String| (action.to_string(), resource, "null".to_string());
@@ -1487,7 +1493,73 @@ fn test_the_archive_backstop_covers_exactly_the_keys_written_in_deep_archive() {
 }
 
 #[test]
-fn test_only_the_archiver_sets_the_archive_lifecycle() {
+fn test_the_researcher_tiers_cleaned_ticks_and_expires_old_versions_in_its_profile_bucket() {
+    let provisioned = Provisioned::run_role("researcher", "development/john.forstmeier", &[]);
+    assert_eq!(provisioned.code, 0, "{}", provisioned.output);
+    let rules =
+        provisioned.json("lifecycle-oscm-fund-development-john-forstmeier.json")["Rules"].clone();
+    let mut identifiers: Vec<&str> = rules
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule["ID"].as_str().unwrap())
+        .collect();
+    identifiers.sort();
+    assert_eq!(
+        identifiers,
+        [
+            "abort-incomplete-multipart-uploads",
+            "expire-noncurrent-versions",
+            "ticks-to-intelligent-tiering"
+        ]
+    );
+    let rule = |identifier: &str| {
+        rules
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["ID"] == identifier)
+            .unwrap()
+            .clone()
+    };
+    let tiering = rule("ticks-to-intelligent-tiering");
+    assert_eq!(tiering["Status"], "Enabled");
+    assert_eq!(tiering["Filter"]["Prefix"], "scratch/ticks/");
+    assert_eq!(
+        tiering["Transitions"][0]["StorageClass"],
+        "INTELLIGENT_TIERING"
+    );
+    assert_eq!(tiering["Transitions"][0]["Days"], 0);
+    assert_eq!(
+        std::fs::read_to_string(
+            provisioned
+                .directory
+                .join("lifecycle-oscm-fund-development-john-forstmeier.size")
+        )
+        .unwrap()
+        .trim(),
+        "all_storage_classes_128K"
+    );
+    let versions = rule("expire-noncurrent-versions");
+    assert_eq!(versions["Status"], "Enabled");
+    // Only scratch: the records keep every version.
+    assert_eq!(versions["Filter"]["Prefix"], "scratch/");
+    assert_eq!(
+        versions["NoncurrentVersionExpiration"]["NoncurrentDays"],
+        30
+    );
+    assert_eq!(versions["Expiration"]["ExpiredObjectDeleteMarker"], true);
+    let abort = rule("abort-incomplete-multipart-uploads");
+    assert_eq!(abort["Status"], "Enabled");
+    assert_eq!(abort["Filter"]["Prefix"], "");
+    assert_eq!(
+        abort["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"],
+        7
+    );
+}
+
+#[test]
+fn test_the_trader_sets_no_lifecycle() {
     let provisioned = Provisioned::run_role("trader", "production", &[]);
     assert_eq!(provisioned.code, 0, "{}", provisioned.output);
     assert!(
