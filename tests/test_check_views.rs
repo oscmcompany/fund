@@ -122,6 +122,7 @@ fn test_every_view_in_views_sql_is_checked() {
         ("journal", Answer::Rows(2)),
         ("logs", Answer::Rows(3)),
         ("experiments", Answer::Rows(1)),
+        ("verdicts", Answer::Rows(0)),
         ("bar_seam", Answer::Rows(0)),
     ]);
     let (status, output) = real(&answers, "");
@@ -153,6 +154,7 @@ fn test_every_view_in_views_sql_is_checked() {
             "journal",
             "logs",
             "experiments",
+            "verdicts",
             "bar_seam"
         ]
     );
@@ -219,7 +221,7 @@ fn test_trader_records_are_optional_in_every_development_profile() {
     }
 }
 
-/// A developer's studies may or may not have shipped, so their journal and experiments pass either way.
+/// A developer's studies may or may not have shipped, so their journal, experiments and verdicts pass either way.
 #[test]
 fn test_an_optional_view_passes_empty_or_read_but_fails_when_broken() {
     let (status, output) = real(&bars(Answer::Rows(5), Answer::Rows(7)), "development");
@@ -230,6 +232,10 @@ fn test_an_optional_view_passes_empty_or_read_but_fails_when_broken() {
     );
     assert!(
         output.contains("experiments: optional, nothing written\n"),
+        "{output}"
+    );
+    assert!(
+        output.contains("verdicts: optional, nothing written\n"),
         "{output}"
     );
     let mut answers = bars(Answer::Rows(5), Answer::Rows(7));
@@ -287,6 +293,7 @@ fn test_every_live_view_out_of_reach_is_a_check_not_made() {
         ("journal", Answer::Error(OUT_OF_REACH)),
         ("logs", Answer::Error(OUT_OF_REACH)),
         ("experiments", Answer::Error(OUT_OF_REACH)),
+        ("verdicts", Answer::Error(OUT_OF_REACH)),
         ("bar_seam", Answer::Error(OUT_OF_REACH)),
     ]);
     let (status, output) = real(&answers, "production");
@@ -358,7 +365,7 @@ fn test_every_view_ends_on_its_first_line_ending_in_a_semicolon() {
         );
         ended.push(view);
     }
-    assert_eq!(ended.len(), 26, "{ended:?}");
+    assert_eq!(ended.len(), 27, "{ended:?}");
 }
 
 /// Each `(bucket, series)` the views of `views.sql` pass to the `sessions`, `snapshots` and `preferred` macros, in file
@@ -441,9 +448,9 @@ fn test_every_series_views_sql_reads_is_a_key_series() {
         keys.push(LogsKey::new(host, Service::new("archive_nightly").unwrap(), session).into());
     }
     let called = macro_series();
-    // 16 series views, the six neutral views' two reads each, `journal`, `logs`, `experiments`, and `bar_seam`'s two
-    // reads.
-    assert_eq!(called.len(), 33, "{called:?}");
+    // 16 series views, the six neutral views' two reads each, `journal`, `logs`, `experiments`, `verdicts`, and
+    // `bar_seam`'s two reads.
+    assert_eq!(called.len(), 34, "{called:?}");
     for (bucket, series) in &called {
         let expected_bucket = if series.starts_with("records/") {
             "profile_bucket"

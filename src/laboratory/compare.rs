@@ -264,6 +264,8 @@ pub(crate) mod tests {
                         | Observation::ArchiveSurveyed(_)
                         | Observation::ViewsChecked(_)
                         | Observation::DatasetRead(_)
+                        | Observation::QuestionDeclared(_)
+                        | Observation::VerdictReached(_)
                         | Observation::OrderSubmitted(_)
                         | Observation::OrderClosed(_)
                         | Observation::OrderRefused(_)

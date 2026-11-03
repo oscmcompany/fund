@@ -1227,6 +1227,8 @@ mod tests {
                 | Observation::ViewsChecked(_)
                 | Observation::DatasetRead(_)
                 | Observation::ExperimentRan(_)
+                | Observation::QuestionDeclared(_)
+                | Observation::VerdictReached(_)
                 | Observation::OrderSubmitted(_)
                 | Observation::OrderRefused(_)
                 | Observation::OrderUnresolved(_)

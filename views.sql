@@ -267,6 +267,9 @@ SELECT
     ) AS symbols,
     payload -> '$.estimates' AS estimates,
     payload -> '$.metrics' AS metrics,
+    CAST(payload ->> '$.checks.population' AS BIGINT) AS population,
+    CAST(payload ->> '$.checks.undefined' AS BIGINT) AS undefined,
+    payload -> '$.checks.null' AS null_reading,
     "commit",
     payload ->> '$.machine.hostname' AS hostname,
     payload ->> '$.machine.architecture' AS architecture,
@@ -289,6 +292,10 @@ COMMENT ON COLUMN experiments.last IS 'Latest session any dataset read covers.';
 COMMENT ON COLUMN experiments.symbols IS 'Symbols per dataset read, in fingerprint order, or "every".';
 COMMENT ON COLUMN experiments.estimates IS 'Estimates by name, as JSON.';
 COMMENT ON COLUMN experiments.metrics IS 'Metrics by name, as JSON.';
+COMMENT ON COLUMN experiments.population IS 'Inputs the estimate read; null when the study reported no checks.';
+COMMENT ON COLUMN experiments.undefined IS 'Inputs that left the estimate undefined; null when no checks.';
+COMMENT ON COLUMN experiments.null_reading IS
+    'The permutation null''s reading of the metric, or why none was taken, as JSON; null when no checks.';
 COMMENT ON COLUMN experiments."commit" IS 'Git sha the binary was built from, with -dirty if the tree differed.';
 COMMENT ON COLUMN experiments.hostname IS 'Hostname of the machine the study ran on.';
 COMMENT ON COLUMN experiments.architecture IS 'CPU architecture of that machine.';
@@ -298,6 +305,71 @@ COMMENT ON COLUMN experiments.milliseconds_since_opened IS 'Milliseconds from th
 COMMENT ON COLUMN experiments.source_digest IS
     'SHA-256 of the study source under records/sources/producer=researcher/; null before sources were captured.';
 COMMENT ON COLUMN experiments.run_id IS 'The study run that journaled the experiment.';
+
+-- A verdict reads the latest declaration of its question made before it, so a later declaration cannot move its bar.
+CREATE OR REPLACE VIEW verdicts AS
+WITH records AS (
+    SELECT * FROM sessions('profile_bucket', 'records/journal/producer=researcher/')
+    WHERE event_type IN ('question_declared', 'verdict_reached')
+),
+declared AS (
+    SELECT
+        timestamp,
+        payload ->> '$.label' AS label,
+        payload ->> '$.question' AS question,
+        payload AS declaration
+    FROM records
+    WHERE event_type = 'question_declared'
+),
+reached AS (
+    SELECT *, payload ->> '$.label' AS label, payload ->> '$.question' AS question
+    FROM records
+    WHERE event_type = 'verdict_reached'
+)
+SELECT
+    reached.timestamp,
+    reached.session,
+    reached.label,
+    reached.question,
+    reached.payload ->> '$.outcome.kind' AS outcome,
+    CAST(reached.payload ->> '$.outcome.reading' AS DOUBLE) AS reading,
+    reached.payload ->> '$.outcome.scope' AS scope,
+    reached.payload ->> '$.outcome.reopen' AS reopen,
+    reached.payload ->> '$.outcome.cause' AS cause,
+    CAST(reached.payload ->> '$.runs' AS VARCHAR[]) AS runs,
+    declared.timestamp AS declared_at,
+    declared.declaration ->> '$.baseline' AS baseline,
+    declared.declaration ->> '$.metric' AS metric,
+    declared.declaration -> '$.bar' AS bar,
+    CAST(declared.declaration ->> '$.as_of' AS DATE) AS as_of,
+    declared.declaration -> '$.parameters' AS parameters,
+    reached."commit",
+    reached.run_id
+FROM reached
+ASOF LEFT JOIN declared
+    ON declared.label = reached.label AND declared.question = reached.question
+    AND declared.timestamp <= reached.timestamp;
+
+COMMENT ON VIEW verdicts IS 'Every question a study closed, one row per verdict, with the declaration it answered.';
+COMMENT ON COLUMN verdicts.timestamp IS 'Instant the verdict was journaled, UTC.';
+COMMENT ON COLUMN verdicts.session IS 'Session the verdict was journaled in, an America/New_York date.';
+COMMENT ON COLUMN verdicts.label IS 'Free text naming what the study is about.';
+COMMENT ON COLUMN verdicts.question IS 'What the study set out to answer.';
+COMMENT ON COLUMN verdicts.outcome IS 'live, refuted or inconclusive.';
+COMMENT ON COLUMN verdicts.reading IS 'The metric reading a live outcome cleared its bar with; null otherwise.';
+COMMENT ON COLUMN verdicts.scope IS 'Exactly what a refutation covers; null otherwise.';
+COMMENT ON COLUMN verdicts.reopen IS 'What would reopen a refutation; null otherwise.';
+COMMENT ON COLUMN verdicts.cause IS 'Why an inconclusive outcome did not decide; null otherwise.';
+COMMENT ON COLUMN verdicts.runs IS 'Study runs the verdict rests on; empty for a finding recorded after its journals.';
+COMMENT ON COLUMN verdicts.declared_at IS
+    'Instant of the latest declaration of the question before the verdict, UTC; null when undeclared.';
+COMMENT ON COLUMN verdicts.baseline IS 'Trivial arm the declaration quoted skill against; null when undeclared.';
+COMMENT ON COLUMN verdicts.metric IS 'Metric the declared bar reads; null when undeclared.';
+COMMENT ON COLUMN verdicts.bar IS 'Where the metric had to land, as JSON; null when undeclared.';
+COMMENT ON COLUMN verdicts.as_of IS 'Session after which data is the "as of" confirm read; null when undeclared.';
+COMMENT ON COLUMN verdicts.parameters IS 'Free choices fixed at declaration, as JSON; null when undeclared.';
+COMMENT ON COLUMN verdicts."commit" IS 'Git sha the binary that journaled the verdict was built from.';
+COMMENT ON COLUMN verdicts.run_id IS 'The study run that journaled the verdict.';
 
 -- The seam over every session, which reads every partition of both series; `bar_seam_on` reads one.
 CREATE OR REPLACE VIEW bar_seam AS
