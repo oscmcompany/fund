@@ -24,11 +24,11 @@ fi
 case "${FUND_PROFILE:-}" in
   # A developer's studies may ship researcher journals and a developer's paper trader its journal and logs.
   development | development/*)
-    optional=" journal logs experiments bar_seam "
+    optional=" journal logs experiments verdicts bar_seam "
     ;;
   # The archiver ships production's journal and logs nightly; the researcher and trader records may be absent.
   *)
-    optional=" experiments bar_seam "
+    optional=" experiments verdicts bar_seam "
     ;;
 esac
 

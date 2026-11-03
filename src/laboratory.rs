@@ -18,7 +18,10 @@ use uuid::Uuid;
 use crate::common::journal::{Observation, RunId};
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::experiment::{
-    DatasetRead, Elapsed, ExperimentRan, Label, Machine, Outputs, Parameters, SourceDigest,
+    DatasetRead, Elapsed, ExperimentRan, Label, Machine, Name, Outputs, Parameters, SourceDigest,
+};
+use crate::common::laboratory::verdict::{
+    Bar, Outcome, Question, QuestionDeclared, VerdictReached,
 };
 use crate::common::storage::{Host, JournalKey, Key, ObjectKey, SourceKey};
 use crate::common::time::SessionDate;
@@ -131,6 +134,44 @@ impl Study {
         self.journal
             .append(Utc::now(), Observation::ExperimentRan(Box::new(ran)))
             .map_err(StudyError::Journal)
+    }
+
+    /// Journals a question: the baseline skill is quoted against, the metric and bar that decide it, and the session
+    /// after which data is the "as of" confirm read. Meant to be called before reading; nothing enforces the order.
+    pub fn declare(
+        &mut self,
+        question: Question,
+        baseline: Name,
+        metric: Name,
+        bar: Bar,
+        as_of: SessionDate,
+        parameters: Parameters,
+    ) -> io::Result<()> {
+        let declared = QuestionDeclared::new(
+            self.label.clone(),
+            question,
+            baseline,
+            metric,
+            bar,
+            as_of,
+            parameters,
+        );
+        self.journal.append(
+            Utc::now(),
+            Observation::QuestionDeclared(Box::new(declared)),
+        )
+    }
+
+    /// Journals how `question` closed and the runs the outcome rests on, which may include other runs than this one.
+    pub fn verdict(
+        &mut self,
+        question: Question,
+        outcome: Outcome,
+        runs: Vec<RunId>,
+    ) -> io::Result<()> {
+        let reached = VerdictReached::new(self.label.clone(), question, outcome, runs);
+        self.journal
+            .append(Utc::now(), Observation::VerdictReached(Box::new(reached)))
     }
 
     /// Stores each source kept in the journal directory under its digest, then merges each recent session file there
@@ -287,6 +328,89 @@ mod tests {
             )]
         );
         assert_eq!(std::fs::read(&kept[0]).unwrap(), source.encode());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A declaration, an experiment carrying its checks and the verdict that closes the question read back from the
+    /// journal in the order the study wrote them.
+    #[test]
+    fn test_a_study_journals_its_question_checks_and_verdict() {
+        use crate::common::journal::{ReadLine, read};
+        use crate::common::laboratory::experiment::Metric;
+        use crate::common::laboratory::verdict::{Checks, NullReading, Reopen, Scope};
+
+        let directory = std::env::temp_dir().join(format!("fund-study-{}", Uuid::new_v4()));
+        let mut study = Study::open(
+            Label::new("records").unwrap(),
+            &directory,
+            Source::new("records.rs", "fn main() {}"),
+        )
+        .unwrap();
+        let question = Question::new("does the arm beat its baseline").unwrap();
+        let as_of = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap());
+        study
+            .declare(
+                question.clone(),
+                Name::new("null_strategy").unwrap(),
+                Name::new("net_bp").unwrap(),
+                Bar::Above(Metric::new(1.0).unwrap()),
+                as_of,
+                Parameters::default(),
+            )
+            .unwrap();
+        let checks =
+            Checks::new(1254, 3, NullReading::Measured(Metric::new(0.1).unwrap())).unwrap();
+        study
+            .experiment(
+                Parameters::default(),
+                &[],
+                Outputs::default().checks(checks.clone()).unwrap(),
+            )
+            .unwrap();
+        let outcome = Outcome::Refuted {
+            scope: Scope::new("every name, 15 minutes").unwrap(),
+            reopen: Reopen::new("a cost under 1bp").unwrap(),
+        };
+        study
+            .verdict(question.clone(), outcome.clone(), vec![study.run_id()])
+            .unwrap();
+        let file = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap();
+        let observations: Vec<Observation> = read(&std::fs::read_to_string(&file).unwrap())
+            .into_iter()
+            .map(|line| match line {
+                ReadLine::Read(record) => record.observation().clone(),
+                other @ (ReadLine::Untyped(_) | ReadLine::Unreadable { .. }) => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            observations
+                .iter()
+                .map(Observation::event_type)
+                .collect::<Vec<_>>(),
+            ["question_declared", "experiment_ran", "verdict_reached"]
+        );
+        match (&observations[0], &observations[1], &observations[2]) {
+            (
+                Observation::QuestionDeclared(declared),
+                Observation::ExperimentRan(ran),
+                Observation::VerdictReached(reached),
+            ) => {
+                assert_eq!((declared.question(), declared.as_of()), (&question, as_of));
+                assert_eq!(ran.checks(), Some(&checks));
+                assert_eq!(
+                    (reached.question(), reached.outcome(), reached.runs()),
+                    (&question, &outcome, &[study.run_id()][..])
+                );
+            }
+            other => panic!("{other:?}"),
+        }
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

@@ -14,6 +14,7 @@ use crate::common::heal::{
     Coverage, Leg, PartitionFailureKind, SessionOutcome, Unrecognized, Window,
 };
 use crate::common::laboratory::experiment::{DatasetRead, ExperimentRan};
+use crate::common::laboratory::verdict::{QuestionDeclared, VerdictReached};
 use crate::common::market::Symbol;
 use crate::common::market::quote_bars::QuoteFoldCounts;
 use crate::common::market::refusal::RowRefusalKind;
@@ -218,6 +219,8 @@ pub enum Observation {
     ViewsChecked(ViewsChecked),
     DatasetRead(Box<DatasetRead>),
     ExperimentRan(Box<ExperimentRan>),
+    QuestionDeclared(Box<QuestionDeclared>),
+    VerdictReached(Box<VerdictReached>),
     OrderSubmitted(OrderSubmitted),
     OrderClosed(OrderClosed),
     OrderRefused(OrderRefused),

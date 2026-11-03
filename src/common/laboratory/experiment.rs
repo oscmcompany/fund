@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::estimate::Estimate;
+use crate::common::laboratory::verdict::Checks;
 
 /// Free text naming what a study is about, for searching the catalog; it gates nothing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -133,9 +134,13 @@ pub enum ExperimentRefusal {
     /// JSON has no NaN or infinity, so a metric that is neither finite nor absent cannot be journaled.
     #[error("metric {metric} is {value}, which is not finite")]
     NotFinite { metric: String, value: f64 },
+    #[error("a question, scope, reopen condition or cause needs text")]
+    BlankStatement,
+    #[error("{undefined} undefined exceeds a population of {population}")]
+    UndefinedExceedsPopulation { undefined: u64, population: u64 },
 }
 
-fn text(raw: String, blank: ExperimentRefusal) -> Result<String, ExperimentRefusal> {
+pub(super) fn text(raw: String, blank: ExperimentRefusal) -> Result<String, ExperimentRefusal> {
     match (raw.trim().is_empty(), raw.contains(['\n', '\r'])) {
         (true, _) => Err(blank),
         (false, true) => Err(ExperimentRefusal::LineBreak { text: raw }),
@@ -290,6 +295,9 @@ pub struct ExperimentRan {
     /// `None` on records journaled before studies captured their source.
     #[serde(default)]
     source_digest: Option<SourceDigest>,
+    /// `None` when the study reported no checks, as every record before checks existed.
+    #[serde(default)]
+    checks: Option<Checks>,
 }
 
 /// The SHA-256 of a study's captured source as 64 lowercase hexadecimal digits, which keys the object holding it.
@@ -340,6 +348,7 @@ impl From<SourceDigest> for String {
 pub struct Outputs {
     estimates: BTreeMap<Name, Estimate>,
     metrics: BTreeMap<Name, Metric>,
+    checks: Option<Checks>,
 }
 
 impl Outputs {
@@ -377,6 +386,16 @@ impl Outputs {
         self.metrics.insert(name, metric);
         Ok(self)
     }
+
+    /// Attaches the experiment's checks; refused a second time, since keeping either would hide the other.
+    pub fn checks(mut self, checks: Checks) -> Result<Self, ExperimentRefusal> {
+        match self.checks.replace(checks) {
+            Some(..) => Err(ExperimentRefusal::Duplicate {
+                name: "checks".to_string(),
+            }),
+            None => Ok(self),
+        }
+    }
 }
 
 impl ExperimentRan {
@@ -398,6 +417,7 @@ impl ExperimentRan {
             metrics: outputs.metrics,
             since_opened,
             source_digest: Some(source_digest),
+            checks: outputs.checks,
         }
     }
 
@@ -432,6 +452,10 @@ impl ExperimentRan {
     pub fn source_digest(&self) -> Option<&SourceDigest> {
         self.source_digest.as_ref()
     }
+
+    pub fn checks(&self) -> Option<&Checks> {
+        self.checks.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +467,7 @@ mod tests {
     use crate::common::laboratory::dataset::{DatasetLeg, PartitionRead};
     use crate::common::laboratory::estimate::summarize;
     use crate::common::laboratory::series::Series;
+    use crate::common::laboratory::verdict::NullReading;
     use crate::common::storage::{EntityTag, Provider};
     use crate::common::time::calendar::{TradingCalendar, TradingSession};
     use crate::common::time::{SessionDate, SessionRange};
@@ -581,6 +606,16 @@ mod tests {
                 .map(|_| ()),
             duplicate
         );
+        let checks = Checks::new(2, 0, NullReading::Measured(Metric::new(0.0).unwrap())).unwrap();
+        assert_eq!(
+            Outputs::default()
+                .checks(checks.clone())
+                .and_then(|outputs| outputs.checks(checks))
+                .map(|_| ()),
+            Err(ExperimentRefusal::Duplicate {
+                name: "checks".to_string()
+            })
+        );
     }
 
     #[test]
@@ -616,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_experiment_journaled_before_sources_reads_back_without_one() {
+    fn test_an_experiment_journaled_before_sources_and_checks_reads_back_without_them() {
         let ran: ExperimentRan = serde_json::from_str(
             r#"{"label":"overnight gap","machine":{"hostname":"laptop","architecture":"aarch64",
             "operating_system":"macos","cores":8},"parameters":{},"fingerprints":[],"estimates":{},
@@ -624,6 +659,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ran.source_digest(), None);
+        assert_eq!(ran.checks(), None);
         assert_eq!(ran.since_opened(), Elapsed::from_milliseconds(5));
     }
 
@@ -650,6 +686,8 @@ mod tests {
                     .estimate("net", estimate)
                     .unwrap()
                     .metric("hit rate", metric)
+                    .unwrap()
+                    .checks(Checks::new(20, 1, NullReading::Measured(Metric::new(metric).unwrap())).unwrap())
                     .unwrap(),
                 Elapsed::from_milliseconds(milliseconds),
                 SourceDigest::new(&"0f".repeat(32)).unwrap(),
