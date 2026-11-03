@@ -21,7 +21,8 @@ This is a collection of guidelines and references.
   tried and concluded, under each profile or with `SET VARIABLE profile_bucket` set to the other bucket, and journal
   every experiment through a `Study`; the catalog is a log of the work and gates none of it
 - Studies are throwaway binaries in the gitignored `studies/src/bin/`, run with `cargo run -p studies --bin <name>`,
-  and a `Study` journals into the gitignored `journal/` at the root, which `finish` ships to the profile bucket
+  and a `Study` journals into the gitignored `journal/` at the root, which `finish` ships to the profile bucket with
+  each file written to `Study::notes`, kept under the run's source
 - Introduce new dependencies only after approval
 - See `README.md` "Principles" section for developer philosophy
 - Docstrings are one sentence on what the item is for, plus at most two more for a caveat, invariant, or

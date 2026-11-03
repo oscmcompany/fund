@@ -23,7 +23,7 @@ use crate::common::laboratory::experiment::{
 use crate::common::laboratory::verdict::{
     Bar, Outcome, Question, QuestionDeclared, VerdictReached,
 };
-use crate::common::storage::{Host, JournalKey, Key, ObjectKey, SourceKey};
+use crate::common::storage::{Host, JournalKey, Key, NoteKey, NoteName, ObjectKey, SourceKey};
 use crate::common::time::SessionDate;
 use crate::journal::{Journal, file_name};
 use crate::laboratory::dataset::Lineage;
@@ -79,6 +79,12 @@ impl Study {
             &partial,
             sources.join(format!("{}.{SOURCE_EXTENSION}", source_digest.as_str())),
         )?;
+        std::fs::create_dir_all(
+            journal
+                .directory()
+                .join(NOTES)
+                .join(journal.run_id().to_string()),
+        )?;
         Ok(Self {
             journal,
             label,
@@ -90,6 +96,15 @@ impl Study {
 
     pub fn run_id(&self) -> RunId {
         self.journal.run_id()
+    }
+
+    /// The directory this run's notes go in, each a file `finish` ships under the run's source and anything else it
+    /// reports as failed; a run that never finishes leaves its notes there unshipped.
+    pub fn notes(&self) -> PathBuf {
+        self.journal
+            .directory()
+            .join(NOTES)
+            .join(self.run_id().to_string())
     }
 
     /// Journals a read; only loaders call it, so every dataset a study holds was cataloged.
@@ -174,9 +189,9 @@ impl Study {
             .append(Utc::now(), Observation::VerdictReached(Box::new(reached)))
     }
 
-    /// Stores each source kept in the journal directory under its digest, then merges each recent session file there
-    /// into its researcher object in `profile`, so studies from other directories or machines that shipped the same
-    /// session keep their records.
+    /// Stores each source kept in the journal directory under its digest and each of this run's notes under its run,
+    /// then merges each recent session file there into its researcher object in `profile`, so studies from other
+    /// directories or machines that shipped the same session keep their records.
     pub async fn finish(self, profile: &Bucket) -> Vec<(Shipment, Result<(), ShipFailure>)> {
         let mut shipped = Vec::new();
         let sources = self.journal.directory().join(SOURCES);
@@ -230,6 +245,58 @@ impl Study {
                 }),
             )),
         }
+        let notes = self.notes();
+        match std::fs::read_dir(&notes) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            let failure = ShipFailure::Read {
+                                path: notes.clone(),
+                                error,
+                            };
+                            shipped.push((Shipment::Local(notes.clone()), Err(failure)));
+                            continue;
+                        }
+                    };
+                    let path = entry.path();
+                    let name = match NoteName::new(&entry.file_name().to_string_lossy()) {
+                        Ok(name) => name,
+                        Err(refusal) => {
+                            shipped
+                                .push((Shipment::Local(path), Err(ShipFailure::Unnamed(refusal))));
+                            continue;
+                        }
+                    };
+                    let key = NoteKey::new(self.source_digest.clone(), self.run_id(), name);
+                    let outcome = match std::fs::read(&path) {
+                        Ok(body) => profile.put(&key, body).await.map_err(ShipFailure::Bucket),
+                        Err(error) => Err(ShipFailure::Read {
+                            path: path.clone(),
+                            error,
+                        }),
+                    };
+                    if outcome.is_ok()
+                        && let Err(error) = std::fs::remove_file(&path)
+                    {
+                        tracing::warn!(path = %path.display(), %error, "Shipped note not removed");
+                    }
+                    shipped.push((Shipment::Note(key), outcome));
+                }
+                match std::fs::remove_dir(&notes) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(error) => {
+                        tracing::warn!(path = %notes.display(), %error, "Notes directory not removed");
+                    }
+                }
+            }
+            Err(error) => shipped.push((
+                Shipment::Local(notes.clone()),
+                Err(ShipFailure::Read { path: notes, error }),
+            )),
+        }
         let today = SessionDate::at(Utc::now());
         for days in 0..RESHIPPED_DAYS {
             let session = today.plus_calendar_days(-days);
@@ -245,11 +312,12 @@ impl Study {
     }
 }
 
-/// What one outcome of `finish` is about: a source stored under its key, a journal session merged into its key, or a
-/// local path in the sources directory that could not be read, so no key was derived for it.
+/// What one outcome of `finish` is about: a source or note stored under its key, a journal session merged into its key,
+/// or a local path in the sources or notes directory no key was derived for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shipment {
     Source(SourceKey),
+    Note(NoteKey),
     Journal(JournalKey),
     Local(PathBuf),
 }
@@ -258,6 +326,7 @@ impl std::fmt::Display for Shipment {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(key) => formatter.write_str(&key.path()),
+            Self::Note(key) => formatter.write_str(&key.path()),
             Self::Journal(key) => formatter.write_str(&Key::from(*key).path()),
             Self::Local(path) => write!(formatter, "{}", path.display()),
         }
@@ -269,6 +338,9 @@ impl std::fmt::Display for Shipment {
 const SOURCES: &str = "sources";
 
 const SOURCE_EXTENSION: &str = "json";
+
+/// The subdirectory of a journal directory holding one directory of notes per run.
+const NOTES: &str = "notes";
 
 /// Creates `encoded` under `key`; a taken key counts as stored only when it reads back as these bytes, since a create
 /// can also be contended by a concurrent delete.
@@ -291,6 +363,7 @@ async fn store_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::storage::NoteNameRefusal;
 
     #[test]
     fn test_a_shipment_displays_the_path_it_names() {
@@ -298,13 +371,24 @@ mod tests {
             SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 21).unwrap());
         let digest = SourceDigest::new(&"0a".repeat(32)).unwrap();
         assert_eq!(
-            Shipment::Source(SourceKey::new(digest)).to_string(),
+            Shipment::Source(SourceKey::new(digest.clone())).to_string(),
             "records/sources/producer=researcher/\
              sha256=0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a/source.json"
         );
         assert_eq!(
             Shipment::Journal(JournalKey::new(Host::Researcher, session)).to_string(),
             "records/journal/producer=researcher/year=2026/month=10/day=21/data.parquet"
+        );
+        assert_eq!(
+            Shipment::Note(NoteKey::new(
+                digest.clone(),
+                RunId::new(Uuid::from_u128(1)),
+                NoteName::new("findings.md").unwrap()
+            ))
+            .to_string(),
+            "records/sources/producer=researcher/\
+             sha256=0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a/\
+             notes/run=00000000-0000-0000-0000-000000000001/findings.md"
         );
         assert_eq!(
             Shipment::Local(PathBuf::from("journal/sources")).to_string(),
@@ -328,6 +412,27 @@ mod tests {
             )]
         );
         assert_eq!(std::fs::read(&kept[0]).unwrap(), source.encode());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_each_run_opens_its_own_notes_directory() {
+        let directory = std::env::temp_dir().join(format!("fund-study-{}", Uuid::new_v4()));
+        let open = || {
+            Study::open(
+                Label::new("notes").unwrap(),
+                &directory,
+                Source::new("notes.rs", "fn main() {}"),
+            )
+            .unwrap()
+        };
+        let (first, second) = (open(), open());
+        assert_eq!(
+            first.notes(),
+            directory.join(format!("notes/{}", first.run_id()))
+        );
+        assert_ne!(first.notes(), second.notes());
+        assert!(first.notes().is_dir() && second.notes().is_dir());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -450,8 +555,43 @@ mod tests {
             study
                 .experiment(Parameters::default(), &[], Outputs::default())
                 .unwrap();
+            let note = format!("note of {}", study.run_id());
+            std::fs::write(study.notes().join("findings.md"), &note).unwrap();
+            let note_key = NoteKey::new(
+                source.digest(),
+                study.run_id(),
+                NoteName::new("findings.md").unwrap(),
+            );
+            let notes = study.notes();
+            let misnamed = notes.join("with space.md");
+            if iteration == 1 {
+                std::fs::write(&misnamed, &note).unwrap();
+            }
             runs.push(study.run_id());
-            let shipped = study.finish(&profile).await;
+            let mut shipped = study.finish(&profile).await;
+            if iteration == 1 {
+                let refused = shipped
+                    .iter()
+                    .position(|(shipment, _)| *shipment == Shipment::Local(misnamed.clone()))
+                    .unwrap();
+                assert!(matches!(
+                    shipped.remove(refused).1,
+                    Err(ShipFailure::Unnamed(NoteNameRefusal::Malformed { raw })) if raw == "with space.md"
+                ));
+                assert_eq!(std::fs::read_dir(&notes).unwrap().count(), 1);
+                assert!(misnamed.is_file());
+            } else {
+                assert!(!notes.exists());
+            }
+            assert!(
+                shipped
+                    .iter()
+                    .any(|(shipment, _)| *shipment == Shipment::Note(note_key.clone()))
+            );
+            assert_eq!(
+                profile.get(&note_key).await.unwrap(),
+                Some(note.into_bytes())
+            );
             assert!(shipped.iter().any(
                 |(shipment, _)| *shipment == Shipment::Source(SourceKey::new(source.digest()))
             ));

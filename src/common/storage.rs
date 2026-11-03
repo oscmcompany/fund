@@ -5,6 +5,7 @@
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
+use crate::common::journal::RunId;
 use crate::common::laboratory::experiment::SourceDigest;
 use crate::common::market::record::BarInterval;
 use crate::common::time::SessionDate;
@@ -118,6 +119,65 @@ impl ObjectKey for SourceKey {
 
     fn storage_class(&self) -> StorageClass {
         StorageClass::Standard
+    }
+}
+
+/// A file a study run wrote beside its journal, kept under the source it ran so the notes read with the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteKey {
+    digest: SourceDigest,
+    run: RunId,
+    name: NoteName,
+}
+
+impl NoteKey {
+    pub fn new(digest: SourceDigest, run: RunId, name: NoteName) -> Self {
+        Self { digest, run, name }
+    }
+}
+
+impl ObjectKey for NoteKey {
+    fn path(&self) -> String {
+        format!(
+            "{RECORDS_ROOT}/sources/producer={}/sha256={}/notes/run={}/{}",
+            Host::Researcher,
+            self.digest.as_str(),
+            self.run,
+            self.name.0
+        )
+    }
+
+    fn storage_class(&self) -> StorageClass {
+        StorageClass::Standard
+    }
+}
+
+/// A note's file name: ASCII letters, digits, `.`, `_` and `-`, not starting with `.`, so it is one path segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteName(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NoteNameRefusal {
+    #[error("`{raw}` is not a note file name")]
+    Malformed { raw: String },
+}
+
+impl NoteName {
+    pub fn new(raw: &str) -> Result<Self, NoteNameRefusal> {
+        let allowed = |character: char| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        };
+        if !raw.is_empty() && !raw.starts_with('.') && raw.chars().all(allowed) {
+            Ok(Self(raw.to_string()))
+        } else {
+            Err(NoteNameRefusal::Malformed {
+                raw: raw.to_string(),
+            })
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -983,6 +1043,35 @@ pub(crate) mod tests {
                 "records/sources/producer=researcher/"
             ]
         );
+    }
+
+    #[test]
+    fn test_a_note_is_keyed_by_its_run_under_its_source() {
+        let key = NoteKey::new(
+            SourceDigest::new(&"0a".repeat(32)).unwrap(),
+            RunId::new(uuid::Uuid::from_u128(1)),
+            NoteName::new("findings_v2.md").unwrap(),
+        );
+        assert_eq!(
+            key.path(),
+            "records/sources/producer=researcher/\
+             sha256=0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a/\
+             notes/run=00000000-0000-0000-0000-000000000001/findings_v2.md"
+        );
+        assert!(
+            Host::Researcher
+                .writable_prefixes()
+                .iter()
+                .any(|prefix| key.path().starts_with(prefix))
+        );
+        for raw in ["", ".hidden", "a/b", "..", "with space.md", "é.md"] {
+            assert_eq!(
+                NoteName::new(raw),
+                Err(NoteNameRefusal::Malformed {
+                    raw: raw.to_string()
+                })
+            );
+        }
     }
 
     #[test]

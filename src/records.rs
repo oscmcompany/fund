@@ -186,6 +186,9 @@ pub enum ShipFailure {
     /// A create found the key taken, and reading it back returned other bytes or none.
     #[error("{path} was taken, and reading it back did not return these bytes")]
     Unmatched { path: String },
+    /// A file in a run's notes directory whose name cannot be a note's key.
+    #[error(transparent)]
+    Unnamed(crate::common::storage::NoteNameRefusal),
 }
 
 /// Each recent journal and log file that exists, encoded under its key, or why it could not be.
