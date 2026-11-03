@@ -189,6 +189,10 @@ pub enum ShipFailure {
     /// A file in a run's notes directory whose name cannot be a note's key.
     #[error(transparent)]
     Unnamed(crate::common::storage::NoteNameRefusal),
+    /// An entry under the notes directory that is not a directory or regular file where one belongs, or whose
+    /// directory name reads as no digest or run.
+    #[error("{} names no note", .path.display())]
+    Unkeyed { path: PathBuf },
 }
 
 /// Each recent journal and log file that exists, encoded under its key, or why it could not be.
