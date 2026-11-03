@@ -362,7 +362,7 @@ COMMENT ON COLUMN verdicts.reopen IS 'What would reopen a refutation; null other
 COMMENT ON COLUMN verdicts.cause IS 'Why an inconclusive outcome did not decide; null otherwise.';
 COMMENT ON COLUMN verdicts.runs IS 'Study runs the verdict rests on; empty for a finding recorded after its journals.';
 COMMENT ON COLUMN verdicts.declared_at IS
-    'Instant of the latest declaration of the question before the verdict, UTC; null when undeclared.';
+    'Instant of the latest declaration of the question at or before the verdict, UTC; null when undeclared.';
 COMMENT ON COLUMN verdicts.baseline IS 'Trivial arm the declaration quoted skill against; null when undeclared.';
 COMMENT ON COLUMN verdicts.metric IS 'Metric the declared bar reads; null when undeclared.';
 COMMENT ON COLUMN verdicts.bar IS 'Where the metric had to land, as JSON; null when undeclared.';

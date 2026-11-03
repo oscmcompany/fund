@@ -1,5 +1,5 @@
-//! What a study asked and what it concluded: the question declared with its baseline and bar before any reading, the
-//! checks beside each experiment, and the verdict that closes the question with its scope and what would reopen it.
+//! What a study asked and what it concluded: the question declared with its baseline and bar, the checks beside each
+//! experiment, and the verdict that closes the question with its scope and what would reopen it.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,8 +68,9 @@ pub enum Bar {
     Below(Metric),
 }
 
-/// A question declared before reading: the trivial baseline skill is quoted against, the metric the bar reads, and
-/// the session after which later data is the "as of" confirm read.
+/// A question declared: the trivial baseline skill is quoted against, the metric the bar reads, and the session after
+/// which later data is the "as of" confirm read. Nothing requires it to be journaled before the experiments that
+/// answer it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuestionDeclared {
     label: Label,

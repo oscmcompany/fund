@@ -136,8 +136,8 @@ impl Study {
             .map_err(StudyError::Journal)
     }
 
-    /// Journals a question before any reading answers it: the baseline skill is quoted against, the metric and bar
-    /// that decide it, and the session after which data is the "as of" confirm read.
+    /// Journals a question: the baseline skill is quoted against, the metric and bar that decide it, and the session
+    /// after which data is the "as of" confirm read. Meant to be called before reading; nothing enforces the order.
     pub fn declare(
         &mut self,
         question: Question,
