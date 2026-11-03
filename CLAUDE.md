@@ -165,6 +165,9 @@ This is a collection of guidelines and references.
   reading, so the journal stamps what was asked with its commit and time, and re-check the declared metric on the
   sessions after that one rather than counting candidates against a raised bar; a verdict answers the latest
   declaration before it, so re-declaring moves the bar; an automated search never reads a confirm set
+- Beside any confirm reading, report how many declared questions were re-checked over the same sessions and the
+  standard errors that count requires through `laboratory::haircut`, since at a 5% bar at least one of ten
+  independent questions read on one block passes by luck about 40% of the time; the count informs and gates nothing
 - Scope a kill precisely — say exactly what was refuted and under what conditions, because over-claiming a
   refutation closes doors that are still open and under-claiming reopens ones that are shut; record what would reopen
   it (a cost level, a data source, a latency), since a change in what we can do undoes a refutation that rested on it;
