@@ -177,10 +177,10 @@ This is a collection of guidelines and references.
   measurement rather than remembering it as a past mistake
 - A tooling trap or a recurring review comment that a check could detect is owed a check, not a memory — a
   memory is read after the trap fires; only a hazard of a typed command that no check can observe stays a note
-- Standard errors assume independent observations, which financial data never is — aggregate to the level
-  that actually varies, found by coarsening (minute, five minutes, hour, session) until the standard error stops
-  growing, a reading that is itself noisy once few blocks remain, and report effective sample size rather than row
-  count
+- Standard errors assume independent observations, which financial data never is — group readings into blocks that
+  move together, by time (minute up to session), by name, by name within a session, and by session and name at once,
+  through `laboratory::blocks::coarsen`; quote the largest error among groupings with at least 20 blocks, week shown
+  only as a check, since fewer leaves the error itself noisy, and report effective sample size rather than row count
 - Always report the undefined share alongside an estimate; an estimator silently defined on 60% of its
   inputs reads exactly like a complete measurement
 - Print the population and the boundary values beside any difference — `1254 / 1254 / 0 / 0` is a proof and
