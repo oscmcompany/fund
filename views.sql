@@ -270,6 +270,7 @@ SELECT
     CAST(payload ->> '$.checks.population' AS BIGINT) AS population,
     CAST(payload ->> '$.checks.undefined' AS BIGINT) AS undefined,
     payload -> '$.checks.null' AS null_reading,
+    coalesce(payload -> '$.coarsenings', '{}'::JSON) AS coarsenings,
     "commit",
     payload ->> '$.machine.hostname' AS hostname,
     payload ->> '$.machine.architecture' AS architecture,
@@ -294,6 +295,8 @@ COMMENT ON COLUMN experiments.estimates IS 'Estimates by name, as JSON.';
 COMMENT ON COLUMN experiments.metrics IS 'Metrics by name, as JSON.';
 COMMENT ON COLUMN experiments.population IS 'Inputs the estimate read; null when the study reported no checks.';
 COMMENT ON COLUMN experiments.undefined IS 'Inputs that left the estimate undefined; null when no checks.';
+COMMENT ON COLUMN experiments.coarsenings IS
+    'Standard errors by block grouping, by name, as JSON; empty before coarsenings were journaled.';
 COMMENT ON COLUMN experiments.null_reading IS
     'The permutation null''s reading of the metric, or why none was taken, as JSON; null when no checks.';
 COMMENT ON COLUMN experiments."commit" IS 'Git sha the binary was built from, with -dirty if the tree differed.';
