@@ -209,9 +209,11 @@ impl From<Coarsening> for CoarseningFields {
             undefined: coarsening.undefined,
             mean: coarsening.mean,
             independent_standard_error: coarsening.independent_standard_error,
+            // Session and name is derived from its parts on reading, so it is never stored beside them.
             groupings: coarsening
                 .groupings
                 .into_iter()
+                .filter(|(grouping, _)| *grouping != Grouping::SessionAndName)
                 .map(|(grouping, reading)| {
                     let reading = match reading {
                         Ok(clustered) => GroupingReading::Clustered(clustered),
@@ -228,7 +230,7 @@ impl TryFrom<CoarseningFields> for Coarsening {
     type Error = Inadmissible;
 
     fn try_from(fields: CoarseningFields) -> Result<Self, Self::Error> {
-        let groupings: BTreeMap<Grouping, Result<Clustered, GroupingRefusal>> = fields
+        let mut groupings: BTreeMap<Grouping, Result<Clustered, GroupingRefusal>> = fields
             .groupings
             .into_iter()
             .map(|(grouping, reading)| match reading {
@@ -236,28 +238,37 @@ impl TryFrom<CoarseningFields> for Coarsening {
                 GroupingReading::Refused { cause } => (grouping, Err(cause)),
             })
             .collect();
-        let keyed = groupings.keys().copied().eq(Grouping::iter())
+        let keyed = groupings
+            .keys()
+            .copied()
+            .eq(Grouping::iter().filter(|grouping| *grouping != Grouping::SessionAndName))
             && groupings.iter().all(|(grouping, reading)| match reading {
                 Ok(clustered) => {
                     clustered.grouping == *grouping && clustered.blocks <= fields.measured
                 }
                 Err(GroupingRefusal::OneBlock) => true,
             });
-        // Session and name stands only on all three of its parts, with the fewer of session's and name's blocks.
-        let two_way = keyed
-            && match (
+        // Every name-session block lies in one session block and one name block, so it has at least as many as each.
+        let partitioned = keyed && {
+            let blocks = |grouping: Grouping| match groupings[&grouping] {
+                Ok(clustered) => clustered.blocks,
+                Err(GroupingRefusal::OneBlock) => 1,
+            };
+            blocks(Grouping::NameSession) >= blocks(Grouping::Session).max(blocks(Grouping::Name))
+        };
+        if partitioned {
+            let derived = combined(
                 groupings[&Grouping::Session],
                 groupings[&Grouping::Name],
                 groupings[&Grouping::NameSession],
-                groupings[&Grouping::SessionAndName],
-            ) {
-                (Ok(session), Ok(name), Ok(_), Ok(both)) => {
-                    both.blocks == session.blocks.min(name.blocks)
-                }
-                (Ok(_), Ok(_), Ok(_), Err(_)) => false,
-                (Err(_), ..) | (_, Err(_), ..) | (_, _, Err(_), _) => {
-                    groupings[&Grouping::SessionAndName].is_err()
-                }
+            );
+            groupings.insert(Grouping::SessionAndName, derived);
+        }
+        // Squaring a finite stored error can overflow, which bounded readings never let coarsen do.
+        let two_way = partitioned
+            && match groupings[&Grouping::SessionAndName] {
+                Ok(two_way) => two_way.standard_error.is_finite(),
+                Err(GroupingRefusal::OneBlock) => true,
             };
         let admitted = two_way
             && fields.measured >= 2
@@ -394,7 +405,6 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
         blocks,
     };
     let mut groupings = BTreeMap::new();
-    let mut variances = BTreeMap::new();
     for grouping in [
         Grouping::Minute,
         Grouping::FiveMinutes,
@@ -405,28 +415,16 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
         Grouping::NameSession,
     ] {
         let reading = one_way(grouping);
-        variances.insert(grouping, reading);
         groupings.insert(
             grouping,
             reading.map(|reading| clustered(grouping, reading)),
         );
     }
-    let two_way = match (
-        variances[&Grouping::Session],
-        variances[&Grouping::Name],
-        variances[&Grouping::NameSession],
-    ) {
-        (Ok((session, session_blocks)), Ok((name, name_blocks)), Ok((intersection, _))) => {
-            let blocks = session_blocks.min(name_blocks);
-            // A negative two-way variance is a small-sample artifact; the larger one-way variance stands in for it.
-            let variance = match session + name - intersection {
-                measured if measured >= 0.0 => measured,
-                _ => session.max(name),
-            };
-            Ok(clustered(Grouping::SessionAndName, (variance, blocks)))
-        }
-        (Err(refusal), ..) | (_, Err(refusal), _) | (.., Err(refusal)) => Err(refusal),
-    };
+    let two_way = combined(
+        groupings[&Grouping::Session],
+        groupings[&Grouping::Name],
+        groupings[&Grouping::NameSession],
+    );
     groupings.insert(Grouping::SessionAndName, two_way);
     Ok(Coarsening {
         measured: count,
@@ -434,6 +432,30 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
         mean,
         independent_standard_error,
         groupings,
+    })
+}
+
+/// Session and name together from its parts (Cameron, Gelbach and Miller), read from their errors so a stored
+/// coarsening derives the same value `coarsen` did; a negative combination, a small-sample artifact, falls back to the
+/// larger one-way variance.
+fn combined(
+    session: Result<Clustered, GroupingRefusal>,
+    name: Result<Clustered, GroupingRefusal>,
+    intersection: Result<Clustered, GroupingRefusal>,
+) -> Result<Clustered, GroupingRefusal> {
+    let (session, name, intersection) = (session?, name?, intersection?);
+    let variance = |clustered: Clustered| clustered.standard_error * clustered.standard_error;
+    let blocks = session.blocks.min(name.blocks);
+    let two_way = match variance(session) + variance(name) - variance(intersection) {
+        measured if measured >= 0.0 => measured,
+        _ => variance(session).max(variance(name)),
+    };
+    Ok(Clustered {
+        grouping: Grouping::SessionAndName,
+        standard_error: two_way.sqrt(),
+        degrees_of_freedom: DegreesOfFreedom::new((blocks - 1) as f64)
+            .expect("two blocks or more leave at least one degree of freedom"),
+        blocks,
     })
 }
 
@@ -893,14 +915,20 @@ mod tests {
         let mut misfiled = encoded.clone();
         misfiled["groupings"]["session"]["clustered"]["grouping"] = serde_json::json!("name");
         assert!(serde_json::from_value::<Coarsening>(misfiled).is_err());
-        let mut unsupported = encoded.clone();
-        unsupported["groupings"]["session_and_name"]["clustered"]["blocks"] = serde_json::json!(3);
-        unsupported["groupings"]["session_and_name"]["clustered"]["degrees_of_freedom"] =
-            serde_json::json!(2.0);
-        assert!(serde_json::from_value::<Coarsening>(unsupported).is_err());
-        let mut orphaned = encoded.clone();
-        orphaned["groupings"]["name"] = serde_json::json!({"refused": {"cause": "one_block"}});
-        assert!(serde_json::from_value::<Coarsening>(orphaned).is_err());
+        // Session and name is derived on reading, never stored, so no stored value can disagree with its parts.
+        assert_eq!(encoded["groupings"].get("session_and_name"), None);
+        let mut stored_two_way = encoded.clone();
+        stored_two_way["groupings"]["session_and_name"] = encoded["groupings"]["session"].clone();
+        assert!(serde_json::from_value::<Coarsening>(stored_two_way).is_err());
+        // Name-session blocks split both session's and name's, so one block beside two of each is impossible.
+        let mut unpartitioned = encoded.clone();
+        unpartitioned["groupings"]["name_session"] =
+            serde_json::json!({"refused": {"cause": "one_block"}});
+        assert!(serde_json::from_value::<Coarsening>(unpartitioned).is_err());
+        let mut overflowing = encoded.clone();
+        overflowing["groupings"]["session"]["clustered"]["standard_error"] =
+            serde_json::json!(1e200);
+        assert!(serde_json::from_value::<Coarsening>(overflowing).is_err());
         let mut missing = encoded;
         missing["groupings"].as_object_mut().unwrap().remove("hour");
         assert!(serde_json::from_value::<Coarsening>(missing).is_err());
@@ -982,6 +1010,23 @@ mod tests {
                     prop_assert!(most_blocks < 20);
                 }
             }
+        }
+
+        /// Every coarsening reads back as itself, its derived session and name included, over partitions that mix
+        /// names across sessions.
+        #[test]
+        fn test_every_coarsening_round_trips(
+            values in prop::collection::vec(-100.0..100.0f64, 2..120),
+            names in 1usize..12,
+            spacing in 1i64..3000,
+        ) {
+            let observations = Observations::new(values.iter().enumerate().map(|(index, value)| {
+                (at(index as i64 * spacing), symbol(index % names), Some(*value))
+            }))
+            .unwrap();
+            let coarsening = coarsen(&observations).unwrap();
+            let encoded = serde_json::to_string(&coarsening).unwrap();
+            prop_assert_eq!(serde_json::from_str::<Coarsening>(&encoded).unwrap(), coarsening);
         }
 
         /// A name traded on one session only: its name and name-session blocks coincide, so the two-way variance is

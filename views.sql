@@ -270,7 +270,7 @@ SELECT
     CAST(payload ->> '$.checks.population' AS BIGINT) AS population,
     CAST(payload ->> '$.checks.undefined' AS BIGINT) AS undefined,
     payload -> '$.checks.null' AS null_reading,
-    payload -> '$.coarsenings' AS coarsenings,
+    coalesce(payload -> '$.coarsenings', '{}'::JSON) AS coarsenings,
     "commit",
     payload ->> '$.machine.hostname' AS hostname,
     payload ->> '$.machine.architecture' AS architecture,
