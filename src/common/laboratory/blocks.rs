@@ -2,11 +2,16 @@
 //! or both), each grouping's error taken from its block sums, and the largest well-supported one quoted.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Datelike, Utc};
+use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 
 use crate::common::laboratory::READING_BOUND;
+use crate::common::laboratory::estimate::share;
 use crate::common::laboratory::haircut::DegreesOfFreedom;
+use crate::common::laboratory::permutation::Generator;
 use crate::common::market::Symbol;
 use crate::common::time::SessionDate;
 
@@ -30,6 +35,11 @@ pub enum BlocksRefusal {
     },
     #[error("{measured} measured readings cannot carry an error")]
     TooFewMeasured { measured: u64 },
+    /// Session and name together has no blocks of its own to relabel.
+    #[error("{grouping} has no blocks of its own")]
+    NotOneWay { grouping: Grouping },
+    #[error("every reading fell in one {grouping} block")]
+    OneBlock { grouping: Grouping },
 }
 
 impl Observations {
@@ -59,11 +69,14 @@ impl Observations {
     PartialOrd,
     Ord,
     Hash,
+    Serialize,
+    Deserialize,
     strum::Display,
     strum::EnumString,
     strum::IntoStaticStr,
     strum::EnumIter,
 )]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Grouping {
     Minute,
@@ -90,12 +103,46 @@ enum Block {
 }
 
 /// One grouping's error of the coarsening's mean, from its block sums, with the blocks behind it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ClusteredFields")]
 pub struct Clustered {
     grouping: Grouping,
     standard_error: f64,
     degrees_of_freedom: DegreesOfFreedom,
     blocks: u64,
+}
+
+#[derive(Deserialize)]
+struct ClusteredFields {
+    grouping: Grouping,
+    standard_error: f64,
+    degrees_of_freedom: DegreesOfFreedom,
+    blocks: u64,
+}
+
+/// Why a stored grouping or coarsening was refused: it is not one `coarsen` could have produced.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("a stored coarsening is not one coarsen could produce")]
+pub struct Inadmissible;
+
+impl TryFrom<ClusteredFields> for Clustered {
+    type Error = Inadmissible;
+
+    fn try_from(fields: ClusteredFields) -> Result<Self, Self::Error> {
+        let admitted = fields.standard_error.is_finite()
+            && fields.standard_error >= 0.0
+            && fields.blocks >= 2
+            && fields.degrees_of_freedom.value() == (fields.blocks - 1) as f64;
+        match admitted {
+            true => Ok(Self {
+                grouping: fields.grouping,
+                standard_error: fields.standard_error,
+                degrees_of_freedom: fields.degrees_of_freedom,
+                blocks: fields.blocks,
+            }),
+            false => Err(Inadmissible),
+        }
+    }
 }
 
 impl Clustered {
@@ -118,7 +165,8 @@ impl Clustered {
 }
 
 /// Why one grouping carries no error.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
 pub enum GroupingRefusal {
     /// Every measured reading fell in one block, which leaves no variation between blocks to read.
     #[error("every reading fell in one block")]
@@ -126,7 +174,8 @@ pub enum GroupingRefusal {
 }
 
 /// Every grouping's error over the same readings, and the grouping the error is quoted at.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "CoarseningFields", into = "CoarseningFields")]
 pub struct Coarsening {
     measured: u64,
     undefined: u64,
@@ -134,6 +183,98 @@ pub struct Coarsening {
     /// The error as if every reading were independent, which effective sample size is read against.
     independent_standard_error: f64,
     groupings: BTreeMap<Grouping, Result<Clustered, GroupingRefusal>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CoarseningFields {
+    measured: u64,
+    undefined: u64,
+    mean: f64,
+    independent_standard_error: f64,
+    groupings: BTreeMap<Grouping, GroupingReading>,
+}
+
+/// One grouping's reading as journaled, in the snake_case form the journal's other outcomes take.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupingReading {
+    Clustered(Clustered),
+    Refused { cause: GroupingRefusal },
+}
+
+impl From<Coarsening> for CoarseningFields {
+    fn from(coarsening: Coarsening) -> Self {
+        Self {
+            measured: coarsening.measured,
+            undefined: coarsening.undefined,
+            mean: coarsening.mean,
+            independent_standard_error: coarsening.independent_standard_error,
+            groupings: coarsening
+                .groupings
+                .into_iter()
+                .map(|(grouping, reading)| {
+                    let reading = match reading {
+                        Ok(clustered) => GroupingReading::Clustered(clustered),
+                        Err(cause) => GroupingReading::Refused { cause },
+                    };
+                    (grouping, reading)
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<CoarseningFields> for Coarsening {
+    type Error = Inadmissible;
+
+    fn try_from(fields: CoarseningFields) -> Result<Self, Self::Error> {
+        let groupings: BTreeMap<Grouping, Result<Clustered, GroupingRefusal>> = fields
+            .groupings
+            .into_iter()
+            .map(|(grouping, reading)| match reading {
+                GroupingReading::Clustered(clustered) => (grouping, Ok(clustered)),
+                GroupingReading::Refused { cause } => (grouping, Err(cause)),
+            })
+            .collect();
+        let keyed = groupings.keys().copied().eq(Grouping::iter())
+            && groupings.iter().all(|(grouping, reading)| match reading {
+                Ok(clustered) => {
+                    clustered.grouping == *grouping && clustered.blocks <= fields.measured
+                }
+                Err(GroupingRefusal::OneBlock) => true,
+            });
+        // Session and name stands only on all three of its parts, with the fewer of session's and name's blocks.
+        let two_way = keyed
+            && match (
+                groupings[&Grouping::Session],
+                groupings[&Grouping::Name],
+                groupings[&Grouping::NameSession],
+                groupings[&Grouping::SessionAndName],
+            ) {
+                (Ok(session), Ok(name), Ok(_), Ok(both)) => {
+                    both.blocks == session.blocks.min(name.blocks)
+                }
+                (Ok(_), Ok(_), Ok(_), Err(_)) => false,
+                (Err(_), ..) | (_, Err(_), ..) | (_, _, Err(_), _) => {
+                    groupings[&Grouping::SessionAndName].is_err()
+                }
+            };
+        let admitted = two_way
+            && fields.measured >= 2
+            && fields.mean.is_finite()
+            && fields.independent_standard_error.is_finite()
+            && fields.independent_standard_error >= 0.0;
+        match admitted {
+            true => Ok(Self {
+                measured: fields.measured,
+                undefined: fields.undefined,
+                mean: fields.mean,
+                independent_standard_error: fields.independent_standard_error,
+                groupings,
+            }),
+            false => Err(Inadmissible),
+        }
+    }
 }
 
 impl Coarsening {
@@ -294,6 +435,53 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
         independent_standard_error,
         groupings,
     })
+}
+
+/// The share of sign flips of `grouping`'s block sums whose total lies at least as far from zero as the readings'
+/// does, counting the readings' own so it is never zero: the permutation null for a mean, relabelled by block so it
+/// keeps the dependence within a block that flipping each reading would break.
+pub fn flipped_block_share(
+    observations: &Observations,
+    grouping: Grouping,
+    seed: u64,
+    permutations: NonZeroU32,
+) -> Result<f64, BlocksRefusal> {
+    if grouping == Grouping::SessionAndName {
+        return Err(BlocksRefusal::NotOneWay { grouping });
+    }
+    let mut sums: BTreeMap<Block, f64> = BTreeMap::new();
+    let mut measured = 0;
+    for (at, symbol, value) in observations
+        .readings
+        .iter()
+        .filter_map(|(at, symbol, reading)| reading.map(|value| (at, symbol, value)))
+    {
+        *sums.entry(block(grouping, *at, symbol)).or_insert(0.0) += value;
+        measured += 1;
+    }
+    if measured < 2 {
+        return Err(BlocksRefusal::TooFewMeasured { measured });
+    }
+    if sums.len() < 2 {
+        return Err(BlocksRefusal::OneBlock { grouping });
+    }
+    let sums: Vec<f64> = sums.into_values().collect();
+    // Summed in block order, so a relabelling that reproduces the readings, or negates them, ties them exactly.
+    let observed = sums.iter().sum::<f64>().abs();
+    let mut generator = Generator::new(seed);
+    let count = (0..permutations.get())
+        .filter(|_| {
+            let flipped: f64 = sums
+                .iter()
+                .map(|sum| match generator.coin() {
+                    true => -sum,
+                    false => *sum,
+                })
+                .sum();
+            flipped.abs() >= observed
+        })
+        .count();
+    Ok(share(count, permutations))
 }
 
 fn block(grouping: Grouping, at: DateTime<Utc>, symbol: &Symbol) -> Block {
@@ -629,11 +817,119 @@ mod tests {
         assert!(calm.quoted().unwrap().standard_error() <= 1.1 * calm.independent_standard_error());
     }
 
+    /// Sessions whose readings share a shock, 20 up and 10 down: flipping each reading reads the 300 readings as
+    /// overwhelming evidence, while flipping each session's sum reads 30 pieces of it, so the block null must be the
+    /// wider of the two.
+    #[test]
+    fn test_flipping_blocks_keeps_the_dependence_flipping_readings_breaks() {
+        let day = chrono::Duration::days(1);
+        let observations = Observations::new((0..30).flat_map(|session| {
+            let shock = if session < 20 { 3.0 } else { -3.0 };
+            (0..10).map(move |index| {
+                (
+                    at(index as i64 * 7) + day * session as i32,
+                    symbol(index),
+                    Some(shock + [0.5, -0.5][(index + session) % 2]),
+                )
+            })
+        }))
+        .unwrap();
+        let permutations = NonZeroU32::new(999).unwrap();
+        let readings =
+            flipped_block_share(&observations, Grouping::Minute, 7, permutations).unwrap();
+        let sessions =
+            flipped_block_share(&observations, Grouping::Session, 7, permutations).unwrap();
+        assert!(readings <= 0.005, "{readings}");
+        assert!(sessions >= 0.03, "{sessions}");
+    }
+
+    #[test]
+    fn test_a_block_null_refuses_two_way_and_a_single_block() {
+        let observations =
+            Observations::new([(at(0), symbol(0), Some(1.0)), (at(1), symbol(1), Some(2.0))])
+                .unwrap();
+        let permutations = NonZeroU32::new(9).unwrap();
+        assert_eq!(
+            flipped_block_share(&observations, Grouping::SessionAndName, 1, permutations),
+            Err(BlocksRefusal::NotOneWay {
+                grouping: Grouping::SessionAndName
+            })
+        );
+        assert_eq!(
+            flipped_block_share(&observations, Grouping::Session, 1, permutations),
+            Err(BlocksRefusal::OneBlock {
+                grouping: Grouping::Session
+            })
+        );
+    }
+
+    /// A coarsening reads back as written, and one misfiling, missing or contradicting a grouping is refused.
+    #[test]
+    fn test_a_coarsening_round_trips_and_refuses_what_coarsen_could_not_produce() {
+        let day = chrono::Duration::days(1);
+        let coarsening = coarsen(
+            &Observations::new([
+                (at(0), symbol(0), Some(1.0)),
+                (at(1), symbol(1), Some(3.0)),
+                (at(0) + day, symbol(0), Some(5.0)),
+                (at(1) + day, symbol(1), Some(7.0)),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&coarsening).unwrap();
+        assert_eq!(
+            encoded["groupings"]["session"],
+            serde_json::json!({"clustered": {"grouping": "session", "standard_error": 2.0, "degrees_of_freedom": 1.0, "blocks": 2}})
+        );
+        assert_eq!(
+            encoded["groupings"]["week"],
+            serde_json::json!({"refused": {"cause": "one_block"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<Coarsening>(encoded.clone()).unwrap(),
+            coarsening
+        );
+        let mut misfiled = encoded.clone();
+        misfiled["groupings"]["session"]["clustered"]["grouping"] = serde_json::json!("name");
+        assert!(serde_json::from_value::<Coarsening>(misfiled).is_err());
+        let mut unsupported = encoded.clone();
+        unsupported["groupings"]["session_and_name"]["clustered"]["blocks"] = serde_json::json!(3);
+        unsupported["groupings"]["session_and_name"]["clustered"]["degrees_of_freedom"] =
+            serde_json::json!(2.0);
+        assert!(serde_json::from_value::<Coarsening>(unsupported).is_err());
+        let mut orphaned = encoded.clone();
+        orphaned["groupings"]["name"] = serde_json::json!({"refused": {"cause": "one_block"}});
+        assert!(serde_json::from_value::<Coarsening>(orphaned).is_err());
+        let mut missing = encoded;
+        missing["groupings"].as_object_mut().unwrap().remove("hour");
+        assert!(serde_json::from_value::<Coarsening>(missing).is_err());
+    }
+
     fn readings() -> impl Strategy<Value = Vec<f64>> {
         prop::collection::vec(-100.0..100.0f64, 2..60)
     }
 
     proptest! {
+        /// Every reading in its own session: flipping session blocks is flipping readings, so the block null agrees
+        /// exactly with `flipped_share` over the same readings as a series.
+        #[test]
+        fn test_one_reading_per_block_matches_the_series_null(values in readings(), seed in 0u64..1000) {
+            let observations = Observations::new(values.iter().enumerate().map(|(index, value)| {
+                (at(0) + chrono::Duration::days(index as i64), symbol(0), Some(*value))
+            }))
+            .unwrap();
+            let sessions = Series::new(values.iter().enumerate().map(|(index, value)| {
+                (SessionDate::at(at(0) + chrono::Duration::days(index as i64)), Some(*value))
+            }))
+            .unwrap();
+            let permutations = NonZeroU32::new(99).unwrap();
+            prop_assert_eq!(
+                flipped_block_share(&observations, Grouping::Session, seed, permutations).unwrap(),
+                crate::common::laboratory::estimate::flipped_share(&sessions, seed, permutations).unwrap()
+            );
+        }
+
         /// Every reading on its own minute and its own name: both groupings are the independent error, which is
         /// what `Estimate` computes from the same readings as sessions.
         #[test]

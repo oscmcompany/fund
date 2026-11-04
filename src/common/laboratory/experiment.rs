@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::laboratory::blocks::Coarsening;
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::estimate::Estimate;
 use crate::common::laboratory::verdict::Checks;
@@ -298,6 +299,9 @@ pub struct ExperimentRan {
     /// `None` when the study reported no checks, as every record before checks existed.
     #[serde(default)]
     checks: Option<Checks>,
+    /// Empty on every record journaled before coarsenings existed.
+    #[serde(default)]
+    coarsenings: BTreeMap<Name, Coarsening>,
 }
 
 /// The SHA-256 of a study's captured source as 64 lowercase hexadecimal digits, which keys the object holding it.
@@ -349,6 +353,7 @@ pub struct Outputs {
     estimates: BTreeMap<Name, Estimate>,
     metrics: BTreeMap<Name, Metric>,
     checks: Option<Checks>,
+    coarsenings: BTreeMap<Name, Coarsening>,
 }
 
 impl Outputs {
@@ -387,6 +392,19 @@ impl Outputs {
         Ok(self)
     }
 
+    pub fn coarsening(
+        mut self,
+        name: impl Into<String>,
+        coarsening: Coarsening,
+    ) -> Result<Self, ExperimentRefusal> {
+        let name = Name::new(name)?;
+        if self.coarsenings.contains_key(&name) {
+            return Err(ExperimentRefusal::Duplicate { name: name.0 });
+        }
+        self.coarsenings.insert(name, coarsening);
+        Ok(self)
+    }
+
     /// Attaches the experiment's checks; refused a second time, since keeping either would hide the other.
     pub fn checks(mut self, checks: Checks) -> Result<Self, ExperimentRefusal> {
         match self.checks.replace(checks) {
@@ -418,6 +436,7 @@ impl ExperimentRan {
             since_opened,
             source_digest: Some(source_digest),
             checks: outputs.checks,
+            coarsenings: outputs.coarsenings,
         }
     }
 
@@ -456,6 +475,10 @@ impl ExperimentRan {
     pub fn checks(&self) -> Option<&Checks> {
         self.checks.as_ref()
     }
+
+    pub fn coarsenings(&self) -> &BTreeMap<Name, Coarsening> {
+        &self.coarsenings
+    }
 }
 
 #[cfg(test)]
@@ -464,6 +487,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::common::laboratory::blocks::{Observations, coarsen};
     use crate::common::laboratory::dataset::{DatasetLeg, PartitionRead};
     use crate::common::laboratory::estimate::summarize;
     use crate::common::laboratory::series::Series;
@@ -474,6 +498,21 @@ mod tests {
 
     fn session(day: i64) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
+    }
+
+    fn coarsened() -> Coarsening {
+        let at = |minutes: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_772_463_600 + minutes * 60, 0)
+                .unwrap()
+        };
+        let symbol = crate::common::market::Symbol::new("SPY").unwrap();
+        coarsen(
+            &Observations::new(
+                (0..4).map(|minute| (at(minute), symbol.clone(), Some(minute as f64))),
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     fn fingerprint() -> Fingerprint {
@@ -606,6 +645,14 @@ mod tests {
                 .map(|_| ()),
             duplicate
         );
+        let coarsening = coarsened();
+        assert_eq!(
+            Outputs::default()
+                .coarsening("side", coarsening.clone())
+                .and_then(|outputs| outputs.coarsening("side", coarsening))
+                .map(|_| ()),
+            duplicate
+        );
         let checks = Checks::new(2, 0, NullReading::Measured(Metric::new(0.0).unwrap())).unwrap();
         assert_eq!(
             Outputs::default()
@@ -660,6 +707,7 @@ mod tests {
         .unwrap();
         assert_eq!(ran.source_digest(), None);
         assert_eq!(ran.checks(), None);
+        assert!(ran.coarsenings().is_empty());
         assert_eq!(ran.since_opened(), Elapsed::from_milliseconds(5));
     }
 
@@ -686,6 +734,8 @@ mod tests {
                     .estimate("net", estimate)
                     .unwrap()
                     .metric("hit rate", metric)
+                    .unwrap()
+                    .coarsening("net by block", coarsened())
                     .unwrap()
                     .checks(Checks::new(20, 1, NullReading::Measured(Metric::new(metric).unwrap())).unwrap())
                     .unwrap(),

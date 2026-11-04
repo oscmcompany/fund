@@ -366,7 +366,7 @@ pub fn shuffled_share(
     Ok(share(count, permutations))
 }
 
-fn share(at_least_as_extreme: usize, permutations: NonZeroU32) -> f64 {
+pub(super) fn share(at_least_as_extreme: usize, permutations: NonZeroU32) -> f64 {
     (at_least_as_extreme as f64 + 1.0) / (f64::from(permutations.get()) + 1.0)
 }
 
