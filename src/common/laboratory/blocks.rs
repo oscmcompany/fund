@@ -217,7 +217,13 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
     if count < 2 {
         return Err(BlocksRefusal::TooFewMeasured { measured: count });
     }
-    let mean = measured.iter().map(|(.., value)| value).sum::<f64>() / count as f64;
+    // A running mean, which stays exactly on a constant reading where a naive sum drifts and manufactures residuals.
+    let mean = measured
+        .iter()
+        .enumerate()
+        .fold(0.0, |mean, (index, (.., value))| {
+            mean + (value - mean) / (index + 1) as f64
+        });
     let squared_residuals: f64 = measured
         .iter()
         .map(|(.., value)| (value - mean).powi(2))
@@ -273,7 +279,7 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
             let blocks = session_blocks.min(name_blocks);
             // A negative two-way variance is a small-sample artifact; the larger one-way variance stands in for it.
             let variance = match session + name - intersection {
-                positive if positive > 0.0 => positive,
+                measured if measured >= 0.0 => measured,
                 _ => session.max(name),
             };
             Ok(clustered(Grouping::SessionAndName, (variance, blocks)))
@@ -490,6 +496,90 @@ mod tests {
         assert_eq!(grid([2.0, -2.0, -1.0, 1.0]).standard_error(), 0.5);
     }
 
+    /// 300 readings of 0.1 over 30 sessions: a naive sum lands the mean off 0.1 and manufactures residuals, where
+    /// identical readings must give every grouping a zero error.
+    #[test]
+    fn test_constant_readings_give_zero_error() {
+        let day = chrono::Duration::days(1);
+        let observations = Observations::new((0..300).map(|index| {
+            (
+                at(index as i64 % 10) + day * (index as i32 / 10),
+                symbol(index % 25),
+                Some(0.1),
+            )
+        }))
+        .unwrap();
+        let coarsening = coarsen(&observations).unwrap();
+        assert_eq!(
+            (coarsening.mean(), coarsening.independent_standard_error()),
+            (0.1, 0.0)
+        );
+        assert_eq!(coarsening.groupings().len(), 8);
+        for (grouping, clustered) in coarsening.groupings() {
+            assert_eq!(
+                clustered.map(|clustered| clustered.standard_error()),
+                Ok(0.0),
+                "{grouping:?}"
+            );
+        }
+        assert_eq!(
+            coarsening.effective_sample_size(),
+            Err(EffectiveSampleSizeRefusal::ZeroError)
+        );
+    }
+
+    /// 20 sessions of +1 and -1 on two names fresh to each session: the session sums vanish and the name and
+    /// name-session variances cancel exactly, so the two-way variance is a measured zero, not a fallback.
+    #[test]
+    fn test_a_zero_two_way_variance_stands() {
+        let day = chrono::Duration::days(1);
+        let observations = Observations::new((0..40).map(|index| {
+            (
+                at(index as i64 % 2) + day * (index as i32 / 2),
+                symbol(index),
+                Some([1.0, -1.0][index % 2]),
+            )
+        }))
+        .unwrap();
+        let coarsening = coarsen(&observations).unwrap();
+        let two_way = coarsening.groupings()[&Grouping::SessionAndName].unwrap();
+        assert_eq!((two_way.standard_error(), two_way.blocks()), (0.0, 20));
+        assert!(
+            coarsening.groupings()[&Grouping::Name]
+                .unwrap()
+                .standard_error()
+                > 0.0
+        );
+    }
+
+    /// The quoting floor is 20 blocks: a grouping of 19 is refused and one of 20 is quoted.
+    #[test]
+    fn test_quoting_needs_twenty_blocks() {
+        let day = chrono::Duration::days(1);
+        let sessions = |count: usize| {
+            Observations::new((0..count * 2).map(|index| {
+                (
+                    at(0) + day * (index as i32 / 2),
+                    symbol(0),
+                    Some(index as f64 % 3.0),
+                )
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            coarsen(&sessions(19)).unwrap().quoted(),
+            Err(QuotedRefusal::TooFewBlocks { most_blocks: 19 })
+        );
+        // One name, so name-session ties session; either may be quoted.
+        let twenty = coarsen(&sessions(20)).unwrap();
+        let quoted = twenty.quoted().unwrap();
+        let session = twenty.groupings()[&Grouping::Session].unwrap();
+        assert_eq!(
+            (quoted.blocks(), quoted.standard_error()),
+            (20, session.standard_error())
+        );
+    }
+
     #[test]
     fn test_fewer_than_two_measured_readings_are_refused() {
         let one =
@@ -584,7 +674,7 @@ mod tests {
                 .groupings()
                 .values()
                 .filter_map(|clustered| clustered.as_ref().ok().copied())
-                .filter(|clustered| clustered.grouping() != Grouping::Week && clustered.blocks() >= QUOTED_BLOCKS)
+                .filter(|clustered| clustered.grouping() != Grouping::Week && clustered.blocks() >= 20)
                 .collect();
             match coarsening.quoted() {
                 Ok(quoted) => {
@@ -593,7 +683,7 @@ mod tests {
                 }
                 Err(QuotedRefusal::TooFewBlocks { most_blocks }) => {
                     prop_assert!(eligible.is_empty());
-                    prop_assert!(most_blocks < QUOTED_BLOCKS);
+                    prop_assert!(most_blocks < 20);
                 }
             }
         }
