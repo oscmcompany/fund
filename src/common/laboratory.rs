@@ -9,6 +9,7 @@ pub mod estimate;
 pub mod experiment;
 pub mod haircut;
 pub mod permutation;
+pub mod residual;
 pub mod score;
 pub mod series;
 pub mod share;
