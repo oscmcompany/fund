@@ -809,8 +809,18 @@ async fn write_security_details(
 /// How far back a filer's annual reports are read: the year before the archive's first security details snapshot.
 const FILINGS_SINCE: (i32, u32, u32) = (2020, 8, 1);
 
-/// Every filer of common stock that a security details snapshot up to `session` names without an industry code,
-/// beside the symbol its latest such snapshot names it under; refused until `session`'s own snapshot is written.
+/// The filer of a common stock or depositary receipt Massive gives no industry code, which the SEC's filings can fill.
+fn uncoded_filer(details: &SecurityDetails) -> Option<CentralIndexKey> {
+    let fillable = matches!(
+        details.security_type(),
+        Some(SecurityType::CommonStock | SecurityType::DepositaryReceipt)
+    ) && details.industry_code().is_none();
+    details.central_index_key().filter(|_| fillable)
+}
+
+/// Every filer of common stock or a depositary receipt that a security details snapshot up to `session` names without
+/// an industry code, beside the symbol its latest such snapshot names it under; refused until `session`'s own snapshot
+/// is written.
 async fn uncoded_filers(
     archive: &Bucket,
     session: SessionDate,
@@ -843,14 +853,7 @@ async fn uncoded_filers(
         filers.extend(
             details
                 .iter()
-                .filter(|row| {
-                    row.security_type() == Some(SecurityType::CommonStock)
-                        && row.industry_code().is_none()
-                })
-                .filter_map(|row| {
-                    row.central_index_key()
-                        .map(|filer| (filer, row.symbol().clone()))
-                }),
+                .filter_map(|row| uncoded_filer(row).map(|filer| (filer, row.symbol().clone()))),
         );
     }
     Ok(filers)
@@ -2186,6 +2189,41 @@ mod tests {
                 b"submissions 3".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn test_only_uncoded_stock_and_receipts_are_filled() {
+        let filer = CentralIndexKey::new(1_046_179).unwrap();
+        let details = |kind: SecurityType, code: Option<&str>, filer: Option<CentralIndexKey>| {
+            SecurityDetails::new(
+                Symbol::new("AAA").unwrap(),
+                Some(kind),
+                code.map(|code| IndustryCode::new(code).unwrap()),
+                None,
+                None,
+                None,
+                None,
+                filer,
+            )
+        };
+        let read = |kind, code, filer| uncoded_filer(&details(kind, code, filer));
+        assert_eq!(
+            read(SecurityType::CommonStock, None, Some(filer)),
+            Some(filer)
+        );
+        assert_eq!(
+            read(SecurityType::DepositaryReceipt, None, Some(filer)),
+            Some(filer)
+        );
+        assert_eq!(
+            read(SecurityType::DepositaryReceipt, Some("3674"), Some(filer)),
+            None
+        );
+        assert_eq!(
+            read(SecurityType::ExchangeTradedFund, None, Some(filer)),
+            None
+        );
+        assert_eq!(read(SecurityType::CommonStock, None, None), None);
     }
 
     /// Reads every security details snapshot in the archive and names the filers Massive left without a code.

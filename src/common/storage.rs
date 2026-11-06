@@ -64,8 +64,8 @@ pub enum ReferenceTable {
     /// Massive's grouped daily bars for a session, kept only as the list of symbols that traded, from the endpoint the
     /// tick legs take their symbols from; never read as prices.
     TradedSymbols,
-    /// The industry code each annual report's header assigned its filer, for the filers of common stock Massive gives no
-    /// code.
+    /// The industry code each annual report's header assigned its filer, for the filers of common stock or a depositary
+    /// receipt Massive gives no code.
     FiledIndustryCodes,
 }
 
