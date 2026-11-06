@@ -14,6 +14,7 @@ use fund::common::time::SessionDate;
 use fund::heal;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::massive::Massive;
+use fund::ingest::sec::Sec;
 use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 use fund::storage::Bucket;
 
@@ -67,6 +68,7 @@ async fn main() -> ExitCode {
             Err(refused) => return refused.into(),
         };
         let http_client = reqwest::Client::new();
+        let sec = Sec::from_environment(http_client.clone());
         let sdk_configuration = aws_config::load_from_env().await;
         let (clients, profile) = match (
             Bucket::archive(&sdk_configuration),
@@ -75,7 +77,7 @@ async fn main() -> ExitCode {
             Alpaca::from_environment(http_client),
         ) {
             (Ok(archive), Ok(profile), Ok(massive), Ok(alpaca)) => {
-                (heal::Clients::new(archive, massive, alpaca), profile)
+                (heal::Clients::new(archive, massive, alpaca, sec), profile)
             }
             (Err(refusal), _, _, _)
             | (_, Err(refusal), _, _)

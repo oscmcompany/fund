@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BooleanBuilder, Date32Builder, Decimal128Builder, StringBuilder, UInt16Builder, UInt64Builder,
+    BooleanBuilder, Date32Builder, Decimal128Builder, StringBuilder, TimestampNanosecondBuilder,
+    UInt16Builder, UInt64Builder,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, StringArray, UInt16Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, StringArray,
+    TimestampNanosecondArray, UInt16Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use super::parquet::{ReadRefusal, RowCause};
 use super::provenance::{Provenance, provenance_from};
@@ -18,6 +19,7 @@ use super::{Bucket, BucketError, parquet};
 use crate::common::market::corporate_actions::{
     ActionId, BoundaryChange, BoundaryKind, SeriesBoundary, Split, SplitRatio,
 };
+use crate::common::market::industry::{AccessionNumber, FiledIndustryCode};
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
 };
@@ -62,6 +64,15 @@ pub enum ReferenceRefusal {
     },
     DuplicateAction {
         id: ActionId,
+    },
+    /// One filer's filing listed twice; a joint filing lists once under each of its filers.
+    DuplicateAccession {
+        filer: CentralIndexKey,
+        accession: AccessionNumber,
+    },
+    /// An acceptance instant outside the nanosecond timestamp's range.
+    UnrepresentableAcceptance {
+        accession: AccessionNumber,
     },
     /// A row that no longer passes its types' own checks.
     Row {
@@ -412,6 +423,117 @@ pub fn decode_security_details(
         }
     }
     Ok((details, provenance))
+}
+
+fn filed_industry_codes_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("central_index_key", DataType::UInt64, false),
+        Field::new("accession_number", DataType::Utf8, false),
+        Field::new("industry_code", DataType::UInt16, false),
+        Field::new(
+            "accepted_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
+    ])
+}
+
+/// A snapshot's file for `key`, rows in filer then acceptance order; a filer's filing listed twice is refused.
+pub fn encode_filed_industry_codes(
+    key: &ReferenceKey,
+    codes: &[FiledIndustryCode],
+    provenance: &Provenance,
+) -> Result<Vec<u8>, ReferenceRefusal> {
+    snapshot_provider(key, ReferenceTable::FiledIndustryCodes, provenance)?;
+    let mut ordered: Vec<&FiledIndustryCode> = codes.iter().collect();
+    ordered.sort_by(|left, right| {
+        (left.filer(), left.accepted_at(), left.accession()).cmp(&(
+            right.filer(),
+            right.accepted_at(),
+            right.accession(),
+        ))
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(repeated) = ordered
+        .iter()
+        .find(|row| !seen.insert((row.filer(), row.accession())))
+    {
+        return Err(ReferenceRefusal::DuplicateAccession {
+            filer: repeated.filer(),
+            accession: repeated.accession().clone(),
+        });
+    }
+    let mut filers = UInt64Builder::new();
+    let mut accessions = StringBuilder::new();
+    let mut industry_codes = UInt16Builder::new();
+    let mut accepted = TimestampNanosecondBuilder::new().with_timezone("UTC");
+    for row in ordered {
+        let accepted_at = row.accepted_at().timestamp_nanos_opt().ok_or_else(|| {
+            ReferenceRefusal::UnrepresentableAcceptance {
+                accession: row.accession().clone(),
+            }
+        })?;
+        filers.append_value(row.filer().value());
+        accessions.append_value(row.accession().as_str());
+        industry_codes.append_value(row.industry_code().code());
+        accepted.append_value(accepted_at);
+    }
+    parquet::write(
+        filed_industry_codes_schema(),
+        vec![
+            Arc::new(filers.finish()),
+            Arc::new(accessions.finish()),
+            Arc::new(industry_codes.finish()),
+            Arc::new(accepted.finish()),
+        ],
+        LAYOUT_VERSION,
+        provenance.metadata(),
+    )
+    .map_err(ReferenceRefusal::Parquet)
+}
+
+/// The snapshot a file written by `encode_filed_industry_codes` under `key` holds, every value rebuilt through its type.
+pub fn decode_filed_industry_codes(
+    key: &ReferenceKey,
+    bytes: Vec<u8>,
+) -> Result<(Vec<FiledIndustryCode>, Provenance), ReferenceRefusal> {
+    table_provider(key, ReferenceTable::FiledIndustryCodes)?;
+    let (batches, entries) = parquet::read(bytes, &filed_industry_codes_schema(), LAYOUT_VERSION)?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
+    snapshot_provider(key, ReferenceTable::FiledIndustryCodes, &provenance)?;
+    let mut codes = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for batch in batches {
+        let filers = parquet::column::<UInt64Array>(&batch, 0)?;
+        let accessions = parquet::column::<StringArray>(&batch, 1)?;
+        let industry_codes = parquet::column::<UInt16Array>(&batch, 2)?;
+        let accepted = parquet::column::<TimestampNanosecondArray>(&batch, 3)?;
+        let read = |row: usize| -> Result<FiledIndustryCode, RowCause> {
+            let raw = accessions.value(row);
+            Ok(FiledIndustryCode::new(
+                CentralIndexKey::new(filers.value(row)).map_err(RowCause::CentralIndexKey)?,
+                AccessionNumber::new(raw).map_err(|_| RowCause::Unparsable {
+                    column: accessions.name().to_string(),
+                    raw: raw.to_string(),
+                })?,
+                IndustryCode::from_code(industry_codes.value(row))
+                    .map_err(RowCause::IndustryCode)?,
+                chrono::DateTime::from_timestamp_nanos(accepted.value(row)),
+            ))
+        };
+        for row in 0..batch.num_rows() {
+            let index = codes.len();
+            let row = read(row).map_err(|cause| ReferenceRefusal::Row { index, cause })?;
+            if !seen.insert((row.filer(), row.accession().clone())) {
+                return Err(ReferenceRefusal::DuplicateAccession {
+                    filer: row.filer(),
+                    accession: row.accession().clone(),
+                });
+            }
+            codes.push(row);
+        }
+    }
+    Ok((codes, provenance))
 }
 
 /// Days since the Unix epoch, as Arrow's `Date32` counts them.
@@ -819,6 +941,87 @@ mod tests {
             encode_security_details(&key, &twice, &provenance),
             Err(ReferenceRefusal::DuplicateSymbol {
                 symbol: Symbol::new("AAA").unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn test_filed_industry_codes_read_back_in_filer_order() {
+        let filed = |filer: u64, accession: &str, code: &str, accepted_at: &str| {
+            FiledIndustryCode::new(
+                CentralIndexKey::new(filer).unwrap(),
+                AccessionNumber::new(accession).unwrap(),
+                IndustryCode::new(code).unwrap(),
+                accepted_at.parse().unwrap(),
+            )
+        };
+        let codes = [
+            filed(
+                901_832,
+                "0001104659-25-014750",
+                "2834",
+                "2025-02-18T21:06:30Z",
+            ),
+            filed(
+                901_832,
+                "0001104659-24-025553",
+                "2834",
+                "2024-02-20T21:32:15Z",
+            ),
+            filed(
+                1_000_275,
+                "0001000275-24-000001",
+                "6029",
+                "2024-12-04T11:02:03Z",
+            ),
+        ];
+        let provenance = Provenance::new(
+            Subscription::EdgarPublic,
+            "2026-11-05T14:31:43Z".parse().unwrap(),
+            RunId::new(Uuid::from_u128(4)),
+            None,
+        );
+        let key = ReferenceKey::new(Provider::Sec, ReferenceTable::FiledIndustryCodes, session());
+        let written = encode_filed_industry_codes(&key, &codes, &provenance).unwrap();
+        let (read, read_provenance) = decode_filed_industry_codes(&key, written).unwrap();
+        assert_eq!(read, [codes[1].clone(), codes[0].clone(), codes[2].clone()]);
+        assert_eq!(read_provenance, provenance);
+        let twice = [codes[0].clone(), codes[0].clone()];
+        assert_eq!(
+            encode_filed_industry_codes(&key, &twice, &provenance),
+            Err(ReferenceRefusal::DuplicateAccession {
+                filer: CentralIndexKey::new(901_832).unwrap(),
+                accession: AccessionNumber::new("0001104659-25-014750").unwrap()
+            })
+        );
+        let joint = [
+            codes[0].clone(),
+            filed(
+                1_000_275,
+                "0001104659-25-014750",
+                "6029",
+                "2025-02-18T21:06:30Z",
+            ),
+        ];
+        let written = encode_filed_industry_codes(&key, &joint, &provenance).unwrap();
+        assert_eq!(decode_filed_industry_codes(&key, written).unwrap().0, joint);
+        let distant = [filed(
+            901_832,
+            "0001104659-25-014750",
+            "2834",
+            "2263-01-01T00:00:00Z",
+        )];
+        assert_eq!(
+            encode_filed_industry_codes(&key, &distant, &provenance),
+            Err(ReferenceRefusal::UnrepresentableAcceptance {
+                accession: AccessionNumber::new("0001104659-25-014750").unwrap()
+            })
+        );
+        assert_eq!(
+            encode_filed_industry_codes(&key, &codes, &snapshot_provenance()),
+            Err(ReferenceRefusal::SubscriptionProvider {
+                provenance: snapshot_provenance(),
+                key: Provider::Sec,
             })
         );
     }

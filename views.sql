@@ -234,6 +234,11 @@ SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=massive/tab
 CREATE OR REPLACE VIEW security_details AS
 SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=massive/table=security_details/');
 
+-- Each quarterly snapshot of the industry code each annual report's header assigned a filer of common stock Massive
+-- gives no code, one row per report; read a code only from its `accepted_at` on.
+CREATE OR REPLACE VIEW filed_industry_codes AS
+SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=sec/table=filed_industry_codes/');
+
 -- Each nightly snapshot of Massive's whole split table, dated by the session it was taken after.
 CREATE OR REPLACE VIEW splits AS
 SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=massive/table=splits/');

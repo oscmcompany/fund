@@ -36,6 +36,8 @@ const CONFIGURATION_ROOT: &str = "configuration";
 pub enum Provider {
     Alpaca,
     Massive,
+    /// The SEC's EDGAR filings.
+    Sec,
 }
 
 /// Which reference table a snapshot holds.
@@ -62,6 +64,9 @@ pub enum ReferenceTable {
     /// Massive's grouped daily bars for a session, kept only as the list of symbols that traded, from the endpoint the
     /// tick legs take their symbols from; never read as prices.
     TradedSymbols,
+    /// The industry code each annual report's header assigned its filer, for the filers of common stock Massive gives no
+    /// code.
+    FiledIndustryCodes,
 }
 
 /// The S3 storage class an object is written in.
@@ -699,7 +704,7 @@ fn date_partition(session: SessionDate) -> String {
 fn raw_ticks_file(provider: Provider) -> &'static str {
     match provider {
         Provider::Massive => "data.csv.gz",
-        Provider::Alpaca => "data.jsonl.gz",
+        Provider::Alpaca | Provider::Sec => "data.jsonl.gz",
     }
 }
 
@@ -858,6 +863,7 @@ pub(crate) mod tests {
             [
                 ("alpaca".to_string(), "\"alpaca\"".to_string()),
                 ("massive".to_string(), "\"massive\"".to_string()),
+                ("sec".to_string(), "\"sec\"".to_string()),
             ]
         );
         for provider in Provider::iter() {
@@ -897,6 +903,19 @@ pub(crate) mod tests {
                 )
                 .into(),
                 "data/equity/stage=parsed/reference/provider=massive/table=security_details/as_of=2026-08-03/data.parquet",
+            ),
+            (
+                ReferenceKey::new(Provider::Sec, ReferenceTable::FiledIndustryCodes, session())
+                    .into(),
+                "data/equity/stage=parsed/reference/provider=sec/table=filed_industry_codes/as_of=2026-08-03/data.parquet",
+            ),
+            (
+                Key::RawReference(ReferenceKey::new(
+                    Provider::Sec,
+                    ReferenceTable::FiledIndustryCodes,
+                    session(),
+                )),
+                "data/equity/stage=raw/reference/provider=sec/table=filed_industry_codes/as_of=2026-08-03/data.jsonl.gz",
             ),
             (
                 ReferenceKey::new(

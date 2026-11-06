@@ -39,6 +39,8 @@ pub enum Leg {
     /// The session's grouped daily response stored raw, from the endpoint the tick legs take their symbols from.
     MassiveTradedSymbols,
     MassiveSecurityDetails,
+    /// After the security details it fills, since it reads every snapshot of them up to its own session.
+    SecFiledIndustryCodes,
     MassiveSplits,
     AlpacaSeriesBoundaries,
     AlpacaQuotes,
@@ -65,6 +67,7 @@ impl Leg {
                 },
             ],
             Self::MassiveSecurityDetails => snapshot(massive_security_details(session)),
+            Self::SecFiledIndustryCodes => snapshot(sec_filed_industry_codes(session)),
             Self::MassiveSplits => snapshot(massive_splits(session)),
             Self::AlpacaSeriesBoundaries => snapshot(alpaca_series_boundaries(session)),
         }
@@ -73,7 +76,8 @@ impl Leg {
     /// The sessions this leg writes. A snapshot of a whole table fetched later cannot stand for an earlier day, so a
     /// snapshot leg keeps only the window's last session; security details are kept once a quarter, on the session that
     /// opens the quarter the window ends in, which the vendor answers as of that date however late it is asked, so a
-    /// missed one stays owed for the rest of the quarter. `calendar` must reach back to that quarter's first day.
+    /// missed one stays owed for the rest of the quarter; the filed industry codes, whose rows each carry the instant
+    /// the SEC accepted them, are kept on the same session. `calendar` must reach back to that quarter's first day.
     pub fn keeps(
         self,
         window: &Window,
@@ -84,7 +88,7 @@ impl Leg {
                 Ok(window.sessions().to_vec())
             }
             Self::MassiveSplits | Self::AlpacaSeriesBoundaries => Ok(vec![window.last()]),
-            Self::MassiveSecurityDetails => {
+            Self::MassiveSecurityDetails | Self::SecFiledIndustryCodes => {
                 quarter_opening(calendar, window.last()).map(|opening| vec![opening])
             }
         }
@@ -108,6 +112,10 @@ pub fn alpaca_trades(session: SessionDate) -> TradesKey {
 
 pub fn massive_security_details(session: SessionDate) -> ReferenceKey {
     ReferenceKey::new(Provider::Massive, ReferenceTable::SecurityDetails, session)
+}
+
+pub fn sec_filed_industry_codes(session: SessionDate) -> ReferenceKey {
+    ReferenceKey::new(Provider::Sec, ReferenceTable::FiledIndustryCodes, session)
 }
 
 /// The grouped daily response kept only for the symbols it names; it has no parsed snapshot.
@@ -188,6 +196,10 @@ pub enum PartitionFailureKind {
     Bucket,
     Vanished,
     NoSymbols,
+    /// A partition the leg reads was not yet written.
+    Unwritten,
+    /// A client the leg needs was not configured.
+    Unconfigured,
     Fold,
     /// The fetched pages could not be stored raw.
     Tee,
@@ -872,6 +884,8 @@ mod tests {
                 r#""bucket""#,
                 r#""vanished""#,
                 r#""no_symbols""#,
+                r#""unwritten""#,
+                r#""unconfigured""#,
                 r#""fold""#,
                 r#""tee""#,
                 r#""journal""#,
@@ -905,6 +919,8 @@ mod tests {
                 "data/equity/stage=raw/reference/provider=massive/table=traded_symbols/",
                 "data/equity/stage=parsed/reference/provider=massive/table=security_details/",
                 "data/equity/stage=raw/reference/provider=massive/table=security_details/",
+                "data/equity/stage=parsed/reference/provider=sec/table=filed_industry_codes/",
+                "data/equity/stage=raw/reference/provider=sec/table=filed_industry_codes/",
                 "data/equity/stage=parsed/reference/provider=massive/table=splits/",
                 "data/equity/stage=raw/reference/provider=massive/table=splits/",
                 "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/",
@@ -942,6 +958,7 @@ mod tests {
         assert_eq!(kept(Leg::MassiveSplits), ["2027-01-06"]);
         assert_eq!(kept(Leg::AlpacaSeriesBoundaries), ["2027-01-06"]);
         assert_eq!(kept(Leg::MassiveSecurityDetails), ["2027-01-04"]);
+        assert_eq!(kept(Leg::SecFiledIndustryCodes), ["2027-01-04"]);
         // Weeks later the quarter's opening is long out of the window and still owed until it is held.
         let later = window(&winter, date("2027-01-28"), sessions(5)).unwrap();
         assert_eq!(

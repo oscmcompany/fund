@@ -1,7 +1,7 @@
 //! The nightly heal: each leg's owed sessions fetched and written to the archive, oldest first, until done or out of
 //! time, with each partition journaled once it has been read back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use strum::IntoEnumIterator;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinSet;
@@ -18,7 +18,8 @@ use tokio::time::Instant;
 use crate::common::heal::{
     Coverage, CoverageRefusal, Held, KeepsRefusal, Leg, PartitionFailureKind, SeriesListing,
     SessionOutcome, WindowRefusal, alpaca_quotes, alpaca_series_boundaries, alpaca_trades,
-    fetched_range, massive_security_details, massive_splits, massive_traded_symbols, owed, window,
+    fetched_range, massive_security_details, massive_splits, massive_traded_symbols, owed,
+    sec_filed_industry_codes, window,
 };
 use crate::common::journal::{
     ArchiveSurveyed, ConditionsWritten, ConfigurationResolved, HealFinished, Observation,
@@ -27,11 +28,14 @@ use crate::common::journal::{
 use crate::common::market::Symbol;
 use crate::common::market::aggregate::{RollsUp, session_bars};
 use crate::common::market::corporate_actions::refresh_boundaries;
+use crate::common::market::industry::{AccessionNumber, FiledIndustryCode};
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
 use crate::common::market::record::{Bar, BarInterval, Partition, PartitionRefusal};
-use crate::common::market::security_details::SecurityDetails;
+use crate::common::market::security_details::{
+    CentralIndexKey, IndustryCode, SecurityDetails, SecurityType,
+};
 use crate::common::market::trade_bars::{TradeConditions, TradeFold};
-use crate::common::monoid::{Monoid, concatenate};
+use crate::common::monoid::{Monoid, Tally, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
 use crate::common::storage::{Key, Provider, ReferenceKey, ReferenceTable, SeriesPrefix};
 use crate::common::time::calendar::TradingCalendar;
@@ -39,13 +43,17 @@ use crate::common::time::{SessionDate, SessionRange};
 use crate::ingest::alpaca::corporate_actions::SeriesBoundaries;
 use crate::ingest::alpaca::{Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, Page, invalid_symbol};
 use crate::ingest::massive::{DetailsAnswer, Massive};
-use crate::ingest::{FetchError, Fetched, RefusedRow, SessionBars, refused_by_cause};
+use crate::ingest::sec::{AnnualReport, Sec};
+use crate::ingest::{
+    FetchError, Fetched, RefusedRow, SessionBars, VariableRefusal, refused_by_cause,
+};
 use crate::journal::Journal;
 use crate::parameter::{Directories, environment_variable};
 use crate::storage::provenance::{Provenance, Subscription};
 use crate::storage::raw::TeeError;
 use crate::storage::reference::{
-    conditions_key, decode_series_boundaries, encode_conditions, encode_security_details,
+    conditions_key, decode_filed_industry_codes, decode_security_details, decode_series_boundaries,
+    encode_conditions, encode_filed_industry_codes, encode_security_details,
     encode_series_boundaries, encode_splits, latest_conditions, latest_snapshot,
 };
 use crate::storage::{self, Bucket, BucketError};
@@ -166,6 +174,11 @@ pub enum PartitionFailure {
     /// The session's grouped daily, which names its symbols, listed none; `key` is its traded-symbols partition.
     #[error("no symbols listed for {}", .key.path())]
     NoSymbols { key: Key },
+    /// A partition the leg reads was not yet written for its session.
+    #[error("{} is not yet written", .key.path())]
+    Unwritten { key: Key },
+    #[error("{0}")]
+    Unconfigured(VariableRefusal),
     #[error("{0}")]
     Fold(QuoteFoldRefusal),
     #[error("{0}")]
@@ -186,6 +199,8 @@ impl PartitionFailure {
             Self::Bucket(_) => PartitionFailureKind::Bucket,
             Self::Vanished { .. } => PartitionFailureKind::Vanished,
             Self::NoSymbols { .. } => PartitionFailureKind::NoSymbols,
+            Self::Unwritten { .. } => PartitionFailureKind::Unwritten,
+            Self::Unconfigured(_) => PartitionFailureKind::Unconfigured,
             Self::Fold(_) => PartitionFailureKind::Fold,
             Self::Tee(_) => PartitionFailureKind::Tee,
             Self::Journal(_) => PartitionFailureKind::Journal,
@@ -237,14 +252,22 @@ pub struct Clients {
     massive: Arc<Massive>,
     /// Shared by the concurrent one-minute batches, so its secret is held once rather than copied into each.
     alpaca: Arc<Alpaca>,
+    /// Refused only where its contact is unset, which fails the one leg that reads it rather than the run.
+    sec: Result<Sec, VariableRefusal>,
 }
 
 impl Clients {
-    pub fn new(archive: Bucket, massive: Massive, alpaca: Alpaca) -> Self {
+    pub fn new(
+        archive: Bucket,
+        massive: Massive,
+        alpaca: Alpaca,
+        sec: Result<Sec, VariableRefusal>,
+    ) -> Self {
         Self {
             archive,
             massive: Arc::new(massive),
             alpaca: Arc::new(alpaca),
+            sec,
         }
     }
 
@@ -425,6 +448,7 @@ async fn write(
         Leg::MassiveSecurityDetails => {
             write_security_details(session, parameters, clients, journal).await
         }
+        Leg::SecFiledIndustryCodes => write_filed_industry_codes(session, clients, journal).await,
     }
 }
 
@@ -780,6 +804,189 @@ async fn write_security_details(
             .collect(),
         BTreeMap::new(),
     ))
+}
+
+/// How far back a filer's annual reports are read: the year before the archive's first security details snapshot.
+const FILINGS_SINCE: (i32, u32, u32) = (2020, 8, 1);
+
+/// Every filer of common stock that a security details snapshot up to `session` names without an industry code,
+/// beside the symbol its latest such snapshot names it under; refused until `session`'s own snapshot is written.
+async fn uncoded_filers(
+    archive: &Bucket,
+    session: SessionDate,
+) -> Result<BTreeMap<CentralIndexKey, Symbol>, PartitionFailure> {
+    let mut snapshots: Vec<ReferenceKey> = archive
+        .list(&SeriesPrefix::reference(
+            Provider::Massive,
+            ReferenceTable::SecurityDetails,
+        ))
+        .await?
+        .iter()
+        .filter_map(|path| path.parse::<Key>().ok())
+        .filter_map(|key| ReferenceKey::try_from(key).ok())
+        .filter(|key| key.as_of() <= session)
+        .collect();
+    snapshots.sort_by_key(ReferenceKey::as_of);
+    if snapshots.last().map(ReferenceKey::as_of) != Some(session) {
+        return Err(PartitionFailure::Unwritten {
+            key: massive_security_details(session).into(),
+        });
+    }
+    let mut filers = BTreeMap::new();
+    for key in snapshots {
+        let bytes = archive
+            .get(&Key::from(key))
+            .await?
+            .ok_or(PartitionFailure::Vanished { key: key.into() })?;
+        let (details, _) =
+            decode_security_details(&key, bytes).map_err(storage::DecodeRefusal::Reference)?;
+        filers.extend(
+            details
+                .iter()
+                .filter(|row| {
+                    row.security_type() == Some(SecurityType::CommonStock)
+                        && row.industry_code().is_none()
+                })
+                .filter_map(|row| {
+                    row.central_index_key()
+                        .map(|filer| (filer, row.symbol().clone()))
+                }),
+        );
+    }
+    Ok(filers)
+}
+
+/// Writes the industry codes the SEC's annual reports assigned every filer `uncoded_filers` names, keeping the
+/// previous snapshot's rows and reading only the reports it lacks; a filer the SEC does not know is unanswered.
+async fn write_filed_industry_codes(
+    session: SessionDate,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, PartitionFailure> {
+    let sec = clients
+        .sec
+        .as_ref()
+        .map_err(|refusal| PartitionFailure::Unconfigured(refusal.clone()))?;
+    let filers = uncoded_filers(&clients.archive, session).await?;
+    let mut codes = match latest_snapshot(
+        &clients.archive,
+        Provider::Sec,
+        ReferenceTable::FiledIndustryCodes,
+        Some(session),
+    )
+    .await?
+    {
+        Some(key) => {
+            let bytes = clients
+                .archive
+                .get(&Key::from(key))
+                .await?
+                .ok_or(PartitionFailure::Vanished { key: key.into() })?;
+            decode_filed_industry_codes(&key, bytes)
+                .map_err(storage::DecodeRefusal::Reference)?
+                .0
+        }
+        None => Vec::new(),
+    };
+    let held: BTreeSet<(CentralIndexKey, AccessionNumber)> = codes
+        .iter()
+        .map(|code| (code.filer(), code.accession().clone()))
+        .collect();
+    let (year, month, day) = FILINGS_SINCE;
+    let since = Utc
+        .with_ymd_and_hms(year, month, day, 0, 0, 0)
+        .single()
+        .expect("the filings' first day is an instant");
+    let provenance = fetched_now(Subscription::EdgarPublic, journal);
+    let (filed, unanswered, fetched) = read_filed_codes(
+        &filers,
+        &held,
+        async |filer| sec.annual_reports(filer, since).await,
+        async |filer, report| sec.assigned_code(filer, report).await,
+    )
+    .await;
+    codes.extend(filed);
+    kept(
+        clients.store(),
+        sec_filed_industry_codes(session),
+        &provenance,
+        fetched,
+    )
+    .await?;
+    let rows = publish(
+        clients.put(),
+        sec_filed_industry_codes(session),
+        &codes,
+        &provenance,
+        encode_filed_industry_codes,
+    )
+    .await?;
+    Ok(PartitionWritten::new(
+        Leg::SecFiledIndustryCodes,
+        session,
+        rows,
+        Tally::empty(),
+        unanswered,
+        BTreeMap::new(),
+    ))
+}
+
+/// The codes each new annual report of `filers` assigned, reading only the filer's reports `held` lacks, beside
+/// the filers the SEC does not know and every body fetched; the first other failure stops the reading.
+async fn read_filed_codes(
+    filers: &BTreeMap<CentralIndexKey, Symbol>,
+    held: &BTreeSet<(CentralIndexKey, AccessionNumber)>,
+    annual_reports: impl AsyncFn(CentralIndexKey) -> Fetched<Vec<AnnualReport>>,
+    assigned_code: impl AsyncFn(CentralIndexKey, &AnnualReport) -> Fetched<Option<IndustryCode>>,
+) -> (
+    Vec<FiledIndustryCode>,
+    BTreeMap<Symbol, Unanswered>,
+    Fetched<()>,
+) {
+    let mut codes = Vec::new();
+    let mut bodies = Vec::new();
+    let mut unanswered = BTreeMap::new();
+    let mut failed = None;
+    'filers: for (filer, symbol) in filers {
+        let (reports, pages) = annual_reports(*filer).await.into_parts();
+        bodies.extend(pages);
+        let reports = match reports {
+            Ok(reports) => reports,
+            Err(FetchError::Refused { status: 404, .. }) => {
+                unanswered.insert(symbol.clone(), Unanswered::Missing);
+                continue;
+            }
+            Err(error) => {
+                failed = Some(error);
+                break;
+            }
+        };
+        for report in reports
+            .iter()
+            .filter(|report| !held.contains(&(*filer, report.accession().clone())))
+        {
+            let (code, pages) = assigned_code(*filer, report).await.into_parts();
+            bodies.extend(pages);
+            match code {
+                Ok(Some(code)) => codes.push(FiledIndustryCode::new(
+                    *filer,
+                    report.accession().clone(),
+                    code,
+                    report.accepted_at(),
+                )),
+                Ok(None) => {}
+                Err(error) => {
+                    failed = Some(error);
+                    break 'filers;
+                }
+            }
+        }
+    }
+    (
+        codes,
+        unanswered,
+        Fetched::new(failed.map_or(Ok(()), Err), bodies),
+    )
 }
 
 /// Folds Alpaca's quotes for every symbol of the session and writes its quote bars.
@@ -1879,6 +2086,122 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_filed_codes_skip_held_reports_and_stop_at_the_first_failure_keeping_bodies() {
+        let filer = |value: u64| CentralIndexKey::new(value).unwrap();
+        let report = |accession: &str, accepted_at: &str| {
+            AnnualReport::new(
+                AccessionNumber::new(accession).unwrap(),
+                accepted_at.parse().unwrap(),
+            )
+        };
+        let filers: BTreeMap<CentralIndexKey, Symbol> =
+            [(1, "AAA"), (2, "BBB"), (3, "CCC"), (4, "DDD")]
+                .into_iter()
+                .map(|(value, symbol)| (filer(value), Symbol::new(symbol).unwrap()))
+                .collect();
+        let held = BTreeSet::from([(
+            filer(1),
+            AccessionNumber::new("0000000001-24-000001").unwrap(),
+        )]);
+        let headers = std::cell::RefCell::new(Vec::new());
+        let (codes, unanswered, fetched) = read_filed_codes(
+            &filers,
+            &held,
+            async |asked: CentralIndexKey| match asked.value() {
+                1 => Fetched::new(
+                    Ok(vec![
+                        report("0000000001-25-000002", "2025-02-18T21:06:30Z"),
+                        report("0000000001-24-000001", "2024-02-20T21:32:15Z"),
+                        report("0000000001-23-000003", "2023-02-21T11:00:00Z"),
+                    ]),
+                    vec![b"submissions 1".to_vec()],
+                ),
+                2 => Fetched::new(
+                    Err(FetchError::Refused {
+                        status: 404,
+                        body: String::new(),
+                    }),
+                    Vec::new(),
+                ),
+                3 => Fetched::new(
+                    Ok(vec![report("0000000003-25-000001", "2025-03-01T21:00:00Z")]),
+                    vec![b"submissions 3".to_vec()],
+                ),
+                _ => panic!("filer {} asked after the failure", asked.value()),
+            },
+            async |asked: CentralIndexKey, report: &AnnualReport| {
+                headers
+                    .borrow_mut()
+                    .push(report.accession().as_str().to_string());
+                match (asked.value(), report.accession().as_str()) {
+                    (1, "0000000001-25-000002") => Fetched::new(
+                        Ok(Some(IndustryCode::new("2834").unwrap())),
+                        vec![b"header 1-25".to_vec()],
+                    ),
+                    (1, _) => Fetched::new(Ok(None), vec![b"header 1-23".to_vec()]),
+                    (_, _) => Fetched::new(
+                        Err(FetchError::Refused {
+                            status: 403,
+                            body: String::new(),
+                        }),
+                        Vec::new(),
+                    ),
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            *headers.borrow(),
+            [
+                "0000000001-25-000002",
+                "0000000001-23-000003",
+                "0000000003-25-000001"
+            ]
+        );
+        assert_eq!(
+            codes,
+            [FiledIndustryCode::new(
+                filer(1),
+                AccessionNumber::new("0000000001-25-000002").unwrap(),
+                IndustryCode::new("2834").unwrap(),
+                "2025-02-18T21:06:30Z".parse().unwrap(),
+            )]
+        );
+        assert_eq!(
+            unanswered,
+            BTreeMap::from([(Symbol::new("BBB").unwrap(), Unanswered::Missing)])
+        );
+        let (outcome, bodies) = fetched.into_parts();
+        assert!(matches!(
+            outcome,
+            Err(FetchError::Refused { status: 403, .. })
+        ));
+        assert_eq!(
+            bodies,
+            [
+                b"submissions 1".to_vec(),
+                b"header 1-25".to_vec(),
+                b"header 1-23".to_vec(),
+                b"submissions 3".to_vec(),
+            ]
+        );
+    }
+
+    /// Reads every security details snapshot in the archive and names the filers Massive left without a code.
+    #[tokio::test]
+    #[ignore = "reads every security details snapshot from the archive bucket"]
+    async fn live_uncoded_filers_name_the_foreign_issuers() {
+        let configuration = aws_config::load_from_env().await;
+        let archive = Bucket::archive(&configuration).unwrap();
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        let filers = uncoded_filers(&archive, session).await.unwrap();
+        println!("{} uncoded filers", filers.len());
+        let astrazeneca = CentralIndexKey::new(901_832).unwrap();
+        assert_eq!(filers.get(&astrazeneca).map(Symbol::as_str), Some("AZN"));
+        assert!(filers.len() > 800);
+    }
+
     /// Stores a session's grouped daily raw in the profile bucket and reads its symbols from Massive.
     #[tokio::test]
     #[ignore = "fetches from Massive and writes one Deep Archive object to the profile bucket, then deletes it"]
@@ -1889,6 +2212,7 @@ mod tests {
             Bucket::profile(&configuration).unwrap(),
             Massive::from_environment(reqwest::Client::new()).unwrap(),
             Alpaca::from_environment(reqwest::Client::new()).unwrap(),
+            Sec::from_environment(reqwest::Client::new()),
         );
         let provenance = Provenance::new(
             Subscription::StocksStarter,
@@ -1929,6 +2253,7 @@ mod tests {
             Bucket::profile(&configuration).unwrap(),
             Massive::from_environment(reqwest::Client::new()).unwrap(),
             Alpaca::from_environment(reqwest::Client::new()).unwrap(),
+            Sec::from_environment(reqwest::Client::new()),
         );
         let key = massive_splits(session);
         clients

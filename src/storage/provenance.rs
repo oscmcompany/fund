@@ -39,6 +39,8 @@ pub enum Subscription {
     AlgoTraderPlus,
     StocksAdvanced,
     StocksStarter,
+    /// EDGAR's public filings, which need no account.
+    EdgarPublic,
 }
 
 impl Subscription {
@@ -46,6 +48,7 @@ impl Subscription {
         match self {
             Self::AlgoTraderPlus => Provider::Alpaca,
             Self::StocksAdvanced | Self::StocksStarter => Provider::Massive,
+            Self::EdgarPublic => Provider::Sec,
         }
     }
 }
