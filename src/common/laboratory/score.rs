@@ -403,6 +403,23 @@ mod tests {
         assert_eq!(up, coefficient.score(&pairs(&expected, &line(20))));
     }
 
+    /// The tie reaches exactly 2^-40 beside 1.0, 4096 ulps of one, and not a single ulp further.
+    #[test]
+    fn test_the_tie_stops_at_its_boundary() {
+        let edge = 1.0 + 2.0_f64.powi(-40);
+        assert!(equal_up_to_rounding(1.0, edge));
+        assert!(equal_up_to_rounding(edge, 1.0));
+        assert!(!equal_up_to_rounding(1.0, edge.next_up()));
+        assert!(!equal_up_to_rounding(1.0, 1.0 + 2.0_f64.powi(-39)));
+        assert!(equal_up_to_rounding(-1024.0, -1024.0 - 2.0_f64.powi(-30)));
+        assert!(!equal_up_to_rounding(
+            -1024.0,
+            (-1024.0 - 2.0_f64.powi(-30)).next_down()
+        ));
+        assert!(equal_up_to_rounding(0.0, -0.0));
+        assert!(!equal_up_to_rounding(0.0, f64::MIN_POSITIVE));
+    }
+
     /// Names with a zero on either side have no direction and leave the denominator: 3 agree of the 4 directional.
     #[test]
     fn test_hit_rate_counts_only_directional_names() {
