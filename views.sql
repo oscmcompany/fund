@@ -235,7 +235,8 @@ CREATE OR REPLACE VIEW security_details AS
 SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=massive/table=security_details/');
 
 -- Each quarterly snapshot of the industry code each annual report's header assigned a filer of common stock or a
--- depositary receipt Massive gives no code, one row per report; read a code only from its `accepted_at` on.
+-- depositary receipt Massive gives no code, one row per report; read a code only from its `accepted_at` on, and a
+-- null code as the filer left unclassified, ending any earlier code.
 CREATE OR REPLACE VIEW filed_industry_codes AS
 SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=sec/table=filed_industry_codes/');
 

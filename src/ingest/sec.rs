@@ -3,13 +3,14 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 
 use super::retry::{send, with_retries};
 use super::{FetchError, Fetched, VariableRefusal, variable};
 use crate::common::market::industry::AccessionNumber;
 use crate::common::market::security_details::{CentralIndexKey, IndustryCode};
+use crate::common::time::SessionDate;
 
 /// The wait before every request, keeping a sequential client at eight a second under the SEC's ten, since a burst over
 /// it blocks the address for ten minutes rather than slowing it.
@@ -55,13 +56,23 @@ struct Submissions {
 
 #[derive(Deserialize)]
 struct Filings {
-    recent: Recent,
+    recent: Columns,
+    /// Older filings EDGAR has moved out of `recent`, one file per entry.
+    #[serde(default)]
+    files: Vec<HistoryFile>,
 }
 
-/// The submissions' recent filings, one array per field, read by index.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Recent {
+struct HistoryFile {
+    name: String,
+    filing_to: NaiveDate,
+}
+
+/// Filings one array per field, read by index: the submissions' recent filings, or a whole history file.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Columns {
     accession_number: Vec<String>,
     acceptance_date_time: Vec<String>,
     form: Vec<String>,
@@ -89,7 +100,8 @@ impl Sec {
         .await
     }
 
-    /// The filer's annual reports accepted at or after `since`, from the submissions' recent filings.
+    /// The filer's annual reports accepted at or after `since`, from the submissions' recent filings and every history
+    /// file whose filings reach `since`.
     pub async fn annual_reports(
         &self,
         filer: CentralIndexKey,
@@ -99,14 +111,42 @@ impl Sec {
             "https://data.sec.gov/submissions/CIK{:010}.json",
             filer.value()
         );
-        match self.get(&url).await {
-            Ok(body) => Fetched::new(parse_annual_reports(&body, filer, since), vec![body]),
-            Err(error) => Fetched::new(Err(error), Vec::new()),
+        let body = match self.get(&url).await {
+            Ok(body) => body,
+            Err(error) => return Fetched::new(Err(error), Vec::new()),
+        };
+        let (mut reports, history) = match parse_annual_reports(&body, filer, since) {
+            Ok(read) => read,
+            Err(error) => return Fetched::new(Err(error), vec![body]),
+        };
+        let mut bodies = vec![body];
+        for name in history {
+            let read = match self
+                .get(&format!("https://data.sec.gov/submissions/{name}"))
+                .await
+            {
+                // A missing history file is not a filer the SEC does not know, which is what a 404 here reads as.
+                Err(FetchError::Refused { status: 404, .. }) => {
+                    Err(malformed(format!("history file `{name}` is missing")))
+                }
+                fetched => fetched,
+            }
+            .and_then(|body| {
+                let read = parse_history(&body, since);
+                bodies.push(body);
+                read
+            });
+            match read {
+                Ok(older) => reports.extend(older),
+                Err(error) => return Fetched::new(Err(error), bodies),
+            }
         }
+        Fetched::new(Ok(reports), bodies)
     }
 
-    /// The industry code `report`'s header assigned `filer`, or `None` where it assigned none; the header is kept as
-    /// a JSON line beside its accession number, since it spans lines, and one that is not UTF-8 is refused unkept.
+    /// The industry code `report`'s header assigned `filer`, or `None` where it assigned none or `0000`; the header is
+    /// kept as a JSON line beside its accession number, since it spans lines, and one that is not UTF-8 is refused
+    /// unkept, as is one that does not name `filer`.
     pub async fn assigned_code(
         &self,
         filer: CentralIndexKey,
@@ -139,12 +179,13 @@ fn malformed(reason: impl std::fmt::Display) -> FetchError {
     }
 }
 
-/// The annual reports a submissions body lists for `filer` accepted at or after `since`.
+/// The annual reports a submissions body lists for `filer` accepted at or after `since`, beside the history files that
+/// reach `since`; a history file named outside the filer's own is refused.
 fn parse_annual_reports(
     body: &[u8],
     filer: CentralIndexKey,
     since: DateTime<Utc>,
-) -> Result<Vec<AnnualReport>, FetchError> {
+) -> Result<(Vec<AnnualReport>, Vec<String>), FetchError> {
     let submissions: Submissions = serde_json::from_slice(body).map_err(malformed)?;
     if submissions.cik.parse::<u64>().ok() != Some(filer.value()) {
         return Err(malformed(format!(
@@ -153,17 +194,45 @@ fn parse_annual_reports(
             filer.value()
         )));
     }
-    let recent = submissions.filings.recent;
-    let rows = recent.form.len();
-    if recent.accession_number.len() != rows || recent.acceptance_date_time.len() != rows {
-        return Err(malformed("the recent filings' columns differ in length"));
+    let prefix = format!("CIK{:010}-submissions-", filer.value());
+    let mut history = Vec::new();
+    for file in submissions.filings.files {
+        let own = file
+            .name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            });
+        match (
+            own,
+            SessionDate::from_date(file.filing_to) >= SessionDate::at(since),
+        ) {
+            (false, _) => return Err(malformed(format!("history file `{}`", file.name))),
+            (true, true) => history.push(file.name),
+            (true, false) => {}
+        }
+    }
+    Ok((reports_in(submissions.filings.recent, since)?, history))
+}
+
+/// The annual reports a history file lists accepted at or after `since`.
+fn parse_history(body: &[u8], since: DateTime<Utc>) -> Result<Vec<AnnualReport>, FetchError> {
+    reports_in(serde_json::from_slice(body).map_err(malformed)?, since)
+}
+
+/// The annual reports among `columns` accepted at or after `since`.
+fn reports_in(columns: Columns, since: DateTime<Utc>) -> Result<Vec<AnnualReport>, FetchError> {
+    let rows = columns.form.len();
+    if columns.accession_number.len() != rows || columns.acceptance_date_time.len() != rows {
+        return Err(malformed("the filings' columns differ in length"));
     }
     let mut reports = Vec::new();
-    for ((form, accession), accepted_at) in recent
+    for ((form, accession), accepted_at) in columns
         .form
         .iter()
-        .zip(&recent.accession_number)
-        .zip(&recent.acceptance_date_time)
+        .zip(&columns.accession_number)
+        .zip(&columns.acceptance_date_time)
     {
         if !ANNUAL_FORMS.contains(&form.as_str()) {
             continue;
@@ -188,9 +257,13 @@ fn parse_assigned_code(
     filer: CentralIndexKey,
 ) -> Result<Option<IndustryCode>, FetchError> {
     let mut ours = false;
+    let mut named = false;
     for line in header.lines() {
         match line.split_once('>') {
-            Some(("<CIK", value)) => ours = value.trim().parse::<u64>().ok() == Some(filer.value()),
+            Some(("<CIK", value)) => {
+                ours = value.trim().parse::<u64>().ok() == Some(filer.value());
+                named |= ours;
+            }
             Some(("<ASSIGNED-SIC", value)) if ours => {
                 let code = IndustryCode::new(value.trim()).map_err(malformed)?;
                 return Ok((code.code() != 0).then_some(code));
@@ -199,11 +272,19 @@ fn parse_assigned_code(
             Some(_) | None => {}
         }
     }
-    Ok(None)
+    match named {
+        true => Ok(None),
+        false => Err(malformed(format!(
+            "the header names no filer {}",
+            filer.value()
+        ))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::Datelike;
+
     use super::*;
 
     fn filer() -> CentralIndexKey {
@@ -221,7 +302,9 @@ mod tests {
 
     #[test]
     fn test_annual_reports_since_the_cutoff_are_read_and_others_left() {
-        let reports = parse_annual_reports(SUBMISSIONS.as_bytes(), filer(), since()).unwrap();
+        let (reports, history) =
+            parse_annual_reports(SUBMISSIONS.as_bytes(), filer(), since()).unwrap();
+        assert_eq!(history, Vec::<String>::new());
         let read: Vec<(&str, String)> = reports
             .iter()
             .map(|report| {
@@ -260,6 +343,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_history_files_reaching_the_cutoff_are_named_and_read() {
+        let listed = SUBMISSIONS.replace(
+            r#""files":[]"#,
+            r#""files":[{"name":"CIK0000004321-submissions-002.json","filingCount":900,"filingFrom":"2020-06-01","filingTo":"2022-03-31"},{"name":"CIK0000004321-submissions-001.json","filingCount":1000,"filingFrom":"2001-01-02","filingTo":"2020-05-29"}]"#,
+        );
+        let (_, history) = parse_annual_reports(listed.as_bytes(), filer(), since()).unwrap();
+        assert_eq!(history, ["CIK0000004321-submissions-002.json"]);
+        let foreign = SUBMISSIONS.replace(
+            r#""files":[]"#,
+            r#""files":[{"name":"../CIK0000004321-submissions-002.json","filingCount":1,"filingFrom":"2022-01-01","filingTo":"2022-03-31"}]"#,
+        );
+        assert!(matches!(
+            parse_annual_reports(foreign.as_bytes(), filer(), since()),
+            Err(FetchError::Malformed { .. })
+        ));
+        let older = r#"{"accessionNumber":["0000004321-22-000007","0000004321-21-000008"],
+            "acceptanceDateTime":["2022-02-15T21:00:00.000Z","2021-02-15T21:00:00.000Z"],
+            "form":["40-F","40-F"]}"#;
+        let reports = parse_history(older.as_bytes(), since()).unwrap();
+        let read: Vec<&str> = reports
+            .iter()
+            .map(|report| report.accession().as_str())
+            .collect();
+        assert_eq!(read, ["0000004321-22-000007"]);
+    }
+
     fn header(companies: &[(&str, &str)]) -> String {
         let mut text =
             "<SEC-HEADER>0000004321-25-000002.hdr.sgml : 20250218\n<TYPE>20-F\n".to_string();
@@ -281,8 +391,13 @@ mod tests {
             code(&header(&[("0000009999", "6029"), ("0000004321", "4832")])),
             Ok(Some(4832))
         );
-        assert_eq!(code(&header(&[("0000009999", "6029")])), Ok(None));
+        assert!(matches!(
+            code(&header(&[("0000009999", "6029")])),
+            Err(FetchError::Malformed { .. })
+        ));
         assert_eq!(code(&header(&[("0000004321", "0000")])), Ok(None));
+        let unassigned = header(&[("0000004321", "2834")]).replace("<ASSIGNED-SIC>2834\n", "");
+        assert_eq!(code(&unassigned), Ok(None));
         assert!(matches!(
             code(&header(&[("0000004321", "28")])),
             Err(FetchError::Malformed { .. })
@@ -302,5 +417,27 @@ mod tests {
         let (code, bodies) = sec.assigned_code(filer, &reports[0]).await.into_parts();
         assert_eq!(code.unwrap().map(IndustryCode::code), Some(2834));
         assert!(!bodies[0].contains(&b'\n'));
+    }
+
+    /// Reads a frequent filer whose annual reports since 2020 sit in its history files as well as its recent list.
+    #[tokio::test]
+    #[ignore = "fetches from EDGAR and needs SEC_EDGAR_CONTACT_EMAIL"]
+    async fn live_a_frequent_filer_reads_its_history_files() {
+        let sec = Sec::from_environment(reqwest::Client::new()).unwrap();
+        let filer = CentralIndexKey::new(1_000_275).unwrap();
+        let since = "2020-08-01T00:00:00Z".parse().unwrap();
+        let (reports, bodies) = sec.annual_reports(filer, since).await.into_parts();
+        let reports = reports.unwrap();
+        let years: std::collections::BTreeSet<i32> = reports
+            .iter()
+            .map(|report| report.accepted_at().year())
+            .collect();
+        println!(
+            "{} reports over {} bodies: {years:?}",
+            reports.len(),
+            bodies.len()
+        );
+        assert!(bodies.len() > 1);
+        assert!(years.is_superset(&(2021..=2025).collect()), "{years:?}");
     }
 }

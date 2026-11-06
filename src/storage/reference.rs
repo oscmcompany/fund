@@ -429,7 +429,7 @@ fn filed_industry_codes_schema() -> Schema {
     Schema::new(vec![
         Field::new("central_index_key", DataType::UInt64, false),
         Field::new("accession_number", DataType::Utf8, false),
-        Field::new("industry_code", DataType::UInt16, false),
+        Field::new("industry_code", DataType::UInt16, true),
         Field::new(
             "accepted_at",
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -475,7 +475,7 @@ pub fn encode_filed_industry_codes(
         })?;
         filers.append_value(row.filer().value());
         accessions.append_value(row.accession().as_str());
-        industry_codes.append_value(row.industry_code().code());
+        industry_codes.append_option(row.industry_code().map(IndustryCode::code));
         accepted.append_value(accepted_at);
     }
     parquet::write(
@@ -516,7 +516,10 @@ pub fn decode_filed_industry_codes(
                     column: accessions.name().to_string(),
                     raw: raw.to_string(),
                 })?,
-                IndustryCode::from_code(industry_codes.value(row))
+                industry_codes
+                    .is_valid(row)
+                    .then(|| IndustryCode::from_code(industry_codes.value(row)))
+                    .transpose()
                     .map_err(RowCause::IndustryCode)?,
                 chrono::DateTime::from_timestamp_nanos(accepted.value(row)),
             ))
@@ -947,11 +950,11 @@ mod tests {
 
     #[test]
     fn test_filed_industry_codes_read_back_in_filer_order() {
-        let filed = |filer: u64, accession: &str, code: &str, accepted_at: &str| {
+        let filed = |filer: u64, accession: &str, code: Option<&str>, accepted_at: &str| {
             FiledIndustryCode::new(
                 CentralIndexKey::new(filer).unwrap(),
                 AccessionNumber::new(accession).unwrap(),
-                IndustryCode::new(code).unwrap(),
+                code.map(|code| IndustryCode::new(code).unwrap()),
                 accepted_at.parse().unwrap(),
             )
         };
@@ -959,19 +962,19 @@ mod tests {
             filed(
                 901_832,
                 "0001104659-25-014750",
-                "2834",
+                Some("2834"),
                 "2025-02-18T21:06:30Z",
             ),
             filed(
                 901_832,
                 "0001104659-24-025553",
-                "2834",
+                Some("2834"),
                 "2024-02-20T21:32:15Z",
             ),
             filed(
                 1_000_275,
                 "0001000275-24-000001",
-                "6029",
+                None,
                 "2024-12-04T11:02:03Z",
             ),
         ];
@@ -999,7 +1002,7 @@ mod tests {
             filed(
                 1_000_275,
                 "0001104659-25-014750",
-                "6029",
+                Some("6029"),
                 "2025-02-18T21:06:30Z",
             ),
         ];
@@ -1008,7 +1011,7 @@ mod tests {
         let distant = [filed(
             901_832,
             "0001104659-25-014750",
-            "2834",
+            Some("2834"),
             "2263-01-01T00:00:00Z",
         )];
         assert_eq!(

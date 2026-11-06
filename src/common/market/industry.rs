@@ -131,12 +131,13 @@ impl AccessionNumber {
     }
 }
 
-/// The industry code an annual report's header assigned its filer, known from the instant the SEC accepted it.
+/// The industry code an annual report's header assigned its filer, known from the instant the SEC accepted it; `None`
+/// where the header left the filer unclassified, which ends any earlier code as of that instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiledIndustryCode {
     filer: CentralIndexKey,
     accession: AccessionNumber,
-    industry_code: IndustryCode,
+    industry_code: Option<IndustryCode>,
     accepted_at: DateTime<Utc>,
 }
 
@@ -144,7 +145,7 @@ impl FiledIndustryCode {
     pub fn new(
         filer: CentralIndexKey,
         accession: AccessionNumber,
-        industry_code: IndustryCode,
+        industry_code: Option<IndustryCode>,
         accepted_at: DateTime<Utc>,
     ) -> Self {
         Self {
@@ -163,7 +164,7 @@ impl FiledIndustryCode {
         &self.accession
     }
 
-    pub fn industry_code(&self) -> IndustryCode {
+    pub fn industry_code(&self) -> Option<IndustryCode> {
         self.industry_code
     }
 
@@ -174,11 +175,13 @@ impl FiledIndustryCode {
 
 /// Every filed code by filer and acceptance instant, read as of an instant.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FiledIndustryCodes(BTreeMap<CentralIndexKey, BTreeMap<DateTime<Utc>, IndustryCode>>);
+pub struct FiledIndustryCodes(
+    BTreeMap<CentralIndexKey, BTreeMap<DateTime<Utc>, Option<IndustryCode>>>,
+);
 
 impl FiledIndustryCodes {
     pub fn new(rows: &[FiledIndustryCode]) -> Self {
-        let mut codes: BTreeMap<CentralIndexKey, BTreeMap<DateTime<Utc>, IndustryCode>> =
+        let mut codes: BTreeMap<CentralIndexKey, BTreeMap<DateTime<Utc>, Option<IndustryCode>>> =
             BTreeMap::new();
         for row in rows {
             codes
@@ -190,11 +193,20 @@ impl FiledIndustryCodes {
     }
 
     /// The code the latest report accepted at or before `at` assigned `filer`.
-    pub fn code(&self, filer: CentralIndexKey, at: DateTime<Utc>) -> Option<IndustryCode> {
-        self.0
+    pub fn code(
+        &self,
+        filer: CentralIndexKey,
+        at: DateTime<Utc>,
+    ) -> Result<IndustryCode, IndustryAbsence> {
+        match self
+            .0
             .get(&filer)
             .and_then(|filed| filed.range(..=at).next_back())
-            .map(|(_, code)| *code)
+        {
+            None => Err(IndustryAbsence::NotYetFiled { filer }),
+            Some((_, None)) => Err(IndustryAbsence::Unclassified { filer }),
+            Some((_, Some(code))) => Ok(*code),
+        }
     }
 }
 
@@ -205,6 +217,8 @@ pub enum IndustryAbsence {
     NoFiler,
     #[error("filer {} had no annual report accepted by then", .filer.value())]
     NotYetFiled { filer: CentralIndexKey },
+    #[error("filer {}'s latest annual report by then left it unclassified", .filer.value())]
+    Unclassified { filer: CentralIndexKey },
 }
 
 /// The industry `details` places its name in at `at`: the vendor's code, else the code its filer's latest annual report
@@ -217,10 +231,7 @@ pub fn industry_at(
     match (details.industry_code(), details.central_index_key()) {
         (Some(code), _) => Ok(Industry::of(code)),
         (None, None) => Err(IndustryAbsence::NoFiler),
-        (None, Some(filer)) => filed
-            .code(filer, at)
-            .map(Industry::of)
-            .ok_or(IndustryAbsence::NotYetFiled { filer }),
+        (None, Some(filer)) => filed.code(filer, at).map(Industry::of),
     }
 }
 
@@ -317,7 +328,7 @@ mod tests {
         FiledIndustryCode::new(
             filer(),
             AccessionNumber::new(accession).unwrap(),
-            IndustryCode::from_code(code).unwrap(),
+            Some(IndustryCode::from_code(code).unwrap()),
             instant(day, 21),
         )
     }
@@ -357,22 +368,39 @@ mod tests {
             filed("0001104659-24-000002", 2834, 20),
             filed("0001104659-24-000001", 6029, 10),
         ]);
-        assert_eq!(codes.code(filer(), instant(10, 20)), None);
+        let code = |filer, at| codes.code(filer, at).map(IndustryCode::code);
         assert_eq!(
-            codes.code(filer(), instant(10, 21)).map(IndustryCode::code),
-            Some(6029)
+            code(filer(), instant(10, 20)),
+            Err(IndustryAbsence::NotYetFiled { filer: filer() })
+        );
+        assert_eq!(code(filer(), instant(10, 21)), Ok(6029));
+        assert_eq!(code(filer(), instant(20, 20)), Ok(6029));
+        assert_eq!(code(filer(), instant(25, 0)), Ok(2834));
+        let unknown = CentralIndexKey::new(1).unwrap();
+        assert_eq!(
+            code(unknown, instant(25, 0)),
+            Err(IndustryAbsence::NotYetFiled { filer: unknown })
+        );
+    }
+
+    #[test]
+    fn an_unclassified_report_ends_the_code_before_it() {
+        let codes = FiledIndustryCodes::new(&[
+            filed("0001104659-24-000001", 2834, 10),
+            FiledIndustryCode::new(
+                filer(),
+                AccessionNumber::new("0001104659-24-000002").unwrap(),
+                None,
+                instant(20, 21),
+            ),
+        ]);
+        assert_eq!(
+            codes.code(filer(), instant(15, 0)).map(IndustryCode::code),
+            Ok(2834)
         );
         assert_eq!(
-            codes.code(filer(), instant(20, 20)).map(IndustryCode::code),
-            Some(6029)
-        );
-        assert_eq!(
-            codes.code(filer(), instant(25, 0)).map(IndustryCode::code),
-            Some(2834)
-        );
-        assert_eq!(
-            codes.code(CentralIndexKey::new(1).unwrap(), instant(25, 0)),
-            None
+            industry_at(&details(None, Some(filer())), &codes, instant(25, 0)),
+            Err(IndustryAbsence::Unclassified { filer: filer() })
         );
     }
 

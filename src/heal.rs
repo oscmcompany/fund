@@ -971,13 +971,15 @@ async fn read_filed_codes(
             let (code, pages) = assigned_code(*filer, report).await.into_parts();
             bodies.extend(pages);
             match code {
-                Ok(Some(code)) => codes.push(FiledIndustryCode::new(
+                Ok(code) => codes.push(FiledIndustryCode::new(
                     *filer,
                     report.accession().clone(),
                     code,
                     report.accepted_at(),
                 )),
-                Ok(None) => {}
+                // A report listed without a header at its address is read again next quarter rather than stopping
+                // every filer after it.
+                Err(FetchError::Refused { status: 404, .. }) => {}
                 Err(error) => {
                     failed = Some(error);
                     break 'filers;
@@ -2117,6 +2119,7 @@ mod tests {
                         report("0000000001-25-000002", "2025-02-18T21:06:30Z"),
                         report("0000000001-24-000001", "2024-02-20T21:32:15Z"),
                         report("0000000001-23-000003", "2023-02-21T11:00:00Z"),
+                        report("0000000001-22-000004", "2022-02-22T11:00:00Z"),
                     ]),
                     vec![b"submissions 1".to_vec()],
                 ),
@@ -2142,7 +2145,14 @@ mod tests {
                         Ok(Some(IndustryCode::new("2834").unwrap())),
                         vec![b"header 1-25".to_vec()],
                     ),
-                    (1, _) => Fetched::new(Ok(None), vec![b"header 1-23".to_vec()]),
+                    (1, "0000000001-23-000003") => Fetched::new(
+                        Err(FetchError::Refused {
+                            status: 404,
+                            body: String::new(),
+                        }),
+                        Vec::new(),
+                    ),
+                    (1, _) => Fetched::new(Ok(None), vec![b"header 1-22".to_vec()]),
                     (_, _) => Fetched::new(
                         Err(FetchError::Refused {
                             status: 403,
@@ -2159,17 +2169,26 @@ mod tests {
             [
                 "0000000001-25-000002",
                 "0000000001-23-000003",
+                "0000000001-22-000004",
                 "0000000003-25-000001"
             ]
         );
         assert_eq!(
             codes,
-            [FiledIndustryCode::new(
-                filer(1),
-                AccessionNumber::new("0000000001-25-000002").unwrap(),
-                IndustryCode::new("2834").unwrap(),
-                "2025-02-18T21:06:30Z".parse().unwrap(),
-            )]
+            [
+                FiledIndustryCode::new(
+                    filer(1),
+                    AccessionNumber::new("0000000001-25-000002").unwrap(),
+                    Some(IndustryCode::new("2834").unwrap()),
+                    "2025-02-18T21:06:30Z".parse().unwrap(),
+                ),
+                FiledIndustryCode::new(
+                    filer(1),
+                    AccessionNumber::new("0000000001-22-000004").unwrap(),
+                    None,
+                    "2022-02-22T11:00:00Z".parse().unwrap(),
+                ),
+            ]
         );
         assert_eq!(
             unanswered,
@@ -2185,7 +2204,7 @@ mod tests {
             [
                 b"submissions 1".to_vec(),
                 b"header 1-25".to_vec(),
-                b"header 1-23".to_vec(),
+                b"header 1-22".to_vec(),
                 b"submissions 3".to_vec(),
             ]
         );
