@@ -8,6 +8,9 @@ use crate::common::time::SessionDate;
 /// Names an instant needs before its score is read.
 pub const MINIMUM_NAMES: usize = 20;
 
+/// The gap between two values, relative to the larger magnitude, at or under which they count as equal up to rounding.
+const ROUNDING_SPREAD: f64 = 4096.0 * f64::EPSILON;
+
 /// What a model forecast for one name, on a scale whose order is what a score reads; always finite.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Forecast(f64);
@@ -194,7 +197,8 @@ pub fn score_sessions<'a>(
     })
 }
 
-/// Ranks from one, smallest first, tied values sharing the mean of the ranks they span.
+/// Ranks from one, smallest first, values equal up to rounding to their neighbour tied and sharing the mean of the ranks
+/// they span.
 fn average_ranks(values: impl Iterator<Item = f64>) -> Vec<f64> {
     let values: Vec<f64> = values.collect();
     let mut order: Vec<usize> = (0..values.len()).collect();
@@ -202,11 +206,11 @@ fn average_ranks(values: impl Iterator<Item = f64>) -> Vec<f64> {
     let mut ranks = vec![0.0; values.len()];
     let mut start = 0;
     while start < order.len() {
-        let end = start
-            + order[start..]
-                .iter()
-                .take_while(|index| values[**index] == values[order[start]])
-                .count();
+        let mut end = start + 1;
+        while end < order.len() && equal_up_to_rounding(values[order[end - 1]], values[order[end]])
+        {
+            end += 1;
+        }
         let shared = (start + end + 1) as f64 / 2.0;
         for index in &order[start..end] {
             ranks[*index] = shared;
@@ -214,6 +218,11 @@ fn average_ranks(values: impl Iterator<Item = f64>) -> Vec<f64> {
         start = end;
     }
     ranks
+}
+
+/// Whether two values differ by no more than rounding explains, so their order means nothing.
+fn equal_up_to_rounding(left: f64, right: f64) -> bool {
+    (right - left).abs() <= ROUNDING_SPREAD * left.abs().max(right.abs())
 }
 
 /// Each value less the mean, or `None` where every value is the same.
@@ -336,6 +345,62 @@ mod tests {
             Measure::HitRate.score(&pairs(&[0.0; 20], &line(20))),
             Err(Undefined::NoDirection { names: 20 })
         );
+    }
+
+    /// A component gone dead leaves its forecast equal up to rounding, and the ulps it differs by order the names at
+    /// random, so the instant has no order to score rather than a score near zero.
+    #[test]
+    fn test_a_forecast_equal_up_to_rounding_is_undefined() {
+        let jittered = |center: f64| -> Vec<f64> {
+            (0..20)
+                .map(|index| match index % 3 {
+                    0 => center,
+                    1 => center.next_up(),
+                    _ => center.next_down().next_down(),
+                })
+                .collect()
+        };
+        let coefficient = Measure::InformationCoefficient;
+        assert_eq!(
+            coefficient.score(&pairs(&jittered(0.5), &line(20))),
+            Err(Undefined::ForecastConstant { names: 20 })
+        );
+        assert_eq!(
+            coefficient.score(&pairs(&jittered(-3.0e7), &line(20))),
+            Err(Undefined::ForecastConstant { names: 20 })
+        );
+        assert_eq!(
+            coefficient.score(&pairs(&line(20), &jittered(0.002))),
+            Err(Undefined::OutcomeConstant { names: 20 })
+        );
+        assert_eq!(
+            coefficient.score(&pairs(&[0.0; 20], &line(20))),
+            Err(Undefined::ForecastConstant { names: 20 })
+        );
+        let resolved: Vec<f64> = line(20).iter().map(|step| 0.5 + step * 1e-9).collect();
+        assert_eq!(coefficient.score(&pairs(&resolved, &line(20))), Ok(1.0));
+    }
+
+    /// Nineteen names collapsed to one value up to rounding beside one far away read as two tied groups, so the ulps
+    /// among the nineteen order nothing and the score is the same whichever way they fall.
+    #[test]
+    fn test_names_equal_up_to_rounding_tie_beside_an_outlier() {
+        let collapsed = |step: fn(f64) -> f64| -> Vec<f64> {
+            let mut forecast: Vec<f64> = (0..19)
+                .map(|index| match index % 2 {
+                    0 => 0.5,
+                    _ => step(0.5),
+                })
+                .collect();
+            forecast.push(9.0);
+            forecast
+        };
+        let coefficient = Measure::InformationCoefficient;
+        let up = coefficient.score(&pairs(&collapsed(f64::next_up), &line(20)));
+        let down = coefficient.score(&pairs(&collapsed(f64::next_down), &line(20)));
+        assert_eq!(up, down);
+        let expected = (0..19).map(|_| 10.0).chain([20.0]).collect::<Vec<f64>>();
+        assert_eq!(up, coefficient.score(&pairs(&expected, &line(20))));
     }
 
     /// Names with a zero on either side have no direction and leave the denominator: 3 agree of the 4 directional.
