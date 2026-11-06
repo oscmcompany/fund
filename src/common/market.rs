@@ -3,6 +3,7 @@
 
 pub mod aggregate;
 pub mod corporate_actions;
+pub mod industry;
 pub mod quote_bars;
 pub mod record;
 pub mod refusal;
