@@ -102,6 +102,7 @@ fn bars(daily: Answer, minute: Answer) -> Vec<(&'static str, Answer)> {
         ("daily_trade_bars", daily),
         ("trade_conditions", daily),
         ("security_details", daily),
+        ("filed_industry_codes", daily),
         ("splits", daily),
         ("series_boundaries", daily),
     ]
@@ -149,6 +150,7 @@ fn test_every_view_in_views_sql_is_checked() {
             "daily_trade_bars",
             "trade_conditions",
             "security_details",
+            "filed_industry_codes",
             "splits",
             "series_boundaries",
             "journal",
@@ -365,7 +367,7 @@ fn test_every_view_ends_on_its_first_line_ending_in_a_semicolon() {
         );
         ended.push(view);
     }
-    assert_eq!(ended.len(), 27, "{ended:?}");
+    assert_eq!(ended.len(), 28, "{ended:?}");
 }
 
 /// Each `(bucket, series)` the views of `views.sql` pass to the `sessions`, `snapshots` and `preferred` macros, in file
@@ -415,6 +417,7 @@ fn archive_keys() -> Vec<Key> {
     for (provider, table) in [
         (Provider::Massive, ReferenceTable::Conditions),
         (Provider::Massive, ReferenceTable::SecurityDetails),
+        (Provider::Sec, ReferenceTable::FiledIndustryCodes),
         (Provider::Massive, ReferenceTable::Splits),
         (Provider::Alpaca, ReferenceTable::SeriesBoundaries),
     ] {
@@ -450,7 +453,7 @@ fn test_every_series_views_sql_reads_is_a_key_series() {
     let called = macro_series();
     // 16 series views, the six neutral views' two reads each, `journal`, `logs`, `experiments`, `verdicts`, and
     // `bar_seam`'s two reads.
-    assert_eq!(called.len(), 34, "{called:?}");
+    assert_eq!(called.len(), 35, "{called:?}");
     for (bucket, series) in &called {
         let expected_bucket = if series.starts_with("records/") {
             "profile_bucket"
