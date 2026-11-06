@@ -8,35 +8,65 @@ use super::READING_BOUND;
 use crate::common::market::industry::Industry;
 use crate::common::market::{Dollars, Symbol};
 
+/// A simple return over one interval as a fraction, `0.01` being one percent, within the reading bound.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct SimpleReturn(f64);
+
+/// Why a return was refused.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum ReturnRefusal {
+    #[error("{value} is not a finite return within the reading bound")]
+    Unbounded { value: f64 },
+}
+
+impl SimpleReturn {
+    pub fn new(value: f64) -> Result<Self, ReturnRefusal> {
+        match (-READING_BOUND..=READING_BOUND).contains(&value) {
+            true => Ok(Self(value)),
+            false => Err(ReturnRefusal::Unbounded { value }),
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// A name's simple return less the capitalization-weighted return of the other names in its industry.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Residual(f64);
+
+impl Residual {
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
 /// One name over one interval: its industry, its capitalization and its simple return.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Member {
     industry: Option<Industry>,
     capitalization: Option<Dollars>,
-    simple_return: f64,
-}
-
-/// Why a member was refused.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
-pub enum MemberRefusal {
-    #[error("{simple_return} is not a finite return within the reading bound")]
-    Unbounded { simple_return: f64 },
+    simple_return: SimpleReturn,
 }
 
 impl Member {
     pub fn new(
         industry: Option<Industry>,
         capitalization: Option<Dollars>,
-        simple_return: f64,
-    ) -> Result<Self, MemberRefusal> {
-        match (-READING_BOUND..=READING_BOUND).contains(&simple_return) {
-            true => Ok(Self {
-                industry,
-                capitalization,
-                simple_return,
-            }),
-            false => Err(MemberRefusal::Unbounded { simple_return }),
+        simple_return: SimpleReturn,
+    ) -> Self {
+        Self {
+            industry,
+            capitalization,
+            simple_return,
         }
+    }
+
+    /// The capitalization a name weighs in its industry's average with, zero where it has none.
+    fn weight(&self) -> u128 {
+        self.capitalization
+            .map_or(0, |capitalization| u128::from(capitalization.millionths()))
     }
 }
 
@@ -54,12 +84,51 @@ pub enum ResidualRefusal {
     },
 }
 
-/// The weights and weighted returns of one industry's capitalized names.
-#[derive(Debug, Clone, Copy, Default)]
-struct Totals {
-    names: usize,
+/// One industry's capitalized names in symbol order, with the weighted returns summed before and after each, so a
+/// name's peers are summed without its own term rather than by subtracting it, which can round small peers away.
+#[derive(Debug, Default)]
+struct Peers<'a> {
+    symbols: Vec<&'a Symbol>,
+    weights: Vec<u128>,
     weight: u128,
-    weighted_return: f64,
+    /// `before[index]` sums the weighted returns of the names before `index`, and `after[index]` those from it on.
+    before: Vec<f64>,
+    after: Vec<f64>,
+}
+
+impl<'a> Peers<'a> {
+    fn new(names: Vec<(&'a Symbol, u128, f64)>) -> Self {
+        let weighted: Vec<f64> = names
+            .iter()
+            .map(|(_, weight, simple_return)| *weight as f64 * simple_return)
+            .collect();
+        let mut before = vec![0.0; weighted.len() + 1];
+        let mut after = vec![0.0; weighted.len() + 1];
+        for index in 0..weighted.len() {
+            before[index + 1] = before[index] + weighted[index];
+            let from_end = weighted.len() - 1 - index;
+            after[from_end] = after[from_end + 1] + weighted[from_end];
+        }
+        Self {
+            symbols: names.iter().map(|(symbol, _, _)| *symbol).collect(),
+            weights: names.iter().map(|(_, weight, _)| *weight).collect(),
+            weight: names.iter().map(|(_, weight, _)| weight).sum(),
+            before,
+            after,
+        }
+    }
+
+    /// How many peers `symbol` has, and their summed weight and weighted return, leaving `symbol` out.
+    fn excluding(&self, symbol: &Symbol) -> (usize, u128, f64) {
+        match self.symbols.binary_search(&symbol) {
+            Ok(index) => (
+                self.symbols.len() - 1,
+                self.weight - self.weights[index],
+                self.before[index] + self.after[index + 1],
+            ),
+            Err(_) => (self.symbols.len(), self.weight, self.after[0]),
+        }
+    }
 }
 
 /// Every member's residual, keyed as the members are.
@@ -68,39 +137,35 @@ struct Totals {
 pub fn residuals(
     members: &BTreeMap<Symbol, Member>,
     minimum_others: NonZeroUsize,
-) -> BTreeMap<Symbol, Result<f64, ResidualRefusal>> {
-    let weight = |member: &Member| {
+) -> BTreeMap<Symbol, Result<Residual, ResidualRefusal>> {
+    let capitalized = members.iter().filter_map(|(symbol, member)| {
+        let weight = member.weight();
         member
-            .capitalization
-            .map_or(0, |capitalization| u128::from(capitalization.millionths()))
-    };
-    let mut totals: BTreeMap<Industry, Totals> = BTreeMap::new();
-    for member in members.values() {
-        match (member.industry, weight(member)) {
-            (Some(industry), weight) if weight > 0 => {
-                let entry = totals.entry(industry).or_default();
-                entry.names += 1;
-                entry.weight += weight;
-                entry.weighted_return += weight as f64 * member.simple_return;
-            }
-            (Some(_) | None, _) => {}
-        }
+            .industry
+            .filter(|_| weight > 0)
+            .map(|industry| (industry, (symbol, weight, member.simple_return.get())))
+    });
+    let mut names: BTreeMap<Industry, Vec<(&Symbol, u128, f64)>> = BTreeMap::new();
+    for (industry, name) in capitalized {
+        names.entry(industry).or_default().push(name);
     }
+    let peers: BTreeMap<Industry, Peers<'_>> = names
+        .into_iter()
+        .map(|(industry, names)| (industry, Peers::new(names)))
+        .collect();
+    let empty = Peers::new(Vec::new());
     members
         .iter()
         .map(|(symbol, member)| {
             let residual = match member.industry {
                 None => Err(ResidualRefusal::NoIndustry),
                 Some(industry) => {
-                    let all = totals.get(&industry).copied().unwrap_or_default();
-                    let own = weight(member);
-                    let others = all.names - usize::from(own > 0);
+                    let (others, weight, weighted_return) =
+                        peers.get(&industry).unwrap_or(&empty).excluding(symbol);
                     match others >= minimum_others.get() {
-                        true => {
-                            let average = (all.weighted_return - own as f64 * member.simple_return)
-                                / (all.weight - own) as f64;
-                            Ok(member.simple_return - average)
-                        }
+                        true => Ok(Residual(
+                            member.simple_return.get() - weighted_return / weight as f64,
+                        )),
                         false => Err(ResidualRefusal::ThinIndustry {
                             others,
                             minimum: minimum_others,
@@ -130,17 +195,16 @@ mod tests {
         Member::new(
             industry,
             dollars.map(|dollars| Dollars::from_millionths(dollars * 1_000_000)),
-            simple_return,
+            SimpleReturn::new(simple_return).unwrap(),
         )
-        .unwrap()
     }
 
     fn one() -> NonZeroUsize {
         NonZeroUsize::new(1).unwrap()
     }
 
-    fn measured(result: &Result<f64, ResidualRefusal>) -> f64 {
-        *result.as_ref().unwrap()
+    fn measured(result: &Result<Residual, ResidualRefusal>) -> f64 {
+        result.as_ref().unwrap().get()
     }
 
     #[test]
@@ -245,15 +309,32 @@ mod tests {
 
     #[test]
     fn a_return_past_the_bound_is_refused() {
-        assert!(Member::new(None, None, f64::NAN).is_err());
-        assert!(Member::new(None, None, f64::INFINITY).is_err());
+        assert!(SimpleReturn::new(f64::NAN).is_err());
+        assert!(SimpleReturn::new(f64::INFINITY).is_err());
         assert_eq!(
-            Member::new(None, None, 1e51),
-            Err(MemberRefusal::Unbounded {
-                simple_return: 1e51
-            })
+            SimpleReturn::new(1e51),
+            Err(ReturnRefusal::Unbounded { value: 1e51 })
         );
-        assert!(Member::new(None, None, -1e50).is_ok());
+        assert!(SimpleReturn::new(-1e50).is_ok());
+    }
+
+    #[test]
+    fn a_dominant_name_does_not_round_its_small_peers_away() {
+        let tiny = |dollars: u64, simple_return: f64| {
+            Member::new(
+                Some(Industry::Finance),
+                Some(Dollars::from_millionths(dollars)),
+                SimpleReturn::new(simple_return).unwrap(),
+            )
+        };
+        let members = BTreeMap::from([
+            (symbol("AAA"), tiny(1 << 60, 0.125)),
+            (symbol("BBB"), tiny(1, 0.125)),
+            (symbol("CCC"), tiny(1, 0.375)),
+        ]);
+        let residuals = residuals(&members, one());
+        assert_eq!(measured(&residuals[&symbol("AAA")]), -0.125);
+        assert_eq!(measured(&residuals[&symbol("CCC")]), 0.25);
     }
 
     fn cross_section() -> impl Strategy<Value = BTreeMap<Symbol, Member>> {
@@ -284,12 +365,12 @@ mod tests {
     }
 
     fn agree(
-        left: &BTreeMap<Symbol, Result<f64, ResidualRefusal>>,
-        right: &BTreeMap<Symbol, Result<f64, ResidualRefusal>>,
+        left: &BTreeMap<Symbol, Result<Residual, ResidualRefusal>>,
+        right: &BTreeMap<Symbol, Result<Residual, ResidualRefusal>>,
     ) -> bool {
         left.keys().eq(right.keys())
             && left.values().zip(right.values()).all(|pair| match pair {
-                (Ok(left), Ok(right)) => (left - right).abs() < TOLERANCE,
+                (Ok(left), Ok(right)) => (left.get() - right.get()).abs() < TOLERANCE,
                 (Err(left), Err(right)) => left == right,
                 (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
             })
@@ -305,7 +386,10 @@ mod tests {
                 (
                     symbol.clone(),
                     Member {
-                        simple_return: member.simple_return + shift(symbol, member),
+                        simple_return: SimpleReturn::new(
+                            member.simple_return.get() + shift(symbol, member),
+                        )
+                        .unwrap(),
                         ..*member
                     },
                 )
@@ -357,7 +441,9 @@ mod tests {
                 one(),
             );
             match (&before[&target], &after[&target]) {
-                (Ok(before), Ok(after)) => prop_assert!((after - before - shock).abs() < TOLERANCE),
+                (Ok(before), Ok(after)) => {
+                    prop_assert!((after.get() - before.get() - shock).abs() < TOLERANCE)
+                }
                 (Err(before), Err(after)) => prop_assert_eq!(before, after),
                 (Ok(_), Err(_)) | (Err(_), Ok(_)) => prop_assert!(false),
             }
