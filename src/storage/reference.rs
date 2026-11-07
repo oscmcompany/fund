@@ -1,6 +1,6 @@
 //! Reference tables as Parquet, one file per table and snapshot date, with the fetch's provenance alongside.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use super::parquet::{ReadRefusal, RowCause};
 use super::provenance::{Provenance, provenance_from};
 use super::{Bucket, BucketError, parquet};
+use crate::common::market::borrow::BorrowFlags;
 use crate::common::market::corporate_actions::{
     ActionId, BoundaryChange, BoundaryKind, SeriesBoundary, Split, SplitRatio,
 };
@@ -782,6 +783,86 @@ pub fn decode_series_boundaries(
     Ok((boundaries, provenance))
 }
 
+fn borrow_flags_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("shortable", DataType::Boolean, false),
+        Field::new("easy_to_borrow", DataType::Boolean, false),
+    ])
+}
+
+/// A borrow flags snapshot's file for `key`, rows in symbol order; a symbol listed twice is refused.
+pub fn encode_borrow_flags(
+    key: &ReferenceKey,
+    flags: &[BorrowFlags],
+    provenance: &Provenance,
+) -> Result<Vec<u8>, ReferenceRefusal> {
+    snapshot_provider(key, ReferenceTable::BorrowFlags, provenance)?;
+    let mut ordered: Vec<&BorrowFlags> = flags.iter().collect();
+    ordered.sort_by(|left, right| left.symbol().cmp(right.symbol()));
+    if let Some(pair) = ordered
+        .windows(2)
+        .find(|pair| pair[0].symbol() == pair[1].symbol())
+    {
+        return Err(ReferenceRefusal::DuplicateSymbol {
+            symbol: pair[0].symbol().clone(),
+        });
+    }
+    let mut symbols = StringBuilder::new();
+    let mut shortable = BooleanBuilder::new();
+    let mut easy_to_borrow = BooleanBuilder::new();
+    for flag in ordered {
+        symbols.append_value(flag.symbol().as_str());
+        shortable.append_value(flag.shortable());
+        easy_to_borrow.append_value(flag.easy_to_borrow());
+    }
+    parquet::write(
+        borrow_flags_schema(),
+        vec![
+            Arc::new(symbols.finish()),
+            Arc::new(shortable.finish()),
+            Arc::new(easy_to_borrow.finish()),
+        ],
+        LAYOUT_VERSION,
+        provenance.metadata(),
+    )
+    .map_err(ReferenceRefusal::Parquet)
+}
+
+/// The snapshot a file written by `encode_borrow_flags` under `key` holds, every symbol rebuilt through its type.
+pub fn decode_borrow_flags(
+    key: &ReferenceKey,
+    bytes: Vec<u8>,
+) -> Result<(Vec<BorrowFlags>, Provenance), ReferenceRefusal> {
+    let (batches, entries) = parquet::read(bytes, &borrow_flags_schema(), LAYOUT_VERSION)?;
+    let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
+    snapshot_provider(key, ReferenceTable::BorrowFlags, &provenance)?;
+    let mut flags = Vec::new();
+    let mut seen = BTreeSet::new();
+    for batch in batches {
+        let symbols = parquet::column::<StringArray>(&batch, 0)?;
+        let shortable = parquet::downcast::<BooleanArray>(batch.column(1))?;
+        let easy_to_borrow = parquet::downcast::<BooleanArray>(batch.column(2))?;
+        for row in 0..batch.num_rows() {
+            let index = flags.len();
+            let symbol =
+                Symbol::new(symbols.value(row)).map_err(|cause| ReferenceRefusal::Row {
+                    index,
+                    cause: RowCause::Symbol(cause),
+                })?;
+            if !seen.insert(symbol.clone()) {
+                return Err(ReferenceRefusal::DuplicateSymbol { symbol });
+            }
+            flags.push(BorrowFlags::new(
+                symbol,
+                shortable.value(row),
+                easy_to_borrow.value(row),
+            ));
+        }
+    }
+    Ok((flags, provenance))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
@@ -1222,6 +1303,61 @@ mod tests {
             proptest::prop_assert_eq!(read, expected);
             proptest::prop_assert_eq!(read_provenance, provenance);
         }
+    }
+
+    fn borrow_provenance() -> Provenance {
+        Provenance::new(
+            Subscription::BrokerageAccount,
+            "2026-11-07T02:00:00Z".parse().unwrap(),
+            RunId::new(Uuid::from_u128(6)),
+            None,
+        )
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn property_borrow_flags_round_trip(
+            rows in proptest::collection::btree_map("[A-Z]{1,5}", (proptest::bool::ANY, proptest::bool::ANY), 1..40),
+        ) {
+            let flags: Vec<BorrowFlags> = rows
+                .iter()
+                .map(|(symbol, (shortable, easy))| BorrowFlags::new(Symbol::new(symbol).unwrap(), *shortable, *easy))
+                .rev()
+                .collect();
+            let key = ReferenceKey::new(Provider::Alpaca, ReferenceTable::BorrowFlags, session());
+            let written = encode_borrow_flags(&key, &flags, &borrow_provenance()).unwrap();
+            let (read, read_provenance) = decode_borrow_flags(&key, written).unwrap();
+            let mut expected = flags.clone();
+            expected.sort_by(|left, right| left.symbol().cmp(right.symbol()));
+            proptest::prop_assert_eq!(read, expected);
+            proptest::prop_assert_eq!(read_provenance, borrow_provenance());
+        }
+    }
+
+    #[test]
+    fn test_a_borrow_flags_snapshot_refuses_a_repeated_symbol_and_another_vendor() {
+        let key = ReferenceKey::new(Provider::Alpaca, ReferenceTable::BorrowFlags, session());
+        let flag = || BorrowFlags::new(Symbol::new("AAA").unwrap(), true, true);
+        assert_eq!(
+            encode_borrow_flags(&key, &[flag(), flag()], &borrow_provenance()),
+            Err(ReferenceRefusal::DuplicateSymbol {
+                symbol: Symbol::new("AAA").unwrap()
+            })
+        );
+        assert!(matches!(
+            encode_borrow_flags(&key, &[flag()], &snapshot_provenance()),
+            Err(ReferenceRefusal::SubscriptionProvider { .. })
+        ));
+        let file = encode_borrow_flags(&key, &[flag()], &borrow_provenance()).unwrap();
+        let other = ReferenceKey::new(
+            Provider::Alpaca,
+            ReferenceTable::SeriesBoundaries,
+            session(),
+        );
+        assert!(matches!(
+            decode_borrow_flags(&other, file),
+            Err(ReferenceRefusal::NotTheTable { .. })
+        ));
     }
 
     #[test]

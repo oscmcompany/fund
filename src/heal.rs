@@ -16,10 +16,10 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::common::heal::{
-    Coverage, CoverageRefusal, Held, KeepsRefusal, Leg, PartitionFailureKind, SeriesListing,
-    SessionOutcome, WindowRefusal, alpaca_quotes, alpaca_series_boundaries, alpaca_trades,
-    fetched_range, massive_security_details, massive_splits, massive_traded_symbols, owed,
-    sec_filed_industry_codes, window,
+    Coverage, CoverageRefusal, Held, KeepsRefusal, Lapse, Leg, PartitionFailureKind, SeriesListing,
+    SessionOutcome, WindowRefusal, alpaca_borrow_flags, alpaca_quotes, alpaca_series_boundaries,
+    alpaca_trades, fetched_range, lapsed, massive_security_details, massive_splits,
+    massive_traded_symbols, owed, sec_filed_industry_codes, window,
 };
 use crate::common::journal::{
     ArchiveSurveyed, ConditionsWritten, ConfigurationResolved, HealFinished, Observation,
@@ -53,7 +53,7 @@ use crate::storage::provenance::{Provenance, Subscription};
 use crate::storage::raw::TeeError;
 use crate::storage::reference::{
     conditions_key, decode_filed_industry_codes, decode_security_details, decode_series_boundaries,
-    encode_conditions, encode_filed_industry_codes, encode_security_details,
+    encode_borrow_flags, encode_conditions, encode_filed_industry_codes, encode_security_details,
     encode_series_boundaries, encode_splits, latest_conditions, latest_snapshot,
 };
 use crate::storage::{self, Bucket, BucketError};
@@ -183,6 +183,9 @@ pub enum PartitionFailure {
     Fold(QuoteFoldRefusal),
     #[error("{0}")]
     Tee(TeeError),
+    /// The listing answers only for now, and could no longer be dated by `session` when it arrived.
+    #[error("{session}'s listing lapsed: {lapse}")]
+    Lapsed { session: SessionDate, lapse: Lapse },
     /// A write the partition needed could not be journaled, which stops the run.
     #[error("journaling a write failed: {0}")]
     Journal(std::io::Error),
@@ -204,6 +207,7 @@ impl PartitionFailure {
             Self::Fold(_) => PartitionFailureKind::Fold,
             Self::Tee(_) => PartitionFailureKind::Tee,
             Self::Journal(_) => PartitionFailureKind::Journal,
+            Self::Lapsed { .. } => PartitionFailureKind::Lapsed,
         }
     }
 
@@ -445,6 +449,7 @@ async fn write(
         Leg::AlpacaTrades => write_trades(session, parameters, clients, journal).await,
         Leg::MassiveSplits => write_splits(session, clients, journal).await,
         Leg::AlpacaSeriesBoundaries => write_series_boundaries(session, clients, journal).await,
+        Leg::AlpacaBorrowFlags => write_borrow_flags(session, calendar, clients, journal).await,
         Leg::MassiveSecurityDetails => {
             write_security_details(session, parameters, clients, journal).await
         }
@@ -700,6 +705,43 @@ async fn write_series_boundaries(
         session,
         rows,
         refused_by_cause(read.refused()),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    ))
+}
+
+/// Writes the session's borrow flags from the asset listing as it stands now, refused once the next session has
+/// opened; the instant is taken after the response, so a slow fetch cannot carry it past the open.
+async fn write_borrow_flags(
+    session: SessionDate,
+    calendar: &TradingCalendar,
+    clients: &Clients,
+    journal: &Journal,
+) -> Result<PartitionWritten, PartitionFailure> {
+    let fetched = clients.alpaca.borrow_flags().await;
+    let provenance = fetched_now(Subscription::BrokerageAccount, journal);
+    lapsed(calendar, session, provenance.fetched_at())
+        .map_err(|lapse| PartitionFailure::Lapsed { session, lapse })?;
+    let read = kept(
+        clients.store(),
+        alpaca_borrow_flags(session),
+        &provenance,
+        fetched,
+    )
+    .await?;
+    let rows = publish(
+        clients.put(),
+        alpaca_borrow_flags(session),
+        &read.flags,
+        &provenance,
+        encode_borrow_flags,
+    )
+    .await?;
+    Ok(PartitionWritten::new(
+        Leg::AlpacaBorrowFlags,
+        session,
+        rows,
+        refused_by_cause(&read.refused),
         BTreeMap::new(),
         BTreeMap::new(),
     ))

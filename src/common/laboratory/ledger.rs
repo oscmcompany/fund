@@ -7,6 +7,7 @@ use std::num::NonZeroU8;
 
 use crate::common::book::{Book, Cash, Fill, Position, Side, ValuationRefusal};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
+use crate::common::market::borrow::Borrow;
 use crate::common::market::{Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::monoid::Monoid;
 use crate::common::risk::{Flat, Limit, Limits, Risk};
@@ -25,24 +26,6 @@ impl Leverage {
     pub fn multiple(self) -> NonZeroU8 {
         self.0
     }
-}
-
-/// Whether a name can be sold short on a session.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    strum::Display,
-    strum::EnumString,
-    strum::IntoStaticStr,
-    strum::EnumIter,
-)]
-#[strum(serialize_all = "snake_case")]
-pub enum Borrow {
-    Available,
-    Unavailable,
 }
 
 /// A cap an opening trade is checked against.

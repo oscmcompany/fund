@@ -67,6 +67,9 @@ pub enum ReferenceTable {
     /// The industry code each annual report's header assigned its filer, for the filers of common stock or a depositary
     /// receipt Massive gives no code.
     FiledIndustryCodes,
+    /// Whether each active asset is shortable and easy to borrow, as the broker's asset listing reported it after a
+    /// session's close.
+    BorrowFlags,
 }
 
 /// The S3 storage class an object is written in.
@@ -925,6 +928,10 @@ pub(crate) mod tests {
                 )
                 .into(),
                 "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/as_of=2026-08-03/data.parquet",
+            ),
+            (
+                ReferenceKey::new(Provider::Alpaca, ReferenceTable::BorrowFlags, session()).into(),
+                "data/equity/stage=parsed/reference/provider=alpaca/table=borrow_flags/as_of=2026-08-03/data.parquet",
             ),
             (
                 Key::RawQuotes {
