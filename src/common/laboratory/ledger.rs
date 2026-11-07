@@ -608,6 +608,124 @@ mod tests {
     }
 
     #[test]
+    fn test_the_daily_loss_is_measured_from_the_last_close() {
+        let session = |day| SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, day).unwrap());
+        // Session 2 earns $1,000 (100 shares from $50 to $60) and closes at $21,000; session 3 buys 100 at $50.
+        let held = ledger(40_000, 10_000, 2)
+            .trade(
+                &fill("AAA", Side::Buy, shares(100), price(50), 0),
+                open(),
+                Borrow::Available,
+                none,
+            )
+            .and_then(|ledger| {
+                ledger.trade(
+                    &fill("AAA", Side::Sell, shares(100), price(60), 0),
+                    open(),
+                    Borrow::Available,
+                    none,
+                )
+            })
+            .unwrap()
+            .close(session(2))
+            .unwrap()
+            .trade(
+                &fill("AAA", Side::Buy, shares(100), price(50), 0),
+                open(),
+                Borrow::Available,
+                none,
+            )
+            .unwrap();
+        assert_eq!(held.session_opening(), dollars(21_000));
+        // At $40 the session has lost exactly the $1,000 limit, though equity is still above the $20,000 funded.
+        let marked_at = |dollars_each: i64| move |_: &Symbol| Some(price(dollars_each));
+        let one_more = fill("AAA", Side::Buy, shares(1), price(40), 0);
+        assert_eq!(
+            held.trade(&one_more, open(), Borrow::Available, marked_at(40)),
+            Err(TradeRefusal::Flat(Flat::LossLimit {
+                loss: dollars(1_000)
+            }))
+        );
+        let room = held
+            .room(
+                &symbol("AAA"),
+                Side::Sell,
+                price(40),
+                open(),
+                Borrow::Available,
+                marked_at(40),
+            )
+            .unwrap();
+        assert_eq!(
+            (room.shares().units(), room.binding()),
+            (
+                shares(100),
+                Binding::Flat(Flat::LossLimit {
+                    loss: dollars(1_000)
+                })
+            )
+        );
+        assert!(
+            held.trade(
+                &fill("AAA", Side::Sell, shares(100), price(40), 0),
+                open(),
+                Borrow::Unavailable,
+                marked_at(40)
+            )
+            .is_ok()
+        );
+        // A cent higher the loss is $999, and new exposure is still allowed.
+        let cent_above = Price::from_ticks(40_010_000).unwrap();
+        let below_limit = fill("AAA", Side::Buy, shares(1), cent_above, 0);
+        assert!(
+            held.trade(&below_limit, open(), Borrow::Available, |_| Some(
+                cent_above
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_buying_power_counts_the_fills_cost() {
+        // Leverage one on $20,000: the room at $50 is 400 shares, which a costless fill fits exactly.
+        let start = ledger(1_000_000, 1_000_000, 1);
+        let room = start
+            .room(
+                &symbol("AAA"),
+                Side::Buy,
+                price(50),
+                open(),
+                Borrow::Available,
+                none,
+            )
+            .unwrap();
+        assert_eq!(
+            (room.shares().units(), room.binding()),
+            (shares(400), Binding::Bound(Bound::BuyingPower))
+        );
+        let buy = |whole, cost_units| fill("AAA", Side::Buy, shares(whole), price(50), cost_units);
+        assert!(
+            start
+                .trade(&buy(400, 0), open(), Borrow::Available, none)
+                .is_ok()
+        );
+        // A dollar of cost leaves $19,999 of equity under $20,000 of exposure.
+        assert_eq!(
+            start.trade(&buy(400, DOLLAR as u128), open(), Borrow::Available, none),
+            Err(TradeRefusal::Exceeds {
+                bound: Bound::BuyingPower,
+                exposure: dollars(20_000),
+                allowed: dollars(19_999)
+            })
+        );
+        assert!(
+            start
+                .trade(&buy(399, DOLLAR as u128), open(), Borrow::Available, none)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_a_session_closes_only_flat_and_in_order() {
         let session = |day| SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, day).unwrap());
         let held = ledger(40_000, 5_000, 2)

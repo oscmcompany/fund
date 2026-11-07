@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::common::book::{Book, Cash, ValuationRefusal};
+use crate::common::laboratory::residual::SimpleReturn;
 use crate::common::laboratory::score::Pair;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::{Price, Symbol};
@@ -77,8 +78,17 @@ pub fn net_exposure(
 /// One stretch a book held unchanged: its net exposure and the market's return across the stretch.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Held {
-    pub exposure: NetExposure,
-    pub market_return: f64,
+    exposure: NetExposure,
+    market_return: SimpleReturn,
+}
+
+impl Held {
+    pub fn new(exposure: NetExposure, market_return: SimpleReturn) -> Self {
+        Self {
+            exposure,
+            market_return,
+        }
+    }
 }
 
 /// One session's return split into the market leg, each held stretch's exposure times the market's return across it,
@@ -91,14 +101,14 @@ pub struct Legs {
 
 impl Legs {
     /// A session that held nothing has no market leg, so its whole return is selection.
-    pub fn of(total: f64, held: &[Held]) -> Self {
+    pub fn of(total: SimpleReturn, held: &[Held]) -> Self {
         let market = held
             .iter()
-            .map(|stretch| stretch.exposure.0 * stretch.market_return)
+            .map(|stretch| stretch.exposure.0 * stretch.market_return.get())
             .sum::<f64>();
         Self {
             market,
-            selection: total - market,
+            selection: total.get() - market,
         }
     }
 
@@ -128,9 +138,11 @@ pub fn split_returns(
         .readings()
         .iter()
         .map(|(session, total)| {
-            let legs = total
-                .zip(held.get(session))
-                .map(|(total, stretches)| Legs::of(total, stretches));
+            let legs = total.zip(held.get(session)).map(|(total, stretches)| {
+                let total = SimpleReturn::new(total)
+                    .expect("a series reading lies within the bound a return admits");
+                Legs::of(total, stretches)
+            });
             (*session, legs)
         })
         .collect();
@@ -183,6 +195,10 @@ mod tests {
         prop::collection::vec((-10.0..10.0f64, -0.1..0.1f64), 1..40)
     }
 
+    fn returned(value: f64) -> SimpleReturn {
+        SimpleReturn::new(value).unwrap()
+    }
+
     fn close(left: f64, right: f64) -> bool {
         (left - right).abs() <= 1e-9 * left.abs().max(right.abs()).max(1.0)
     }
@@ -233,10 +249,7 @@ mod tests {
         let held = BTreeMap::from([
             (
                 session(2),
-                vec![Held {
-                    exposure: NetExposure(0.3),
-                    market_return: 0.01,
-                }],
+                vec![Held::new(NetExposure(0.3), returned(0.01))],
             ),
             (session(3), Vec::new()),
             (session(4), Vec::new()),
@@ -303,10 +316,7 @@ mod tests {
             let exposure = net_exposure(ledger.book(), |_| mark, ledger.session_opening())
                 .unwrap()
                 .unwrap();
-            held.push(Held {
-                exposure,
-                market_return: to / from - 1.0,
-            });
+            held.push(Held::new(exposure, returned(to / from - 1.0)));
         }
         let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap());
         ledger = ledger
@@ -374,12 +384,12 @@ mod tests {
             exposure in -2.0..2.0f64,
             residual in -0.01..0.01f64,
         ) {
-            let stretch = |exposure| [Held { exposure: NetExposure(exposure), market_return: market }];
-            let held = Legs::of(exposure * market, &stretch(exposure));
+            let stretch = |exposure| [Held::new(NetExposure(exposure), returned(market))];
+            let held = Legs::of(returned(exposure * market), &stretch(exposure));
             prop_assert!(held.selection().abs() < 1e-15);
-            let neutral = Legs::of(residual, &stretch(0.0));
+            let neutral = Legs::of(returned(residual), &stretch(0.0));
             prop_assert_eq!((neutral.market(), neutral.selection()), (0.0, residual));
-            let both = Legs::of(exposure * market + residual, &stretch(exposure));
+            let both = Legs::of(returned(exposure * market + residual), &stretch(exposure));
             prop_assert!((both.selection() - residual).abs() < 1e-12);
         }
 
@@ -394,14 +404,14 @@ mod tests {
             let stretches = |readings: &[(f64, f64)]| -> Vec<Held> {
                 readings
                     .iter()
-                    .map(|(exposure, market_return)| Held { exposure: NetExposure(*exposure), market_return: *market_return })
+                    .map(|(exposure, market_return)| Held::new(NetExposure(*exposure), returned(*market_return)))
                     .collect()
             };
             let joined: Vec<(f64, f64)> = first.iter().chain(&second).copied().collect();
-            let whole = Legs::of(total, &stretches(&joined)).market();
-            let parts = Legs::of(total, &stretches(&first)).market() + Legs::of(total, &stretches(&second)).market();
+            let whole = Legs::of(returned(total), &stretches(&joined)).market();
+            let parts = Legs::of(returned(total), &stretches(&first)).market() + Legs::of(returned(total), &stretches(&second)).market();
             prop_assert!((whole - parts).abs() < 1e-12);
-            prop_assert_eq!(Legs::of(total, &[]).market(), 0.0);
+            prop_assert_eq!(Legs::of(returned(total), &[]).market(), 0.0);
         }
     }
 }
