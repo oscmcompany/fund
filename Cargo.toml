@@ -37,6 +37,11 @@ parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",
   "snap",
 ] }
+# Draws the synthetic market; no `sys_rng` or `thread_rng`, so every generator is seeded by its caller.
+rand = { version = "0.10.3", default-features = false, features = [
+  "std",
+  "std_rng",
+] }
 reqwest = { version = "0.13.5", default-features = false, features = [
   "rustls",
   "http2",

@@ -1207,6 +1207,7 @@ dependencies = [
  "parquet",
  "proc-macro2",
  "proptest",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

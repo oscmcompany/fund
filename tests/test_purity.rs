@@ -7,11 +7,12 @@ use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// Crates a pure module may name, with `prop` for proptest's prelude alias; adding one is the review.
-const PURE_CRATES: [&str; 10] = [
+const PURE_CRATES: [&str; 11] = [
     "chrono",
     "chrono_tz",
     "proptest",
     "prop",
+    "rand",
     "serde",
     "serde_json",
     "strum",
@@ -22,6 +23,17 @@ const PURE_CRATES: [&str; 10] = [
 
 /// Collections whose default hasher is seeded at random, so their iteration order differs per run.
 const RANDOMLY_SEEDED: [&str; 3] = ["HashMap", "HashSet", "RandomState"];
+
+/// Paths that seed from the operating system's entropy, which a pure module never reaches; its generators are seeded
+/// by the caller.
+const ENTROPY_SOURCES: [&str; 6] = [
+    "new_v4",
+    "rng",
+    "thread_rng",
+    "random",
+    "from_os_rng",
+    "OsRng",
+];
 
 /// The parts of `std` that reach outside the process's memory, `time` among them for its clocks.
 const EFFECTFUL_STD_MODULES: [&str; 8] =
@@ -91,7 +103,10 @@ impl Checker {
             segments.len() > 1,
             segments.last().map(String::as_str),
         ) {
-            (true, _, _) | (false, true, Some("new_v4")) => Some("draws randomness"),
+            (true, _, _) => Some("draws randomness"),
+            (false, true, Some(last)) if ENTROPY_SOURCES.contains(&last) => {
+                Some("draws randomness")
+            }
             (false, true, Some("now")) => Some("reads the clock"),
             _ => None,
         };
@@ -389,6 +404,18 @@ fn test_each_effect_is_named() {
             "draws randomness through `uuid::Uuid::new_v4`",
         ),
         (
+            "fn f() { rand::rng(); }",
+            "draws randomness through `rand::rng`",
+        ),
+        (
+            "fn f() { let _: f64 = rand::random(); }",
+            "draws randomness through `rand::random`",
+        ),
+        (
+            "fn f() { StdRng::from_os_rng(); }",
+            "draws randomness through `StdRng::from_os_rng`",
+        ),
+        (
             "use std::collections::HashMap;",
             "draws randomness through `std::collections::HashMap`",
         ),
@@ -454,6 +481,7 @@ fn test_pure_paths_pass() {
     let cases = [
         source,
         "use super::calendar;",
+        "use rand::SeedableRng; fn f() { rand::rngs::StdRng::seed_from_u64(7); }",
         r##"fn f() { concat!(r#"a "std::fs"#); }"##,
         r#"fn f() { assert!(c == '"' && Vec::<u8>::new().is_empty()); }"#,
         "use std::collections as maps; fn f() { maps::BTreeMap::<u8, u8>::new(); }",
