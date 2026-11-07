@@ -25,7 +25,8 @@ impl Fraction {
     }
 }
 
-/// The L2 penalty on a leaf's value; positive and finite, so a leaf's denominator never vanishes.
+/// The L2 penalty on a fitted weight, a leaf's value or a ridge coefficient; positive and finite, so a leaf's
+/// denominator never vanishes.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Penalty(f64);
 
