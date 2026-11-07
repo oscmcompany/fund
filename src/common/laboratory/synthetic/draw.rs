@@ -43,9 +43,25 @@ impl Seed {
 /// A positive quantity whose logarithm is normal: `median` is its median and `dispersion` the standard deviation of
 /// its logarithm.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "LogNormalFields")]
 pub struct LogNormal {
     median: f64,
     dispersion: f64,
+}
+
+/// A log-normal as stored, read back through `LogNormal::new` so a saved shape is checked as a built one is.
+#[derive(Deserialize)]
+struct LogNormalFields {
+    median: f64,
+    dispersion: f64,
+}
+
+impl TryFrom<LogNormalFields> for LogNormal {
+    type Error = LogNormalRefusal;
+
+    fn try_from(fields: LogNormalFields) -> Result<Self, Self::Error> {
+        Self::new(fields.median, fields.dispersion)
+    }
 }
 
 /// Why a log-normal was refused, with the value read.
@@ -159,6 +175,21 @@ mod tests {
         assert_eq!(
             LogNormal::fit(&[4.0, 0.0]),
             Err(LogNormalRefusal::Reading { value: 0.0 })
+        );
+    }
+
+    #[test]
+    fn test_a_saved_shape_is_checked_as_a_built_one_is() {
+        let shape = LogNormal::new(12.5, 0.75).unwrap();
+        let saved = serde_json::to_string(&shape).unwrap();
+        assert_eq!(saved, r#"{"median":12.5,"dispersion":0.75}"#);
+        assert_eq!(serde_json::from_str::<LogNormal>(&saved).unwrap(), shape);
+        let refused = serde_json::from_str::<LogNormal>(r#"{"median":-1.0,"dispersion":0.0}"#);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("a median of -1 is not finite and positive")
         );
     }
 

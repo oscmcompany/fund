@@ -115,14 +115,25 @@ pub struct Flow {
 }
 
 impl Flow {
-    /// The pieces as the multiplier a `TimeDelta` takes; a flow of more than `i32::MAX` pieces cannot be scheduled.
+    /// The pieces as the multiplier a `TimeDelta` takes; `Market::new` refuses a flow it cannot schedule.
     fn piece_count(self) -> i32 {
-        i32::try_from(self.pieces.get()).expect("a flow has at most i32::MAX pieces")
+        i32::try_from(self.pieces.get()).expect("Market::new refuses a flow it cannot schedule")
+    }
+
+    /// From the first piece to the last, or `None` when the pieces or the span are more than a schedule can count.
+    fn checked_duration(self) -> Option<TimeDelta> {
+        let pieces = i32::try_from(self.pieces.get()).ok()?;
+        // chrono's `checked_mul` can return a delta past `TimeDelta::MAX`, so the bound is checked here.
+        self.spacing
+            .get()
+            .checked_mul(pieces - 1)
+            .filter(|duration| *duration <= TimeDelta::MAX)
     }
 
     /// From the first piece to the last.
     fn duration(self) -> TimeDelta {
-        self.spacing.get() * (self.piece_count() - 1)
+        self.checked_duration()
+            .expect("Market::new refuses a flow it cannot schedule")
     }
 }
 
