@@ -31,6 +31,12 @@ pub enum RidgeRefusal {
     /// Rounding left the penalized system without a positive pivot, as near-collinear inputs at a tiny penalty can.
     #[error("the penalized system's pivot at input {input} is {pivot}")]
     Unsolvable { input: usize, pivot: f64 },
+    /// A solved coefficient that is not finite, as labels near `f64::MAX` against spread inputs give.
+    #[error("the coefficient on input {input} is {value}, not a finite number")]
+    Coefficient { input: usize, value: f64 },
+    /// Finite coefficients whose intercept is not, as a large slope times inputs far from zero gives.
+    #[error("the intercept is {value}, not a finite number")]
+    Intercept { value: f64 },
 }
 
 impl Ridge {
@@ -57,9 +63,14 @@ impl Ridge {
         }
         let count = rows as f64;
         let means: Vec<f64> = (0..width)
-            .map(|input| (0..rows).map(|row| matrix.row(row)[input]).sum::<f64>() / count)
+            .map(|input| {
+                (0..rows)
+                    .map(|row| matrix.row(row)[input] / count)
+                    .sum::<f64>()
+            })
             .collect();
-        let label_mean = labels.iter().map(|label| label.get()).sum::<f64>() / count;
+        // Dividing before summing keeps a mean of finite values finite where their sum would overflow.
+        let label_mean = labels.iter().map(|label| label.get() / count).sum::<f64>();
         let mut gram = vec![0.0; width * width];
         let mut moments = vec![0.0; width];
         for (row, label) in labels.iter().enumerate() {
@@ -86,6 +97,9 @@ impl Ridge {
                 .zip(&means)
                 .map(|(coefficient, mean)| coefficient * mean)
                 .sum::<f64>();
+        if !intercept.is_finite() {
+            return Err(RidgeRefusal::Intercept { value: intercept });
+        }
         Ok(Self {
             intercept,
             coefficients,
@@ -124,7 +138,7 @@ impl Ridge {
 }
 
 /// Solves `system · x = right` by Cholesky for a symmetric `system` stored row-major, refusing when a pivot is not
-/// positive and finite or the solution overflows, since rounding can break the definiteness a penalty promises.
+/// positive and finite, since rounding can break the definiteness a penalty promises, or the solution overflows.
 fn solve_positive_definite(
     mut system: Vec<f64>,
     mut right: Vec<f64>,
@@ -163,9 +177,9 @@ fn solve_positive_definite(
         right[row] = (right[row] - dot) / system[row * width + row];
     }
     match right.iter().position(|value| !value.is_finite()) {
-        Some(input) => Err(RidgeRefusal::Unsolvable {
+        Some(input) => Err(RidgeRefusal::Coefficient {
             input,
-            pivot: system[input * width + input].powi(2),
+            value: right[input],
         }),
         None => Ok(right),
     }
@@ -254,6 +268,48 @@ mod tests {
             Ridge::fit(&sample(&huge, 1, &[1.0, 2.0]), penalty),
             Err(RidgeRefusal::Unsolvable { input: 0, .. })
         ));
+    }
+
+    #[test]
+    fn test_a_fit_whose_intercept_overflows_is_refused() {
+        // Rows 10 and 11, labels 0 and 1e308, penalty 0.5: the slope is 0.5e308 / (0.5 + 0.5) = 5e307 and the
+        // intercept 5e307 - 5e307 × 10.5, past f64::MAX.
+        assert_eq!(
+            Ridge::fit(
+                &sample(&[10.0, 11.0], 1, &[0.0, 1e308]),
+                Penalty::new(0.5).unwrap()
+            ),
+            Err(RidgeRefusal::Intercept {
+                value: f64::NEG_INFINITY
+            })
+        );
+    }
+
+    #[test]
+    fn test_labels_whose_sum_overflows_still_fit() {
+        // Labels 1e308 twice sum past f64::MAX, yet their mean is 1e308 and every centered label is zero.
+        let ridge = Ridge::fit(
+            &sample(&[1.0, 2.0], 1, &[1e308, 1e308]),
+            Penalty::new(0.5).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ridge.coefficients(), &[0.0]);
+        assert_eq!(ridge.intercept(), 1e308);
+    }
+
+    #[test]
+    fn test_a_fit_whose_coefficient_overflows_is_refused() {
+        // Centered rows -5 and 5 against labels -1e308 and 1e308: each moment term is 5e308, past f64::MAX.
+        assert_eq!(
+            Ridge::fit(
+                &sample(&[0.0, 10.0], 1, &[-1e308, 1e308]),
+                Penalty::new(0.5).unwrap()
+            ),
+            Err(RidgeRefusal::Coefficient {
+                input: 0,
+                value: f64::INFINITY
+            })
+        );
     }
 
     #[test]
