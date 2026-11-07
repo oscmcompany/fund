@@ -157,7 +157,8 @@ mod tests {
     use chrono::TimeDelta;
 
     use crate::common::book::{Fill, Position, Side};
-    use crate::common::laboratory::ledger::{Borrow, Ledger, Leverage};
+    use crate::common::laboratory::ledger::{Ledger, Leverage};
+    use crate::common::market::borrow::Borrow;
     use crate::common::market::{DollarVolume, Shares};
     use crate::common::risk::Limits;
     use crate::common::time::calendar::SessionPhase;

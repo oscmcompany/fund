@@ -1,5 +1,5 @@
-//! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session, and its
-//! published trading calendar.
+//! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session, its
+//! published trading calendar, and its asset listing's short-sale flags.
 
 pub mod corporate_actions;
 
@@ -11,9 +11,10 @@ use tokio::sync::mpsc::Sender;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{
-    OneSidedQuote, ParseRefusal, PrintOrigin, QuoteOrigin, RefusedRow, RowRefusal, Secret,
+    Fetched, OneSidedQuote, ParseRefusal, PrintOrigin, QuoteOrigin, RefusedRow, RowRefusal, Secret,
     VariableRefusal, priced_side, variable,
 };
+use crate::common::market::borrow::BorrowFlags;
 use crate::common::market::record::Quote;
 use crate::common::market::trade_bars::{ConditionLetter, Correction, Print, Tape};
 use crate::common::market::{Price, Shares, Symbol};
@@ -144,6 +145,38 @@ impl Alpaca {
         .await?;
         parse_calendar(&body, range)
     }
+
+    /// Every active US equity's short-sale flags as of now, from one response of the asset listing.
+    pub async fn borrow_flags(&self) -> Fetched<BorrowFlagsRead> {
+        let url = format!("{}/v2/assets", self.account.trading_url());
+        let body = with_retries(|| {
+            send(
+                self.credentials
+                    .sign(self.http_client.get(&url))
+                    .query(&[("status", "active"), ("asset_class", "us_equity")]),
+            )
+        })
+        .await;
+        match body {
+            Ok(body) => Fetched::new(parse_borrow_flags(&body), vec![body]),
+            Err(error) => Fetched::new(Err(error), Vec::new()),
+        }
+    }
+}
+
+/// One active asset's short-sale flags; the listing carries more fields, which the archive keeps raw.
+#[derive(Deserialize)]
+struct AssetRow {
+    symbol: String,
+    shortable: bool,
+    easy_to_borrow: bool,
+}
+
+/// The asset listing as read: each asset's flags, and every row whose symbol did not read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BorrowFlagsRead {
+    pub flags: Vec<BorrowFlags>,
+    pub refused: Vec<RefusedRow>,
 }
 
 #[derive(Deserialize)]
@@ -673,6 +706,29 @@ fn account(is_paper: String) -> Result<Account, VariableRefusal> {
     }
 }
 
+/// The listing's rows, a row whose symbol does not read refused rather than dropped; a body that is not the listing is
+/// malformed.
+fn parse_borrow_flags(body: &[u8]) -> Result<BorrowFlagsRead, FetchError> {
+    let rows: Vec<AssetRow> =
+        serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
+            reason: error.to_string(),
+        })?;
+    let mut read = BorrowFlagsRead::default();
+    for row in rows {
+        match Symbol::new(&row.symbol) {
+            Ok(symbol) => {
+                read.flags
+                    .push(BorrowFlags::new(symbol, row.shortable, row.easy_to_borrow))
+            }
+            Err(cause) => read.refused.push(RefusedRow {
+                ticker: row.symbol,
+                cause: RowRefusal::Symbol(cause),
+            }),
+        }
+    }
+    Ok(read)
+}
+
 fn parse_calendar(body: &[u8], range: SessionRange) -> Result<TradingCalendar, FetchError> {
     let malformed = |reason: String| FetchError::Malformed { reason };
     let rows: Vec<CalendarRow> =
@@ -772,6 +828,41 @@ mod tests {
         assert_eq!(tokens.next(&page(None)), Ok(None));
         assert!(matches!(
             tokens.next(b"<html>"),
+            Err(FetchError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_the_asset_listing_reads_its_borrow_flags_and_refuses_an_unreadable_symbol() {
+        // Rows shaped as the live listing sends them (probed 2026-11-07), with synthetic names and values.
+        let row = |symbol: &str, shortable: bool, easy: bool| {
+            format!(
+                r#"{{"id":"e3d28abe-4e29-408d-8cc1-356777ae3c8a","class":"us_equity","exchange":"NASDAQ","symbol":"{symbol}","name":"Example","status":"active","tradable":true,"marginable":true,"maintenance_margin_requirement":30,"margin_requirement_long":"50","margin_requirement_short":"50","shortable":{shortable},"easy_to_borrow":{easy},"borrow_status":"easy_to_borrow","fractionable":true,"attributes":[]}}"#
+            )
+        };
+        let body = format!(
+            "[{},{},{}]",
+            row("AAA", true, true),
+            row("BB.A", false, true),
+            row("bad-1", true, false)
+        );
+        let read = parse_borrow_flags(body.as_bytes()).unwrap();
+        assert_eq!(
+            read.flags,
+            [
+                BorrowFlags::new(Symbol::new("AAA").unwrap(), true, true),
+                BorrowFlags::new(Symbol::new("BB.A").unwrap(), false, true),
+            ]
+        );
+        assert_eq!(
+            read.refused,
+            [RefusedRow {
+                ticker: "bad-1".to_string(),
+                cause: RowRefusal::Symbol(Symbol::new("bad-1").unwrap_err()),
+            }]
+        );
+        assert!(matches!(
+            parse_borrow_flags(b"{}"),
             Err(FetchError::Malformed { .. })
         ));
     }
@@ -1178,6 +1269,32 @@ mod tests {
             outcome,
             AlpacaTradeOutcome::Refused(row) if *row.cause() == RowRefusal::Unrequested
         )));
+    }
+
+    #[tokio::test]
+    #[ignore = "reads Alpaca's asset listing; run deliberately under secretspec"]
+    async fn live_the_asset_listing_reads_whole() {
+        let alpaca = Alpaca::from_environment(reqwest::Client::new()).unwrap();
+        let (read, bodies) = alpaca.borrow_flags().await.into_parts();
+        let read = read.unwrap();
+        assert_eq!(bodies.len(), 1);
+        // About 14,000 active assets on 2026-11-07, every symbol reading, a third of them borrowable.
+        assert!(read.flags.len() > 10_000, "{}", read.flags.len());
+        assert!(read.refused.is_empty(), "{:?}", read.refused);
+        let available = read
+            .flags
+            .iter()
+            .filter(|flags| {
+                matches!(
+                    flags.borrow(),
+                    crate::common::market::borrow::Borrow::Available
+                )
+            })
+            .count();
+        assert!(
+            available > 3_000 && available < read.flags.len(),
+            "{available}"
+        );
     }
 
     /// Two adjacent minutes of the 2026-10-12 open hold exactly the trades of the two-minute window, every field

@@ -41,12 +41,14 @@ pub enum Subscription {
     StocksStarter,
     /// EDGAR's public filings, which need no account.
     EdgarPublic,
+    /// Alpaca's trading API, which any brokerage account reads, such as its asset listing.
+    BrokerageAccount,
 }
 
 impl Subscription {
     pub fn provider(self) -> Provider {
         match self {
-            Self::AlgoTraderPlus => Provider::Alpaca,
+            Self::AlgoTraderPlus | Self::BrokerageAccount => Provider::Alpaca,
             Self::StocksAdvanced | Self::StocksStarter => Provider::Massive,
             Self::EdgarPublic => Provider::Sec,
         }

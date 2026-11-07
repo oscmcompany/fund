@@ -248,6 +248,11 @@ SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=massive/tab
 CREATE OR REPLACE VIEW series_boundaries AS
 SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/');
 
+-- Each nightly snapshot of whether every active asset was shortable and easy to borrow, as Alpaca listed it after the
+-- session's close; a session trades on the snapshot dated before it.
+CREATE OR REPLACE VIEW borrow_flags AS
+SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=alpaca/table=borrow_flags/');
+
 -- Every producer's journal, the hosts' and the operator's, one row per line; `payload` is JSON text for `json_extract`.
 CREATE OR REPLACE VIEW journal AS
 SELECT * FROM sessions('profile_bucket', 'records/journal/producer=*/');

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::common::market::record::BarInterval;
@@ -43,6 +43,8 @@ pub enum Leg {
     SecFiledIndustryCodes,
     MassiveSplits,
     AlpacaSeriesBoundaries,
+    /// A snapshot only of the night it runs, since the listing answers for now and a missed night cannot be fetched.
+    AlpacaBorrowFlags,
     AlpacaQuotes,
     AlpacaTrades,
 }
@@ -70,6 +72,7 @@ impl Leg {
             Self::SecFiledIndustryCodes => snapshot(sec_filed_industry_codes(session)),
             Self::MassiveSplits => snapshot(massive_splits(session)),
             Self::AlpacaSeriesBoundaries => snapshot(alpaca_series_boundaries(session)),
+            Self::AlpacaBorrowFlags => snapshot(alpaca_borrow_flags(session)),
         }
     }
 
@@ -87,7 +90,9 @@ impl Leg {
             Self::MassiveTradedSymbols | Self::AlpacaQuotes | Self::AlpacaTrades => {
                 Ok(window.sessions().to_vec())
             }
-            Self::MassiveSplits | Self::AlpacaSeriesBoundaries => Ok(vec![window.last()]),
+            Self::MassiveSplits | Self::AlpacaSeriesBoundaries | Self::AlpacaBorrowFlags => {
+                Ok(vec![window.last()])
+            }
             Self::MassiveSecurityDetails | Self::SecFiledIndustryCodes => {
                 quarter_opening(calendar, window.last()).map(|opening| vec![opening])
             }
@@ -129,6 +134,41 @@ pub fn massive_splits(session: SessionDate) -> ReferenceKey {
 
 pub fn alpaca_series_boundaries(session: SessionDate) -> ReferenceKey {
     ReferenceKey::new(Provider::Alpaca, ReferenceTable::SeriesBoundaries, session)
+}
+
+pub fn alpaca_borrow_flags(session: SessionDate) -> ReferenceKey {
+    ReferenceKey::new(Provider::Alpaca, ReferenceTable::BorrowFlags, session)
+}
+
+/// Why a listing that answers only for now cannot be dated by a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Lapse {
+    /// The fetch reached the next session's open.
+    #[error("the next session opened at {next_open}")]
+    Opened { next_open: DateTime<Utc> },
+    /// The calendar names no session after it, so whether one has opened cannot be told.
+    #[error("the calendar names no later session through {covered_through}")]
+    Unscheduled { covered_through: SessionDate },
+}
+
+/// Refuses a listing fetched at `fetched_at` as `session`'s once the next session has opened, or when the calendar
+/// cannot say when that is.
+pub fn lapsed(
+    calendar: &TradingCalendar,
+    session: SessionDate,
+    fetched_at: DateTime<Utc>,
+) -> Result<(), Lapse> {
+    let next_open = calendar
+        .next_trading_day(session)
+        .and_then(|next| calendar.session(next))
+        .map(|next| next.hours().0)
+        .ok_or(Lapse::Unscheduled {
+            covered_through: calendar.range().last(),
+        })?;
+    match fetched_at >= next_open {
+        true => Err(Lapse::Opened { next_open }),
+        false => Ok(()),
+    }
 }
 
 /// Why a leg's sessions could not be read off the calendar.
@@ -205,6 +245,9 @@ pub enum PartitionFailureKind {
     Tee,
     /// A write the partition needed went unrecorded, which stops the run.
     Journal,
+    /// A listing that answers only for now was fetched after the next session opened, so it no longer describes the
+    /// close it would be dated by.
+    Lapsed,
 }
 
 /// How one owed session ended.
@@ -293,11 +336,15 @@ pub fn calendar_range(today: SessionDate, sessions: NonZeroUsize) -> SessionRang
         .reaching_back_to(today.plus_calendar_days(-days))
 }
 
+/// Calendar days past `today` a run fetches, so [`lapsed`] can find the session after the window's last.
+const NEXT_SESSION_REACH_DAYS: i64 = 10;
+
 /// The calendar days a run fetches: `calendar_range` reaching back to its first day's quarter start, which no window
-/// drawn from it can end before, so [`Leg::keeps`] can always find that quarter's opening.
+/// drawn from it can end before, so [`Leg::keeps`] can always find that quarter's opening, and forward past `today`.
 pub fn fetched_range(today: SessionDate, sessions: NonZeroUsize) -> SessionRange {
     let range = calendar_range(today, sessions);
-    range.reaching_back_to(quarter_start(range.first()))
+    SessionRange::single(today.plus_calendar_days(NEXT_SESSION_REACH_DAYS))
+        .reaching_back_to(quarter_start(range.first()))
 }
 
 /// The last `sessions` trading days strictly before `today`, oldest first; today is never owed, since its session
@@ -889,6 +936,7 @@ mod tests {
                 r#""fold""#,
                 r#""tee""#,
                 r#""journal""#,
+                r#""lapsed""#,
             ]
         );
     }
@@ -905,6 +953,45 @@ mod tests {
             })
             .collect();
         assert_eq!(names, [r#""not_a_key""#, r#""another_series""#]);
+    }
+
+    #[test]
+    fn test_a_listing_lapses_when_the_next_session_opens() {
+        // Friday 2026-11-06 and Monday 2026-11-09; the Monday open is 14:30 UTC, after the change back from daylight time.
+        let sessions = ["2026-11-06", "2026-11-09"]
+            .map(|day| {
+                TradingSession::new(
+                    date(day),
+                    "09:30:00".parse().unwrap(),
+                    "16:00:00".parse().unwrap(),
+                )
+                .unwrap()
+            })
+            .to_vec();
+        let range = SessionRange::new(date("2026-11-06"), date("2026-11-09")).unwrap();
+        let calendar = TradingCalendar::new(sessions, range).unwrap();
+        let at = |instant: &str| instant.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            lapsed(&calendar, date("2026-11-06"), at("2026-11-07T03:00:00Z")),
+            Ok(())
+        );
+        assert_eq!(
+            lapsed(&calendar, date("2026-11-06"), at("2026-11-09T14:29:59Z")),
+            Ok(())
+        );
+        assert_eq!(
+            lapsed(&calendar, date("2026-11-06"), at("2026-11-09T14:30:00Z")),
+            Err(Lapse::Opened {
+                next_open: at("2026-11-09T14:30:00Z")
+            })
+        );
+        // With no later session in the calendar, whether one has opened cannot be told, so the listing is refused.
+        assert_eq!(
+            lapsed(&calendar, date("2026-11-09"), at("2026-11-10T03:00:00Z")),
+            Err(Lapse::Unscheduled {
+                covered_through: date("2026-11-09")
+            })
+        );
     }
 
     #[test]
@@ -925,6 +1012,8 @@ mod tests {
                 "data/equity/stage=raw/reference/provider=massive/table=splits/",
                 "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/",
                 "data/equity/stage=raw/reference/provider=alpaca/table=series_boundaries/",
+                "data/equity/stage=parsed/reference/provider=alpaca/table=borrow_flags/",
+                "data/equity/stage=raw/reference/provider=alpaca/table=borrow_flags/",
                 "data/equity/stage=parsed/quotes/provider=alpaca/interval=one_day/",
                 "data/equity/stage=raw/quotes/provider=alpaca/",
                 "data/equity/stage=parsed/trades/provider=alpaca/interval=one_day/",
@@ -976,11 +1065,23 @@ mod tests {
         let range = fetched_range(today, sessions(5));
         assert_eq!(
             range,
-            SessionRange::new(date("2026-10-01"), date("2027-01-03")).unwrap()
+            SessionRange::new(date("2026-10-01"), date("2027-01-14")).unwrap()
         );
-        let fetched = calendar("2026-10-01", "2027-01-03", &["2026-12-25", "2027-01-01"]);
+        let fetched = calendar("2026-10-01", "2027-01-14", &["2026-12-25", "2027-01-01"]);
         let drawn = window(&fetched, today, sessions(5)).unwrap();
         assert_eq!(drawn.last(), date("2026-12-31"));
+        // The window's last session finds its successor, so a run on today's session after the open is refused.
+        let at = |instant: &str| instant.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            lapsed(&fetched, drawn.last(), at("2027-01-04T08:00:00Z")),
+            Ok(())
+        );
+        assert_eq!(
+            lapsed(&fetched, drawn.last(), at("2027-01-04T15:00:00Z")),
+            Err(Lapse::Opened {
+                next_open: at("2027-01-04T14:30:00Z")
+            })
+        );
         assert_eq!(
             Leg::MassiveSecurityDetails.keeps(&drawn, &fetched),
             Ok(vec![date("2026-10-01")])
