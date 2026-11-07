@@ -29,8 +29,7 @@ impl RiskFree {
         &self.rates
     }
 
-    /// The source, the instant it was read and the digest of the response, which also names its note, for an
-    /// experiment's parameters.
+    /// The source and the digest of the response, which also names its note, for an experiment's parameters.
     pub fn settings(&self) -> &[(String, String)] {
         &self.settings
     }

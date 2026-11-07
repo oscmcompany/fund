@@ -48,6 +48,12 @@ pub struct Massive {
 /// The most days one Treasury request asks for, past the whole series since 1962, so it always answers in one page.
 const TREASURY_DAYS_AT_MOST: &str = "50000";
 
+/// The first day the 3-month yield was published, as the live series shows; earlier days carry none.
+const THREE_MONTH_SERIES_BEGAN: NaiveDate = match NaiveDate::from_ymd_opt(1981, 9, 1) {
+    Some(date) => date,
+    None => panic!("the series began on a real date"),
+};
+
 #[derive(Deserialize)]
 struct TreasuryResponse {
     #[serde(default)]
@@ -722,8 +728,8 @@ pub fn massive_ticker(symbol: &Symbol) -> String {
     }
 }
 
-/// The days with a 3-month yield; a further page, a day repeated, a yield out of range or one missing after the
-/// series began refuses the whole response, since a dropped day would silently lend its neighbour's rate.
+/// The days with a 3-month yield; a further page, a day repeated, a yield out of range or one missing on or after
+/// `THREE_MONTH_SERIES_BEGAN` refuses the whole response, since a dropped day would silently lend its neighbour's rate.
 fn parse_treasury_yields(body: &[u8]) -> Result<BTreeMap<NaiveDate, AnnualYield>, FetchError> {
     let malformed = |reason: String| FetchError::Malformed { reason };
     let response: TreasuryResponse =
@@ -738,7 +744,7 @@ fn parse_treasury_yields(body: &[u8]) -> Result<BTreeMap<NaiveDate, AnnualYield>
     let mut yields = BTreeMap::new();
     for row in rows {
         let date = row.date;
-        match (row.yield_3_month, yields.is_empty()) {
+        match (row.yield_3_month, date < THREE_MONTH_SERIES_BEGAN) {
             (None, true) => {}
             (None, false) => return Err(malformed(format!("{date}: no 3-month yield"))),
             (Some(percent), _) => {
@@ -1140,6 +1146,15 @@ mod tests {
             ),
             body(
                 &[row("2026-11-05", "4.17"), row("2026-11-05", "4.18")],
+                "null",
+            ),
+            // A day missing its yield is refused even when it opens the response, once the series has begun.
+            body(
+                &[row("2026-11-04", "null"), row("2026-11-05", "4.17")],
+                "null",
+            ),
+            body(
+                &[row("1981-09-01", "null"), row("1981-09-02", "16.95")],
                 "null",
             ),
         ];
