@@ -90,6 +90,13 @@ pub enum GenerationRefusal {
         previous: SessionDate,
         next: SessionDate,
     },
+    /// More pieces, or a longer span from first to last, than a schedule can count.
+    #[error("a {kind} flow of {pieces} pieces {spacing} apart is more than can be scheduled")]
+    Unschedulable {
+        kind: MechanismKind,
+        pieces: u32,
+        spacing: TimeDelta,
+    },
     /// A flow's pieces need at least the window's length, so no start fits inside it.
     #[error("a {kind} flow lasting {duration} does not fit in its window")]
     FlowOutlastsWindow {
@@ -153,10 +160,21 @@ struct Path {
     spread_ticks: f64,
     trade_size: f64,
     quote_size: f64,
-    /// The name's own log return to date, permanent impact included.
+    /// The name's own diffused log return to date.
     level: f64,
+    /// The permanent planted impact to date, in log price.
+    impact: f64,
     impulses: Vec<Impulse>,
-    standing: Option<Quote>,
+    standing: Option<Standing>,
+}
+
+/// The quote a name stands at, with what a planted piece re-quotes it from.
+struct Standing {
+    quote: Quote,
+    /// The spread in ticks of the quote's grid.
+    ticks: i64,
+    /// The log return the quote was placed at, the market's included and planted impact left out.
+    background: f64,
 }
 
 /// One name: its path, and the streams it draws from; the background tape and each mechanism draw from their own,
@@ -176,23 +194,16 @@ enum Event {
 }
 
 impl Path {
-    fn midpoint(&self, at: DateTime<Utc>, market: &MarketPath) -> f64 {
+    /// The midpoint at `at` of a `background` log return with the planted impact laid on it.
+    fn midpoint(&self, at: DateTime<Utc>, background: f64) -> f64 {
         let transient: f64 = self.impulses.iter().map(|impulse| impulse.at(at)).sum();
-        let logarithm = self.level + self.beta * market.level(at) + transient;
+        let logarithm = background + self.impact + transient;
         (self.opening_price * logarithm.exp()).min(HIGHEST_MIDPOINT_DOLLARS)
     }
 
     /// Quotes around the midpoint at `at`, the spread and sizes drawn from `generator`, and stands the quote.
     fn quote(&mut self, at: DateTime<Utc>, market: &MarketPath, generator: &mut StdRng) -> Quote {
-        let midpoint = self.midpoint(at, market);
         let ticks = 1 + exponential(generator, self.spread_ticks - 1.0).round() as i64;
-        let subpenny_ask = midpoint * PRICE_SCALE as f64 + (ticks * SUBPENNY) as f64 / 2.0;
-        let tick = match subpenny_ask >= PRICE_SCALE as f64 {
-            true => CENT,
-            false => SUBPENNY,
-        };
-        let below = midpoint * PRICE_SCALE as f64 - (ticks * tick) as f64 / 2.0;
-        let bid = ((below / tick as f64).floor() as i64 * tick).max(tick);
         let mut lots = || {
             let lots = (exponential(generator, self.quote_size) / 100.0)
                 .round()
@@ -200,26 +211,56 @@ impl Path {
             Shares::whole(lots as u64 * 100).expect("a drawn quote size fits")
         };
         let (bid_size, ask_size) = (lots(), lots());
+        let background = self.level + self.beta * market.level(at);
+        self.stand(at, background, ticks, bid_size, ask_size)
+    }
+
+    /// Re-quotes the standing quote's spread, sizes and background at `at`, so only planted impact moves it and a
+    /// planted piece of no strength leaves the background tape's prices as they were.
+    fn requote(&mut self, at: DateTime<Utc>) -> Quote {
+        let standing = self
+            .standing
+            .as_ref()
+            .expect("a session opens with a quote");
+        let (ticks, background) = (standing.ticks, standing.background);
+        let (bid_size, ask_size) = (standing.quote.bid_size(), standing.quote.ask_size());
+        self.stand(at, background, ticks, bid_size, ask_size)
+    }
+
+    fn stand(
+        &mut self,
+        at: DateTime<Utc>,
+        background: f64,
+        ticks: i64,
+        bid_size: Shares,
+        ask_size: Shares,
+    ) -> Quote {
+        let (bid, ask) = place(self.midpoint(at, background), ticks);
         let quote = Quote::new(
             self.symbol.clone(),
             at,
             Price::from_ticks(bid)
                 .expect("the bid is a tick above zero and below the highest midpoint"),
-            Price::from_ticks(bid + ticks * tick).expect("the ask is inside a price's range"),
+            Price::from_ticks(ask).expect("the ask is inside a price's range"),
             bid_size,
             ask_size,
         )
         .expect("the ask is above the bid");
-        self.standing = Some(quote.clone());
+        self.standing = Some(Standing {
+            quote: quote.clone(),
+            ticks,
+            background,
+        });
         quote
     }
 
     /// A print of a drawn size against the standing quote's `side`.
     fn print(&self, at: DateTime<Utc>, side: Side, generator: &mut StdRng) -> Print {
-        let standing = self
+        let standing = &self
             .standing
             .as_ref()
-            .expect("a session opens with a quote");
+            .expect("a session opens with a quote")
+            .quote;
         let price = match side {
             Side::Buy => standing.ask(),
             Side::Sell => standing.bid(),
@@ -259,6 +300,7 @@ impl Name {
                 trade_size,
                 quote_size,
                 level: 0.0,
+                impact: 0.0,
                 impulses: Vec::new(),
                 standing: None,
             },
@@ -396,14 +438,32 @@ impl Name {
                             amplitude,
                             half_life_seconds: half_life.seconds(),
                         }),
-                        None => self.path.level += amplitude,
+                        None => self.path.impact += amplitude,
                     }
-                    generated
-                        .quotes
-                        .push(self.path.quote(at, market, generator));
+                    generated.quotes.push(self.path.requote(at));
                 }
             }
         }
+        // Diffuses through the close, so a name's daily variance does not shrink with how sparsely it trades.
+        self.path.level += self.path.volatility_per_root_second
+            * (close - last_background).as_seconds_f64().sqrt()
+            * standard_normal(&mut self.background);
+    }
+}
+
+/// The bid and ask in price ticks `ticks` apart around `midpoint` dollars: on the subpenny grid when the ask stays
+/// below a dollar, and on the cent grid otherwise, as Reg NMS sets the quoting grid; the bid is at least one tick.
+fn place(midpoint: f64, ticks: i64) -> (i64, i64) {
+    let on = |tick: i64| {
+        let below = midpoint * PRICE_SCALE as f64 - (ticks * tick) as f64 / 2.0;
+        let bid = ((below / tick as f64).floor() as i64 * tick).max(tick);
+        (bid, bid + ticks * tick)
+    };
+    let (bid, ask) = on(SUBPENNY);
+    if ask < PRICE_SCALE {
+        (bid, ask)
+    } else {
+        on(CENT)
     }
 }
 
@@ -464,7 +524,13 @@ impl Market {
 /// Refuses a mechanism whose pieces cannot all land inside every session.
 fn check(mechanism: &Mechanism, sessions: &[TradingSession]) -> Result<(), GenerationRefusal> {
     let kind = mechanism.kind();
-    let duration = mechanism.flow().duration();
+    let flow = mechanism.flow();
+    let unschedulable = || GenerationRefusal::Unschedulable {
+        kind,
+        pieces: flow.pieces.get(),
+        spacing: flow.spacing.get(),
+    };
+    let duration = flow.checked_duration().ok_or_else(unschedulable)?;
     let window = |window: &Window| match duration < window.to() - window.from() {
         true => Ok(()),
         false => Err(GenerationRefusal::FlowOutlastsWindow { kind, duration }),
@@ -487,7 +553,10 @@ fn check(mechanism: &Mechanism, sessions: &[TradingSession]) -> Result<(), Gener
             }
         }
         Mechanism::ClosingFlow { flow, .. } => {
-            let needs = duration + flow.spacing.get();
+            let needs = duration
+                .checked_add(&flow.spacing.get())
+                .filter(|needs| *needs <= TimeDelta::MAX)
+                .ok_or_else(unschedulable)?;
             match sessions
                 .iter()
                 .find(|session| session.close() - session.open() < needs)
@@ -554,7 +623,7 @@ mod tests {
 
     use super::super::draw::{LogNormal, Seed};
     use super::super::tests::{flow, shapes, window};
-    use super::super::{Shapes, Span, Volatility};
+    use super::super::{Flow, Shapes, Span, Volatility};
     use super::*;
 
     fn trading_session(date: &str, close: &str) -> TradingSession {
@@ -889,6 +958,88 @@ mod tests {
     }
 
     #[test]
+    fn test_a_planted_flow_of_no_strength_leaves_the_background_prices_alone() {
+        // A moving market and many pieces, so a requote that tracked the market between quotes would show.
+        let treatment = specification(
+            Shapes {
+                market_volatility: Volatility::new(0.2).unwrap(),
+                ..shapes()
+            },
+            vec![Mechanism::WorkedParent {
+                flow: flow(0.0, 1.0, 200, 30),
+                window: window("10:00:00", "14:00:00"),
+            }],
+        );
+        let planted = generate(&treatment, &["AAA", "BBB"]);
+        let null = generate(&treatment.null(), &["AAA", "BBB"]);
+        for (planted, null) in planted.iter().zip(&null) {
+            let pieces: Vec<(DateTime<Utc>, &Symbol)> = planted
+                .planted()
+                .iter()
+                .flat_map(|planted| {
+                    (0..200).map(move |piece| {
+                        (
+                            planted.first + TimeDelta::seconds(30) * piece,
+                            &planted.symbol,
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(pieces.len(), 400);
+            let background: Vec<&Print> = planted
+                .prints()
+                .iter()
+                .filter(|print| !pieces.contains(&(print.timestamp(), print.symbol())))
+                .collect();
+            assert_eq!(planted.prints().len() - background.len(), 400);
+            assert_eq!(background, null.prints().iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn test_a_sparse_name_still_carries_its_daily_volatility() {
+        let sparse = Shapes {
+            volatility: LogNormal::new(0.02, 0.0).unwrap(),
+            market_volatility: Volatility::new(0.0).unwrap(),
+            trades_per_minute: LogNormal::new(1e-9, 0.0).unwrap(),
+            quotes_per_minute: LogNormal::new(1e-9, 0.0).unwrap(),
+            ..shapes()
+        };
+        let first = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let sessions: Vec<TradingSession> = (0..400)
+            .map(|day| {
+                let date = (first + chrono::Days::new(day)).to_string();
+                trading_session(&date, "16:00:00")
+            })
+            .collect();
+        let openings: Vec<f64> = Market::new(
+            &specification(sparse, Vec::new()),
+            &universe(&["AAA"]),
+            &sessions,
+        )
+        .unwrap()
+        .map(|session| midpoint(&session.quotes()[0]).ln())
+        .collect();
+        let changes: Vec<f64> = openings.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let deviation = (changes.iter().map(|change| change.powi(2)).sum::<f64>()
+            / changes.len() as f64)
+            .sqrt();
+        // 399 daily changes of a 2% walk, quoted on a cent grid near $100.
+        assert!((deviation - 0.02).abs() < 0.003, "{deviation}");
+    }
+
+    #[test]
+    fn test_a_quote_whose_subpenny_ask_reaches_a_dollar_moves_to_the_cent_grid() {
+        // A $0.01 midpoint 10,000 subpenny ticks wide would floor its bid to $0.0001 and ask $1.0001.
+        assert_eq!(place(0.01, 10_000), (10_000, 100_010_000));
+        assert_eq!(place(0.50, 2), (499_900, 500_100));
+        assert_eq!(place(0.99985, 2), (999_700, 999_900));
+        // A subpenny ask landing on exactly a dollar is no longer below it.
+        assert_eq!(place(0.99995, 2), (980_000, 1_000_000));
+        assert_eq!(place(25.0, 3), (24_980_000, 25_010_000));
+    }
+
+    #[test]
     fn test_a_market_that_cannot_hold_its_mechanisms_is_refused() {
         let half_day = vec![trading_session("2026-11-27", "13:00:00")];
         let refuse = |mechanisms: Vec<Mechanism>, symbols: &[&str], sessions: &[TradingSession]| {
@@ -929,6 +1080,33 @@ mod tests {
                 session: half_day[0].date(),
                 from: "10:00:00".parse().unwrap(),
                 to: "14:00:00".parse().unwrap(),
+            })
+        );
+        let countless = Mechanism::WorkedParent {
+            flow: flow(10.0, 1.0, 1 << 31, 1),
+            window: window("10:00:00", "11:00:00"),
+        };
+        assert_eq!(
+            refuse(vec![countless], &["AAA"], &sessions()),
+            Some(GenerationRefusal::Unschedulable {
+                kind: MechanismKind::WorkedParent,
+                pieces: 1 << 31,
+                spacing: TimeDelta::seconds(1),
+            })
+        );
+        let lasting = Mechanism::WorkedParent {
+            flow: Flow {
+                spacing: Span::new(TimeDelta::MAX).unwrap(),
+                ..flow(10.0, 1.0, 3, 1)
+            },
+            window: window("10:00:00", "11:00:00"),
+        };
+        assert_eq!(
+            refuse(vec![lasting], &["AAA"], &sessions()),
+            Some(GenerationRefusal::Unschedulable {
+                kind: MechanismKind::WorkedParent,
+                pieces: 3,
+                spacing: TimeDelta::MAX,
             })
         );
         let closing = Mechanism::ClosingFlow {
