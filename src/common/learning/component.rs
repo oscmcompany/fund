@@ -195,10 +195,17 @@ fn record_predictions(predictions: &[Prediction], diagnostics: &mut Diagnostics)
         (predictions.len() - defined.len()) as f64,
     );
     if !defined.is_empty() {
-        diagnostics.record(
-            "mean_prediction",
-            defined.iter().sum::<f64>() / defined.len() as f64,
-        );
+        diagnostics.record("mean_prediction", mean(&defined));
+    }
+}
+
+/// The mean of finite `values`, summing each share of the mean where the plain sum would overflow.
+fn mean(values: &[f64]) -> f64 {
+    let count = values.len() as f64;
+    let total: f64 = values.iter().sum();
+    match total.is_finite() {
+        true => total / count,
+        false => values.iter().map(|value| value / count).sum(),
     }
 }
 
@@ -212,12 +219,11 @@ impl<'a> Component<Matrix<'a>> for Ridge {
         diagnostics: &mut Diagnostics,
     ) -> Result<Vec<Prediction>, WidthError> {
         let predictions = self.predict(&input)?;
+        // `hypot` scales as it goes, so a coefficient whose square overflows still has a finite norm.
         let norm = self
             .coefficients()
             .iter()
-            .map(|coefficient| coefficient.powi(2))
-            .sum::<f64>()
-            .sqrt();
+            .fold(0.0_f64, |norm, coefficient| norm.hypot(*coefficient));
         diagnostics.record("coefficient_norm", norm);
         record_predictions(&predictions, diagnostics);
         Ok(predictions)
@@ -247,7 +253,7 @@ mod tests {
     use super::*;
     use crate::common::learning::boosting::ensemble::{Settings, Stopping};
     use crate::common::learning::boosting::{Fraction, Penalty};
-    use crate::common::learning::loss::Loss;
+    use crate::common::learning::loss::{Loss, Score};
     use crate::common::learning::matrix::Sample;
     use crate::common::monoid::Sequential;
 
@@ -417,7 +423,7 @@ mod tests {
         let matrix = Matrix::new(&values, NonZeroUsize::MIN).unwrap();
         let sample = Sample::new(matrix, &labels, Loss::SquaredError).unwrap();
         let settings = Settings {
-            leaves: NonZeroUsize::new(4).unwrap(),
+            leaves: NonZeroUsize::MIN,
             learning_rate: Fraction::new(0.5).unwrap(),
             minimum_rows_per_leaf: NonZeroUsize::new(2).unwrap(),
             input_fraction: Fraction::new(1.0).unwrap(),
@@ -433,21 +439,40 @@ mod tests {
         )
         .unwrap();
         let mut diagnostics = Diagnostics::default();
-        let predictions = booster.apply(matrix, &mut diagnostics).unwrap();
-        let mean = predictions
-            .iter()
-            .map(|prediction| prediction.get())
-            .sum::<f64>()
-            / 20.0;
+        booster.apply(matrix, &mut diagnostics).unwrap();
+        // The base is the mean label, 3 × 9.5 = 28.5, and a one-leaf tree fits the residuals' mean, which is zero, so
+        // every row predicts 28.5.
         assert_eq!(
             diagnostics.readings(),
             [
                 ("rounds".to_string(), 3.0),
                 ("rows".to_string(), 20.0),
                 ("undefined_predictions".to_string(), 0.0),
-                ("mean_prediction".to_string(), mean),
+                ("mean_prediction".to_string(), 28.5),
             ]
         );
+    }
+
+    #[test]
+    fn test_readings_stay_finite_where_a_square_or_a_sum_would_overflow() {
+        // Inputs -1 and 1, labels ∓1e155, penalty 2: the slope is Σxy / (Σx² + λ) = 2e155 / 4 = 5e154.
+        let matrix = Matrix::new(&[-1.0, 1.0], NonZeroUsize::MIN).unwrap();
+        let sample = Sample::new(matrix, &[-1e155, 1e155], Loss::SquaredError).unwrap();
+        let ridge = Ridge::fit(&sample, Penalty::new(2.0).unwrap()).unwrap();
+        let mut diagnostics = Diagnostics::default();
+        ridge.apply(matrix, &mut diagnostics).unwrap();
+        assert_eq!(
+            diagnostics.readings()[0],
+            ("coefficient_norm".to_string(), 5e154)
+        );
+        let mut diagnostics = Diagnostics::default();
+        let large = Loss::SquaredError.response(Score::new(1e308));
+        record_predictions(&[large, large], &mut diagnostics);
+        assert_eq!(
+            diagnostics.readings().last(),
+            Some(&("mean_prediction".to_string(), 1e308))
+        );
+        assert!(diagnostics.journal(Outputs::default()).is_ok());
     }
 
     #[test]
