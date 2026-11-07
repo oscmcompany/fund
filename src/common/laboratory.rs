@@ -12,6 +12,7 @@ pub mod haircut;
 pub mod ledger;
 pub mod permutation;
 pub mod residual;
+pub mod risk_free;
 pub mod score;
 pub mod series;
 pub mod share;

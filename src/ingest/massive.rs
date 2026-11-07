@@ -1,5 +1,5 @@
 //! Massive's grouped daily bars, which are also a session's symbol list, and its reference data: trade conditions,
-//! splits, and each symbol's details as of a date.
+//! splits, each symbol's details as of a date, and the 3-month Treasury yield.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,6 +10,7 @@ use super::retry::{FetchError, send, with_retries};
 use super::{
     Accepted, Fetched, RefusedRow, RowRefusal, Secret, SessionBars, VariableRefusal, variable,
 };
+use crate::common::laboratory::risk_free::AnnualYield;
 use crate::common::market::corporate_actions::{ActionId, Split, SplitRatio};
 use crate::common::market::record::{Bar, BarInterval, BarPrices};
 use crate::common::market::security_details::{
@@ -42,6 +43,29 @@ pub struct Massive {
     http_client: reqwest::Client,
     base_url: String,
     api_key: Secret,
+}
+
+/// The most days one Treasury request asks for, past the whole series since 1962, so it always answers in one page.
+const TREASURY_DAYS_AT_MOST: &str = "50000";
+
+/// The first day the 3-month yield was published, as the live series shows; earlier days carry none.
+const THREE_MONTH_SERIES_BEGAN: NaiveDate = match NaiveDate::from_ymd_opt(1981, 9, 1) {
+    Some(date) => date,
+    None => panic!("the series began on a real date"),
+};
+
+#[derive(Deserialize)]
+struct TreasuryResponse {
+    #[serde(default)]
+    results: Vec<TreasuryRow>,
+    next_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TreasuryRow {
+    date: NaiveDate,
+    /// Absent before the series began in 1981.
+    yield_3_month: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +106,32 @@ impl Massive {
             base_url: variable("MASSIVE_BASE_URL")?,
             api_key: Secret::new(variable("MASSIVE_API_KEY")?),
         })
+    }
+
+    /// The 3-month Treasury yield for each day on or after `since` that has one, from one response.
+    pub async fn treasury_yields(
+        &self,
+        since: NaiveDate,
+    ) -> Fetched<BTreeMap<NaiveDate, AnnualYield>> {
+        let url = format!("{}/fed/v1/treasury-yields", self.base_url);
+        let since = since.to_string();
+        let body = with_retries(|| {
+            send(
+                self.http_client
+                    .get(&url)
+                    .bearer_auth(self.api_key.expose())
+                    .query(&[
+                        ("date.gte", since.as_str()),
+                        ("limit", TREASURY_DAYS_AT_MOST),
+                        ("sort", "date.asc"),
+                    ]),
+            )
+        })
+        .await;
+        match body {
+            Ok(body) => Fetched::new(parse_treasury_yields(&body), vec![body]),
+            Err(error) => Fetched::new(Err(error), Vec::new()),
+        }
     }
 
     /// The sale conditions a stock print can carry, with the consolidated tape's update rules for each.
@@ -678,6 +728,37 @@ pub fn massive_ticker(symbol: &Symbol) -> String {
     }
 }
 
+/// The days with a 3-month yield; a further page, a day repeated, a yield out of range or one missing on or after
+/// `THREE_MONTH_SERIES_BEGAN` refuses the whole response, since a dropped day would silently lend its neighbour's rate.
+fn parse_treasury_yields(body: &[u8]) -> Result<BTreeMap<NaiveDate, AnnualYield>, FetchError> {
+    let malformed = |reason: String| FetchError::Malformed { reason };
+    let response: TreasuryResponse =
+        serde_json::from_slice(body).map_err(|error| malformed(error.to_string()))?;
+    if let Some(next) = response.next_url {
+        return Err(malformed(format!(
+            "the yields continue past one page: {next}"
+        )));
+    }
+    let mut rows = response.results;
+    rows.sort_by_key(|row| row.date);
+    let mut yields = BTreeMap::new();
+    for row in rows {
+        let date = row.date;
+        match (row.yield_3_month, date < THREE_MONTH_SERIES_BEGAN) {
+            (None, true) => {}
+            (None, false) => return Err(malformed(format!("{date}: no 3-month yield"))),
+            (Some(percent), _) => {
+                let annual = AnnualYield::new(percent)
+                    .map_err(|refusal| malformed(format!("{date}: {refusal}")))?;
+                if yields.insert(date, annual).is_some() {
+                    return Err(malformed(format!("{date}: read twice")));
+                }
+            }
+        }
+    }
+    Ok(yields)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
@@ -876,6 +957,25 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "reads the live Massive API; run under secretspec with --ignored"]
+    async fn live_treasury_yields_cover_the_archive_without_a_gap() {
+        let massive = Massive::from_environment(reqwest::Client::new()).unwrap();
+        let since = NaiveDate::from_ymd_opt(2020, 8, 1).unwrap();
+        let (yields, bodies) = massive.treasury_yields(since).await.into_parts();
+        let yields = yields.unwrap();
+        assert_eq!(bodies.len(), 1);
+        // 1,566 days from 2020-08-03 to 2026-11-05 when probed on 2026-11-07; no business day goes without a yield.
+        assert!(yields.len() >= 1_566, "{}", yields.len());
+        let dates: Vec<NaiveDate> = yields.keys().copied().collect();
+        let widest = dates
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).num_days())
+            .max()
+            .unwrap();
+        assert!(widest <= 5, "{widest} days between yields");
+    }
+
+    #[tokio::test]
+    #[ignore = "reads the live Massive API; run under secretspec with --ignored"]
     async fn live_grouped_daily_refuses_only_unmapped_notation() {
         let massive = Massive::from_environment(reqwest::Client::new()).unwrap();
         let daily = massive
@@ -990,6 +1090,82 @@ mod tests {
         assert_eq!(spelled, codes);
         for code in MassiveTypeCode::iter() {
             assert_eq!(code.to_string().parse::<MassiveTypeCode>(), Ok(code));
+        }
+    }
+
+    #[test]
+    fn test_treasury_yields_keep_the_days_with_a_three_month_yield() {
+        // Shaped as the live response (probed 2026-11-07), with synthetic yields.
+        let row = |date: &str, three_month: &str| {
+            format!(
+                r#"{{"date":"{date}","yield_1_month":4.0,"yield_3_month":{three_month},"yield_1_year":4.2,"yield_2_year":4.4,"yield_5_year":4.5,"yield_10_year":4.8,"yield_30_year":5.2}}"#
+            )
+        };
+        let body = |rows: &[String], next: &str| {
+            format!(
+                r#"{{"results":[{}],"status":"OK","request_id":"r","next_url":{next}}}"#,
+                rows.join(",")
+            )
+        };
+        let read = parse_treasury_yields(
+            body(
+                &[
+                    row("1981-08-31", "null"),
+                    row("1981-09-01", "17.01"),
+                    row("2026-11-05", "4.17"),
+                ],
+                "null",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let days: Vec<(String, f64)> = read
+            .iter()
+            .map(|(date, annual)| (date.to_string(), annual.percent()))
+            .collect();
+        assert_eq!(
+            days,
+            [
+                ("1981-09-01".to_string(), 17.01),
+                ("2026-11-05".to_string(), 4.17)
+            ]
+        );
+        let paged = body(
+            &[row("2026-11-05", "4.17")],
+            r#""https://api.massive.com/fed/v1/treasury-yields?cursor=x""#,
+        );
+        assert!(matches!(
+            parse_treasury_yields(paged.as_bytes()),
+            Err(FetchError::Malformed { .. })
+        ));
+        let refused = [
+            body(&[row("2026-11-05", "417")], "null"),
+            body(
+                &[row("2026-11-04", "4.16"), row("2026-11-05", "null")],
+                "null",
+            ),
+            body(
+                &[row("2026-11-05", "4.17"), row("2026-11-05", "4.18")],
+                "null",
+            ),
+            // A day missing its yield is refused even when it opens the response, once the series has begun.
+            body(
+                &[row("2026-11-04", "null"), row("2026-11-05", "4.17")],
+                "null",
+            ),
+            body(
+                &[row("1981-09-01", "null"), row("1981-09-02", "16.95")],
+                "null",
+            ),
+        ];
+        for response in refused {
+            assert!(
+                matches!(
+                    parse_treasury_yields(response.as_bytes()),
+                    Err(FetchError::Malformed { .. })
+                ),
+                "{response}"
+            );
         }
     }
 
