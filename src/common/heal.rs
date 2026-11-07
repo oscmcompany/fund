@@ -36,6 +36,9 @@ use crate::common::time::{SessionDate, SessionRange};
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Leg {
+    /// A snapshot only of the night it runs, since the listing answers for now and a missed night cannot be fetched;
+    /// first, because a run walks the legs in this order until its budget ends and every other leg can be healed later.
+    AlpacaBorrowFlags,
     /// The session's grouped daily response stored raw, from the endpoint the tick legs take their symbols from.
     MassiveTradedSymbols,
     MassiveSecurityDetails,
@@ -43,8 +46,6 @@ pub enum Leg {
     SecFiledIndustryCodes,
     MassiveSplits,
     AlpacaSeriesBoundaries,
-    /// A snapshot only of the night it runs, since the listing answers for now and a missed night cannot be fetched.
-    AlpacaBorrowFlags,
     AlpacaQuotes,
     AlpacaTrades,
 }
@@ -1003,6 +1004,8 @@ mod tests {
         assert_eq!(
             series,
             [
+                "data/equity/stage=parsed/reference/provider=alpaca/table=borrow_flags/",
+                "data/equity/stage=raw/reference/provider=alpaca/table=borrow_flags/",
                 "data/equity/stage=raw/reference/provider=massive/table=traded_symbols/",
                 "data/equity/stage=parsed/reference/provider=massive/table=security_details/",
                 "data/equity/stage=raw/reference/provider=massive/table=security_details/",
@@ -1012,8 +1015,6 @@ mod tests {
                 "data/equity/stage=raw/reference/provider=massive/table=splits/",
                 "data/equity/stage=parsed/reference/provider=alpaca/table=series_boundaries/",
                 "data/equity/stage=raw/reference/provider=alpaca/table=series_boundaries/",
-                "data/equity/stage=parsed/reference/provider=alpaca/table=borrow_flags/",
-                "data/equity/stage=raw/reference/provider=alpaca/table=borrow_flags/",
                 "data/equity/stage=parsed/quotes/provider=alpaca/interval=one_day/",
                 "data/equity/stage=raw/quotes/provider=alpaca/",
                 "data/equity/stage=parsed/trades/provider=alpaca/interval=one_day/",
