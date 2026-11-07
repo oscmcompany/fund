@@ -221,7 +221,7 @@ fn average_ranks(values: impl Iterator<Item = f64>) -> Vec<f64> {
 }
 
 /// Whether two values differ by no more than rounding explains, so their order means nothing.
-fn equal_up_to_rounding(left: f64, right: f64) -> bool {
+pub(super) fn equal_up_to_rounding(left: f64, right: f64) -> bool {
     (right - left).abs() <= ROUNDING_SPREAD * left.abs().max(right.abs())
 }
 
