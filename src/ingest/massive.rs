@@ -742,17 +742,19 @@ fn parse_treasury_yields(body: &[u8]) -> Result<BTreeMap<NaiveDate, AnnualYield>
     let mut rows = response.results;
     rows.sort_by_key(|row| row.date);
     let mut yields = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for row in rows {
         let date = row.date;
+        if !seen.insert(date) {
+            return Err(malformed(format!("{date}: read twice")));
+        }
         match (row.yield_3_month, date < THREE_MONTH_SERIES_BEGAN) {
             (None, true) => {}
             (None, false) => return Err(malformed(format!("{date}: no 3-month yield"))),
             (Some(percent), _) => {
                 let annual = AnnualYield::new(percent)
                     .map_err(|refusal| malformed(format!("{date}: {refusal}")))?;
-                if yields.insert(date, annual).is_some() {
-                    return Err(malformed(format!("{date}: read twice")));
-                }
+                yields.insert(date, annual);
             }
         }
     }
@@ -1146,6 +1148,11 @@ mod tests {
             ),
             body(
                 &[row("2026-11-05", "4.17"), row("2026-11-05", "4.18")],
+                "null",
+            ),
+            // A day listed twice is refused even before the series began, when neither carries a yield.
+            body(
+                &[row("1981-08-31", "null"), row("1981-08-31", "null")],
                 "null",
             ),
             // A day missing its yield is refused even when it opens the response, once the series has begun.
