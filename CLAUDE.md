@@ -119,7 +119,8 @@ This is a collection of guidelines and references.
   probabilities, a mean that lands on the forward) rather than agreement with a fixture
 - Prove an instrument can see before trusting it: break the code a new assertion covers, watch the test fail and
   restore it, and before trusting a measurement that reports nothing, confirm it reports something when something
-  is there
+  is there; a model change shows it can see by recovering what `laboratory::synthetic` planted at a stated
+  strength, against the null arm that planted nothing, before it is read on real sessions
 - Before believing a result, try to produce it from nothing — permute the labels, shuffle the target, feed the
   pipeline noise, or run it on an input that cannot contain the effect — and confirm the effect disappears;
   whatever it still reports is the machinery's own bias, and every real reading has to clear it

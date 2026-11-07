@@ -13,6 +13,7 @@ pub mod residual;
 pub mod score;
 pub mod series;
 pub mod share;
+pub mod synthetic;
 pub mod verdict;
 
 /// The largest reading magnitude a series admits; no measured quantity comes near it, and below it every sum, square
