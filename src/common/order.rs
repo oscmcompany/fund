@@ -527,6 +527,48 @@ impl OrderRequest {
     }
 }
 
+/// A limit's increment at or above a dollar, a cent; Alpaca refuses a finer one.
+const CENT_TICKS: i64 = 10_000;
+/// A limit's increment under a dollar, a hundredth of a cent.
+const HUNDREDTH_OF_A_CENT_TICKS: i64 = 100;
+/// The price from which a limit takes whole cents.
+const DOLLAR_TICKS: i64 = 1_000_000;
+
+/// A price an order may be limited to, on the broker's increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitPrice(Price);
+
+/// Why a price cannot be a limit, naming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LimitPriceRefusal {
+    #[error("{price} is finer than the {increment_ticks}-tick increment a limit at it takes")]
+    OffIncrement { price: Price, increment_ticks: i64 },
+}
+
+impl TryFrom<Price> for LimitPrice {
+    type Error = LimitPriceRefusal;
+
+    fn try_from(price: Price) -> Result<Self, Self::Error> {
+        let increment_ticks = match price.ticks() >= DOLLAR_TICKS {
+            true => CENT_TICKS,
+            false => HUNDREDTH_OF_A_CENT_TICKS,
+        };
+        match price.ticks() % increment_ticks == 0 {
+            true => Ok(Self(price)),
+            false => Err(LimitPriceRefusal::OffIncrement {
+                price,
+                increment_ticks,
+            }),
+        }
+    }
+}
+
+impl LimitPrice {
+    pub fn price(self) -> Price {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -550,6 +592,39 @@ mod tests {
 
     fn whole(count: u64) -> Shares {
         Shares::whole(count).unwrap()
+    }
+
+    /// A limit takes whole cents from a dollar up and hundredths of a cent below it: $45.12 and $0.4512 are limits,
+    /// $45.125 and $0.45125 are refused naming the increment, and $1.0001 is refused where $0.9999 is not.
+    #[test]
+    fn test_a_limit_price_off_the_brokers_increment_is_refused() {
+        let limit = |ticks| LimitPrice::try_from(Price::from_ticks(ticks).unwrap());
+        let off = |ticks, increment_ticks| {
+            Err(LimitPriceRefusal::OffIncrement {
+                price: Price::from_ticks(ticks).unwrap(),
+                increment_ticks,
+            })
+        };
+        assert_eq!(
+            limit(45_120_000).map(LimitPrice::price),
+            Ok(Price::from_ticks(45_120_000).unwrap())
+        );
+        assert_eq!(
+            limit(451_200).map(LimitPrice::price),
+            Ok(Price::from_ticks(451_200).unwrap())
+        );
+        assert_eq!(
+            limit(1_000_000).map(LimitPrice::price),
+            Ok(Price::from_ticks(1_000_000).unwrap())
+        );
+        assert_eq!(
+            limit(999_900).map(LimitPrice::price),
+            Ok(Price::from_ticks(999_900).unwrap())
+        );
+        assert_eq!(limit(45_125_000), off(45_125_000, 10_000));
+        assert_eq!(limit(451_250), off(451_250, 100));
+        assert_eq!(limit(1_000_100), off(1_000_100, 10_000));
+        assert_eq!(limit(999_999), off(999_999, 100));
     }
 
     fn executed(count: u64, ticks: i64) -> Option<OrderExecution> {

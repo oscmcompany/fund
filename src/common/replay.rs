@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
-use crate::common::guard::{OrderGuarded, Tradability, guard};
+use crate::common::guard::{OrderGuarded, Tradability, TradabilityRead, guard};
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::BarInterval;
@@ -173,9 +173,10 @@ impl Restraint {
         &self.tradability
     }
 
-    /// Every symbol `orders` name, read from the map or else fractionable.
-    fn tradability_of(&self, orders: &[Order]) -> BTreeMap<Symbol, Tradability> {
-        orders
+    /// Every symbol `orders` name, read from the map or else fractionable; no borrow is read, so the guard holds every
+    /// order that would open or add to a short as unread.
+    fn tradability_of(&self, orders: &[Order]) -> TradabilityRead {
+        let readings = orders
             .iter()
             .map(|order| {
                 let symbol = order.symbol().clone();
@@ -186,7 +187,8 @@ impl Restraint {
                     .unwrap_or(Tradability::Fractionable);
                 (symbol, tradability)
             })
-            .collect()
+            .collect();
+        TradabilityRead::new(readings, BTreeMap::new())
     }
 }
 
@@ -489,7 +491,8 @@ impl<S: Strategy> Replayer<S> {
                             replay.restraints.insert(ends, Ok(solution.cuts().to_vec()));
                             let wanted = orders(&replay.book, solution.target());
                             let tradability = restraint.tradability_of(&wanted);
-                            let guarded = guard(wanted, &tradability, price);
+                            let guarded =
+                                guard(wanted, &tradability, restraint.limits.per_name(), price);
                             replay
                                 .held
                                 .extend(guarded.held().iter().cloned().map(|held| (ends, held)));

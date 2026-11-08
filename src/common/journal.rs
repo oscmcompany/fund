@@ -1052,7 +1052,9 @@ mod tests {
     #[test]
     fn test_the_order_records_encode_to_their_wire_format() {
         use crate::common::book::{Book, Cash, Position, ValuationRefusal};
-        use crate::common::guard::{Tradability, TradabilityRead, TradabilityUnread, guard};
+        use crate::common::guard::{
+            Shortability, Tradability, TradabilityRead, TradabilityUnread, guard,
+        };
         use crate::common::market::{Price, Shares};
         use crate::common::order::{
             BrokerFailure, ClientOrderId, OrderClosed, OrderEnding, OrderExecution, OrderRefused,
@@ -1088,16 +1090,30 @@ mod tests {
             Symbol::new("VWDRY").unwrap(),
             Shares::from_units(1_500_000),
         )]));
-        let whole_only =
-            BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]);
-        let guarded =
-            guard(orders(&Book::default(), &fraction), &whole_only, |_| None).held()[0].clone();
+        let wide = crate::common::risk::DollarLimit::new(crate::common::book::Cash::from_units(
+            1_000_000_000_000_000_000_000,
+        ))
+        .unwrap();
+        let whole_only = TradabilityRead::new(
+            BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]),
+            BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Shortability::EasyToBorrow)]),
+        );
+        let guarded = guard(
+            orders(&Book::default(), &fraction),
+            &whole_only,
+            wide,
+            |_| None,
+        )
+        .held()[0]
+            .clone();
         let sliver = Target::new(BTreeMap::from([(
             Symbol::new("DIA").unwrap(),
             Shares::from_units(19),
         )]));
-        let fractionable =
-            BTreeMap::from([(Symbol::new("DIA").unwrap(), Tradability::Fractionable)]);
+        let fractionable = TradabilityRead::new(
+            BTreeMap::from([(Symbol::new("DIA").unwrap(), Tradability::Fractionable)]),
+            BTreeMap::new(),
+        );
         let rolling = crate::common::playbook::Playbook::parse(
             "roll_off_minutes = 10\n\n[[entries]]\nfrom = \"09:30\"\nuntil = \"12:00\"\nstrategy = { kind = \"flat\" }\nnote = \"n\"\n\n[[entries]]\nfrom = \"12:00\"\nuntil = \"16:00\"\nstrategy = { kind = \"flat\" }\nnote = \"n\"\n",
         )
@@ -1108,9 +1124,12 @@ mod tests {
                 "2026-10-07T16:05:00Z".parse().unwrap(),
             ),
         ));
-        let below = guard(orders(&Book::default(), &sliver), &fractionable, |_| {
-            Price::from_ticks(470_000_000).ok()
-        })
+        let below = guard(
+            orders(&Book::default(), &sliver),
+            &fractionable,
+            wide,
+            |_| Price::from_ticks(470_000_000).ok(),
+        )
         .held()[0]
             .clone();
         let observations = [
@@ -1134,7 +1153,7 @@ mod tests {
             )),
             Observation::OrderGuarded(guarded),
             Observation::OrderGuarded(below),
-            Observation::TradabilityRead(TradabilityRead::new(whole_only.clone())),
+            Observation::TradabilityRead(whole_only.clone()),
             Observation::TradabilityUnread(TradabilityUnread::new(BrokerFailure::Exhausted {
                 attempts: 3,
                 last: "timed out".to_string(),
@@ -1232,7 +1251,7 @@ mod tests {
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"DIA","side":"buy","shares":19,"cause":{"below_minimum":{"price":470000000}}}}"#.to_string(),
-                r#"{"event_type":"tradability_read","payload":{"readings":{"VWDRY":"whole_shares_only"}}}"#.to_string(),
+                r#"{"event_type":"tradability_read","payload":{"readings":{"VWDRY":"whole_shares_only"},"shortability":{"VWDRY":"easy_to_borrow"}}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":{"exhausted":{"attempts":3,"last":"timed out"}}}}"#.to_string(),
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","stretch":{"from":"12:00:00","progress":500000},"wanted":{"SPY":5000000},"solver":"clip","solution":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}],"risk":{"flat":{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}}}}}"#.to_string(),
