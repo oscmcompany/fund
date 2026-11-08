@@ -15,10 +15,16 @@ Below are resources for the project and repository.
 ### Setup
 
 ```sh
-# Install devenv (https://devenv.sh/getting-started/), clone the repository
-# and enter the directory - available tasks are printed on shell entry.
+# Install Determinate Nix and devenv (https://devenv.sh/getting-started/) at
+# the versions in host/versions, then clone the repository.
 git clone git@github.com:oscmcompany/fund.git
 cd fund
+
+# Name your secretspec profile (add it to secretspec.toml if it is new); its
+# secrets are read from AWS Parameter Store with your AWS credentials.
+echo "FUND_PROFILE=development/<name>" > .env
+
+# Enter the environment - available tasks are printed on shell entry.
 devenv shell
 
 # Run every check.
