@@ -324,7 +324,7 @@ mod tests {
     use crate::common::book::{Book, Cash, Fill, Position};
     use crate::common::monoid::{Monoid, concatenate};
     use crate::common::problem::formulate;
-    use crate::common::risk::Limits;
+    use crate::common::risk::{Limits, NameLosses};
     use crate::common::solver::Solver;
     use crate::common::strategy::Holding;
     use crate::common::time::calendar::SessionPhase;
@@ -833,6 +833,7 @@ mod tests {
                             dollars(gross),
                             dollars(per_name),
                             dollars(loss),
+                            dollars(loss),
                             TimeDelta::minutes(15),
                         )
                         .unwrap(),
@@ -862,6 +863,7 @@ mod tests {
                 decision.phase,
                 decision.opening,
                 &decision.book,
+                &NameLosses::default(),
                 price,
                 decision.wanted.clone(),
             )

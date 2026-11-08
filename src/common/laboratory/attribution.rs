@@ -292,6 +292,7 @@ mod tests {
             Cash::from_units(40_000 * DOLLAR),
             Cash::from_units(40_000 * DOLLAR),
             Cash::from_units(1_000 * DOLLAR),
+            Cash::from_units(1_000 * DOLLAR),
             TimeDelta::minutes(10),
         )
         .unwrap();

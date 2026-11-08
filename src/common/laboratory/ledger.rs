@@ -431,6 +431,7 @@ mod tests {
             dollars(gross),
             dollars(per_name),
             dollars(1_000),
+            dollars(1_000),
             TimeDelta::minutes(10),
         )
         .unwrap();

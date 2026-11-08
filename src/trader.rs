@@ -18,7 +18,7 @@ use crate::common::order::{BrokerFailure, OrderSequence};
 use crate::common::playbook::Played;
 use crate::common::problem::formulate;
 use crate::common::reconcile::rounding_allowance;
-use crate::common::risk::{Limits, TargetDecided};
+use crate::common::risk::{Limits, NameLosses, TargetDecided};
 use crate::common::solver::Solver;
 use crate::common::standing::{HaltCause, SessionHalted};
 use crate::common::strategy::Strategy;
@@ -214,6 +214,8 @@ pub struct Session<S: Strategy> {
     book: Book,
     /// The book's worth when the session opened, from which the daily loss is measured.
     opening: Cash,
+    /// Each name's gain since the open, from which a name's own loss is measured.
+    losses: NameLosses,
     /// Fills since the last reconciliation, which bound how far the broker's cash may stray from the book's.
     fills: Vec<Fill>,
     next_decision: DateTime<Utc>,
@@ -244,8 +246,8 @@ fn journal_refused(error: &std::io::Error) -> HaltCause {
 
 impl<S: Strategy> Session<S> {
     /// A session for `session`'s tape of `symbols` building from `open`, from a state warmed on earlier sessions and
-    /// the book the broker reported at the open, worth `opening`. A session the calendar does not publish has its close
-    /// at `open`, so it builds nothing.
+    /// the book the broker reported at the open, worth `opening` and split by name into `losses`. A session the
+    /// calendar does not publish has its close at `open`, so it builds nothing.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is one independent input a session starts from"
@@ -260,6 +262,7 @@ impl<S: Strategy> Session<S> {
         warm: MarketState,
         book: Book,
         opening: Cash,
+        losses: NameLosses,
         open: DateTime<Utc>,
     ) -> Self {
         let close = calendar
@@ -279,6 +282,7 @@ impl<S: Strategy> Session<S> {
             state: warm,
             book,
             opening,
+            losses,
             fills: Vec::new(),
             sequence: OrderSequence::default(),
             standing: Standing::Trading,
@@ -451,18 +455,27 @@ impl<S: Strategy> Session<S> {
         }
         let wanted = self.strategy.decide(&self.state, &self.book);
         let phase = self.calendar.phase_at(now);
+        let mut losses = std::mem::take(&mut self.losses);
+        let barred = losses.bar(&self.settings.limits, |symbol| {
+            self.fresh_price(symbol, now)
+        });
+        self.losses = losses;
+        for name in &barred {
+            tracing::warn!(?name, "Name barred for its loss");
+        }
         let solver = Solver::Clip;
         let solution = formulate(
             &self.settings.limits,
             phase,
             self.opening,
             &self.book,
+            &self.losses,
             |symbol| self.fresh_price(symbol, now),
             wanted.clone(),
         )
         .map(|problem| solver.solve(&problem));
         let stretch = self.strategy.stretch_at(&self.state);
-        let decided = TargetDecided::new(bar, stretch, wanted, solver, solution.clone());
+        let decided = TargetDecided::new(bar, stretch, wanted, barred, solver, solution.clone());
         if let Err(error) = journal.append(now, Observation::TargetDecided(decided)) {
             self.halt(journal, journal_refused(&error));
             return Err(SessionError::Journal(JournalFailure::before_any_order(
@@ -544,6 +557,7 @@ impl<S: Strategy> Session<S> {
             match outcome {
                 OrderOutcome::Closed(Some(fill)) => {
                     self.book = std::mem::take(&mut self.book).combine(Book::of(fill));
+                    self.losses.take(fill);
                     self.fills.push(fill.clone());
                 }
                 OrderOutcome::Unresolved {
@@ -799,6 +813,26 @@ mod tests {
         open: DateTime<Utc>,
         decision: DecisionInterval,
     ) -> Session<OneShare> {
+        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
+        let limits = Limits::new(
+            dollars(10_000),
+            Cash::from_units(per_name),
+            dollars(1_000),
+            dollars(1_000),
+            TimeDelta::minutes(15),
+        )
+        .unwrap();
+        session_limited(stale_after, funded, limits, open, decision)
+    }
+
+    /// `session_from` held to `limits`, each held name opening at $700.
+    fn session_limited(
+        stale_after: TimeDelta,
+        funded: Book,
+        limits: Limits,
+        open: DateTime<Utc>,
+        decision: DecisionInterval,
+    ) -> Session<OneShare> {
         let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
         let calendar = TradingCalendar::new(
             vec![
@@ -810,14 +844,6 @@ mod tests {
                 .unwrap(),
             ],
             SessionRange::single(date),
-        )
-        .unwrap();
-        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
-        let limits = Limits::new(
-            dollars(10_000),
-            Cash::from_units(per_name),
-            dollars(1_000),
-            TimeDelta::minutes(15),
         )
         .unwrap();
         let patience = Patience::new(Duration::from_secs(1), Duration::from_secs(30)).unwrap();
@@ -836,8 +862,9 @@ mod tests {
             TradeConditions::new(BTreeMap::new()),
             vec![spy()],
             MarketState::default(),
-            funded,
-            dollars(10_000),
+            funded.clone(),
+            Cash::from_units(10_000 * DOLLAR),
+            NameLosses::open(&funded, |_| Price::from_ticks(700_000_000).ok()).unwrap(),
             open,
         )
     }
@@ -1047,6 +1074,73 @@ mod tests {
             serde_json::json!([{"unpriced": {"symbol": "SPY", "wanted": 1_000_000}}])
         );
         assert_eq!(session.book(), &funded);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// One SPY bought at $700 and marked at $650 has lost $50, the per-name loss limit: the decision journals SPY barred
+    /// with its loss and limit and sells it though the strategy wants it, and once SPY recovers to $800 the next decision
+    /// still holds it at zero and sends nothing.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_name_past_its_loss_limit_is_sold_and_kept_flat() {
+        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
+        let funded = Book::funded(dollars(10_000));
+        let broker = Filling::new(700_000_000, funded.clone());
+        let limits = Limits::new(
+            dollars(10_000),
+            dollars(5_000),
+            dollars(1_000),
+            dollars(50),
+            TimeDelta::minutes(15),
+        )
+        .unwrap();
+        let mut session = session_limited(
+            TimeDelta::minutes(5),
+            funded.clone(),
+            limits,
+            at("14:00:00"),
+            DecisionInterval::FiveMinute,
+        );
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        for (when, ticks, decided) in [
+            ("14:04:30", 700_000_000, "14:05:02"),
+            ("14:09:30", 650_000_000, "14:10:02"),
+            ("14:14:30", 800_000_000, "14:15:02"),
+        ] {
+            tape.file(print(when, ticks));
+            session
+                .advance(&|| at(decided), &tape, &broker, &mut journal)
+                .await
+                .unwrap();
+        }
+        let decided: Vec<serde_json::Value> = records(&directory)
+            .iter()
+            .filter(|record| record.observation().event_type() == "target_decided")
+            .map(|record| serde_json::to_value(record.observation()).unwrap()["payload"].clone())
+            .collect();
+        let cut = serde_json::json!([{"per_name_loss": {
+            "symbol": "SPY",
+            "wanted": 1_000_000,
+            "loss": "50000000000000"
+        }}]);
+        assert_eq!(decided.len(), 3);
+        assert_eq!(decided[0]["solution"]["cuts"], serde_json::json!([]));
+        assert_eq!(
+            decided[1]["barred"],
+            serde_json::json!([{"symbol": "SPY", "loss": "50000000000000", "limit": "50000000000000"}])
+        );
+        assert_eq!(decided[1]["solution"]["cuts"], cut);
+        assert_eq!(decided[2].get("barred"), None);
+        assert_eq!(decided[2]["solution"]["cuts"], cut);
+        assert_eq!(
+            journaled(&directory)
+                .iter()
+                .filter(|event| **event == "order_submitted")
+                .count(),
+            2
+        );
+        assert_eq!(session.book(), &funded);
+        assert_eq!(session.standing(), &Standing::Trading);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

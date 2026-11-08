@@ -241,15 +241,22 @@ impl Parameters {
         let universe: Universe = record_required(read(Parameter::Universe)?, &mut resolved)?;
         let mut limit =
             |parameter| record_required::<Dollars>(read(parameter)?, &mut resolved).map(Cash::from);
-        let (gross, per_name, daily_loss) = (
+        let (gross, per_name, daily_loss, per_name_loss) = (
             limit(Parameter::GrossLimit)?,
             limit(Parameter::PerNameLimit)?,
             limit(Parameter::DailyLossLimit)?,
+            limit(Parameter::PerNameLossLimit)?,
         );
         let flat_before_close: FlatBeforeClose =
             record_required(read(Parameter::FlatBeforeCloseMinutes)?, &mut resolved)?;
-        let limits = Limits::new(gross, per_name, daily_loss, flat_before_close.into())
-            .map_err(ParametersRefusal::Limits)?;
+        let limits = Limits::new(
+            gross,
+            per_name,
+            daily_loss,
+            per_name_loss,
+            flat_before_close.into(),
+        )
+        .map_err(ParametersRefusal::Limits)?;
         let decision = record(
             read(Parameter::DecisionInterval)?,
             DEFAULT_DECISION_INTERVAL,
@@ -314,11 +321,12 @@ mod tests {
     use super::*;
     use crate::common::journal::ParameterSource;
 
-    const REQUIRED: [(Parameter, &str); 5] = [
+    const REQUIRED: [(Parameter, &str); 6] = [
         (Parameter::Universe, "SPY, QQQ"),
         (Parameter::GrossLimit, "1000"),
         (Parameter::PerNameLimit, "500.5"),
         (Parameter::DailyLossLimit, "50"),
+        (Parameter::PerNameLossLimit, "20"),
         (Parameter::FlatBeforeCloseMinutes, "15"),
     ];
 
@@ -363,6 +371,7 @@ mod tests {
                 ("gross_limit", "1000.00", ParameterSource::Environment),
                 ("per_name_limit", "500.50", ParameterSource::Environment),
                 ("daily_loss_limit", "50.00", ParameterSource::Environment),
+                ("per_name_loss_limit", "20.00", ParameterSource::Environment),
                 (
                     "flat_before_close_minutes",
                     "15",

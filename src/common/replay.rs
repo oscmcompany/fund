@@ -19,7 +19,7 @@ use crate::common::market::trade_bars::TradeBar;
 use crate::common::market::{DollarVolume, Price, Symbol};
 use crate::common::monoid::{Monoid, concatenate};
 use crate::common::problem::formulate;
-use crate::common::risk::{Cut, Limits};
+use crate::common::risk::{Cut, Limits, NameLosses};
 use crate::common::solver::Solver;
 use crate::common::strategy::{Order, Strategy, orders};
 use crate::common::time::SessionDate;
@@ -222,6 +222,9 @@ pub struct Replay {
     fills: Vec<Fill>,
     unfilled: Vec<Unfilled>,
     marks: BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
+    /// The session decided in and each name's gain since its open, opened at the session's first decision from the
+    /// closes before it, or why a position had no close; `None` before the first decision or when unrestrained.
+    losses: Option<(SessionDate, Result<NameLosses, ValuationRefusal>)>,
     /// Under restraint, what the solver cut at each decision, or why risk could not judge it and nothing was sent.
     restraints: BTreeMap<DateTime<Utc>, Result<Vec<Cut>, ValuationRefusal>>,
     held: Vec<(DateTime<Utc>, OrderGuarded)>,
@@ -254,6 +257,7 @@ impl Replay {
             fills: Vec::new(),
             unfilled: Vec::new(),
             marks: BTreeMap::new(),
+            losses: None,
             restraints: BTreeMap::new(),
             held: Vec::new(),
         }
@@ -447,6 +451,20 @@ impl<S: Strategy> Replayer<S> {
             Vec::new()
         };
         let mut unclosed = Unclosed::default();
+        let session = SessionDate::at(ends);
+        let opened = matches!(&replay.losses, Some((opened, _)) if *opened == session);
+        let restrained = match &self.controls {
+            Controls::Unrestrained => false,
+            Controls::Restrained(_) => true,
+        };
+        // Before this step's bars fold in, so a position is marked at the closes before the session.
+        if decides && restrained && !opened {
+            let state = &replay.state;
+            let losses = NameLosses::open(&replay.book, |symbol| {
+                state.last_price(symbol, self.decision)
+            });
+            replay.losses = Some((session, losses));
+        }
         for order in pending {
             if unclosed.holds(&order) {
                 let held = OrderGuarded::new(&order, GuardCause::Unclosed);
@@ -461,6 +479,10 @@ impl<S: Strategy> Replayer<S> {
             match filled {
                 Ok(fill) => {
                     replay.book = replay.book.combine(Book::of(&fill));
+                    match &mut replay.losses {
+                        Some((_, Ok(losses))) => losses.take(&fill),
+                        Some((_, Err(_))) | None => {}
+                    }
                     replay.fills.push(fill);
                 }
                 Err(unfilled) => replay.unfilled.push(unfilled),
@@ -486,17 +508,28 @@ impl<S: Strategy> Replayer<S> {
                     let price = |symbol: &Symbol| {
                         state.fresh_price(symbol, self.decision, ends, restraint.stale_after)
                     };
-                    let solution = session_opening(&replay.marks, ends).and_then(|opening| {
-                        formulate(
-                            &restraint.limits,
-                            restraint.calendar.phase_at(ends),
-                            opening,
-                            &replay.book,
-                            price,
-                            wanted,
-                        )
-                        .map(|problem| Solver::Clip.solve(&problem))
-                    });
+                    let (_, losses) = replay
+                        .losses
+                        .as_mut()
+                        .expect("a deciding step opens its session's losses");
+                    let solution =
+                        losses
+                            .as_mut()
+                            .map_err(|refusal| refusal.clone())
+                            .and_then(|losses| {
+                                losses.bar(&restraint.limits, price);
+                                let opening = session_opening(&replay.marks, ends)?;
+                                formulate(
+                                    &restraint.limits,
+                                    restraint.calendar.phase_at(ends),
+                                    opening,
+                                    &replay.book,
+                                    losses,
+                                    price,
+                                    wanted,
+                                )
+                                .map(|problem| Solver::Clip.solve(&problem))
+                            });
                     match solution {
                         Ok(solution) => {
                             replay.restraints.insert(ends, Ok(solution.cuts().to_vec()));
@@ -756,6 +789,16 @@ mod tests {
         tradability: BTreeMap<Symbol, Tradability>,
         stale_after: TimeDelta,
     ) -> Controls {
+        restraint_losing(flat_before_close, tradability, stale_after, cash(1_000))
+    }
+
+    /// `restraint_stale` barring a name once it loses `per_name_loss` in the session.
+    fn restraint_losing(
+        flat_before_close: TimeDelta,
+        tradability: BTreeMap<Symbol, Tradability>,
+        stale_after: TimeDelta,
+        per_name_loss: Cash,
+    ) -> Controls {
         let monday = SessionDate::at(day(0));
         let session = crate::common::time::calendar::TradingSession::new(
             monday,
@@ -768,7 +811,14 @@ mod tests {
             crate::common::time::SessionRange::new(monday, monday).unwrap(),
         )
         .unwrap();
-        let limits = Limits::new(cash(1_000), cash(1_000), cash(1_000), flat_before_close).unwrap();
+        let limits = Limits::new(
+            cash(1_000),
+            cash(1_000),
+            cash(1_000),
+            per_name_loss,
+            flat_before_close,
+        )
+        .unwrap();
         Controls::Restrained(Restraint::new(
             limits,
             calendar,
@@ -851,6 +901,156 @@ mod tests {
                 "{stale_after}"
             );
         }
+    }
+
+    /// AAPL bought at $100 and marked at $94 loses $6, past a $5 limit: it is barred and sold, and stays flat when it
+    /// recovers to $120, each later decision cutting it with the loss that barred it.
+    #[test]
+    fn test_a_restrained_replay_bars_a_name_past_its_loss_limit() {
+        let replayer = Replayer::controlled(
+            Hold(vec![("AAPL", 1)]),
+            free(),
+            BarInterval::OneMinute,
+            restraint_losing(
+                TimeDelta::minutes(15),
+                BTreeMap::new(),
+                TimeDelta::minutes(2),
+                cash(5),
+            ),
+        )
+        .unwrap();
+        let first = before_close(120);
+        let minute = |offset: i64, open: i64, close: i64| {
+            bar(
+                "AAPL",
+                BarInterval::OneMinute,
+                first + TimeDelta::minutes(offset),
+                open,
+                close,
+            )
+        };
+        let bars = [
+            minute(0, 100_000_000, 100_000_000),
+            minute(1, 100_000_000, 94_000_000),
+            minute(2, 94_000_000, 120_000_000),
+            minute(3, 120_000_000, 120_000_000),
+        ];
+        let replay = replayer
+            .act(Replay::open(Book::funded(cash(1_000))), bars)
+            .unwrap()
+            .finish();
+        let barred = Ok(vec![Cut::PerNameLoss {
+            symbol: symbol("AAPL"),
+            wanted: Shares::whole(1).unwrap().into(),
+            loss: cash(6),
+        }]);
+        let decisions: Vec<_> = (1..=4)
+            .map(|offset| first + TimeDelta::minutes(offset))
+            .collect();
+        assert_eq!(
+            replay.restraints().keys().copied().collect::<Vec<_>>(),
+            decisions
+        );
+        assert_eq!(replay.restraints()[&decisions[0]], Ok(Vec::new()));
+        for decided in &decisions[1..] {
+            assert_eq!(replay.restraints()[decided], barred, "{decided}");
+        }
+        assert_eq!(
+            replay
+                .fills()
+                .iter()
+                .map(|fill| (fill.side(), fill.price().ticks()))
+                .collect::<Vec<_>>(),
+            [(Side::Buy, 100_000_000), (Side::Sell, 94_000_000)]
+        );
+        assert_eq!(replay.book(), &Book::funded(cash(994)));
+    }
+
+    /// AAPL barred on Monday for a $6 loss is bought again at Tuesday's first decision, as each session reopens its
+    /// losses, and a $3 fall on Tuesday stays inside the $5 limit, since Monday's $6 is not carried into it.
+    #[test]
+    fn test_a_name_barred_in_one_session_trades_in_the_next() {
+        let sessions: Vec<_> = (0..2)
+            .map(|index| {
+                crate::common::time::calendar::TradingSession::new(
+                    SessionDate::at(day(index)),
+                    chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+                    chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let calendar = TradingCalendar::new(
+            sessions,
+            crate::common::time::SessionRange::new(
+                SessionDate::at(day(0)),
+                SessionDate::at(day(1)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let limits = Limits::new(
+            cash(1_000),
+            cash(1_000),
+            cash(1_000),
+            cash(5),
+            TimeDelta::minutes(15),
+        )
+        .unwrap();
+        let replayer = Replayer::controlled(
+            Hold(vec![("AAPL", 1)]),
+            free(),
+            BarInterval::OneMinute,
+            Controls::Restrained(Restraint::new(
+                limits,
+                calendar,
+                BTreeMap::new(),
+                Staleness::new(TimeDelta::minutes(2)).unwrap(),
+            )),
+        )
+        .unwrap();
+        let minute = |index: i64, offset: i64, open: i64, close: i64| {
+            bar(
+                "AAPL",
+                BarInterval::OneMinute,
+                day(index) - TimeDelta::minutes(120) + TimeDelta::minutes(offset),
+                open,
+                close,
+            )
+        };
+        let bars = [
+            minute(0, 0, 100_000_000, 100_000_000),
+            minute(0, 1, 100_000_000, 94_000_000),
+            minute(0, 2, 94_000_000, 94_000_000),
+            minute(1, 0, 94_000_000, 94_000_000),
+            minute(1, 1, 94_000_000, 91_000_000),
+            minute(1, 2, 91_000_000, 91_000_000),
+        ];
+        let replay = replayer
+            .act(Replay::open(Book::funded(cash(1_000))), bars)
+            .unwrap()
+            .finish();
+        let tuesday = day(1) - TimeDelta::minutes(120);
+        assert_eq!(
+            replay
+                .restraints()
+                .range(tuesday..)
+                .map(|(_, cuts)| cuts.clone())
+                .collect::<Vec<_>>(),
+            [Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new())]
+        );
+        assert_eq!(
+            replay
+                .fills()
+                .iter()
+                .map(|fill| (fill.side(), fill.price().ticks()))
+                .collect::<Vec<_>>(),
+            [
+                (Side::Buy, 100_000_000),
+                (Side::Sell, 94_000_000),
+                (Side::Buy, 94_000_000)
+            ]
+        );
     }
 
     #[test]

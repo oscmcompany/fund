@@ -18,6 +18,7 @@ use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
 use fund::common::playbook::{Playbook, PlaybookRead, PlaybookRefusal, Played};
+use fund::common::risk::NameLosses;
 use fund::common::standing::{HaltCause, SessionClosed, SessionEnding};
 use fund::common::storage::{ConfigurationKey, Host, Key, ObjectKey, Provider, Service, TradesKey};
 use fund::common::time::calendar::TradingCalendar;
@@ -299,8 +300,10 @@ async fn trade(
     let (previous, closes) = previous_bars(archive, &calendar, today, &symbols)
         .await
         .map_err(|refusal| refused(StartRefusal::PreviousSession(refusal)))?;
-    let opening = book
-        .value(|symbol| closes.get(symbol).copied())
+    let previous_close = |symbol: &Symbol| closes.get(symbol).copied();
+    let (opening, losses) = book
+        .value(previous_close)
+        .and_then(|opening| Ok((opening, NameLosses::open(&book, previous_close)?)))
         .map_err(|refusal| refused(StartRefusal::Opening(refusal)))?;
     journal
         .append(
@@ -327,6 +330,7 @@ async fn trade(
         previous,
         book,
         opening,
+        losses,
         open,
     );
     let mut ticks = tokio::time::interval(TICK);

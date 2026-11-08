@@ -1062,7 +1062,7 @@ mod tests {
         };
         use crate::common::problem::formulate;
         use crate::common::reconcile::{reconcile, rounding_allowance};
-        use crate::common::risk::{Limits, TargetDecided};
+        use crate::common::risk::{Limits, NameLosses, TargetDecided};
         use crate::common::solver::Solver;
         use crate::common::strategy::{Target, orders};
         use crate::common::time::calendar::SessionPhase;
@@ -1164,9 +1164,11 @@ mod tests {
                 "2026-10-07T14:05:00Z".parse().unwrap(),
                 rolling,
                 target.clone(),
+                Vec::new(),
                 Solver::Clip,
                 formulate(
                     &Limits::new(
+                        Cash::from_units(1),
                         Cash::from_units(1),
                         Cash::from_units(1),
                         Cash::from_units(1),
@@ -1178,6 +1180,7 @@ mod tests {
                     },
                     Cash::from_units(0),
                     &Book::default(),
+                    &NameLosses::default(),
                     |_| None,
                     target.clone(),
                 )
@@ -1187,6 +1190,7 @@ mod tests {
                 "2026-10-07T14:05:00Z".parse().unwrap(),
                 None,
                 target.clone(),
+                Vec::new(),
                 Solver::Clip,
                 Err(ValuationRefusal::Unpriced {
                     symbol: Symbol::new("SPY").unwrap(),
