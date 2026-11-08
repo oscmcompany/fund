@@ -48,7 +48,8 @@ use crate::ingest::alpaca::{
 use crate::ingest::massive::{DetailsAnswer, Massive};
 use crate::ingest::sec::{AnnualReport, Sec};
 use crate::ingest::{
-    FetchError, Fetched, QuoteOrigin, RefusedRow, SessionBars, VariableRefusal, refused_by_cause,
+    FetchError, Fetched, QuoteOrigin, RefusedRow, RowRefusal, SessionBars, VariableRefusal,
+    refused_by_cause,
 };
 use crate::journal::Journal;
 use crate::parameter::{Directories, environment_variable};
@@ -1080,9 +1081,7 @@ async fn write_quotes(
                 one_sided += 1;
             }
             AlpacaQuoteOutcome::Refused(row) => {
-                if let Ok(symbol) = Symbol::new(row.ticker()) {
-                    restatements.interrupt(&symbol);
-                }
+                interrupt_refused(&mut restatements, &row);
                 refused.push(row);
             }
         },
@@ -1133,6 +1132,38 @@ fn restates(
         origin,
     };
     restatements.restates(quote.symbol(), quote.timestamp(), tape, row)
+}
+
+/// Forgets the previous row of the symbol whose row Alpaca refused; a row filed under an unrequested ticker leaves
+/// every symbol's previous row in place.
+fn interrupt_refused(restatements: &mut Restatements<AlpacaQuoteRow>, row: &RefusedRow) {
+    let interrupts = match row.cause() {
+        RowRefusal::Unrequested => false,
+        RowRefusal::Symbol(_)
+        | RowRefusal::Session { .. }
+        | RowRefusal::Price(_)
+        | RowRefusal::Prices(_)
+        | RowRefusal::Shares(_)
+        | RowRefusal::DollarVolume(_)
+        | RowRefusal::Bar(_)
+        | RowRefusal::Quote(_)
+        | RowRefusal::Tape { .. }
+        | RowRefusal::Conditions { .. }
+        | RowRefusal::Correction { .. }
+        | RowRefusal::Duplicate
+        | RowRefusal::ActionId(_)
+        | RowRefusal::SplitRatio(_)
+        | RowRefusal::Boundary(_)
+        | RowRefusal::Undated
+        | RowRefusal::SecurityType { .. }
+        | RowRefusal::IndustryCode(_)
+        | RowRefusal::Exchange(_)
+        | RowRefusal::Dollars(_)
+        | RowRefusal::CentralIndexKey { .. } => true,
+    };
+    if interrupts && let Ok(symbol) = Symbol::new(row.ticker()) {
+        restatements.interrupt(&symbol);
+    }
 }
 
 /// Folds Alpaca's trades for every symbol of the session under the newest conditions table and writes its trade bars.
@@ -1414,7 +1445,6 @@ mod tests {
         Condition, ConditionCode, ConditionStatus, UpdateRules,
     };
     use crate::common::monoid::{Tally, laws};
-    use crate::ingest::RowRefusal;
 
     /// The batches' symbols in the order they were concatenated.
     #[derive(Debug, Clone, PartialEq)]
@@ -2424,6 +2454,167 @@ mod tests {
         assert_eq!(clients.archive.get(&Key::from(key)).await.unwrap(), None);
         assert!(pages > 1);
         assert_eq!(stored.fetched_at(), Some(provenance.fetched_at()));
+    }
+
+    /// A two-sided quote of `symbol` at `at`, its prices and sizes, and Alpaca's origin for it on tape A.
+    fn alpaca_quote(
+        symbol: &str,
+        at: &str,
+        (bid, ask): (f64, f64),
+        (bid_size, ask_size): (u64, u64),
+    ) -> (Quote, QuoteOrigin) {
+        let quote = Quote::new(
+            Symbol::new(symbol).unwrap(),
+            at.parse().unwrap(),
+            Price::from_dollars(bid).unwrap(),
+            Price::from_dollars(ask).unwrap(),
+            Shares::whole(bid_size).unwrap(),
+            Shares::whole(ask_size).unwrap(),
+        )
+        .unwrap();
+        let origin = QuoteOrigin {
+            bid_exchange: Some("N".to_string()),
+            ask_exchange: Some("N".to_string()),
+            tape: Some("A".to_string()),
+            conditions: vec!["R".to_string()],
+            indicators: Vec::new(),
+            participant_timestamp: None,
+            sequence: None,
+        };
+        (quote, origin)
+    }
+
+    #[test]
+    fn test_an_alpaca_quote_restates_only_when_every_served_field_repeats() {
+        let (first, base) = alpaca_quote(
+            "UTL",
+            "2026-10-01T14:00:29.990Z",
+            (50.00, 50.10),
+            (100, 200),
+        );
+        let tape_b = QuoteOrigin {
+            tape: Some("B".to_string()),
+            ..base.clone()
+        };
+        let bid_exchange = QuoteOrigin {
+            bid_exchange: Some("P".to_string()),
+            ..base.clone()
+        };
+        let ask_exchange = QuoteOrigin {
+            ask_exchange: Some("P".to_string()),
+            ..base.clone()
+        };
+        let conditions = QuoteOrigin {
+            conditions: vec!["O".to_string()],
+            ..base.clone()
+        };
+        let at = "2026-10-01T14:00:30.005Z";
+        for (name, (quote, origin), restated) in [
+            (
+                "repeat",
+                alpaca_quote("UTL", at, (50.00, 50.10), (100, 200)),
+                true,
+            ),
+            (
+                "bid",
+                alpaca_quote("UTL", at, (50.01, 50.10), (100, 200)),
+                false,
+            ),
+            (
+                "ask",
+                alpaca_quote("UTL", at, (50.00, 50.11), (100, 200)),
+                false,
+            ),
+            (
+                "bid size",
+                alpaca_quote("UTL", at, (50.00, 50.10), (101, 200)),
+                false,
+            ),
+            (
+                "ask size",
+                alpaca_quote("UTL", at, (50.00, 50.10), (100, 201)),
+                false,
+            ),
+            (
+                "tape",
+                (
+                    alpaca_quote("UTL", at, (50.00, 50.10), (100, 200)).0,
+                    tape_b,
+                ),
+                false,
+            ),
+            (
+                "bid exchange",
+                (
+                    alpaca_quote("UTL", at, (50.00, 50.10), (100, 200)).0,
+                    bid_exchange,
+                ),
+                false,
+            ),
+            (
+                "ask exchange",
+                (
+                    alpaca_quote("UTL", at, (50.00, 50.10), (100, 200)).0,
+                    ask_exchange,
+                ),
+                false,
+            ),
+            (
+                "conditions",
+                (
+                    alpaca_quote("UTL", at, (50.00, 50.10), (100, 200)).0,
+                    conditions,
+                ),
+                false,
+            ),
+            (
+                "off boundary",
+                alpaca_quote(
+                    "UTL",
+                    "2026-10-01T14:00:30.100Z",
+                    (50.00, 50.10),
+                    (100, 200),
+                ),
+                false,
+            ),
+        ] {
+            let mut restatements = Restatements::default();
+            assert!(!restates(&mut restatements, &first, base.clone()), "{name}");
+            assert_eq!(
+                restates(&mut restatements, &quote, origin),
+                restated,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_a_refused_row_of_the_requested_symbol_interrupts_its_restatements() {
+        let (first, origin) = alpaca_quote(
+            "UTL",
+            "2026-10-01T14:00:29.990Z",
+            (50.00, 50.10),
+            (100, 200),
+        );
+        let (repeat, _) = alpaca_quote(
+            "UTL",
+            "2026-10-01T14:00:30.005Z",
+            (50.00, 50.10),
+            (100, 200),
+        );
+        for (refusal, restated) in [
+            (RefusedRow::new("UTL", RowRefusal::Unrequested), true),
+            (RefusedRow::new("UTL", RowRefusal::Duplicate), false),
+        ] {
+            let mut restatements = Restatements::default();
+            assert!(!restates(&mut restatements, &first, origin.clone()));
+            interrupt_refused(&mut restatements, &refusal);
+            assert_eq!(
+                restates(&mut restatements, &repeat, origin.clone()),
+                restated,
+                "{refusal:?}"
+            );
+        }
     }
 
     /// A quiet tape-A name's session restates its quote at most once per half-minute boundary, and does so at all.
