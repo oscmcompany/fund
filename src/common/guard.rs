@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::book::Side;
+use crate::common::book::{Book, Side};
 use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::order::BrokerFailure;
 use crate::common::risk::DollarLimit;
@@ -172,12 +172,40 @@ impl Guarded {
     }
 }
 
+/// The symbols whose reducing leg fell short of flat, where an order opening beyond zero would cross it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unclosed {
+    symbols: BTreeSet<Symbol>,
+}
+
+impl Unclosed {
+    /// Whether `order` opens beyond zero in a symbol whose close fell short.
+    pub fn holds(&self, order: &Order) -> bool {
+        match order.leg() {
+            Leg::Increasing => self.symbols.contains(order.symbol()),
+            Leg::Reducing => false,
+        }
+    }
+
+    /// Records `order`'s symbol as unclosed when it reduced and did not go out or fill whole.
+    pub fn record(&mut self, order: &Order, whole: bool) {
+        match (order.leg(), whole) {
+            (Leg::Reducing, false) => {
+                self.symbols.insert(order.symbol().clone());
+            }
+            (Leg::Reducing, true) | (Leg::Increasing, true | false) => {}
+        }
+    }
+}
+
 /// Lets each order through only when `read` vouches for its symbol and size, and for its borrow when it opens or adds to
 /// a short; a cover is never held for borrow. A fractional buy is held under the minimum at `price`; one without a price
 /// goes out for the broker to judge. An order opening beyond zero is held as unclosed after its symbol's close was held,
-/// which `orders` puts before it.
+/// which `orders` puts before it; an order adding to a holding is held when the holding after it at `price` would pass
+/// `per_name`, read from `book` and the orders passed before it, so `orders` must be built from `book`.
 pub fn guard(
     orders: Vec<Order>,
+    book: &Book,
     read: &TradabilityRead,
     per_name: DollarLimit,
     price: impl Fn(&Symbol) -> Option<Price>,
@@ -186,23 +214,29 @@ pub fn guard(
         passed: Vec::new(),
         held: Vec::new(),
     };
-    let mut unclosed = BTreeSet::new();
+    let mut unclosed = Unclosed::default();
+    // Each symbol's position once the orders passed before this one fill.
+    let mut reached: BTreeMap<Symbol, i128> = BTreeMap::new();
     for order in orders {
-        let cause = match (order.leg(), unclosed.contains(order.symbol())) {
-            (Leg::Increasing, true) => Some(GuardCause::Unclosed),
-            (Leg::Increasing, false) | (Leg::Reducing, true | false) => {
-                cause(&order, read, per_name, &price)
-            }
+        let before = *reached
+            .entry(order.symbol().clone())
+            .or_insert_with(|| book.position(order.symbol()).units());
+        let shares = i128::from(order.shares().units());
+        let resulting = match order.side() {
+            Side::Buy => before.saturating_add(shares),
+            Side::Sell => before.saturating_sub(shares),
         };
-        match (cause, order.leg()) {
-            (None, Leg::Reducing | Leg::Increasing) => guarded.passed.push(order),
-            (Some(cause), Leg::Reducing) => {
-                unclosed.insert(order.symbol().clone());
-                guarded.held.push(OrderGuarded::new(&order, cause));
+        let cause = match unclosed.holds(&order) {
+            true => Some(GuardCause::Unclosed),
+            false => cause(&order, resulting, read, per_name, &price),
+        };
+        unclosed.record(&order, cause.is_none());
+        match cause {
+            None => {
+                reached.insert(order.symbol().clone(), resulting);
+                guarded.passed.push(order);
             }
-            (Some(cause), Leg::Increasing) => {
-                guarded.held.push(OrderGuarded::new(&order, cause));
-            }
+            Some(cause) => guarded.held.push(OrderGuarded::new(&order, cause)),
         }
     }
     guarded
@@ -211,6 +245,7 @@ pub fn guard(
 /// Why `order` is held, or `None` when `read` vouches for it.
 fn cause(
     order: &Order,
+    resulting: i128,
     read: &TradabilityRead,
     per_name: DollarLimit,
     price: impl Fn(&Symbol) -> Option<Price>,
@@ -224,7 +259,7 @@ fn cause(
         (Some(Tradability::Unlisted), true | false) => return Some(GuardCause::Unlisted),
         (None, true | false) => return Some(GuardCause::Unread),
     }
-    if let Some(cause) = beyond_per_name(order, per_name, &price) {
+    if let Some(cause) = beyond_per_name(order, resulting, per_name, &price) {
         return Some(cause);
     }
     if order.borrows() {
@@ -247,18 +282,22 @@ fn cause(
     }
 }
 
-/// The cause holding an order that opens or adds to a holding worth more than `per_name` at its known price; a reducing
-/// order is never held for its size, so a holding past the limit can always be cut.
+/// The cause holding an order that opens or adds to a holding worth more than `per_name` at its known price once the
+/// position is `resulting` millionths; a reducing order is never held for its size, so a holding past the limit can
+/// always be cut.
 fn beyond_per_name(
     order: &Order,
+    resulting: i128,
     per_name: DollarLimit,
     price: impl Fn(&Symbol) -> Option<Price>,
 ) -> Option<GuardCause> {
     match order.leg() {
         Leg::Increasing => {
             let price = price(order.symbol())?;
-            // A price is at most 10^13 ticks and an order at most u64::MAX millionths, so the product fits u128.
-            let notional = DollarVolume::of(price, order.shares());
+            // A holding past one `u64` of millionths is past any limit, so saturating there holds it all the same.
+            let shares =
+                Shares::from_units(u64::try_from(resulting.unsigned_abs()).unwrap_or(u64::MAX));
+            let notional = DollarVolume::of(price, shares);
             (notional.units() > per_name.units())
                 .then_some(GuardCause::BeyondPerName { price, notional })
         }
@@ -378,7 +417,13 @@ mod tests {
                 ("ZZZZ", units),
                 ("QQQ", units),
             ]);
-            let guarded = guard(orders, &unshorted(&tradability), wide(), |_| None);
+            let guarded = guard(
+                orders,
+                &Book::default(),
+                &unshorted(&tradability),
+                wide(),
+                |_| None,
+            );
             let symbols: Vec<&str> = guarded
                 .passed()
                 .iter()
@@ -497,7 +542,7 @@ mod tests {
         let read = TradabilityRead::new(tradability, shortability);
         let short = || Holding::short(Shares::whole(2).unwrap()).unwrap();
         let causes = |book: &Book, target: Target| {
-            let guarded = guard(orders(book, &target), &read, wide(), |_| None);
+            let guarded = guard(orders(book, &target), book, &read, wide(), |_| None);
             let passed: Vec<(String, Side)> = guarded
                 .passed()
                 .iter()
@@ -596,7 +641,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let guarded = guard(orders(&book, &target), &read, wide(), |_| None);
+        let guarded = guard(orders(&book, &target), &book, &read, wide(), |_| None);
         let passed: Vec<(&str, u64)> = guarded
             .passed()
             .iter()
@@ -619,8 +664,10 @@ mod tests {
 
     /// An order opening or adding to a holding is held past the per-name limit and passes at it, and an order cutting a
     /// holding passes whatever it is worth: under a $100 limit at $10, 10 shares bought or shorted pass, 10.000001 are
-    /// held with their $100.00001, an unpriced 11 pass for the broker to judge, and 11 sold from 20 held pass; past one
-    /// order's units, a close of u64::MAX millionths passes where the open of 11 short beyond it does not.
+    /// held with their $100.00001, an unpriced 11 pass for the broker to judge, and 11 sold from 20 held pass; the limit
+    /// reads the holding after the order, so 2 more on 9 long or 9 short are held where 1 more on 9, or 10 long past 2
+    /// short, pass where 11 long past 2 short is held; past one order's units, a close of u64::MAX millionths passes
+    /// where the open of 11 short beyond it does not.
     #[test]
     fn test_an_order_past_the_per_name_limit_is_held_unless_it_cuts() {
         let limit = DollarLimit::new(Cash::from_units(100 * 1_000_000_000_000)).unwrap();
@@ -631,7 +678,7 @@ mod tests {
         );
         let causes = |book: &Book, wanted: Holding, price: &dyn Fn(&Symbol) -> Option<Price>| {
             let target = Target::new(BTreeMap::from([(symbol("A"), wanted)]));
-            guard(orders(book, &target), &read, limit, price)
+            guard(orders(book, &target), book, &read, limit, price)
                 .held()
                 .iter()
                 .map(OrderGuarded::cause)
@@ -657,6 +704,15 @@ mod tests {
             )
         };
         assert_eq!(causes(&held(20_000_000), long(9_000_000), &ten), []);
+        let eleven = [GuardCause::BeyondPerName {
+            price: Price::from_ticks(10_000_000).unwrap(),
+            notional: DollarVolume::from_units(110_000_000_000_000),
+        }];
+        assert_eq!(causes(&held(9_000_000), long(11_000_000), &ten), eleven);
+        assert_eq!(causes(&held(-9_000_000), short(11), &ten), eleven);
+        assert_eq!(causes(&held(9_000_000), long(10_000_000), &ten), []);
+        assert_eq!(causes(&held(-2_000_000), long(10_000_000), &ten), []);
+        assert_eq!(causes(&held(-2_000_000), long(11_000_000), &ten), eleven);
         assert_eq!(
             causes(&held(i128::from(u64::MAX)), short(11), &ten),
             [GuardCause::BeyondPerName {
@@ -673,11 +729,17 @@ mod tests {
         let fractionable = BTreeMap::from([(symbol("F"), Tradability::Fractionable)]);
         let price = |_: &Symbol| Some(Price::from_ticks(10_000_000).unwrap());
         let held = |order: Order, price: &dyn Fn(&Symbol) -> Option<Price>| {
-            guard(vec![order], &unshorted(&fractionable), wide(), price)
-                .held()
-                .iter()
-                .map(OrderGuarded::cause)
-                .collect::<Vec<_>>()
+            guard(
+                vec![order],
+                &Book::default(),
+                &unshorted(&fractionable),
+                wide(),
+                price,
+            )
+            .held()
+            .iter()
+            .map(OrderGuarded::cause)
+            .collect::<Vec<_>>()
         };
         let buy = |units| buys(&[("F", units)]).remove(0);
         assert_eq!(
@@ -819,6 +881,7 @@ mod tests {
         );
         let guarded = guard(
             orders(&decision.book, solution.target()),
+            &decision.book,
             &unshorted(&decision.readings),
             decision.limits.per_name(),
             price,
@@ -926,7 +989,7 @@ mod tests {
                 .map(|(raw, reading)| (symbol(raw), reading))
                 .collect();
             let orders = buys(&wanted);
-            let guarded = guard(orders.clone(), &unshorted(&tradability), wide(), |_| None);
+            let guarded = guard(orders.clone(), &Book::default(), &unshorted(&tradability), wide(), |_| None);
             let mut sorted: Vec<&Symbol> = guarded
                 .passed()
                 .iter()

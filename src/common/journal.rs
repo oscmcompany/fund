@@ -1100,6 +1100,7 @@ mod tests {
         );
         let guarded = guard(
             orders(&Book::default(), &fraction),
+            &Book::default(),
             &whole_only,
             wide,
             |_| None,
@@ -1126,6 +1127,7 @@ mod tests {
         ));
         let below = guard(
             orders(&Book::default(), &sliver),
+            &Book::default(),
             &fractionable,
             wide,
             |_| Price::from_ticks(470_000_000).ok(),

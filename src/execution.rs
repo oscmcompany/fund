@@ -1,7 +1,7 @@
 //! Takes a book to a target at a broker: each order is submitted, followed to its close, canceled when it outlives its
 //! patience, and journaled, and the fills of the orders that closed are handed back for the book.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -10,7 +10,9 @@ use tokio::time::Instant;
 use crate::broker::Broker;
 use crate::broker::BrokerError;
 use crate::common::book::{Book, Fill};
-use crate::common::guard::{GuardCause, OrderGuarded, TradabilityRead, TradabilityUnread, guard};
+use crate::common::guard::{
+    GuardCause, OrderGuarded, TradabilityRead, TradabilityUnread, Unclosed, guard,
+};
 use crate::common::journal::Observation;
 use crate::common::market::{Price, Symbol};
 use crate::common::order::{
@@ -19,7 +21,7 @@ use crate::common::order::{
 };
 use crate::common::reconcile::{Allowance, BookReconciled, reconcile};
 use crate::common::risk::DollarLimit;
-use crate::common::strategy::{Holding, Leg, Target, orders};
+use crate::common::strategy::{Holding, Target, orders};
 use crate::ingest::FetchError;
 use crate::journal::Journal;
 
@@ -183,28 +185,26 @@ pub async fn execute(
             TradabilityRead::default()
         }
     };
-    let guarded = guard(orders, &tradability, per_name, |symbol| {
+    let guarded = guard(orders, book, &tradability, per_name, |symbol| {
         prices.get(symbol).copied()
     });
-    // The symbols whose close fell short of flat, where an order opening beyond zero would cross it.
-    let mut unclosed = BTreeSet::new();
+    let mut unclosed = Unclosed::default();
     for held in guarded.held() {
         outcomes.push(OrderOutcome::Guarded(held.cause()));
         if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held.clone())) {
             return Err(JournalFailure::new(outcomes, error));
         }
     }
-    for order in guarded.passed().iter().cloned() {
-        if order.leg() == Leg::Increasing && unclosed.contains(order.symbol()) {
-            let held = OrderGuarded::new(&order, GuardCause::Unclosed);
+    for order in guarded.passed() {
+        if unclosed.holds(order) {
+            let held = OrderGuarded::new(order, GuardCause::Unclosed);
             outcomes.push(OrderOutcome::Guarded(held.cause()));
             if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held)) {
                 return Err(JournalFailure::new(outcomes, error));
             }
             continue;
         }
-        let (symbol, leg, shares) = (order.symbol().clone(), order.leg(), order.shares());
-        let request = OrderRequest::new(order, sequence.draw(journal.run_id()));
+        let request = OrderRequest::new(order.clone(), sequence.draw(journal.run_id()));
         if let Err(error) = journal.append(
             Utc::now(),
             Observation::OrderSubmitted(OrderSubmitted::of(&request)),
@@ -212,10 +212,9 @@ pub async fn execute(
             return Err(JournalFailure::new(outcomes, error));
         }
         let (observation, outcome) = follow(broker, &request, patience).await;
-        let whole = matches!(&outcome, OrderOutcome::Closed(Some(fill)) if fill.shares() == shares);
-        if leg == Leg::Reducing && !whole {
-            unclosed.insert(symbol);
-        }
+        let whole =
+            matches!(&outcome, OrderOutcome::Closed(Some(fill)) if fill.shares() == order.shares());
+        unclosed.record(order, whole);
         let stop = match outcome {
             OrderOutcome::Guarded(_) | OrderOutcome::Closed(_) | OrderOutcome::Refused => false,
             OrderOutcome::Unresolved { .. } => true,
@@ -253,9 +252,10 @@ pub enum Reconciliation {
 }
 
 /// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge tries
-/// to close every short and every position the journal expected none of, keeping the rest at the broker's count; the
-/// book returned is the broker's after those attempts. A close can be held, refused, partial or unresolved, so the
-/// caller checks `closing` before trading from that book, and refuses further trading on any divergence.
+/// to close every position the journal did not expect on the side the broker reports, and every one a `Holding` refuses,
+/// such as a fractional short, keeping the rest at the broker's count; the book returned is the broker's after those
+/// attempts. A close can be held, refused, partial or unresolved, so the caller checks `closing` before trading from
+/// that book, and refuses further trading on any divergence.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one independent input an execution runs from"
@@ -1433,9 +1433,23 @@ mod tests {
             .await
             .unwrap()
         };
+        // An unresolved order leaves the position uncertain, so the run stops with its journal rather than trade on.
+        let settled = |stage: &str, outcomes: &[OrderOutcome]| {
+            for outcome in outcomes {
+                match outcome {
+                    OrderOutcome::Unresolved { .. } => panic!(
+                        "{stage} left {outcome:?}; resolve SPY on the paper account by hand, journal at {}",
+                        directory.display()
+                    ),
+                    OrderOutcome::Guarded(_) | OrderOutcome::Closed(_) | OrderOutcome::Refused => {}
+                }
+            }
+        };
         let opened = trade(&before, shorted).await;
+        settled("the short", &opened);
         let short = account.book().await.unwrap();
         let covered = trade(&short, holdings).await;
+        settled("the cover", &covered);
         let after = account.book().await.unwrap();
         let read = journal_records(&directory)
             .into_iter()
@@ -1599,7 +1613,7 @@ mod tests {
                 }
             }
             let read = TradabilityRead::new(readings, BTreeMap::new());
-            let guarded = guard(orders(&book, &target), &read, wide(), |symbol| prices.get(symbol).copied());
+            let guarded = guard(orders(&book, &target), &book, &read, wide(), |symbol| prices.get(symbol).copied());
             let direct = book.combine(concatenate(guarded.passed().iter().map(|order| {
                 Book::of(
                     &Fill::new(

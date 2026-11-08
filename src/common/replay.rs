@@ -8,7 +8,9 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
-use crate::common::guard::{OrderGuarded, Tradability, TradabilityRead, guard};
+use crate::common::guard::{
+    GuardCause, OrderGuarded, Tradability, TradabilityRead, Unclosed, guard,
+};
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::BarInterval;
@@ -280,7 +282,8 @@ impl Replay {
         &self.restraints
     }
 
-    /// Under restraint, each order the guard held and the decision it came from.
+    /// Each order held back and when: by the guard at its decision under restraint, or as unclosed at the instant it
+    /// was due to fill after its symbol's close did not.
     pub fn held(&self) -> &[(DateTime<Utc>, OrderGuarded)] {
         &self.held
     }
@@ -443,11 +446,19 @@ impl<S: Strategy> Replayer<S> {
         } else {
             Vec::new()
         };
+        let mut unclosed = Unclosed::default();
         for order in pending {
+            if unclosed.holds(&order) {
+                let held = OrderGuarded::new(&order, GuardCause::Unclosed);
+                replay.held.push((ends, held));
+                continue;
+            }
             let opening = bars
                 .iter()
                 .find(|bar| bar.symbol() == order.symbol() && bar.interval() == self.decision);
-            match self.fill(&replay.book, order, opening, ends) {
+            let filled = self.fill(&replay.book, order.clone(), opening, ends);
+            unclosed.record(&order, filled.is_ok());
+            match filled {
                 Ok(fill) => {
                     replay.book = replay.book.combine(Book::of(&fill));
                     replay.fills.push(fill);
@@ -491,8 +502,13 @@ impl<S: Strategy> Replayer<S> {
                             replay.restraints.insert(ends, Ok(solution.cuts().to_vec()));
                             let wanted = orders(&replay.book, solution.target());
                             let tradability = restraint.tradability_of(&wanted);
-                            let guarded =
-                                guard(wanted, &tradability, restraint.limits.per_name(), price);
+                            let guarded = guard(
+                                wanted,
+                                &replay.book,
+                                &tradability,
+                                restraint.limits.per_name(),
+                                price,
+                            );
                             replay
                                 .held
                                 .extend(guarded.held().iter().cloned().map(|held| (ends, held)));
@@ -1206,6 +1222,38 @@ mod tests {
             ]
         );
         assert!(replay.fills().is_empty());
+    }
+
+    /// A cover that cannot fill holds the buy past zero behind it, so the book stays short rather than crossing.
+    #[test]
+    fn test_a_failed_cover_holds_the_buy_beyond_zero() {
+        let short = Fill::new(
+            day(-1),
+            symbol("AAPL"),
+            Side::Sell,
+            Shares::whole(2).unwrap(),
+            Price::from_ticks(10_000_000).unwrap(),
+            DollarVolume::from_units(0),
+        )
+        .unwrap();
+        let book = Book::funded(cash(80)).combine(Book::of(&short));
+        let replay = replayer(Hold(vec![("AAPL", 1)]))
+            .act(
+                Replay::open(book),
+                [
+                    daily("AAPL", 0, 60_000_000, 60_000_000),
+                    daily("AAPL", 1, 60_000_000, 60_000_000),
+                ],
+            )
+            .unwrap();
+        assert_eq!(replay.book().position(&symbol("AAPL")).units(), -2_000_000);
+        assert!(replay.fills().is_empty());
+        let held: Vec<_> = replay
+            .held()
+            .iter()
+            .map(|(at, held)| (*at, held.cause()))
+            .collect();
+        assert_eq!(held, [(day(1), GuardCause::Unclosed)]);
     }
 
     /// A buy costing exactly the cash held fills; a tick more would not.

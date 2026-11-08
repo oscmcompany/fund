@@ -178,8 +178,20 @@ struct PositionPayload {
 }
 
 /// A position's side as Alpaca documents it, read so a quantity whose sign disagrees is refused rather than trusted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 enum AlpacaPositionSide {
     Long,
     Short,
@@ -739,6 +751,17 @@ mod tests {
         }
         assert!(serde_json::from_str::<AlpacaOrderStatus>(r#""Filled""#).is_err());
         assert!(serde_json::from_str::<AlpacaAssetStatus>(r#""delisted""#).is_err());
+        let sides: Vec<&str> = AlpacaPositionSide::iter().map(Into::into).collect();
+        assert_eq!(sides, ["long", "short"]);
+        for side in AlpacaPositionSide::iter() {
+            let named = format!("\"{side}\"");
+            assert_eq!(
+                serde_json::from_str::<AlpacaPositionSide>(&named).unwrap(),
+                side
+            );
+            assert_eq!(side.to_string().parse(), Ok(side));
+        }
+        assert!(serde_json::from_str::<AlpacaPositionSide>(r#""Long""#).is_err());
     }
 
     #[test]
