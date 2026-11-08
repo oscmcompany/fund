@@ -74,6 +74,36 @@ fn test_each_unpinned_date_fails_and_is_named() {
             "#!/usr/bin/env bash\nduckdb -c \"SELECT extract(day FROM timestamp) FROM quotes\"\n",
             2,
         ),
+        (
+            "inline.sql",
+            "SELECT timestamp::DATE FROM quotes; SET TimeZone = 'UTC';\n",
+            1,
+        ),
+        (
+            "upper.rs",
+            "const SQL: &str = \"SELECT CAST(timestamp AS DATE) FROM quotes\";\n",
+            1,
+        ),
+        (
+            "upper.sh",
+            "duckdb -c \"SELECT CAST(timestamp AS DATE) FROM quotes\"\n",
+            1,
+        ),
+        (
+            "lower.sh",
+            "duckdb -c \"SELECT timestamp::date FROM quotes\"\n",
+            1,
+        ),
+        (
+            "part.sh",
+            "duckdb -c \"SELECT day(timestamp) FROM quotes\"\n",
+            1,
+        ),
+        (
+            "connections.sh",
+            "duckdb -c \"SET TimeZone = 'UTC'; SELECT 1\"\nduckdb -c \"SELECT timestamp::DATE FROM quotes\"\n",
+            2,
+        ),
     ] {
         let (code, output) = check(&[(name, contents)]);
         assert_eq!(code, 3, "{name}: {output}");
@@ -117,6 +147,19 @@ fn test_a_pinned_or_converted_date_passes() {
         ),
         ("unread.rs", "fn main() { let _ = timestamp::DATE; }\n"),
         (
+            "connection.sh",
+            "duckdb -c \"SET TimeZone = 'UTC'; SELECT timestamp::DATE FROM quotes\"\n",
+        ),
+        (
+            "inline.sql",
+            "SET TimeZone = 'UTC'; SELECT timestamp AT TIME ZONE 'UTC' FROM quotes;\n\
+             SELECT timestamp::DATE FROM quotes;\n",
+        ),
+        (
+            "heredoc.sh",
+            "duckdb <<'SQL'\nSET TimeZone = 'UTC';\nSELECT timestamp::DATE FROM quotes;\nSQL\n",
+        ),
+        (
             "commented.sh",
             "# SELECT timestamp::DATE\nduckdb -c \"SELECT 1\"\n",
         ),
@@ -127,7 +170,7 @@ fn test_a_pinned_or_converted_date_passes() {
         ("notes.txt", "SELECT timestamp::DATE FROM quotes;\n"),
     ]);
     assert_eq!(code, 0, "{output}");
-    assert!(output.contains("in 8 files"), "{output}");
+    assert!(output.contains("in 11 files"), "{output}");
 }
 
 #[test]
