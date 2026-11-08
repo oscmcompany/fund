@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Reconciles one host's EC2 instance, IAM and security group for a role and a profile, a scheduled role's start and stop
-# schedules, the archiver's archive bucket lifecycle rules and the researcher's profile bucket lifecycle rules.
+# schedules, the archiver's archive bucket lifecycle rules, the researcher's profile bucket lifecycle rules, and the
+# host's alarms on its profile's paging topic.
 # Dry run unless --apply; a setting that cannot change in place is reported as drift and refused, never adopted.
 set -euo pipefail
 
@@ -15,10 +16,11 @@ BOOTSTRAP_POLL_SECONDS="${BOOTSTRAP_POLL_SECONDS:-30}"
 BOOTSTRAP_BACKSTOP_MINUTES=$((BOOTSTRAP_POLLS * BOOTSTRAP_POLL_SECONDS / 60 + 90))
 ROLE=""
 PROFILE=""
+ALERT_EMAIL=""
 APPLY=false
 
 usage() {
-  echo "Usage: $(basename "$0") --role <archiver|trader|researcher> --profile <profile> [--apply]"
+  echo "Usage: $(basename "$0") --role <archiver|trader|researcher> --profile <profile> [--alert-email <address>] [--apply]"
   exit "${1:-0}"
 }
 
@@ -30,6 +32,9 @@ while [[ $# -gt 0 ]]; do
     --profile)
       [[ -z "${2:-}" ]] && { echo "Error: --profile requires a value" >&2; usage 1; }
       PROFILE="$2"; shift 2 ;;
+    --alert-email)
+      [[ -z "${2:-}" ]] && { echo "Error: --alert-email requires a value" >&2; usage 1; }
+      ALERT_EMAIL="$2"; shift 2 ;;
     --apply) APPLY=true; shift ;;
     -h|--help) usage ;;
     *) echo "Error: unknown option '$1'" >&2; usage 1 ;;
@@ -37,7 +42,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Schedules are Eastern wall clock, clear of the 01:00-02:59 a transition skips or repeats: the archiver starts at
-# 03:00, the trader an hour before the 09:30 open, and each stop is a backstop behind the run's own power-off.
+# 03:00, the trader an hour before the 09:30 open every day (a closed session exits at once, so one alarm covers every
+# day), and each stop is a backstop behind the run's own power-off.
 # The researcher has no schedule: an operator holds and starts it with `host/researcher`, which bounds its run.
 SCHEDULE_TIMEZONE="America/New_York"
 case "$ROLE" in
@@ -54,8 +60,8 @@ case "$ROLE" in
     ARCHITECTURE="arm64"
     VOLUME_SIZE_GB=50
     BUILD="--bin trader"
-    START_EXPRESSION="cron(30 8 ? * MON-FRI *)"
-    STOP_EXPRESSION="cron(30 16 ? * MON-FRI *)"
+    START_EXPRESSION="cron(30 8 * * ? *)"
+    STOP_EXPRESSION="cron(30 16 * * ? *)"
     ;;
   researcher)
     INSTANCE_TYPE="r6i.2xlarge"
@@ -84,6 +90,8 @@ fi
 
 SLUG="${PROFILE//[\/.]/-}"
 NAME="fund-${ROLE}-${SLUG}"
+# One namespace per host, since PutMetricData can be conditioned on the namespace but not on dimensions.
+NAMESPACE="fund/${ROLE}/${PROFILE}"
 PROFILE_BUCKET="oscm-fund-${SLUG}"
 if [[ ${#NAME} -gt 54 ]]; then
   echo "Error: \"$NAME\" is ${#NAME} characters; ${NAME}-scheduler would exceed IAM's 64" >&2
@@ -317,7 +325,9 @@ ${ROLE_STATEMENTS}
      "NotResource": "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/secretspec/fund/${PROFILE}/*"},
     {"Sid": "WriteOwnRecords", "Effect": "Allow", "Action": ["s3:PutObject"],
      "Resource": ["arn:aws:s3:::${PROFILE_BUCKET}/records/journal/producer=${ROLE}/*",
-                  "arn:aws:s3:::${PROFILE_BUCKET}/records/logs/producer=${ROLE}/*"]}
+                  "arn:aws:s3:::${PROFILE_BUCKET}/records/logs/producer=${ROLE}/*"]},
+    {"Sid": "PublishRunOutcome", "Effect": "Allow", "Action": ["cloudwatch:PutMetricData"], "Resource": "*",
+     "Condition": {"StringEquals": {"cloudwatch:namespace": "${NAMESPACE}"}}}
 ]}
 JSON
 )"
@@ -445,6 +455,101 @@ CLOUDINIT
   fi
 fi
 
+ALARM_TOPIC="fund-alarms-${SLUG}"
+ALARM_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${ALARM_TOPIC}"
+
+# Writes alarm `name` paging the profile's topic; `put-metric-alarm` replaces an existing one whole.
+put_alarm() {
+  local name="$1" description="$2" summary="$3" found
+  shift 3
+  found="$(aws cloudwatch describe-alarms --region "$REGION" --alarm-names "$name" \
+    --query 'MetricAlarms[].AlarmName' --output text)"
+  if [[ "$found" == "$name" ]]; then
+    changed "refresh alarm $name: $summary"
+  else
+    changed "create alarm $name: $summary"
+  fi
+  [[ "$APPLY" == true ]] || return 0
+  aws cloudwatch put-metric-alarm --region "$REGION" --alarm-name "$name" --alarm-description "$description" \
+    --alarm-actions "$ALARM_TOPIC_ARN" "$@"
+}
+
+# run-host publishes `RunCompleted` or `RunFailed` to the host's namespace as a run exits; every role pages on a
+# failure, and a scheduled one also on a missing success, the only sign of a box that never booted or reached the CLI.
+reconcile_alarms() {
+  local lookup owner listed="" confirmed pending about completed
+  step "Alarms for $NAME on $ALARM_TOPIC"
+  if lookup="$(aws sns get-topic-attributes --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" 2>&1 >/dev/null)"; then
+    owner="$(aws sns list-tags-for-resource --region "$REGION" --resource-arn "$ALARM_TOPIC_ARN" \
+      --query "Tags[?Key=='fund-profile'].Value" --output text)"
+    [[ "$owner" == "None" ]] && owner=""
+    if [[ "$owner" != "$PROFILE" ]]; then
+      echo "Error: topic $ALARM_TOPIC belongs to profile ${owner:-<untagged>}, which shares this profile's slug" >&2
+      exit 1
+    fi
+    unchanged "topic $ALARM_TOPIC"
+    listed="$(aws sns list-subscriptions-by-topic --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" \
+      --query "Subscriptions[?Protocol=='email'].[Endpoint,SubscriptionArn]" --output text)"
+  elif [[ "$lookup" == *"(NotFound)"* ]]; then
+    changed "create topic $ALARM_TOPIC"
+    if [[ "$APPLY" == true ]]; then
+      aws sns create-topic --region "$REGION" --name "$ALARM_TOPIC" --tags "Key=fund-profile,Value=$PROFILE" >/dev/null
+    fi
+  else
+    echo "Error: could not read topic $ALARM_TOPIC: $lookup" >&2
+    exit 1
+  fi
+  [[ "$listed" == "None" ]] && listed=""
+  # An unconfirmed email is listed with the ARN `PendingConfirmation` and is paged nothing.
+  confirmed="$(awk -F'\t' 'NF && $2 != "PendingConfirmation" { print $1 }' <<<"$listed")"
+  pending="$(awk -F'\t' 'NF && $2 == "PendingConfirmation" { print $1 }' <<<"$listed")"
+  if [[ -n "$ALERT_EMAIL" ]] && grep -qxF -- "$ALERT_EMAIL" <<<"$confirmed"; then
+    unchanged "$ALERT_EMAIL subscribed"
+  elif [[ -n "$ALERT_EMAIL" ]] && grep -qxF -- "$ALERT_EMAIL" <<<"$pending"; then
+    drift "$ALERT_EMAIL has not confirmed the email AWS sent, so $ALARM_TOPIC pages no one there until it does"
+  elif [[ -n "$ALERT_EMAIL" ]]; then
+    changed "subscribe $ALERT_EMAIL, which is paged only once it confirms the email AWS sends"
+    if [[ "$APPLY" == true ]]; then
+      aws sns subscribe --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" --protocol email \
+        --notification-endpoint "$ALERT_EMAIL" >/dev/null
+    fi
+  elif [[ -n "$confirmed" ]]; then
+    unchanged "subscribed: ${confirmed//$'\n'/, }"
+  elif [[ -n "$pending" ]]; then
+    drift "${pending//$'\n'/, } has not confirmed the email AWS sent, so $ALARM_TOPIC pages no one there until it does"
+  else
+    echo "Error: $ALARM_TOPIC has no email subscription, so its alarms would page no one; pass --alert-email" >&2
+    exit 1
+  fi
+
+  about="the $PROFILE $ROLE on instance ${INSTANCE_ID:-not yet launched}; read"
+  about+=" s3://${PROFILE_BUCKET}/records/logs/producer=${ROLE}/ first. Managed by host/provision-host."
+  put_alarm "$NAME-run-failed" "A run exited non-zero on $about" "RunFailed in $NAMESPACE at least 1 in 5 minutes" \
+    --namespace "$NAMESPACE" --metric-name RunFailed \
+    --statistic Sum --period 300 --evaluation-periods 1 --threshold 1 \
+    --comparison-operator GreaterThanOrEqualToThreshold --treat-missing-data notBreaching
+  # Hourly rather than daily, since a day-long sliding window breaches whenever a run finishes later than the last.
+  completed="{\"Namespace\":\"$NAMESPACE\",\"MetricName\":\"RunCompleted\"}"
+  # Successes land at most 29 hours apart for the archiver (03:00 to the 08:00 stop) and 32 for the trader, which
+  # boots daily and finishes by 09:00 on a closed session or by the 16:30 stop on an open one.
+  case "$ROLE" in
+    archiver) window=32 ;;
+    trader) window=36 ;;
+    researcher) window="" ;;
+  esac
+  if [[ -n "$window" ]]; then
+    put_alarm "$NAME-run-missing" "No success in $window hours on $about" \
+      "no RunCompleted in $NAMESPACE in $window hours" \
+      --metrics "[{\"Id\":\"completed\",\"ReturnData\":true,\"MetricStat\":{\"Metric\":$completed,\"Period\":3600,\"Stat\":\"Sum\"}}]" \
+      --evaluation-periods "$window" --datapoints-to-alarm "$window" --threshold 1 \
+      --comparison-operator LessThanThreshold --treat-missing-data breaching
+  fi
+  if [[ "$DRIFT" -gt 0 ]]; then
+    echo "Error: $DRIFT drifted field(s) above; confirm the subscription, then re-run" >&2
+    exit 1
+  fi
+}
+
 # An on-demand role keeps no schedule, so one an earlier provisioning left is removed.
 if [[ -z "$START_EXPRESSION" ]]; then
   step "No schedules for $NAME"
@@ -461,6 +566,7 @@ if [[ -z "$START_EXPRESSION" ]]; then
       exit 1
     fi
   done
+  reconcile_alarms
   step "Done"
   echo "  Instance: ${INSTANCE_ID}"
   echo "  Start:    on demand, held by host/researcher"
@@ -532,6 +638,7 @@ put_schedule "$NAME-start" "$START_EXPRESSION" startInstances \
 put_schedule "$NAME-stop" "$STOP_EXPRESSION" stopInstances \
   "Stop the $PROFILE $ROLE if its run has not. Managed by host/provision-host."
 
+reconcile_alarms
 step "Done"
 echo "  Instance: ${INSTANCE_ID}"
 echo "  Start:    ${START_EXPRESSION} ${SCHEDULE_TIMEZONE}"

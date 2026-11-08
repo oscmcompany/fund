@@ -515,8 +515,9 @@ fn test_every_host_is_a_role_of_both_scripts() {
     }
 }
 
-/// Stands in for the `aws` CLI: answers each call from `STUB_*`, saves every policy, schedule target and lifecycle
-/// configuration it is handed under `STUB_DIRECTORY`, and logs each call's service and operation to `calls`.
+/// Stands in for the `aws` CLI: answers each call from `STUB_*`, saves every policy, schedule target, lifecycle
+/// configuration, alarm and subscription it is handed under `STUB_DIRECTORY`, and logs each call's service and operation
+/// to `calls`.
 const STUB: &str = r#"#!/usr/bin/env bash
 echo "$1 $2" >> "$STUB_DIRECTORY/calls"
 value_of() {
@@ -549,6 +550,18 @@ case "$1 $2" in
   "s3api put-bucket-lifecycle-configuration")
     value_of --lifecycle-configuration "$@" > "$STUB_DIRECTORY/lifecycle-$(value_of --bucket "$@").json"
     value_of --transition-default-minimum-object-size "$@" > "$STUB_DIRECTORY/lifecycle-$(value_of --bucket "$@").size" ;;
+  "sns get-topic-attributes")
+    [[ -n "${STUB_NO_TOPIC+set}" ]] || exit 0
+    echo "An error occurred (NotFound) when calling the GetTopicAttributes operation" >&2; exit 254 ;;
+  "sns list-tags-for-resource") echo "${STUB_TOPIC_OWNER}" ;;
+  "sns list-subscriptions-by-topic")
+    printf '%b\n' "${STUB_SUBSCRIBED-pager@example.com\tarn:aws:sns:us-east-1:123456789012:fund-alarms-production:1}" ;;
+  "sns subscribe") value_of --notification-endpoint "$@" >> "$STUB_DIRECTORY/subscribed" ;;
+  "cloudwatch describe-alarms") echo "${STUB_ALARMS:-}" ;;
+  "cloudwatch put-metric-alarm")
+    name="$(value_of --alarm-name "$@")"
+    value_of --metrics "$@" > "$STUB_DIRECTORY/alarm-$name.metrics"
+    printf '%s\n' "$@" > "$STUB_DIRECTORY/alarm-$name.arguments" ;;
   "scheduler create-schedule" | "scheduler update-schedule")
     value_of --target "$@" > "$STUB_DIRECTORY/target-$(value_of --name "$@").json"
     echo "$(value_of --schedule-expression "$@") $(value_of --schedule-expression-timezone "$@")" \
@@ -557,7 +570,8 @@ case "$1 $2" in
 esac
 "#;
 
-/// A run of the provisioner for the archiver under `profile` with `--apply`, the stub answering from `environment`.
+/// A run of the provisioner for the archiver under `profile`, with `--apply` unless planned, the stub answering from
+/// `environment`.
 struct Provisioned {
     code: i32,
     output: String,
@@ -570,6 +584,13 @@ impl Provisioned {
     }
 
     fn run_role(role: &str, profile: &str, environment: &[(&str, &str)]) -> Self {
+        Self::invoke(
+            &["--role", role, "--profile", profile, "--apply"],
+            environment,
+        )
+    }
+
+    fn invoke(arguments: &[&str], environment: &[(&str, &str)]) -> Self {
         let directory =
             std::env::temp_dir().join(format!("provision-host-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -584,11 +605,17 @@ impl Provisioned {
             std::fs::set_permissions(&path, permissions).unwrap();
         }
         let path = format!("{}:{}", directory.display(), std::env::var("PATH").unwrap());
+        let profile = arguments
+            .iter()
+            .skip_while(|argument| **argument != "--profile")
+            .nth(1)
+            .unwrap();
         let output = Command::new("bash")
             .arg(script("provision-host"))
-            .args(["--role", role, "--profile", profile, "--apply"])
+            .args(arguments)
             .env("PATH", path)
             .env("STUB_DIRECTORY", &directory)
+            .env("STUB_TOPIC_OWNER", profile)
             .env("BOOTSTRAP_POLL_SECONDS", "0")
             .envs(environment.iter().copied())
             .output()
@@ -615,6 +642,36 @@ impl Provisioned {
     fn json(&self, name: &str) -> serde_json::Value {
         let text = std::fs::read_to_string(self.directory.join(name)).unwrap();
         serde_json::from_str(&text).unwrap_or_else(|error| panic!("{name}: {error}: {text}"))
+    }
+
+    /// The flags alarm `name` was last written with, each beside its value, and apart from them its `--metrics` if any.
+    fn alarm(&self, name: &str) -> (Vec<(String, String)>, Option<serde_json::Value>) {
+        let read = |extension: &str| {
+            std::fs::read_to_string(self.directory.join(format!("alarm-{name}.{extension}")))
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        let arguments = read("arguments");
+        let arguments: Vec<&str> = arguments.lines().collect();
+        let mut flags = Vec::new();
+        let mut index = arguments
+            .iter()
+            .position(|argument| argument.starts_with("--"))
+            .unwrap();
+        while index < arguments.len() {
+            let flag = arguments[index];
+            let mut values = Vec::new();
+            index += 1;
+            while index < arguments.len() && !arguments[index].starts_with("--") {
+                values.push(arguments[index]);
+                index += 1;
+            }
+            if flag != "--metrics" {
+                flags.push((flag.to_string(), values.join(" ")));
+            }
+        }
+        let metrics = read("metrics");
+        let metrics = (!metrics.trim().is_empty()).then(|| serde_json::from_str(&metrics).unwrap());
+        (flags, metrics)
     }
 
     /// The expression and timezone the schedule `name` was last written with, space-separated.
@@ -1189,11 +1246,11 @@ fn test_a_new_trader_reads_its_playbook_and_writes_only_its_own_records() {
     );
     assert_eq!(
         provisioned.schedule("fund-trader-development-a-b-start"),
-        "cron(30 8 ? * MON-FRI *) America/New_York"
+        "cron(30 8 * * ? *) America/New_York"
     );
     assert_eq!(
         provisioned.schedule("fund-trader-development-a-b-stop"),
-        "cron(30 16 ? * MON-FRI *) America/New_York"
+        "cron(30 16 * * ? *) America/New_York"
     );
 }
 
@@ -1614,4 +1671,563 @@ fn test_the_trader_sets_no_lifecycle() {
         "{:?}",
         provisioned.calls()
     );
+}
+
+/// Each flag of an alarm beside its value, as `Provisioned::alarm` reads them.
+fn flags(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(flag, value)| (flag.to_string(), value.to_string()))
+        .collect()
+}
+
+#[test]
+fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() {
+    let archiver = Provisioned::run("production", &[]);
+    assert_eq!(archiver.code, 0, "{}", archiver.output);
+    let about = "the production archiver on instance i-0new; read \
+                 s3://oscm-fund-production/records/logs/producer=archiver/ first. Managed by host/provision-host.";
+    let topic = "arn:aws:sns:us-east-1:123456789012:fund-alarms-production";
+    assert_eq!(
+        archiver.alarm("fund-archiver-production-run-failed"),
+        (
+            flags(&[
+                ("--region", "us-east-1"),
+                ("--alarm-name", "fund-archiver-production-run-failed"),
+                (
+                    "--alarm-description",
+                    &format!("A run exited non-zero on {about}")
+                ),
+                ("--alarm-actions", topic),
+                ("--namespace", "fund/archiver/production"),
+                ("--metric-name", "RunFailed"),
+                ("--statistic", "Sum"),
+                ("--period", "300"),
+                ("--evaluation-periods", "1"),
+                ("--threshold", "1"),
+                ("--comparison-operator", "GreaterThanOrEqualToThreshold"),
+                ("--treat-missing-data", "notBreaching"),
+            ]),
+            None
+        )
+    );
+    let completed =
+        |namespace: &str| serde_json::json!({"Namespace": namespace, "MetricName": "RunCompleted"});
+    let (missing, metrics) = archiver.alarm("fund-archiver-production-run-missing");
+    assert_eq!(
+        missing[1..],
+        flags(&[
+            ("--alarm-name", "fund-archiver-production-run-missing"),
+            (
+                "--alarm-description",
+                &format!("No success in 32 hours on {about}")
+            ),
+            ("--alarm-actions", topic),
+            ("--evaluation-periods", "32"),
+            ("--datapoints-to-alarm", "32"),
+            ("--threshold", "1"),
+            ("--comparison-operator", "LessThanThreshold"),
+            ("--treat-missing-data", "breaching"),
+        ])
+    );
+    assert_eq!(
+        metrics.unwrap(),
+        serde_json::json!([{"Id": "completed", "ReturnData": true, "MetricStat": {
+            "Metric": completed("fund/archiver/production"), "Period": 3600, "Stat": "Sum"}}])
+    );
+
+    let trader = Provisioned::run_role("trader", "development/a.b", &[]);
+    assert_eq!(trader.code, 0, "{}", trader.output);
+    let (missing, metrics) = trader.alarm("fund-trader-development-a-b-run-missing");
+    assert_eq!(
+        missing[3..],
+        flags(&[
+            (
+                "--alarm-actions",
+                "arn:aws:sns:us-east-1:123456789012:fund-alarms-development-a-b"
+            ),
+            ("--evaluation-periods", "36"),
+            ("--datapoints-to-alarm", "36"),
+            ("--threshold", "1"),
+            ("--comparison-operator", "LessThanThreshold"),
+            ("--treat-missing-data", "breaching"),
+        ])
+    );
+    assert_eq!(
+        metrics.unwrap(),
+        serde_json::json!([
+            {"Id": "completed", "ReturnData": true, "MetricStat": {
+                "Metric": completed("fund/trader/development/a.b"), "Period": 3600, "Stat": "Sum"}}
+        ])
+    );
+
+    let researcher = Provisioned::run_role("researcher", "production", &[]);
+    assert_eq!(researcher.code, 0, "{}", researcher.output);
+    let mut written: Vec<String> = std::fs::read_dir(&researcher.directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("alarm-"))
+        .collect();
+    written.sort();
+    assert_eq!(
+        written,
+        [
+            "alarm-fund-researcher-production-run-failed.arguments",
+            "alarm-fund-researcher-production-run-failed.metrics",
+        ]
+    );
+
+    for (provisioned, role, namespace) in [
+        (&archiver, "archiver", "fund/archiver/production"),
+        (&trader, "trader", "fund/trader/development/a.b"),
+        (&researcher, "researcher", "fund/researcher/production"),
+    ] {
+        let grant = provisioned.json(&format!("policy-{role}.json"));
+        let publishing: Vec<&serde_json::Value> = grant["Statement"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|statement| statement["Action"].to_string().contains("cloudwatch:"))
+            .collect();
+        assert_eq!(
+            publishing,
+            [
+                &serde_json::json!({"Sid": "PublishRunOutcome", "Effect": "Allow",
+                "Action": ["cloudwatch:PutMetricData"], "Resource": "*",
+                "Condition": {"StringEquals": {"cloudwatch:namespace": namespace}}})
+            ],
+            "{role}"
+        );
+    }
+}
+
+#[test]
+fn test_the_plan_names_each_alarm_and_writes_nothing() {
+    let planned = Provisioned::invoke(
+        &[
+            "--role",
+            "archiver",
+            "--profile",
+            "production",
+            "--alert-email",
+            "new@example.com",
+        ],
+        &[
+            ("STUB_NO_TOPIC", ""),
+            ("STUB_ALARMS", "fund-archiver-production-run-failed"),
+        ],
+    );
+    assert_eq!(planned.code, 0, "{}", planned.output);
+    let alarms: Vec<&str> = planned
+        .output
+        .lines()
+        .skip_while(|line| !line.starts_with("==> Alarms"))
+        .take_while(|line| !line.starts_with("==> Done"))
+        .collect();
+    assert_eq!(
+        alarms,
+        [
+            "==> Alarms for fund-archiver-production on fund-alarms-production",
+            "    WOULD CHANGE: create topic fund-alarms-production",
+            "    WOULD CHANGE: subscribe new@example.com, which is paged only once it confirms the email AWS sends",
+            "    WOULD CHANGE: refresh alarm fund-archiver-production-run-failed: RunFailed in fund/archiver/production at least 1 in 5 minutes",
+            "    WOULD CHANGE: create alarm fund-archiver-production-run-missing: no RunCompleted in fund/archiver/production in 32 hours",
+            "",
+        ]
+    );
+    for call in planned.calls() {
+        assert!(
+            ![
+                "sns create-topic",
+                "sns subscribe",
+                "cloudwatch put-metric-alarm"
+            ]
+            .contains(&call.as_str()),
+            "{call}"
+        );
+    }
+
+    let trader = Provisioned::invoke(
+        &[
+            "--role",
+            "trader",
+            "--profile",
+            "production",
+            "--alert-email",
+            "pager@example.com",
+        ],
+        &[],
+    );
+    assert_eq!(trader.code, 0, "{}", trader.output);
+    for line in [
+        "    ok: topic fund-alarms-production",
+        "    ok: pager@example.com subscribed",
+        "    WOULD CHANGE: create alarm fund-trader-production-run-missing: no RunCompleted in fund/trader/production in 36 hours",
+    ] {
+        assert!(
+            trader.output.lines().any(|output| output == line),
+            "{line}: {}",
+            trader.output
+        );
+    }
+
+    let researcher = Provisioned::invoke(&["--role", "researcher", "--profile", "production"], &[]);
+    assert_eq!(researcher.code, 0, "{}", researcher.output);
+    assert!(
+        researcher
+            .output
+            .contains("    ok: subscribed: pager@example.com"),
+        "{}",
+        researcher.output
+    );
+    assert!(
+        researcher.output.contains("run-failed"),
+        "{}",
+        researcher.output
+    );
+    assert!(
+        !researcher.output.contains("run-missing"),
+        "{}",
+        researcher.output
+    );
+}
+
+#[test]
+fn test_a_topic_without_a_subscriber_stops_before_any_alarm() {
+    let unsubscribed = Provisioned::run("production", &[("STUB_SUBSCRIBED", "")]);
+    assert_eq!(unsubscribed.code, 1, "{}", unsubscribed.output);
+    assert!(
+        unsubscribed.output.contains(
+            "Error: fund-alarms-production has no email subscription, so its alarms would page no one; \
+             pass --alert-email"
+        ),
+        "{}",
+        unsubscribed.output
+    );
+    assert!(
+        !unsubscribed
+            .calls()
+            .contains(&"cloudwatch put-metric-alarm".to_string()),
+        "{:?}",
+        unsubscribed.calls()
+    );
+
+    let subscribing = Provisioned::invoke(
+        &[
+            "--role",
+            "archiver",
+            "--profile",
+            "production",
+            "--alert-email",
+            "new@example.com",
+            "--apply",
+        ],
+        &[("STUB_SUBSCRIBED", "")],
+    );
+    assert_eq!(subscribing.code, 0, "{}", subscribing.output);
+    assert_eq!(
+        std::fs::read_to_string(subscribing.directory.join("subscribed")).unwrap(),
+        "new@example.com\n"
+    );
+    assert!(
+        subscribing.output.contains(
+            "    CHANGED: subscribe new@example.com, which is paged only once it confirms the email AWS sends"
+        ) && !subscribing.output.contains("DRIFT"),
+        "{}",
+        subscribing.output
+    );
+}
+
+#[test]
+fn test_an_unconfirmed_subscription_is_drift_and_never_resubscribed() {
+    let pending = "pager@example.com\tPendingConfirmation";
+    for arguments in [
+        &["--alert-email", "pager@example.com", "--apply"][..],
+        &["--apply"][..],
+    ] {
+        let provisioned = Provisioned::invoke(
+            &[
+                &["--role", "archiver", "--profile", "production"][..],
+                arguments,
+            ]
+            .concat(),
+            &[("STUB_SUBSCRIBED", pending)],
+        );
+        assert_eq!(provisioned.code, 1, "{arguments:?}: {}", provisioned.output);
+        assert!(
+            provisioned.output.lines().any(|line| line
+                == "    DRIFT: pager@example.com has not confirmed the email AWS sent, so \
+                    fund-alarms-production pages no one there until it does"),
+            "{arguments:?}: {}",
+            provisioned.output
+        );
+        assert!(
+            !provisioned.output.contains("has no email subscription")
+                && !provisioned
+                    .output
+                    .contains("ok: pager@example.com subscribed")
+                && !provisioned.output.contains("ok: subscribed:"),
+            "{arguments:?}: {}",
+            provisioned.output
+        );
+        assert!(
+            !provisioned.calls().contains(&"sns subscribe".to_string()),
+            "{arguments:?}: {:?}",
+            provisioned.calls()
+        );
+    }
+}
+
+#[test]
+fn test_a_topic_another_profile_owns_is_refused_before_any_alarm() {
+    for owner in ["development/a-b", ""] {
+        let refused = Provisioned::invoke(
+            &[
+                "--role",
+                "trader",
+                "--profile",
+                "development/a.b",
+                "--alert-email",
+                "new@example.com",
+                "--apply",
+            ],
+            &[("STUB_TOPIC_OWNER", owner)],
+        );
+        assert_eq!(refused.code, 1, "{owner}: {}", refused.output);
+        let expected = format!(
+            "Error: topic fund-alarms-development-a-b belongs to profile {}, which shares this profile's slug",
+            if owner.is_empty() {
+                "<untagged>"
+            } else {
+                owner
+            }
+        );
+        assert!(
+            refused.output.lines().any(|line| line == expected),
+            "{owner}: {}",
+            refused.output
+        );
+        let calls = refused.calls();
+        assert!(
+            calls.contains(&"sns list-tags-for-resource".to_string())
+                && !calls.contains(&"sns subscribe".to_string())
+                && !calls.contains(&"cloudwatch put-metric-alarm".to_string()),
+            "{owner}: {calls:?}"
+        );
+    }
+}
+
+/// Stands in for `curl` against the instance metadata service, answering the tags from `STUB_*`.
+const METADATA: &str = r#"#!/usr/bin/env bash
+case "${*: -1}" in
+  */api/token) echo token ;;
+  */tags/instance)
+    [[ -z "${STUB_UNREADABLE+set}" ]] || exit 22
+    printf '%s\n' fund-role fund-profile ${STUB_HELD+fund-hold} ;;
+  */tags/instance/fund-role) echo "$STUB_ROLE" ;;
+  */tags/instance/fund-profile) echo "$STUB_PROFILE" ;;
+  */tags/instance/fund-hold) echo operator ;;
+  */placement/region) [[ -z "${STUB_NO_REGION+set}" ]] || exit 22; echo eu-west-2 ;;
+  *) exit 22 ;;
+esac
+"#;
+
+/// Stands in for `devenv`: reports the pinned release, exits the role with `STUB_RUN_STATUS` and logs any publish.
+const DEVENV: &str = r#"#!/usr/bin/env bash
+source "$STUB_DIRECTORY/host/versions"
+case "$1" in
+  version) echo "devenv $DEVENV_VERSION" ;;
+  shell)
+    shift 2
+    case "$1" in
+      host/run-role) echo "run $2" >> "$STUB_DIRECTORY/events"; exit "${STUB_RUN_STATUS:-0}" ;;
+      aws)
+        echo publish >> "$STUB_DIRECTORY/events"
+        printf '%s\n' "$@" > "$STUB_DIRECTORY/published"
+        exit "${STUB_PUBLISH_STATUS:-0}" ;;
+    esac ;;
+esac
+"#;
+
+/// A boot of a copy of `run-host` under a scratch `HOME`, whose profile holds a stub for every command it reaches.
+struct Booted {
+    code: i32,
+    output: String,
+    directory: PathBuf,
+}
+
+impl Booted {
+    fn run(environment: &[(&str, &str)]) -> Self {
+        let directory = std::env::temp_dir().join(format!("run-host-{}", uuid::Uuid::new_v4()));
+        let stubs = directory.join(".nix-profile").join("bin");
+        std::fs::create_dir_all(&stubs).unwrap();
+        std::fs::create_dir_all(directory.join("host")).unwrap();
+        for name in ["run-host", "versions"] {
+            std::fs::copy(script(name), directory.join("host").join(name)).unwrap();
+        }
+        let nix = "#!/usr/bin/env bash\nsource \"$STUB_DIRECTORY/host/versions\"\n\
+                   echo \"nix (Determinate Nix ${NIX_VERSION}) 2.0\"\n";
+        for (name, body) in [
+            ("curl", METADATA),
+            ("devenv", DEVENV),
+            ("nix", nix),
+            (
+                "sudo",
+                "#!/usr/bin/env bash\necho \"sudo $*\" >> \"$STUB_DIRECTORY/events\"\n",
+            ),
+            (
+                "git",
+                "#!/usr/bin/env bash\n[[ \"$1\" != rev-parse ]] || echo abc1234\n",
+            ),
+        ] {
+            let path = stubs.join(name);
+            std::fs::write(&path, body).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        let output = Command::new("bash")
+            .arg(directory.join("host").join("run-host"))
+            .env("HOME", &directory)
+            .env(
+                "PATH",
+                format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("STUB_DIRECTORY", &directory)
+            .env("STUB_ROLE", "trader")
+            .env("STUB_PROFILE", "development/a.b")
+            .envs(environment.iter().copied())
+            .output()
+            .unwrap();
+        Self {
+            code: output.status.code().unwrap(),
+            output: format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            directory,
+        }
+    }
+
+    fn events(&self) -> Vec<String> {
+        std::fs::read_to_string(self.directory.join("events"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn published(&self) -> Vec<String> {
+        std::fs::read_to_string(self.directory.join("published"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl Drop for Booted {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// The publish `run-host` hands devenv's AWS CLI for `metric`.
+fn publish(metric: &str) -> Vec<String> {
+    [
+        "aws",
+        "cloudwatch",
+        "put-metric-data",
+        "--region",
+        "eu-west-2",
+        "--namespace",
+        "fund/trader/development/a.b",
+        "--metric-name",
+        metric,
+        "--value",
+        "1",
+        "--unit",
+        "Count",
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+#[test]
+fn test_a_run_publishes_its_outcome_before_powering_off() {
+    let completed = Booted::run(&[]);
+    assert_eq!(completed.code, 0, "{}", completed.output);
+    assert_eq!(completed.published(), publish("RunCompleted"));
+    assert_eq!(
+        completed.events(),
+        [
+            "sudo shutdown -P +1560",
+            "run trader",
+            "publish",
+            "sudo systemctl poweroff"
+        ]
+    );
+
+    let failed = Booted::run(&[("STUB_RUN_STATUS", "3")]);
+    assert_eq!(failed.code, 3, "{}", failed.output);
+    assert_eq!(failed.published(), publish("RunFailed"));
+    assert_eq!(
+        failed.events(),
+        [
+            "sudo shutdown -P +1560",
+            "run trader",
+            "publish",
+            "sudo systemctl poweroff"
+        ]
+    );
+
+    let unpublished = Booted::run(&[("STUB_PUBLISH_STATUS", "1")]);
+    assert_eq!(unpublished.code, 0, "{}", unpublished.output);
+    assert!(
+        unpublished
+            .output
+            .contains("Error: RunCompleted could not be published to fund/trader/development/a.b"),
+        "{}",
+        unpublished.output
+    );
+    assert_eq!(
+        unpublished.events().last().unwrap(),
+        "sudo systemctl poweroff"
+    );
+
+    let unplaced = Booted::run(&[("STUB_NO_REGION", "")]);
+    assert_ne!(unplaced.code, 0, "{}", unplaced.output);
+    let mut unregioned = publish("RunFailed");
+    unregioned.drain(3..5);
+    assert_eq!(unplaced.published(), unregioned);
+    assert_eq!(
+        unplaced.events(),
+        [
+            "sudo shutdown -P +1560",
+            "publish",
+            "sudo systemctl poweroff"
+        ]
+    );
+}
+
+#[test]
+fn test_a_held_or_unreadable_box_publishes_nothing_and_stays_up() {
+    for environment in [[("STUB_HELD", "")], [("STUB_UNREADABLE", "")]] {
+        let booted = Booted::run(&environment);
+        let events = booted.events();
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("sudo shutdown -P +1560"),
+            "{}",
+            booted.output
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event == "publish" || event == "sudo systemctl poweroff"),
+            "{events:?}: {}",
+            booted.output
+        );
+    }
 }
