@@ -12,6 +12,7 @@ use crate::broker::BrokerError;
 use crate::common::book::{Book, Fill};
 use crate::common::guard::{GuardCause, TradabilityRead, TradabilityUnread, guard};
 use crate::common::journal::Observation;
+use crate::common::market::state::LastQuote;
 use crate::common::market::{Price, Shares, Symbol};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
@@ -146,7 +147,8 @@ impl JournalFailure {
 /// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
 /// overlaps it; each order's id is drawn from `sequence`, so a later call on the same sequence cannot repeat one.
 /// A non-empty tradability read is journaled once, or its failure with its cause, which vouches for nothing, so every
-/// order is held as unread.
+/// order is held as unread; each submission carries its symbol's quote from `quotes`, or that it had none.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     broker: &impl Broker,
     journal: &mut Journal,
@@ -154,6 +156,7 @@ pub async fn execute(
     book: &Book,
     target: &Target,
     prices: &BTreeMap<Symbol, Price>,
+    quotes: &BTreeMap<Symbol, LastQuote>,
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailure> {
     let mut outcomes = Vec::new();
@@ -185,9 +188,10 @@ pub async fn execute(
     }
     for order in guarded.passed().iter().cloned() {
         let request = OrderRequest::new(order, sequence.draw(journal.run_id()));
+        let quote = quotes.get(request.order().symbol()).copied();
         if let Err(error) = journal.append(
             Utc::now(),
-            Observation::OrderSubmitted(OrderSubmitted::of(&request)),
+            Observation::OrderSubmitted(OrderSubmitted::of(&request, quote)),
         ) {
             return Err(JournalFailure::new(outcomes, error));
         }
@@ -232,6 +236,7 @@ pub enum Reconciliation {
 /// to close every short and every position the journal expected none of, keeping the rest at the broker's count; the
 /// book returned is the broker's after those attempts. A close can be held, refused, partial or unresolved, so the
 /// caller checks `closing` before trading from that book, and refuses further trading on any divergence.
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_and_close(
     broker: &impl Broker,
     journal: &mut Journal,
@@ -239,6 +244,7 @@ pub async fn reconcile_and_close(
     expected: &Book,
     allowance: Allowance,
     prices: &BTreeMap<Symbol, Price>,
+    quotes: &BTreeMap<Symbol, LastQuote>,
     patience: Patience,
 ) -> Result<Reconciliation, ReconcileFailure> {
     let reported = broker.book().await.map_err(ReconcileFailure::Unread)?;
@@ -263,7 +269,7 @@ pub async fn reconcile_and_close(
             .collect(),
     );
     let closing = execute(
-        broker, journal, sequence, &reported, &kept, prices, patience,
+        broker, journal, sequence, &reported, &kept, prices, quotes, patience,
     )
     .await
     .map_err(ReconcileFailure::Journal)?;
@@ -609,6 +615,7 @@ mod tests {
             &Book::default(),
             target,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             patience,
         )
         .await
@@ -725,6 +732,60 @@ mod tests {
                 "order_refused"
             ]
         );
+    }
+
+    /// Each submission carries its own symbol's quote, and a symbol with none carries why.
+    #[tokio::test(start_paused = true)]
+    async fn test_each_submission_carries_its_own_symbols_quote() {
+        let broker = Scripted::new(&[Answer::Refused, Answer::Refused], &[]);
+        let quote = crate::common::market::record::Quote::new(
+            Symbol::new("SPY").unwrap(),
+            "2026-10-05T14:00:00Z".parse().unwrap(),
+            Price::from_ticks(670_000_000).unwrap(),
+            Price::from_ticks(670_010_000).unwrap(),
+            Shares::whole(1).unwrap(),
+            Shares::whole(1).unwrap(),
+        )
+        .unwrap();
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        execute(
+            &broker,
+            &mut journal,
+            &mut OrderSequence::default(),
+            &Book::default(),
+            &buying(&["AAPL", "SPY"], 1),
+            &BTreeMap::new(),
+            &BTreeMap::from([(Symbol::new("SPY").unwrap(), LastQuote::of(&quote))]),
+            patient(),
+        )
+        .await
+        .unwrap();
+        let submitted: Vec<_> = journal_records(&directory)
+            .iter()
+            .map(|record| serde_json::to_value(record.observation()).unwrap())
+            .filter(|read| read["event_type"] == "order_submitted")
+            .map(|read| {
+                (
+                    read["payload"]["symbol"].clone(),
+                    read["payload"]["quote"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            submitted,
+            [
+                (
+                    serde_json::json!("AAPL"),
+                    serde_json::json!({"unquoted": {"cause": "none_folded"}})
+                ),
+                (
+                    serde_json::json!("SPY"),
+                    serde_json::json!({"quoted": {"quoted_at": "2026-10-05T14:00:00Z", "bid": 670_000_000, "ask": 670_010_000}})
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -966,6 +1027,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             patient(),
         )
         .await
@@ -1006,6 +1068,7 @@ mod tests {
             &mut sequence,
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             patient(),
         )
@@ -1132,6 +1195,7 @@ mod tests {
             expected,
             Allowance::NONE,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             patient(),
         )
         .await
@@ -1155,6 +1219,7 @@ mod tests {
             &mut sequence,
             &Book::default(),
             &buying(&["SPY"], 1),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             patient(),
         )
@@ -1196,6 +1261,7 @@ mod tests {
             &mut sequence,
             &before,
             &target,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             patience,
         )
@@ -1360,6 +1426,7 @@ mod tests {
                     &book,
                     &target,
                     &prices,
+                    &BTreeMap::new(),
                     patient(),
                 ))
                 .unwrap();

@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 
-use super::record::BarInterval;
+use super::record::{BarInterval, Quote, QuoteRefusal};
 use super::trade_bars::TradeBar;
 use super::{Price, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
@@ -19,7 +20,62 @@ pub const RETAINED_BARS: usize = 100;
 pub enum MarketEvent {
     /// A bar built from the tape's prints, as the archive derives them and the trader builds them live.
     Trades(TradeBar),
+    /// A top-of-book quote, of which the state keeps each symbol's latest.
+    Quote(Quote),
     Clock(DateTime<Utc>),
+}
+
+/// A symbol's latest quote as a state holds it, its bid never above its ask; ordered by when it was quoted first, so a
+/// combine keeps the latest and breaks a tie on the sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedLastQuote")]
+pub struct LastQuote {
+    quoted_at: DateTime<Utc>,
+    bid: Price,
+    ask: Price,
+}
+
+/// A `LastQuote` as read, before its sides are checked.
+#[derive(Deserialize)]
+struct UncheckedLastQuote {
+    quoted_at: DateTime<Utc>,
+    bid: Price,
+    ask: Price,
+}
+
+impl TryFrom<UncheckedLastQuote> for LastQuote {
+    type Error = QuoteRefusal;
+
+    fn try_from(unchecked: UncheckedLastQuote) -> Result<Self, Self::Error> {
+        QuoteRefusal::check(unchecked.bid, unchecked.ask)?;
+        Ok(Self {
+            quoted_at: unchecked.quoted_at,
+            bid: unchecked.bid,
+            ask: unchecked.ask,
+        })
+    }
+}
+
+impl LastQuote {
+    pub fn of(quote: &Quote) -> Self {
+        Self {
+            quoted_at: quote.timestamp(),
+            bid: quote.bid(),
+            ask: quote.ask(),
+        }
+    }
+
+    pub fn quoted_at(self) -> DateTime<Utc> {
+        self.quoted_at
+    }
+
+    pub fn bid(self) -> Price {
+        self.bid
+    }
+
+    pub fn ask(self) -> Price {
+        self.ask
+    }
 }
 
 /// What one bar leaves in the state; ordered so a repeated timestamp keeps the greater and the combine commutes.
@@ -66,12 +122,13 @@ impl Staleness {
     }
 }
 
-/// The latest clock and each series' latest `RETAINED_BARS` bars.
+/// The latest clock, each series' latest `RETAINED_BARS` bars, and each symbol's latest quote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarketState {
     /// The latest instant a clock event reported; a bar's timestamp names its period, not when it was seen.
     clock: Option<DateTime<Utc>>,
     series: BTreeMap<(Symbol, BarInterval), BTreeMap<DateTime<Utc>, Retained>>,
+    quotes: BTreeMap<Symbol, LastQuote>,
 }
 
 impl MarketState {
@@ -80,7 +137,11 @@ impl MarketState {
         match event {
             MarketEvent::Clock(instant) => Self {
                 clock: Some(instant),
-                series: BTreeMap::new(),
+                ..Self::default()
+            },
+            MarketEvent::Quote(quote) => Self {
+                quotes: BTreeMap::from([(quote.symbol().clone(), LastQuote::of(&quote))]),
+                ..Self::default()
             },
             MarketEvent::Trades(bar) => Self::retaining(
                 bar.symbol(),
@@ -100,11 +161,11 @@ impl MarketState {
         retained: Retained,
     ) -> Self {
         Self {
-            clock: None,
             series: BTreeMap::from([(
                 (symbol.clone(), interval),
                 BTreeMap::from([(timestamp, retained)]),
             )]),
+            ..Self::default()
         }
     }
 
@@ -135,6 +196,11 @@ impl MarketState {
             .values()
             .rev()
             .find_map(|retained| retained.close)
+    }
+
+    /// Each symbol's latest quote; a symbol is absent only when none of its quotes was folded.
+    pub fn quotes(&self) -> &BTreeMap<Symbol, LastQuote> {
+        &self.quotes
     }
 
     /// Where the clock falls in `calendar`'s sessions, `None` before any clock event.
@@ -168,6 +234,12 @@ impl Monoid for MarketState {
             while held.len() > RETAINED_BARS {
                 held.pop_first();
             }
+        }
+        for (symbol, quote) in other.quotes {
+            self.quotes
+                .entry(symbol)
+                .and_modify(|kept| *kept = (*kept).max(quote))
+                .or_insert(quote);
         }
         self
     }
@@ -384,6 +456,39 @@ mod tests {
         }
     }
 
+    /// A quote `minute` minutes after the session's 13:30 UTC open, its sides in ticks.
+    fn quote(raw: &str, minute: i64, bid: i64, ask: i64) -> Quote {
+        Quote::new(
+            symbol(raw),
+            "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute),
+            Price::from_ticks(bid).unwrap(),
+            Price::from_ticks(ask).unwrap(),
+            Shares::whole(1).unwrap(),
+            Shares::whole(1).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A symbol keeps its latest quote whatever order the quotes arrive in, and a symbol never quoted has none.
+    #[test]
+    fn test_a_symbol_keeps_its_latest_quote() {
+        let early = MarketEvent::Quote(quote("AAPL", 1, 1_000_000, 1_010_000));
+        let late = MarketEvent::Quote(quote("AAPL", 2, 1_020_000, 1_030_000));
+        for events in [[early.clone(), late.clone()], [late, early]] {
+            let state = fold(events);
+            assert_eq!(state.quotes().keys().collect::<Vec<_>>(), [&symbol("AAPL")]);
+            let kept = state.quotes()[&symbol("AAPL")];
+            assert_eq!(
+                (kept.quoted_at(), kept.bid().ticks(), kept.ask().ticks()),
+                (
+                    "2026-09-25T13:32:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    1_020_000,
+                    1_030_000
+                )
+            );
+        }
+    }
+
     /// The clock is the latest reported, whatever order the reports arrive in, and phases read from it.
     #[test]
     fn test_the_phase_reads_the_latest_clock() {
@@ -424,6 +529,8 @@ mod tests {
                 .prop_map(|(raw, minute, close, volume)| MarketEvent::Trades(minute_trade_bar(raw, minute, close, volume))),
             2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_u64..1_000)
                 .prop_map(|(raw, day, close, volume)| MarketEvent::Trades(daily_bar(raw, day, close, volume))),
+            2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_i64..3)
+                .prop_map(|(raw, minute, bid, width)| MarketEvent::Quote(quote(raw, minute, bid, bid + width))),
             1 => (0_i64..1_000).prop_map(|minute| MarketEvent::Clock(session().regular_close() + TimeDelta::minutes(minute))),
         ]
     }
@@ -486,6 +593,7 @@ mod tests {
                 .chain(&tail)
                 .map(|event| match event {
                     MarketEvent::Trades(bar) => bar.timestamp(),
+                    MarketEvent::Quote(quote) => quote.timestamp(),
                     MarketEvent::Clock(instant) => *instant,
                 })
                 .collect();

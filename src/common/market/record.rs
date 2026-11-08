@@ -253,6 +253,16 @@ pub enum QuoteRefusal {
     Crossed { bid: Price, ask: Price },
 }
 
+impl QuoteRefusal {
+    /// Refuses sides that cross; a locked book passes.
+    pub fn check(bid: Price, ask: Price) -> Result<(), Self> {
+        if bid > ask {
+            return Err(Self::Crossed { bid, ask });
+        }
+        Ok(())
+    }
+}
+
 impl Quote {
     pub fn new(
         symbol: Symbol,
@@ -262,9 +272,7 @@ impl Quote {
         bid_size: Shares,
         ask_size: Shares,
     ) -> Result<Self, QuoteRefusal> {
-        if bid > ask {
-            return Err(QuoteRefusal::Crossed { bid, ask });
-        }
+        QuoteRefusal::check(bid, ask)?;
         Ok(Self {
             symbol,
             timestamp,

@@ -488,6 +488,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             solution.target(),
             &prices,
+            self.state.quotes(),
             self.settings.patience,
         )
         .await;
@@ -508,6 +509,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             rounding_allowance(&self.fills),
             &prices,
+            self.state.quotes(),
             self.settings.patience,
         )
         .await
@@ -646,7 +648,7 @@ mod tests {
     use crate::common::guard::Tradability;
     use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::aggregate::TradeTotals;
-    use crate::common::market::record::Trade;
+    use crate::common::market::record::{Quote, Trade};
     use crate::common::market::trade_bars::{
         ConditionLetter, Correction, OpenClose, Print, Tape, TradeSums,
     };
@@ -1011,6 +1013,52 @@ mod tests {
             .unwrap();
         assert_eq!(journaled(&directory).len(), 7);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// An order's submission carries the quote the session's state held for its symbol when it decided, or that it
+    /// held none.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_submission_journals_the_quote_the_decision_held() {
+        let quoted = Quote::new(
+            spy(),
+            at("14:04:50"),
+            Price::from_ticks(700_990_000).unwrap(),
+            Price::from_ticks(701_010_000).unwrap(),
+            Shares::whole(1).unwrap(),
+            Shares::whole(1).unwrap(),
+        )
+        .unwrap();
+        for (quote, expected) in [
+            (
+                Some(quoted),
+                serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:50Z", "bid": 700_990_000, "ask": 701_010_000}}),
+            ),
+            (
+                None,
+                serde_json::json!({"unquoted": {"cause": "none_folded"}}),
+            ),
+        ] {
+            let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+            let broker = Filling::new(701_000_000, funded.clone());
+            let mut session = session(TimeDelta::minutes(5), funded);
+            if let Some(quote) = quote {
+                session.fold_in(MarketEvent::Quote(quote));
+            }
+            let (mut journal, directory) = journal();
+            let tape = Scripted::default();
+            tape.file(print("14:04:30", 701_000_000));
+            session
+                .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+                .await
+                .unwrap();
+            let kinds = journaled(&directory);
+            let submitted = &payloads(&directory)[kinds
+                .iter()
+                .position(|kind| *kind == "order_submitted")
+                .unwrap()];
+            assert_eq!(submitted["quote"], expected);
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
     }
 
     /// A price older than the settings allow is no price: a wanted name the book does not hold is held at zero, so
