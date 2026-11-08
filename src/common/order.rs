@@ -368,7 +368,8 @@ impl OrderState {
 }
 
 /// An order about to be sent to the broker under `client_order_id`, journaled before the send so a crash between the
-/// two leaves the order on record; the record's timestamp is the instant it was sent from.
+/// two leaves the order on record; the record's timestamp marks the intent to submit, taken before the append and the
+/// send, so a record can name an order that was never sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderSubmitted {
     client_order_id: ClientOrderId,
@@ -408,8 +409,21 @@ pub enum DecisionQuote {
 }
 
 /// Why a decision held no quote for a symbol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum QuoteAbsence {
     /// No quote for the symbol had been folded into the market state.
     NoneFolded,
@@ -624,6 +638,15 @@ mod tests {
         for side in Side::iter() {
             assert_eq!(serde_json::to_string(&side).unwrap(), format!("\"{side}\""));
             assert_eq!(side.to_string().parse(), Ok(side));
+        }
+        let absences: Vec<&str> = QuoteAbsence::iter().map(Into::into).collect();
+        assert_eq!(absences, ["none_folded"]);
+        for absence in QuoteAbsence::iter() {
+            assert_eq!(
+                serde_json::to_string(&absence).unwrap(),
+                format!("\"{absence}\"")
+            );
+            assert_eq!(absence.to_string().parse(), Ok(absence));
         }
         assert!(
             serde_json::from_str::<OrderExecution>(r#"{"shares":0,"average_price":1}"#).is_err()
