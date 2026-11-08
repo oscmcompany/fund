@@ -10,7 +10,7 @@ use crate::common::book::{Book, Side};
 use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::order::BrokerFailure;
 use crate::common::risk::DollarLimit;
-use crate::common::strategy::{Leg, Order};
+use crate::common::strategy::{Leg, Order, Target, orders};
 
 /// The least a fractional buy may be worth, one dollar, under which Alpaca refuses it; a fractional sell has no floor.
 const LEAST_FRACTIONAL_BUY: DollarVolume =
@@ -198,14 +198,14 @@ impl Unclosed {
     }
 }
 
-/// Lets each order through only when `read` vouches for its symbol and size, and for its borrow when it opens or adds to
-/// a short; a cover is never held for borrow. A fractional buy is held under the minimum at `price`; one without a price
-/// goes out for the broker to judge. An order opening beyond zero is held as unclosed after its symbol's close was held,
-/// which `orders` puts before it; an order adding to a holding is held when the holding after it at `price` would pass
-/// `per_name`, read from `book` and the orders passed before it, so `orders` must be built from `book`.
+/// Lets each of the orders taking `book` to `target` through only when `read` vouches for its symbol and size, and for
+/// its borrow when it opens or adds to a short; a cover is never held for borrow. A fractional buy is held under the
+/// minimum at `price`; one without a price goes out for the broker to judge. An order opening beyond zero is held as
+/// unclosed after its symbol's close was held, and an order adding to a holding is held when the holding after it, read
+/// from `book` and the orders passed before it, would pass `per_name` at `price`.
 pub fn guard(
-    orders: Vec<Order>,
     book: &Book,
+    target: &Target,
     read: &TradabilityRead,
     per_name: DollarLimit,
     price: impl Fn(&Symbol) -> Option<Price>,
@@ -217,7 +217,7 @@ pub fn guard(
     let mut unclosed = Unclosed::default();
     // Each symbol's position once the orders passed before this one fill.
     let mut reached: BTreeMap<Symbol, i128> = BTreeMap::new();
-    for order in orders {
+    for order in orders(book, target) {
         let before = *reached
             .entry(order.symbol().clone())
             .or_insert_with(|| book.position(order.symbol()).units());
@@ -326,7 +326,7 @@ mod tests {
     use crate::common::problem::formulate;
     use crate::common::risk::Limits;
     use crate::common::solver::Solver;
-    use crate::common::strategy::{Holding, Target, orders};
+    use crate::common::strategy::Holding;
     use crate::common::time::calendar::SessionPhase;
 
     fn symbol(raw: &str) -> Symbol {
@@ -366,16 +366,13 @@ mod tests {
         }
     }
 
-    /// Buys from an empty book, one per symbol, in the symbol order `orders` gives.
-    fn buys(wanted: &[(&str, u64)]) -> Vec<Order> {
-        orders(
-            &Book::default(),
-            &Target::new(
-                wanted
-                    .iter()
-                    .map(|(raw, units)| (symbol(raw), Shares::from_units(*units)))
-                    .collect(),
-            ),
+    /// A target of `units` millionths long of each named symbol.
+    fn longs(wanted: &[(&str, u64)]) -> Target {
+        Target::new(
+            wanted
+                .iter()
+                .map(|(raw, units)| (symbol(raw), Shares::from_units(*units)))
+                .collect(),
         )
     }
 
@@ -410,7 +407,7 @@ mod tests {
                 ],
             ),
         ] {
-            let orders = buys(&[
+            let target = longs(&[
                 ("SPY", units),
                 ("VWDRY", units),
                 ("SSUNF", units),
@@ -418,8 +415,8 @@ mod tests {
                 ("QQQ", units),
             ]);
             let guarded = guard(
-                orders,
                 &Book::default(),
+                &target,
                 &unshorted(&tradability),
                 wide(),
                 |_| None,
@@ -542,7 +539,7 @@ mod tests {
         let read = TradabilityRead::new(tradability, shortability);
         let short = || Holding::short(Shares::whole(2).unwrap()).unwrap();
         let causes = |book: &Book, target: Target| {
-            let guarded = guard(orders(book, &target), book, &read, wide(), |_| None);
+            let guarded = guard(book, &target, &read, wide(), |_| None);
             let passed: Vec<(String, Side)> = guarded
                 .passed()
                 .iter()
@@ -641,7 +638,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let guarded = guard(orders(&book, &target), &book, &read, wide(), |_| None);
+        let guarded = guard(&book, &target, &read, wide(), |_| None);
         let passed: Vec<(&str, u64)> = guarded
             .passed()
             .iter()
@@ -678,7 +675,7 @@ mod tests {
         );
         let causes = |book: &Book, wanted: Holding, price: &dyn Fn(&Symbol) -> Option<Price>| {
             let target = Target::new(BTreeMap::from([(symbol("A"), wanted)]));
-            guard(orders(book, &target), book, &read, limit, price)
+            guard(book, &target, &read, limit, price)
                 .held()
                 .iter()
                 .map(OrderGuarded::cause)
@@ -728,30 +725,25 @@ mod tests {
     fn test_a_fractional_buy_under_a_dollar_is_held() {
         let fractionable = BTreeMap::from([(symbol("F"), Tradability::Fractionable)]);
         let price = |_: &Symbol| Some(Price::from_ticks(10_000_000).unwrap());
-        let held = |order: Order, price: &dyn Fn(&Symbol) -> Option<Price>| {
-            guard(
-                vec![order],
-                &Book::default(),
-                &unshorted(&fractionable),
-                wide(),
-                price,
-            )
-            .held()
-            .iter()
-            .map(OrderGuarded::cause)
-            .collect::<Vec<_>>()
+        let held = |book: &Book, target: Target, price: &dyn Fn(&Symbol) -> Option<Price>| {
+            guard(book, &target, &unshorted(&fractionable), wide(), price)
+                .held()
+                .iter()
+                .map(OrderGuarded::cause)
+                .collect::<Vec<_>>()
         };
-        let buy = |units| buys(&[("F", units)]).remove(0);
+        let flat = Book::default();
+        let buy = |units| longs(&[("F", units)]);
         assert_eq!(
-            held(buy(99_999), &price),
+            held(&flat, buy(99_999), &price),
             [GuardCause::BelowMinimum {
                 price: Price::from_ticks(10_000_000).unwrap()
             }]
         );
-        assert_eq!(held(buy(100_000), &price), []);
-        assert_eq!(held(buy(99_999), &|_| None), []);
+        assert_eq!(held(&flat, buy(100_000), &price), []);
+        assert_eq!(held(&flat, buy(99_999), &|_| None), []);
         let cheap = |_: &Symbol| Some(Price::from_ticks(500_000).unwrap());
-        assert_eq!(held(buy(1_000_000), &cheap), []);
+        assert_eq!(held(&flat, buy(1_000_000), &cheap), []);
         let book = Book::of(
             &crate::common::book::Fill::new(
                 "2026-10-07T18:00:00Z".parse().unwrap(),
@@ -763,13 +755,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let sell = orders(
-            &book,
-            &Target::new(BTreeMap::from([(symbol("F"), Shares::from_units(100_000))])),
-        )
-        .remove(0);
-        assert_eq!(sell.side(), Side::Sell);
-        assert_eq!(held(sell, &price), []);
+        let sell = longs(&[("F", 100_000)]);
+        assert_eq!(orders(&book, &sell)[0].side(), Side::Sell);
+        assert_eq!(held(&book, sell, &price), []);
     }
 
     const SYMBOLS: [&str; 4] = ["AAPL", "MSFT", "SPY", "QQQ"];
@@ -880,8 +868,8 @@ mod tests {
             .unwrap(),
         );
         let guarded = guard(
-            orders(&decision.book, solution.target()),
             &decision.book,
+            solution.target(),
             &unshorted(&decision.readings),
             decision.limits.per_name(),
             price,
@@ -988,8 +976,9 @@ mod tests {
                 .zip(readings)
                 .map(|(raw, reading)| (symbol(raw), reading))
                 .collect();
-            let orders = buys(&wanted);
-            let guarded = guard(orders.clone(), &Book::default(), &unshorted(&tradability), wide(), |_| None);
+            let target = longs(&wanted);
+            let built = orders(&Book::default(), &target);
+            let guarded = guard(&Book::default(), &target, &unshorted(&tradability), wide(), |_| None);
             let mut sorted: Vec<&Symbol> = guarded
                 .passed()
                 .iter()
@@ -997,10 +986,10 @@ mod tests {
                 .chain(guarded.held().iter().map(|held| &held.symbol))
                 .collect();
             sorted.sort();
-            prop_assert_eq!(sorted, orders.iter().map(Order::symbol).collect::<Vec<_>>());
+            prop_assert_eq!(sorted, built.iter().map(Order::symbol).collect::<Vec<_>>());
             let mut passed = guarded.passed().iter();
             let mut next = passed.next();
-            for order in &orders {
+            for order in &built {
                 if next == Some(order) {
                     next = passed.next();
                 }

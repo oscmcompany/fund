@@ -1098,15 +1098,8 @@ mod tests {
             BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]),
             BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Shortability::EasyToBorrow)]),
         );
-        let guarded = guard(
-            orders(&Book::default(), &fraction),
-            &Book::default(),
-            &whole_only,
-            wide,
-            |_| None,
-        )
-        .held()[0]
-            .clone();
+        let guarded =
+            guard(&Book::default(), &fraction, &whole_only, wide, |_| None).held()[0].clone();
         let sliver = Target::new(BTreeMap::from([(
             Symbol::new("DIA").unwrap(),
             Shares::from_units(19),
@@ -1125,13 +1118,9 @@ mod tests {
                 "2026-10-07T16:05:00Z".parse().unwrap(),
             ),
         ));
-        let below = guard(
-            orders(&Book::default(), &sliver),
-            &Book::default(),
-            &fractionable,
-            wide,
-            |_| Price::from_ticks(470_000_000).ok(),
-        )
+        let below = guard(&Book::default(), &sliver, &fractionable, wide, |_| {
+            Price::from_ticks(470_000_000).ok()
+        })
         .held()[0]
             .clone();
         let observations = [

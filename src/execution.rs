@@ -166,8 +166,10 @@ pub async fn execute(
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailure> {
     let mut outcomes = Vec::new();
-    let orders = orders(book, target);
-    let symbols: Vec<Symbol> = orders.iter().map(|order| order.symbol().clone()).collect();
+    let symbols: Vec<Symbol> = orders(book, target)
+        .iter()
+        .map(|order| order.symbol().clone())
+        .collect();
     let tradability = match broker.tradability(&symbols).await {
         Ok(read) if read.is_empty() => read,
         Ok(read) => {
@@ -185,7 +187,7 @@ pub async fn execute(
             TradabilityRead::default()
         }
     };
-    let guarded = guard(orders, book, &tradability, per_name, |symbol| {
+    let guarded = guard(book, target, &tradability, per_name, |symbol| {
         prices.get(symbol).copied()
     });
     let mut unclosed = Unclosed::default();
@@ -1613,7 +1615,7 @@ mod tests {
                 }
             }
             let read = TradabilityRead::new(readings, BTreeMap::new());
-            let guarded = guard(orders(&book, &target), &book, &read, wide(), |symbol| prices.get(symbol).copied());
+            let guarded = guard(&book, &target, &read, wide(), |symbol| prices.get(symbol).copied());
             let direct = book.combine(concatenate(guarded.passed().iter().map(|order| {
                 Book::of(
                     &Fill::new(

@@ -503,8 +503,8 @@ impl<S: Strategy> Replayer<S> {
                             let wanted = orders(&replay.book, solution.target());
                             let tradability = restraint.tradability_of(&wanted);
                             let guarded = guard(
-                                wanted,
                                 &replay.book,
+                                solution.target(),
                                 &tradability,
                                 restraint.limits.per_name(),
                                 price,
