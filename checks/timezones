@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Fails (exit 3) on SQL in `.sql` files, or in Rust and shell holding `SELECT`, that derives a date or calendar part
+# before `SET TimeZone` (held to the file's end, or a shell script's next `duckdb`) and without `AT TIME ZONE` on its
+# line; it cannot see types, so a cast of a string counts too. Exits 1 if unchecked; arguments name paths to scan.
+set -euo pipefail
+export LC_ALL=C
+
+listing="$(mktemp)"
+trap 'rm -f "${listing}"' EXIT
+if (($# > 0)); then
+  if ! find "$@" -type f -print0 >"${listing}"; then
+    echo "Error: could not list the files under $*" >&2
+    exit 1
+  fi
+else
+  repository="$(dirname "${BASH_SOURCE[0]}")/.."
+  # The check's own test holds its failing fixtures as strings.
+  if ! git -C "${repository}" ls-files -z -- ':!tests/test_check_timezones.rs' >"${listing}"; then
+    echo "Error: could not list the files git tracks in ${repository}" >&2
+    exit 1
+  fi
+  cd "${repository}"
+fi
+
+shell='^#!.*[/ ](ba)?sh([[:space:]]|$)'
+found=0
+scanned=0
+while IFS= read -r -d '' path; do
+  # A tracked file deleted from the working tree holds no SQL.
+  if [[ ! -e "${path}" ]]; then
+    continue
+  fi
+  case "${path}" in
+    *.sql) language=sql ;;
+    *.rs) language=rust ;;
+    *.sh) language=shell ;;
+    *)
+      if [[ "${path##*/}" == *.* ]]; then
+        continue
+      fi
+      if ! first="$(head -n 1 -- "${path}" | tr -d '\000')"; then
+        echo "Error: could not read ${path}" >&2
+        exit 1
+      fi
+      # An extensionless script is read when its shebang names a shell, as `checks/` and `host/` scripts do.
+      if [[ ! "${first}" =~ ${shell} ]]; then
+        continue
+      fi
+      language=shell
+      ;;
+  esac
+  if [[ "${language}" != sql ]]; then
+    selects=0
+    grep -qiE '(^|[^[:alnum:]_])select([^[:alnum:]_]|$)' -- "${path}" || selects=$?
+    case "${selects}" in
+      0) ;;
+      1) continue ;;
+      *)
+        echo "Error: could not read ${path}" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  scanned=$((scanned + 1))
+  if ! hits="$(awk -v language="${language}" -v path="${path}" '
+    # Whether `text` derives a date or a calendar part; Rust names paths `::date` and calls `day(`, so there only an
+    # upper-case cast and the longer names count.
+    function derives(text,    lowered, cast, parts, date) {
+      lowered = tolower(text)
+      cast = language == "rust" ? text : lowered
+      parts = "date_trunc|datetrunc|date_part|datepart|extract|strftime|time_bucket|dayofweek|dayofmonth|dayofyear" \
+        "|isodow|weekofyear|yearweek|dayname|monthname|last_day"
+      if (language != "rust") { parts = parts "|year|month|day|week" }
+      date = language == "rust" ? "DATE" : "date"
+      return cast ~ ("::[[:space:]]*" date "([^[:alnum:]_]|$)") \
+        || cast ~ ("[[:space:]][aA][sS][[:space:]]+" date "[[:space:]]*(\\)|$)") \
+        || lowered ~ ("(^|[^[:alnum:]_.])(" parts ")[[:space:]]*\\(")
+    }
+    {
+      line = $0
+      # A comment may name a cast without making one.
+      if (language == "sql") { sub(/--.*/, "", line) } else if (line ~ /^[[:space:]]*(\/\/|#)/) { next }
+      lowered = tolower(line)
+      # Each `duckdb` a shell script runs is its own connection, with its own zone.
+      if (language == "shell" && lowered ~ /(^|[^[:alnum:]_])duckdb([^[:alnum:]_]|$)/) { set = 0 }
+      if (set) { next }
+      # Only what runs before a `SET TimeZone` on the line is unpinned.
+      before = line
+      if (match(lowered, /(^|[^[:alnum:]_])set[[:space:]]+((global|session|local)[[:space:]]+)?timezone([^[:alnum:]_]|$)/)) {
+        before = substr(line, 1, RSTART)
+        set = 1
+      }
+      if (lowered ~ /at[[:space:]]+time[[:space:]]+zone|(^|[^[:alnum:]_])timezone[[:space:]]*\(/) { next }
+      if (derives(before)) { print path ":" FNR ": " $0 }
+    }' "${path}")"; then
+    echo "Error: could not read ${path}" >&2
+    exit 1
+  fi
+  if [[ -n "${hits}" ]]; then
+    printf '%s\n' "${hits}" >&2
+    found=$((found + $(wc -l <<<"${hits}")))
+  fi
+done <"${listing}"
+
+if ((found > 0)); then
+  echo "Error: ${found} lines of ${scanned} files derive a date without a pinned time zone" >&2
+  exit 3
+fi
+echo "No date is derived without a pinned time zone in ${scanned} files"
