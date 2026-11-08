@@ -23,6 +23,7 @@ use crate::common::time::{SessionDate, SessionRange};
 
 const QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes";
 const TRADES_URL: &str = "https://data.alpaca.markets/v2/stocks/trades";
+const LATEST_QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes/latest";
 
 /// Bars per page, the endpoint's maximum.
 const PAGE_LIMIT: &str = "10000";
@@ -183,6 +184,12 @@ pub struct BorrowFlagsRead {
 struct QuotesPage {
     /// `null` on a page with no quotes.
     quotes: Option<BTreeMap<String, Vec<AlpacaQuote>>>,
+}
+
+/// The latest-quotes response: one quote per ticker rather than a page of them.
+#[derive(Deserialize)]
+struct LatestQuotes {
+    quotes: BTreeMap<String, AlpacaQuote>,
 }
 
 #[derive(Deserialize)]
@@ -424,6 +431,47 @@ impl Alpaca {
             }
         }
     }
+
+    /// Each of `symbols`' latest SIP quote, read through transient failures; a symbol with no quote is absent.
+    pub async fn latest_quotes(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
+        let names: Vec<&str> = symbols.iter().map(Symbol::as_str).collect();
+        let names = names.join(",");
+        let body = with_retries(|| {
+            send(
+                self.credentials
+                    .sign(self.http_client.get(LATEST_QUOTES_URL))
+                    .query(&[("symbols", names.as_str()), ("feed", "sip")]),
+            )
+        })
+        .await?;
+        latest_quotes(&body, symbols)
+    }
+}
+
+/// The latest quotes for `requested`, a quote filed under any other ticker refused.
+fn latest_quotes(body: &[u8], requested: &[Symbol]) -> Result<Vec<AlpacaQuoteOutcome>, FetchError> {
+    let page: LatestQuotes =
+        serde_json::from_slice(body).map_err(|error| FetchError::Malformed {
+            reason: error.to_string(),
+        })?;
+    Ok(page
+        .quotes
+        .into_iter()
+        .map(|(ticker, row)| match Symbol::new(&ticker) {
+            Ok(symbol) if requested.contains(&symbol) => quote_outcome(&symbol, &row),
+            Ok(_) => AlpacaQuoteOutcome::Refused(RefusedRow {
+                ticker,
+                cause: RowRefusal::Unrequested,
+            }),
+            Err(cause) => AlpacaQuoteOutcome::Refused(RefusedRow {
+                ticker,
+                cause: RowRefusal::Symbol(cause),
+            }),
+        })
+        .collect())
 }
 
 /// One page of trades for `requested`, a row filed under any other ticker refused.
@@ -1063,6 +1111,39 @@ mod tests {
                 );
             }
             other @ (AlpacaQuoteOutcome::Quote { .. } | AlpacaQuoteOutcome::Refused(_)) => {
+                panic!("{other:?}")
+            }
+        }
+    }
+
+    /// The latest-quotes response as Alpaca served it on 2026-11-08, one object per ticker, with synthetic values.
+    const LATEST_QUOTES: &str = r#"{"quotes":{"ABC":{"ap":50.27,"as":40,"ax":"K","bp":50.25,"bs":320,"bx":"P","c":["R"],"t":"2026-11-07T00:59:51.009613177Z","z":"C"},"XYZ":{"ap":20.01,"as":1,"ax":"P","bp":20.0,"bs":2,"bx":"P","c":["R"],"t":"2026-11-07T01:00:00.161965348Z","z":"B"}}}"#;
+
+    #[test]
+    fn test_latest_quotes_read_each_requested_ticker_and_refuse_another() {
+        let abc = Symbol::new("ABC").unwrap();
+        let outcomes = latest_quotes(LATEST_QUOTES.as_bytes(), std::slice::from_ref(&abc)).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        match &outcomes[0] {
+            AlpacaQuoteOutcome::Quote { quote, .. } => {
+                assert_eq!(quote.symbol(), &abc);
+                assert_eq!(quote.bid().ticks(), 50_250_000);
+                assert_eq!(quote.ask().ticks(), 50_270_000);
+                assert_eq!(
+                    quote.timestamp().to_rfc3339(),
+                    "2026-11-07T00:59:51.009613177+00:00"
+                );
+            }
+            other @ (AlpacaQuoteOutcome::OneSided { .. } | AlpacaQuoteOutcome::Refused(_)) => {
+                panic!("{other:?}")
+            }
+        }
+        match &outcomes[1] {
+            AlpacaQuoteOutcome::Refused(row) => {
+                assert_eq!(row.ticker(), "XYZ");
+                assert_eq!(*row.cause(), RowRefusal::Unrequested);
+            }
+            other @ (AlpacaQuoteOutcome::Quote { .. } | AlpacaQuoteOutcome::OneSided { .. }) => {
                 panic!("{other:?}")
             }
         }

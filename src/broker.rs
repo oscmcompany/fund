@@ -254,8 +254,42 @@ struct OrderBody<'a> {
     side: &'static str,
     #[serde(rename = "type")]
     order_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_price: Option<String>,
     time_in_force: &'static str,
     client_order_id: String,
+}
+
+/// How an order is priced: at the market, or no worse than a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pricing {
+    Market,
+    Limit(Price),
+}
+
+/// The JSON body that sends `request` for the day, priced by `pricing`.
+fn order_body(request: &OrderRequest, pricing: Pricing) -> Vec<u8> {
+    let order = request.order();
+    let (order_type, limit_price) = match pricing {
+        Pricing::Market => ("market", None),
+        Pricing::Limit(limit) => (
+            "limit",
+            Some(units_to_decimal(
+                u128::from(limit.ticks_unsigned()),
+                PRICE_DIGITS,
+            )),
+        ),
+    };
+    let body = OrderBody {
+        symbol: order.symbol().as_str(),
+        qty: units_to_decimal(u128::from(order.shares().units()), SHARE_DIGITS),
+        side: order.side().into(),
+        order_type,
+        limit_price,
+        time_in_force: "day",
+        client_order_id: request.client_order_id().to_string(),
+    };
+    serde_json::to_vec(&body).expect("an order body serializes")
 }
 
 impl PaperAccount {
@@ -264,6 +298,31 @@ impl PaperAccount {
             Account::Paper => Ok(Self { alpaca }),
             Account::Live => Err(BrokerError::NotPaper),
         }
+    }
+
+    /// Sends `request` once as a limit order for the day at `limit`, never retried, as `Broker::submit` explains.
+    pub async fn submit_limit(
+        &self,
+        request: &OrderRequest,
+        limit: Price,
+    ) -> Result<BrokerOrder, BrokerError> {
+        self.send_order(request, Pricing::Limit(limit)).await
+    }
+
+    async fn send_order(
+        &self,
+        request: &OrderRequest,
+        pricing: Pricing,
+    ) -> Result<BrokerOrder, BrokerError> {
+        submitted(
+            send(
+                self.alpaca
+                    .trading(Method::POST, "/v2/orders")
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(order_body(request, pricing)),
+            )
+            .await,
+        )
     }
 
     async fn get(&self, path: &str) -> Result<Vec<u8>, BrokerError> {
@@ -283,25 +342,7 @@ impl Broker for PaperAccount {
     /// Sends `request` once as a market order for the day. Never retried: a lost response is answered by reading the
     /// order back by its client order id, and a resend under the same id is refused by Alpaca as a duplicate.
     async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
-        let order = request.order();
-        let body = OrderBody {
-            symbol: order.symbol().as_str(),
-            qty: units_to_decimal(u128::from(order.shares().units()), SHARE_DIGITS),
-            side: order.side().into(),
-            order_type: "market",
-            time_in_force: "day",
-            client_order_id: request.client_order_id().to_string(),
-        };
-        let body = serde_json::to_vec(&body).expect("an order body serializes");
-        submitted(
-            send(
-                self.alpaca
-                    .trading(Method::POST, "/v2/orders")
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body),
-            )
-            .await,
-        )
+        self.send_order(request, Pricing::Market).await
     }
 
     /// The order sent under `id`, read through transient failures.
@@ -560,6 +601,35 @@ mod tests {
 
     /// A filled order as the paper account returned it on 2026-10-05, trimmed likewise.
     const FILLED: &str = r#"{"id":"a9df02ed-b9da-4955-9b7f-ecd1a427e9cf","updated_at":"2026-08-21T19:45:07.724724Z","qty":"26","filled_qty":"26","filled_avg_price":"37.89","side":"buy","type":"market","status":"filled"}"#;
+
+    #[test]
+    fn test_an_order_body_carries_a_limit_only_when_priced_by_one() {
+        let order = orders(
+            &Book::empty(),
+            &Target::new(BTreeMap::from([(
+                Symbol::new("ABC").unwrap(),
+                Shares::whole(2).unwrap(),
+            )])),
+        )
+        .remove(0);
+        let request =
+            OrderRequest::new(order, ClientOrderId::new(RunId::new(Uuid::from_u128(7)), 3));
+        let read = |pricing| -> serde_json::Value {
+            serde_json::from_slice(&order_body(&request, pricing)).unwrap()
+        };
+        let market = read(Pricing::Market);
+        assert_eq!(market["type"], "market");
+        assert_eq!(market["qty"], "2");
+        assert_eq!(market["side"], "buy");
+        assert_eq!(market["time_in_force"], "day");
+        assert!(market.get("limit_price").is_none());
+        let limit = read(Pricing::Limit(Price::from_ticks(45_120_000).unwrap()));
+        assert_eq!(limit["type"], "limit");
+        assert_eq!(limit["limit_price"], "45.12");
+        assert_eq!(limit["symbol"], "ABC");
+        assert_eq!(limit["qty"], "2");
+        assert_eq!(limit["client_order_id"], market["client_order_id"]);
+    }
 
     #[test]
     fn test_live_keys_are_refused() {
