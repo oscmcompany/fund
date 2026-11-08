@@ -90,6 +90,8 @@ fi
 
 SLUG="${PROFILE//[\/.]/-}"
 NAME="fund-${ROLE}-${SLUG}"
+# One namespace per host, since PutMetricData can be conditioned on the namespace but not on dimensions.
+NAMESPACE="fund/${ROLE}/${PROFILE}"
 PROFILE_BUCKET="oscm-fund-${SLUG}"
 if [[ ${#NAME} -gt 54 ]]; then
   echo "Error: \"$NAME\" is ${#NAME} characters; ${NAME}-scheduler would exceed IAM's 64" >&2
@@ -325,7 +327,7 @@ ${ROLE_STATEMENTS}
      "Resource": ["arn:aws:s3:::${PROFILE_BUCKET}/records/journal/producer=${ROLE}/*",
                   "arn:aws:s3:::${PROFILE_BUCKET}/records/logs/producer=${ROLE}/*"]},
     {"Sid": "PublishRunOutcome", "Effect": "Allow", "Action": ["cloudwatch:PutMetricData"], "Resource": "*",
-     "Condition": {"StringEquals": {"cloudwatch:namespace": "fund"}}}
+     "Condition": {"StringEquals": {"cloudwatch:namespace": "${NAMESPACE}"}}}
 ]}
 JSON
 )"
@@ -472,15 +474,22 @@ put_alarm() {
     --alarm-actions "$ALARM_TOPIC_ARN" "$@"
 }
 
-# run-host publishes `fund/RunCompleted` or `fund/RunFailed` as a run exits; every role pages on a failure, and a
-# scheduled role also on a missing success, the only sign of a box that never booted or never reached the CLI.
+# run-host publishes `RunCompleted` or `RunFailed` to the host's namespace as a run exits; every role pages on a
+# failure, and a scheduled one also on a missing success, the only sign of a box that never booted or reached the CLI.
 reconcile_alarms() {
-  local lookup subscribed="" about completed
+  local lookup owner listed="" confirmed pending about completed
   step "Alarms for $NAME on $ALARM_TOPIC"
   if lookup="$(aws sns get-topic-attributes --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" 2>&1 >/dev/null)"; then
+    owner="$(aws sns list-tags-for-resource --region "$REGION" --resource-arn "$ALARM_TOPIC_ARN" \
+      --query "Tags[?Key=='fund-profile'].Value" --output text)"
+    [[ "$owner" == "None" ]] && owner=""
+    if [[ "$owner" != "$PROFILE" ]]; then
+      echo "Error: topic $ALARM_TOPIC belongs to profile ${owner:-<untagged>}, which shares this profile's slug" >&2
+      exit 1
+    fi
     unchanged "topic $ALARM_TOPIC"
-    subscribed="$(aws sns list-subscriptions-by-topic --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" \
-      --query "Subscriptions[?Protocol=='email'].Endpoint" --output text)"
+    listed="$(aws sns list-subscriptions-by-topic --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" \
+      --query "Subscriptions[?Protocol=='email'].[Endpoint,SubscriptionArn]" --output text)"
   elif [[ "$lookup" == *"(NotFound)"* ]]; then
     changed "create topic $ALARM_TOPIC"
     if [[ "$APPLY" == true ]]; then
@@ -490,30 +499,37 @@ reconcile_alarms() {
     echo "Error: could not read topic $ALARM_TOPIC: $lookup" >&2
     exit 1
   fi
-  [[ "$subscribed" == "None" ]] && subscribed=""
-  if [[ -n "$ALERT_EMAIL" ]] && grep -qxF -- "$ALERT_EMAIL" <<<"${subscribed//$'\t'/$'\n'}"; then
+  [[ "$listed" == "None" ]] && listed=""
+  # An unconfirmed email is listed with the ARN `PendingConfirmation` and is paged nothing.
+  confirmed="$(awk -F'\t' 'NF && $2 != "PendingConfirmation" { print $1 }' <<<"$listed")"
+  pending="$(awk -F'\t' 'NF && $2 == "PendingConfirmation" { print $1 }' <<<"$listed")"
+  if [[ -n "$ALERT_EMAIL" ]] && grep -qxF -- "$ALERT_EMAIL" <<<"$confirmed"; then
     unchanged "$ALERT_EMAIL subscribed"
+  elif [[ -n "$ALERT_EMAIL" ]] && grep -qxF -- "$ALERT_EMAIL" <<<"$pending"; then
+    drift "$ALERT_EMAIL has not confirmed the email AWS sent, so $ALARM_TOPIC pages no one there until it does"
   elif [[ -n "$ALERT_EMAIL" ]]; then
     changed "subscribe $ALERT_EMAIL, which is paged only once it confirms the email AWS sends"
     if [[ "$APPLY" == true ]]; then
       aws sns subscribe --region "$REGION" --topic-arn "$ALARM_TOPIC_ARN" --protocol email \
         --notification-endpoint "$ALERT_EMAIL" >/dev/null
     fi
-  elif [[ -z "$subscribed" ]]; then
+  elif [[ -n "$confirmed" ]]; then
+    unchanged "subscribed: ${confirmed//$'\n'/, }"
+  elif [[ -n "$pending" ]]; then
+    drift "${pending//$'\n'/, } has not confirmed the email AWS sent, so $ALARM_TOPIC pages no one there until it does"
+  else
     echo "Error: $ALARM_TOPIC has no email subscription, so its alarms would page no one; pass --alert-email" >&2
     exit 1
-  else
-    unchanged "subscribed: ${subscribed//$'\t'/, }"
   fi
 
   about="the $PROFILE $ROLE on instance ${INSTANCE_ID:-not yet launched}; read"
   about+=" s3://${PROFILE_BUCKET}/records/logs/producer=${ROLE}/ first. Managed by host/provision-host."
-  put_alarm "$NAME-run-failed" "A run exited non-zero on $about" "fund/RunFailed at least 1 in 5 minutes" \
-    --namespace fund --metric-name RunFailed --dimensions "Name=role,Value=$ROLE" "Name=profile,Value=$PROFILE" \
+  put_alarm "$NAME-run-failed" "A run exited non-zero on $about" "RunFailed in $NAMESPACE at least 1 in 5 minutes" \
+    --namespace "$NAMESPACE" --metric-name RunFailed \
     --statistic Sum --period 300 --evaluation-periods 1 --threshold 1 \
     --comparison-operator GreaterThanOrEqualToThreshold --treat-missing-data notBreaching
   # Hourly rather than daily, since a day-long sliding window breaches whenever a run finishes later than the last.
-  completed="{\"Namespace\":\"fund\",\"MetricName\":\"RunCompleted\",\"Dimensions\":[{\"Name\":\"role\",\"Value\":\"$ROLE\"},{\"Name\":\"profile\",\"Value\":\"$PROFILE\"}]}"
+  completed="{\"Namespace\":\"$NAMESPACE\",\"MetricName\":\"RunCompleted\"}"
   # Successes land at most 29 hours apart for the archiver (03:00 to the 08:00 stop) and 32 for the trader, which
   # boots daily and finishes by 09:00 on a closed session or by the 16:30 stop on an open one.
   case "$ROLE" in
@@ -522,10 +538,15 @@ reconcile_alarms() {
     researcher) window="" ;;
   esac
   if [[ -n "$window" ]]; then
-    put_alarm "$NAME-run-missing" "No success in $window hours on $about" "no fund/RunCompleted in $window hours" \
+    put_alarm "$NAME-run-missing" "No success in $window hours on $about" \
+      "no RunCompleted in $NAMESPACE in $window hours" \
       --metrics "[{\"Id\":\"completed\",\"ReturnData\":true,\"MetricStat\":{\"Metric\":$completed,\"Period\":3600,\"Stat\":\"Sum\"}}]" \
       --evaluation-periods "$window" --datapoints-to-alarm "$window" --threshold 1 \
       --comparison-operator LessThanThreshold --treat-missing-data breaching
+  fi
+  if [[ "$DRIFT" -gt 0 ]]; then
+    echo "Error: $DRIFT drifted field(s) above; confirm the subscription, then re-run" >&2
+    exit 1
   fi
 }
 

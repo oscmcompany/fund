@@ -553,7 +553,9 @@ case "$1 $2" in
   "sns get-topic-attributes")
     [[ -n "${STUB_NO_TOPIC+set}" ]] || exit 0
     echo "An error occurred (NotFound) when calling the GetTopicAttributes operation" >&2; exit 254 ;;
-  "sns list-subscriptions-by-topic") echo "${STUB_SUBSCRIBED-pager@example.com}" ;;
+  "sns list-tags-for-resource") echo "${STUB_TOPIC_OWNER}" ;;
+  "sns list-subscriptions-by-topic")
+    printf '%b\n' "${STUB_SUBSCRIBED-pager@example.com\tarn:aws:sns:us-east-1:123456789012:fund-alarms-production:1}" ;;
   "sns subscribe") value_of --notification-endpoint "$@" >> "$STUB_DIRECTORY/subscribed" ;;
   "cloudwatch describe-alarms") echo "${STUB_ALARMS:-}" ;;
   "cloudwatch put-metric-alarm")
@@ -603,11 +605,17 @@ impl Provisioned {
             std::fs::set_permissions(&path, permissions).unwrap();
         }
         let path = format!("{}:{}", directory.display(), std::env::var("PATH").unwrap());
+        let profile = arguments
+            .iter()
+            .skip_while(|argument| **argument != "--profile")
+            .nth(1)
+            .unwrap();
         let output = Command::new("bash")
             .arg(script("provision-host"))
             .args(arguments)
             .env("PATH", path)
             .env("STUB_DIRECTORY", &directory)
+            .env("STUB_TOPIC_OWNER", profile)
             .env("BOOTSTRAP_POLL_SECONDS", "0")
             .envs(environment.iter().copied())
             .output()
@@ -1691,12 +1699,8 @@ fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() 
                     &format!("A run exited non-zero on {about}")
                 ),
                 ("--alarm-actions", topic),
-                ("--namespace", "fund"),
+                ("--namespace", "fund/archiver/production"),
                 ("--metric-name", "RunFailed"),
-                (
-                    "--dimensions",
-                    "Name=role,Value=archiver Name=profile,Value=production"
-                ),
                 ("--statistic", "Sum"),
                 ("--period", "300"),
                 ("--evaluation-periods", "1"),
@@ -1707,10 +1711,8 @@ fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() 
             None
         )
     );
-    let completed = |role: &str, profile: &str| {
-        serde_json::json!({"Namespace": "fund", "MetricName": "RunCompleted", "Dimensions": [
-            {"Name": "role", "Value": role}, {"Name": "profile", "Value": profile}]})
-    };
+    let completed =
+        |namespace: &str| serde_json::json!({"Namespace": namespace, "MetricName": "RunCompleted"});
     let (missing, metrics) = archiver.alarm("fund-archiver-production-run-missing");
     assert_eq!(
         missing[1..],
@@ -1731,7 +1733,7 @@ fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() 
     assert_eq!(
         metrics.unwrap(),
         serde_json::json!([{"Id": "completed", "ReturnData": true, "MetricStat": {
-            "Metric": completed("archiver", "production"), "Period": 3600, "Stat": "Sum"}}])
+            "Metric": completed("fund/archiver/production"), "Period": 3600, "Stat": "Sum"}}])
     );
 
     let trader = Provisioned::run_role("trader", "development/a.b", &[]);
@@ -1755,7 +1757,7 @@ fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() 
         metrics.unwrap(),
         serde_json::json!([
             {"Id": "completed", "ReturnData": true, "MetricStat": {
-                "Metric": completed("trader", "development/a.b"), "Period": 3600, "Stat": "Sum"}}
+                "Metric": completed("fund/trader/development/a.b"), "Period": 3600, "Stat": "Sum"}}
         ])
     );
 
@@ -1775,10 +1777,10 @@ fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() 
         ]
     );
 
-    for (provisioned, role) in [
-        (&archiver, "archiver"),
-        (&trader, "trader"),
-        (&researcher, "researcher"),
+    for (provisioned, role, namespace) in [
+        (&archiver, "archiver", "fund/archiver/production"),
+        (&trader, "trader", "fund/trader/development/a.b"),
+        (&researcher, "researcher", "fund/researcher/production"),
     ] {
         let grant = provisioned.json(&format!("policy-{role}.json"));
         let publishing: Vec<&serde_json::Value> = grant["Statement"]
@@ -1792,7 +1794,7 @@ fn test_each_role_pages_on_a_failure_and_a_scheduled_one_on_a_missing_success() 
             [
                 &serde_json::json!({"Sid": "PublishRunOutcome", "Effect": "Allow",
                 "Action": ["cloudwatch:PutMetricData"], "Resource": "*",
-                "Condition": {"StringEquals": {"cloudwatch:namespace": "fund"}}})
+                "Condition": {"StringEquals": {"cloudwatch:namespace": namespace}}})
             ],
             "{role}"
         );
@@ -1828,8 +1830,8 @@ fn test_the_plan_names_each_alarm_and_writes_nothing() {
             "==> Alarms for fund-archiver-production on fund-alarms-production",
             "    WOULD CHANGE: create topic fund-alarms-production",
             "    WOULD CHANGE: subscribe new@example.com, which is paged only once it confirms the email AWS sends",
-            "    WOULD CHANGE: refresh alarm fund-archiver-production-run-failed: fund/RunFailed at least 1 in 5 minutes",
-            "    WOULD CHANGE: create alarm fund-archiver-production-run-missing: no fund/RunCompleted in 32 hours",
+            "    WOULD CHANGE: refresh alarm fund-archiver-production-run-failed: RunFailed in fund/archiver/production at least 1 in 5 minutes",
+            "    WOULD CHANGE: create alarm fund-archiver-production-run-missing: no RunCompleted in fund/archiver/production in 32 hours",
             "",
         ]
     );
@@ -1860,7 +1862,7 @@ fn test_the_plan_names_each_alarm_and_writes_nothing() {
     for line in [
         "    ok: topic fund-alarms-production",
         "    ok: pager@example.com subscribed",
-        "    WOULD CHANGE: create alarm fund-trader-production-run-missing: no fund/RunCompleted in 36 hours",
+        "    WOULD CHANGE: create alarm fund-trader-production-run-missing: no RunCompleted in fund/trader/production in 36 hours",
     ] {
         assert!(
             trader.output.lines().any(|output| output == line),
@@ -1927,6 +1929,92 @@ fn test_a_topic_without_a_subscriber_stops_before_any_alarm() {
         std::fs::read_to_string(subscribing.directory.join("subscribed")).unwrap(),
         "new@example.com\n"
     );
+    assert!(
+        subscribing.output.contains(
+            "    CHANGED: subscribe new@example.com, which is paged only once it confirms the email AWS sends"
+        ) && !subscribing.output.contains("DRIFT"),
+        "{}",
+        subscribing.output
+    );
+}
+
+#[test]
+fn test_an_unconfirmed_subscription_is_drift_and_never_resubscribed() {
+    let pending = "pager@example.com\tPendingConfirmation";
+    for arguments in [
+        &["--alert-email", "pager@example.com", "--apply"][..],
+        &["--apply"][..],
+    ] {
+        let provisioned = Provisioned::invoke(
+            &[
+                &["--role", "archiver", "--profile", "production"][..],
+                arguments,
+            ]
+            .concat(),
+            &[("STUB_SUBSCRIBED", pending)],
+        );
+        assert_eq!(provisioned.code, 1, "{arguments:?}: {}", provisioned.output);
+        assert!(
+            provisioned.output.lines().any(|line| line
+                == "    DRIFT: pager@example.com has not confirmed the email AWS sent, so \
+                    fund-alarms-production pages no one there until it does"),
+            "{arguments:?}: {}",
+            provisioned.output
+        );
+        assert!(
+            !provisioned.output.contains("has no email subscription")
+                && !provisioned
+                    .output
+                    .contains("ok: pager@example.com subscribed")
+                && !provisioned.output.contains("ok: subscribed:"),
+            "{arguments:?}: {}",
+            provisioned.output
+        );
+        assert!(
+            !provisioned.calls().contains(&"sns subscribe".to_string()),
+            "{arguments:?}: {:?}",
+            provisioned.calls()
+        );
+    }
+}
+
+#[test]
+fn test_a_topic_another_profile_owns_is_refused_before_any_alarm() {
+    for owner in ["development/a-b", ""] {
+        let refused = Provisioned::invoke(
+            &[
+                "--role",
+                "trader",
+                "--profile",
+                "development/a.b",
+                "--alert-email",
+                "new@example.com",
+                "--apply",
+            ],
+            &[("STUB_TOPIC_OWNER", owner)],
+        );
+        assert_eq!(refused.code, 1, "{owner}: {}", refused.output);
+        let expected = format!(
+            "Error: topic fund-alarms-development-a-b belongs to profile {}, which shares this profile's slug",
+            if owner.is_empty() {
+                "<untagged>"
+            } else {
+                owner
+            }
+        );
+        assert!(
+            refused.output.lines().any(|line| line == expected),
+            "{owner}: {}",
+            refused.output
+        );
+        let calls = refused.calls();
+        assert!(
+            calls.contains(&"sns list-tags-for-resource".to_string())
+                && !calls.contains(&"sns subscribe".to_string())
+                && !calls.contains(&"cloudwatch put-metric-alarm".to_string()),
+            "{owner}: {calls:?}"
+        );
+    }
 }
 
 /// Stands in for `curl` against the instance metadata service, answering the tags from `STUB_*`.
@@ -1939,7 +2027,7 @@ case "${*: -1}" in
   */tags/instance/fund-role) echo "$STUB_ROLE" ;;
   */tags/instance/fund-profile) echo "$STUB_PROFILE" ;;
   */tags/instance/fund-hold) echo operator ;;
-  */placement/region) echo us-east-1 ;;
+  */placement/region) [[ -z "${STUB_NO_REGION+set}" ]] || exit 22; echo eu-west-2 ;;
   *) exit 22 ;;
 esac
 "#;
@@ -2051,16 +2139,16 @@ fn publish(metric: &str) -> Vec<String> {
         "aws",
         "cloudwatch",
         "put-metric-data",
+        "--region",
+        "eu-west-2",
         "--namespace",
-        "fund",
+        "fund/trader/development/a.b",
         "--metric-name",
         metric,
         "--value",
         "1",
         "--unit",
         "Count",
-        "--dimensions",
-        "role=trader,profile=development/a.b",
     ]
     .map(str::to_string)
     .to_vec()
@@ -2099,13 +2187,27 @@ fn test_a_run_publishes_its_outcome_before_powering_off() {
     assert!(
         unpublished
             .output
-            .contains("Error: fund/RunCompleted could not be published"),
+            .contains("Error: RunCompleted could not be published to fund/trader/development/a.b"),
         "{}",
         unpublished.output
     );
     assert_eq!(
         unpublished.events().last().unwrap(),
         "sudo systemctl poweroff"
+    );
+
+    let unplaced = Booted::run(&[("STUB_NO_REGION", "")]);
+    assert_ne!(unplaced.code, 0, "{}", unplaced.output);
+    let mut unregioned = publish("RunFailed");
+    unregioned.drain(3..5);
+    assert_eq!(unplaced.published(), unregioned);
+    assert_eq!(
+        unplaced.events(),
+        [
+            "sudo shutdown -P +1560",
+            "publish",
+            "sudo systemctl poweroff"
+        ]
     );
 }
 

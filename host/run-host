@@ -47,12 +47,13 @@ fi
 
 # Publishes the run's outcome for the role's alarms, then powers off whether or not the publish succeeded.
 finish() {
-  local status=$? metric=RunCompleted
+  local status=$? metric=RunCompleted namespace="fund/${role:-none}/${profile:-none}"
   [[ "$status" -eq 0 ]] || metric=RunFailed
-  echo "Run exited ${status}; publishing fund/${metric}"
-  timeout 300 devenv shell -- aws cloudwatch put-metric-data --namespace fund --metric-name "$metric" --value 1 \
-    --unit Count --dimensions "role=${role:-none},profile=${profile:-none}" \
-    || echo "Error: fund/${metric} could not be published"
+  echo "Run exited ${status}; publishing ${metric} to ${namespace}"
+  # The instance's region is expanded here, since devenv's shell sets its own; an unread one falls back to devenv's.
+  timeout 300 devenv shell -- aws cloudwatch put-metric-data ${AWS_REGION:+--region "$AWS_REGION"} \
+    --namespace "$namespace" --metric-name "$metric" --value 1 --unit Count \
+    || echo "Error: ${metric} could not be published to ${namespace}"
   echo "Powering off"
   sudo systemctl poweroff
 }
