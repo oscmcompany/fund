@@ -628,7 +628,12 @@ mod tests {
         assert_eq!(limit["limit_price"], "45.12");
         assert_eq!(limit["symbol"], "ABC");
         assert_eq!(limit["qty"], "2");
-        assert_eq!(limit["client_order_id"], market["client_order_id"]);
+        for body in [&market, &limit] {
+            assert_eq!(
+                body["client_order_id"],
+                "fund:00000000-0000-0000-0000-000000000007:3"
+            );
+        }
     }
 
     #[test]
