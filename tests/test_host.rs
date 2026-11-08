@@ -417,6 +417,49 @@ fn test_a_push_refuses_while_a_study_holds_the_working_tree_and_proceeds_once_it
     assert!(replaced, "the push after the study ended left the old tree");
 }
 
+/// A push replaces the tree but keeps the box's study journal, moving a root `journal/` under `studies/` and deleting
+/// neither when both exist.
+#[test]
+fn test_a_push_keeps_the_study_journal_wherever_it_was() {
+    let _pushing = PUSHING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (before, after) in [
+        (&["journal/root"][..], &["studies/journal/root"][..]),
+        (&["studies/journal/kept"][..], &["studies/journal/kept"][..]),
+        (
+            &["journal/root", "studies/journal/kept"][..],
+            &["journal/root", "studies/journal/kept"][..],
+        ),
+    ] {
+        let home = researcher_home();
+        let tree = home.join("working-tree");
+        for file in before.iter().chain(["studies/stale", "stale"].iter()) {
+            std::fs::create_dir_all(tree.join(file).parent().unwrap()).unwrap();
+            std::fs::write(tree.join(file), file).unwrap();
+        }
+        let pushed = researcher(&home, &["push"]);
+        let kept: Vec<&str> = [
+            "journal/root",
+            "studies/journal/root",
+            "studies/journal/kept",
+        ]
+        .into_iter()
+        .filter(|file| tree.join(file).exists())
+        .collect();
+        let stale = ["stale", "studies/stale"].map(|file| tree.join(file).exists());
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(
+            pushed.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&pushed.stderr)
+        );
+        assert_eq!(kept, after, "from {before:?}");
+        assert_eq!(stale, [false, false], "from {before:?}");
+    }
+}
+
 #[test]
 fn test_a_run_refuses_a_tree_another_push_replaced_before_it_ran() {
     let _pushing = PUSHING

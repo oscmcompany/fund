@@ -12,6 +12,8 @@
 /studies/src/bin/
 /studies/jobs/
 /studies/journal/
+/jobs/
+/journal/
 playbook*.toml
 capital_flows.toml
 *.parquet

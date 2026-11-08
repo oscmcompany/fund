@@ -9,7 +9,7 @@ set -euo pipefail
 export LC_ALL=C
 
 repository="${1:-$(dirname "${BASH_SOURCE[0]}")/..}"
-private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl(\.gz)?$|\.safetensors?$|\.weights\.json$|(^|/)capital_flows\.toml$|^studies/(src/bin|jobs|journal)/|^\.scratchpad/|^\.claude/skills/[^/]+/measurements\.md$'
+private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl(\.gz)?$|\.safetensors?$|\.weights\.json$|(^|/)capital_flows\.toml$|^studies/(src/bin|jobs|journal)/|^(jobs|journal)/|^\.scratchpad/|^\.claude/skills/[^/]+/measurements\.md$'
 
 listing="$(mktemp)"
 trap 'rm -f "${listing}"' EXIT

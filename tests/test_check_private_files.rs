@@ -85,6 +85,8 @@ fn test_each_private_file_fails_and_is_named() {
         "studies/journal/README.md",
         "studies/src/bin/null_check.rs",
         "studies/jobs/parse_ticks.sh",
+        "jobs/parse_ticks.sh",
+        "journal/README.md",
         ".scratchpad/plan.md",
         ".claude/skills/report-findings/measurements.md",
         "studies/journal/échange.md",
