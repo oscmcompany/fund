@@ -863,7 +863,7 @@ mod tests {
                 decision.phase,
                 decision.opening,
                 &decision.book,
-                &NameLosses::default(),
+                Ok(&NameLosses::default()),
                 price,
                 decision.wanted.clone(),
             )

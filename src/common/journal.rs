@@ -262,8 +262,8 @@ impl ConfigurationResolved {
     }
 }
 
-/// The book a trading session started from, as the broker reported it, and its worth at the previous session's closes,
-/// from which the session's loss is measured.
+/// The book a trading session started from, as the broker reported it less every fill it reports since the open, and
+/// its worth at the previous session's closes, from which the session's loss is measured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionOpened {
     session: SessionDate,
@@ -1180,7 +1180,7 @@ mod tests {
                     },
                     Cash::from_units(0),
                     &Book::default(),
-                    &NameLosses::default(),
+                    Ok(&NameLosses::default()),
                     |_| None,
                     target.clone(),
                 )

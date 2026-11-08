@@ -223,7 +223,8 @@ pub struct Replay {
     unfilled: Vec<Unfilled>,
     marks: BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
     /// The session decided in and each name's gain since its open, opened at the session's first decision from the
-    /// closes before it, or why a position had no close; `None` before the first decision or when unrestrained.
+    /// closes before it, or why a position had no close, retried at each later decision until it has one; `None`
+    /// before the first decision or when unrestrained.
     losses: Option<(SessionDate, Result<NameLosses, ValuationRefusal>)>,
     /// Under restraint, what the solver cut at each decision, or why risk could not judge it and nothing was sent.
     restraints: BTreeMap<DateTime<Utc>, Result<Vec<Cut>, ValuationRefusal>>,
@@ -452,7 +453,7 @@ impl<S: Strategy> Replayer<S> {
         };
         let mut unclosed = Unclosed::default();
         let session = SessionDate::at(ends);
-        let opened = matches!(&replay.losses, Some((opened, _)) if *opened == session);
+        let opened = matches!(&replay.losses, Some((opened, Ok(_))) if *opened == session);
         let restrained = match &self.controls {
             Controls::Unrestrained => false,
             Controls::Restrained(_) => true,
@@ -512,24 +513,21 @@ impl<S: Strategy> Replayer<S> {
                         .losses
                         .as_mut()
                         .expect("a deciding step opens its session's losses");
-                    let solution =
-                        losses
-                            .as_mut()
-                            .map_err(|refusal| refusal.clone())
-                            .and_then(|losses| {
-                                losses.bar(&restraint.limits, price);
-                                let opening = session_opening(&replay.marks, ends)?;
-                                formulate(
-                                    &restraint.limits,
-                                    restraint.calendar.phase_at(ends),
-                                    opening,
-                                    &replay.book,
-                                    losses,
-                                    price,
-                                    wanted,
-                                )
-                                .map(|problem| Solver::Clip.solve(&problem))
-                            });
+                    if let Ok(losses) = losses {
+                        losses.bar(&restraint.limits, price);
+                    }
+                    let solution = session_opening(&replay.marks, ends).and_then(|opening| {
+                        formulate(
+                            &restraint.limits,
+                            restraint.calendar.phase_at(ends),
+                            opening,
+                            &replay.book,
+                            losses.as_ref(),
+                            price,
+                            wanted,
+                        )
+                        .map(|problem| Solver::Clip.solve(&problem))
+                    });
                     match solution {
                         Ok(solution) => {
                             replay.restraints.insert(ends, Ok(solution.cuts().to_vec()));
@@ -964,6 +962,66 @@ mod tests {
             [(Side::Buy, 100_000_000), (Side::Sell, 94_000_000)]
         );
         assert_eq!(replay.book(), &Book::funded(cash(994)));
+    }
+
+    /// A replay opening on one AAPL with no close before it cannot measure AAPL's loss at its first decision, yet sells
+    /// it there inside the flat window; outside it, the first decision is refused for the missing close and the next,
+    /// once a price has arrived, decides.
+    #[test]
+    fn test_an_opening_position_without_a_close_still_flattens_and_then_decides() {
+        let held = Book::reported(
+            cash(1_000),
+            [(symbol("AAPL"), Position::from_units(1_000_000))],
+        );
+        let replay = |first: DateTime<Utc>| {
+            let bars = (0..3).map(|offset| {
+                bar(
+                    "AAPL",
+                    BarInterval::OneMinute,
+                    first + TimeDelta::minutes(offset),
+                    100_000_000,
+                    100_000_000,
+                )
+            });
+            Replayer::controlled(
+                Hold(vec![("AAPL", 1)]),
+                free(),
+                BarInterval::OneMinute,
+                restraint(BTreeMap::new()),
+            )
+            .unwrap()
+            .act(Replay::open(held.clone()), bars)
+            .unwrap()
+            .finish()
+        };
+        let closing = replay(before_close(10));
+        assert_eq!(closing.restraints().len(), 3);
+        for cuts in closing.restraints().values() {
+            assert!(
+                matches!(cuts.as_deref(), Ok([Cut::OutsideTradingWindow { .. }])),
+                "{cuts:?}"
+            );
+        }
+        assert_eq!(
+            closing
+                .fills()
+                .iter()
+                .map(|fill| (fill.side(), fill.price().ticks()))
+                .collect::<Vec<_>>(),
+            [(Side::Sell, 100_000_000)]
+        );
+        let trading = replay(before_close(120));
+        assert_eq!(
+            trading.restraints().values().cloned().collect::<Vec<_>>(),
+            [
+                Err(ValuationRefusal::Unpriced {
+                    symbol: symbol("AAPL")
+                }),
+                Ok(Vec::new()),
+                Ok(Vec::new())
+            ]
+        );
+        assert_eq!(trading.fills(), []);
     }
 
     /// AAPL barred on Monday for a $6 loss is bought again at Tuesday's first decision, as each session reopens its

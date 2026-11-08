@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 
 use crate::broker::Broker;
-use crate::common::book::{Book, Cash, Fill};
+use crate::common::book::{Book, Cash, Fill, ValuationRefusal};
 use crate::common::journal::Observation;
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState, Staleness};
@@ -244,6 +244,25 @@ fn journal_refused(error: &std::io::Error) -> HaltCause {
     }
 }
 
+/// Where a session stands as a run starts: the book it opened with, from the book the broker holds now less every fill
+/// it reports since the open, that book's worth at `close`, and each name's session so far, so a second run of one
+/// session measures every loss from the open rather than from its own start; refused for a position with no close.
+pub fn resumed(
+    now: &Book,
+    fills: &[Fill],
+    close: impl Fn(&Symbol) -> Option<Price>,
+) -> Result<(Book, Cash, NameLosses), ValuationRefusal> {
+    let opened = fills.iter().fold(now.clone(), |book, fill| {
+        book.combine(Book::of(fill).negated())
+    });
+    let opening = opened.value(&close)?;
+    let mut losses = NameLosses::open(&opened, close)?;
+    for fill in fills {
+        losses.take(fill);
+    }
+    Ok((opened, opening, losses))
+}
+
 impl<S: Strategy> Session<S> {
     /// A session for `session`'s tape of `symbols` building from `open`, from a state warmed on earlier sessions and
     /// the book the broker reported at the open, worth `opening` and split by name into `losses`. A session the
@@ -469,7 +488,7 @@ impl<S: Strategy> Session<S> {
             phase,
             self.opening,
             &self.book,
-            &self.losses,
+            Ok(&self.losses),
             |symbol| self.fresh_price(symbol, now),
             wanted.clone(),
         )
@@ -695,9 +714,11 @@ mod tests {
         }
     }
 
-    /// A broker that fills every order at once at `ticks`, keeping its own book, which starts wherever a test puts it.
+    /// A broker that fills every order at once at `ticks`, keeping its own book, which starts wherever a test puts it,
+    /// and every fill it made.
     struct Filling {
-        ticks: i64,
+        ticks: Mutex<i64>,
+        filled: Mutex<Vec<Fill>>,
         /// Whether orders fill; when they do not, each stays open and its cancel never takes.
         fills: bool,
         /// Whether reading the book fails, as when the broker answers with a malformed cash field.
@@ -709,7 +730,8 @@ mod tests {
     impl Filling {
         fn new(ticks: i64, book: Book) -> Self {
             Self {
-                ticks,
+                ticks: Mutex::new(ticks),
+                filled: Mutex::new(Vec::new()),
                 fills: true,
                 book_unreadable: false,
                 book: Mutex::new(book),
@@ -721,7 +743,7 @@ mod tests {
     impl Broker for Filling {
         async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
             let order = request.order();
-            let price = Price::from_ticks(self.ticks).unwrap();
+            let price = Price::from_ticks(*self.ticks.lock().unwrap()).unwrap();
             if !self.fills {
                 let open = BrokerOrder::new(
                     BrokerOrderId::new("broker-1".to_string()),
@@ -741,6 +763,7 @@ mod tests {
             .unwrap();
             let mut book = self.book.lock().unwrap();
             *book = std::mem::take(&mut *book).combine(Book::of(&fill));
+            self.filled.lock().unwrap().push(fill);
             let filled = BrokerOrder::new(
                 BrokerOrderId::new("broker-1".to_string()),
                 OrderReport::new(
@@ -833,6 +856,21 @@ mod tests {
         open: DateTime<Utc>,
         decision: DecisionInterval,
     ) -> Session<OneShare> {
+        let losses = NameLosses::open(&funded, |_| Price::from_ticks(700_000_000).ok()).unwrap();
+        let opening = Cash::from_units(10_000 * DOLLAR);
+        session_resumed(stale_after, funded, opening, losses, limits, open, decision)
+    }
+
+    /// `session_limited` holding `book`, opened worth `opening` with each name's session so far in `losses`.
+    fn session_resumed(
+        stale_after: TimeDelta,
+        book: Book,
+        opening: Cash,
+        losses: NameLosses,
+        limits: Limits,
+        open: DateTime<Utc>,
+        decision: DecisionInterval,
+    ) -> Session<OneShare> {
         let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
         let calendar = TradingCalendar::new(
             vec![
@@ -862,9 +900,9 @@ mod tests {
             TradeConditions::new(BTreeMap::new()),
             vec![spy()],
             MarketState::default(),
-            funded.clone(),
-            Cash::from_units(10_000 * DOLLAR),
-            NameLosses::open(&funded, |_| Price::from_ticks(700_000_000).ok()).unwrap(),
+            book,
+            opening,
+            losses,
             open,
         )
     }
@@ -1141,6 +1179,91 @@ mod tests {
         );
         assert_eq!(session.book(), &funded);
         assert_eq!(session.standing(), &Standing::Trading);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// SPY bought at $700 and sold at $650 is barred in the first run; a second run of the session, resumed from the
+    /// broker's book and its fills, opens worth the first run's $10,000 and keeps SPY flat at $800, sending nothing.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_name_barred_in_one_run_stays_barred_in_the_next() {
+        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
+        let funded = Book::funded(dollars(10_000));
+        let broker = Filling::new(700_000_000, funded.clone());
+        let limits = Limits::new(
+            dollars(10_000),
+            dollars(5_000),
+            dollars(1_000),
+            dollars(50),
+            TimeDelta::minutes(15),
+        )
+        .unwrap();
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        let mut first = session_limited(
+            TimeDelta::minutes(5),
+            funded.clone(),
+            limits,
+            at("14:00:00"),
+            DecisionInterval::FiveMinute,
+        );
+        for (when, ticks, decided) in [
+            ("14:04:30", 700_000_000, "14:05:02"),
+            ("14:09:30", 650_000_000, "14:10:02"),
+        ] {
+            *broker.ticks.lock().unwrap() = ticks;
+            tape.file(print(when, ticks));
+            first
+                .advance(&|| at(decided), &tape, &broker, &mut journal)
+                .await
+                .unwrap();
+        }
+        let now = broker.book().await.unwrap();
+        assert_eq!(now, Book::funded(dollars(9_950)));
+        let fills = broker.filled.lock().unwrap().clone();
+        let (opened, opening, losses) =
+            resumed(&now, &fills, |_| Price::from_ticks(700_000_000).ok()).unwrap();
+        assert_eq!((opened, opening), (funded, dollars(10_000)));
+        let submitted = |directory| {
+            journaled(directory)
+                .iter()
+                .filter(|event| **event == "order_submitted")
+                .count()
+        };
+        assert_eq!(submitted(&directory), 2);
+        let mut second = session_resumed(
+            TimeDelta::minutes(5),
+            now.clone(),
+            opening,
+            losses,
+            limits,
+            at("14:15:00"),
+            DecisionInterval::FiveMinute,
+        );
+        tape.file(print("14:19:30", 800_000_000));
+        second
+            .advance(&|| at("14:20:02"), &tape, &broker, &mut journal)
+            .await
+            .unwrap();
+        let last: serde_json::Value = records(&directory)
+            .iter()
+            .filter(|record| record.observation().event_type() == "target_decided")
+            .map(|record| serde_json::to_value(record.observation()).unwrap()["payload"].clone())
+            .next_back()
+            .unwrap();
+        assert_eq!(
+            last["barred"],
+            serde_json::json!([{"symbol": "SPY", "loss": "50000000000000", "limit": "50000000000000"}])
+        );
+        assert_eq!(
+            last["solution"]["cuts"],
+            serde_json::json!([{"per_name_loss": {
+                "symbol": "SPY",
+                "wanted": 1_000_000,
+                "loss": "50000000000000"
+            }}])
+        );
+        assert_eq!(submitted(&directory), 2);
+        assert_eq!(second.book(), &now);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

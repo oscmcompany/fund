@@ -299,6 +299,18 @@ impl Book {
             })
     }
 
+    /// The book that undoes this one, so the two combined are empty.
+    pub fn negated(&self) -> Self {
+        Self {
+            cash: self.cash.negated(),
+            positions: self
+                .positions
+                .iter()
+                .map(|(symbol, position)| (symbol.clone(), Position(-position.0)))
+                .collect(),
+        }
+    }
+
     fn canonical(mut self) -> Self {
         self.positions.retain(|_, position| position.0 != 0);
         self
@@ -478,6 +490,11 @@ mod tests {
             third in arbitrary_book(),
         ) {
             laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_a_book_combined_with_its_negation_is_empty(book in arbitrary_book()) {
+            prop_assert_eq!(book.clone().combine(book.negated()), Book::empty());
         }
 
         #[test]

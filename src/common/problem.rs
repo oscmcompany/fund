@@ -75,13 +75,14 @@ impl Problem {
 
 /// The problem of reaching `wanted` within `limits`, given where the session stands, the equity it opened with, the
 /// book now, the names barred for their loss and a price for every symbol held or wanted; refused when risk must value
-/// a holding with no price, while a wanted symbol with no price is held at zero.
+/// a holding with no price, or caps the target while `losses` could not be measured, while a wanted symbol with no
+/// price is held at zero.
 pub fn formulate(
     limits: &Limits,
     phase: SessionPhase,
     opening: Cash,
     book: &Book,
-    losses: &NameLosses,
+    losses: Result<&NameLosses, &ValuationRefusal>,
     price: impl Fn(&Symbol) -> Option<Price>,
     wanted: Target,
 ) -> Result<Problem, ValuationRefusal> {
@@ -94,7 +95,7 @@ pub fn formulate(
                 .keys()
                 .filter_map(|symbol| Some((symbol.clone(), price(symbol)?)))
                 .collect(),
-            losses.barred().clone(),
+            losses.map_err(Clone::clone)?.barred().clone(),
         ),
     };
     Ok(Problem {

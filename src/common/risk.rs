@@ -477,7 +477,7 @@ mod tests {
             phase,
             opening,
             book,
-            &NameLosses::default(),
+            Ok(&NameLosses::default()),
             price,
             target,
         )
@@ -966,7 +966,7 @@ mod tests {
             open(),
             dollars(10_000),
             &funded(10_000),
-            &NameLosses::default(),
+            Ok(&NameLosses::default()),
             &price,
             target(&[("AAPL", 2), ("SPY", 1)]),
         )
@@ -1070,7 +1070,7 @@ mod tests {
             open(),
             dollars(0),
             &book,
-            &losses,
+            Ok(&losses),
             &recovered,
             target(&[("AAPL", 10_000_000)]),
         )
@@ -1232,7 +1232,7 @@ mod tests {
                     prop_assert!(ever_barred.insert(name.symbol, name.loss).is_none());
                 }
                 prop_assert_eq!(losses.barred(), &ever_barred);
-                let problem = formulate(&limits, open(), opening, &book, &losses, price, wanted.clone())
+                let problem = formulate(&limits, open(), opening, &book, Ok(&losses), price, wanted.clone())
                     .unwrap();
                 let solution = Solver::Clip.solve(&problem);
                 for symbol in &names {
@@ -1357,7 +1357,7 @@ mod tests {
                 phase,
                 dollars(10_000),
                 &funded(10_000),
-                &NameLosses::default(),
+                Ok(&NameLosses::default()),
                 price,
                 wanted,
             )
