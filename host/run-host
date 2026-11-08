@@ -45,7 +45,18 @@ if grep -qx fund-hold <<<"$tags"; then
   exit 0
 fi
 
-trap 'echo "Powering off"; sudo systemctl poweroff' EXIT
+# Publishes the run's outcome for the role's alarms, then powers off whether or not the publish succeeded.
+finish() {
+  local status=$? metric=RunCompleted
+  [[ "$status" -eq 0 ]] || metric=RunFailed
+  echo "Run exited ${status}; publishing fund/${metric}"
+  timeout 300 devenv shell -- aws cloudwatch put-metric-data --namespace fund --metric-name "$metric" --value 1 \
+    --unit Count --dimensions "role=${role:-none},profile=${profile:-none}" \
+    || echo "Error: fund/${metric} could not be published"
+  echo "Powering off"
+  sudo systemctl poweroff
+}
+trap finish EXIT
 
 role="$(metadata tags/instance/fund-role || true)"
 profile="$(metadata tags/instance/fund-profile || true)"
