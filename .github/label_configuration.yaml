@@ -35,8 +35,7 @@ nix:
 bash:
   - changed-files:
       - any-glob-to-any-file:
-          - "check-views"
-          - "check-private-files"
+          - "checks/**"
           - "host/provision-host"
           - "host/run-host"
           - "host/run-role"

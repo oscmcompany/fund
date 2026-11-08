@@ -291,7 +291,7 @@ fn researcher(home: &PathBuf, arguments: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-/// What a throwaway `jobs/<name>.sh` pushed and run by `researcher run` with `arguments` saw: whether it ran under
+/// What a throwaway `studies/jobs/<name>.sh` pushed and run by `researcher run` with `arguments` saw: whether it ran under
 /// secretspec, whether the working tree's lock was held, then its argument count and arguments.
 fn job_run(arguments: &[&str]) -> Vec<String> {
     let _pushing = PUSHING
@@ -302,13 +302,15 @@ fn job_run(arguments: &[&str]) -> Vec<String> {
     let body = format!(
         "printf '%s\\n' \"${{UNDER_SECRETSPEC:-no}}\" \"$({TRY_LOCK} \"$HOME/working-tree.lock\")\" \"$#\" \"$@\" > \"$HOME/job\"\n"
     );
-    let jobs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("jobs");
+    let jobs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("studies/jobs");
     std::fs::create_dir_all(&jobs).unwrap();
     std::fs::write(jobs.join(format!("{job}.sh")), body).unwrap();
     let output = researcher(&home, &[&["run", job.as_str()], arguments].concat());
     std::fs::remove_file(jobs.join(format!("{job}.sh"))).unwrap();
     let seen = std::fs::read_to_string(home.join("job"));
-    let uploaded = home.join(format!("working-tree/jobs/{job}.sh")).exists();
+    let uploaded = home
+        .join(format!("working-tree/studies/jobs/{job}.sh"))
+        .exists();
     std::fs::remove_dir_all(&home).unwrap();
     assert_eq!(
         output.status.code(),
@@ -413,6 +415,49 @@ fn test_a_push_refuses_while_a_study_holds_the_working_tree_and_proceeds_once_it
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(replaced, "the push after the study ended left the old tree");
+}
+
+/// A push replaces the tree but keeps the box's study journal, moving a root `journal/` under `studies/` and deleting
+/// neither when both exist.
+#[test]
+fn test_a_push_keeps_the_study_journal_wherever_it_was() {
+    let _pushing = PUSHING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (before, after) in [
+        (&["journal/root"][..], &["studies/journal/root"][..]),
+        (&["studies/journal/kept"][..], &["studies/journal/kept"][..]),
+        (
+            &["journal/root", "studies/journal/kept"][..],
+            &["journal/root", "studies/journal/kept"][..],
+        ),
+    ] {
+        let home = researcher_home();
+        let tree = home.join("working-tree");
+        for file in before.iter().chain(["studies/stale", "stale"].iter()) {
+            std::fs::create_dir_all(tree.join(file).parent().unwrap()).unwrap();
+            std::fs::write(tree.join(file), file).unwrap();
+        }
+        let pushed = researcher(&home, &["push"]);
+        let kept: Vec<&str> = [
+            "journal/root",
+            "studies/journal/root",
+            "studies/journal/kept",
+        ]
+        .into_iter()
+        .filter(|file| tree.join(file).exists())
+        .collect();
+        let stale = ["stale", "studies/stale"].map(|file| tree.join(file).exists());
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(
+            pushed.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&pushed.stderr)
+        );
+        assert_eq!(kept, after, "from {before:?}");
+        assert_eq!(stale, [false, false], "from {before:?}");
+    }
 }
 
 #[test]

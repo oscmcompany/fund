@@ -21,7 +21,7 @@ jobs:
       # Ungated, since a private file can be of any type; plain git, so it
       # needs no devenv shell.
       - name: Check no private file is tracked
-        run: ./check-private-files
+        run: ./checks/private-files
       - name: Detect changed file types
         uses: dorny/paths-filter@v3
         id: changes
@@ -39,8 +39,7 @@ jobs:
               - 'clippy.toml'
               - 'secretspec.toml'
               - 'views.sql'
-              - 'check-views'
-              - 'check-private-files'
+              - 'checks/**'
               - 'rust-toolchain.toml'
               - 'devenv.nix'
               - 'devenv.yaml'

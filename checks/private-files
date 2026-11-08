@@ -8,8 +8,8 @@ set -euo pipefail
 # Bytes, not characters: under a UTF-8 locale a path that is not valid UTF-8 matches no pattern.
 export LC_ALL=C
 
-repository="${1:-$(dirname "${BASH_SOURCE[0]}")}"
-private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl(\.gz)?$|\.safetensors?$|\.weights\.json$|(^|/)capital_flows\.toml$|^journal/|^studies/src/bin/|^jobs/|^\.scratchpad/|^\.claude/skills/[^/]+/measurements\.md$'
+repository="${1:-$(dirname "${BASH_SOURCE[0]}")/..}"
+private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl(\.gz)?$|\.safetensors?$|\.weights\.json$|(^|/)capital_flows\.toml$|^studies/(src/bin|jobs|journal)/|^(jobs|journal)/|^\.scratchpad/|^\.claude/skills/[^/]+/measurements\.md$'
 
 listing="$(mktemp)"
 trap 'rm -f "${listing}"' EXIT

@@ -16,13 +16,13 @@ This is a collection of guidelines and references.
   and capital details); the user names the plan a conversation works from
 - Machinery is public and state is private: playbooks, journals, vendor data, fitted weights, capital and plans stay
   out of git, and fixtures are synthetic because vendor licences forbid redistributing their data;
-  `check-private-files` refuses only the patterns it names, so a new private format needs adding there
+  `checks/private-files` refuses only the patterns it names, so a new private format needs adding there
 - Read the `experiments` and `verdicts` views (`start-duckdb`) before starting a study to see what has already been
   tried and concluded, under each profile or with `SET VARIABLE profile_bucket` set to the other bucket, and journal
   every experiment through a `Study`; the catalog is a log of the work and gates none of it
 - Studies are throwaway binaries in the gitignored `studies/src/bin/`, run with `cargo run -p studies --bin <name>`,
-  and a `Study` journals into the gitignored `journal/` at the root, which `finish` ships to the profile bucket with
-  each file written to `Study::notes`, kept under the run's source
+  or scripts in the gitignored `studies/jobs/`, and a `Study` journals into the gitignored `studies/journal/`, which
+  `finish` ships to the profile bucket with each file written to `Study::notes`, kept under the run's source
 - Introduce new dependencies only after approval
 - See `README.md` "Principles" section for developer philosophy
 - Docstrings are one sentence on what the item is for, plus at most two more for a caveat, invariant, or

@@ -12,7 +12,7 @@ Usage: researcher <command>
   run <study> [arguments]             push, then run it on the box with its output here
   detach <hours> <study> [arguments]  push, then run it in the background, killed after <hours>, then power off
   log <study>                         follow a detached run's output
-A study is the binary studies/src/bin/<study>.rs, or the script jobs/<study>.sh run with the built binaries on PATH.
+A study is the binary studies/src/bin/<study>.rs, or the script studies/jobs/<study>.sh run with the built binaries on PATH.
   shell                               an interactive devenv shell in ~/working-tree on the box
   stop                                release the hold and stop the box
 EOF
@@ -42,8 +42,8 @@ case "$command" in
       echo "Error: the study is \"$study\", not a name of lowercase letters, digits and underscores" >&2
       exit 1
     fi
-    if [[ "$command" != log && -f "jobs/$study.sh" && -f "studies/src/bin/$study.rs" ]]; then
-      echo "Error: both jobs/$study.sh and studies/src/bin/$study.rs exist, so the study \"$study\" is ambiguous" >&2
+    if [[ "$command" != log && -f "studies/jobs/$study.sh" && -f "studies/src/bin/$study.rs" ]]; then
+      echo "Error: both studies/jobs/$study.sh and studies/src/bin/$study.rs exist, so the study \"$study\" is ambiguous" >&2
       exit 1
     fi
     ;;
@@ -106,7 +106,8 @@ upload="$(date +%s)-$$-$RANDOM"
 owned="$claim && if [ \"\$(cat ~/working-tree/.upload 2>/dev/null)\" != $(quoted "$upload")]; then
   echo 'Error: another push replaced this upload before it could run' >&2; exit 1; fi"
 
-# Tracked and untracked files that git does not ignore, plus the gitignored studies and jobs the box runs.
+# Tracked and untracked files that git does not ignore, plus the gitignored studies and jobs the box runs; the box keeps
+# its build and `studies/journal/`, into which a root `journal/` moves unless both exist, when neither is removed.
 push() {
   local commit
   commit="$(git rev-parse HEAD)"
@@ -114,12 +115,14 @@ push() {
   [[ -z "$(git status --porcelain)" ]] || commit="$commit-dirty"
   {
     git ls-files -z --cached --others --exclude-standard
-    find studies/src/bin jobs -type f -print0 2>/dev/null || true
+    find studies/src/bin studies/jobs -type f -print0 2>/dev/null || true
   } | while IFS= read -r -d '' file; do
     if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
   done | COPYFILE_DISABLE=1 tar --no-xattrs --null -T - -czf - |
     connect "$claim && mkdir -p ~/working-tree && cd ~/working-tree &&
-      find . -mindepth 1 -maxdepth 1 ! -name target ! -name '.devenv*' ! -name journal -exec rm -rf {} + &&
+      { [ ! -d journal ] || [ -e studies/journal ] || { mkdir -p studies && mv journal studies/journal; }; } &&
+      find . -mindepth 1 -maxdepth 1 ! -name target ! -name '.devenv*' ! -name journal ! -name studies -exec rm -rf {} + &&
+      mkdir -p studies && find studies -mindepth 1 -maxdepth 1 ! -name journal -exec rm -rf {} + &&
       tar -xzf - --warning=no-unknown-keyword && echo $(quoted "$commit") > .commit && echo $(quoted "$upload") > .upload"
   echo "Pushed $commit to $instance"
 }
@@ -128,8 +131,8 @@ push() {
 program() {
   local study="$1"
   shift
-  if [[ -f "jobs/$study.sh" ]]; then
-    echo "cargo build -q --profile study --workspace && PATH=\"\$PWD/target/study:\$PATH\" bash jobs/$study.sh $(quoted "$@")"
+  if [[ -f "studies/jobs/$study.sh" ]]; then
+    echo "cargo build -q --profile study --workspace && PATH=\"\$PWD/target/study:\$PATH\" bash studies/jobs/$study.sh $(quoted "$@")"
   else
     echo "cargo run -q --profile study -p studies --bin $(quoted "$study")-- $(quoted "$@")"
   fi

@@ -3,7 +3,7 @@
 # does not create fails, while an optional view, whose producer may not run in this profile, may be empty but must create.
 # Exits 0 if every view is as expected, 3 if any is not, 1 if the check could not be made; `DUCKDB` sets the binary.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 duckdb="${DUCKDB:-duckdb}"
 for variable in AWS_S3_ARCHIVE_BUCKET_NAME AWS_S3_PROFILE_BUCKET_NAME; do

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("check-private-files")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checks/private-files")
 }
 
 /// A command that ignores the `GIT_*` variables a hook exports, so it acts on the scratch repository it names.
@@ -52,11 +52,12 @@ fn check(paths: &[&str]) -> (i32, String) {
     )
 }
 
-const PUBLIC: [&str; 8] = [
+const PUBLIC: [&str; 9] = [
     "src/journal.rs",
     "src/common/journal.rs",
     "src/common/journal/record.rs",
     "studies/src/lib.rs",
+    "studies/Cargo.toml",
     "data/equity_details.csv",
     "secretspec.toml",
     "views.sql",
@@ -81,12 +82,14 @@ fn test_each_private_file_fails_and_is_named() {
         "models/weights.safetensors",
         "models/model.weights.json",
         "data/capital_flows.toml",
-        "journal/README.md",
+        "studies/journal/README.md",
         "studies/src/bin/null_check.rs",
+        "studies/jobs/parse_ticks.sh",
         "jobs/parse_ticks.sh",
+        "journal/README.md",
         ".scratchpad/plan.md",
         ".claude/skills/report-findings/measurements.md",
-        "journal/échange.md",
+        "studies/journal/échange.md",
         "data/équité.parquet",
     ] {
         let mut paths = PUBLIC.to_vec();
