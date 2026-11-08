@@ -22,6 +22,9 @@ jobs:
       # needs no devenv shell.
       - name: Check no private file is tracked
         run: ./checks/private-files
+      # Ungated too, since the SQL it reads sits in .sql, Rust and shell files.
+      - name: Check every derived date has a pinned time zone
+        run: ./checks/timezones
       - name: Detect changed file types
         uses: dorny/paths-filter@v3
         id: changes

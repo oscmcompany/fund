@@ -26,6 +26,8 @@ in {
     check-private-files =
       hook "Check no private file is tracked" "private-files" ""
       // {always_run = true;};
+    check-timezones =
+      hook "Check every derived date has a pinned time zone" "timezones" "(\\.(sql|rs|sh)$|(^|/)[^./]+$)";
     check-rust =
       hook "Check all Rust code" "rust"
       "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|^checks/.+|^host/.+|devenv\\.(nix|lock|yaml))$";
@@ -157,6 +159,9 @@ in {
     "checks:private-files".exec = ''
       "$DEVENV_ROOT/checks/private-files"
     '';
+    "checks:timezones".exec = ''
+      "$DEVENV_ROOT/checks/timezones"
+    '';
 
     "checks:base" = {
       exec = ''
@@ -177,6 +182,7 @@ in {
       after = [
         "checks:base"
         "checks:private-files"
+        "checks:timezones"
         "checks:rust:format"
         "checks:rust:lint"
         "checks:rust:test"
@@ -202,6 +208,8 @@ in {
       echo "    checks:base                 Non-language checks (nix, markdown,"
       echo "                                yaml, toml)"
       echo "    checks:private-files        Fail on any tracked private file"
+      echo "    checks:timezones            Fail on a date derived in the machine's"
+      echo "                                time zone"
       echo "    checks:all                  All checks combined"
       echo ""
       echo "  Scripts:"
