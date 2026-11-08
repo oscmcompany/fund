@@ -6,6 +6,9 @@ edition = "2024"
 [workspace]
 members = ["studies"]
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.lints.clippy]
 match_wildcard_for_single_variants = "deny"
 wildcard_enum_match_arm = "deny"
@@ -79,6 +82,10 @@ syn = { version = "3", default-features = false, features = [
   "visit",
 ] }
 tokio = { version = "1.53.1", features = ["test-util", "rt"] }
+
+# Integer overflow panics in release and the `study` profile that inherits it, as it does in debug, rather than wrapping.
+[profile.release]
+overflow-checks = true
 
 # Studies iterate on code that changes every build, so our crates compile fast while dependencies stay optimized.
 [profile.study]
