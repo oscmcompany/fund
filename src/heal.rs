@@ -25,27 +25,30 @@ use crate::common::journal::{
     ArchiveSurveyed, ConditionsWritten, ConfigurationResolved, HealFinished, Observation,
     PartitionFailed, PartitionWritten, Unanswered, quotes_folded, trades_folded,
 };
-use crate::common::market::Symbol;
 use crate::common::market::aggregate::{RollsUp, session_bars};
 use crate::common::market::corporate_actions::refresh_boundaries;
 use crate::common::market::industry::{AccessionNumber, FiledIndustryCode};
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
-use crate::common::market::record::{Bar, BarInterval, Partition, PartitionRefusal};
+use crate::common::market::record::{Bar, BarInterval, Partition, PartitionRefusal, Quote};
+use crate::common::market::restatements::Restatements;
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, SecurityDetails, SecurityType,
 };
 use crate::common::market::trade_bars::{TradeConditions, TradeFold};
+use crate::common::market::{Price, Shares, Symbol};
 use crate::common::monoid::{Monoid, Tally, concatenate};
 use crate::common::parameter::{Parameter, ParameterRefusal, at_most, record};
 use crate::common::storage::{Key, Provider, ReferenceKey, ReferenceTable, SeriesPrefix};
 use crate::common::time::calendar::TradingCalendar;
 use crate::common::time::{SessionDate, SessionRange};
 use crate::ingest::alpaca::corporate_actions::SeriesBoundaries;
-use crate::ingest::alpaca::{Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, Page, invalid_symbol};
+use crate::ingest::alpaca::{
+    Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome, Page, invalid_symbol, tape_of,
+};
 use crate::ingest::massive::{DetailsAnswer, Massive};
 use crate::ingest::sec::{AnnualReport, Sec};
 use crate::ingest::{
-    FetchError, Fetched, RefusedRow, SessionBars, VariableRefusal, refused_by_cause,
+    FetchError, Fetched, QuoteOrigin, RefusedRow, SessionBars, VariableRefusal, refused_by_cause,
 };
 use crate::journal::Journal;
 use crate::parameter::{Directories, environment_variable};
@@ -1048,6 +1051,8 @@ async fn write_quotes(
     let mut fold = QuoteFold::new(open, close).map_err(PartitionFailure::Fold)?;
     let mut refused = Vec::new();
     let mut one_sided = 0_u64;
+    let mut restatements = Restatements::default();
+    let mut restated = 0_u64;
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let unanswered = per_symbol_raw(
         &clients.archive,
@@ -1064,9 +1069,22 @@ async fn write_quotes(
             async move { alpaca.quotes(&symbol, session, &pages).await }
         },
         |outcome| match outcome {
-            AlpacaQuoteOutcome::Quote { quote, .. } => fold.push(&quote),
-            AlpacaQuoteOutcome::OneSided { .. } => one_sided += 1,
-            AlpacaQuoteOutcome::Refused(row) => refused.push(row),
+            AlpacaQuoteOutcome::Quote { quote, origin } => {
+                match restates(&mut restatements, &quote, origin) {
+                    true => restated += 1,
+                    false => fold.push(&quote),
+                }
+            }
+            AlpacaQuoteOutcome::OneSided { quote, .. } => {
+                restatements.interrupt(&quote.symbol);
+                one_sided += 1;
+            }
+            AlpacaQuoteOutcome::Refused(row) => {
+                if let Ok(symbol) = Symbol::new(row.ticker()) {
+                    restatements.interrupt(&symbol);
+                }
+                refused.push(row);
+            }
         },
     )
     .await?;
@@ -1079,15 +1097,42 @@ async fn write_quotes(
         quote_bars::encode,
     )
     .await?;
-    tracing::info!(%session, quotes = counts.accepted(), out_of_order = counts.out_of_order(), one_sided, "Alpaca quotes folded");
+    tracing::info!(%session, quotes = counts.accepted(), out_of_order = counts.out_of_order(), one_sided, restated, "Alpaca quotes folded");
     Ok(PartitionWritten::new(
         Leg::AlpacaQuotes,
         session,
         minute_bars,
         refused_by_cause(&refused),
         unanswered,
-        quotes_folded(counts, one_sided),
+        quotes_folded(counts, one_sided, restated),
     ))
+}
+
+/// Everything Alpaca serves of a quote but its symbol and timestamp.
+#[derive(Debug, Clone, PartialEq)]
+struct AlpacaQuoteRow {
+    bid: Price,
+    ask: Price,
+    bid_size: Shares,
+    ask_size: Shares,
+    origin: QuoteOrigin,
+}
+
+/// Whether Alpaca's `quote` restates its symbol's previous row, which `restatements` then holds.
+fn restates(
+    restatements: &mut Restatements<AlpacaQuoteRow>,
+    quote: &Quote,
+    origin: QuoteOrigin,
+) -> bool {
+    let tape = origin.tape.as_deref().and_then(tape_of);
+    let row = AlpacaQuoteRow {
+        bid: quote.bid(),
+        ask: quote.ask(),
+        bid_size: quote.bid_size(),
+        ask_size: quote.ask_size(),
+        origin,
+    };
+    restatements.restates(quote.symbol(), quote.timestamp(), tape, row)
 }
 
 /// Folds Alpaca's trades for every symbol of the session under the newest conditions table and writes its trade bars.
@@ -1815,7 +1860,6 @@ mod tests {
     fn trade_minutes(session: SessionDate) -> Vec<crate::common::market::trade_bars::TradeBar> {
         use crate::common::market::record::Trade;
         use crate::common::market::trade_bars::{Correction, Print};
-        use crate::common::market::{Price, Shares};
         let mut fold = TradeFold::new(session, TradeConditions::new(BTreeMap::new()));
         for at in ["2026-09-29T13:31:00Z", "2026-09-29T13:32:00Z"] {
             let print = Trade::new(
@@ -2380,6 +2424,52 @@ mod tests {
         assert_eq!(clients.archive.get(&Key::from(key)).await.unwrap(), None);
         assert!(pages > 1);
         assert_eq!(stored.fetched_at(), Some(provenance.fetched_at()));
+    }
+
+    /// A quiet tape-A name's session restates its quote at most once per half-minute boundary, and does so at all.
+    #[tokio::test]
+    #[ignore = "reads Alpaca's REST quote history; run deliberately under secretspec"]
+    async fn live_a_quiet_tape_a_session_restates_once_per_boundary() {
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        let symbol = Symbol::new("UTL").unwrap();
+        let alpaca = Alpaca::from_environment(reqwest::Client::new()).unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let fetch = async move {
+            let answered = alpaca.quotes(&symbol, session, &sender).await;
+            drop(sender);
+            answered
+        };
+        let mut restatements = Restatements::default();
+        let (mut quotes, mut boundaries) = (0_u64, BTreeMap::<i64, u64>::new());
+        let drain = async {
+            while let Some(page) = receiver.recv().await {
+                for outcome in page.into_parts().1 {
+                    match outcome {
+                        AlpacaQuoteOutcome::Quote { quote, origin } => {
+                            quotes += 1;
+                            if restates(&mut restatements, &quote, origin) {
+                                let nearest = (quote.timestamp().timestamp_millis() + 15_000)
+                                    .div_euclid(30_000);
+                                *boundaries.entry(nearest).or_insert(0) += 1;
+                            }
+                        }
+                        AlpacaQuoteOutcome::OneSided { quote, .. } => {
+                            restatements.interrupt(&quote.symbol);
+                        }
+                        AlpacaQuoteOutcome::Refused(row) => panic!("{row:?}"),
+                    }
+                }
+            }
+        };
+        let (answered, ()) = tokio::join!(fetch, drain);
+        let restated: u64 = boundaries.values().sum();
+        println!(
+            "{quotes} quotes, {restated} restated over {} boundaries",
+            boundaries.len()
+        );
+        assert!(answered.unwrap());
+        assert!(restated > 0);
+        assert_eq!(restated, u64::try_from(boundaries.len()).unwrap());
     }
 
     /// Stores five busy symbols' quotes for one session, enough to span several parts, in the profile bucket,

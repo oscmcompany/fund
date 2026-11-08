@@ -361,6 +361,7 @@ pub enum FoldCount {
     Accepted,
     OutOfOrder,
     OneSided,
+    Restated,
     Folded,
     OtherSession,
     Withdrawn,
@@ -370,12 +371,17 @@ pub enum FoldCount {
     Late,
 }
 
-/// Every count of a quote fold, with the one-sided quotes left out before it.
-pub fn quotes_folded(counts: QuoteFoldCounts, one_sided: u64) -> BTreeMap<FoldCount, u64> {
+/// Every count of a quote fold, with the one-sided quotes and the restatements left out before it.
+pub fn quotes_folded(
+    counts: QuoteFoldCounts,
+    one_sided: u64,
+    restated: u64,
+) -> BTreeMap<FoldCount, u64> {
     BTreeMap::from([
         (FoldCount::Accepted, counts.accepted()),
         (FoldCount::OutOfOrder, counts.out_of_order()),
         (FoldCount::OneSided, one_sided),
+        (FoldCount::Restated, restated),
     ])
 }
 
@@ -868,7 +874,7 @@ mod tests {
                 (Symbol::new("ABC").unwrap(), Unanswered::Missing),
                 (Symbol::new("BC.PRC").unwrap(), Unanswered::Invalid),
             ]),
-            quotes_folded(QuoteFoldCounts::default(), 3),
+            quotes_folded(QuoteFoldCounts::default(), 3, 2),
         );
         let failed = PartitionFailed::new(
             Leg::AlpacaTrades,
@@ -916,7 +922,7 @@ mod tests {
                     r#""session":"2026-09-29","rows":1872987,"#,
                     r#""refused":{"dollar_volume":1,"duplicate":2},"#,
                     r#""unanswered":{"ABC":"missing","BC.PRC":"invalid"},"#,
-                    r#""folded":{"accepted":0,"out_of_order":0,"one_sided":3}}}"#,
+                    r#""folded":{"accepted":0,"out_of_order":0,"one_sided":3,"restated":2}}}"#,
                 )
             )
         );
@@ -979,10 +985,15 @@ mod tests {
                 json
             })
             .collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         assert_eq!(
-            names[..3],
-            [r#""accepted""#, r#""out_of_order""#, r#""one_sided""#]
+            names[..4],
+            [
+                r#""accepted""#,
+                r#""out_of_order""#,
+                r#""one_sided""#,
+                r#""restated""#
+            ]
         );
     }
 

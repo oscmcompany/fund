@@ -8,6 +8,7 @@ pub mod industry;
 pub mod quote_bars;
 pub mod record;
 pub mod refusal;
+pub mod restatements;
 pub mod security_details;
 pub mod state;
 pub mod trade_bars;
