@@ -295,19 +295,26 @@ pub fn orders(book: &Book, target: &Target) -> Vec<Order> {
     let mut orders: Vec<Order> = symbols
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter_map(|symbol| {
+        .flat_map(|symbol| {
             let gap = target.wanted(symbol) - book.position(symbol).units();
             let side = match gap.cmp(&0) {
-                Ordering::Equal => return None,
+                Ordering::Equal => return Vec::new(),
                 Ordering::Greater => Side::Buy,
                 Ordering::Less => Side::Sell,
             };
-            let units = u64::try_from(gap.unsigned_abs()).expect("an order fits u64 share units");
-            Some(Order {
-                symbol: symbol.clone(),
-                side,
-                shares: Shares::from_units(units),
-            })
+            // A gap past one order's `u64` units goes out as several orders.
+            let mut remaining = gap.unsigned_abs();
+            let mut split = Vec::new();
+            while remaining > 0 {
+                let units = u64::try_from(remaining).unwrap_or(u64::MAX);
+                remaining -= u128::from(units);
+                split.push(Order {
+                    symbol: symbol.clone(),
+                    side,
+                    shares: Shares::from_units(units),
+                });
+            }
+            split
         })
         .collect();
     orders.sort_by_key(|order| order.side == Side::Buy);
@@ -371,6 +378,30 @@ mod tests {
             .iter()
             .map(|(symbol, holding)| (symbol.clone(), holding.position()))
             .collect()
+    }
+
+    #[test]
+    fn test_a_gap_past_one_order_is_split_into_orders_that_each_fit() {
+        let symbol = Symbol::new("ABC").unwrap();
+        let book = holding(&BTreeMap::from([(
+            symbol.clone(),
+            Holding::from(Shares::from_units(u64::MAX)),
+        )]));
+        let target = Target::new(BTreeMap::from([(
+            symbol,
+            Holding::short(Shares::whole(1).unwrap()).unwrap(),
+        )]));
+        let sold: Vec<(Side, u64)> = orders(&book, &target)
+            .iter()
+            .map(|order| (order.side(), order.shares().units()))
+            .collect();
+        assert_eq!(
+            sold,
+            [
+                (Side::Sell, 18_446_744_073_709_551_615),
+                (Side::Sell, 1_000_000)
+            ]
+        );
     }
 
     fn holding(holdings: &BTreeMap<Symbol, Holding>) -> Book {
