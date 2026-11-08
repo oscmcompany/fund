@@ -1,6 +1,5 @@
 .DS_Store
 .env
-.coverage_output/
 *.csv
 **/target/
 **/*.json
@@ -11,8 +10,8 @@
 .claude/skills/*/measurements.md
 .scratchpad/
 /studies/src/bin/
-/jobs/
-/journal/
+/studies/jobs/
+/studies/journal/
 playbook*.toml
 capital_flows.toml
 *.parquet
@@ -27,6 +26,5 @@ capital_flows.toml
 # LLVM coverage raw files
 *.profraw
 
-# Test tool output: proptest failure seeds and cargo-mutants reports
+# Proptest failure seeds
 proptest-regressions/
-mutants.out*/

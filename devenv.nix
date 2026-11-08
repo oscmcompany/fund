@@ -28,7 +28,7 @@ in {
       // {always_run = true;};
     check-rust =
       hook "Check all Rust code" "rust"
-      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|check-views|check-private-files|^host/.+|devenv\\.(nix|lock|yaml))$";
+      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|^checks/.+|^host/.+|devenv\\.(nix|lock|yaml))$";
     check-markdown = hook "Check all Markdown code" "markdown" "\\.md$";
     check-yaml = hook "Check all YAML code" "yaml" "\\.(yaml|yml)$";
     check-toml = hook "Check all TOML code" "toml" "\\.toml$";
@@ -68,7 +68,7 @@ in {
   scripts.mutate-rust.exec = ''
     set -euo pipefail
     echo "Running mutation tests on the lines changed in ''${1:?a unified diff file}"
-    cargo mutants --in-diff "$1"
+    cargo mutants --in-diff "$1" --output target
     echo "Every mutant in the diff was caught"
   '';
 
@@ -79,7 +79,7 @@ in {
   '';
 
   scripts.check-views.exec = ''
-    "$DEVENV_ROOT/check-views" "$@"
+    "$DEVENV_ROOT/checks/views" "$@"
   '';
 
   scripts.researcher.exec = ''
@@ -111,12 +111,12 @@ in {
     "checks:rust:test" = {
       exec = ''
         set -euo pipefail
-        mkdir -p .coverage_output
+        mkdir -p target/coverage
         cargo llvm-cov --lib --bins --tests --all-features \
           --cobertura \
-          --output-path .coverage_output/rust.xml
+          --output-path target/coverage/rust.xml
 
-        rate=$(awk 'match($0, /line-rate="([^"]*)"/, a) {print a[1]; exit}' .coverage_output/rust.xml)
+        rate=$(awk 'match($0, /line-rate="([^"]*)"/, a) {print a[1]; exit}' target/coverage/rust.xml)
         rate_pct=$(awk "BEGIN {printf \"%.1f\", ''${rate:-0} * 100}")
         threshold=75
         echo "Rust line coverage: ''${rate_pct}%"
@@ -155,7 +155,7 @@ in {
       git ls-files -z '*.nix' | xargs -0 -r -n 1 statix check -c .statix.toml
     '';
     "checks:private-files".exec = ''
-      "$DEVENV_ROOT/check-private-files"
+      "$DEVENV_ROOT/checks/private-files"
     '';
 
     "checks:base" = {

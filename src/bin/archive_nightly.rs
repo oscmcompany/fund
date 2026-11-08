@@ -19,7 +19,7 @@ use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 use fund::storage::Bucket;
 
 const SERVICE: &str = "archive_nightly";
-const CHECK_VIEWS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/check-views");
+const CHECK_VIEWS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/checks/views");
 
 /// Runs `check-views` from the checkout this binary was built in, keeping each line it printed.
 async fn check_views() -> ViewsChecked {

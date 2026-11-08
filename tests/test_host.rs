@@ -291,7 +291,7 @@ fn researcher(home: &PathBuf, arguments: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-/// What a throwaway `jobs/<name>.sh` pushed and run by `researcher run` with `arguments` saw: whether it ran under
+/// What a throwaway `studies/jobs/<name>.sh` pushed and run by `researcher run` with `arguments` saw: whether it ran under
 /// secretspec, whether the working tree's lock was held, then its argument count and arguments.
 fn job_run(arguments: &[&str]) -> Vec<String> {
     let _pushing = PUSHING
@@ -302,13 +302,15 @@ fn job_run(arguments: &[&str]) -> Vec<String> {
     let body = format!(
         "printf '%s\\n' \"${{UNDER_SECRETSPEC:-no}}\" \"$({TRY_LOCK} \"$HOME/working-tree.lock\")\" \"$#\" \"$@\" > \"$HOME/job\"\n"
     );
-    let jobs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("jobs");
+    let jobs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("studies/jobs");
     std::fs::create_dir_all(&jobs).unwrap();
     std::fs::write(jobs.join(format!("{job}.sh")), body).unwrap();
     let output = researcher(&home, &[&["run", job.as_str()], arguments].concat());
     std::fs::remove_file(jobs.join(format!("{job}.sh"))).unwrap();
     let seen = std::fs::read_to_string(home.join("job"));
-    let uploaded = home.join(format!("working-tree/jobs/{job}.sh")).exists();
+    let uploaded = home
+        .join(format!("working-tree/studies/jobs/{job}.sh"))
+        .exists();
     std::fs::remove_dir_all(&home).unwrap();
     assert_eq!(
         output.status.code(),

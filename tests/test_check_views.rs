@@ -76,7 +76,7 @@ fn check(script: &Path, answers: &[(&str, Answer)], profile: &str) -> (i32, Stri
 }
 
 fn real(answers: &[(&str, Answer)], profile: &str) -> (i32, String) {
-    check(&root().join("check-views"), answers, profile)
+    check(&root().join("checks/views"), answers, profile)
 }
 
 /// The archive's market data views in `views.sql` order, each answering as the daily or the minute bars do.
@@ -321,11 +321,12 @@ fn test_every_live_glob_matching_nothing_is_a_broken_view() {
 #[test]
 fn test_a_declaration_the_parser_misses_fails_the_check() {
     let directory = scratch();
-    std::fs::copy(root().join("check-views"), directory.join("check-views")).unwrap();
+    std::fs::create_dir(directory.join("checks")).unwrap();
+    std::fs::copy(root().join("checks/views"), directory.join("checks/views")).unwrap();
     let read_one = "CREATE OR REPLACE VIEW bars_1m AS\nSELECT 1\n);\n";
     std::fs::write(directory.join("views.sql"), read_one).unwrap();
     let (status, output) = check(
-        &directory.join("check-views"),
+        &directory.join("checks/views"),
         &[("bars_1m", Answer::Rows(9))],
         "",
     );
@@ -335,7 +336,7 @@ fn test_a_declaration_the_parser_misses_fails_the_check() {
     );
     let missed = format!("{read_one}CREATE VIEW unparsed AS\nSELECT 1\n);\n");
     std::fs::write(directory.join("views.sql"), missed).unwrap();
-    let (status, _) = check(&directory.join("check-views"), &[], "");
+    let (status, _) = check(&directory.join("checks/views"), &[], "");
     assert_eq!(status, 1);
     std::fs::remove_dir_all(&directory).unwrap();
 }
