@@ -509,7 +509,7 @@ pub(crate) mod tests {
         let ran = read(&std::fs::read_to_string(&file).unwrap())
             .into_iter()
             .find_map(|line| match line {
-                ReadLine::Read(record) => match record.observation() {
+                ReadLine::Read(read) => match read.record().observation() {
                     Observation::ExperimentRan(ran) => Some(ran.clone()),
                     Observation::ConfigurationResolved(_)
                     | Observation::PartitionWritten(_)
@@ -539,7 +539,6 @@ pub(crate) mod tests {
                     | Observation::PlaybookRead(_)
                     | Observation::PlaybookUploaded(_) => None,
                 },
-                ReadLine::Untyped(untyped) => panic!("untyped: {untyped:?}"),
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
             .unwrap();

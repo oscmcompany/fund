@@ -701,8 +701,8 @@ mod tests {
         let observations: Vec<Observation> = read(&std::fs::read_to_string(&file).unwrap())
             .into_iter()
             .map(|line| match line {
-                ReadLine::Read(record) => record.observation().clone(),
-                other @ (ReadLine::Untyped(_) | ReadLine::Unreadable { .. }) => panic!("{other:?}"),
+                ReadLine::Read(read) => read.record().observation().clone(),
+                other @ ReadLine::Unreadable { .. } => panic!("{other:?}"),
             })
             .collect();
         assert_eq!(
@@ -874,7 +874,7 @@ mod tests {
             assert!(
                 held.iter().any(|line| matches!(
                     line,
-                    crate::common::journal::ReadLine::Read(record) if record.run_id() == run
+                    crate::common::journal::ReadLine::Read(read) if read.run_id() == run
                 )),
                 "{run} is missing"
             );

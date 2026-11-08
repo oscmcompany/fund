@@ -268,57 +268,12 @@ SELECT
     session,
     payload ->> '$.label' AS label,
     payload -> '$.parameters' AS parameters,
-    list_sort(list_distinct(CAST(payload ->> '$.fingerprints[*].leg' AS VARCHAR[]))) AS legs,
-    CAST(list_min(CAST(payload ->> '$.fingerprints[*].first' AS VARCHAR[])) AS DATE) AS first,
-    CAST(list_max(CAST(payload ->> '$.fingerprints[*].last' AS VARCHAR[])) AS DATE) AS last,
-    -- One entry per fingerprint, in its order; a read journaled before subsets kept every symbol.
-    list_transform(
-        CAST(payload -> '$.fingerprints[*]' AS JSON[]),
-        lambda fingerprint: coalesce(fingerprint -> '$.symbols', '"every"'::JSON)
-    ) AS symbols,
-    payload -> '$.estimates' AS estimates,
     payload -> '$.metrics' AS metrics,
-    CAST(payload ->> '$.checks.population' AS BIGINT) AS population,
-    CAST(payload ->> '$.checks.undefined' AS BIGINT) AS undefined,
-    payload -> '$.checks.null' AS null_reading,
-    coalesce(payload -> '$.coarsenings', '{}'::JSON) AS coarsenings,
+    payload,
     "commit",
-    payload ->> '$.machine.hostname' AS hostname,
-    payload ->> '$.machine.architecture' AS architecture,
-    payload ->> '$.machine.operating_system' AS operating_system,
-    CAST(payload ->> '$.machine.cores' AS BIGINT) AS cores,
-    CAST(payload ->> '$.since_opened' AS BIGINT) AS milliseconds_since_opened,
-    payload ->> '$.source_digest' AS source_digest,
     run_id
 FROM sessions('profile_bucket', 'records/journal/producer=researcher/')
 WHERE event_type = 'experiment_ran';
-
-COMMENT ON VIEW experiments IS 'Every experiment a study journaled, one row each, with its inputs, outputs and code.';
-COMMENT ON COLUMN experiments.timestamp IS 'Instant the experiment was journaled, UTC.';
-COMMENT ON COLUMN experiments.session IS 'Session the experiment was journaled in, an America/New_York date.';
-COMMENT ON COLUMN experiments.label IS 'Free text naming what the study is about.';
-COMMENT ON COLUMN experiments.parameters IS 'Settings by name, as JSON.';
-COMMENT ON COLUMN experiments.legs IS 'Distinct dataset legs read, sorted.';
-COMMENT ON COLUMN experiments.first IS 'Earliest session any dataset read covers.';
-COMMENT ON COLUMN experiments.last IS 'Latest session any dataset read covers.';
-COMMENT ON COLUMN experiments.symbols IS 'Symbols per dataset read, in fingerprint order, or "every".';
-COMMENT ON COLUMN experiments.estimates IS 'Estimates by name, as JSON.';
-COMMENT ON COLUMN experiments.metrics IS 'Metrics by name, as JSON.';
-COMMENT ON COLUMN experiments.population IS 'Inputs the estimate read; null when the study reported no checks.';
-COMMENT ON COLUMN experiments.undefined IS 'Inputs that left the estimate undefined; null when no checks.';
-COMMENT ON COLUMN experiments.coarsenings IS
-    'Standard errors by block grouping, by name, as JSON; empty before coarsenings were journaled.';
-COMMENT ON COLUMN experiments.null_reading IS
-    'The permutation null''s reading of the metric, or why none was taken, as JSON; null when no checks.';
-COMMENT ON COLUMN experiments."commit" IS 'Git sha the binary was built from, with -dirty if the tree differed.';
-COMMENT ON COLUMN experiments.hostname IS 'Hostname of the machine the study ran on.';
-COMMENT ON COLUMN experiments.architecture IS 'CPU architecture of that machine.';
-COMMENT ON COLUMN experiments.operating_system IS 'Operating system of that machine.';
-COMMENT ON COLUMN experiments.cores IS 'Cores available to the study.';
-COMMENT ON COLUMN experiments.milliseconds_since_opened IS 'Milliseconds from the study opening to this experiment.';
-COMMENT ON COLUMN experiments.source_digest IS
-    'SHA-256 of the study source under records/sources/producer=researcher/; null before sources were captured.';
-COMMENT ON COLUMN experiments.run_id IS 'The study run that journaled the experiment.';
 
 -- A verdict reads the latest declaration of its question made before it, so a later declaration cannot move its bar.
 CREATE OR REPLACE VIEW verdicts AS
