@@ -562,11 +562,12 @@ mod tests {
     use proptest::strategy::Strategy as _;
 
     use super::*;
+    use crate::common::book::Position;
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::trade_bars::{HighLow, OpenClose, TradeSums};
     use crate::common::market::{Price, Shares, StampedPrice, TradeCount};
     use crate::common::strategy::Strategy;
-    use crate::common::strategy::Target;
+    use crate::common::strategy::{Holding, Target};
     use crate::common::time::SessionDate;
 
     /// Wants `shares` of each named symbol, whatever it has seen.
@@ -580,6 +581,18 @@ mod tests {
                     .map(|(raw, shares)| (symbol(raw), Shares::whole(*shares).unwrap()))
                     .collect(),
             )
+        }
+    }
+
+    /// Wants 2 shares of AAPL short, whatever it has seen.
+    struct Short;
+
+    impl Strategy for Short {
+        fn decide(&self, _: &MarketState, _: &Book) -> Target {
+            Target::new(BTreeMap::from([(
+                symbol("AAPL"),
+                Holding::short(Shares::whole(2).unwrap()).unwrap(),
+            )]))
         }
     }
 
@@ -812,7 +825,7 @@ mod tests {
                 Ok(match stale {
                     true => vec![Cut::Unpriced {
                         symbol: symbol("AAPL"),
-                        wanted: Shares::from_units(1_000_000),
+                        wanted: Shares::from_units(1_000_000).into(),
                     }],
                     false => Vec::new(),
                 }),
@@ -1055,6 +1068,34 @@ mod tests {
         let cash = |whole: i128| Ok(Cash::from_units(whole * 1_000_000_000_000));
         assert_eq!(marks, [(day(0), cash(100)), (day(1), cash(100 - 12 + 13))]);
         assert!(replay.unfilled().is_empty());
+    }
+
+    /// A short target sells into a book holding nothing, leaving it 2 short at day 1's open of $12 and marked at its
+    /// close of $13.
+    #[test]
+    fn test_a_short_target_takes_the_book_below_zero() {
+        let replay = replayer(Short)
+            .act(
+                Replay::open(Book::funded(cash(100))),
+                [
+                    daily("AAPL", 0, 10_000_000, 11_000_000),
+                    daily("AAPL", 1, 12_000_000, 13_000_000),
+                ],
+            )
+            .unwrap();
+        let fills: Vec<_> = replay
+            .fills()
+            .iter()
+            .map(|fill| (fill.filled_against(), fill.side(), fill.shares()))
+            .collect();
+        assert_eq!(fills, [(day(1), Side::Sell, Shares::whole(2).unwrap())]);
+        assert_eq!(
+            replay.book().position(&symbol("AAPL")),
+            Position::from_units(-2_000_000)
+        );
+        let marks: Vec<_> = replay.marks().values().cloned().collect();
+        let cash = |whole: i128| Ok(Cash::from_units(whole * 1_000_000_000_000));
+        assert_eq!(marks, [cash(100), cash(100 + 24 - 26)]);
     }
 
     /// A minute strategy decides on each minute's close and fills at the next minute's open.

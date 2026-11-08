@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, ValuationRefusal};
 use crate::common::constraint::{Constraint, Constraints};
-use crate::common::market::{Price, Shares, Symbol};
+use crate::common::market::{Price, Symbol};
 use crate::common::monoid::concatenate;
 use crate::common::playbook::Stretch;
 use crate::common::solver::{Solution, Solver};
-use crate::common::strategy::Target;
+use crate::common::strategy::{Holding, Target};
 use crate::common::time::calendar::SessionPhase;
 
 /// The grid a gross cut's scale is taken on; flooring onto it keeps a cut target inside the limit.
@@ -274,12 +274,12 @@ pub enum Cut {
     /// Flat, as the book has lost `loss` since the session opened, at least the daily limit.
     LossLimit { loss: Cash },
     /// `symbol` held at zero, as it has no price and the book does not hold it.
-    Unpriced { symbol: Symbol, wanted: Shares },
-    /// `symbol` held to the most the per-name limit buys at its price.
+    Unpriced { symbol: Symbol, wanted: Holding },
+    /// `symbol` held to the most the per-name limit buys at its price, a short to whole shares.
     PerName {
         symbol: Symbol,
-        wanted: Shares,
-        kept: Shares,
+        wanted: Holding,
+        kept: Holding,
     },
     /// Every holding scaled down together, as the target's worth `wanted` exceeded the gross limit.
     Gross { wanted: Cash },
@@ -302,6 +302,7 @@ mod tests {
 
     use super::*;
     use crate::common::book::Position;
+    use crate::common::market::Shares;
     use crate::common::problem::formulate;
 
     const DOLLAR: i128 = 1_000_000_000_000;
@@ -399,15 +400,16 @@ mod tests {
         for (symbol, wanted) in target.holdings() {
             let ticks = ticks(&price, symbol)?;
             let affordable = limits.dollars(Limit::PerName).units().cast_unsigned() / ticks;
+            let wanted = long(*wanted);
             let kept = u128::from(wanted.units()).min(affordable);
             let kept = Shares::from_units(
                 u64::try_from(kept).expect("a kept holding is at most the wanted one"),
             );
-            if kept != *wanted {
+            if kept != wanted {
                 cuts.push(Cut::PerName {
                     symbol: symbol.clone(),
-                    wanted: *wanted,
-                    kept,
+                    wanted: wanted.into(),
+                    kept: kept.into(),
                 });
             }
             worth = worth
@@ -446,6 +448,14 @@ mod tests {
                 .collect(),
         );
         Ok((target, cuts))
+    }
+
+    /// The oracle's holding, which predates shorts.
+    fn long(holding: Holding) -> Shares {
+        match holding {
+            Holding::Long(shares) => shares,
+            Holding::Short(short) => panic!("the frozen oracle holds no short, given {short:?}"),
+        }
     }
 
     fn flat(cut: Cut) -> (Target, Vec<Cut>) {
@@ -671,8 +681,8 @@ mod tests {
                 target(&[("SPY", 3_333_333), ("AAPL", 5_000_000)]),
                 vec![Cut::PerName {
                     symbol: symbol("SPY"),
-                    wanted: Shares::from_units(10_000_000),
-                    kept: Shares::from_units(3_333_333),
+                    wanted: Shares::from_units(10_000_000).into(),
+                    kept: Shares::from_units(3_333_333).into(),
                 }]
             ))
         );
@@ -740,7 +750,7 @@ mod tests {
                 target(&[("SPY", 1)]),
                 vec![Cut::Unpriced {
                     symbol: symbol("AAPL"),
-                    wanted: Shares::from_units(2),
+                    wanted: Shares::from_units(2).into(),
                 }]
             ))
         );
@@ -785,10 +795,24 @@ mod tests {
 
     const SYMBOLS: [&str; 4] = ["AAPL", "MSFT", "SPY", "QQQ"];
 
-    fn arbitrary_target() -> impl Strategy<Value = Target> {
+    fn arbitrary_long_target() -> impl Strategy<Value = Target> {
         prop::collection::btree_map(
             prop::sample::select(SYMBOLS.to_vec()).prop_map(symbol),
             (0..2_000_000_000u64).prop_map(Shares::from_units),
+            0..4,
+        )
+        .prop_map(Target::new)
+    }
+
+    /// Longs of any millionths beside shorts of whole shares.
+    fn arbitrary_target() -> impl Strategy<Value = Target> {
+        prop::collection::btree_map(
+            prop::sample::select(SYMBOLS.to_vec()).prop_map(symbol),
+            prop_oneof![
+                (0..2_000_000_000u64).prop_map(|units| Holding::from(Shares::from_units(units))),
+                (0..2_000u64)
+                    .prop_map(|count| Holding::short(Shares::whole(count).unwrap()).unwrap()),
+            ],
             0..4,
         )
         .prop_map(Target::new)
@@ -813,15 +837,15 @@ mod tests {
         target
             .holdings()
             .iter()
-            .map(|(symbol, shares)| {
-                u128::from(prices[symbol].ticks_unsigned()) * u128::from(shares.units())
+            .map(|(symbol, holding)| {
+                u128::from(prices[symbol].ticks_unsigned()) * u128::from(holding.shares().units())
             })
             .collect()
     }
 
     proptest! {
-        /// Risk only lowers holdings, leaves each name and the whole target within limits, and risk applied to its own
-        /// output changes nothing.
+        /// Risk only moves holdings toward zero on their own side, leaves each name and the whole target within limits
+        /// long or short, keeps every short whole, and risk applied to its own output changes nothing.
         #[test]
         fn property_risk_lowers_into_the_limits_and_is_idempotent(
             wanted in arbitrary_target(),
@@ -833,7 +857,8 @@ mod tests {
             let price = |symbol: &Symbol| prices.get(symbol).copied();
             let once = risk(&limits, open(), dollars(10_000), &funded(10_000), price, wanted.clone()).unwrap();
             for (symbol, kept) in once.0.holdings() {
-                prop_assert!(*kept <= wanted.holdings()[symbol]);
+                let (kept, wanted) = (kept.position().units(), wanted.holdings()[symbol].position().units());
+                prop_assert!(kept.signum() == wanted.signum() && kept.abs() <= wanted.abs());
             }
             let worths = worth(&once.0, &prices);
             prop_assert!(worths.iter().all(|value| *value <= dollars(per_name).units().cast_unsigned()));
@@ -862,7 +887,7 @@ mod tests {
         /// included, and cuts each unpriced want to zero unless risk is flat.
         #[test]
         fn property_the_clip_arm_reproduces_risk_before_the_split(
-            wanted in arbitrary_target(),
+            wanted in arbitrary_long_target(),
             listed in prop::collection::vec(prop::option::weighted(0.75, 1..2_000_000_000i64), 4),
             held in prop::collection::vec(prop::option::weighted(0.3, -5_000_000i128..5_000_000), 4),
             gross in arbitrary_dollar_scale(),

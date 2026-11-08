@@ -71,7 +71,7 @@ impl Monoid for Cash {
     }
 }
 
-/// A signed holding in millionths of a share; signed so fills form a group, though targets are long-only today.
+/// A signed holding in millionths of a share, negative when short; signed so fills form a group.
 // Written as a decimal string, since serde's buffer for a tagged journal record cannot hold an i128.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

@@ -524,15 +524,13 @@ mod tests {
                 .collect();
             prop_assert_eq!(owed, held);
             if guarded.held().is_empty() {
-                let reached: BTreeMap<Symbol, Shares> = after
-                    .positions()
+                let wanted: BTreeMap<Symbol, Position> = target
+                    .holdings()
                     .iter()
-                    .map(|(symbol, position)| {
-                        (symbol.clone(), Shares::from_units(u64::try_from(position.units()).unwrap()))
-                    })
+                    .map(|(symbol, holding)| (symbol.clone(), holding.position()))
                     .collect();
-                prop_assert_eq!(reached.keys().collect::<Vec<_>>(), target.holdings().keys().collect::<Vec<_>>());
-                prop_assert_eq!(&reached, target.holdings());
+                prop_assert_eq!(after.positions().keys().collect::<Vec<_>>(), wanted.keys().collect::<Vec<_>>());
+                prop_assert_eq!(after.positions(), &wanted);
             }
         }
 
@@ -551,8 +549,8 @@ mod tests {
             }
             let mut worth = 0_i128;
             for (symbol, position) in after.positions() {
-                let wanted = target.holdings().get(symbol).copied().unwrap_or_default();
-                prop_assert!(0 <= position.units() && position.units() <= i128::from(wanted.units()));
+                let wanted = target.holdings().get(symbol).map_or(0, |holding| holding.position().units());
+                prop_assert!(0 <= position.units() && position.units() <= wanted);
                 let value = position.units() * i128::from(decision.prices[symbol].ticks());
                 prop_assert!(value <= decision.per_name.units());
                 worth += value;
