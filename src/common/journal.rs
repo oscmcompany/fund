@@ -1638,8 +1638,8 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    /// The reader types only the envelope, so a retired event, a payload that no longer types and a line from a
-    /// later schema version all read with the envelope and payload as written.
+    /// The reader types only the envelope, so a retired event, a payload that no longer types, a payload with a field
+    /// no build writes and a line from a later schema version all read with the envelope and payload as written.
     #[test]
     fn test_a_line_reads_whatever_its_payload_or_version() {
         let good = record(None).encode();
@@ -1648,9 +1648,13 @@ mod tests {
         changed["payload"] = serde_json::json!({"parameters": "no longer a map"});
         let changed = changed.to_string();
         let later = good.replace(r#""schema_version":1"#, r#""schema_version":2"#);
+        let mut extended: serde_json::Value = serde_json::from_str(&good).unwrap();
+        extended["payload"]["kept"] = serde_json::json!(true);
+        let extended = extended.to_string();
         for (text, event_type, version) in [
             (retired.as_str(), "configuration_guessed", 1),
             (changed.as_str(), "configuration_resolved", 1),
+            (extended.as_str(), "configuration_resolved", 1),
             (later.as_str(), "configuration_resolved", 2),
         ] {
             let lines = read(text);

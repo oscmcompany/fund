@@ -352,6 +352,28 @@ mod tests {
         parquet::write(schema(), columns, LAYOUT_VERSION, Vec::new()).unwrap()
     }
 
+    /// A current event whose payload holds a field no build writes ships that field and reads it back.
+    #[test]
+    fn test_a_payload_field_no_build_writes_survives_shipping() {
+        let mut line: serde_json::Value = serde_json::from_str(&record(
+            1,
+            "2026-09-30T07:00:00Z",
+            Observation::ConfigurationResolved(ConfigurationResolved::new(BTreeMap::new())),
+        ))
+        .unwrap();
+        line["payload"]["kept"] = serde_json::json!(true);
+        let lines = read(&line.to_string());
+        let bytes = encode(&key(), &lines).unwrap();
+        let shipped = decode(&key(), bytes).unwrap();
+        let [ReadLine::Read(read)] = shipped.as_slice() else {
+            panic!("not read: {shipped:?}");
+        };
+        assert_eq!(
+            read.payload(),
+            &serde_json::json!({"parameters": {}, "kept": true})
+        );
+    }
+
     /// A row naming a retired event reads back with its envelope, and is written back into the envelope's columns
     /// rather than as text, so it stays filterable by run and event.
     #[test]
