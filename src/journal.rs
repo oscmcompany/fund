@@ -6,37 +6,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use crate::common::journal::{Commit, Observation, ReadLine, Record, RunId, UnreadableCause, read};
+use crate::common::journal::{Commit, Observation, Record, RunId};
 use crate::common::storage::Service;
 use crate::common::time::SessionDate;
 use chrono::{DateTime, Utc};
-
-/// Why a journal's history was not read whole.
-#[derive(Debug, thiserror::Error)]
-pub enum HistoryError {
-    #[error("{0}")]
-    Io(io::Error),
-    /// A complete record this build cannot read.
-    #[error("{} line {line} is a record this build cannot read: {cause:?}", .file.display())]
-    Unreadable {
-        file: PathBuf,
-        line: usize,
-        cause: UnreadableCause,
-    },
-    /// A complete record whose payload this build cannot type, such as one naming a retired variant.
-    #[error("{} holds a {event_type} record this build cannot type: {reason}", .file.display())]
-    Untyped {
-        file: PathBuf,
-        event_type: String,
-        reason: String,
-    },
-}
-
-impl From<io::Error> for HistoryError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
 
 /// Writes one run's records.
 pub struct Journal {
@@ -83,13 +56,14 @@ impl Journal {
         &self.directory
     }
 
-    /// Every record in this journal's directory, from every run, oldest file first. A line that is not JSON is
-    /// skipped, since a crash can tear the last line it wrote; a complete record this build cannot read is an error,
-    /// so a reader never acts on a history with a record silently missing.
-    pub fn history(&self) -> Result<Vec<Record>, HistoryError> {
+    /// Every record in this journal's directory, from every run, oldest file first, skipping a line that is not JSON
+    /// since a crash can tear the last line it wrote; panics on any other line that does not type.
+    #[cfg(test)]
+    pub fn history(&self) -> Vec<Record> {
+        use crate::common::journal::{ReadLine, UnreadableCause, read};
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(&self.directory)? {
-            let path = entry?.path();
+        for entry in std::fs::read_dir(&self.directory).unwrap() {
+            let path = entry.unwrap().path();
             let session = path
                 .file_name()
                 .and_then(|name| session_of_file_name(name.to_str()?));
@@ -100,27 +74,20 @@ impl Journal {
         files.sort();
         let mut records = Vec::new();
         for (_, file) in files {
-            for line in read(&std::fs::read_to_string(&file)?) {
+            for line in read(&std::fs::read_to_string(&file).unwrap()) {
                 match line {
-                    ReadLine::Read(record) => records.push(*record),
-                    ReadLine::Untyped(untyped) => {
-                        return Err(HistoryError::Untyped {
-                            file,
-                            event_type: untyped.event_type().to_string(),
-                            reason: untyped.reason().to_string(),
-                        });
-                    }
+                    ReadLine::Read(read) => records.push(read.record()),
                     ReadLine::Unreadable {
                         cause: UnreadableCause::NotJson { .. },
                         ..
                     } => {}
                     ReadLine::Unreadable { line, cause, .. } => {
-                        return Err(HistoryError::Unreadable { file, line, cause });
+                        panic!("{} line {line}: {cause:?}", file.display())
                     }
                 }
             }
         }
-        Ok(records)
+        records
     }
 
     /// Returns once the record is durable, so a caller that waits before acting knows the observation survives the
@@ -235,6 +202,7 @@ pub fn file_name(session: SessionDate) -> String {
 }
 
 /// The session whose records `name` holds, as `file_name` writes it; `None` for any other file.
+#[cfg(test)]
 fn session_of_file_name(name: &str) -> Option<SessionDate> {
     let date = name.strip_prefix("session-")?.strip_suffix(".jsonl")?;
     let session = SessionDate::from_date(date.parse().ok()?);
@@ -310,10 +278,9 @@ mod tests {
             read(&std::fs::read_to_string(directory.join(file)).unwrap())
                 .into_iter()
                 .map(|line| match line {
-                    ReadLine::Read(record) => {
-                        (record.sequence(), record.run_id(), record.commit().cloned())
+                    ReadLine::Read(read) => {
+                        (read.sequence(), read.run_id(), read.commit().cloned())
                     }
-                    ReadLine::Untyped(untyped) => panic!("untyped: {untyped:?}"),
                     ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
                 })
                 .collect()
@@ -330,45 +297,46 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A torn fragment is a lost record and is skipped; a complete record this build cannot read stops the history.
+    /// A torn fragment is a lost record and is skipped, and a stray file beside the journal is not read.
     #[test]
-    fn test_history_skips_a_torn_line_and_refuses_an_unreadable_record() {
+    fn test_history_skips_a_torn_line() {
         let directory = temporary_directory();
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         journal
             .append("2026-07-31T14:30:00Z".parse().unwrap(), observation())
             .unwrap();
-        let file = directory.join("session-2026-07-31.jsonl");
-        let append = |text: &str| {
-            let mut handle = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&file)
-                .unwrap();
-            handle.write_all(text.as_bytes()).unwrap();
-        };
-        append("{\"torn\n");
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join("session-2026-07-31.jsonl"))
+            .unwrap();
+        handle.write_all(b"{\"torn\n").unwrap();
         std::fs::write(directory.join("heal.lock"), "").unwrap();
-        assert_eq!(journal.history().unwrap().len(), 1);
-        for unreadable in [
-            "{\"schema_version\":1,\"event_type\":\"heal_finished\"}\n",
-            "{\"schema_version\":99}\n",
-            "{\"event_type\":\"heal_finished\"}\n",
-        ] {
-            let before = std::fs::read_to_string(&file).unwrap();
-            append(unreadable);
-            let error = journal.history().unwrap_err();
-            assert!(
-                matches!(error, HistoryError::Unreadable { line: 3, .. }),
-                "{unreadable}: {error}"
-            );
-            std::fs::write(&file, before).unwrap();
-        }
+        assert_eq!(journal.history().len(), 1);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A complete record this build cannot type, a retired event or a later schema version, stops the history.
+    /// A complete record without an envelope is not a torn line, so the history refuses it rather than drop it.
     #[test]
-    fn test_history_refuses_a_complete_record_it_cannot_type() {
+    #[should_panic(expected = "line 2: Malformed")]
+    fn test_history_refuses_a_record_without_an_envelope() {
+        let directory = temporary_directory();
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        journal
+            .append("2026-07-31T14:30:00Z".parse().unwrap(), observation())
+            .unwrap();
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join("session-2026-07-31.jsonl"))
+            .unwrap();
+        handle
+            .write_all(b"{\"schema_version\":1,\"event_type\":\"heal_finished\"}\n")
+            .unwrap();
+        journal.history();
+    }
+
+    /// A record written under a later schema version reads with the version it was written under.
+    #[test]
+    fn test_history_reads_a_later_schema_version() {
         let directory = temporary_directory();
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
         journal
@@ -376,19 +344,14 @@ mod tests {
             .unwrap();
         let file = directory.join("session-2026-07-31.jsonl");
         let written = std::fs::read_to_string(&file).unwrap();
-        let retired = written.replace("configuration_resolved", "retired_event");
         let later = written.replace(r#""schema_version":1"#, r#""schema_version":2"#);
-        for (untyped, event_type) in [
-            (retired, "retired_event"),
-            (later, "configuration_resolved"),
-        ] {
-            std::fs::write(&file, format!("{written}{untyped}")).unwrap();
-            let error = journal.history().unwrap_err();
-            assert!(
-                matches!(&error, HistoryError::Untyped { event_type: found, .. } if found == event_type),
-                "{untyped}: {error}"
-            );
-        }
+        std::fs::write(&file, format!("{written}{later}")).unwrap();
+        let versions: Vec<u64> = journal
+            .history()
+            .iter()
+            .map(Record::schema_version)
+            .collect();
+        assert_eq!(versions, [1, 2]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -449,8 +412,7 @@ mod tests {
         let sequences: Vec<u64> = lines(&directory)
             .iter()
             .map(|line| match line {
-                ReadLine::Read(record) => record.sequence(),
-                ReadLine::Untyped(untyped) => panic!("untyped: {untyped:?}"),
+                ReadLine::Read(read) => read.sequence(),
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
             .collect();
@@ -473,7 +435,7 @@ mod tests {
         ] {
             std::fs::write(directory.join(stray), "{\"schema_version\":99}\n").unwrap();
         }
-        assert_eq!(journal.history().unwrap().len(), 1);
+        assert_eq!(journal.history().len(), 1);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

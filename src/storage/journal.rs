@@ -47,7 +47,7 @@ impl From<ReadRefusal> for DecodeRefusal {
     }
 }
 
-/// A line's envelope as its columns hold it, from a typed record or an untyped one alike.
+/// A line's envelope as its columns hold it.
 struct Envelope {
     schema_version: u64,
     run_id: String,
@@ -58,30 +58,17 @@ struct Envelope {
     payload: String,
 }
 
-/// The envelope a typed or untyped line carries, or an unreadable line's number and text, which has none.
+/// The envelope a read line carries, or an unreadable line's number and text, which has none.
 fn envelope(line: &ReadLine) -> Result<Envelope, (usize, &str)> {
     match line {
-        ReadLine::Read(record) => {
-            let tagged = serde_json::to_value(record.observation())
-                .expect("an observation has only string keys, so it serializes");
-            Ok(Envelope {
-                schema_version: record.schema_version(),
-                run_id: record.run_id().to_string(),
-                sequence: record.sequence(),
-                timestamp: record.timestamp(),
-                commit: record.commit().map(Commit::to_string),
-                event_type: record.observation().event_type().to_string(),
-                payload: tagged["payload"].to_string(),
-            })
-        }
-        ReadLine::Untyped(untyped) => Ok(Envelope {
-            schema_version: untyped.schema_version(),
-            run_id: untyped.run_id().to_string(),
-            sequence: untyped.sequence(),
-            timestamp: untyped.timestamp(),
-            commit: untyped.commit().map(Commit::to_string),
-            event_type: untyped.event_type().to_string(),
-            payload: untyped.payload().to_string(),
+        ReadLine::Read(read) => Ok(Envelope {
+            schema_version: read.schema_version(),
+            run_id: read.run_id().to_string(),
+            sequence: read.sequence(),
+            timestamp: read.timestamp(),
+            commit: read.commit().map(Commit::to_string),
+            event_type: read.event_type().to_string(),
+            payload: read.payload().to_string(),
         }),
         ReadLine::Unreadable { line, text, .. } => Err((*line, text)),
     }
@@ -172,8 +159,7 @@ pub fn encode(key: &JournalKey, lines: &[ReadLine]) -> Result<Vec<u8>, EncodeRef
 }
 
 /// The lines a file written by `encode` under `key` holds, each read again through the journal's own reader, so a
-/// row edited out of band reads back as what it now says rather than what it was. A row this build no longer types,
-/// such as one naming a retired variant, reads back untyped with its envelope rather than refusing the file.
+/// row edited out of band reads back as what it now says rather than what it was.
 pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeRefusal> {
     let session = key.session();
     let (batches, _) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
@@ -204,8 +190,7 @@ pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeR
             if unreadables.is_valid(row) {
                 let read = read_one(number, unreadables.value(row));
                 match &read {
-                    ReadLine::Read(record) => stamped_in_session(record.session())?,
-                    ReadLine::Untyped(untyped) => stamped_in_session(untyped.session())?,
+                    ReadLine::Read(read) => stamped_in_session(read.session())?,
                     ReadLine::Unreadable { .. } => {}
                 }
                 lines.push(read);
@@ -219,7 +204,7 @@ pub fn decode(key: &JournalKey, bytes: Vec<u8>) -> Result<Vec<ReadLine>, DecodeR
             if !present {
                 return Err(refused("an envelope column is null on a readable line"));
             }
-            // Checked on the typed column, so a row this build cannot type is held to the key too.
+            // Checked on the typed column, so a row whose line would not read is held to the key too.
             let timestamp = DateTime::from_timestamp_nanos(timestamps.value(row));
             stamped_in_session(SessionDate::at(timestamp))?;
             let payload: serde_json::Value = serde_json::from_str(payloads.value(row))
@@ -367,21 +352,21 @@ mod tests {
         parquet::write(schema(), columns, LAYOUT_VERSION, Vec::new()).unwrap()
     }
 
-    /// A row naming a retired event reads back untyped with its envelope, and is written back into the envelope's
-    /// columns rather than as text, so it stays filterable by run and event.
+    /// A row naming a retired event reads back with its envelope, and is written back into the envelope's columns
+    /// rather than as text, so it stays filterable by run and event.
     #[test]
-    fn test_a_row_this_build_cannot_type_reads_back_untyped_and_keeps_its_columns() {
+    fn test_a_row_naming_a_retired_event_reads_back_and_keeps_its_columns() {
         let lines = decode(
             &key(),
             file_with_row(Some("retired_event"), r#"{"kept":true}"#),
         )
         .unwrap();
-        let [ReadLine::Untyped(untyped)] = lines.as_slice() else {
-            panic!("not untyped: {lines:?}");
+        let [ReadLine::Read(read)] = lines.as_slice() else {
+            panic!("not read: {lines:?}");
         };
-        assert_eq!(untyped.event_type(), "retired_event");
-        assert_eq!(untyped.run_id(), RunId::new(Uuid::from_u128(7)));
-        assert_eq!(untyped.payload(), &serde_json::json!({"kept": true}));
+        assert_eq!(read.event_type(), "retired_event");
+        assert_eq!(read.run_id(), RunId::new(Uuid::from_u128(7)));
+        assert_eq!(read.payload(), &serde_json::json!({"kept": true}));
         let bytes = encode(&key(), &lines).unwrap();
         assert_eq!(
             bytes,
@@ -391,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_row_this_build_cannot_type_from_another_session_refuses_the_file() {
+    fn test_a_retired_row_from_another_session_refuses_the_file() {
         let next = session().plus_calendar_days(1);
         assert_eq!(
             decode(&key(), file_with_row_on(next, Some("retired_event"), "{}")),

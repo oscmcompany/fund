@@ -1476,7 +1476,6 @@ mod tests {
     fn event_types(journal: &Journal) -> Vec<&'static str> {
         journal
             .history()
-            .unwrap()
             .iter()
             .map(|record| record.observation().event_type())
             .collect()
@@ -1674,7 +1673,6 @@ mod tests {
         );
         let observations: Vec<Observation> = journal
             .history()
-            .unwrap()
             .iter()
             .map(|record| record.observation().clone())
             .collect();

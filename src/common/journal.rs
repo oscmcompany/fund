@@ -29,7 +29,7 @@ use crate::common::standing::{SessionClosed, SessionHalted};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 
-/// Stamped on every record this build writes; a line under another version reads back untyped, its envelope intact.
+/// Stamped on every record this build writes.
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// One process's run, within which `sequence` orders records.
@@ -136,7 +136,8 @@ impl From<Commit> for String {
 /// One line of the journal: an observation and the envelope that orders and attributes it.
 ///
 /// Nothing derivable is stored: the session comes from `timestamp` and the host from the `producer=` partition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Record {
     schema_version: u64,
     run_id: RunId,
@@ -613,15 +614,12 @@ pub enum ParameterSource {
     Default,
 }
 
-/// One journal line read back; a line this build cannot type is kept, never dropped, so a reader never reports a
-/// shorter run than the one that happened.
+/// One journal line read back; a line is kept, never dropped, so a reader never reports a shorter run than the one
+/// that happened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadLine {
-    Read(Box<Record>),
-    /// The envelope reads but the payload does not type: a retired variant, a changed payload, or another schema
-    /// version, kept with its envelope so it stays queryable by run, session and event.
-    Untyped(Box<Untyped>),
-    /// The envelope itself does not read; `text` is the line as written, kept so it can be preserved or migrated.
+    Read(Box<Line>),
+    /// The envelope does not read; `text` is the line as written, kept so it can be preserved or migrated.
     Unreadable {
         line: usize,
         text: String,
@@ -629,24 +627,9 @@ pub enum ReadLine {
     },
 }
 
-/// A line whose envelope reads and whose payload this build does not type, held as the JSON it was written as; built
-/// only by the reader, after the payload failed to type.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Untyped {
-    schema_version: u64,
-    run_id: RunId,
-    sequence: NonZeroU64,
-    timestamp: DateTime<Utc>,
-    commit: Option<Commit>,
-    event_type: String,
-    payload: serde_json::Value,
-    /// Why the payload did not type, which a reader may show but nothing decides from.
-    reason: String,
-}
-
-/// The envelope as written, read before the reader knows whether the payload types.
-#[derive(Deserialize)]
-struct Envelope {
+/// A line's envelope with its payload held as the JSON it was written as, which the reader never types.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Line {
     schema_version: u64,
     run_id: RunId,
     sequence: NonZeroU64,
@@ -658,7 +641,7 @@ struct Envelope {
     payload: serde_json::Value,
 }
 
-impl Untyped {
+impl Line {
     pub fn schema_version(&self) -> u64 {
         self.schema_version
     }
@@ -687,13 +670,25 @@ impl Untyped {
         &self.payload
     }
 
-    pub fn reason(&self) -> &str {
-        &self.reason
-    }
-
     /// The session the line happened in, which files it.
     pub fn session(&self) -> SessionDate {
         SessionDate::at(self.timestamp)
+    }
+
+    /// The line typed as this build's `Record`, panicking with its event type when it does not type.
+    #[cfg(test)]
+    pub fn record(&self) -> Record {
+        let value = serde_json::json!({
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "sequence": self.sequence,
+            "timestamp": self.timestamp,
+            "commit": self.commit,
+            "event_type": self.event_type,
+            "payload": self.payload,
+        });
+        serde_json::from_value(value)
+            .unwrap_or_else(|error| panic!("{} does not type: {error}", self.event_type))
     }
 }
 
@@ -710,8 +705,8 @@ pub enum UnreadableCause {
     },
 }
 
-/// Reads every line of a journal file in the order it was written, typing each payload only under this build's
-/// version. The writer never emits a blank line, so one reads back as unreadable rather than being skipped.
+/// Reads every line of a journal file in the order it was written. The writer never emits a blank line, so one reads
+/// back as unreadable rather than being skipped.
 pub fn read(contents: &str) -> Vec<ReadLine> {
     contents
         .lines()
@@ -723,7 +718,7 @@ pub fn read(contents: &str) -> Vec<ReadLine> {
 /// Line `line` of a journal file, as `read` would give it.
 pub fn read_one(line: usize, text: &str) -> ReadLine {
     match read_line(text) {
-        Ok(read) => read,
+        Ok(read) => ReadLine::Read(Box::new(read)),
         Err(cause) => ReadLine::Unreadable {
             line,
             text: text.to_string(),
@@ -732,52 +727,30 @@ pub fn read_one(line: usize, text: &str) -> ReadLine {
     }
 }
 
-fn read_line(line: &str) -> Result<ReadLine, UnreadableCause> {
+fn read_line(line: &str) -> Result<Line, UnreadableCause> {
     let value: serde_json::Value =
         serde_json::from_str(line).map_err(|error| UnreadableCause::NotJson {
             reason: error.to_string(),
         })?;
-    let schema_version = value
+    value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         .ok_or(UnreadableCause::NoVersion)?;
-    let typed = match schema_version == SCHEMA_VERSION {
-        true => serde_json::from_value::<Record>(value.clone()).map_err(|error| error.to_string()),
-        false => Err(format!("written under schema version {schema_version}")),
-    };
-    let reason = match typed {
-        Ok(record) => return Ok(ReadLine::Read(Box::new(record))),
-        Err(reason) => reason,
-    };
     let event_type = value
         .get("event_type")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    serde_json::from_value::<Envelope>(value)
-        .map(|envelope| {
-            ReadLine::Untyped(Box::new(Untyped {
-                schema_version: envelope.schema_version,
-                run_id: envelope.run_id,
-                sequence: envelope.sequence,
-                timestamp: envelope.timestamp,
-                commit: envelope.commit,
-                event_type: envelope.event_type,
-                payload: envelope.payload,
-                reason,
-            }))
-        })
-        .map_err(|error| UnreadableCause::Malformed {
-            event_type,
-            reason: error.to_string(),
-        })
+    serde_json::from_value::<Line>(value).map_err(|error| UnreadableCause::Malformed {
+        event_type,
+        reason: error.to_string(),
+    })
 }
 
 /// `held` with every line of `adding` it lacks appended, so two writers shipping one session's object both keep
 /// their records. A record is the same record by run and sequence; an unreadable line by its text.
 pub fn merge(held: Vec<ReadLine>, adding: Vec<ReadLine>) -> Vec<ReadLine> {
     let identity = |line: &ReadLine| match line {
-        ReadLine::Read(record) => (Some((record.run_id(), record.sequence())), None),
-        ReadLine::Untyped(untyped) => (Some((untyped.run_id(), untyped.sequence())), None),
+        ReadLine::Read(read) => (Some((read.run_id(), read.sequence())), None),
         ReadLine::Unreadable { text, .. } => (None, Some(text.clone())),
     };
     let mut seen: std::collections::BTreeSet<_> = held.iter().map(identity).collect();
@@ -828,13 +801,17 @@ mod tests {
     fn line(run: u128, sequence: u64) -> ReadLine {
         match run {
             0 => read_one(1, &format!("torn {sequence}")),
-            _ => ReadLine::Read(Box::new(Record::new(
-                RunId::new(Uuid::from_u128(run)),
-                NonZeroU64::new(sequence).unwrap(),
-                "2026-07-31T14:30:00Z".parse().unwrap(),
-                None,
-                Observation::ConfigurationResolved(ConfigurationResolved::new(BTreeMap::new())),
-            ))),
+            _ => read_one(
+                1,
+                &Record::new(
+                    RunId::new(Uuid::from_u128(run)),
+                    NonZeroU64::new(sequence).unwrap(),
+                    "2026-07-31T14:30:00Z".parse().unwrap(),
+                    None,
+                    Observation::ConfigurationResolved(ConfigurationResolved::new(BTreeMap::new())),
+                )
+                .encode(),
+            ),
         }
     }
 
@@ -1613,7 +1590,10 @@ mod tests {
         let contents = [&[good.as_str()][..], &unreadable].concat().join("\n");
         let lines = read(&contents);
         assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0], ReadLine::Read(Box::new(record(None))));
+        let ReadLine::Read(first) = &lines[0] else {
+            panic!("not read: {:?}", lines[0]);
+        };
+        assert_eq!(first.record(), record(None));
         // Parser messages are serde's, so the reasons are blanked before comparing.
         let found: Vec<(usize, String, UnreadableCause)> = lines[1..]
             .iter()
@@ -1633,8 +1613,7 @@ mod tests {
                     };
                     (*line, text.clone(), cause)
                 }
-                ReadLine::Read(record) => panic!("read {record:?}"),
-                ReadLine::Untyped(untyped) => panic!("untyped {untyped:?}"),
+                ReadLine::Read(read) => panic!("read {read:?}"),
             })
             .collect();
         let not_json = UnreadableCause::NotJson {
@@ -1659,10 +1638,10 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    /// A whole envelope keeps its line queryable whatever the payload: a retired event, a payload that no longer
-    /// types, and a line from another schema version all read back untyped with the envelope and payload as written.
+    /// The reader types only the envelope, so a retired event, a payload that no longer types and a line from a
+    /// later schema version all read with the envelope and payload as written.
     #[test]
-    fn test_a_line_whose_payload_does_not_type_keeps_its_envelope() {
+    fn test_a_line_reads_whatever_its_payload_or_version() {
         let good = record(None).encode();
         let retired = good.replace("configuration_resolved", "configuration_guessed");
         let mut changed: serde_json::Value = serde_json::from_str(&good).unwrap();
@@ -1675,23 +1654,23 @@ mod tests {
             (later.as_str(), "configuration_resolved", 2),
         ] {
             let lines = read(text);
-            let [ReadLine::Untyped(untyped)] = lines.as_slice() else {
-                panic!("not untyped: {text}");
+            let [ReadLine::Read(read)] = lines.as_slice() else {
+                panic!("not read: {text}");
             };
             let written: serde_json::Value = serde_json::from_str(text).unwrap();
-            assert_eq!(untyped.event_type(), event_type);
-            assert_eq!(untyped.schema_version(), version);
-            assert_eq!(untyped.run_id(), RunId::new(Uuid::from_u128(1)));
-            assert_eq!(untyped.sequence(), 1);
-            assert_eq!(untyped.timestamp(), record(None).timestamp());
-            assert_eq!(untyped.payload(), &written["payload"]);
-            assert!(!untyped.reason().is_empty(), "{text}");
+            assert_eq!(read.event_type(), event_type);
+            assert_eq!(read.schema_version(), version);
+            assert_eq!(read.run_id(), RunId::new(Uuid::from_u128(1)));
+            assert_eq!(read.sequence(), 1);
+            assert_eq!(read.timestamp(), record(None).timestamp());
+            assert_eq!(read.commit(), None);
+            assert_eq!(read.payload(), &written["payload"]);
         }
     }
 
-    /// An untyped line is the same line by run and sequence, so merging it twice keeps one.
+    /// A line whose payload does not type is the same line by run and sequence, so merging it twice keeps one.
     #[test]
-    fn test_an_untyped_line_merges_once() {
+    fn test_a_retired_line_merges_once() {
         let retired = record(None)
             .encode()
             .replace("configuration_resolved", "configuration_guessed");
@@ -1932,7 +1911,11 @@ mod tests {
 
         #[test]
         fn property_a_record_reads_back_as_itself(record in any_record()) {
-            prop_assert_eq!(read(&record.encode()), vec![ReadLine::Read(Box::new(record))]);
+            let lines = read(&record.encode());
+            let [ReadLine::Read(read)] = lines.as_slice() else {
+                panic!("not one read line: {lines:?}");
+            };
+            prop_assert_eq!(read.record(), record);
         }
     }
 }

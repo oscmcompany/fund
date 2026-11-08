@@ -352,7 +352,6 @@ mod tests {
         Journal::open(directory, RunId::new(Uuid::new_v4()))
             .unwrap()
             .history()
-            .unwrap()
             .iter()
             .map(|record| record.observation().event_type())
             .collect()

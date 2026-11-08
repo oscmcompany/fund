@@ -545,8 +545,7 @@ pub(crate) mod tests {
         let observations: Vec<Observation> = lines
             .iter()
             .map(|line| match line {
-                ReadLine::Read(record) => record.observation().clone(),
-                ReadLine::Untyped(untyped) => panic!("untyped: {untyped:?}"),
+                ReadLine::Read(read) => read.record().observation().clone(),
                 ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
             })
             .collect();
@@ -576,8 +575,8 @@ pub(crate) mod tests {
         );
         assert!(first.since_opened() <= second.since_opened());
         let session = match &lines[0] {
-            ReadLine::Read(record) => record.session(),
-            ReadLine::Untyped(_) | ReadLine::Unreadable { .. } => {
+            ReadLine::Read(read) => read.session(),
+            ReadLine::Unreadable { .. } => {
                 unreachable!("every line read above")
             }
         };

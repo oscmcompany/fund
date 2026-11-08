@@ -252,7 +252,7 @@ pub(crate) mod tests {
         for file in files {
             for line in read(&std::fs::read_to_string(file).unwrap()) {
                 match line {
-                    ReadLine::Read(record) => match record.observation() {
+                    ReadLine::Read(read) => match read.record().observation() {
                         Observation::ExperimentRan(experiment) => ran.push((**experiment).clone()),
                         Observation::ConfigurationResolved(_)
                         | Observation::PartitionWritten(_)
@@ -282,7 +282,6 @@ pub(crate) mod tests {
                         | Observation::PlaybookRead(_)
                         | Observation::PlaybookUploaded(_) => {}
                     },
-                    ReadLine::Untyped(untyped) => panic!("untyped: {untyped:?}"),
                     ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
                 }
             }
