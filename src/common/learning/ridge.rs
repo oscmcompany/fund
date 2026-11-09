@@ -41,7 +41,7 @@ pub enum RidgeRefusal {
 
 impl Ridge {
     /// Minimizes the squared error plus `penalty` times the squared coefficients; the intercept goes unpenalized, so
-    /// the fit is the same whatever constant the labels are shifted by.
+    /// shifting the labels by a constant moves only the intercept.
     pub fn fit(sample: &Sample, penalty: Penalty) -> Result<Self, RidgeRefusal> {
         let (matrix, labels) = (sample.matrix(), sample.labels());
         match sample.loss() {
@@ -216,6 +216,21 @@ mod tests {
         assert!((ridge.coefficients()[0] - 2.0).abs() < 1e-6, "{ridge:?}");
         assert!((ridge.coefficients()[1] + 0.5).abs() < 1e-6, "{ridge:?}");
         assert!((ridge.coefficients()[2] - 0.25).abs() < 1e-6, "{ridge:?}");
+    }
+
+    #[test]
+    fn test_a_fit_survives_a_serde_round_trip() {
+        let values = [1.0, 0.0, 2.0, 1.0, 3.0, 5.0, 4.0, 2.0];
+        let ridge = Ridge::fit(
+            &sample(&values, 2, &[0.3, 1.7, 2.9, 4.1]),
+            Penalty::new(0.5).unwrap(),
+        )
+        .unwrap();
+        let text = serde_json::to_string(&ridge).unwrap();
+        let restored: Ridge = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored, ridge);
+        let matrix = Matrix::new(&values, NonZeroUsize::new(2).unwrap()).unwrap();
+        assert_eq!(restored.predict(&matrix), ridge.predict(&matrix));
     }
 
     #[test]

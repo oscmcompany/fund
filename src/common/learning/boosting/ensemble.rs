@@ -17,10 +17,6 @@ use crate::common::monoid::{Fold, Monoid, Sequence};
 pub struct Ensemble(Vec<Tree>);
 
 impl Ensemble {
-    pub fn of(tree: Tree) -> Self {
-        Self(vec![tree])
-    }
-
     pub fn trees(&self) -> &[Tree] {
         &self.0
     }

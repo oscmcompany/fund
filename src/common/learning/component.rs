@@ -250,6 +250,8 @@ impl<'a> Component<Matrix<'a>> for Booster {
 mod tests {
     use std::num::NonZeroUsize;
 
+    use proptest::prelude::*;
+
     use super::*;
     use crate::common::learning::boosting::ensemble::{Settings, Stopping};
     use crate::common::learning::boosting::{Fraction, Penalty};
@@ -291,6 +293,36 @@ mod tests {
         ) -> Result<Vec<f64>, Infallible> {
             Ok(input.iter().map(|prediction| prediction.get()).collect())
         }
+    }
+
+    /// Multiplies each value by its factor and records the factor, a component whose input and output share a type.
+    struct Multiply(f64);
+
+    impl Component<Vec<f64>> for Multiply {
+        type Output = Vec<f64>;
+        type Refusal = Infallible;
+
+        fn apply(
+            &self,
+            input: Vec<f64>,
+            diagnostics: &mut Diagnostics,
+        ) -> Result<Vec<f64>, Infallible> {
+            diagnostics.record("factor", self.0);
+            Ok(input.iter().map(|value| value * self.0).collect())
+        }
+    }
+
+    /// Applies `component` to `input`, returning its output beside the readings it recorded.
+    fn run<C: Component<Vec<f64>, Output = Vec<f64>>>(
+        component: &C,
+        input: &[f64],
+    ) -> (Vec<f64>, Diagnostics)
+    where
+        C::Refusal: std::fmt::Debug,
+    {
+        let mut diagnostics = Diagnostics::default();
+        let output = component.apply(input.to_vec(), &mut diagnostics).unwrap();
+        (output, diagnostics)
     }
 
     fn name(text: &str) -> Name {
@@ -480,6 +512,49 @@ mod tests {
         let mut diagnostics = Diagnostics::default();
         assert_eq!(Identity.apply(vec![1, 2], &mut diagnostics), Ok(vec![1, 2]));
         assert!(diagnostics.readings().is_empty());
+    }
+
+    #[test]
+    fn test_a_setting_reads_back_from_its_name() {
+        use strum::IntoEnumIterator;
+        let names = ["on", "off"];
+        for name in names {
+            assert_eq!(name.parse::<Setting>().unwrap().to_string(), name);
+        }
+        let iterated: Vec<&str> = Setting::iter().map(|setting| setting.into()).collect();
+        assert_eq!(iterated, names);
+        assert!("On".parse::<Setting>().is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn test_the_identity_is_a_unit_of_wiring(
+            factor in -1e3_f64..1e3,
+            input in prop::collection::vec(-1e3_f64..1e3, 0..8),
+        ) {
+            let alone = run(&Multiply(factor), &input);
+            prop_assert_eq!(&run(&Then { first: Identity, second: Multiply(factor) }, &input), &alone);
+            prop_assert_eq!(&run(&Then { first: Multiply(factor), second: Identity }, &input), &alone);
+            prop_assert_eq!(alone.1.readings(), [("factor".to_string(), factor)]);
+        }
+
+        #[test]
+        fn test_wiring_is_associative(
+            first in -1e3_f64..1e3,
+            second in -1e3_f64..1e3,
+            third in -1e3_f64..1e3,
+            input in prop::collection::vec(-1e3_f64..1e3, 0..8),
+        ) {
+            let left = Then {
+                first: Then { first: Multiply(first), second: Multiply(second) },
+                second: Multiply(third),
+            };
+            let right = Then {
+                first: Multiply(first),
+                second: Then { first: Multiply(second), second: Multiply(third) },
+            };
+            prop_assert_eq!(run(&left, &input), run(&right, &input));
+        }
     }
 
     #[test]
