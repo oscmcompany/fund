@@ -634,7 +634,7 @@ note = "Hold nothing in the afternoon"
                 .decide(&state, &book)
                 .holdings()
                 .iter()
-                .map(|(symbol, shares)| (symbol.clone(), shares.units()))
+                .map(|(symbol, holding)| (symbol.clone(), holding.shares().units()))
                 .collect();
             let expected: Vec<_> = noise
                 .decide(&state, &book)
@@ -733,7 +733,7 @@ note = "Exercise the afternoon on paper"
                 .decide(&state, &book)
                 .holdings()
                 .iter()
-                .map(|(symbol, shares)| (symbol.clone(), shares.units()))
+                .map(|(symbol, holding)| (symbol.clone(), holding.shares().units()))
                 .collect();
             let expected: Vec<_> = noise
                 .decide(&state, &book)
