@@ -34,8 +34,8 @@ const EXCHANGE_TEST_TICKERS: [&str; 34] = [
     "ZZZTS", "ZZZTT", "ZZZTX",
 ];
 
-/// Whether `ticker` is an exchange test ticker, which the flat files print too.
-pub(crate) fn is_exchange_test_ticker(ticker: &str) -> bool {
+/// Whether `ticker` is an exchange test ticker.
+fn is_exchange_test_ticker(ticker: &str) -> bool {
     EXCHANGE_TEST_TICKERS.contains(&ticker)
 }
 
@@ -691,7 +691,7 @@ fn security_type(code: String) -> Result<SecurityType, RowRefusal> {
 /// Massive's ticker in Alpaca's notation, which `Symbol` holds: preferred `BCpC` is `BC.PRC`, warrant `ABCw` is
 /// `ABC.WS` and right `ABCr` is `ABC.RT`. Anything else goes to `Symbol::new` as written, so a lowercase form no rule
 /// covers is refused rather than uppercased into another security (`BCpC` is not the common `BCPC`).
-pub fn alpaca_symbol(ticker: &str) -> Result<Symbol, SymbolRefusal> {
+fn alpaca_symbol(ticker: &str) -> Result<Symbol, SymbolRefusal> {
     let suffixed = |root: &str, suffix: &str| format!("{root}.{suffix}");
     let translated = match ticker.char_indices().rev().nth(1) {
         Some((index, 'p'))
@@ -903,8 +903,11 @@ mod tests {
         assert_eq!(abd.timestamp().to_rfc3339(), "2026-09-25T20:00:00+00:00");
         assert_eq!(abd.volume().to_string(), "210482.125375");
         assert_eq!(abd.trade_count(), Some(TradeCount::new(7500)));
-        let average = abd.volume_weighted_average_price().unwrap();
-        assert!((average - 74.5).abs() < 1e-9, "{average}");
+        // A 74.50 average over the volume, to the float product's precision.
+        assert_eq!(
+            abd.dollar_volume(),
+            Some(DollarVolume::from_units(15_680_918_340_437_499_904))
+        );
         assert_eq!(abd.prices().open().to_string(), "73.75");
     }
 

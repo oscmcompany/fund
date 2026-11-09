@@ -455,8 +455,8 @@ fn test_every_series_views_sql_reads_is_a_key_series() {
         keys.push(LogsKey::new(host, Service::new("archive_nightly").unwrap(), session).into());
     }
     let called = macro_series();
-    // 17 series views, the six neutral views' two reads each, `journal`, `logs`, `experiments`, `verdicts`, and
-    // `bar_seam`'s two reads.
+    // 12 bar and 6 reference series views, the six neutral views' two reads each, `journal`, `logs`, `experiments`,
+    // `verdicts`, and `bar_seam`'s two reads.
     assert_eq!(called.len(), 36, "{called:?}");
     for (bucket, series) in &called {
         let expected_bucket = if series.starts_with("records/") {

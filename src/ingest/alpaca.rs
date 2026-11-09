@@ -1,5 +1,5 @@
-//! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session, its
-//! published trading calendar, and its asset listing's short-sale flags.
+//! Alpaca's SIP quotes and trades, a session's requested as of that session, its latest quotes, its published trading
+//! calendar, and its asset listing's short-sale flags.
 
 pub mod corporate_actions;
 
@@ -25,7 +25,7 @@ const QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes";
 const TRADES_URL: &str = "https://data.alpaca.markets/v2/stocks/trades";
 const LATEST_QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes/latest";
 
-/// Bars per page, the endpoint's maximum.
+/// Rows per page, the endpoint's maximum.
 const PAGE_LIMIT: &str = "10000";
 
 pub struct Alpaca {
@@ -400,36 +400,37 @@ impl Alpaca {
             start.to_rfc3339(),
             (end - TimeDelta::nanoseconds(1)).to_rfc3339(),
         );
+        let (names, start, end) = (&names, &start, &end);
         let mut trades = Vec::new();
-        let mut tokens = PageTokens::default();
-        let mut token: Option<String> = None;
-        loop {
-            let body = with_retries(|| {
-                let mut query = vec![
-                    ("symbols", names.as_str()),
-                    ("start", start.as_str()),
-                    ("end", end.as_str()),
-                    ("feed", "sip"),
-                    ("sort", "asc"),
-                    ("limit", PAGE_LIMIT),
-                ];
-                if let Some(token) = token.as_deref() {
-                    query.push(("page_token", token));
-                }
-                send(
-                    self.credentials
-                        .sign(self.http_client.get(TRADES_URL))
-                        .query(&query),
-                )
-            })
-            .await?;
-            let next = tokens.next(&body)?;
-            trades.extend(requested_trades(&body, symbols)?);
-            match next {
-                Some(next) => token = Some(next),
-                None => return Ok(trades),
-            }
-        }
+        paginate(
+            |page_token| async move {
+                with_retries(|| {
+                    let mut query = vec![
+                        ("symbols", names.as_str()),
+                        ("start", start.as_str()),
+                        ("end", end.as_str()),
+                        ("feed", "sip"),
+                        ("sort", "asc"),
+                        ("limit", PAGE_LIMIT),
+                    ];
+                    if let Some(token) = page_token.as_deref() {
+                        query.push(("page_token", token));
+                    }
+                    send(
+                        self.credentials
+                            .sign(self.http_client.get(TRADES_URL))
+                            .query(&query),
+                    )
+                })
+                .await
+            },
+            |page| {
+                trades.extend(requested_trades(&page, symbols)?);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(trades)
     }
 
     /// Each of `symbols`' latest SIP quote, read through transient failures; a symbol with no quote is absent.
@@ -791,21 +792,24 @@ fn parse_calendar(body: &[u8], range: SessionRange) -> Result<TradingCalendar, F
     TradingCalendar::new(sessions, range).map_err(|refusal| malformed(format!("{refusal:?}")))
 }
 
-/// Follows `next_page_token` until it is null.
-async fn paginate<Fetch, Pending>(mut fetch_page: Fetch) -> Result<Vec<Vec<u8>>, FetchError>
+/// Follows `next_page_token` until it is null, handing each page to `read_page` before fetching the next.
+async fn paginate<Fetch, Pending, Read>(
+    mut fetch_page: Fetch,
+    mut read_page: Read,
+) -> Result<(), FetchError>
 where
     Fetch: FnMut(Option<String>) -> Pending,
     Pending: std::future::Future<Output = Result<Vec<u8>, FetchError>>,
+    Read: FnMut(Vec<u8>) -> Result<(), FetchError>,
 {
     let mut tokens = PageTokens::default();
-    let mut pages = Vec::new();
     let mut token = None;
     loop {
         let body = fetch_page(token).await?;
         let next = tokens.next(&body)?;
-        pages.push(body);
+        read_page(body)?;
         match next {
-            None => return Ok(pages),
+            None => return Ok(()),
             Some(next) => token = Some(next),
         }
     }
@@ -918,16 +922,23 @@ mod tests {
     #[tokio::test]
     async fn test_pages_are_followed_until_the_token_is_null() {
         let requested = std::cell::RefCell::new(Vec::new());
-        let pages = paginate(|token| {
-            requested.borrow_mut().push(token.clone());
-            async move {
-                Ok(match token.as_deref() {
-                    None => page(Some("a")),
-                    Some("a") => page(Some("b")),
-                    _ => page(None),
-                })
-            }
-        })
+        let mut pages = Vec::new();
+        paginate(
+            |token| {
+                requested.borrow_mut().push(token.clone());
+                async move {
+                    Ok(match token.as_deref() {
+                        None => page(Some("a")),
+                        Some("a") => page(Some("b")),
+                        _ => page(None),
+                    })
+                }
+            },
+            |body| {
+                pages.push(body);
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         assert_eq!(pages, [page(Some("a")), page(Some("b")), page(None)]);
@@ -940,23 +951,26 @@ mod tests {
     #[tokio::test]
     async fn test_a_cycling_page_token_is_refused() {
         let calls = std::cell::Cell::new(0);
-        let result = paginate(|token| {
-            calls.set(calls.get() + 1);
-            // A cap, so a broken cycle check fails this test instead of hanging it.
-            let exhausted = calls.get() > 10;
-            async move {
-                if exhausted {
-                    return Err(FetchError::Exhausted {
-                        attempts: 10,
-                        last: "cycle never detected".to_string(),
-                    });
+        let result = paginate(
+            |token| {
+                calls.set(calls.get() + 1);
+                // A cap, so a broken cycle check fails this test instead of hanging it.
+                let exhausted = calls.get() > 10;
+                async move {
+                    if exhausted {
+                        return Err(FetchError::Exhausted {
+                            attempts: 10,
+                            last: "cycle never detected".to_string(),
+                        });
+                    }
+                    Ok(match token.as_deref() {
+                        None | Some("b") => page(Some("a")),
+                        _ => page(Some("b")),
+                    })
                 }
-                Ok(match token.as_deref() {
-                    None | Some("b") => page(Some("a")),
-                    _ => page(Some("b")),
-                })
-            }
-        })
+            },
+            |_| Ok(()),
+        )
         .await;
         assert_eq!(
             result,
@@ -965,6 +979,30 @@ mod tests {
             })
         );
         assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_a_page_that_cannot_be_read_stops_the_fetching() {
+        let calls = std::cell::Cell::new(0);
+        let result = paginate(
+            |_| {
+                calls.set(calls.get() + 1);
+                async { Ok(page(Some("a"))) }
+            },
+            |_| {
+                Err(FetchError::Malformed {
+                    reason: "unreadable".to_string(),
+                })
+            },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(FetchError::Malformed {
+                reason: "unreadable".to_string()
+            })
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     /// Alpaca's calendar over Thanksgiving 2026, whose hours are the exchange's published schedule.

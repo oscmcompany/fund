@@ -36,8 +36,8 @@ use crate::common::time::{SessionDate, SessionRange};
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Leg {
-    /// A snapshot only of the night it runs, since the listing answers for now and a missed night cannot be fetched;
-    /// first, because a run walks the legs in this order until its budget ends and every other leg can be healed later.
+    /// A snapshot only of the night it runs, so a missed night is lost; first, so a run that exhausts its budget still
+    /// takes it.
     AlpacaBorrowFlags,
     /// The session's grouped daily response stored raw, from the endpoint the tick legs take their symbols from.
     MassiveTradedSymbols,
@@ -77,11 +77,10 @@ impl Leg {
         }
     }
 
-    /// The sessions this leg writes. A snapshot of a whole table fetched later cannot stand for an earlier day, so a
-    /// snapshot leg keeps only the window's last session; security details are kept once a quarter, on the session that
-    /// opens the quarter the window ends in, which the vendor answers as of that date however late it is asked, so a
-    /// missed one stays owed for the rest of the quarter; the filed industry codes, whose rows each carry the instant
-    /// the SEC accepted them, are kept on the same session. `calendar` must reach back to that quarter's first day.
+    /// The sessions this leg writes: every window session for a tick leg or the traded symbols, the window's last for
+    /// a snapshot, and the opening session of the last session's quarter for security details and filed industry codes.
+    /// A snapshot of a whole table stands only for the day it was fetched; `calendar` must reach back to that quarter's
+    /// first day.
     pub fn keeps(
         self,
         window: &Window,
@@ -340,8 +339,8 @@ pub fn calendar_range(today: SessionDate, sessions: NonZeroUsize) -> SessionRang
 /// Calendar days past `today` a run fetches, so [`lapsed`] can find the session after the window's last.
 const NEXT_SESSION_REACH_DAYS: i64 = 10;
 
-/// The calendar days a run fetches: `calendar_range` reaching back to its first day's quarter start, which no window
-/// drawn from it can end before, so [`Leg::keeps`] can always find that quarter's opening, and forward past `today`.
+/// The calendar days a run fetches: from the start of the quarter `calendar_range` begins in, so [`Leg::keeps`] can
+/// always find a window's quarter opening, through `NEXT_SESSION_REACH_DAYS` past `today`.
 pub fn fetched_range(today: SessionDate, sessions: NonZeroUsize) -> SessionRange {
     let range = calendar_range(today, sessions);
     SessionRange::single(today.plus_calendar_days(NEXT_SESSION_REACH_DAYS))
@@ -900,11 +899,28 @@ mod tests {
 
     #[test]
     fn test_serde_and_strum_agree_on_every_leg() {
-        for leg in Leg::iter() {
-            let json = serde_json::to_string(&leg).unwrap();
-            assert_eq!(json, format!("\"{leg}\""));
-            assert_eq!(serde_json::from_str::<Leg>(&json).unwrap(), leg);
-        }
+        let names: Vec<String> = Leg::iter()
+            .map(|leg| {
+                let json = serde_json::to_string(&leg).unwrap();
+                assert_eq!(json, format!("\"{leg}\""));
+                assert_eq!(leg.to_string().parse::<Leg>(), Ok(leg));
+                assert_eq!(serde_json::from_str::<Leg>(&json).unwrap(), leg);
+                json
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "\"alpaca_borrow_flags\"",
+                "\"massive_traded_symbols\"",
+                "\"massive_security_details\"",
+                "\"sec_filed_industry_codes\"",
+                "\"massive_splits\"",
+                "\"alpaca_series_boundaries\"",
+                "\"alpaca_quotes\"",
+                "\"alpaca_trades\"",
+            ]
+        );
     }
 
     #[test]

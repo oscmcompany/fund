@@ -15,7 +15,7 @@ use crate::common::time::calendar::TradingCalendar;
 /// Sessions in a trading year, the scale an annualized Sharpe takes.
 pub const SESSIONS_PER_YEAR: f64 = 252.0;
 
-/// The fewest sessions a Sharpe is read over, as settled before any result was known.
+/// The fewest sessions a Sharpe is read over.
 pub const MINIMUM_SESSIONS: usize = 60;
 
 /// How far a result's Sharpe must clear the index's over the same sessions.

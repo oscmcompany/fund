@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::laboratory::haircut::{DegreesOfFreedom, Haircut};
 use crate::common::laboratory::permutation::Generator;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
+use crate::common::monoid::{Monoid, concatenate};
 use crate::common::time::SessionDate;
 
 /// The measured count, mean and summed squared deviations, with the unmeasured counted beside them.
@@ -41,9 +42,15 @@ impl Summary {
             },
         }
     }
+}
+
+impl Monoid for Summary {
+    fn empty() -> Self {
+        Self::EMPTY
+    }
 
     /// Chan's pairwise update: associative up to rounding, and exact against `EMPTY`.
-    pub fn combine(self, other: Self) -> Self {
+    fn combine(self, other: Self) -> Self {
         let undefined = self.undefined + other.undefined;
         match (self.measured, other.measured) {
             (0, _) => Self { undefined, ..other },
@@ -63,22 +70,15 @@ impl Summary {
             }
         }
     }
-
-    pub fn measured(self) -> u64 {
-        self.measured
-    }
-
-    pub fn undefined(self) -> u64 {
-        self.undefined
-    }
 }
 
 pub fn summarize(series: &Series) -> Summary {
-    series
-        .readings()
-        .values()
-        .map(|reading| Summary::of(*reading))
-        .fold(Summary::EMPTY, Summary::combine)
+    concatenate(
+        series
+            .readings()
+            .values()
+            .map(|reading| Summary::of(*reading)),
+    )
 }
 
 /// A mean with its sample, its standard error (zero where the readings never varied) and the freedom it was taken on.
@@ -212,7 +212,7 @@ pub struct Treatment<T>(pub T);
 pub struct Control<T>(pub T);
 
 /// Treatment less control per session, refused where only one arm read a session so nothing is dropped silently.
-pub fn matched(
+fn matched(
     Treatment(treatment): Treatment<&Series>,
     Control(control): Control<&Series>,
 ) -> Result<Series, EstimateRefusal> {

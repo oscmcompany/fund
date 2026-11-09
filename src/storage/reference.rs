@@ -17,8 +17,10 @@ use super::parquet::{ReadRefusal, RowCause};
 use super::provenance::{Provenance, provenance_from};
 use super::{Bucket, BucketError, parquet};
 use crate::common::market::borrow::BorrowFlags;
+#[cfg(test)]
+use crate::common::market::corporate_actions::SplitRatio;
 use crate::common::market::corporate_actions::{
-    ActionId, BoundaryChange, BoundaryKind, SeriesBoundary, Split, SplitRatio,
+    ActionId, BoundaryChange, BoundaryKind, SeriesBoundary, Split,
 };
 use crate::common::market::industry::{AccessionNumber, FiledIndustryCode};
 use crate::common::market::security_details::{
@@ -35,7 +37,7 @@ use chrono::NaiveDate;
 /// The file layout this build writes, read back from the metadata before any row.
 const LAYOUT_VERSION: &str = "1";
 
-/// The conditions layout, which gained each condition's tape letters and retired flag after its first snapshot.
+/// The conditions table's layout, versioned apart from the other tables'.
 const CONDITIONS_LAYOUT_VERSION: &str = "2";
 
 const SHARES_TYPE: DataType = DataType::Decimal128(20, 6);
@@ -303,12 +305,9 @@ pub fn encode_security_details(
     snapshot_provider(key, ReferenceTable::SecurityDetails, provenance)?;
     let mut ordered: Vec<&SecurityDetails> = details.iter().collect();
     ordered.sort_by(|left, right| left.symbol().cmp(right.symbol()));
-    if let Some(pair) = ordered
-        .windows(2)
-        .find(|pair| pair[0].symbol() == pair[1].symbol())
-    {
+    if let Some(symbol) = first_repeated(ordered.iter().map(|row| row.symbol())) {
         return Err(ReferenceRefusal::DuplicateSymbol {
-            symbol: pair[0].symbol().clone(),
+            symbol: symbol.clone(),
         });
     }
     let mut symbols = StringBuilder::new();
@@ -454,14 +453,12 @@ pub fn encode_filed_industry_codes(
             right.accession(),
         ))
     });
-    let mut seen = std::collections::BTreeSet::new();
-    if let Some(repeated) = ordered
-        .iter()
-        .find(|row| !seen.insert((row.filer(), row.accession())))
+    if let Some((filer, accession)) =
+        first_repeated(ordered.iter().map(|row| (row.filer(), row.accession())))
     {
         return Err(ReferenceRefusal::DuplicateAccession {
-            filer: repeated.filer(),
-            accession: repeated.accession().clone(),
+            filer,
+            accession: accession.clone(),
         });
     }
     let mut filers = UInt64Builder::new();
@@ -569,7 +566,7 @@ fn snapshot_provider(
     provenance: &Provenance,
 ) -> Result<Provider, ReferenceRefusal> {
     let provider = table_provider(key, table)?;
-    match provenance.subscription().provider() == provider {
+    match provenance.fetched_from(provider) {
         true => Ok(provider),
         false => Err(ReferenceRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
@@ -578,10 +575,10 @@ fn snapshot_provider(
     }
 }
 
-/// The first identifier listed twice, which a snapshot refuses.
-fn duplicate_action<'a>(ids: impl IntoIterator<Item = &'a ActionId>) -> Option<ActionId> {
-    let mut seen = std::collections::BTreeSet::new();
-    ids.into_iter().find(|id| !seen.insert(*id)).cloned()
+/// The first item that repeats one before it, which a snapshot refuses.
+fn first_repeated<T: Ord + Clone>(items: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut seen = BTreeSet::new();
+    items.into_iter().find(|item| !seen.insert(item.clone()))
 }
 
 fn splits_schema() -> Schema {
@@ -601,7 +598,7 @@ pub fn encode_splits(
     provenance: &Provenance,
 ) -> Result<Vec<u8>, ReferenceRefusal> {
     snapshot_provider(key, ReferenceTable::Splits, provenance)?;
-    if let Some(id) = duplicate_action(splits.iter().map(Split::id)) {
+    if let Some(id) = first_repeated(splits.iter().map(Split::id)).cloned() {
         return Err(ReferenceRefusal::DuplicateAction { id });
     }
     let mut ordered: Vec<&Split> = splits.iter().collect();
@@ -640,6 +637,7 @@ pub fn encode_splits(
 }
 
 /// The snapshot a file written by `encode_splits` under `key` holds, every value rebuilt through its type.
+#[cfg(test)]
 pub fn decode_splits(
     key: &ReferenceKey,
     bytes: Vec<u8>,
@@ -675,7 +673,7 @@ pub fn decode_splits(
             splits.push(read(row).map_err(|cause| ReferenceRefusal::Row { index, cause })?);
         }
     }
-    if let Some(id) = duplicate_action(splits.iter().map(Split::id)) {
+    if let Some(id) = first_repeated(splits.iter().map(Split::id)).cloned() {
         return Err(ReferenceRefusal::DuplicateAction { id });
     }
     Ok((splits, provenance))
@@ -699,7 +697,7 @@ pub fn encode_series_boundaries(
     provenance: &Provenance,
 ) -> Result<Vec<u8>, ReferenceRefusal> {
     snapshot_provider(key, ReferenceTable::SeriesBoundaries, provenance)?;
-    if let Some(id) = duplicate_action(boundaries.iter().map(SeriesBoundary::id)) {
+    if let Some(id) = first_repeated(boundaries.iter().map(SeriesBoundary::id)).cloned() {
         return Err(ReferenceRefusal::DuplicateAction { id });
     }
     let mut ordered: Vec<&SeriesBoundary> = boundaries.iter().collect();
@@ -777,7 +775,7 @@ pub fn decode_series_boundaries(
             boundaries.push(read(row).map_err(|cause| ReferenceRefusal::Row { index, cause })?);
         }
     }
-    if let Some(id) = duplicate_action(boundaries.iter().map(SeriesBoundary::id)) {
+    if let Some(id) = first_repeated(boundaries.iter().map(SeriesBoundary::id)).cloned() {
         return Err(ReferenceRefusal::DuplicateAction { id });
     }
     Ok((boundaries, provenance))
@@ -800,12 +798,9 @@ pub fn encode_borrow_flags(
     snapshot_provider(key, ReferenceTable::BorrowFlags, provenance)?;
     let mut ordered: Vec<&BorrowFlags> = flags.iter().collect();
     ordered.sort_by(|left, right| left.symbol().cmp(right.symbol()));
-    if let Some(pair) = ordered
-        .windows(2)
-        .find(|pair| pair[0].symbol() == pair[1].symbol())
-    {
+    if let Some(symbol) = first_repeated(ordered.iter().map(|row| row.symbol())) {
         return Err(ReferenceRefusal::DuplicateSymbol {
-            symbol: pair[0].symbol().clone(),
+            symbol: symbol.clone(),
         });
     }
     let mut symbols = StringBuilder::new();
@@ -830,6 +825,7 @@ pub fn encode_borrow_flags(
 }
 
 /// The snapshot a file written by `encode_borrow_flags` under `key` holds, every symbol rebuilt through its type.
+#[cfg(test)]
 pub fn decode_borrow_flags(
     key: &ReferenceKey,
     bytes: Vec<u8>,
@@ -1228,6 +1224,47 @@ mod tests {
             let (read, provenance) = decode_security_details(&key, written).unwrap();
             proptest::prop_assert_eq!(read, details);
             proptest::prop_assert_eq!(provenance, snapshot_provenance());
+        }
+
+        /// A snapshot of unique filings reads back exactly, every absent code kept, in filer then acceptance order.
+        #[test]
+        fn property_filed_industry_codes_round_trip(
+            rows in proptest::collection::btree_map(
+                (1_u64..5, "[0-9]{10}-[0-9]{2}-[0-9]{6}"),
+                (proptest::option::of(100_u16..10_000), 0_i64..4_000_000_000_000_000_000),
+                0..20,
+            ),
+        ) {
+            let codes: Vec<FiledIndustryCode> = rows
+                .iter()
+                .map(|((filer, accession), (code, accepted_at))| {
+                    FiledIndustryCode::new(
+                        CentralIndexKey::new(*filer).unwrap(),
+                        AccessionNumber::new(accession).unwrap(),
+                        code.map(|code| IndustryCode::from_code(code).unwrap()),
+                        chrono::DateTime::from_timestamp_nanos(*accepted_at),
+                    )
+                })
+                .collect();
+            let provenance = Provenance::new(
+                Subscription::EdgarPublic,
+                "2026-11-05T14:31:43Z".parse().unwrap(),
+                RunId::new(Uuid::from_u128(4)),
+                None,
+            );
+            let key = ReferenceKey::new(Provider::Sec, ReferenceTable::FiledIndustryCodes, session());
+            let written = encode_filed_industry_codes(&key, &codes, &provenance).unwrap();
+            let (read, read_provenance) = decode_filed_industry_codes(&key, written).unwrap();
+            let mut expected = codes.clone();
+            expected.sort_by(|left, right| {
+                (left.filer(), left.accepted_at(), left.accession()).cmp(&(
+                    right.filer(),
+                    right.accepted_at(),
+                    right.accession(),
+                ))
+            });
+            proptest::prop_assert_eq!(read, expected);
+            proptest::prop_assert_eq!(read_provenance, provenance);
         }
 
         /// A splits snapshot of unique actions reads back exactly, whatever order it was given in.

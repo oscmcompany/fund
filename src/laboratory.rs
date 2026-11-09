@@ -194,10 +194,9 @@ impl Study {
             .append(Utc::now(), Observation::VerdictReached(Box::new(reached)))
     }
 
-    /// Stores each source kept in the journal directory under its digest and the notes of this run and of every ended
-    /// run there under their runs,
-    /// then merges each recent session file there into its researcher object in `profile`, so studies from other
-    /// directories or machines that shipped the same session keep their records.
+    /// Stores each source kept in the journal directory under its digest, and ships the notes of this run and of every
+    /// ended run there under their runs. It then merges each recent session file there into its researcher object in
+    /// `profile`, so studies from other directories or machines that shipped the same session keep their records.
     pub async fn finish(self, profile: &Bucket) -> Vec<(Shipment, Result<(), ShipFailure>)> {
         let mut shipped = Vec::new();
         let sources = self.journal.directory().join(SOURCES);

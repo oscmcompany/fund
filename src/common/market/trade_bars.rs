@@ -364,13 +364,6 @@ impl OpenClose {
         }
     }
 
-    fn combine(self, other: Self) -> Self {
-        Self {
-            open: self.open.min(other.open),
-            close: self.close.max(other.close),
-        }
-    }
-
     /// The opening print's time and price.
     pub fn open(&self) -> StampedPrice {
         self.open
@@ -379,6 +372,15 @@ impl OpenClose {
     /// The closing print's time and price.
     pub fn close(&self) -> StampedPrice {
         self.close
+    }
+}
+
+impl Semigroup for OpenClose {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            open: self.open.min(other.open),
+            close: self.close.max(other.close),
+        }
     }
 }
 
@@ -411,19 +413,21 @@ impl HighLow {
         }
     }
 
-    fn combine(self, other: Self) -> Self {
-        Self {
-            high: self.high.max(other.high),
-            low: self.low.min(other.low),
-        }
-    }
-
     pub fn high(&self) -> Price {
         self.high
     }
 
     pub fn low(&self) -> Price {
         self.low
+    }
+}
+
+impl Semigroup for HighLow {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            high: self.high.max(other.high),
+            low: self.low.min(other.low),
+        }
     }
 }
 
@@ -479,18 +483,9 @@ impl Semigroup for TradeSums {
     fn combine(self, other: Self) -> Self {
         Self {
             totals: self.totals.combine(other.totals),
-            open_close: either(self.open_close, other.open_close, OpenClose::combine),
-            high_low: either(self.high_low, other.high_low, HighLow::combine),
+            open_close: self.open_close.combine(other.open_close),
+            high_low: self.high_low.combine(other.high_low),
         }
-    }
-}
-
-/// Two optional fragments combined, `None` being the identity.
-fn either<T>(left: Option<T>, right: Option<T>, combine: fn(T, T) -> T) -> Option<T> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(combine(left, right)),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
     }
 }
 
@@ -506,7 +501,7 @@ pub struct TradeBar {
 /// Why a trade bar was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TradeBarRefusal {
-    #[error("{timestamp} does not end a {interval} bar")]
+    #[error("{timestamp} is not on the {interval} grid")]
     Misaligned {
         interval: BarInterval,
         timestamp: DateTime<Utc>,
@@ -520,7 +515,7 @@ impl TradeBar {
         timestamp: DateTime<Utc>,
         sums: TradeSums,
     ) -> Result<Self, TradeBarRefusal> {
-        if interval.bucket(timestamp) != timestamp {
+        if !interval.is_on_grid(timestamp) {
             return Err(TradeBarRefusal::Misaligned {
                 interval,
                 timestamp,
@@ -1304,7 +1299,7 @@ mod tests {
             "a price pair is null in low",
             "the open 100.00 at 2026-10-08 14:00:55 UTC orders after the close 101.00 at 2026-10-08 14:00:50 UTC",
             "the high 99.00 is below the low 100.00",
-            "2026-10-08 14:00:30 UTC does not end a one_minute bar",
+            "2026-10-08 14:00:30 UTC is not on the one_minute grid",
         ];
         for (refusal, expected) in refusals.iter().zip(expected) {
             assert!(refusal.starts_with(expected), "{refusal}");
@@ -1443,6 +1438,31 @@ mod tests {
         assert_eq!((counts.folded(), counts.late()), (3, 1));
     }
 
+    fn any_point() -> impl Strategy<Value = StampedPrice> {
+        (0_i64..120, 1_i64..2_000).prop_map(|(second, ticks)| {
+            StampedPrice::new(
+                instant("2026-10-02T13:30:00Z") + TimeDelta::seconds(second),
+                Price::from_ticks(ticks).unwrap(),
+            )
+        })
+    }
+
+    fn any_open_close() -> impl Strategy<Value = Option<OpenClose>> {
+        prop::option::of((any_point(), any_point()).prop_map(|(first, second)| {
+            OpenClose::new(first.min(second), first.max(second)).unwrap()
+        }))
+    }
+
+    fn any_high_low() -> impl Strategy<Value = Option<HighLow>> {
+        prop::option::of((1_i64..2_000, 1_i64..2_000).prop_map(|(first, second)| {
+            HighLow::new(
+                Price::from_ticks(first.max(second)).unwrap(),
+                Price::from_ticks(first.min(second)).unwrap(),
+            )
+            .unwrap()
+        }))
+    }
+
     fn any_rules() -> impl Strategy<Value = UpdateRules> {
         any::<(bool, bool, bool)>().prop_map(|(volume, high_low, open_close)| UpdateRules {
             volume,
@@ -1503,6 +1523,35 @@ mod tests {
             handed_out.sort_by_key(TradeBar::timestamp);
             prop_assert_eq!(counts.late(), 0);
             prop_assert_eq!(handed_out, whole.finish().0);
+        }
+
+        #[test]
+        fn property_open_closes_are_a_commutative_monoid(
+            first in any_open_close(),
+            second in any_open_close(),
+            third in any_open_close(),
+        ) {
+            laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_high_lows_are_a_commutative_monoid(
+            first in any_high_low(),
+            second in any_high_low(),
+            third in any_high_low(),
+        ) {
+            laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_a_built_bar_reads_back_as_itself(minutes in prop::collection::vec(any_rollup(0..300), 1..10)) {
+            let bars = concatenate(minutes).into_bars();
+            prop_assert!(!bars.is_empty());
+            for bar in &bars {
+                let built = BarBuilt::of(bar);
+                let text = serde_json::to_string(&built).unwrap();
+                prop_assert_eq!(serde_json::from_str::<BarBuilt>(&text).unwrap(), built);
+            }
         }
 
         #[test]

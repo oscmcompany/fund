@@ -33,8 +33,7 @@ chrono = { version = "0.4.44", default-features = false, features = [
   "std",
 ] }
 chrono-tz = "0.10"
-# Reads the vendor's raw flat files, which are gzipped CSV.
-csv = "1.4.0"
+# Gzips the raw response pages the archive keeps as served, and reads them back.
 flate2 = "1.1"
 parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",

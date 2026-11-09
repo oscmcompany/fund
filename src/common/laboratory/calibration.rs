@@ -4,7 +4,7 @@
 use crate::common::laboratory::score::{Forecast, Outcome};
 use crate::common::laboratory::share::Share;
 use crate::common::learning::loss::Level;
-use crate::common::monoid::Monoid;
+use crate::common::monoid::{Monoid, concatenate};
 
 /// Width deciles a calibration is read in.
 pub const WIDTH_DECILES: usize = 10;
@@ -137,15 +137,13 @@ pub struct Calibration {
 }
 
 impl Calibration {
+    /// The levels its coverage is read against.
     pub fn levels(&self) -> Levels {
         self.levels
     }
 
     pub fn overall(&self) -> Coverage {
-        self.by_width
-            .iter()
-            .copied()
-            .fold(Coverage::empty(), Coverage::combine)
+        concatenate(self.by_width)
     }
 
     pub fn by_width(&self) -> &[Coverage; WIDTH_DECILES] {
@@ -163,10 +161,11 @@ pub fn calibrate(levels: Levels, bands: &[Band]) -> Calibration {
     let mut start = 0;
     for (decile, coverage) in by_width.iter_mut().enumerate() {
         let end = start + size + usize::from(decile < larger);
-        *coverage = order[start..end]
-            .iter()
-            .map(|index| Coverage::of(bands[*index]))
-            .fold(Coverage::empty(), Coverage::combine);
+        *coverage = concatenate(
+            order[start..end]
+                .iter()
+                .map(|index| Coverage::of(bands[*index])),
+        );
         start = end;
     }
     Calibration { levels, by_width }
@@ -178,6 +177,7 @@ mod tests {
 
     use super::*;
     use crate::common::laboratory::permutation::Generator;
+    use crate::common::monoid::laws;
 
     fn band(lower: f64, upper: f64, outcome: f64) -> Band {
         Band::new(
@@ -316,12 +316,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_coverage_is_a_monoid(first in coverage(), second in coverage(), third in coverage()) {
-            prop_assert_eq!(first.combine(Coverage::empty()), first);
-            prop_assert_eq!(Coverage::empty().combine(first), first);
-            prop_assert_eq!(
-                first.combine(second).combine(third),
-                first.combine(second.combine(third))
-            );
+            laws::check(first, second, third)?;
         }
 
         /// Every band lands in exactly one decile, and the deciles differ in size by at most one, the larger first.

@@ -1,4 +1,4 @@
-//! Sends a request through transient failures with capped exponential backoff.
+//! Sends a request through transient failures with exponential backoff.
 
 use std::future::Future;
 use std::time::Duration;
@@ -207,7 +207,7 @@ mod tests {
                 last: "status 429".to_string()
             })
         );
-        // 250 + 500 + 1000 + 2000 + 4000: the fifth wait is capped at four seconds.
+        // 250 + 500 + 1000 + 2000 + 4000 between six attempts.
         assert_eq!(started.elapsed(), Duration::from_millis(7_750));
     }
 }

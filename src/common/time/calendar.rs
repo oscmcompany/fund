@@ -170,15 +170,6 @@ impl TradingCalendar {
             .filter(|session| session.close() < REGULAR_CLOSE)
     }
 
-    /// The number of published sessions.
-    pub fn len(&self) -> usize {
-        self.sessions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
-
     /// The latest trading day strictly before `date`, or `None` when the range holds none.
     pub fn previous_trading_day(&self, date: SessionDate) -> Option<SessionDate> {
         self.sessions.range(..date).next_back().map(|(day, _)| *day)
@@ -360,8 +351,7 @@ mod tests {
     fn test_empty_calendar_refuses_everything() {
         let empty =
             TradingCalendar::new(vec![], range(date(2026, 11, 28), date(2026, 11, 29))).unwrap();
-        assert!(empty.is_empty());
-        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.trading_days_in_range(empty.range()), []);
         assert!(!empty.is_trading_day(date(2026, 11, 24)));
         assert_eq!(
             empty.phase_at(instant("2026-11-24T16:00:00Z")),
@@ -374,7 +364,7 @@ mod tests {
     #[test]
     fn test_previous_trading_day_skips_holiday_and_weekend() {
         let calendar = calendar();
-        assert_eq!(calendar.len(), 4);
+        assert_eq!(calendar.trading_days_in_range(calendar.range()).len(), 4);
         assert_eq!(
             calendar.previous_trading_day(date(2026, 11, 27)),
             Some(date(2026, 11, 25))
@@ -487,11 +477,36 @@ mod tests {
             })
     }
 
+    fn any_phase() -> impl Strategy<Value = SessionPhase> {
+        prop_oneof![
+            Just(SessionPhase::NoPublishedSession),
+            any::<i64>().prop_map(|nanoseconds| SessionPhase::BeforeOpen {
+                until_open: TimeDelta::nanoseconds(nanoseconds)
+            }),
+            any::<i64>().prop_map(|nanoseconds| SessionPhase::Open {
+                until_close: TimeDelta::nanoseconds(nanoseconds)
+            }),
+            Just(SessionPhase::AfterClose),
+        ]
+    }
+
     proptest! {
+        #[test]
+        fn property_a_phase_reads_back_exactly(phase in any_phase()) {
+            let text = serde_json::to_string(&phase).unwrap();
+            prop_assert_eq!(serde_json::from_str::<SessionPhase>(&text).unwrap(), phase);
+        }
+
         #[test]
         fn property_next_and_previous_are_inverses_on_trading_days(calendar in any_calendar()) {
             let trading_days = calendar.trading_days_in_range(calendar.range());
-            prop_assert_eq!(trading_days.len(), calendar.len());
+            let (first, last) = (calendar.range().first(), calendar.range().last());
+            let walked: Vec<SessionDate> = (0..)
+                .map(|offset| first.plus_calendar_days(offset))
+                .take_while(|day| *day <= last)
+                .filter(|day| calendar.is_trading_day(*day))
+                .collect();
+            prop_assert_eq!(&trading_days, &walked);
             for day in trading_days {
                 if let Some(next) = calendar.next_trading_day(day) {
                     prop_assert_eq!(calendar.previous_trading_day(next), Some(day));

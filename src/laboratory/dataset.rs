@@ -6,7 +6,6 @@ use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{
     Contamination, DatasetLeg, Fingerprint, FingerprintRefusal, PartitionRead, Symbols,
 };
-use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::{BarInterval, Partition};
 use crate::common::market::trade_bars::TradeBar;
 use crate::common::storage::{Key, Provider, TradesKey};
@@ -51,18 +50,6 @@ impl Dataset {
 
     pub fn fingerprint(&self) -> &Fingerprint {
         self.lineage.fingerprint()
-    }
-
-    /// One reading per session holding bars, `read` folding them; a session missing or keeping no symbol stays out.
-    pub fn series(
-        &self,
-        read: impl Fn(&[TradeBar]) -> Option<f64>,
-    ) -> Result<Series, SeriesRefusal> {
-        Series::new(
-            self.bars
-                .iter()
-                .map(|(session, bars)| (*session, read(bars.rows()))),
-        )
     }
 }
 
@@ -243,6 +230,7 @@ pub(crate) mod tests {
     use crate::common::journal::{Observation, ReadLine, read};
     use crate::common::laboratory::estimate::{Estimate, summarize};
     use crate::common::laboratory::experiment::{Label, Outputs, Parameters};
+    use crate::common::laboratory::series::Series;
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::BarInterval;
     use crate::common::market::trade_bars::{HighLow, OpenClose, TradeBar, TradeSums};
@@ -487,24 +475,6 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// The series keeps exactly the sessions read, an unmeasured one as `None`.
-    #[test]
-    fn test_a_series_holds_one_reading_per_session_read() {
-        let dataset = dataset(RunId::new(uuid::Uuid::new_v4()));
-        let series = dataset
-            .series(|bars| (bars.len() != 2).then_some(bars.len() as f64))
-            .unwrap();
-        assert_eq!(
-            series.readings().iter().collect::<Vec<_>>(),
-            [
-                (&session(0), &Some(1.0)),
-                (&session(1), &None),
-                (&session(3), &Some(3.0))
-            ]
-        );
-        assert_eq!(dataset.fingerprint().missing(), [session(2)]);
-    }
-
     /// A study's reads and experiments land in its journal in order, name exactly the data read, and survive the
     /// parquet encoding the profile bucket stores.
     #[test]
@@ -518,7 +488,12 @@ pub(crate) mod tests {
         .unwrap();
         let dataset = dataset(study.run_id());
         study.read(dataset.fingerprint()).unwrap();
-        let series = dataset.series(|bars| Some(bars.len() as f64)).unwrap();
+        let series = Series::new([
+            (session(0), Some(1.0)),
+            (session(1), Some(2.0)),
+            (session(3), Some(3.0)),
+        ])
+        .unwrap();
         let estimate = Estimate::from_summary(summarize(&series)).unwrap();
         for variant in ["all", "none"] {
             study

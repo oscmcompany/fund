@@ -318,7 +318,7 @@ pub enum EncodeRefusal {
         key: Provider,
     },
     Placement(PlacementRefusal),
-    /// A total past what its column's decimal holds.
+    /// A total or instant past what its column holds.
     Unrepresentable {
         symbol: Symbol,
         timestamp: DateTime<Utc>,

@@ -47,7 +47,15 @@ pub enum ReplayStudyError {
 
 /// A setting every replay journals itself, by the name it is journaled under.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum ReplaySetting {
@@ -306,12 +314,11 @@ pub(crate) mod tests {
     use crate::common::journal::{Observation, ReadLine, RunId, read};
     use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::Label;
+    use crate::common::market::Symbol;
     use crate::common::market::record::BarInterval;
-    use crate::common::market::state::MarketState;
-    use crate::common::market::{Shares, Symbol};
     use crate::common::replay::Restraint;
     use crate::common::risk::Limits;
-    use crate::common::strategy::Target;
+    use crate::laboratory::compare::tests::OneShare;
     use crate::laboratory::dataset::tests::{calendar, dataset, minute_dataset};
     use crate::laboratory::source::Source;
 
@@ -376,18 +383,6 @@ pub(crate) mod tests {
                 ("orders_held", 6.0)
             ]
         );
-    }
-
-    /// Wants one share of AAPL, whatever it has seen.
-    struct OneShare;
-
-    impl Strategy for OneShare {
-        fn decide(&self, _: &MarketState, _: &Book) -> Target {
-            Target::new(BTreeMap::from([(
-                Symbol::new("AAPL").unwrap(),
-                Shares::whole(1).unwrap(),
-            )]))
-        }
     }
 
     /// A restrained replay journals its limits and tradability as settings and its restraints as metrics.
@@ -468,7 +463,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_a_replay_setting_reads_back_from_the_name_it_is_journaled_under() {
-        for name in [
+        use strum::IntoEnumIterator;
+        let names = [
             "decision_interval",
             "fill_style",
             "opening_cash_units",
@@ -480,9 +476,13 @@ pub(crate) mod tests {
             "per_name_loss_limit_units",
             "flat_before_close_seconds",
             "tradability",
-        ] {
+            "stale_after_seconds",
+        ];
+        for name in names {
             assert_eq!(name.parse::<ReplaySetting>().unwrap().to_string(), name);
         }
+        let iterated: Vec<&str> = ReplaySetting::iter().map(<&str>::from).collect();
+        assert_eq!(iterated, names);
         assert!("FillStyle".parse::<ReplaySetting>().is_err());
     }
 

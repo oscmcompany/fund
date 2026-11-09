@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ops::Range;
 
-/// An aggregate whose `combine` is associative and for which `empty` changes nothing it is combined with.
+/// An aggregate whose `combine` is associative and for which `empty` changes nothing it is combined with; a
+/// floating-point aggregate is associative only up to rounding.
 pub trait Monoid: Sized {
     fn empty() -> Self;
 
@@ -96,6 +97,21 @@ impl<T> Monoid for Sequence<T> {
     fn combine(mut self, other: Self) -> Self {
         self.0.extend(other.0);
         self
+    }
+}
+
+/// A semigroup with `None` adjoined as its empty value, so a fragment that saw nothing combines away.
+impl<S: Semigroup> Monoid for Option<S> {
+    fn empty() -> Self {
+        None
+    }
+
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Some(left), Some(right)) => Some(left.combine(right)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
     }
 }
 

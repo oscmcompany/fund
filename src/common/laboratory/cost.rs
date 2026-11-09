@@ -1,4 +1,4 @@
-//! What a round trip costs, as a value, so changing the fill assumption re-scores every study that used it.
+//! What a round trip costs under a fill assumption, in basis points of notional.
 
 use std::num::NonZeroU32;
 

@@ -140,6 +140,10 @@ mod tests {
                 serde_json::to_string(&solver).unwrap(),
                 format!("\"{solver}\"")
             );
+            assert_eq!(
+                serde_json::from_str::<Solver>(&format!("\"{solver}\"")).unwrap(),
+                solver
+            );
         }
     }
 }

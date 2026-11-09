@@ -103,6 +103,7 @@ pub struct Unfilled {
     cause: UnfilledCause,
 }
 
+#[cfg(test)]
 impl Unfilled {
     pub fn order(&self) -> &Order {
         &self.order
@@ -1650,6 +1651,52 @@ mod tests {
             let whole = replayer.act(opening.clone(), bars).unwrap();
             prop_assert_eq!(&stretched, &whole);
             prop_assert_eq!(replayer.act(whole.clone(), Vec::<TradeBar>::new()).unwrap(), whole);
+        }
+
+        /// A restrained replay that bars names past a per-name loss gives the same result over a one-minute stream
+        /// replayed in two consecutive stretches as replayed whole.
+        #[test]
+        fn property_a_restrained_replay_in_stretches_equals_replaying_whole(
+            minutes in prop::collection::vec(
+                (90_000_000..110_000_000i64, 90_000_000..110_000_000i64, prop::bool::ANY),
+                1..20,
+            ),
+            split in 0..20i64,
+            per_name_loss in 1..10i128,
+        ) {
+            let replayer = Replayer::controlled(
+                Hold(vec![("AAPL", 1), ("MSFT", 1)]),
+                free(),
+                BarInterval::OneMinute,
+                restraint_losing(
+                    TimeDelta::minutes(15),
+                    BTreeMap::new(),
+                    TimeDelta::minutes(2),
+                    cash(per_name_loss),
+                ),
+            )
+            .unwrap();
+            let first = before_close(120);
+            let bars: Vec<TradeBar> = minutes
+                .iter()
+                .enumerate()
+                .flat_map(|(offset, (open, close, msft))| {
+                    let at = first + TimeDelta::minutes(offset as i64);
+                    let aapl = bar("AAPL", BarInterval::OneMinute, at, *open, *close);
+                    let msft = msft.then(|| bar("MSFT", BarInterval::OneMinute, at, *close, *open));
+                    [Some(aapl), msft].into_iter().flatten()
+                })
+                .collect();
+            let opening = Replay::open(Book::funded(cash(1_000)));
+            let (before, after): (Vec<_>, Vec<_>) = bars
+                .iter()
+                .cloned()
+                .partition(|bar| bar.interval().ends(bar.timestamp()) <= first + TimeDelta::minutes(split));
+            let stretched = replayer
+                .act(replayer.act(opening.clone(), before).unwrap(), after)
+                .unwrap();
+            let whole = replayer.act(opening, bars).unwrap();
+            prop_assert_eq!(&stretched, &whole);
         }
 
         /// The book a replay reaches is its opening combined with each fill, so no cash appears outside a fill.

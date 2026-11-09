@@ -12,8 +12,8 @@ use crate::common::guard::{Shortability, Tradability, TradabilityRead};
 use crate::common::market::DollarVolume;
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol, SymbolRefusal};
 use crate::common::order::{
-    BrokerFailure, ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest,
-    OrderStatus,
+    BrokerFailure, ClientOrderId, LimitPrice, OrderEnding, OrderExecution, OrderReport,
+    OrderRequest, OrderStatus,
 };
 use crate::ingest::FetchError;
 use crate::ingest::alpaca::{Account, Alpaca};
@@ -33,11 +33,9 @@ pub trait Broker {
         id: ClientOrderId,
     ) -> impl Future<Output = Result<BrokerOrder, BrokerError>> + Send;
 
-    /// Asks the broker to cancel `id`; neither answer proves the order has closed.
-    fn cancel(
-        &self,
-        id: &BrokerOrderId,
-    ) -> impl Future<Output = Result<Cancel, BrokerError>> + Send;
+    /// Asks the broker to cancel `id`; a 422, an order past canceling, is `Ok` too, so neither answer proves the order
+    /// has closed.
+    fn cancel(&self, id: &BrokerOrderId) -> impl Future<Output = Result<(), BrokerError>> + Send;
 
     /// What the broker reports of each symbol's trading and short sale, read before orders in them go out.
     fn tradability(
@@ -96,15 +94,6 @@ impl BrokerOrder {
     pub fn report(&self) -> OrderReport {
         self.report
     }
-}
-
-/// What a cancel achieved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cancel {
-    /// Alpaca accepted the request; the order may still fill before it takes effect, so read it back.
-    Requested,
-    /// Alpaca refused it as past canceling: closed, or a cancel already pending, so read it back.
-    NotCancelable,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -323,7 +312,7 @@ struct OrderBody<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pricing {
     Market,
-    Limit(Price),
+    Limit(LimitPrice),
 }
 
 /// The JSON body that sends `request` for the day, priced by `pricing`.
@@ -334,7 +323,7 @@ fn order_body(request: &OrderRequest, pricing: Pricing) -> Vec<u8> {
         Pricing::Limit(limit) => (
             "limit",
             Some(units_to_decimal(
-                u128::from(limit.ticks_unsigned()),
+                u128::from(limit.price().ticks_unsigned()),
                 PRICE_DIGITS,
             )),
         ),
@@ -363,7 +352,7 @@ impl PaperAccount {
     pub async fn submit_limit(
         &self,
         request: &OrderRequest,
-        limit: Price,
+        limit: LimitPrice,
     ) -> Result<BrokerOrder, BrokerError> {
         self.send_order(request, Pricing::Limit(limit)).await
     }
@@ -497,7 +486,7 @@ impl Broker for PaperAccount {
     }
 
     /// Asks Alpaca to cancel `id`; a 422 means the order is past canceling, which is not proof it has closed.
-    async fn cancel(&self, id: &BrokerOrderId) -> Result<Cancel, BrokerError> {
+    async fn cancel(&self, id: &BrokerOrderId) -> Result<(), BrokerError> {
         let path = format!("/v2/orders/{}", id.0);
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
     }
@@ -531,10 +520,9 @@ fn submitted(outcome: Outcome) -> Result<BrokerOrder, BrokerError> {
 }
 
 /// A cancel's answer, a 422 being Alpaca's refusal of an order past canceling.
-fn canceled(outcome: Result<Vec<u8>, FetchError>) -> Result<Cancel, BrokerError> {
+fn canceled(outcome: Result<Vec<u8>, FetchError>) -> Result<(), BrokerError> {
     match outcome {
-        Ok(_) => Ok(Cancel::Requested),
-        Err(FetchError::Refused { status: 422, .. }) => Ok(Cancel::NotCancelable),
+        Ok(_) | Err(FetchError::Refused { status: 422, .. }) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
@@ -809,6 +797,7 @@ mod tests {
         let sides: Vec<&str> = AlpacaFillSide::iter().map(Into::into).collect();
         assert_eq!(sides, ["buy", "sell", "sell_short"]);
         for side in AlpacaFillSide::iter() {
+            assert_eq!(side.to_string().parse::<AlpacaFillSide>(), Ok(side));
             let named = format!("\"{side}\"");
             assert_eq!(
                 serde_json::from_str::<AlpacaFillSide>(&named).unwrap(),
@@ -838,7 +827,9 @@ mod tests {
         assert_eq!(market["side"], "buy");
         assert_eq!(market["time_in_force"], "day");
         assert!(market.get("limit_price").is_none());
-        let limit = read(Pricing::Limit(Price::from_ticks(45_120_000).unwrap()));
+        let limit = read(Pricing::Limit(
+            LimitPrice::try_from(Price::from_ticks(45_120_000).unwrap()).unwrap(),
+        ));
         assert_eq!(limit["type"], "limit");
         assert_eq!(limit["limit_price"], "45.12");
         assert_eq!(limit["symbol"], "ABC");
@@ -1161,8 +1152,8 @@ mod tests {
                 body: String::new(),
             }))
         };
-        assert_eq!(canceled(Ok(Vec::new())).unwrap(), Cancel::Requested);
-        assert_eq!(refused(422).unwrap(), Cancel::NotCancelable);
+        assert!(canceled(Ok(Vec::new())).is_ok());
+        assert!(refused(422).is_ok());
         assert!(matches!(
             refused(404),
             Err(BrokerError::Fetch(FetchError::Refused { status: 404, .. }))
@@ -1232,7 +1223,7 @@ mod tests {
             .unwrap();
         let read = account.order(id).await.unwrap();
         assert_eq!(read.id(), submitted.id());
-        let cancel = account.cancel(read.id()).await.unwrap();
+        account.cancel(read.id()).await.unwrap();
         let mut last = account.order(id).await.unwrap();
         for _ in 0..20 {
             match last.report().status() {
@@ -1249,7 +1240,7 @@ mod tests {
                 state.observe(&order, report)
             })
             .unwrap();
-        println!("cancel {cancel:?}, closed as {state:?}");
+        println!("closed as {state:?}");
         match (state.closed(), state.executed()) {
             (Some(_), None) => {}
             (Some(_), Some(_)) | (None, _) => {

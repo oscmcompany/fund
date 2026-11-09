@@ -1,6 +1,6 @@
 //! The hard pre-trade check between orders and the broker: an order goes out only in a symbol the broker reports
-//! tradable, in whole shares where it trades no fraction, as a short only where it lends whole shares easily, and as a
-//! fractional buy only when it meets the broker's minimum; anything it cannot vouch for is refused with its cause.
+//! tradable, whole where it trades no fraction, short where whole shares lend easily, a fractional buy at the minimum,
+//! adding within the per-name limit, and past zero once its close filled whole; else it is held with its cause.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -659,12 +659,8 @@ mod tests {
         );
     }
 
-    /// An order opening or adding to a holding is held past the per-name limit and passes at it, and an order cutting a
-    /// holding passes whatever it is worth: under a $100 limit at $10, 10 shares bought or shorted pass, 10.000001 are
-    /// held with their $100.00001, an unpriced 11 pass for the broker to judge, and 11 sold from 20 held pass; the limit
-    /// reads the holding after the order, so 2 more on 9 long or 9 short are held where 1 more on 9, or 10 long past 2
-    /// short, pass where 11 long past 2 short is held; past one order's units, a close of u64::MAX millionths passes
-    /// where the open of 11 short beyond it does not.
+    /// An order opening or adding to a holding is held past the per-name limit, read on the holding after it, and
+    /// passes at it or unpriced; an order cutting a holding passes whatever it is worth.
     #[test]
     fn test_an_order_past_the_per_name_limit_is_held_unless_it_cuts() {
         let limit = DollarLimit::new(Cash::from_units(100 * 1_000_000_000_000)).unwrap();

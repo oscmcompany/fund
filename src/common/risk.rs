@@ -1366,4 +1366,17 @@ mod tests {
             prop_assert_eq!(problem.constraints().admits(solved.target(), price), Ok(true));
         }
     }
+
+    proptest! {
+        /// Every limit from one cash unit to the most a limit may be is journaled as its units and reads back as is.
+        #[test]
+        fn property_a_dollar_limit_round_trips_through_its_journaled_text(
+            units in 1..=u128::MAX / 100_000_000,
+        ) {
+            let limit = DollarLimit::new(Cash::from_units(units.cast_signed())).unwrap();
+            let written = serde_json::to_string(&limit).unwrap();
+            prop_assert_eq!(&written, &format!("\"{units}\""));
+            prop_assert_eq!(serde_json::from_str::<DollarLimit>(&written).unwrap(), limit);
+        }
+    }
 }

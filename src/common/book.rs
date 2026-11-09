@@ -335,12 +335,28 @@ impl Monoid for Book {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+    use strum::IntoEnumIterator;
 
     use super::*;
     use crate::common::monoid::{concatenate, laws};
 
     fn symbol(raw: &str) -> Symbol {
         Symbol::new(raw).unwrap()
+    }
+
+    /// Every side's name, pinned as a literal, read back through strum and through serde.
+    #[test]
+    fn test_side_names_round_trip() {
+        assert_eq!(
+            Side::iter().map(<&str>::from).collect::<Vec<_>>(),
+            ["buy", "sell"]
+        );
+        for side in Side::iter() {
+            assert_eq!(side.to_string().parse(), Ok(side));
+            let written = serde_json::to_string(&side).unwrap();
+            assert_eq!(written, format!("\"{side}\""));
+            assert_eq!(serde_json::from_str::<Side>(&written).unwrap(), side);
+        }
     }
 
     fn fill(raw: &str, side: Side, shares: u64, ticks: i64, cost: u128) -> Fill {

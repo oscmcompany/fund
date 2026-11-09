@@ -59,30 +59,37 @@ impl Alpaca {
     pub async fn series_boundaries(&self, range: SessionRange) -> Fetched<SeriesBoundaries> {
         let (start, end) = (range.first().to_string(), range.last().to_string());
         let (start, end) = (&start, &end);
-        let pages = paginate(|page_token| async move {
-            with_retries(|| {
-                let mut query = vec![
-                    ("start", start.as_str()),
-                    ("end", end.as_str()),
-                    ("types", BOUNDARY_TYPES),
-                    ("limit", PAGE_LIMIT),
-                ];
-                if let Some(token) = page_token.as_deref() {
-                    query.push(("page_token", token));
-                }
-                send(
-                    self.credentials
-                        .sign(self.http_client.get(CORPORATE_ACTIONS_URL))
-                        .query(&query),
-                )
-            })
-            .await
-        })
+        let mut pages = Vec::new();
+        let fetched = paginate(
+            |page_token| async move {
+                with_retries(|| {
+                    let mut query = vec![
+                        ("start", start.as_str()),
+                        ("end", end.as_str()),
+                        ("types", BOUNDARY_TYPES),
+                        ("limit", PAGE_LIMIT),
+                    ];
+                    if let Some(token) = page_token.as_deref() {
+                        query.push(("page_token", token));
+                    }
+                    send(
+                        self.credentials
+                            .sign(self.http_client.get(CORPORATE_ACTIONS_URL))
+                            .query(&query),
+                    )
+                })
+                .await
+            },
+            |page| {
+                pages.push(page);
+                Ok(())
+            },
+        )
         .await;
-        let pages = match pages {
-            Ok(pages) => pages,
+        match fetched {
+            Ok(()) => {}
             Err(error) => return Fetched::new(Err(error), Vec::new()),
-        };
+        }
         let read = pages
             .iter()
             .map(|page| parse_boundaries_page(page))

@@ -124,7 +124,8 @@ impl Loss {
         }
     }
 
-    /// The pinball loss has no curvature, so its hessian is one by convention and `renewed` sets its leaves.
+    /// The gradient and hessian of the loss at `score`; the pinball loss has no curvature, so its hessian is one by
+    /// convention and `renewed` sets its leaves.
     pub fn derivatives(self, Score(score): Score, Label(label): Label) -> Derivatives {
         match self {
             Loss::SquaredError => Derivatives {

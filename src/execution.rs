@@ -146,12 +146,10 @@ impl JournalFailure {
     }
 }
 
-/// Sends the orders that take `book` to `target` that the guard passes at `prices`, one at a time, sells
-/// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
-/// overlaps it; each order's id is drawn from `sequence`, so a later call on the same sequence cannot repeat one. An
-/// order opening beyond zero is held as unclosed unless the close to flat before it filled whole.
-/// A non-empty tradability read is journaled once, or its failure with its cause, which vouches for nothing, so every
-/// order is held as unread; each submission carries its symbol's quote from `quotes`, or that it had none.
+/// Sends the orders that take `book` to `target` that the guard passes at `prices`, sells first, journaling the
+/// held-back ones first and stopping after an unresolved order so none overlaps it. Ids are drawn from `sequence`, and
+/// an open beyond zero is held unless the close before it filled whole. A failed tradability read is journaled and
+/// holds every order as unread; each submission carries its symbol's quote from `quotes`, or that it had none.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one independent input an execution runs from"
@@ -256,11 +254,10 @@ pub enum Reconciliation {
     },
 }
 
-/// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge tries
-/// to close every position the journal did not expect on the side the broker reports, and every one a `Holding` refuses,
-/// such as a fractional short, keeping the rest at the broker's count; the book returned is the broker's after those
-/// attempts. A close can be held, refused, partial or unresolved, so the caller checks `closing` before trading from
-/// that book, and refuses further trading on any divergence.
+/// Reads the broker's book against `expected`, journals the reading, and on divergence tries to close every position
+/// the journal did not expect on the broker's side, or that a `Holding` refuses, keeping the rest at the broker's
+/// count.
+/// The book returned is the broker's after those closes, any of which may be held, refused, partial or unresolved.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one independent input an execution runs from"
@@ -423,7 +420,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::broker::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
+    use crate::broker::{BrokerOrder, BrokerOrderId, PaperAccount};
     use crate::common::book::{Cash, Position, Side};
     use crate::common::guard::{OrderGuarded, Shortability, Tradability};
     use crate::common::journal::{ReadLine, Record, RunId, read};
@@ -531,7 +528,7 @@ mod tests {
             Self::answer(answer)
         }
 
-        async fn cancel(&self, _: &BrokerOrderId) -> Result<Cancel, BrokerError> {
+        async fn cancel(&self, _: &BrokerOrderId) -> Result<(), BrokerError> {
             self.calls.lock().unwrap().push("cancel");
             self.cancels.lock().unwrap().push(Instant::now());
             match self.cancel_fails {
@@ -539,7 +536,7 @@ mod tests {
                     attempts: 3,
                     last: "status 503".to_string(),
                 })),
-                false => Ok(Cancel::Requested),
+                false => Ok(()),
             }
         }
 
@@ -1078,7 +1075,10 @@ mod tests {
         assert_eq!(outcomes[0], OrderOutcome::Guarded(GuardCause::Untradable));
         assert_eq!(shares_filled(&outcomes[1]), Some(1));
         assert_eq!(broker.calls(), ["submit"]);
-        assert_eq!(sequence.draw(journal.run_id()).sequence(), 1);
+        assert_eq!(
+            sequence.draw(journal.run_id()),
+            ClientOrderId::new(journal.run_id(), 1)
+        );
         assert_eq!(
             journaled(&directory),
             [
@@ -1354,27 +1354,28 @@ mod tests {
         assert!(broker.calls().is_empty());
     }
 
-    /// While the market is closed, an order to buy one SPY share stays open past its patience, is canceled, and closes
-    /// unfilled: the journal holds its submission and its close, and the paper account's book is unchanged.
+    /// While the market is closed and SPY flat, an order to buy one SPY share stays open past its patience, is
+    /// canceled, and closes unfilled: the journal holds its submission and its close, and the paper account's book is
+    /// unchanged.
     #[tokio::test]
     #[ignore = "trades on the Alpaca paper account; run deliberately under a development secretspec profile"]
     async fn live_an_order_open_past_its_patience_is_canceled_and_journaled() {
         let account =
             PaperAccount::new(Alpaca::from_environment(reqwest::Client::new()).unwrap()).unwrap();
         let before = account.book().await.unwrap();
+        let spy = Symbol::new("SPY").unwrap();
+        assert_eq!(
+            before.position(&spy),
+            Position::default(),
+            "run with SPY flat"
+        );
         // Every other holding is kept, so the run sends only the one SPY buy.
-        let mut holdings: BTreeMap<Symbol, Shares> = before
+        let mut holdings: BTreeMap<Symbol, Holding> = before
             .positions()
             .iter()
-            .map(|(symbol, position)| {
-                let units =
-                    u64::try_from(position.units()).expect("the paper account holds no short");
-                (symbol.clone(), Shares::from_units(units))
-            })
+            .map(|(symbol, position)| (symbol.clone(), Holding::try_from(*position).unwrap()))
             .collect();
-        let spy = Symbol::new("SPY").unwrap();
-        let held = holdings.get(&spy).copied().unwrap_or_default();
-        holdings.insert(spy, held.plus(Shares::whole(1).unwrap()));
+        holdings.insert(spy, Holding::from(Shares::whole(1).unwrap()));
         let target = Target::new(holdings);
         let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
         let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
@@ -1393,7 +1394,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(sequence.draw(journal.run_id()).sequence(), 1);
+        assert_eq!(
+            sequence.draw(journal.run_id()),
+            ClientOrderId::new(journal.run_id(), 1)
+        );
         assert_eq!(
             outcomes,
             [OrderOutcome::Closed(None)],
@@ -1580,7 +1584,7 @@ mod tests {
             unreachable!("an order filled on submit is never read back")
         }
 
-        async fn cancel(&self, _: &BrokerOrderId) -> Result<Cancel, BrokerError> {
+        async fn cancel(&self, _: &BrokerOrderId) -> Result<(), BrokerError> {
             unreachable!("an order filled on submit is never canceled")
         }
 

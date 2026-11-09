@@ -83,6 +83,11 @@ impl Provenance {
         self.subscription
     }
 
+    /// Whether the subscription that fetched this belongs to `provider`.
+    pub fn fetched_from(&self, provider: Provider) -> bool {
+        self.subscription.provider() == provider
+    }
+
     pub fn fetched_at(&self) -> DateTime<Utc> {
         self.fetched_at
     }

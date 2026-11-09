@@ -221,11 +221,9 @@ fn test_a_researcher_command_is_refused_before_any_aws_call() {
     std::fs::remove_dir_all(&directory).unwrap();
 }
 
-/// A temporary home for `researcher`, where `ssh` runs the command it is handed with the upload on its input, so a
-/// push really unpacks into `working-tree`, and `devenv`, `secretspec`, `cargo`, `sudo` and `flock` are stubs; `cargo`
-/// and a failing `sudo` write their arguments to `cargo` and `sudoed`, `flock -n <fd>` takes a real lock through Perl
-/// since macOS has no `flock`, and `ssh` rewrites the tree's `.upload` before any command but a push while the file
-/// `replace` exists.
+/// A temporary home for `researcher`, where `ssh` runs its command with the upload on its input, so a push really
+/// unpacks into `working-tree`; `devenv`, `secretspec`, `cargo`, `sudo` and `flock` are stubs, and `cargo` and a
+/// failing `sudo` record their arguments, and `ssh` rewrites `.upload` before any but a push while `replace` exists.
 fn researcher_home() -> PathBuf {
     let directory = std::env::temp_dir().join(format!("researcher-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();

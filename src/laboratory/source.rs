@@ -35,7 +35,8 @@ impl Source {
     }
 }
 
-/// The digest of an encoded source, so stored bytes are keyed by what they hold rather than by what names them.
+/// The SHA-256 of `encoded` in lowercase hexadecimal, so stored bytes are keyed by what they hold rather than by what
+/// names them.
 pub fn digest_of(encoded: &[u8]) -> SourceDigest {
     let hash = Sha256::digest(encoded);
     let hexadecimal: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
