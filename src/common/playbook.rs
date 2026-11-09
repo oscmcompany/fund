@@ -45,30 +45,6 @@ pub struct Entry {
     runs: Vec<RunId>,
 }
 
-impl Entry {
-    pub fn from(&self) -> NaiveTime {
-        self.from
-    }
-
-    pub fn until(&self) -> NaiveTime {
-        self.until
-    }
-
-    pub fn choice(&self) -> Choice {
-        self.choice
-    }
-
-    /// Why the entry trades what it does.
-    pub fn note(&self) -> &str {
-        &self.note
-    }
-
-    /// The experiments the note cites, if any.
-    pub fn runs(&self) -> &[RunId] {
-        &self.runs
-    }
-}
-
 /// Entries covering the regular session from the open to the 16:00 close exactly once, in order, and how long a
 /// switch between two of them takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,15 +160,6 @@ impl Playbook {
             }
             (false, std::cmp::Ordering::Equal) => Ok(Self { roll_off, entries }),
         }
-    }
-
-    pub fn roll_off(&self) -> TimeDelta {
-        self.roll_off
-    }
-
-    /// In session order.
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
     }
 
     /// The strategy that trades this playbook over `universe`.
@@ -343,10 +310,6 @@ impl PlaybookRead {
     pub fn new(contents: String) -> Self {
         Self { contents }
     }
-
-    pub fn contents(&self) -> &str {
-        &self.contents
-    }
 }
 
 /// A playbook an operator uploaded, journaled whole beside the version it replaced, `None` when none was held.
@@ -359,14 +322,6 @@ pub struct PlaybookUploaded {
 impl PlaybookUploaded {
     pub fn new(contents: String, replaced: Option<EntityTag>) -> Self {
         Self { contents, replaced }
-    }
-
-    pub fn contents(&self) -> &str {
-        &self.contents
-    }
-
-    pub fn replaced(&self) -> Option<&EntityTag> {
-        self.replaced.as_ref()
     }
 }
 
@@ -436,46 +391,30 @@ note = "Hold nothing in the afternoon"
 
     #[test]
     fn test_a_playbook_reads_its_entries_in_session_order() {
-        let playbook = Playbook::parse(TWO_ENTRIES).unwrap();
-        assert_eq!(playbook.roll_off(), TimeDelta::minutes(10));
-        let entries: Vec<_> = playbook
-            .entries()
-            .iter()
-            .map(|entry| {
-                (
-                    entry.from(),
-                    entry.until(),
-                    entry.choice(),
-                    entry.note(),
-                    entry
-                        .runs()
-                        .iter()
-                        .map(RunId::to_string)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
         assert_eq!(
-            entries,
-            [
-                (
-                    time(9, 30),
-                    time(12, 0),
-                    Choice::Noise {
-                        shares: Shares::whole(2).unwrap(),
-                        seed: 7
+            Playbook::parse(TWO_ENTRIES).unwrap(),
+            Playbook {
+                roll_off: TimeDelta::minutes(10),
+                entries: vec![
+                    Entry {
+                        from: time(9, 30),
+                        until: time(12, 0),
+                        choice: Choice::Noise {
+                            shares: Shares::whole(2).unwrap(),
+                            seed: 7
+                        },
+                        note: "Exercise the session on paper".to_string(),
+                        runs: vec![RunId::new(uuid::Uuid::from_u128(1))],
                     },
-                    "Exercise the session on paper",
-                    vec!["00000000-0000-0000-0000-000000000001".to_string()]
-                ),
-                (
-                    time(12, 0),
-                    time(16, 0),
-                    Choice::Flat,
-                    "Hold nothing in the afternoon",
-                    vec![]
-                ),
-            ]
+                    Entry {
+                        from: time(12, 0),
+                        until: time(16, 0),
+                        choice: Choice::Flat,
+                        note: "Hold nothing in the afternoon".to_string(),
+                        runs: vec![],
+                    },
+                ],
+            }
         );
         let reversed = written(&[
             ("12:00", "16:00", r#"{ kind = "flat" }"#),
@@ -483,9 +422,9 @@ note = "Hold nothing in the afternoon"
         ]);
         let froms: Vec<_> = Playbook::parse(&reversed)
             .unwrap()
-            .entries()
+            .entries
             .iter()
-            .map(Entry::from)
+            .map(|entry| entry.from)
             .collect();
         assert_eq!(froms, [time(9, 30), time(12, 0)]);
     }
@@ -766,7 +705,7 @@ note = "Exercise the afternoon on paper"
                 .collect();
             let playbook = Playbook::parse(&written(&entries)).unwrap();
             let read: Vec<(NaiveTime, NaiveTime)> =
-                playbook.entries().iter().map(|entry| (entry.from(), entry.until())).collect();
+                playbook.entries.iter().map(|entry| (entry.from, entry.until)).collect();
             let expected: Vec<(NaiveTime, NaiveTime)> = bounds.windows(2).map(|pair| (pair[0], pair[1])).collect();
             prop_assert_eq!(read, expected);
         }

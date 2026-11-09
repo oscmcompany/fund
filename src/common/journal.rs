@@ -30,7 +30,7 @@ use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 
 /// Stamped on every record this build writes.
-pub const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 1;
 
 /// One process's run, within which `sequence` orders records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -314,14 +314,6 @@ impl PartitionWritten {
         }
     }
 
-    pub fn leg(&self) -> Leg {
-        self.leg
-    }
-
-    pub fn session(&self) -> SessionDate {
-        self.session
-    }
-
     pub fn rows(&self) -> u64 {
         self.rows
     }
@@ -332,10 +324,6 @@ impl PartitionWritten {
 
     pub fn unanswered(&self) -> &BTreeMap<Symbol, Unanswered> {
         &self.unanswered
-    }
-
-    pub fn folded(&self) -> &BTreeMap<FoldCount, u64> {
-        &self.folded
     }
 }
 

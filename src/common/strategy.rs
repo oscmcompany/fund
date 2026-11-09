@@ -71,12 +71,6 @@ pub enum Holding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WholeShares(Shares);
 
-impl WholeShares {
-    pub fn shares(self) -> Shares {
-        self.0
-    }
-}
-
 /// Why a signed count cannot be a holding, naming the count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HoldingRefusal {
@@ -515,6 +509,17 @@ mod tests {
             Err(ProgressRefusal { parts: 1_000_001 })
         );
         assert!(serde_json::from_str::<Progress>("1000001").is_err());
+    }
+
+    proptest! {
+        /// Every progress from none to whole is journaled as its parts and reads back as itself.
+        #[test]
+        fn property_progress_round_trips_through_its_journaled_parts(parts in 0..=1_000_000u32) {
+            let progress = Progress::new(parts).unwrap();
+            let written = serde_json::to_string(&progress).unwrap();
+            prop_assert_eq!(&written, &parts.to_string());
+            prop_assert_eq!(serde_json::from_str::<Progress>(&written).unwrap(), progress);
+        }
     }
 
     /// A quarter of the way from 4 SPY to 0 SPY and 8 AAPL holds 3 SPY and 2 AAPL.

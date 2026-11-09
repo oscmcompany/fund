@@ -15,7 +15,7 @@ use fund::heal;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::massive::Massive;
 use fund::ingest::sec::Sec;
-use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
+use fund::records::{RefusedToStart, resolved, ship_logged, start};
 use fund::storage::Bucket;
 
 const SERVICE: &str = "archive_nightly";
@@ -62,7 +62,6 @@ async fn main() -> ExitCode {
         let (mut journal, _lock) = match started.open(
             parameters.journal_directory(),
             configuration,
-            Exclusion::Exclusive,
         ) {
             Ok(opened) => opened,
             Err(refused) => return refused.into(),

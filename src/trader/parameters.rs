@@ -459,24 +459,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_each_default_count_reads_back_from_its_text() {
-        assert_eq!(
-            DEFAULT_STALE_AFTER.to_string().parse(),
-            Ok(DEFAULT_STALE_AFTER)
-        );
-        assert_eq!(
-            DEFAULT_MINUTE_WAIT.to_string().parse(),
-            Ok(DEFAULT_MINUTE_WAIT)
-        );
-        assert_eq!(
-            DEFAULT_ORDER_POLL.to_string().parse(),
-            Ok(DEFAULT_ORDER_POLL)
-        );
-        assert_eq!(
-            DEFAULT_ORDER_OPEN.to_string().parse(),
-            Ok(DEFAULT_ORDER_OPEN)
-        );
+    /// A count read from its text writes that text back, and the text it writes reads back as the same count.
+    fn round_trips<Count>(raw: u16) -> Result<(), TestCaseError>
+    where
+        Count: FromStr<Err = CountRefusal> + Display + PartialEq + std::fmt::Debug,
+    {
+        let text = raw.to_string();
+        let read: Count = text.parse().unwrap();
+        prop_assert_eq!(read.to_string(), text);
+        prop_assert_eq!(read.to_string().parse::<Count>(), Ok(read));
+        Ok(())
+    }
+
+    proptest! {
+        /// Every count in its valid range round trips through the text the journal records for it.
+        #[test]
+        fn property_each_count_round_trips_through_its_text(
+            flat in 0..=390u16,
+            stale in 0..=3_600u16,
+            wait in any::<u16>(),
+            poll in 1..=60_000u16,
+            open in 1..=3_600u16,
+        ) {
+            round_trips::<FlatBeforeClose>(flat)?;
+            round_trips::<StaleAfter>(stale)?;
+            round_trips::<MinuteWaitSeconds>(wait)?;
+            round_trips::<OrderPoll>(poll)?;
+            round_trips::<OrderOpen>(open)?;
+        }
     }
 
     #[test]

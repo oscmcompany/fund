@@ -25,7 +25,7 @@ use fund::common::time::{SessionDate, SessionRange};
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::{FetchError, VariableRefusal};
 use fund::journal::Journal;
-use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
+use fund::records::{RefusedToStart, resolved, ship_logged, start};
 use fund::storage::reference::{SnapshotError, latest_conditions};
 use fund::storage::{Bucket, BucketError, parquet, trade_bars};
 use fund::trader::parameters::Parameters;
@@ -51,11 +51,8 @@ async fn main() -> ExitCode {
             Err(refused) => return refused.into(),
         };
         // Held until the process exits, so two traders never send orders against one account.
-        let (mut journal, _lock) = match started.open(
-            parameters.journal_directory(),
-            configuration,
-            Exclusion::Exclusive,
-        ) {
+        let (mut journal, _lock) = match started.open(parameters.journal_directory(), configuration)
+        {
             Ok(opened) => opened,
             Err(refused) => return refused.into(),
         };
@@ -480,6 +477,11 @@ mod tests {
             StartRefusal::AfterClose { close },
             StartRefusal::Conditions(SnapshotError::Absent),
             StartRefusal::Book(BrokerError::NotPaper),
+            StartRefusal::Fills(BrokerError::NotPaper),
+            StartRefusal::FillsMoved {
+                before: 3,
+                after: 4,
+            },
             StartRefusal::PreviousSession(PreviousRefusal::NotArchived {
                 key: previous_key(),
             }),
@@ -503,6 +505,8 @@ mod tests {
                 "the session closed at 2026-10-08 20:00:00 UTC",
                 "the conditions were not read: no conditions table in the archive",
                 "the book was not read: the Alpaca keys trade live, not on paper",
+                "the session's fills were not read: the Alpaca keys trade live, not on paper",
+                "the session's fills moved from 3 to 4 while the book was read",
                 &format!("{PREVIOUS_PATH} is not archived"),
                 "the opening was not valued: the book holds AAPL with no price",
                 "the journal refused a write: disk full",

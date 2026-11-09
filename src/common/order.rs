@@ -12,7 +12,7 @@ use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal};
 use crate::common::strategy::Order;
 
 /// Alpaca's limit, measured against the paper account on 2026-09-25: 128 characters accepted, 129 refused.
-pub const CLIENT_ORDER_ID_MAXIMUM_LENGTH: usize = 128;
+const CLIENT_ORDER_ID_MAXIMUM_LENGTH: usize = 128;
 
 const CLIENT_ORDER_ID_PREFIX: &str = "fund";
 
@@ -34,14 +34,6 @@ const _: () = assert!(
 impl ClientOrderId {
     pub fn new(run: RunId, sequence: u32) -> Self {
         Self { run, sequence }
-    }
-
-    pub fn run(self) -> RunId {
-        self.run
-    }
-
-    pub fn sequence(self) -> u32 {
-        self.sequence
     }
 }
 
@@ -203,10 +195,6 @@ impl OrderExecution {
 
     pub fn shares(self) -> Shares {
         self.shares
-    }
-
-    pub fn average_price(self) -> Price {
-        self.average_price
     }
 }
 
@@ -554,7 +542,7 @@ pub enum BrokerFailure {
     },
 }
 
-/// An order as sent: what to trade and the identifier it goes under, filled at market for the day.
+/// An order as sent: what to trade and the identifier it goes under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRequest {
     order: Order,
@@ -745,9 +733,15 @@ mod tests {
     fn test_a_sequence_draws_each_place_once_under_its_run() {
         let run = RunId::new(Uuid::from_u128(3));
         let mut sequence = OrderSequence::default();
-        let drawn: Vec<u32> = (0..3).map(|_| sequence.draw(run).sequence()).collect();
-        assert_eq!(drawn, [0, 1, 2]);
-        assert_eq!(sequence.draw(run).run(), run);
+        let drawn: Vec<ClientOrderId> = (0..3).map(|_| sequence.draw(run)).collect();
+        assert_eq!(
+            drawn,
+            [
+                ClientOrderId::new(run, 0),
+                ClientOrderId::new(run, 1),
+                ClientOrderId::new(run, 2),
+            ]
+        );
     }
 
     /// A submission journaled before the decision's quote was reads it back as unmeasured.
@@ -828,7 +822,6 @@ mod tests {
             "fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42"
         );
         assert_eq!(id.to_string().parse::<ClientOrderId>(), Ok(id));
-        assert_eq!((id.run(), id.sequence()), (run, 42));
         let shape = |raw: &str| ClientOrderIdRefusal::Shape {
             raw: raw.to_string(),
         };

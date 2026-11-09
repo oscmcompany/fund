@@ -244,9 +244,8 @@ fn journal_refused(error: &std::io::Error) -> HaltCause {
     }
 }
 
-/// Where a session stands as a run starts: the book it opened with, from the book the broker holds now less every fill
-/// it reports since the open, that book's worth at `close`, and each name's session so far, so a second run of one
-/// session measures every loss from the open rather than from its own start; refused for a position with no close.
+/// Where a session stands as a run starts: the book it opened with (the broker's book `now` less every fill since the
+/// open), that book's worth at `close`, and each name's gain since the open. Refused for a position with no close.
 pub fn resumed(
     now: &Book,
     fills: &[Fill],
@@ -265,8 +264,8 @@ pub fn resumed(
 
 impl<S: Strategy> Session<S> {
     /// A session for `session`'s tape of `symbols` building from `open`, from a state warmed on earlier sessions and
-    /// the book the broker reported at the open, worth `opening` and split by name into `losses`. A session the
-    /// calendar does not publish has its close at `open`, so it builds nothing.
+    /// `book`, the broker's book as the run starts. `opening` and `losses` are the open's worth and each name's gain
+    /// since the open, as `resumed` reads them; a session the calendar does not publish has its close at `open`.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is one independent input a session starts from"
@@ -306,10 +305,6 @@ impl<S: Strategy> Session<S> {
             sequence: OrderSequence::default(),
             standing: Standing::Trading,
         }
-    }
-
-    pub fn book(&self) -> &Book {
-        &self.book
     }
 
     pub fn standing(&self) -> &Standing {
@@ -679,7 +674,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
+    use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId};
     use crate::common::book::Position;
     use crate::common::guard::{Shortability, Tradability, TradabilityRead};
     use crate::common::journal::{ReadLine, Record, RunId, read};
@@ -788,8 +783,8 @@ mod tests {
                 .expect("an order was submitted"))
         }
 
-        async fn cancel(&self, _: &BrokerOrderId) -> Result<Cancel, BrokerError> {
-            Ok(Cancel::Requested)
+        async fn cancel(&self, _: &BrokerOrderId) -> Result<(), BrokerError> {
+            Ok(())
         }
 
         async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
@@ -1072,9 +1067,9 @@ mod tests {
                 "book_reconciled"
             ]
         );
-        assert_eq!(session.book().position(&spy()).units(), 1_000_000);
+        assert_eq!(session.book.position(&spy()).units(), 1_000_000);
         assert_eq!(
-            session.book().cash(),
+            session.book.cash(),
             Cash::from_units(10_000 * DOLLAR - 701 * DOLLAR)
         );
         assert_eq!(session.standing(), &Standing::Trading);
@@ -1211,7 +1206,7 @@ mod tests {
             decided["solution"]["cuts"],
             serde_json::json!([{"unpriced": {"symbol": "SPY", "wanted": 1_000_000}}])
         );
-        assert_eq!(session.book(), &funded);
+        assert_eq!(&session.book, &funded);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1277,7 +1272,7 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(session.book(), &funded);
+        assert_eq!(&session.book, &funded);
         assert_eq!(session.standing(), &Standing::Trading);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -1363,7 +1358,7 @@ mod tests {
             }}])
         );
         assert_eq!(submitted(&directory), 2);
-        assert_eq!(second.book(), &now);
+        assert_eq!(&second.book, &now);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1390,7 +1385,7 @@ mod tests {
             payloads(&directory)[1]["refused"],
             serde_json::json!({"unpriced": {"symbol": "SPY"}})
         );
-        assert_eq!(session.book(), &holding);
+        assert_eq!(&session.book, &holding);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1425,7 +1420,7 @@ mod tests {
         assert_eq!(count(&directory, "target_decided"), 1);
         assert_eq!(count(&directory, "session_halted"), 1);
         assert_eq!(
-            session.book().cash(),
+            session.book.cash(),
             Cash::from_units(9_000 * DOLLAR - 701 * DOLLAR)
         );
         std::fs::remove_dir_all(&directory).unwrap();
@@ -1444,7 +1439,7 @@ mod tests {
             .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(session.book().position(&spy()).units(), 1_000_000);
+        assert_eq!(session.book.position(&spy()).units(), 1_000_000);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1608,7 +1603,7 @@ mod tests {
             Standing::Halted(HaltCause::JournalRefused { .. })
         ));
         assert_eq!(session.next_decision, at("14:10:00"));
-        assert_eq!(session.book().position(&spy()).units(), 0);
+        assert_eq!(session.book.position(&spy()).units(), 0);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1744,7 +1739,7 @@ mod tests {
                 "book_reconciled"
             ]
         );
-        assert_eq!(session.book(), &funded);
+        assert_eq!(&session.book, &funded);
         assert_eq!(session.standing(), &Standing::Trading);
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -1935,7 +1930,7 @@ mod tests {
             journaled(&directory)[..3],
             ["bar_built", "bar_built", "target_decided"]
         );
-        assert_eq!(session.book().position(&spy()).units(), 1_000_000);
+        assert_eq!(session.book.position(&spy()).units(), 1_000_000);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

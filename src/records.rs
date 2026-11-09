@@ -35,13 +35,6 @@ impl From<RefusedToStart> for ExitCode {
     }
 }
 
-/// Whether a run takes its service's lock, so no two runs of it act at once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Exclusion {
-    Exclusive,
-    Concurrent,
-}
-
 /// A run whose subscriber is installed: its service, id and span, and why its log file did not open, if it did not.
 pub struct Started {
     service: Service,
@@ -114,14 +107,13 @@ impl Started {
         self.span.clone()
     }
 
-    /// Opens the run's journal in `journal_directory`, takes the service's lock when `exclusion` asks, and journals
-    /// `configuration` first; the lock, when taken, is held while the returned file lives.
+    /// Opens the run's journal in `journal_directory`, takes the service's lock, and journals `configuration` first;
+    /// the lock is held while the returned file lives.
     pub fn open(
         self,
         journal_directory: &Path,
         configuration: ConfigurationResolved,
-        exclusion: Exclusion,
-    ) -> Result<(Journal, Option<File>), RefusedToStart> {
+    ) -> Result<(Journal, File), RefusedToStart> {
         if let Some(error) = self.log_file_error {
             tracing::error!(%error, "Log file did not open");
             return Err(RefusedToStart);
@@ -130,13 +122,10 @@ impl Started {
             tracing::error!(%error, "Journal did not open");
             RefusedToStart
         })?;
-        let held = match exclusion {
-            Exclusion::Exclusive => Some(lock(journal_directory, &self.service).map_err(|refusal| {
-                tracing::error!(%refusal, "Another run is under way or the lock is unavailable");
-                RefusedToStart
-            })?),
-            Exclusion::Concurrent => None,
-        };
+        let held = lock(journal_directory, &self.service).map_err(|refusal| {
+            tracing::error!(%refusal, "Another run is under way or the lock is unavailable");
+            RefusedToStart
+        })?;
         journal
             .append(
                 Utc::now(),
@@ -240,7 +229,7 @@ pub(crate) fn contents(path: &Path) -> Option<Result<String, ShipFailure>> {
 }
 
 /// Ships every recent file, returning each key with whether it landed.
-pub async fn ship(
+async fn ship(
     profile: &Bucket,
     host: Host,
     service: &Service,
@@ -357,33 +346,21 @@ mod tests {
             .collect()
     }
 
-    /// An exclusive run refuses while another holds the lock and journals nothing; a concurrent one opens beside it.
+    /// A run refuses while another holds the lock, and so does a run whose log file did not open; neither journals.
     #[test]
     fn test_a_run_journals_its_configuration_only_once_it_may_start() {
         let directory = std::env::temp_dir().join(format!("fund-records-{}", Uuid::new_v4()));
         let configuration = || ConfigurationResolved::new(std::collections::BTreeMap::new());
-        let opened = started(None).open(&directory, configuration(), Exclusion::Exclusive);
-        let (_journal, held) = opened.unwrap();
-        assert!(held.is_some());
+        let (_journal, _held) = started(None).open(&directory, configuration()).unwrap();
         assert_eq!(event_types(&directory), ["configuration_resolved"]);
-        let refused = started(None).open(&directory, configuration(), Exclusion::Exclusive);
+        let refused = started(None).open(&directory, configuration());
         assert_eq!(refused.err(), Some(RefusedToStart));
-        let (_journal, unlocked) = started(None)
-            .open(&directory, configuration(), Exclusion::Concurrent)
-            .unwrap();
-        assert!(unlocked.is_none());
-        assert_eq!(
-            event_types(&directory),
-            ["configuration_resolved", "configuration_resolved"]
-        );
         let unlogged = started(Some(std::io::Error::other("read-only")));
         assert_eq!(
-            unlogged
-                .open(&directory, configuration(), Exclusion::Concurrent)
-                .err(),
+            unlogged.open(&directory, configuration()).err(),
             Some(RefusedToStart)
         );
-        assert_eq!(event_types(&directory).len(), 2);
+        assert_eq!(event_types(&directory), ["configuration_resolved"]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

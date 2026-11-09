@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::env::VarError;
 use std::path::{Path, PathBuf};
 
-use crate::common::journal::{ConfigurationResolved, ResolvedParameter};
+use crate::common::journal::ResolvedParameter;
 use crate::common::parameter::{Parameter, ParameterRefusal, record};
 
-pub const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
-pub const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
+const DEFAULT_JOURNAL_DIRECTORY: &str = "/var/journal/fund";
+const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 
 /// The parameter as its variable supplies it, `None` when the variable is unset.
 pub fn environment_variable(parameter: Parameter) -> Result<Option<String>, ParameterRefusal> {
@@ -40,13 +40,6 @@ pub struct Directories {
 }
 
 impl Directories {
-    /// Both directories from their variables, with the configuration the journal records for them.
-    pub fn from_environment() -> Result<(Self, ConfigurationResolved), ParameterRefusal> {
-        let mut resolved = BTreeMap::new();
-        let directories = Self::resolved(&environment_variable, &mut resolved)?;
-        Ok((directories, ConfigurationResolved::new(resolved)))
-    }
-
     /// Each directory from what `supplied` returns for it, or its default when that is nothing, recorded in `resolved`.
     pub fn resolved(
         supplied: &impl Fn(Parameter) -> Result<Option<String>, ParameterRefusal>,
