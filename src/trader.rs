@@ -489,6 +489,7 @@ impl<S: Strategy> Session<S> {
             solution.target(),
             &prices,
             self.state.quotes(),
+            self.settings.limits.per_name(),
             self.settings.patience,
         )
         .await;
@@ -510,6 +511,7 @@ impl<S: Strategy> Session<S> {
             rounding_allowance(&self.fills),
             &prices,
             self.state.quotes(),
+            self.settings.limits.per_name(),
             self.settings.patience,
         )
         .await
@@ -646,7 +648,7 @@ mod tests {
     use super::*;
     use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
     use crate::common::book::Position;
-    use crate::common::guard::Tradability;
+    use crate::common::guard::{Shortability, Tradability, TradabilityRead};
     use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::{Quote, Trade};
@@ -753,14 +755,17 @@ mod tests {
             Ok(Cancel::Requested)
         }
 
-        async fn tradability(
-            &self,
-            symbols: &[Symbol],
-        ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
-            Ok(symbols
-                .iter()
-                .map(|symbol| (symbol.clone(), Tradability::Fractionable))
-                .collect())
+        async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
+            Ok(TradabilityRead::new(
+                symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), Tradability::Fractionable))
+                    .collect(),
+                symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), Shortability::EasyToBorrow))
+                    .collect(),
+            ))
         }
 
         async fn book(&self) -> Result<Book, BrokerError> {

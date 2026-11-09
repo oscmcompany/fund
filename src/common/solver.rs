@@ -1,7 +1,6 @@
 //! The ways a problem becomes a target: a closed set, each journaled by name beside the decision it made.
 
 use crate::common::book::Cash;
-use crate::common::market::Shares;
 use crate::common::problem::{Objective, Problem};
 use crate::common::risk::{Cut, Risk, SCALE_GRID};
 use crate::common::strategy::Target;
@@ -77,10 +76,7 @@ fn clip(problem: &Problem) -> Solution {
             continue;
         };
         let ticks = u128::from(price.ticks_unsigned());
-        let kept = u128::from(wanted.units()).min(per_name / ticks);
-        let kept = Shares::from_units(
-            u64::try_from(kept).expect("a kept holding is at most the wanted one"),
-        );
+        let kept = wanted.capped(per_name / ticks);
         if kept != *wanted {
             cuts.push(Cut::PerName {
                 symbol: symbol.clone(),
@@ -89,7 +85,7 @@ fn clip(problem: &Problem) -> Solution {
             });
         }
         worth = worth
-            .checked_add(ticks * u128::from(kept.units()))
+            .checked_add(ticks * u128::from(kept.shares().units()))
             .expect("a target's worth fits u128");
         holdings.push((symbol.clone(), kept));
     }
@@ -108,11 +104,8 @@ fn clip(problem: &Problem) -> Solution {
         holdings
             .into_iter()
             .map(|(symbol, kept)| {
-                let scaled = u128::from(kept.units()) * scale / SCALE_GRID;
-                (
-                    symbol,
-                    Shares::from_units(u64::try_from(scaled).expect("a cut holding fits u64")),
-                )
+                let scaled = u128::from(kept.shares().units()) * scale / SCALE_GRID;
+                (symbol, kept.capped(scaled))
             })
             .collect(),
     );

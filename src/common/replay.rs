@@ -8,7 +8,9 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
-use crate::common::guard::{OrderGuarded, Tradability, guard};
+use crate::common::guard::{
+    GuardCause, OrderGuarded, Tradability, TradabilityRead, Unclosed, guard,
+};
 use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::BarInterval;
@@ -173,9 +175,10 @@ impl Restraint {
         &self.tradability
     }
 
-    /// Every symbol `orders` name, read from the map or else fractionable.
-    fn tradability_of(&self, orders: &[Order]) -> BTreeMap<Symbol, Tradability> {
-        orders
+    /// Every symbol `orders` name, read from the map or else fractionable; no borrow is read, so the guard holds every
+    /// order that would open or add to a short as unread.
+    fn tradability_of(&self, orders: &[Order]) -> TradabilityRead {
+        let readings = orders
             .iter()
             .map(|order| {
                 let symbol = order.symbol().clone();
@@ -186,7 +189,8 @@ impl Restraint {
                     .unwrap_or(Tradability::Fractionable);
                 (symbol, tradability)
             })
-            .collect()
+            .collect();
+        TradabilityRead::new(readings, BTreeMap::new())
     }
 }
 
@@ -278,7 +282,8 @@ impl Replay {
         &self.restraints
     }
 
-    /// Under restraint, each order the guard held and the decision it came from.
+    /// Each order held back and when: by the guard at its decision under restraint, or as unclosed at the instant it
+    /// was due to fill after its symbol's close did not.
     pub fn held(&self) -> &[(DateTime<Utc>, OrderGuarded)] {
         &self.held
     }
@@ -441,11 +446,19 @@ impl<S: Strategy> Replayer<S> {
         } else {
             Vec::new()
         };
+        let mut unclosed = Unclosed::default();
         for order in pending {
+            if unclosed.holds(&order) {
+                let held = OrderGuarded::new(&order, GuardCause::Unclosed);
+                replay.held.push((ends, held));
+                continue;
+            }
             let opening = bars
                 .iter()
                 .find(|bar| bar.symbol() == order.symbol() && bar.interval() == self.decision);
-            match self.fill(&replay.book, order, opening, ends) {
+            let filled = self.fill(&replay.book, order.clone(), opening, ends);
+            unclosed.record(&order, filled.is_ok());
+            match filled {
                 Ok(fill) => {
                     replay.book = replay.book.combine(Book::of(&fill));
                     replay.fills.push(fill);
@@ -489,7 +502,13 @@ impl<S: Strategy> Replayer<S> {
                             replay.restraints.insert(ends, Ok(solution.cuts().to_vec()));
                             let wanted = orders(&replay.book, solution.target());
                             let tradability = restraint.tradability_of(&wanted);
-                            let guarded = guard(wanted, &tradability, price);
+                            let guarded = guard(
+                                &replay.book,
+                                solution.target(),
+                                &tradability,
+                                restraint.limits.per_name(),
+                                price,
+                            );
                             replay
                                 .held
                                 .extend(guarded.held().iter().cloned().map(|held| (ends, held)));
@@ -562,11 +581,12 @@ mod tests {
     use proptest::strategy::Strategy as _;
 
     use super::*;
+    use crate::common::book::Position;
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::trade_bars::{HighLow, OpenClose, TradeSums};
     use crate::common::market::{Price, Shares, StampedPrice, TradeCount};
     use crate::common::strategy::Strategy;
-    use crate::common::strategy::Target;
+    use crate::common::strategy::{Holding, Target};
     use crate::common::time::SessionDate;
 
     /// Wants `shares` of each named symbol, whatever it has seen.
@@ -580,6 +600,18 @@ mod tests {
                     .map(|(raw, shares)| (symbol(raw), Shares::whole(*shares).unwrap()))
                     .collect(),
             )
+        }
+    }
+
+    /// Wants 2 shares of AAPL short, whatever it has seen.
+    struct Short;
+
+    impl Strategy for Short {
+        fn decide(&self, _: &MarketState, _: &Book) -> Target {
+            Target::new(BTreeMap::from([(
+                symbol("AAPL"),
+                Holding::short(Shares::whole(2).unwrap()).unwrap(),
+            )]))
         }
     }
 
@@ -812,7 +844,7 @@ mod tests {
                 Ok(match stale {
                     true => vec![Cut::Unpriced {
                         symbol: symbol("AAPL"),
-                        wanted: Shares::from_units(1_000_000),
+                        wanted: Shares::from_units(1_000_000).into(),
                     }],
                     false => Vec::new(),
                 }),
@@ -1057,6 +1089,34 @@ mod tests {
         assert!(replay.unfilled().is_empty());
     }
 
+    /// A short target sells into a book holding nothing, leaving it 2 short at day 1's open of $12 and marked at its
+    /// close of $13.
+    #[test]
+    fn test_a_short_target_takes_the_book_below_zero() {
+        let replay = replayer(Short)
+            .act(
+                Replay::open(Book::funded(cash(100))),
+                [
+                    daily("AAPL", 0, 10_000_000, 11_000_000),
+                    daily("AAPL", 1, 12_000_000, 13_000_000),
+                ],
+            )
+            .unwrap();
+        let fills: Vec<_> = replay
+            .fills()
+            .iter()
+            .map(|fill| (fill.filled_against(), fill.side(), fill.shares()))
+            .collect();
+        assert_eq!(fills, [(day(1), Side::Sell, Shares::whole(2).unwrap())]);
+        assert_eq!(
+            replay.book().position(&symbol("AAPL")),
+            Position::from_units(-2_000_000)
+        );
+        let marks: Vec<_> = replay.marks().values().cloned().collect();
+        let cash = |whole: i128| Ok(Cash::from_units(whole * 1_000_000_000_000));
+        assert_eq!(marks, [cash(100), cash(100 + 24 - 26)]);
+    }
+
     /// A minute strategy decides on each minute's close and fills at the next minute's open.
     #[test]
     fn test_an_intraday_decision_fills_at_the_next_bar() {
@@ -1162,6 +1222,38 @@ mod tests {
             ]
         );
         assert!(replay.fills().is_empty());
+    }
+
+    /// A cover that cannot fill holds the buy past zero behind it, so the book stays short rather than crossing.
+    #[test]
+    fn test_a_failed_cover_holds_the_buy_beyond_zero() {
+        let short = Fill::new(
+            day(-1),
+            symbol("AAPL"),
+            Side::Sell,
+            Shares::whole(2).unwrap(),
+            Price::from_ticks(10_000_000).unwrap(),
+            DollarVolume::from_units(0),
+        )
+        .unwrap();
+        let book = Book::funded(cash(80)).combine(Book::of(&short));
+        let replay = replayer(Hold(vec![("AAPL", 1)]))
+            .act(
+                Replay::open(book),
+                [
+                    daily("AAPL", 0, 60_000_000, 60_000_000),
+                    daily("AAPL", 1, 60_000_000, 60_000_000),
+                ],
+            )
+            .unwrap();
+        assert_eq!(replay.book().position(&symbol("AAPL")).units(), -2_000_000);
+        assert!(replay.fills().is_empty());
+        let held: Vec<_> = replay
+            .held()
+            .iter()
+            .map(|(at, held)| (*at, held.cause()))
+            .collect();
+        assert_eq!(held, [(day(1), GuardCause::Unclosed)]);
     }
 
     /// A buy costing exactly the cash held fills; a tick more would not.

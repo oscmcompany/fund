@@ -17,9 +17,9 @@ pub enum Constraint {
     Flat,
     /// Nothing held in the symbol.
     Excluded(Symbol),
-    /// Each holding worth at most the limit.
+    /// Each holding worth at most the limit, long or short.
     PerName(DollarLimit),
-    /// The holdings together worth at most the limit.
+    /// The holdings' worths, long and short, together at most the limit.
     Gross(DollarLimit),
 }
 
@@ -129,11 +129,11 @@ impl Constraints {
         }
         let mut gross = DollarVolume::default();
         let mut each_admitted = true;
-        for (symbol, shares) in target.holdings() {
+        for (symbol, holding) in target.holdings() {
             let price = price(symbol).ok_or_else(|| ValuationRefusal::Unpriced {
                 symbol: symbol.clone(),
             })?;
-            let worth = DollarVolume::of(price, *shares);
+            let worth = DollarVolume::of(price, holding.shares());
             each_admitted &= self.per_name.admits(worth);
             gross = gross.plus(worth);
         }
@@ -151,6 +151,7 @@ mod tests {
     use crate::common::book::Cash;
     use crate::common::market::Shares;
     use crate::common::monoid::{concatenate, laws};
+    use crate::common::strategy::Holding;
 
     const DOLLAR: i128 = 1_000_000_000_000;
 
@@ -202,18 +203,22 @@ mod tests {
             })
     }
 
-    /// Holdings in three names of up to five shares each, the bounds above reaching both sides of every limit.
+    /// Holdings in three names of up to five shares long or short, the bounds above reaching both sides of every limit.
     fn arbitrary_target() -> impl Strategy<Value = Target> {
         prop::collection::btree_map(
             prop::sample::select(vec!["A", "B", "C"]),
-            0_u64..=5_000_000,
+            prop_oneof![
+                (0_u64..=5_000_000).prop_map(|units| Holding::from(Shares::from_units(units))),
+                (0_u64..=5)
+                    .prop_map(|count| Holding::short(Shares::whole(count).unwrap()).unwrap()),
+            ],
             0..=3,
         )
-        .prop_map(|holdings: BTreeMap<&str, u64>| {
+        .prop_map(|holdings: BTreeMap<&str, Holding>| {
             Target::new(
                 holdings
                     .into_iter()
-                    .map(|(raw, units)| (symbol(raw), Shares::from_units(units)))
+                    .map(|(raw, holding)| (symbol(raw), holding))
                     .collect(),
             )
         })
@@ -235,6 +240,22 @@ mod tests {
         let over = target(&[("A", 2_000_000), ("B", 2_000_001)]);
         assert_eq!(constraints.admits(&at, ten_dollars), Ok(true));
         assert_eq!(constraints.admits(&over, ten_dollars), Ok(false));
+    }
+
+    /// A short's worth counts at its size: 2 short and 2 long at $10 are $20 each and $40 together.
+    #[test]
+    fn test_a_short_counts_against_both_limits_at_its_size() {
+        let short = |count| Holding::short(Shares::whole(count).unwrap()).unwrap();
+        let at = Target::new(BTreeMap::from([
+            (symbol("A"), short(2)),
+            (symbol("B"), Holding::from(Shares::whole(2).unwrap())),
+        ]));
+        let over = Target::new(BTreeMap::from([(symbol("A"), short(3))]));
+        let per_name = Constraints::from(Constraint::PerName(limit(20)));
+        let gross = Constraints::from(Constraint::Gross(limit(39)));
+        assert_eq!(per_name.admits(&at, ten_dollars), Ok(true));
+        assert_eq!(per_name.admits(&over, ten_dollars), Ok(false));
+        assert_eq!(gross.admits(&at, ten_dollars), Ok(false));
     }
 
     #[test]
