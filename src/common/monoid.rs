@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ops::Range;
 
-/// An aggregate whose `combine` is associative and for which `empty` changes nothing it is combined with.
+/// An aggregate whose `combine` is associative and for which `empty` changes nothing it is combined with; a
+/// floating-point aggregate is associative only up to rounding.
 pub trait Monoid: Sized {
     fn empty() -> Self;
 

@@ -223,7 +223,7 @@ fn test_a_researcher_command_is_refused_before_any_aws_call() {
 
 /// A temporary home for `researcher`, where `ssh` runs its command with the upload on its input, so a push really
 /// unpacks into `working-tree`; `devenv`, `secretspec`, `cargo`, `sudo` and `flock` are stubs, and `cargo` and a
-/// failing `sudo` record their arguments, while `ssh` rewrites `.upload` before any non-push command while `replace` exists.
+/// failing `sudo` record their arguments, and `ssh` rewrites `.upload` before any but a push while `replace` exists.
 fn researcher_home() -> PathBuf {
     let directory = std::env::temp_dir().join(format!("researcher-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();

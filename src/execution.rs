@@ -255,7 +255,8 @@ pub enum Reconciliation {
 }
 
 /// Reads the broker's book against `expected`, journals the reading, and on divergence tries to close every position
-/// the journal did not expect on the broker's side, or that a `Holding` refuses, keeping the rest at the broker's count.
+/// the journal did not expect on the broker's side, or that a `Holding` refuses, keeping the rest at the broker's
+/// count.
 /// The book returned is the broker's after those closes, any of which may be held, refused, partial or unresolved.
 #[expect(
     clippy::too_many_arguments,
@@ -1353,8 +1354,9 @@ mod tests {
         assert!(broker.calls().is_empty());
     }
 
-    /// While the market is closed and SPY flat, an order to buy one SPY share stays open past its patience, is canceled,
-    /// and closes unfilled: the journal holds its submission and its close, and the paper account's book is unchanged.
+    /// While the market is closed and SPY flat, an order to buy one SPY share stays open past its patience, is
+    /// canceled, and closes unfilled: the journal holds its submission and its close, and the paper account's book is
+    /// unchanged.
     #[tokio::test]
     #[ignore = "trades on the Alpaca paper account; run deliberately under a development secretspec profile"]
     async fn live_an_order_open_past_its_patience_is_canceled_and_journaled() {

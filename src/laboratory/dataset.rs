@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{
-    DatasetLeg, Fingerprint, FingerprintRefusal, PartitionRead, Symbols,
+    Contamination, DatasetLeg, Fingerprint, FingerprintRefusal, PartitionRead, Symbols,
 };
 use crate::common::market::record::{BarInterval, Partition};
 use crate::common::market::trade_bars::TradeBar;
@@ -193,6 +193,33 @@ async fn read<K: Copy + Into<Key>, B>(
     let (rows, _) =
         decode(&key, body).map_err(|refusal| DatasetError::Decode { session, refusal })?;
     Ok(Some((rows, PartitionRead::new(provider, tag))))
+}
+
+/// Every session `fingerprint` read that now reads as another provider or version, or not at all, each looked up as
+/// its loader would read it now.
+pub async fn lineage(
+    archive: &Bucket,
+    fingerprint: &Fingerprint,
+) -> Result<Vec<Contamination>, BucketError> {
+    let mut current = BTreeMap::new();
+    for session in fingerprint.partitions().keys() {
+        let candidates: Vec<(Provider, Key)> = trade_keys(fingerprint.leg().interval(), *session)
+            .map(|(provider, key)| (provider, key.into()))
+            .into();
+        let found = preferred(candidates, async |provider, key| {
+            Ok::<_, BucketError>(
+                archive
+                    .tag(&key)
+                    .await?
+                    .map(|tag| PartitionRead::new(provider, tag)),
+            )
+        })
+        .await?;
+        if let Some(partition_read) = found {
+            current.insert(*session, partition_read);
+        }
+    }
+    Ok(fingerprint.contaminated(&current))
 }
 
 #[cfg(test)]
@@ -624,6 +651,7 @@ pub(crate) mod tests {
             }
         }
         eprintln!("missing {:?}", fingerprint.missing());
+        assert_eq!(lineage(&archive, fingerprint).await.unwrap(), []);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

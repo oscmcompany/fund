@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn test_a_vendor_average_becomes_its_dollar_volume() {
         let volume = Shares::whole(436_147).unwrap();
-        // The exact product ends 786_000_000; the float average lands 2,176 units, about two billionths of a dollar, short.
+        // The exact product ends 786_000_000; the float average lands 2,176 units, two billionths of a dollar, short.
         assert_eq!(
             DollarVolume::from_average(335.929_638, volume)
                 .unwrap()

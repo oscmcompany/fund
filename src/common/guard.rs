@@ -659,8 +659,8 @@ mod tests {
         );
     }
 
-    /// An order opening or adding to a holding is held past the per-name limit, read on the holding after it, and passes
-    /// at it or unpriced; an order cutting a holding passes whatever it is worth.
+    /// An order opening or adding to a holding is held past the per-name limit, read on the holding after it, and
+    /// passes at it or unpriced; an order cutting a holding passes whatever it is worth.
     #[test]
     fn test_an_order_past_the_per_name_limit_is_held_unless_it_cuts() {
         let limit = DollarLimit::new(Cash::from_units(100 * 1_000_000_000_000)).unwrap();

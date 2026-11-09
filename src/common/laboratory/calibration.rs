@@ -132,10 +132,16 @@ impl Coverage {
 /// A band forecast's coverage overall and in each decile of width, narrowest first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
+    levels: Levels,
     by_width: [Coverage; WIDTH_DECILES],
 }
 
 impl Calibration {
+    /// The levels its coverage is read against.
+    pub fn levels(&self) -> Levels {
+        self.levels
+    }
+
     pub fn overall(&self) -> Coverage {
         concatenate(self.by_width)
     }
@@ -147,7 +153,7 @@ impl Calibration {
 
 /// Reads `bands` overall and in width deciles whose sizes differ by at most one, the larger first; bands of equal
 /// width at a decile boundary are split in the order given.
-pub fn calibrate(bands: &[Band]) -> Calibration {
+pub fn calibrate(levels: Levels, bands: &[Band]) -> Calibration {
     let mut order: Vec<usize> = (0..bands.len()).collect();
     order.sort_by(|left, right| bands[*left].width().total_cmp(&bands[*right].width()));
     let (size, larger) = (bands.len() / WIDTH_DECILES, bands.len() % WIDTH_DECILES);
@@ -162,7 +168,7 @@ pub fn calibrate(bands: &[Band]) -> Calibration {
         );
         start = end;
     }
-    Calibration { by_width }
+    Calibration { levels, by_width }
 }
 
 #[cfg(test)]
@@ -209,7 +215,7 @@ mod tests {
             band(7.0, 3.0, 5.0),
             band(5.0, 5.0, 5.0),
         ];
-        let overall = calibrate(&bands).overall();
+        let overall = calibrate(levels(), &bands).overall();
         assert_eq!(
             overall,
             Coverage {
@@ -240,7 +246,7 @@ mod tests {
                 band(0.0, f64::from(width), outcome)
             })
             .collect();
-        let calibration = calibrate(&bands);
+        let calibration = calibrate(levels(), &bands);
         let sizes: Vec<u64> = calibration
             .by_width()
             .iter()
@@ -269,7 +275,7 @@ mod tests {
                 .iter()
                 .map(|outcome| band(lower, upper, *outcome))
                 .collect();
-            calibrate(&bands)
+            calibrate(levels(), &bands)
         };
         let calibrated = read(0.1, 0.9);
         let standard_error = (0.1 * 0.9 / 2_000.0f64).sqrt();
@@ -316,7 +322,7 @@ mod tests {
         /// Every band lands in exactly one decile, and the deciles differ in size by at most one, the larger first.
         #[test]
         fn test_deciles_partition_the_bands_in_width_order(bands in bands()) {
-            let calibration = calibrate(&bands);
+            let calibration = calibrate(levels(), &bands);
             let sizes: Vec<u64> = calibration.by_width().iter().map(|coverage| coverage.bands()).collect();
             prop_assert_eq!(sizes.iter().sum::<u64>(), bands.len() as u64);
             prop_assert_eq!(calibration.overall().bands(), bands.len() as u64);

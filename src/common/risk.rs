@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     proptest! {
-        /// Every limit from one cash unit to the most a limit may be is journaled as its units and reads back as itself.
+        /// Every limit from one cash unit to the most a limit may be is journaled as its units and reads back as is.
         #[test]
         fn property_a_dollar_limit_round_trips_through_its_journaled_text(
             units in 1..=u128::MAX / 100_000_000,
