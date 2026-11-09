@@ -17,9 +17,8 @@ use crate::common::laboratory::verdict::Checks;
 #[serde(try_from = "String", into = "String")]
 pub struct Label(String);
 
-/// The machine a study ran on: its hostname, so a laptop run and a researcher-host run read apart, and what can
-/// change how a result reads, the architecture (floating-point results can differ across them) and the cores a
-/// duration was measured on.
+/// The machine a study ran on: hostname, architecture, operating system and core count, any of which can change how a
+/// result reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "MachineFields")]
 pub struct Machine {
@@ -109,11 +108,8 @@ impl From<Metric> for f64 {
     }
 }
 
-/// One experiment's settings, by name.
-///
-/// Strings to strings on purpose: whether two runs tried the same variant is answered by equality, and strings
-/// compare exactly where floats do not (0.1 written two ways, NaN); untyped values also let every study name its
-/// own settings without a schema change. Typing the values would make float equality decide what counts as a repeat.
+/// One experiment's settings by name, kept as strings so two runs tried the same variant exactly when their settings
+/// are equal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Parameters(BTreeMap<Name, String>);
@@ -124,7 +120,7 @@ pub enum ExperimentRefusal {
     BlankLabel,
     #[error("a machine needs a hostname, an architecture and an operating system")]
     BlankMachine,
-    /// A label or name with a line break would split a catalog line.
+    /// Text with a line break would split a catalog line.
     #[error("{text:?} holds a line break")]
     LineBreak { text: String },
     #[error("a parameter, estimate or metric needs a name")]

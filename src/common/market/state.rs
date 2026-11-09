@@ -10,7 +10,6 @@ use super::record::{BarInterval, Quote, QuoteRefusal};
 use super::trade_bars::TradeBar;
 use super::{Price, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
-use crate::common::time::calendar::{SessionPhase, TradingCalendar};
 
 /// The latest bars a state keeps for each symbol and interval.
 pub const RETAINED_BARS: usize = 100;
@@ -203,11 +202,6 @@ impl MarketState {
         &self.quotes
     }
 
-    /// Where the clock falls in `calendar`'s sessions, `None` before any clock event.
-    pub fn phase(&self, calendar: &TradingCalendar) -> Option<SessionPhase> {
-        self.clock.map(|instant| calendar.phase_at(instant))
-    }
-
     fn bars(
         &self,
         symbol: &Symbol,
@@ -247,7 +241,7 @@ impl Monoid for MarketState {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{NaiveDate, NaiveTime, TimeDelta};
+    use chrono::{NaiveDate, TimeDelta};
     use proptest::prelude::*;
 
     use super::*;
@@ -255,8 +249,7 @@ mod tests {
     use crate::common::market::trade_bars::{OpenClose, TradeSums};
     use crate::common::market::{DollarVolume, Shares, TradeCount};
     use crate::common::monoid::{concatenate, laws};
-    use crate::common::time::calendar::TradingSession;
-    use crate::common::time::{SessionDate, SessionRange};
+    use crate::common::time::SessionDate;
 
     fn session() -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 9, 25).unwrap())
@@ -489,34 +482,16 @@ mod tests {
         }
     }
 
-    /// The clock is the latest reported, whatever order the reports arrive in, and phases read from it.
+    /// The clock is the latest reported, whatever order the reports arrive in.
     #[test]
-    fn test_the_phase_reads_the_latest_clock() {
-        let calendar = TradingCalendar::new(
-            vec![
-                TradingSession::new(
-                    session(),
-                    NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
-                    NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
-                )
-                .unwrap(),
-            ],
-            SessionRange::single(session()),
-        )
-        .unwrap();
-        assert_eq!(MarketState::empty().phase(&calendar), None);
+    fn test_the_clock_is_the_latest_reported() {
+        assert_eq!(MarketState::empty().clock(), None);
         let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
         let state = fold([
             MarketEvent::Clock(instant("2026-09-25T19:00:00Z")),
             MarketEvent::Clock(instant("2026-09-25T13:00:00Z")),
         ]);
         assert_eq!(state.clock(), Some(instant("2026-09-25T19:00:00Z")));
-        assert_eq!(
-            state.phase(&calendar),
-            Some(SessionPhase::Open {
-                until_close: TimeDelta::hours(1)
-            })
-        );
     }
 
     /// Trade bars, priced or not, for two symbols at both intervals, with timestamps dense enough to repeat

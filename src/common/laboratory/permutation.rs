@@ -23,7 +23,7 @@ impl Generator {
     }
 
     /// A uniform draw from `0..bound`, rejecting the low remainder so no value is favored.
-    pub fn below(&mut self, bound: NonZeroU64) -> u64 {
+    fn below(&mut self, bound: NonZeroU64) -> u64 {
         let bound = bound.get();
         let threshold = bound.wrapping_neg() % bound;
         loop {

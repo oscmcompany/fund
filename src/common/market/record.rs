@@ -51,6 +51,11 @@ impl BarInterval {
             Self::OneDay => SessionDate::at(instant).regular_close(),
         }
     }
+
+    /// Whether `timestamp` is a bar's own stamp on this interval rather than an instant inside one.
+    pub fn is_on_grid(self, timestamp: DateTime<Utc>) -> bool {
+        self.bucket(timestamp) == timestamp
+    }
 }
 
 /// Open, high, low and close, with the open and close inside `[low, high]`.
@@ -133,7 +138,7 @@ pub struct Bar {
 /// Why a bar was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BarRefusal {
-    #[error("{timestamp} does not end a {interval} bar")]
+    #[error("{timestamp} is not on the {interval} grid")]
     Misaligned {
         interval: BarInterval,
         timestamp: DateTime<Utc>,
@@ -151,7 +156,7 @@ impl Bar {
         trade_count: Option<TradeCount>,
         dollar_volume: Option<DollarVolume>,
     ) -> Result<Self, BarRefusal> {
-        if interval.bucket(timestamp) != timestamp {
+        if !interval.is_on_grid(timestamp) {
             return Err(BarRefusal::Misaligned {
                 interval,
                 timestamp,
@@ -194,11 +199,6 @@ impl Bar {
 
     pub fn dollar_volume(&self) -> Option<DollarVolume> {
         self.dollar_volume
-    }
-
-    /// In dollars, for presentation; `None` when unreported or when nothing traded.
-    pub fn volume_weighted_average_price(&self) -> Option<f64> {
-        self.dollar_volume?.average_over(self.volume)
     }
 }
 
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_bar_derives_its_average_from_its_dollar_volume() {
+    fn test_a_bar_keeps_its_dollar_volume_and_trade_count() {
         let volume = Shares::whole(200).unwrap();
         let bar = Bar::new(
             Symbol::new("AAPL").unwrap(),
@@ -484,19 +484,11 @@ mod tests {
             Some(DollarVolume::of(price(10.25), volume)),
         )
         .unwrap();
-        assert_eq!(bar.volume_weighted_average_price(), Some(10.25));
+        assert_eq!(
+            bar.dollar_volume(),
+            Some(DollarVolume::from_units(2_050_000_000_000_000))
+        );
         assert_eq!(bar.trade_count(), Some(TradeCount::new(3)));
-        let quiet = Bar::new(
-            Symbol::new("AAPL").unwrap(),
-            BarInterval::OneMinute,
-            instant("2026-07-31T14:31:00Z"),
-            prices(),
-            Shares::default(),
-            Some(TradeCount::new(0)),
-            Some(DollarVolume::default()),
-        )
-        .unwrap();
-        assert_eq!(quiet.volume_weighted_average_price(), None);
     }
 
     #[test]

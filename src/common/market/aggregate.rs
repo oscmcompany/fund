@@ -45,11 +45,6 @@ impl TradeTotals {
     pub fn dollar_volume(&self) -> DollarVolume {
         self.dollar_volume
     }
-
-    /// In dollars, derived from the exact sums; `None` when nothing traded.
-    pub fn volume_weighted_average_price(&self) -> Option<f64> {
-        self.dollar_volume.average_over(self.volume)
-    }
 }
 
 impl Monoid for TradeTotals {
@@ -280,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trade_totals_derive_the_average_price() {
+    fn test_trade_totals_sum_exactly() {
         let totals = concatenate(
             [trade(10.0, 100), trade(10.2, 300)]
                 .iter()
@@ -289,8 +284,8 @@ mod tests {
         assert_eq!(totals.count(), TradeCount::new(2));
         assert_eq!(totals.volume(), Shares::whole(400).unwrap());
         assert_eq!(totals.dollar_volume().to_string(), "4060.00");
-        assert_eq!(totals.volume_weighted_average_price(), Some(10.15));
-        assert_eq!(TradeTotals::empty().volume_weighted_average_price(), None);
+        assert_eq!(totals.dollar_volume().units(), 4_060_000_000_000_000);
+        assert_eq!(TradeTotals::empty().dollar_volume().units(), 0);
     }
 
     fn roll(bars: &[TradeBar], interval: BarInterval) -> Vec<TradeBar> {

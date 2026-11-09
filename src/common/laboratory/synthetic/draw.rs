@@ -3,7 +3,6 @@
 
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
-use serde::{Deserialize, Serialize};
 
 use crate::common::laboratory::permutation::Generator;
 
@@ -11,7 +10,7 @@ use crate::common::laboratory::permutation::Generator;
 const MINIMUM_FIT_READINGS: usize = 2;
 
 /// The value every draw of a synthetic run descends from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seed(u64);
 
 impl Seed {
@@ -42,26 +41,10 @@ impl Seed {
 
 /// A positive quantity whose logarithm is normal: `median` is its median and `dispersion` the standard deviation of
 /// its logarithm.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "LogNormalFields")]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LogNormal {
     median: f64,
     dispersion: f64,
-}
-
-/// A log-normal as stored, read back through `LogNormal::new` so a saved shape is checked as a built one is.
-#[derive(Deserialize)]
-struct LogNormalFields {
-    median: f64,
-    dispersion: f64,
-}
-
-impl TryFrom<LogNormalFields> for LogNormal {
-    type Error = LogNormalRefusal;
-
-    fn try_from(fields: LogNormalFields) -> Result<Self, Self::Error> {
-        Self::new(fields.median, fields.dispersion)
-    }
 }
 
 /// Why a log-normal was refused, with the value read.
@@ -179,21 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn test_a_saved_shape_is_checked_as_a_built_one_is() {
-        let shape = LogNormal::new(12.5, 0.75).unwrap();
-        let saved = serde_json::to_string(&shape).unwrap();
-        assert_eq!(saved, r#"{"median":12.5,"dispersion":0.75}"#);
-        assert_eq!(serde_json::from_str::<LogNormal>(&saved).unwrap(), shape);
-        let refused = serde_json::from_str::<LogNormal>(r#"{"median":-1.0,"dispersion":0.0}"#);
-        assert!(
-            refused
-                .unwrap_err()
-                .to_string()
-                .contains("a median of -1 is not finite and positive")
-        );
-    }
-
-    #[test]
     fn test_a_fit_of_equal_readings_has_no_dispersion() {
         let fitted = LogNormal::fit(&[5.0, 5.0, 5.0]).unwrap();
         assert!((fitted.median() - 5.0).abs() < 1e-12);
@@ -220,7 +188,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn test_children_differ_from_their_parent_and_each_other(parent in any::<u64>(), stream in 0u64..1_000) {
+        fn test_children_are_reproducible_and_differ_from_their_neighbours(parent in any::<u64>(), stream in 0u64..1_000) {
             let seed = Seed::new(parent);
             prop_assert_ne!(seed.child(stream), seed.child(stream + 1));
             prop_assert_eq!(seed.child(stream), seed.child(stream));

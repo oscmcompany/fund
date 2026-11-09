@@ -15,7 +15,7 @@ use crate::common::laboratory::permutation::Generator;
 use crate::common::market::Symbol;
 use crate::common::time::SessionDate;
 
-/// The fewest blocks a grouping's error is quoted from; below it the error's own error passes about 16%.
+/// The fewest blocks a grouping's error is quoted from; below it the error's own relative error exceeds about 16%.
 pub const QUOTED_BLOCKS: u64 = 20;
 
 /// Readings stamped with the instant they were taken and the name they were taken on; `None` is unmeasurable.
@@ -554,6 +554,12 @@ mod tests {
     fn test_grouping_names_agree_between_display_and_parse() {
         for grouping in Grouping::iter() {
             assert_eq!(grouping.to_string().parse::<Grouping>(), Ok(grouping));
+            let written = serde_json::to_string(&grouping).unwrap();
+            assert_eq!(written, format!("\"{grouping}\""));
+            assert_eq!(
+                serde_json::from_str::<Grouping>(&written).unwrap(),
+                grouping
+            );
         }
         assert_eq!(Grouping::SessionAndName.to_string(), "session_and_name");
     }

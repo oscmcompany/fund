@@ -43,7 +43,7 @@ impl TryFrom<f64> for DegreesOfFreedom {
 
 /// The Bonferroni bar for a family of `tests`, two-sided, against Student's t; Bonferroni rather than Šidák because
 /// readings in one family share a universe and a window, and only Bonferroni's bound holds without independence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Haircut {
     tests: NonZeroU32,
 }
@@ -51,10 +51,6 @@ pub struct Haircut {
 impl Haircut {
     pub fn new(tests: NonZeroU32) -> Self {
         Self { tests }
-    }
-
-    pub fn tests(self) -> NonZeroU32 {
-        self.tests
     }
 
     pub fn required_standard_errors(self, degrees_of_freedom: DegreesOfFreedom) -> f64 {

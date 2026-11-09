@@ -10,7 +10,7 @@ use crate::common::monoid::Monoid;
 use crate::common::risk::DollarLimit;
 use crate::common::strategy::Target;
 
-/// One form a solver can read; every form admits the empty target, so no intersection of them excludes flat.
+/// One form of allowed target; every form admits the empty target, so no intersection of them excludes flat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Constraint {
     /// Nothing held.

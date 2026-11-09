@@ -108,8 +108,7 @@ impl Split {
 }
 
 /// What ends a symbol's series on a boundary's date, with the symbol the series continues under where there is one.
-#[derive(Debug, Clone, PartialEq, Eq, strum::IntoStaticStr, strum::EnumDiscriminants)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, strum::EnumDiscriminants)]
 #[strum_discriminants(
     name(BoundaryKind),
     derive(strum::Display, strum::EnumString, strum::EnumIter),

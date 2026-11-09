@@ -116,6 +116,9 @@ mod tests {
         );
         let names: Vec<&str> = Borrow::iter().map(Into::into).collect();
         assert_eq!(names, ["available", "unavailable"]);
+        for borrow in Borrow::iter() {
+            assert_eq!(borrow.to_string().parse(), Ok(borrow));
+        }
     }
 
     #[test]

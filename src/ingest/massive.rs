@@ -903,8 +903,11 @@ mod tests {
         assert_eq!(abd.timestamp().to_rfc3339(), "2026-09-25T20:00:00+00:00");
         assert_eq!(abd.volume().to_string(), "210482.125375");
         assert_eq!(abd.trade_count(), Some(TradeCount::new(7500)));
-        let average = abd.volume_weighted_average_price().unwrap();
-        assert!((average - 74.5).abs() < 1e-9, "{average}");
+        // A 74.50 average over the volume, to the float product's precision.
+        assert_eq!(
+            abd.dollar_volume(),
+            Some(DollarVolume::from_units(15_680_918_340_437_499_904))
+        );
         assert_eq!(abd.prices().open().to_string(), "73.75");
     }
 

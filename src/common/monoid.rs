@@ -99,6 +99,21 @@ impl<T> Monoid for Sequence<T> {
     }
 }
 
+/// A semigroup with `None` adjoined as its empty value, so a fragment that saw nothing combines away.
+impl<S: Semigroup> Monoid for Option<S> {
+    fn empty() -> Self {
+        None
+    }
+
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Some(left), Some(right)) => Some(left.combine(right)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Folds any number of fragments, returning `empty` for none.
 pub fn concatenate<M: Monoid>(values: impl IntoIterator<Item = M>) -> M {
     values.into_iter().fold(M::empty(), M::combine)

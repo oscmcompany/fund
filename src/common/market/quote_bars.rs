@@ -18,7 +18,7 @@ pub const RELATIVE_SPREAD_SCALE: u128 = 1_000_000;
 pub struct Spread(u64);
 
 impl Spread {
-    /// Private so only a `Quote`'s sides reach it: `Quote` refuses a crossed book, so the ask is never below the bid.
+    /// Private so only a `StandingQuote`'s sides reach it, which its constructors keep uncrossed.
     fn of(bid: Price, ask: Price) -> Self {
         Self(ask.ticks().abs_diff(bid.ticks()))
     }
@@ -242,7 +242,7 @@ impl QuoteSums {
 impl Semigroup for QuoteSums {
     fn combine(self, other: Self) -> Self {
         Self {
-            quote_count: self.quote_count.plus(other.quote_count),
+            quote_count: self.quote_count.combine(other.quote_count),
             covered_nanoseconds: self
                 .covered_nanoseconds
                 .checked_add(other.covered_nanoseconds)
@@ -267,7 +267,7 @@ pub struct QuoteBar {
 /// Why a quote bar was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuoteBarRefusal {
-    #[error("{timestamp} does not end a {interval} bar")]
+    #[error("{timestamp} is not on the {interval} grid")]
     Misaligned {
         interval: BarInterval,
         timestamp: DateTime<Utc>,
@@ -285,7 +285,7 @@ impl QuoteBar {
         timestamp: DateTime<Utc>,
         sums: QuoteSums,
     ) -> Result<Self, QuoteBarRefusal> {
-        if interval.bucket(timestamp) != timestamp {
+        if !interval.is_on_grid(timestamp) {
             return Err(QuoteBarRefusal::Misaligned {
                 interval,
                 timestamp,
@@ -434,7 +434,7 @@ impl QuoteFold {
         for (key, count) in std::mem::take(&mut self.began) {
             // A quote replaced within its own nanosecond covers nothing, and its minute holds the one that replaced it.
             if let Some(sums) = self.minutes.get_mut(&key) {
-                sums.quote_count = sums.quote_count.plus(QuoteCount::new(count));
+                sums.quote_count = sums.quote_count.combine(QuoteCount::new(count));
             }
         }
         let bars = self.minutes.into_bars();
@@ -775,6 +775,20 @@ mod tests {
     }
 
     proptest! {
+        /// A bar splits into parts it is rebuilt from unchanged.
+        #[test]
+        fn property_a_quote_bar_is_rebuilt_from_its_parts(sums in any_sums(), minute in 0_i64..3) {
+            let bar = QuoteBar::new(
+                Symbol::new("AAPL").unwrap(),
+                BarInterval::OneMinute,
+                instant("2026-10-02T13:30:00Z") + TimeDelta::minutes(minute),
+                sums,
+            )
+            .unwrap();
+            let (key, sums) = bar.parts();
+            prop_assert_eq!(QuoteBar::from_parts(key, sums), bar);
+        }
+
         #[test]
         fn property_quote_rollups_are_a_commutative_monoid(
             first in any_rollup(),

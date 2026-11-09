@@ -4,7 +4,7 @@
 use crate::common::laboratory::score::{Forecast, Outcome};
 use crate::common::laboratory::share::Share;
 use crate::common::learning::loss::Level;
-use crate::common::monoid::Monoid;
+use crate::common::monoid::{Monoid, concatenate};
 
 /// Width deciles a calibration is read in.
 pub const WIDTH_DECILES: usize = 10;
@@ -132,20 +132,12 @@ impl Coverage {
 /// A band forecast's coverage overall and in each decile of width, narrowest first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
-    levels: Levels,
     by_width: [Coverage; WIDTH_DECILES],
 }
 
 impl Calibration {
-    pub fn levels(&self) -> Levels {
-        self.levels
-    }
-
     pub fn overall(&self) -> Coverage {
-        self.by_width
-            .iter()
-            .copied()
-            .fold(Coverage::empty(), Coverage::combine)
+        concatenate(self.by_width)
     }
 
     pub fn by_width(&self) -> &[Coverage; WIDTH_DECILES] {
@@ -155,7 +147,7 @@ impl Calibration {
 
 /// Reads `bands` overall and in width deciles whose sizes differ by at most one, the larger first; bands of equal
 /// width at a decile boundary are split in the order given.
-pub fn calibrate(levels: Levels, bands: &[Band]) -> Calibration {
+pub fn calibrate(bands: &[Band]) -> Calibration {
     let mut order: Vec<usize> = (0..bands.len()).collect();
     order.sort_by(|left, right| bands[*left].width().total_cmp(&bands[*right].width()));
     let (size, larger) = (bands.len() / WIDTH_DECILES, bands.len() % WIDTH_DECILES);
@@ -163,13 +155,14 @@ pub fn calibrate(levels: Levels, bands: &[Band]) -> Calibration {
     let mut start = 0;
     for (decile, coverage) in by_width.iter_mut().enumerate() {
         let end = start + size + usize::from(decile < larger);
-        *coverage = order[start..end]
-            .iter()
-            .map(|index| Coverage::of(bands[*index]))
-            .fold(Coverage::empty(), Coverage::combine);
+        *coverage = concatenate(
+            order[start..end]
+                .iter()
+                .map(|index| Coverage::of(bands[*index])),
+        );
         start = end;
     }
-    Calibration { levels, by_width }
+    Calibration { by_width }
 }
 
 #[cfg(test)]
@@ -178,6 +171,7 @@ mod tests {
 
     use super::*;
     use crate::common::laboratory::permutation::Generator;
+    use crate::common::monoid::laws;
 
     fn band(lower: f64, upper: f64, outcome: f64) -> Band {
         Band::new(
@@ -215,7 +209,7 @@ mod tests {
             band(7.0, 3.0, 5.0),
             band(5.0, 5.0, 5.0),
         ];
-        let overall = calibrate(levels(), &bands).overall();
+        let overall = calibrate(&bands).overall();
         assert_eq!(
             overall,
             Coverage {
@@ -246,7 +240,7 @@ mod tests {
                 band(0.0, f64::from(width), outcome)
             })
             .collect();
-        let calibration = calibrate(levels(), &bands);
+        let calibration = calibrate(&bands);
         let sizes: Vec<u64> = calibration
             .by_width()
             .iter()
@@ -275,7 +269,7 @@ mod tests {
                 .iter()
                 .map(|outcome| band(lower, upper, *outcome))
                 .collect();
-            calibrate(levels(), &bands)
+            calibrate(&bands)
         };
         let calibrated = read(0.1, 0.9);
         let standard_error = (0.1 * 0.9 / 2_000.0f64).sqrt();
@@ -316,18 +310,13 @@ mod tests {
     proptest! {
         #[test]
         fn test_coverage_is_a_monoid(first in coverage(), second in coverage(), third in coverage()) {
-            prop_assert_eq!(first.combine(Coverage::empty()), first);
-            prop_assert_eq!(Coverage::empty().combine(first), first);
-            prop_assert_eq!(
-                first.combine(second).combine(third),
-                first.combine(second.combine(third))
-            );
+            laws::check(first, second, third)?;
         }
 
         /// Every band lands in exactly one decile, and the deciles differ in size by at most one, the larger first.
         #[test]
         fn test_deciles_partition_the_bands_in_width_order(bands in bands()) {
-            let calibration = calibrate(levels(), &bands);
+            let calibration = calibrate(&bands);
             let sizes: Vec<u64> = calibration.by_width().iter().map(|coverage| coverage.bands()).collect();
             prop_assert_eq!(sizes.iter().sum::<u64>(), bands.len() as u64);
             prop_assert_eq!(calibration.overall().bands(), bands.len() as u64);

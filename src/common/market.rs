@@ -404,6 +404,16 @@ impl QuoteCount {
     }
 }
 
+impl Monoid for QuoteCount {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(self, other: Self) -> Self {
+        self.plus(other)
+    }
+}
+
 /// A sum of price × shares, held in ticks × millionths of a share: `PRICE_SCALE × SHARE_SCALE` to the dollar.
 /// Unsigned, since a positive price times a share count cannot be negative.
 // Written as a decimal string, since serde's buffer for a tagged journal record cannot hold a u128.
@@ -490,14 +500,6 @@ impl DollarVolume {
     /// The amount in dollars, for presentation only: sums belong on `units`.
     pub fn dollars(self) -> f64 {
         self.0 as f64 / (PRICE_SCALE as f64 * SHARE_SCALE as f64)
-    }
-
-    /// The average price in dollars over `volume`, for presentation; `None` when nothing traded.
-    pub fn average_over(self, volume: Shares) -> Option<f64> {
-        match volume.0 {
-            0 => None,
-            units => Some(self.0 as f64 / PRICE_SCALE as f64 / units as f64),
-        }
     }
 }
 
@@ -760,8 +762,6 @@ mod tests {
         assert_eq!(volume.units(), 4_500_000_000_000);
         assert_eq!(volume.plus(volume).to_string(), "9.00");
         assert_eq!(volume.dollars(), 4.5);
-        assert_eq!(volume.average_over(Shares::whole(3).unwrap()), Some(1.5));
-        assert_eq!(volume.average_over(Shares::default()), None);
     }
 
     #[test]
@@ -821,11 +821,15 @@ mod tests {
     }
 
     #[test]
-    fn test_a_vendor_average_becomes_a_dollar_volume_it_can_be_recovered_from() {
+    fn test_a_vendor_average_becomes_its_dollar_volume() {
         let volume = Shares::whole(436_147).unwrap();
-        let dollar_volume = DollarVolume::from_average(335.929_638, volume).unwrap();
-        let recovered = dollar_volume.average_over(volume).unwrap();
-        assert!((recovered - 335.929_638).abs() < 1e-9, "{recovered}");
+        // The exact product ends 786_000_000; the float average lands 2,176 units, about two billionths of a dollar, short.
+        assert_eq!(
+            DollarVolume::from_average(335.929_638, volume)
+                .unwrap()
+                .units(),
+            146_514_703_824_785_997_824
+        );
         assert_eq!(
             DollarVolume::from_average(0.0, Shares::default()),
             Ok(DollarVolume::default())
@@ -876,6 +880,12 @@ mod tests {
         #[test]
         fn property_trade_counts_are_a_commutative_monoid(counts in prop::array::uniform3(0_u64..u64::MAX / 3)) {
             let [first, second, third] = counts.map(TradeCount::new);
+            laws::check(first, second, third)?;
+        }
+
+        #[test]
+        fn property_quote_counts_are_a_commutative_monoid(counts in prop::array::uniform3(0_u64..u64::MAX / 3)) {
+            let [first, second, third] = counts.map(QuoteCount::new);
             laws::check(first, second, third)?;
         }
 

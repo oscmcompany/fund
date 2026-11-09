@@ -173,10 +173,6 @@ impl Ledger {
         &self.book
     }
 
-    pub fn closes(&self) -> &BTreeMap<SessionDate, Cash> {
-        &self.closes
-    }
-
     /// The equity the current session opened with: the last close, or the opening before any.
     pub fn session_opening(&self) -> Cash {
         self.closes
@@ -210,18 +206,25 @@ impl Ledger {
     ) -> Result<[(Bound, i128); 3], ValuationRefusal> {
         let remaining = gross(&self.book, price)? - released;
         let equity = self.book.value(price)?.units();
-        let power = equity.saturating_mul(i128::from(self.leverage.0.get()));
-        Ok([
+        Ok(self.allowances(equity).map(|(bound, allowed)| {
+            let used = match bound {
+                Bound::PerName => same_side,
+                Bound::Gross | Bound::BuyingPower => remaining,
+            };
+            (bound, allowed - used)
+        }))
+    }
+
+    /// The cash each bound allows at `equity`, in the order ties resolve.
+    fn allowances(&self, equity: i128) -> [(Bound, i128); 3] {
+        [
+            (Bound::PerName, self.limits.dollars(Limit::PerName).units()),
+            (Bound::Gross, self.limits.dollars(Limit::Gross).units()),
             (
-                Bound::PerName,
-                self.limits.dollars(Limit::PerName).units() - same_side,
+                Bound::BuyingPower,
+                equity.saturating_mul(i128::from(self.leverage.multiple().get())),
             ),
-            (
-                Bound::Gross,
-                self.limits.dollars(Limit::Gross).units() - remaining,
-            ),
-            (Bound::BuyingPower, power - remaining),
-        ])
+        ]
     }
 
     /// The most shares of `symbol` a trade on `side` at `price` may carry before costs, with what binds it; the other
@@ -349,23 +352,13 @@ impl Ledger {
                 .value(price_of)
                 .map_err(TradeRefusal::Unpriced)?
                 .units();
-            let checks = [
-                (
-                    Bound::PerName,
-                    name,
-                    self.limits.dollars(Limit::PerName).units(),
-                ),
-                (
-                    Bound::Gross,
-                    total,
-                    self.limits.dollars(Limit::Gross).units(),
-                ),
-                (
-                    Bound::BuyingPower,
-                    total,
-                    equity.saturating_mul(i128::from(self.leverage.0.get())),
-                ),
-            ];
+            let checks = self.allowances(equity).map(|(bound, allowed)| {
+                let exposure = match bound {
+                    Bound::PerName => name,
+                    Bound::Gross | Bound::BuyingPower => total,
+                };
+                (bound, exposure, allowed)
+            });
             if let Some((bound, exposure, allowed)) = checks
                 .into_iter()
                 .find(|(_, exposure, allowed)| exposure > allowed)
