@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::common::book::{Fill, Side};
 use crate::common::journal::RunId;
+use crate::common::market::state::LastQuote;
 use crate::common::market::{DollarVolume, Price, Shares, Symbol, SymbolRefusal};
 use crate::common::strategy::Order;
 
@@ -376,24 +377,65 @@ impl OrderState {
 }
 
 /// An order about to be sent to the broker under `client_order_id`, journaled before the send so a crash between the
-/// two leaves the order on record.
+/// two leaves the order on record; the record's timestamp marks the intent to submit, taken before the append and the
+/// send, so a record can name an order that was never sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderSubmitted {
     client_order_id: ClientOrderId,
     symbol: Symbol,
     side: Side,
     shares: Shares,
+    /// `None` on a record journaled before the decision's quote was.
+    #[serde(default)]
+    quote: Option<DecisionQuote>,
 }
 
 impl OrderSubmitted {
-    pub fn of(request: &OrderRequest) -> Self {
+    /// `quote` is the decision's latest quote for the order's symbol, `None` when it held none.
+    pub fn of(request: &OrderRequest, quote: Option<LastQuote>) -> Self {
+        let quote = match quote {
+            Some(quote) => DecisionQuote::Quoted(quote),
+            None => DecisionQuote::Unquoted {
+                cause: QuoteAbsence::NoneFolded,
+            },
+        };
         Self {
             client_order_id: request.client_order_id,
             symbol: request.order.symbol().clone(),
             side: request.order.side(),
             shares: request.order.shares(),
+            quote: Some(quote),
         }
     }
+}
+
+/// The quote the decision behind an order held for its symbol, or why it held none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionQuote {
+    Quoted(LastQuote),
+    Unquoted { cause: QuoteAbsence },
+}
+
+/// Why a decision held no quote for a symbol.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum QuoteAbsence {
+    /// No quote for the symbol had been folded into the market state.
+    NoneFolded,
 }
 
 /// An order closed at the broker at `closed_at`, having executed `executed`.
@@ -681,6 +723,15 @@ mod tests {
             assert_eq!(serde_json::to_string(&side).unwrap(), format!("\"{side}\""));
             assert_eq!(side.to_string().parse(), Ok(side));
         }
+        let absences: Vec<&str> = QuoteAbsence::iter().map(Into::into).collect();
+        assert_eq!(absences, ["none_folded"]);
+        for absence in QuoteAbsence::iter() {
+            assert_eq!(
+                serde_json::to_string(&absence).unwrap(),
+                format!("\"{absence}\"")
+            );
+            assert_eq!(absence.to_string().parse(), Ok(absence));
+        }
         assert!(
             serde_json::from_str::<OrderExecution>(r#"{"shares":0,"average_price":1}"#).is_err()
         );
@@ -697,6 +748,75 @@ mod tests {
         let drawn: Vec<u32> = (0..3).map(|_| sequence.draw(run).sequence()).collect();
         assert_eq!(drawn, [0, 1, 2]);
         assert_eq!(sequence.draw(run).run(), run);
+    }
+
+    /// A submission journaled before the decision's quote was reads it back as unmeasured.
+    #[test]
+    fn test_a_submission_without_its_quote_reads_it_as_unmeasured() {
+        let old = r#"{"client_order_id":"fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42","symbol":"SPY","side":"buy","shares":5000000}"#;
+        let read: OrderSubmitted = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            read,
+            OrderSubmitted {
+                client_order_id: ClientOrderId::new(
+                    RunId::new(Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap()),
+                    42
+                ),
+                symbol: symbol("SPY"),
+                side: Side::Buy,
+                shares: whole(5),
+                quote: None,
+            }
+        );
+    }
+
+    /// A submission carries the decision's quote, or the cause of its absence, and reads back; a crossed quote does not.
+    #[test]
+    fn test_a_submission_journals_the_decision_quote() {
+        let request = OrderRequest::new(
+            orders(
+                &Book::default(),
+                &Target::new(BTreeMap::from([(symbol("SPY"), whole(5))])),
+            )[0]
+            .clone(),
+            ClientOrderId::new(
+                RunId::new(Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap()),
+                42,
+            ),
+        );
+        let quote = crate::common::market::record::Quote::new(
+            symbol("SPY"),
+            instant(0),
+            Price::from_ticks(670_000_000).unwrap(),
+            Price::from_ticks(670_010_000).unwrap(),
+            whole(1),
+            whole(2),
+        )
+        .unwrap();
+        let prefix = r#"{"client_order_id":"fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42","symbol":"SPY","side":"buy","shares":5000000"#;
+        for (quote, written) in [
+            (
+                Some(LastQuote::of(&quote)),
+                format!(
+                    r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670000000,"ask":670010000}}}}}}"#
+                ),
+            ),
+            (
+                None,
+                format!(r#"{prefix},"quote":{{"unquoted":{{"cause":"none_folded"}}}}}}"#),
+            ),
+        ] {
+            let submitted = OrderSubmitted::of(&request, quote);
+            assert_eq!(serde_json::to_string(&submitted).unwrap(), written);
+            assert_eq!(
+                serde_json::from_str::<OrderSubmitted>(&written).unwrap(),
+                submitted
+            );
+        }
+        let crossed = format!(
+            r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670010001,"ask":670010000}}}}}}"#
+        );
+        assert!(serde_json::from_str::<OrderSubmitted>(&crossed).is_err());
     }
 
     #[test]

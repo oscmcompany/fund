@@ -1124,7 +1124,7 @@ mod tests {
         .held()[0]
             .clone();
         let observations = [
-            Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id))),
+            Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id), None)),
             Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
             Observation::OrderRefused(OrderRefused::new(
                 id,
@@ -1229,7 +1229,7 @@ mod tests {
             payloads,
             [
                 format!(
-                    r#"{{"event_type":"order_submitted","payload":{{{id},"symbol":"SPY","side":"buy","shares":5000000}}}}"#
+                    r#"{{"event_type":"order_submitted","payload":{{{id},"symbol":"SPY","side":"buy","shares":5000000,"quote":{{"unquoted":{{"cause":"none_folded"}}}}}}}}"#
                 ),
                 format!(
                     r#"{{"event_type":"order_closed","payload":{{{id},"ending":"canceled","executed":{{"shares":3000000,"average_price":12500000}},"closed_at":"2026-10-06T14:00:00Z"}}}}"#

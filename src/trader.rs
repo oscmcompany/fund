@@ -488,6 +488,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             solution.target(),
             &prices,
+            self.state.quotes(),
             self.settings.limits.per_name(),
             self.settings.patience,
         )
@@ -509,6 +510,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             rounding_allowance(&self.fills),
             &prices,
+            self.state.quotes(),
             self.settings.limits.per_name(),
             self.settings.patience,
         )
@@ -645,10 +647,11 @@ mod tests {
 
     use super::*;
     use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId, Cancel};
+    use crate::common::book::Position;
     use crate::common::guard::{Shortability, Tradability, TradabilityRead};
     use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::aggregate::TradeTotals;
-    use crate::common::market::record::Trade;
+    use crate::common::market::record::{Quote, Trade};
     use crate::common::market::trade_bars::{
         ConditionLetter, Correction, OpenClose, Print, Tape, TradeSums,
     };
@@ -1015,6 +1018,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journaled(&directory).len(), 7);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// An order's submission carries the quote the session's state held for its symbol when it decided, or that it
+    /// held none.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_submission_journals_the_quote_the_decision_held() {
+        let quoted = Quote::new(
+            spy(),
+            at("14:04:50"),
+            Price::from_ticks(700_990_000).unwrap(),
+            Price::from_ticks(701_010_000).unwrap(),
+            Shares::whole(1).unwrap(),
+            Shares::whole(1).unwrap(),
+        )
+        .unwrap();
+        for (quote, expected) in [
+            (
+                Some(quoted),
+                serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:50Z", "bid": 700_990_000, "ask": 701_010_000}}),
+            ),
+            (
+                None,
+                serde_json::json!({"unquoted": {"cause": "none_folded"}}),
+            ),
+        ] {
+            let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+            let broker = Filling::new(701_000_000, funded.clone());
+            let mut session = session(TimeDelta::minutes(5), funded);
+            if let Some(quote) = quote {
+                session.fold_in(MarketEvent::Quote(quote));
+            }
+            let (mut journal, directory) = journal();
+            let tape = Scripted::default();
+            tape.file(print("14:04:30", 701_000_000));
+            session
+                .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+                .await
+                .unwrap();
+            let kinds = journaled(&directory);
+            let submitted = &payloads(&directory)[kinds
+                .iter()
+                .position(|kind| *kind == "order_submitted")
+                .unwrap()];
+            assert_eq!(submitted["quote"], expected);
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
+
+    /// A holding the broker reports outside the session's book and target is closed at reconciliation, and the close's
+    /// submission carries the quote the session's state held for that symbol.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_reconciliation_close_journals_the_quote_the_state_held() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let quoted = Quote::new(
+            aapl.clone(),
+            at("14:04:40"),
+            Price::from_ticks(250_000_000).unwrap(),
+            Price::from_ticks(250_020_000).unwrap(),
+            Shares::whole(1).unwrap(),
+            Shares::whole(1).unwrap(),
+        )
+        .unwrap();
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let strayed = Book::reported(
+            Cash::from_units(10_000 * DOLLAR),
+            [(aapl, Position::from_units(1_000_000))],
+        );
+        let broker = Filling::new(701_000_000, strayed);
+        let mut session = session(TimeDelta::minutes(5), funded);
+        session.fold_in(MarketEvent::Quote(quoted));
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        tape.file(print("14:04:30", 701_000_000));
+        session
+            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .await
+            .unwrap();
+        let submitted: Vec<(serde_json::Value, serde_json::Value)> = journaled(&directory)
+            .iter()
+            .zip(payloads(&directory))
+            .filter(|(kind, _)| **kind == "order_submitted")
+            .map(|(_, payload)| (payload["symbol"].clone(), payload["quote"].clone()))
+            .collect();
+        assert_eq!(
+            submitted,
+            [
+                (
+                    serde_json::json!("SPY"),
+                    serde_json::json!({"unquoted": {"cause": "none_folded"}})
+                ),
+                (
+                    serde_json::json!("AAPL"),
+                    serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:40Z", "bid": 250_000_000, "ask": 250_020_000}})
+                ),
+            ]
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

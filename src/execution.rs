@@ -14,6 +14,7 @@ use crate::common::guard::{
     GuardCause, OrderGuarded, TradabilityRead, TradabilityUnread, Unclosed, guard,
 };
 use crate::common::journal::Observation;
+use crate::common::market::state::LastQuote;
 use crate::common::market::{Price, Symbol};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
@@ -150,7 +151,7 @@ impl JournalFailure {
 /// overlaps it; each order's id is drawn from `sequence`, so a later call on the same sequence cannot repeat one. An
 /// order opening beyond zero is held as unclosed unless the close to flat before it filled whole.
 /// A non-empty tradability read is journaled once, or its failure with its cause, which vouches for nothing, so every
-/// order is held as unread.
+/// order is held as unread; each submission carries its symbol's quote from `quotes`, or that it had none.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one independent input an execution runs from"
@@ -162,6 +163,7 @@ pub async fn execute(
     book: &Book,
     target: &Target,
     prices: &BTreeMap<Symbol, Price>,
+    quotes: &BTreeMap<Symbol, LastQuote>,
     per_name: DollarLimit,
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailure> {
@@ -207,9 +209,10 @@ pub async fn execute(
             continue;
         }
         let request = OrderRequest::new(order.clone(), sequence.draw(journal.run_id()));
+        let quote = quotes.get(request.order().symbol()).copied();
         if let Err(error) = journal.append(
             Utc::now(),
-            Observation::OrderSubmitted(OrderSubmitted::of(&request)),
+            Observation::OrderSubmitted(OrderSubmitted::of(&request, quote)),
         ) {
             return Err(JournalFailure::new(outcomes, error));
         }
@@ -269,6 +272,7 @@ pub async fn reconcile_and_close(
     expected: &Book,
     allowance: Allowance,
     prices: &BTreeMap<Symbol, Price>,
+    quotes: &BTreeMap<Symbol, LastQuote>,
     per_name: DollarLimit,
     patience: Patience,
 ) -> Result<Reconciliation, ReconcileFailure> {
@@ -296,7 +300,7 @@ pub async fn reconcile_and_close(
             .collect(),
     );
     let closing = execute(
-        broker, journal, sequence, &reported, &kept, prices, per_name, patience,
+        broker, journal, sequence, &reported, &kept, prices, quotes, per_name, patience,
     )
     .await
     .map_err(ReconcileFailure::Journal)?;
@@ -650,6 +654,7 @@ mod tests {
             &Book::default(),
             target,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             wide(),
             patience,
         )
@@ -767,6 +772,61 @@ mod tests {
                 "order_refused"
             ]
         );
+    }
+
+    /// Each submission carries its own symbol's quote, and a symbol with none carries why.
+    #[tokio::test(start_paused = true)]
+    async fn test_each_submission_carries_its_own_symbols_quote() {
+        let broker = Scripted::new(&[Answer::Refused, Answer::Refused], &[]);
+        let quote = crate::common::market::record::Quote::new(
+            Symbol::new("SPY").unwrap(),
+            "2026-10-05T14:00:00Z".parse().unwrap(),
+            Price::from_ticks(670_000_000).unwrap(),
+            Price::from_ticks(670_010_000).unwrap(),
+            Shares::whole(1).unwrap(),
+            Shares::whole(1).unwrap(),
+        )
+        .unwrap();
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        execute(
+            &broker,
+            &mut journal,
+            &mut OrderSequence::default(),
+            &Book::default(),
+            &buying(&["AAPL", "SPY"], 1),
+            &BTreeMap::new(),
+            &BTreeMap::from([(Symbol::new("SPY").unwrap(), LastQuote::of(&quote))]),
+            wide(),
+            patient(),
+        )
+        .await
+        .unwrap();
+        let submitted: Vec<_> = journal_records(&directory)
+            .iter()
+            .map(|record| serde_json::to_value(record.observation()).unwrap())
+            .filter(|read| read["event_type"] == "order_submitted")
+            .map(|read| {
+                (
+                    read["payload"]["symbol"].clone(),
+                    read["payload"]["quote"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            submitted,
+            [
+                (
+                    serde_json::json!("AAPL"),
+                    serde_json::json!({"unquoted": {"cause": "none_folded"}})
+                ),
+                (
+                    serde_json::json!("SPY"),
+                    serde_json::json!({"quoted": {"quoted_at": "2026-10-05T14:00:00Z", "bid": 670_000_000, "ask": 670_010_000}})
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1008,6 +1068,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             wide(),
             patient(),
         )
@@ -1049,6 +1110,7 @@ mod tests {
             &mut sequence,
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             wide(),
             patient(),
@@ -1190,6 +1252,7 @@ mod tests {
             book,
             &target,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             wide(),
             patient(),
         )
@@ -1255,6 +1318,7 @@ mod tests {
             expected,
             Allowance::NONE,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             wide(),
             patient(),
         )
@@ -1279,6 +1343,7 @@ mod tests {
             &mut sequence,
             &Book::default(),
             &buying(&["SPY"], 1),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             wide(),
             patient(),
@@ -1321,6 +1386,7 @@ mod tests {
             &mut sequence,
             &before,
             &target,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             wide(),
             patience,
@@ -1428,6 +1494,7 @@ mod tests {
                 &mut sequence,
                 from,
                 &Target::new(to),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 wide(),
                 patience((500, 30_000)),
@@ -1598,6 +1665,7 @@ mod tests {
                     &book,
                     &target,
                     &prices,
+                    &BTreeMap::new(),
                     wide(),
                     patient(),
                 ))
