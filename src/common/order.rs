@@ -229,6 +229,15 @@ impl OrderReport {
     pub fn status(self) -> OrderStatus {
         self.status
     }
+
+    pub fn executed(self) -> Option<OrderExecution> {
+        self.executed
+    }
+
+    /// When the broker last changed the order, as it stamps it.
+    pub fn at(self) -> DateTime<Utc> {
+        self.at
+    }
 }
 
 /// Where an order stands, folded from its reports in the order they were read; only `submitted` and `observe` make
