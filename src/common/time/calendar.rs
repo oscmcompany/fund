@@ -500,7 +500,13 @@ mod tests {
         #[test]
         fn property_next_and_previous_are_inverses_on_trading_days(calendar in any_calendar()) {
             let trading_days = calendar.trading_days_in_range(calendar.range());
-            prop_assert!(trading_days.iter().all(|day| calendar.is_trading_day(*day)));
+            let (first, last) = (calendar.range().first(), calendar.range().last());
+            let walked: Vec<SessionDate> = (0..)
+                .map(|offset| first.plus_calendar_days(offset))
+                .take_while(|day| *day <= last)
+                .filter(|day| calendar.is_trading_day(*day))
+                .collect();
+            prop_assert_eq!(&trading_days, &walked);
             for day in trading_days {
                 if let Some(next) = calendar.next_trading_day(day) {
                     prop_assert_eq!(calendar.previous_trading_day(next), Some(day));
