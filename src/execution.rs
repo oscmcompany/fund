@@ -10,15 +10,18 @@ use tokio::time::Instant;
 use crate::broker::Broker;
 use crate::broker::BrokerError;
 use crate::common::book::{Book, Fill};
-use crate::common::guard::{GuardCause, TradabilityRead, TradabilityUnread, guard};
+use crate::common::guard::{
+    GuardCause, OrderGuarded, TradabilityRead, TradabilityUnread, Unclosed, guard,
+};
 use crate::common::journal::Observation;
-use crate::common::market::{Price, Shares, Symbol};
+use crate::common::market::{Price, Symbol};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
     OrderSequence, OrderState, OrderSubmitted, OrderTrouble, OrderUnresolved, UnresolvedCause,
 };
 use crate::common::reconcile::{Allowance, BookReconciled, reconcile};
-use crate::common::strategy::{Target, orders};
+use crate::common::risk::DollarLimit;
+use crate::common::strategy::{Holding, Target, orders};
 use crate::ingest::FetchError;
 use crate::journal::Journal;
 
@@ -144,9 +147,14 @@ impl JournalFailure {
 
 /// Sends the orders that take `book` to `target` that the guard passes at `prices`, one at a time, sells
 /// first, journaling each under the journal's run, the held-back ones first, and stops after an unresolved order so none
-/// overlaps it; each order's id is drawn from `sequence`, so a later call on the same sequence cannot repeat one.
+/// overlaps it; each order's id is drawn from `sequence`, so a later call on the same sequence cannot repeat one. An
+/// order opening beyond zero is held as unclosed unless the close to flat before it filled whole.
 /// A non-empty tradability read is journaled once, or its failure with its cause, which vouches for nothing, so every
 /// order is held as unread.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one independent input an execution runs from"
+)]
 pub async fn execute(
     broker: &impl Broker,
     journal: &mut Journal,
@@ -154,37 +162,51 @@ pub async fn execute(
     book: &Book,
     target: &Target,
     prices: &BTreeMap<Symbol, Price>,
+    per_name: DollarLimit,
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailure> {
     let mut outcomes = Vec::new();
-    let orders = orders(book, target);
-    let symbols: Vec<Symbol> = orders.iter().map(|order| order.symbol().clone()).collect();
+    let symbols: Vec<Symbol> = orders(book, target)
+        .iter()
+        .map(|order| order.symbol().clone())
+        .collect();
     let tradability = match broker.tradability(&symbols).await {
-        Ok(tradability) if tradability.is_empty() => tradability,
-        Ok(tradability) => {
-            let read = TradabilityRead::new(tradability.clone());
-            if let Err(error) = journal.append(Utc::now(), Observation::TradabilityRead(read)) {
+        Ok(read) if read.is_empty() => read,
+        Ok(read) => {
+            let journaled = Observation::TradabilityRead(read.clone());
+            if let Err(error) = journal.append(Utc::now(), journaled) {
                 return Err(JournalFailure::new(outcomes, error));
             }
-            tradability
+            read
         }
         Err(error) => {
             let unread = TradabilityUnread::new(BrokerFailure::from(&error));
             if let Err(error) = journal.append(Utc::now(), Observation::TradabilityUnread(unread)) {
                 return Err(JournalFailure::new(outcomes, error));
             }
-            BTreeMap::new()
+            TradabilityRead::default()
         }
     };
-    let guarded = guard(orders, &tradability, |symbol| prices.get(symbol).copied());
+    let guarded = guard(book, target, &tradability, per_name, |symbol| {
+        prices.get(symbol).copied()
+    });
+    let mut unclosed = Unclosed::default();
     for held in guarded.held() {
         outcomes.push(OrderOutcome::Guarded(held.cause()));
         if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held.clone())) {
             return Err(JournalFailure::new(outcomes, error));
         }
     }
-    for order in guarded.passed().iter().cloned() {
-        let request = OrderRequest::new(order, sequence.draw(journal.run_id()));
+    for order in guarded.passed() {
+        if unclosed.holds(order) {
+            let held = OrderGuarded::new(order, GuardCause::Unclosed);
+            outcomes.push(OrderOutcome::Guarded(held.cause()));
+            if let Err(error) = journal.append(Utc::now(), Observation::OrderGuarded(held)) {
+                return Err(JournalFailure::new(outcomes, error));
+            }
+            continue;
+        }
+        let request = OrderRequest::new(order.clone(), sequence.draw(journal.run_id()));
         if let Err(error) = journal.append(
             Utc::now(),
             Observation::OrderSubmitted(OrderSubmitted::of(&request)),
@@ -192,6 +214,9 @@ pub async fn execute(
             return Err(JournalFailure::new(outcomes, error));
         }
         let (observation, outcome) = follow(broker, &request, patience).await;
+        let whole =
+            matches!(&outcome, OrderOutcome::Closed(Some(fill)) if fill.shares() == order.shares());
+        unclosed.record(order, whole);
         let stop = match outcome {
             OrderOutcome::Guarded(_) | OrderOutcome::Closed(_) | OrderOutcome::Refused => false,
             OrderOutcome::Unresolved { .. } => true,
@@ -229,9 +254,14 @@ pub enum Reconciliation {
 }
 
 /// Reads the broker's book against `expected`, journals the reading as `book_reconciled`, and when they diverge tries
-/// to close every short and every position the journal expected none of, keeping the rest at the broker's count; the
-/// book returned is the broker's after those attempts. A close can be held, refused, partial or unresolved, so the
-/// caller checks `closing` before trading from that book, and refuses further trading on any divergence.
+/// to close every position the journal did not expect on the side the broker reports, and every one a `Holding` refuses,
+/// such as a fractional short, keeping the rest at the broker's count; the book returned is the broker's after those
+/// attempts. A close can be held, refused, partial or unresolved, so the caller checks `closing` before trading from
+/// that book, and refuses further trading on any divergence.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one independent input an execution runs from"
+)]
 pub async fn reconcile_and_close(
     broker: &impl Broker,
     journal: &mut Journal,
@@ -239,6 +269,7 @@ pub async fn reconcile_and_close(
     expected: &Book,
     allowance: Allowance,
     prices: &BTreeMap<Symbol, Price>,
+    per_name: DollarLimit,
     patience: Patience,
 ) -> Result<Reconciliation, ReconcileFailure> {
     let reported = broker.book().await.map_err(ReconcileFailure::Unread)?;
@@ -249,21 +280,23 @@ pub async fn reconcile_and_close(
     if reading.agrees() {
         return Ok(Reconciliation::Agreed { book: reported });
     }
-    // Kept only where the journal expected a holding and the broker reports a long one; a short is never ours.
+    // Kept only where the journal expected a holding on the side the broker reports, a short only in whole shares.
     let kept = Target::new(
         reported
             .positions()
             .iter()
-            .filter(|(symbol, _)| expected.position(symbol).units() != 0)
+            .filter(|(symbol, position)| {
+                expected.position(symbol).units().signum() == position.units().signum()
+            })
             .filter_map(|(symbol, position)| {
-                u64::try_from(position.units())
+                Holding::try_from(*position)
                     .ok()
-                    .map(|units| (symbol.clone(), Shares::from_units(units)))
+                    .map(|holding| (symbol.clone(), holding))
             })
             .collect(),
     );
     let closing = execute(
-        broker, journal, sequence, &reported, &kept, prices, patience,
+        broker, journal, sequence, &reported, &kept, prices, per_name, patience,
     )
     .await
     .map_err(ReconcileFailure::Journal)?;
@@ -388,7 +421,7 @@ mod tests {
     use super::*;
     use crate::broker::{BrokerOrder, BrokerOrderId, Cancel, PaperAccount};
     use crate::common::book::{Cash, Position, Side};
-    use crate::common::guard::{OrderGuarded, Tradability};
+    use crate::common::guard::{OrderGuarded, Shortability, Tradability};
     use crate::common::journal::{ReadLine, Record, RunId, read};
     use crate::common::market::{DollarVolume, Price, Shares, Symbol};
     use crate::common::monoid::{Monoid, concatenate};
@@ -412,6 +445,8 @@ mod tests {
         submit_takes: Duration,
         /// The tradability reported, every symbol tradable in any amount when `None`.
         readings: Option<BTreeMap<Symbol, Tradability>>,
+        /// The shortability reported, none unless set.
+        borrow: BTreeMap<Symbol, Shortability>,
         tradability_fails: bool,
         /// The books reported, the last repeating.
         books: Mutex<VecDeque<Book>>,
@@ -428,6 +463,7 @@ mod tests {
                 cancel_fails: false,
                 submit_takes: Duration::ZERO,
                 readings: None,
+                borrow: BTreeMap::new(),
                 tradability_fails: false,
                 books: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
@@ -513,10 +549,7 @@ mod tests {
             })
         }
 
-        async fn tradability(
-            &self,
-            symbols: &[Symbol],
-        ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
+        async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
             self.calls.lock().unwrap().push("tradability");
             if self.tradability_fails {
                 return Err(BrokerError::Fetch(FetchError::Exhausted {
@@ -529,10 +562,13 @@ mod tests {
                     .as_ref()
                     .map_or(Tradability::Fractionable, |readings| readings[symbol])
             };
-            Ok(symbols
-                .iter()
-                .map(|symbol| (symbol.clone(), reading(symbol)))
-                .collect())
+            Ok(TradabilityRead::new(
+                symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), reading(symbol)))
+                    .collect(),
+                self.borrow.clone(),
+            ))
         }
     }
 
@@ -543,6 +579,11 @@ mod tests {
     /// A patience polling every `poll` and open for `open_for`, both in milliseconds.
     fn patience((poll, open_for): (u64, u64)) -> Patience {
         Patience::new(Duration::from_millis(poll), Duration::from_millis(open_for)).unwrap()
+    }
+
+    /// A per-name limit of a billion dollars, which no order here reaches.
+    fn wide() -> DollarLimit {
+        DollarLimit::new(Cash::from_units(1_000_000_000 * 1_000_000_000_000)).unwrap()
     }
 
     fn patient() -> Patience {
@@ -609,6 +650,7 @@ mod tests {
             &Book::default(),
             target,
             &BTreeMap::new(),
+            wide(),
             patience,
         )
         .await
@@ -966,6 +1008,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
+            wide(),
             patient(),
         )
         .await
@@ -1007,6 +1050,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
+            wide(),
             patient(),
         )
         .await
@@ -1055,18 +1099,26 @@ mod tests {
         assert_eq!(events, ["book_reconciled"]);
     }
 
-    /// The broker holds AAPL the journal never bought, a QQQ short where it expected a long, and more SPY than it
-    /// expected: AAPL is sold, QQQ bought back, SPY kept at the broker's count, and the book returned is the broker's
-    /// after the close.
+    /// The broker holds AAPL the journal never bought, a QQQ short where it expected a long, more SPY than it expected
+    /// and more DIA short: AAPL is sold, QQQ bought back, SPY and DIA kept at the broker's count, and the book returned
+    /// is the broker's after the close.
     #[tokio::test(start_paused = true)]
     async fn test_a_divergence_closes_what_the_journal_did_not_expect() {
         let broker = Scripted::new(&[Answer::Stands(FILLED, 1), Answer::Stands(FILLED, 1)], &[]);
-        let expected = holding(1_000, &[("QQQ", 1_000_000), ("SPY", 1_000_000)]);
+        let expected = holding(
+            1_000,
+            &[("DIA", -2_000_000), ("QQQ", 1_000_000), ("SPY", 1_000_000)],
+        );
         let reported = holding(
             1_000,
-            &[("AAPL", 1_000_000), ("QQQ", -1_000_000), ("SPY", 2_000_000)],
+            &[
+                ("AAPL", 1_000_000),
+                ("DIA", -3_000_000),
+                ("QQQ", -1_000_000),
+                ("SPY", 2_000_000),
+            ],
         );
-        let after = holding(1_100, &[("SPY", 2_000_000)]);
+        let after = holding(1_100, &[("DIA", -3_000_000), ("SPY", 2_000_000)]);
         *broker.books.lock().unwrap() = VecDeque::from([reported, after.clone()]);
         let (reconciliation, events) = reconciling(&broker, &expected).await;
         let Reconciliation::Diverged {
@@ -1083,7 +1135,7 @@ mod tests {
             .iter()
             .map(|gap| gap.symbol().as_str())
             .collect();
-        assert_eq!(gaps, ["AAPL", "QQQ", "SPY"]);
+        assert_eq!(gaps, ["AAPL", "DIA", "QQQ", "SPY"]);
         let closed: Vec<(&str, Side, u64)> = closing
             .iter()
             .filter_map(|outcome| match outcome {
@@ -1118,6 +1170,77 @@ mod tests {
         );
     }
 
+    /// Runs `execute` from `book` to 2 SPY short against `broker`, which reads SPY easy to borrow, returning its
+    /// outcomes and the event types journaled.
+    async fn shorting(
+        broker: &mut Scripted,
+        book: &Book,
+    ) -> (Vec<OrderOutcome>, Vec<&'static str>) {
+        broker.borrow = BTreeMap::from([(Symbol::new("SPY").unwrap(), Shortability::EasyToBorrow)]);
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let target = Target::new(BTreeMap::from([(
+            Symbol::new("SPY").unwrap(),
+            Holding::short(Shares::whole(2).unwrap()).unwrap(),
+        )]));
+        let outcomes = execute(
+            &*broker,
+            &mut journal,
+            &mut OrderSequence::default(),
+            book,
+            &target,
+            &BTreeMap::new(),
+            wide(),
+            patient(),
+        )
+        .await
+        .unwrap();
+        let events = journaled(&directory);
+        std::fs::remove_dir_all(&directory).unwrap();
+        (outcomes, events)
+    }
+
+    /// From 3 SPY long to 2 short, the close of 3 fills whole and then the open of 2 goes out.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_target_across_zero_closes_then_opens() {
+        let mut broker =
+            Scripted::new(&[Answer::Stands(FILLED, 3), Answer::Stands(FILLED, 2)], &[]);
+        let (outcomes, events) = shorting(&mut broker, &holding(0, &[("SPY", 3_000_000)])).await;
+        let fills: Vec<Option<u64>> = outcomes.iter().map(shares_filled).collect();
+        assert_eq!(fills, [Some(3), Some(2)]);
+        assert_eq!(broker.calls(), ["submit", "submit"]);
+        assert_eq!(
+            events,
+            [
+                "tradability_read",
+                "order_submitted",
+                "order_closed",
+                "order_submitted",
+                "order_closed"
+            ]
+        );
+    }
+
+    /// From 3 SPY long to 2 short, a close canceled after filling 1 holds the open as unclosed, so no order crosses
+    /// zero.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_open_after_a_close_that_fell_short_is_held() {
+        let mut broker = Scripted::new(&[Answer::Stands(CANCELED, 1)], &[]);
+        let (outcomes, events) = shorting(&mut broker, &holding(0, &[("SPY", 3_000_000)])).await;
+        assert_eq!(shares_filled(&outcomes[0]), Some(1));
+        assert_eq!(outcomes[1..], [OrderOutcome::Guarded(GuardCause::Unclosed)]);
+        assert_eq!(broker.calls(), ["submit"]);
+        assert_eq!(
+            events,
+            [
+                "tradability_read",
+                "order_submitted",
+                "order_closed",
+                "order_guarded"
+            ]
+        );
+    }
+
     async fn reconciling(
         broker: &Scripted,
         expected: &Book,
@@ -1132,6 +1255,7 @@ mod tests {
             expected,
             Allowance::NONE,
             &BTreeMap::new(),
+            wide(),
             patient(),
         )
         .await
@@ -1156,6 +1280,7 @@ mod tests {
             &Book::default(),
             &buying(&["SPY"], 1),
             &BTreeMap::new(),
+            wide(),
             patient(),
         )
         .await
@@ -1197,6 +1322,7 @@ mod tests {
             &before,
             &target,
             &BTreeMap::new(),
+            wide(),
             patience,
         )
         .await
@@ -1252,6 +1378,118 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// While the market is open, shorts one SPY share and covers it, then prints every account activity since the
+    /// week before other than a fill, so a borrow fee can be looked for.
+    #[tokio::test]
+    #[ignore = "trades on the Alpaca paper account while the market is open; run deliberately under a development secretspec profile"]
+    async fn live_a_paper_short_is_opened_covered_and_its_fees_read() {
+        use crate::ingest::retry::{send, with_retries};
+
+        assert_eq!(
+            std::env::var("ALPACA_IS_PAPER").as_deref(),
+            Ok("true"),
+            "run only against the paper account"
+        );
+        let get = |path: String| async move {
+            let alpaca = Alpaca::from_environment(reqwest::Client::new()).unwrap();
+            let body = with_retries(|| send(alpaca.trading(reqwest::Method::GET, &path)))
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let clock = get("/v2/clock".to_string()).await;
+        assert_eq!(clock["is_open"], true, "run while the market is open");
+        let account =
+            PaperAccount::new(Alpaca::from_environment(reqwest::Client::new()).unwrap()).unwrap();
+        let before = account.book().await.unwrap();
+        let spy = Symbol::new("SPY").unwrap();
+        assert_eq!(
+            before.position(&spy),
+            Position::default(),
+            "run with SPY flat"
+        );
+        let holdings: BTreeMap<Symbol, Holding> = before
+            .positions()
+            .iter()
+            .map(|(symbol, position)| (symbol.clone(), Holding::try_from(*position).unwrap()))
+            .collect();
+        let mut shorted = holdings.clone();
+        shorted.insert(
+            spy.clone(),
+            Holding::short(Shares::whole(1).unwrap()).unwrap(),
+        );
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let mut sequence = OrderSequence::default();
+        let mut trade = async |from: &Book, to: BTreeMap<Symbol, Holding>| {
+            execute(
+                &account,
+                &mut journal,
+                &mut sequence,
+                from,
+                &Target::new(to),
+                &BTreeMap::new(),
+                wide(),
+                patience((500, 30_000)),
+            )
+            .await
+            .unwrap()
+        };
+        // An unresolved order leaves the position uncertain, so the run stops with its journal rather than trade on.
+        let settled = |stage: &str, outcomes: &[OrderOutcome]| {
+            for outcome in outcomes {
+                match outcome {
+                    OrderOutcome::Unresolved { .. } => panic!(
+                        "{stage} left {outcome:?}; resolve SPY on the paper account by hand, journal at {}",
+                        directory.display()
+                    ),
+                    OrderOutcome::Guarded(_) | OrderOutcome::Closed(_) | OrderOutcome::Refused => {}
+                }
+            }
+        };
+        let opened = trade(&before, shorted).await;
+        settled("the short", &opened);
+        let short = account.book().await.unwrap();
+        let covered = trade(&short, holdings).await;
+        settled("the cover", &covered);
+        let after = account.book().await.unwrap();
+        let read = journal_records(&directory)
+            .into_iter()
+            .find(|record| record.observation().event_type() == "tradability_read")
+            .map(|record| serde_json::to_value(record.observation()).unwrap()["payload"].clone());
+        std::fs::remove_dir_all(&directory).unwrap();
+        println!("borrow read {read:?}");
+        println!("opened {opened:?}, covered {covered:?}");
+        let filled =
+            |outcomes: &[OrderOutcome]| outcomes.iter().map(shares_filled).collect::<Vec<_>>();
+        assert_eq!(
+            filled(&opened),
+            [Some(1)],
+            "flatten SPY on the paper account by hand if short"
+        );
+        assert_eq!(short.position(&spy), Position::from_units(-1_000_000));
+        assert_eq!(
+            filled(&covered),
+            [Some(1)],
+            "cover SPY on the paper account by hand"
+        );
+        assert_eq!(after.positions(), before.positions());
+        let since = (Utc::now() - chrono::TimeDelta::days(7))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let activities = get(format!(
+            "/v2/account/activities?after={since}&direction=asc&page_size=100"
+        ))
+        .await;
+        let activities = activities.as_array().unwrap();
+        println!("{} activities since {since}", activities.len());
+        for activity in activities
+            .iter()
+            .filter(|activity| activity["activity_type"] != "FILL")
+        {
+            println!("{activity}");
+        }
+    }
+
     /// A broker that fills every order whole at its symbol's price on submit, and reads only the symbols it was given.
     struct Exact {
         prices: BTreeMap<Symbol, Price>,
@@ -1283,14 +1521,14 @@ mod tests {
             unreachable!("execute never reads the book")
         }
 
-        async fn tradability(
-            &self,
-            symbols: &[Symbol],
-        ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
-            Ok(symbols
-                .iter()
-                .filter_map(|symbol| Some((symbol.clone(), *self.readings.get(symbol)?)))
-                .collect())
+        async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
+            Ok(TradabilityRead::new(
+                symbols
+                    .iter()
+                    .filter_map(|symbol| Some((symbol.clone(), *self.readings.get(symbol)?)))
+                    .collect(),
+                BTreeMap::new(),
+            ))
         }
     }
 
@@ -1360,6 +1598,7 @@ mod tests {
                     &book,
                     &target,
                     &prices,
+                    wide(),
                     patient(),
                 ))
                 .unwrap();
@@ -1375,7 +1614,8 @@ mod tests {
                     }
                 }
             }
-            let guarded = guard(orders(&book, &target), &readings, |symbol| prices.get(symbol).copied());
+            let read = TradabilityRead::new(readings, BTreeMap::new());
+            let guarded = guard(&book, &target, &read, wide(), |symbol| prices.get(symbol).copied());
             let direct = book.combine(concatenate(guarded.passed().iter().map(|order| {
                 Book::of(
                     &Fill::new(

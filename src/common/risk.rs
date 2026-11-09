@@ -141,6 +141,10 @@ impl Limits {
         })
     }
 
+    pub fn per_name(&self) -> DollarLimit {
+        self.per_name
+    }
+
     pub fn dollars(&self, limit: Limit) -> Cash {
         match limit {
             Limit::Gross => self.gross.cash(),
@@ -661,6 +665,46 @@ mod tests {
             .unwrap(),
             (wanted, vec![])
         );
+    }
+
+    /// A short counts against the book's worth: 10 AAPL short at $100 owes $1,000, so $10,000 cash is $9,000 of
+    /// equity and $1,000 lost from the $10,000 opening, where $10,001 cash loses less.
+    #[test]
+    fn test_a_short_position_is_valued_as_owed() {
+        let wanted = target(&[("SPY", 1_000_000)]);
+        let price = prices(&[("SPY", 500_000_000), ("AAPL", 100_000_000)]);
+        let holding = |cash: i128| {
+            Book::reported(
+                dollars(cash),
+                [(symbol("AAPL"), Position::from_units(-10_000_000))],
+            )
+        };
+        let flat = risk(
+            &limits(10_000, 10_000),
+            open(),
+            dollars(10_000),
+            &holding(10_000),
+            &price,
+            wanted.clone(),
+        );
+        assert_eq!(
+            flat,
+            Ok((
+                Target::default(),
+                vec![Cut::LossLimit {
+                    loss: dollars(1_000)
+                }]
+            ))
+        );
+        let kept = risk(
+            &limits(10_000, 10_000),
+            open(),
+            dollars(10_000),
+            &holding(10_001),
+            &price,
+            wanted.clone(),
+        );
+        assert_eq!(kept.unwrap(), (wanted, vec![]));
     }
 
     /// $1,000 a name at $300 buys 3.333333 shares, floored onto the share grid.

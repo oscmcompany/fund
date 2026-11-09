@@ -8,7 +8,7 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Cash, Position};
-use crate::common::guard::Tradability;
+use crate::common::guard::{Shortability, Tradability, TradabilityRead};
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol, SymbolRefusal};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest,
@@ -38,11 +38,11 @@ pub trait Broker {
         id: &BrokerOrderId,
     ) -> impl Future<Output = Result<Cancel, BrokerError>> + Send;
 
-    /// What the broker reports of each symbol's trading, read before orders in them go out.
+    /// What the broker reports of each symbol's trading and short sale, read before orders in them go out.
     fn tradability(
         &self,
         symbols: &[Symbol],
-    ) -> impl Future<Output = Result<BTreeMap<Symbol, Tradability>, BrokerError>> + Send;
+    ) -> impl Future<Output = Result<TradabilityRead, BrokerError>> + Send;
 
     /// The account's cash and positions as a book, the authority a journal's fills are reconciled against.
     fn book(&self) -> impl Future<Output = Result<Book, BrokerError>> + Send;
@@ -174,6 +174,27 @@ struct PositionPayload {
     symbol: String,
     /// Negative for a short position.
     qty: String,
+    side: AlpacaPositionSide,
+}
+
+/// A position's side as Alpaca documents it, read so a quantity whose sign disagrees is refused rather than trusted.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum AlpacaPositionSide {
+    Long,
+    Short,
 }
 
 /// An asset's status as Alpaca documents it; any other string fails to parse.
@@ -236,6 +257,8 @@ struct AssetPayload {
     status: AlpacaAssetStatus,
     tradable: bool,
     fractionable: bool,
+    shortable: bool,
+    easy_to_borrow: bool,
 }
 
 #[derive(Deserialize)]
@@ -365,18 +388,19 @@ impl Broker for PaperAccount {
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
     }
 
-    /// What Alpaca reports of each symbol's trading, one asset read apiece.
-    async fn tradability(
-        &self,
-        symbols: &[Symbol],
-    ) -> Result<BTreeMap<Symbol, Tradability>, BrokerError> {
-        let mut readings = BTreeMap::new();
+    /// What Alpaca reports of each symbol's trading and short sale, one asset read apiece.
+    async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
+        let (mut readings, mut shortability) = (BTreeMap::new(), BTreeMap::new());
         for symbol in symbols {
             let path = format!("/v2/assets/{}", symbol.as_str());
             let outcome = with_retries(|| send(self.alpaca.trading(Method::GET, &path))).await;
-            readings.insert(symbol.clone(), asset(outcome)?);
+            let (tradability, borrow) = asset(outcome)?;
+            readings.insert(symbol.clone(), tradability);
+            if let Some(borrow) = borrow {
+                shortability.insert(symbol.clone(), borrow);
+            }
         }
-        Ok(readings)
+        Ok(TradabilityRead::new(readings, shortability))
     }
 }
 
@@ -401,22 +425,29 @@ fn canceled(outcome: Result<Vec<u8>, FetchError>) -> Result<Cancel, BrokerError>
     }
 }
 
-/// An asset read as a reading; a 404 is Alpaca's answer for a symbol it does not list.
-fn asset(outcome: Result<Vec<u8>, FetchError>) -> Result<Tradability, BrokerError> {
+/// An asset read as its tradability and shortability; a 404 is Alpaca's answer for a symbol it does not list, which
+/// has no shortability.
+fn asset(
+    outcome: Result<Vec<u8>, FetchError>,
+) -> Result<(Tradability, Option<Shortability>), BrokerError> {
     let body = match outcome {
         Ok(body) => body,
-        Err(FetchError::Refused { status: 404, .. }) => return Ok(Tradability::Unlisted),
+        Err(FetchError::Refused { status: 404, .. }) => return Ok((Tradability::Unlisted, None)),
         Err(error) => return Err(error.into()),
     };
     let payload: AssetPayload = parse(&body)?;
-    Ok(
-        match (payload.status, payload.tradable, payload.fractionable) {
-            (AlpacaAssetStatus::Active, true, true) => Tradability::Fractionable,
-            (AlpacaAssetStatus::Active, true, false) => Tradability::WholeSharesOnly,
-            (AlpacaAssetStatus::Active, false, true | false)
-            | (AlpacaAssetStatus::Inactive, true | false, true | false) => Tradability::Untradable,
-        },
-    )
+    let tradability = match (payload.status, payload.tradable, payload.fractionable) {
+        (AlpacaAssetStatus::Active, true, true) => Tradability::Fractionable,
+        (AlpacaAssetStatus::Active, true, false) => Tradability::WholeSharesOnly,
+        (AlpacaAssetStatus::Active, false, true | false)
+        | (AlpacaAssetStatus::Inactive, true | false, true | false) => Tradability::Untradable,
+    };
+    let shortability = match (payload.shortable, payload.easy_to_borrow) {
+        (true, true) => Shortability::EasyToBorrow,
+        (true, false) => Shortability::HardToBorrow,
+        (false, true | false) => Shortability::Unshortable,
+    };
+    Ok((tradability, Some(shortability)))
 }
 
 fn parse<Payload: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<Payload, BrokerError> {
@@ -441,6 +472,15 @@ fn book(account: &[u8], positions: &[u8]) -> Result<Book, BrokerError> {
         .map(|position| {
             let symbol = Symbol::new(&position.symbol).map_err(BrokerError::Symbol)?;
             let units = decimal(&position.qty, SHARE_DIGITS, Rounding::Exact, "qty")?;
+            match (position.side, units < 0) {
+                (AlpacaPositionSide::Long, false) | (AlpacaPositionSide::Short, true) => {}
+                (AlpacaPositionSide::Long, true) | (AlpacaPositionSide::Short, false) => {
+                    return Err(BrokerError::Malformed {
+                        field: "qty",
+                        raw: position.qty,
+                    });
+                }
+            }
             Ok((symbol, Position::from_units(units)))
         })
         .collect::<Result<Vec<_>, BrokerError>>()?;
@@ -724,9 +764,18 @@ mod tests {
         assert!(book(b"", b"[]").is_err());
         assert!(book(account, b"").is_err());
         assert!(matches!(
-            book(account, br#"[{"symbol":"spy","qty":"1"}]"#),
+            book(account, br#"[{"symbol":"spy","qty":"1","side":"long"}]"#),
             Err(BrokerError::Symbol(SymbolRefusal::Malformed { raw })) if raw == "spy"
         ));
+        for disagreeing in [
+            br#"[{"symbol":"F","qty":"1","side":"short"}]"#.as_slice(),
+            br#"[{"symbol":"F","qty":"-1","side":"long"}]"#.as_slice(),
+        ] {
+            assert!(matches!(
+                book(account, disagreeing),
+                Err(BrokerError::Malformed { field: "qty", .. })
+            ));
+        }
     }
 
     /// Alpaca's documented names read alike through serde and strum, and nothing else reads.
@@ -777,6 +826,17 @@ mod tests {
         }
         assert!(serde_json::from_str::<AlpacaOrderStatus>(r#""Filled""#).is_err());
         assert!(serde_json::from_str::<AlpacaAssetStatus>(r#""delisted""#).is_err());
+        let sides: Vec<&str> = AlpacaPositionSide::iter().map(Into::into).collect();
+        assert_eq!(sides, ["long", "short"]);
+        for side in AlpacaPositionSide::iter() {
+            let named = format!("\"{side}\"");
+            assert_eq!(
+                serde_json::from_str::<AlpacaPositionSide>(&named).unwrap(),
+                side
+            );
+            assert_eq!(side.to_string().parse(), Ok(side));
+        }
+        assert!(serde_json::from_str::<AlpacaPositionSide>(r#""Long""#).is_err());
     }
 
     #[test]
@@ -818,34 +878,31 @@ mod tests {
         ));
     }
 
-    /// Assets as the paper account returned them on 2026-10-06, trimmed to the fields read and two beside, and its
-    /// 404 for a symbol it does not list.
+    /// Assets as the paper account returned them on 2026-11-08, trimmed to the fields read and one beside, a synthetic
+    /// shortable name that is hard to borrow, and its 404 for a symbol it does not list.
     #[test]
     fn test_assets_read_as_the_paper_account_sends_them() {
         let read = |body: &str| asset(Ok(body.as_bytes().to_vec())).unwrap();
+        let readings = [
+            r#"{"symbol":"SPY","status":"active","tradable":true,"fractionable":true,"shortable":true,"easy_to_borrow":true}"#,
+            r#"{"symbol":"VWDRY","status":"active","tradable":true,"fractionable":false,"shortable":true,"easy_to_borrow":true}"#,
+            r#"{"symbol":"SSUNF","status":"active","tradable":false,"fractionable":false,"shortable":false,"easy_to_borrow":false}"#,
+            r#"{"symbol":"DDG","status":"inactive","tradable":false,"fractionable":true,"shortable":false,"easy_to_borrow":false}"#,
+            r#"{"symbol":"HTB","status":"active","tradable":true,"fractionable":true,"shortable":true,"easy_to_borrow":false}"#,
+        ]
+        .map(read);
         assert_eq!(
-            read(
-                r#"{"symbol":"SPY","status":"active","tradable":true,"fractionable":true,"shortable":true}"#
-            ),
-            Tradability::Fractionable
-        );
-        assert_eq!(
-            read(
-                r#"{"symbol":"VWDRY","status":"active","tradable":true,"fractionable":false,"shortable":true}"#
-            ),
-            Tradability::WholeSharesOnly
-        );
-        assert_eq!(
-            read(
-                r#"{"symbol":"SSUNF","status":"active","tradable":false,"fractionable":false,"shortable":false}"#
-            ),
-            Tradability::Untradable
-        );
-        assert_eq!(
-            read(
-                r#"{"symbol":"DDG","status":"inactive","tradable":false,"fractionable":true,"shortable":false}"#
-            ),
-            Tradability::Untradable
+            readings,
+            [
+                (Tradability::Fractionable, Some(Shortability::EasyToBorrow)),
+                (
+                    Tradability::WholeSharesOnly,
+                    Some(Shortability::EasyToBorrow)
+                ),
+                (Tradability::Untradable, Some(Shortability::Unshortable)),
+                (Tradability::Untradable, Some(Shortability::Unshortable)),
+                (Tradability::Fractionable, Some(Shortability::HardToBorrow)),
+            ]
         );
         let refused = |status| {
             asset(Err(FetchError::Refused {
@@ -853,13 +910,13 @@ mod tests {
                 body: r#"{"code":40410000,"message":"asset not found for NOSUCHSYM"}"#.to_string(),
             }))
         };
-        assert_eq!(refused(404).unwrap(), Tradability::Unlisted);
+        assert_eq!(refused(404).unwrap(), (Tradability::Unlisted, None));
         assert!(matches!(
             refused(403),
             Err(BrokerError::Fetch(FetchError::Refused { status: 403, .. }))
         ));
         assert!(matches!(
-            asset(Ok(br#"{"status":"delisted","tradable":false,"fractionable":false}"#.to_vec())),
+            asset(Ok(br#"{"status":"delisted","tradable":false,"fractionable":false,"shortable":false,"easy_to_borrow":false}"#.to_vec())),
             Err(BrokerError::Fetch(FetchError::Malformed { reason })) if reason.contains("delisted")
         ));
     }

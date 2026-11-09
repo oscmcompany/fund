@@ -272,6 +272,15 @@ pub struct Order {
     symbol: Symbol,
     side: Side,
     shares: Shares,
+    leg: Leg,
+}
+
+/// Whether an order takes its holding toward flat or away from it; no order does both, since a broker refuses one
+/// across zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leg {
+    Reducing,
+    Increasing,
 }
 
 impl Order {
@@ -286,9 +295,49 @@ impl Order {
     pub fn shares(&self) -> Shares {
         self.shares
     }
+
+    pub fn leg(&self) -> Leg {
+        self.leg
+    }
+
+    /// Whether the order opens or adds to a short, the only kind that borrows.
+    pub fn borrows(&self) -> bool {
+        match (self.side, self.leg) {
+            (Side::Sell, Leg::Increasing) => true,
+            (Side::Sell, Leg::Reducing) | (Side::Buy, Leg::Reducing | Leg::Increasing) => false,
+        }
+    }
+
+    /// The orders taking `symbol` from `from` to `to` millionths, which lie on one side of zero: none when equal, and
+    /// a gap past one order's `u64` units as several.
+    fn between(symbol: &Symbol, from: i128, to: i128) -> Vec<Self> {
+        let side = match to.cmp(&from) {
+            Ordering::Equal => return Vec::new(),
+            Ordering::Greater => Side::Buy,
+            Ordering::Less => Side::Sell,
+        };
+        let leg = match to.unsigned_abs() < from.unsigned_abs() {
+            true => Leg::Reducing,
+            false => Leg::Increasing,
+        };
+        let mut remaining = to.abs_diff(from);
+        let mut split = Vec::new();
+        while remaining > 0 {
+            let units = u64::try_from(remaining).unwrap_or(u64::MAX);
+            remaining -= u128::from(units);
+            split.push(Self {
+                symbol: symbol.clone(),
+                side,
+                shares: Shares::from_units(units),
+                leg,
+            });
+        }
+        split
+    }
 }
 
-/// The orders that take `book` to `target`, sells before buys so a rebalance frees cash before spending it.
+/// The orders that take `book` to `target`, sells before buys so a rebalance frees cash before spending it. A gap
+/// across zero is split there, the close to flat going before the open beyond it.
 pub fn orders(book: &Book, target: &Target) -> Vec<Order> {
     // Straight to the target, which holds while our orders are small against volume; a schedule stage goes here if not.
     let symbols = book.positions().keys().chain(target.0.keys());
@@ -296,24 +345,13 @@ pub fn orders(book: &Book, target: &Target) -> Vec<Order> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .flat_map(|symbol| {
-            let gap = target.wanted(symbol) - book.position(symbol).units();
-            let side = match gap.cmp(&0) {
-                Ordering::Equal => return Vec::new(),
-                Ordering::Greater => Side::Buy,
-                Ordering::Less => Side::Sell,
+            let (held, wanted) = (book.position(symbol).units(), target.wanted(symbol));
+            let waypoint = match held.signum() * wanted.signum() < 0 {
+                true => 0,
+                false => wanted,
             };
-            // A gap past one order's `u64` units goes out as several orders.
-            let mut remaining = gap.unsigned_abs();
-            let mut split = Vec::new();
-            while remaining > 0 {
-                let units = u64::try_from(remaining).unwrap_or(u64::MAX);
-                remaining -= u128::from(units);
-                split.push(Order {
-                    symbol: symbol.clone(),
-                    side,
-                    shares: Shares::from_units(units),
-                });
-            }
+            let mut split = Order::between(symbol, held, waypoint);
+            split.extend(Order::between(symbol, waypoint, wanted));
             split
         })
         .collect();
@@ -327,7 +365,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        BTreeMap, Book, Holding, HoldingRefusal, Order, Position, Progress, ProgressRefusal,
+        BTreeMap, Book, Holding, HoldingRefusal, Leg, Order, Position, Progress, ProgressRefusal,
         Shares, Side, Symbol, Target, TimeDelta, orders, roll,
     };
     use crate::common::book::{Cash, Fill};
@@ -523,7 +561,7 @@ mod tests {
         );
     }
 
-    /// A short target sells the book through zero: 3 held and 2 short wanted sells 5.
+    /// A short target sells the book through zero in two orders: 3 held and 2 short wanted sells the 3, then 2 short.
     #[test]
     fn test_a_short_target_sells_through_zero() {
         let book = holding(&BTreeMap::from([(
@@ -536,9 +574,30 @@ mod tests {
         )]));
         let sides: Vec<_> = orders(&book, &target)
             .iter()
-            .map(|order| (order.side(), order.shares()))
+            .map(|order| (order.side(), order.shares(), order.leg(), order.borrows()))
             .collect();
-        assert_eq!(sides, [(Side::Sell, Shares::whole(5).unwrap())]);
+        assert_eq!(
+            sides,
+            [
+                (Side::Sell, Shares::whole(3).unwrap(), Leg::Reducing, false),
+                (Side::Sell, Shares::whole(2).unwrap(), Leg::Increasing, true),
+            ]
+        );
+        let back = orders(
+            &holding(target.holdings()),
+            &Target::new(BTreeMap::from([(symbol("SPY"), Shares::whole(1).unwrap())])),
+        );
+        let sides: Vec<_> = back
+            .iter()
+            .map(|order| (order.side(), order.shares(), order.leg(), order.borrows()))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                (Side::Buy, Shares::whole(2).unwrap(), Leg::Reducing, false),
+                (Side::Buy, Shares::whole(1).unwrap(), Leg::Increasing, false),
+            ]
+        );
     }
 
     /// Halfway from 1 short to 4 short is 2.5 short, truncated toward zero to 2; capping a 3-share short at 2.5 keeps 2.
@@ -596,6 +655,28 @@ mod tests {
             let wanted = positions(&target);
             prop_assert_eq!(after.positions().keys().collect::<Vec<_>>(), wanted.keys().collect::<Vec<_>>());
             prop_assert_eq!(after.positions(), &wanted);
+        }
+
+        /// Filled one at a time, no order takes a holding across zero, each reduces or increases its size as its leg
+        /// says, and an order borrows exactly when it leaves the holding further short.
+        #[test]
+        fn property_no_order_crosses_zero(held in arbitrary_holdings(), wanted in arbitrary_holdings()) {
+            let book = holding(&held);
+            let mut positions: BTreeMap<Symbol, i128> =
+                book.positions().iter().map(|(symbol, position)| (symbol.clone(), position.units())).collect();
+            for order in orders(&book, &Target::new(wanted)) {
+                let before = positions.get(order.symbol()).copied().unwrap_or(0);
+                let units = i128::from(order.shares().units());
+                let after = match order.side() {
+                    Side::Buy => before + units,
+                    Side::Sell => before - units,
+                };
+                prop_assert!(before.signum() * after.signum() >= 0, "{before} to {after}");
+                let reducing = after.unsigned_abs() < before.unsigned_abs();
+                prop_assert_eq!(order.leg() == Leg::Reducing, reducing);
+                prop_assert_eq!(order.borrows(), after < 0 && after < before);
+                positions.insert(order.symbol().clone(), after);
+            }
         }
 
         /// A long-only target orders exactly as it did when targets were long-only: each gap from the book, in shares.
