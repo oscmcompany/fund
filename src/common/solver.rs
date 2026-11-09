@@ -22,7 +22,8 @@ use crate::common::strategy::Target;
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Solver {
-    /// Each holding cut to what its per-name limit buys, then the whole target scaled down to the gross limit.
+    /// Each barred name held at zero, each holding cut to what its per-name limit buys, then the whole target scaled
+    /// down to the gross limit.
     Clip,
 }
 
@@ -68,6 +69,14 @@ fn clip(problem: &Problem) -> Solution {
     let mut holdings = Vec::new();
     let mut worth = 0_u128;
     for (symbol, wanted) in wanted.holdings() {
+        if let Some(loss) = problem.barred(symbol) {
+            cuts.push(Cut::PerNameLoss {
+                symbol: symbol.clone(),
+                wanted: *wanted,
+                loss,
+            });
+            continue;
+        }
         let Some(price) = problem.price(symbol) else {
             cuts.push(Cut::Unpriced {
                 symbol: symbol.clone(),

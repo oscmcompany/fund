@@ -1,13 +1,15 @@
 //! The risk a target is held to: flat outside the session's trading window and past the daily loss limit, otherwise
-//! each name and the whole book capped; and the record of a decision made under it.
+//! each name and the whole book capped, less the names barred by their own loss; and the record of a decision under it.
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::common::book::{Book, Cash, ValuationRefusal};
+use crate::common::book::{Book, Cash, Fill, ValuationRefusal};
 use crate::common::constraint::{Constraint, Constraints};
 use crate::common::market::{Price, Symbol};
-use crate::common::monoid::concatenate;
+use crate::common::monoid::{Monoid, concatenate};
 use crate::common::playbook::Stretch;
 use crate::common::solver::{Solution, Solver};
 use crate::common::strategy::{Holding, Target};
@@ -25,6 +27,7 @@ pub struct Limits {
     gross: DollarLimit,
     per_name: DollarLimit,
     daily_loss: DollarLimit,
+    per_name_loss: DollarLimit,
     flat_before_close: TimeDelta,
 }
 
@@ -92,6 +95,7 @@ pub enum Limit {
     Gross,
     PerName,
     DailyLoss,
+    PerNameLoss,
 }
 
 /// Why limits were refused, naming the value.
@@ -117,11 +121,13 @@ impl LimitsRefusal {
 
 impl Limits {
     /// `gross` caps the target's worth, `per_name` each holding's, `daily_loss` the loss from the session's opening
-    /// equity before going flat, and `flat_before_close` how long before the close the target is emptied.
+    /// equity before going flat, `per_name_loss` one name's loss since the open before it is barred for the session,
+    /// and `flat_before_close` how long before the close the target is emptied.
     pub fn new(
         gross: Cash,
         per_name: Cash,
         daily_loss: Cash,
+        per_name_loss: Cash,
         flat_before_close: TimeDelta,
     ) -> Result<Self, LimitsRefusal> {
         let named = |limit, value| {
@@ -130,6 +136,7 @@ impl Limits {
         let gross = named(Limit::Gross, gross)?;
         let per_name = named(Limit::PerName, per_name)?;
         let daily_loss = named(Limit::DailyLoss, daily_loss)?;
+        let per_name_loss = named(Limit::PerNameLoss, per_name_loss)?;
         if flat_before_close < TimeDelta::zero() {
             return Err(LimitsRefusal::NegativeWindow { flat_before_close });
         }
@@ -137,6 +144,7 @@ impl Limits {
             gross,
             per_name,
             daily_loss,
+            per_name_loss,
             flat_before_close,
         })
     }
@@ -150,6 +158,7 @@ impl Limits {
             Limit::Gross => self.gross.cash(),
             Limit::PerName => self.per_name.cash(),
             Limit::DailyLoss => self.daily_loss.cash(),
+            Limit::PerNameLoss => self.per_name_loss.cash(),
         }
     }
 
@@ -225,8 +234,94 @@ impl Risk {
     }
 }
 
-/// A decision as journaled: the playbook stretch that decided, the strategy's target, the solver asked, and its
-/// solution, or why risk could not price the book.
+/// Each name's session so far, as its opening position bought at the previous closes combined with every fill in it
+/// since, so its value at a price is its gain since the open, realized and unrealized; and each name barred for its loss.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameLosses {
+    names: BTreeMap<Symbol, Book>,
+    /// Each barred name with the loss that barred it; a name once barred stays barred.
+    barred: BTreeMap<Symbol, Cash>,
+}
+
+/// A name barred for the rest of the session, as its loss since the open reached the per-name loss limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameBarred {
+    symbol: Symbol,
+    loss: Cash,
+    limit: DollarLimit,
+}
+
+impl NameLosses {
+    /// The session opening with `book`, each position marked at `close`; refused for a position with no close.
+    pub fn open(
+        book: &Book,
+        close: impl Fn(&Symbol) -> Option<Price>,
+    ) -> Result<Self, ValuationRefusal> {
+        let names = book
+            .positions()
+            .iter()
+            .map(|(symbol, position)| {
+                let held = Book::reported(Cash::empty(), [(symbol.clone(), *position)]);
+                let paid = negated(held.value(&close)?);
+                Ok((symbol.clone(), Book::funded(paid).combine(held)))
+            })
+            .collect::<Result<_, ValuationRefusal>>()?;
+        Ok(Self {
+            names,
+            barred: BTreeMap::new(),
+        })
+    }
+
+    /// Folds `fill` into its name, opening one with nothing held for a name the session opened without.
+    pub fn take(&mut self, fill: &Fill) {
+        let name = self.names.remove(fill.symbol()).unwrap_or_default();
+        self.names
+            .insert(fill.symbol().clone(), name.combine(Book::of(fill)));
+    }
+
+    /// Bars each name whose loss at `price` is at least the per-name loss limit, returning the names barred now; a
+    /// name holding a position `price` cannot answer is unmeasured and left as it stands.
+    pub fn bar(
+        &mut self,
+        limits: &Limits,
+        price: impl Fn(&Symbol) -> Option<Price>,
+    ) -> Vec<NameBarred> {
+        let limit = limits.per_name_loss;
+        let mut barred = Vec::new();
+        for (symbol, name) in &self.names {
+            if self.barred.contains_key(symbol) {
+                continue;
+            }
+            let Ok(gain) = name.value(&price) else {
+                continue;
+            };
+            let loss = negated(gain);
+            if loss >= limit.cash() {
+                barred.push(NameBarred {
+                    symbol: symbol.clone(),
+                    loss,
+                    limit,
+                });
+            }
+        }
+        for name in &barred {
+            self.barred.insert(name.symbol.clone(), name.loss);
+        }
+        barred
+    }
+
+    /// Each barred name with the loss that barred it.
+    pub fn barred(&self) -> &BTreeMap<Symbol, Cash> {
+        &self.barred
+    }
+}
+
+fn negated(cash: Cash) -> Cash {
+    Cash::from_units(cash.units().checked_neg().expect("cash fits i128"))
+}
+
+/// A decision as journaled: the playbook stretch that decided, the strategy's target, the names it barred, the solver
+/// asked, and its solution, or why risk could not price the book.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetDecided {
     /// The end of the decision bar decided at; a bar missed by a late call has no record of its own.
@@ -234,6 +329,9 @@ pub struct TargetDecided {
     /// `None` when the state had no clock, so no stretch decided.
     stretch: Option<Stretch>,
     wanted: Target,
+    /// The names this decision barred for their loss, each journaled once, at the decision that barred it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    barred: Vec<NameBarred>,
     solver: Solver,
     #[serde(flatten)]
     decision: Decision,
@@ -252,6 +350,7 @@ impl TargetDecided {
         bar: DateTime<Utc>,
         stretch: Option<Stretch>,
         wanted: Target,
+        barred: Vec<NameBarred>,
         solver: Solver,
         solution: Result<Solution, ValuationRefusal>,
     ) -> Self {
@@ -263,6 +362,7 @@ impl TargetDecided {
             bar,
             stretch,
             wanted,
+            barred,
             solver,
             decision,
         }
@@ -279,6 +379,12 @@ pub enum Cut {
     LossLimit { loss: Cash },
     /// `symbol` held at zero, as it has no price and the book does not hold it.
     Unpriced { symbol: Symbol, wanted: Holding },
+    /// `symbol` held at zero, as its loss since the open reached `loss`, at least the per-name loss limit, and barred it.
+    PerNameLoss {
+        symbol: Symbol,
+        wanted: Holding,
+        loss: Cash,
+    },
     /// `symbol` held to the most the per-name limit buys at its price, a short to whole shares.
     PerName {
         symbol: Symbol,
@@ -305,8 +411,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::common::book::Position;
-    use crate::common::market::Shares;
+    use crate::common::book::{Position, Side};
+    use crate::common::market::{DollarVolume, Shares};
     use crate::common::problem::formulate;
 
     const DOLLAR: i128 = 1_000_000_000_000;
@@ -323,6 +429,7 @@ mod tests {
         Limits::new(
             dollars(gross),
             dollars(per_name),
+            dollars(1_000),
             dollars(1_000),
             TimeDelta::minutes(15),
         )
@@ -365,7 +472,16 @@ mod tests {
         price: impl Fn(&Symbol) -> Option<Price>,
         target: Target,
     ) -> Result<(Target, Vec<Cut>), ValuationRefusal> {
-        formulate(limits, phase, opening, book, price, target).map(|problem| {
+        formulate(
+            limits,
+            phase,
+            opening,
+            book,
+            Ok(&NameLosses::default()),
+            price,
+            target,
+        )
+        .map(|problem| {
             let solution = Solver::Clip.solve(&problem);
             (solution.target().clone(), solution.cuts().to_vec())
         })
@@ -495,33 +611,55 @@ mod tests {
     fn test_limits_refuse_a_value_that_is_not_positive() {
         let window = TimeDelta::minutes(15);
         assert_eq!(
-            Limits::new(dollars(0), dollars(1), dollars(1), window),
+            Limits::new(dollars(0), dollars(1), dollars(1), dollars(1), window),
             Err(LimitsRefusal::NotPositive {
                 limit: Limit::Gross,
                 value: dollars(0)
             })
         );
         assert_eq!(
-            Limits::new(dollars(1), dollars(-1), dollars(1), window),
+            Limits::new(dollars(1), dollars(-1), dollars(1), dollars(1), window),
             Err(LimitsRefusal::NotPositive {
                 limit: Limit::PerName,
                 value: dollars(-1)
             })
         );
         assert_eq!(
-            Limits::new(dollars(1), dollars(1), dollars(0), window),
+            Limits::new(dollars(1), dollars(1), dollars(0), dollars(1), window),
             Err(LimitsRefusal::NotPositive {
                 limit: Limit::DailyLoss,
                 value: dollars(0)
             })
         );
         assert_eq!(
-            Limits::new(dollars(1), dollars(1), dollars(1), TimeDelta::minutes(-1)),
+            Limits::new(dollars(1), dollars(1), dollars(1), dollars(0), window),
+            Err(LimitsRefusal::NotPositive {
+                limit: Limit::PerNameLoss,
+                value: dollars(0)
+            })
+        );
+        assert_eq!(
+            Limits::new(
+                dollars(1),
+                dollars(1),
+                dollars(1),
+                dollars(1),
+                TimeDelta::minutes(-1)
+            ),
             Err(LimitsRefusal::NegativeWindow {
                 flat_before_close: TimeDelta::minutes(-1)
             })
         );
-        assert!(Limits::new(dollars(1), dollars(1), dollars(1), TimeDelta::zero()).is_ok());
+        assert!(
+            Limits::new(
+                dollars(1),
+                dollars(1),
+                dollars(1),
+                dollars(1),
+                TimeDelta::zero()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -531,8 +669,14 @@ mod tests {
         for limit in Limit::iter() {
             assert_eq!(limit.to_string().parse(), Ok(limit));
         }
-        assert_eq!(names, ["gross", "per_name", "daily_loss"]);
-        let refused = Limits::new(dollars(1), dollars(-2), dollars(1), TimeDelta::zero());
+        assert_eq!(names, ["gross", "per_name", "daily_loss", "per_name_loss"]);
+        let refused = Limits::new(
+            dollars(1),
+            dollars(-2),
+            dollars(1),
+            dollars(1),
+            TimeDelta::zero(),
+        );
         assert_eq!(
             refused.unwrap_err().to_string(),
             "the per_name limit is -2.00 dollars, which is not positive"
@@ -546,7 +690,7 @@ mod tests {
         let window = TimeDelta::minutes(15);
         let beyond = Cash::from_units(10_i128.pow(31));
         assert_eq!(
-            Limits::new(beyond, beyond, beyond, window),
+            Limits::new(beyond, beyond, beyond, beyond, window),
             Err(LimitsRefusal::BeyondRange {
                 limit: Limit::Gross,
                 value: beyond
@@ -558,6 +702,7 @@ mod tests {
                 largest,
                 Cash::from_units(largest.units() + 1),
                 largest,
+                largest,
                 window
             ),
             Err(LimitsRefusal::BeyondRange {
@@ -565,7 +710,7 @@ mod tests {
                 ..
             })
         ));
-        let limits = Limits::new(largest, largest, largest, window).unwrap();
+        let limits = Limits::new(largest, largest, largest, largest, window).unwrap();
         let price = prices(&[("SPY", 10_000_000_000_000), ("AAPL", 10_000_000_000_000)]);
         let wanted = target(&[("SPY", u64::MAX), ("AAPL", u64::MAX)]);
         let solved = risk(
@@ -821,6 +966,7 @@ mod tests {
             open(),
             dollars(10_000),
             &funded(10_000),
+            Ok(&NameLosses::default()),
             &price,
             target(&[("AAPL", 2), ("SPY", 1)]),
         )
@@ -834,6 +980,143 @@ mod tests {
         assert_eq!(
             problem.constraints().admits(&target(&[("SPY", 1)]), &price),
             Ok(true)
+        );
+    }
+
+    /// Limits whose only binding one is the loss in any one name.
+    fn losing(per_name_loss: i128) -> Limits {
+        Limits::new(
+            dollars(1_000_000),
+            dollars(1_000_000),
+            dollars(1_000_000),
+            dollars(per_name_loss),
+            TimeDelta::minutes(15),
+        )
+        .unwrap()
+    }
+
+    /// `units` millionths of AAPL, short when negative, bought at the previous close of $100.
+    fn opened(units: i128) -> NameLosses {
+        let book = Book::reported(dollars(0), [(symbol("AAPL"), Position::from_units(units))]);
+        NameLosses::open(&book, prices(&[("AAPL", 100_000_000)])).unwrap()
+    }
+
+    /// The names barred under a $50 limit when AAPL is marked at `ticks`.
+    fn barred_at(mut losses: NameLosses, ticks: i64) -> Vec<NameBarred> {
+        losses.bar(&losing(50), prices(&[("AAPL", ticks)]))
+    }
+
+    fn barred(loss: Cash) -> Vec<NameBarred> {
+        vec![NameBarred {
+            symbol: symbol("AAPL"),
+            loss,
+            limit: DollarLimit::new(dollars(50)).unwrap(),
+        }]
+    }
+
+    /// Ten long from $100 lose exactly $50 at $95 and are barred; a millionth of a dollar higher loses less.
+    #[test]
+    fn test_a_long_is_barred_at_exactly_its_loss_limit() {
+        assert_eq!(
+            barred_at(opened(10_000_000), 95_000_000),
+            barred(dollars(50))
+        );
+        assert_eq!(barred_at(opened(10_000_000), 95_000_001), []);
+    }
+
+    /// Ten short from $100 lose exactly $50 at $105 and are barred; a millionth of a dollar lower loses less.
+    #[test]
+    fn test_a_short_is_barred_at_exactly_its_loss_limit() {
+        assert_eq!(
+            barred_at(opened(-10_000_000), 105_000_000),
+            barred(dollars(50))
+        );
+        assert_eq!(barred_at(opened(-10_000_000), 104_999_999), []);
+    }
+
+    /// Ten long from $100 sold at $95 is a realized $50 loss, read with no price since nothing is held.
+    #[test]
+    fn test_a_realized_loss_bars_a_name_no_longer_held() {
+        let mut losses = opened(10_000_000);
+        let sold = Fill::new(
+            DateTime::UNIX_EPOCH,
+            symbol("AAPL"),
+            Side::Sell,
+            Shares::whole(10).unwrap(),
+            Price::from_ticks(95_000_000).unwrap(),
+            DollarVolume::default(),
+        )
+        .unwrap();
+        losses.take(&sold);
+        assert_eq!(losses.bar(&losing(50), |_| None), barred(dollars(50)));
+    }
+
+    /// A barred name is journaled once, stays barred however its price recovers, and is cut to zero with its loss.
+    #[test]
+    fn test_a_barred_name_stays_barred_and_is_cut_to_zero() {
+        let mut losses = opened(10_000_000);
+        assert_eq!(
+            losses.bar(&losing(50), prices(&[("AAPL", 90_000_000)])),
+            barred(dollars(100))
+        );
+        let recovered = prices(&[("AAPL", 120_000_000)]);
+        assert_eq!(losses.bar(&losing(50), &recovered), []);
+        let book = Book::reported(
+            dollars(0),
+            [(symbol("AAPL"), Position::from_units(10_000_000))],
+        );
+        let problem = formulate(
+            &losing(50),
+            open(),
+            dollars(0),
+            &book,
+            Ok(&losses),
+            &recovered,
+            target(&[("AAPL", 10_000_000)]),
+        )
+        .unwrap();
+        let solution = Solver::Clip.solve(&problem);
+        assert_eq!(solution.target(), &Target::default());
+        assert_eq!(
+            solution.cuts(),
+            [Cut::PerNameLoss {
+                symbol: symbol("AAPL"),
+                wanted: Shares::whole(10).unwrap().into(),
+                loss: dollars(100),
+            }]
+        );
+    }
+
+    /// A barred name journals its symbol, loss and limit as text and reads back, and a decision barring nothing journals
+    /// no `barred` key.
+    #[test]
+    fn test_a_barred_name_round_trips_beside_its_decision() {
+        let decided = |barred| {
+            TargetDecided::new(
+                DateTime::UNIX_EPOCH,
+                None,
+                Target::default(),
+                barred,
+                Solver::Clip,
+                Err(ValuationRefusal::Unpriced {
+                    symbol: symbol("SPY"),
+                }),
+            )
+        };
+        let json = serde_json::to_value(decided(barred(dollars(50)))).unwrap();
+        assert_eq!(
+            json["barred"],
+            serde_json::json!([{"symbol": "AAPL", "loss": "50000000000000", "limit": "50000000000000"}])
+        );
+        assert_eq!(
+            serde_json::from_value::<TargetDecided>(json).unwrap(),
+            decided(barred(dollars(50)))
+        );
+        let none = serde_json::to_value(decided(Vec::new())).unwrap();
+        assert!(none.get("barred").is_none());
+        assert_eq!(
+            serde_json::from_value::<TargetDecided>(none).unwrap(),
+            decided(Vec::new())
         );
     }
 
@@ -911,6 +1194,61 @@ mod tests {
             prop_assert_eq!(twice, (once.0, vec![]));
         }
 
+        /// Once a name's loss reaches the limit it is barred, and every later decision in the session leaves it flat
+        /// however its price moves, while a name never barred is never cut for its loss.
+        #[test]
+        fn property_a_barred_name_is_flat_for_every_later_decision(
+            held in prop::collection::vec(-20i128..=20, 2),
+            path in prop::collection::vec(prop::collection::vec(50_000_000..150_000_000i64, 2), 1..12),
+            wanted in prop::collection::vec(1..=20u64, 2),
+            per_name_loss in 1..200i128,
+        ) {
+            let names = [symbol("AAPL"), symbol("SPY")];
+            let book = Book::reported(
+                dollars(0),
+                names.iter().cloned().zip(held.iter().map(|count| Position::from_units(count * 1_000_000))),
+            );
+            let close = |_: &Symbol| Price::from_ticks(100_000_000).ok();
+            let opening = book.value(close).unwrap();
+            let mut losses = NameLosses::open(&book, close).unwrap();
+            let limits = losing(per_name_loss);
+            let wanted = Target::new(
+                names
+                    .iter()
+                    .cloned()
+                    .zip(wanted.iter().map(|count| Holding::from(Shares::whole(*count).unwrap())))
+                    .collect(),
+            );
+            let mut ever_barred = BTreeMap::new();
+            for ticks in path {
+                let marks: BTreeMap<Symbol, Price> = names
+                    .iter()
+                    .cloned()
+                    .zip(ticks.iter().map(|tick| Price::from_ticks(*tick).unwrap()))
+                    .collect();
+                let price = |symbol: &Symbol| marks.get(symbol).copied();
+                for name in losses.bar(&limits, price) {
+                    prop_assert!(name.loss >= limits.dollars(Limit::PerNameLoss));
+                    prop_assert!(ever_barred.insert(name.symbol, name.loss).is_none());
+                }
+                prop_assert_eq!(losses.barred(), &ever_barred);
+                let problem = formulate(&limits, open(), opening, &book, Ok(&losses), price, wanted.clone())
+                    .unwrap();
+                let solution = Solver::Clip.solve(&problem);
+                for symbol in &names {
+                    let flat = !solution.target().holdings().contains_key(symbol);
+                    let cut = solution
+                        .cuts()
+                        .iter()
+                        .any(|cut| matches!(cut, Cut::PerNameLoss { symbol: barred, .. } if barred == symbol));
+                    match ever_barred.contains_key(symbol) {
+                        true => prop_assert!(flat && cut),
+                        false => prop_assert!(!cut),
+                    }
+                }
+            }
+        }
+
         /// A target already within every limit passes untouched.
         #[test]
         fn property_a_target_within_its_limits_passes_unchanged(
@@ -963,6 +1301,7 @@ mod tests {
                 dollars(gross),
                 dollars(per_name),
                 dollars(daily_loss),
+                dollars(daily_loss),
                 TimeDelta::minutes(window),
             )
             .unwrap();
@@ -1013,7 +1352,15 @@ mod tests {
                 false => SessionPhase::AfterClose,
             };
             let price = |symbol: &Symbol| prices.get(symbol).filter(|_| !unlisted.contains(symbol)).copied();
-            let problem = formulate(&limits(gross, per_name), phase, dollars(10_000), &funded(10_000), price, wanted)
+            let problem = formulate(
+                &limits(gross, per_name),
+                phase,
+                dollars(10_000),
+                &funded(10_000),
+                Ok(&NameLosses::default()),
+                price,
+                wanted,
+            )
                 .unwrap();
             let solved = Solver::Clip.solve(&problem);
             prop_assert_eq!(problem.constraints().admits(solved.target(), price), Ok(true));

@@ -46,6 +46,8 @@ pub enum Parameter {
     PerNameLimit,
     /// Dollars the trader may lose in a session before it goes flat.
     DailyLossLimit,
+    /// Dollars the trader may lose in one name in a session before it bars the name for the rest of it.
+    PerNameLossLimit,
     /// Minutes before the close from which the trader holds nothing.
     FlatBeforeCloseMinutes,
     /// Seconds a price may age before the trader treats its symbol as unpriced.
@@ -193,6 +195,7 @@ mod tests {
                 "FUND_GROSS_LIMIT",
                 "FUND_PER_NAME_LIMIT",
                 "FUND_DAILY_LOSS_LIMIT",
+                "FUND_PER_NAME_LOSS_LIMIT",
                 "FUND_FLAT_BEFORE_CLOSE_MINUTES",
                 "FUND_STALE_AFTER_SECONDS",
                 "FUND_MINUTE_WAIT_SECONDS",

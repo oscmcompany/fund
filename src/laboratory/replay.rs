@@ -59,6 +59,7 @@ pub enum ReplaySetting {
     GrossLimitUnits,
     PerNameLimitUnits,
     DailyLossLimitUnits,
+    PerNameLossLimitUnits,
     FlatBeforeCloseSeconds,
     Tradability,
     StaleAfterSeconds,
@@ -170,6 +171,10 @@ pub(crate) fn settings(
                 (ReplaySetting::GrossLimitUnits, units(Limit::Gross)),
                 (ReplaySetting::PerNameLimitUnits, units(Limit::PerName)),
                 (ReplaySetting::DailyLossLimitUnits, units(Limit::DailyLoss)),
+                (
+                    ReplaySetting::PerNameLossLimitUnits,
+                    units(Limit::PerNameLoss),
+                ),
                 (
                     ReplaySetting::FlatBeforeCloseSeconds,
                     limits.flat_before_close().num_seconds().to_string(),
@@ -320,6 +325,7 @@ pub(crate) mod tests {
             thousand,
             thousand,
             thousand,
+            thousand,
             chrono::TimeDelta::minutes(flat_before_close_minutes),
         )
         .unwrap();
@@ -407,6 +413,7 @@ pub(crate) mod tests {
             Cash::from_units(3),
             Cash::from_units(2),
             Cash::from_units(1),
+            Cash::from_units(4),
             chrono::TimeDelta::minutes(15),
         )
         .unwrap();
@@ -441,6 +448,7 @@ pub(crate) mod tests {
                 ("gross_limit_units", "3".to_string()),
                 ("per_name_limit_units", "2".to_string()),
                 ("daily_loss_limit_units", "1".to_string()),
+                ("per_name_loss_limit_units", "4".to_string()),
                 ("flat_before_close_seconds", "900".to_string()),
                 ("tradability", r#"{"AAPL":"untradable"}"#.to_string()),
                 ("stale_after_seconds", "120".to_string()),
@@ -469,6 +477,7 @@ pub(crate) mod tests {
             "gross_limit_units",
             "per_name_limit_units",
             "daily_loss_limit_units",
+            "per_name_loss_limit_units",
             "flat_before_close_seconds",
             "tradability",
         ] {

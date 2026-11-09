@@ -10,7 +10,7 @@ use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::borrow::Borrow;
 use crate::common::market::{Price, SHARE_SCALE, Shares, Symbol};
 use crate::common::monoid::Monoid;
-use crate::common::risk::{Flat, Limit, Limits, Risk};
+use crate::common::risk::{Flat, Limit, Limits, NameLosses, Risk};
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::SessionPhase;
 
@@ -57,6 +57,9 @@ pub enum TradeRefusal {
     Flat(Flat),
     #[error("{symbol} cannot be borrowed to sell short")]
     Unborrowable { symbol: Symbol },
+    /// `symbol` lost `loss` in the session, at least the per-name loss limit, so it opens nothing until the close.
+    #[error("{symbol} is barred for the session by its loss of {:.2} dollars", .loss.dollars())]
+    Barred { symbol: Symbol, loss: Cash },
     /// Short sales are whole shares, so a trade that opens or grows a short must leave it whole.
     #[error("{symbol} would be short a fraction of a share: {} millionths", .position.units())]
     FractionalShort { symbol: Symbol, position: Position },
@@ -75,6 +78,7 @@ pub enum TradeRefusal {
 pub enum Binding {
     Flat(Flat),
     Unborrowable,
+    Barred { loss: Cash },
     Bound(Bound),
 }
 
@@ -113,13 +117,15 @@ pub enum LedgerRefusal {
     },
 }
 
-/// The opening equity, the book and its terms, and each closed session's equity.
+/// The opening equity, the book and its terms, each name's session so far, and each closed session's equity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ledger {
     limits: Limits,
     leverage: Leverage,
     opening: Cash,
     book: Book,
+    /// Every name opens each session flat, as the book is flat at every close.
+    losses: NameLosses,
     closes: BTreeMap<SessionDate, Cash>,
 }
 
@@ -154,6 +160,7 @@ impl Ledger {
             leverage,
             opening,
             book: Book::funded(opening),
+            losses: NameLosses::default(),
             closes: BTreeMap::new(),
         })
     }
@@ -185,6 +192,13 @@ impl Ledger {
     ) -> Result<Risk, ValuationRefusal> {
         self.limits
             .risk(phase, self.session_opening(), &self.book, price)
+    }
+
+    /// Each name's session so far with every name barred whose loss at `price` reaches the per-name loss limit.
+    fn losses(&self, price: &impl Fn(&Symbol) -> Option<Price>) -> NameLosses {
+        let mut losses = self.losses.clone();
+        losses.bar(&self.limits, price);
+        losses
     }
 
     /// The cash each bound leaves for new exposure once `released` is closed, in the order ties resolve.
@@ -236,11 +250,15 @@ impl Ledger {
         };
         let same_side = exposure(Position::from_units(holding), price);
         let released = exposure(Position::from_units(closing.cast_signed()), price);
-        let opening_side = match (self.risk(phase, &price_of)?, side, borrow) {
-            (Risk::Flat(flat), _, _) => Err(Binding::Flat(flat)),
-            (Risk::Capped { .. }, Side::Sell, Borrow::Unavailable) => Err(Binding::Unborrowable),
-            (Risk::Capped { .. }, Side::Buy, _)
-            | (Risk::Capped { .. }, Side::Sell, Borrow::Available) => Ok(()),
+        let barred = self.losses(&price_of).barred().get(symbol).copied();
+        let opening_side = match (self.risk(phase, &price_of)?, barred, side, borrow) {
+            (Risk::Flat(flat), _, _, _) => Err(Binding::Flat(flat)),
+            (Risk::Capped { .. }, Some(loss), _, _) => Err(Binding::Barred { loss }),
+            (Risk::Capped { .. }, None, Side::Sell, Borrow::Unavailable) => {
+                Err(Binding::Unborrowable)
+            }
+            (Risk::Capped { .. }, None, Side::Buy, _)
+            | (Risk::Capped { .. }, None, Side::Sell, Borrow::Available) => Ok(()),
         };
         let (opening, binding) = match opening_side {
             Err(binding) => (0, binding),
@@ -274,8 +292,8 @@ impl Ledger {
         })
     }
 
-    /// The ledger after `fill`, refused when it opens exposure risk, borrow or a cap does not allow; the fill's own
-    /// symbol is marked at its price and every other holding by `marks`.
+    /// The ledger after `fill`, refused when it opens exposure risk, the name's loss, borrow or a cap does not allow;
+    /// the fill's own symbol is marked at its price and every other holding by `marks`.
     pub fn trade(
         &self,
         fill: &Fill,
@@ -294,6 +312,7 @@ impl Ledger {
             after.position(symbol).units(),
         );
         let opens = held.abs() > before.abs() || held.signum() * before.signum() < 0;
+        let mut losses = self.losses(&price_of);
         if opens {
             match self
                 .risk(phase, &price_of)
@@ -301,6 +320,12 @@ impl Ledger {
             {
                 Risk::Flat(flat) => return Err(TradeRefusal::Flat(flat)),
                 Risk::Capped { .. } => {}
+            }
+            if let Some(loss) = losses.barred().get(symbol) {
+                return Err(TradeRefusal::Barred {
+                    symbol: symbol.clone(),
+                    loss: *loss,
+                });
             }
             if held < 0 {
                 match borrow {
@@ -352,8 +377,10 @@ impl Ledger {
                 });
             }
         }
+        losses.take(fill);
         Ok(Self {
             book: after,
+            losses,
             ..self.clone()
         })
     }
@@ -375,6 +402,7 @@ impl Ledger {
             });
         }
         let mut closed = self.clone();
+        closed.losses = NameLosses::default();
         closed.closes.insert(session, self.book.cash());
         Ok(closed)
     }
@@ -430,6 +458,7 @@ mod tests {
         let limits = Limits::new(
             dollars(gross),
             dollars(per_name),
+            dollars(1_000),
             dollars(1_000),
             TimeDelta::minutes(10),
         )
@@ -526,6 +555,68 @@ mod tests {
                 allowed: dollars(20_000)
             }
         );
+    }
+
+    /// Ten AAA bought at $100 and sold at $95 lose $50, the per-name loss limit under a $1,000 daily one: a further
+    /// buy of AAA is refused with its loss, its room is none, BBB still trades, and the next session trades AAA again.
+    #[test]
+    fn test_a_name_past_its_loss_limit_is_refused_until_the_session_closes() {
+        let limits = Limits::new(
+            dollars(40_000),
+            dollars(5_000),
+            dollars(1_000),
+            dollars(50),
+            TimeDelta::minutes(10),
+        )
+        .unwrap();
+        let leverage = Leverage::new(NonZeroU8::new(2).unwrap());
+        let mut traded = Ledger::open(dollars(20_000), limits, leverage).unwrap();
+        for (side, at_price) in [(Side::Buy, price(100)), (Side::Sell, price(95))] {
+            traded = traded
+                .trade(
+                    &fill("AAA", side, shares(10), at_price, 0),
+                    open(),
+                    Borrow::Available,
+                    none,
+                )
+                .unwrap();
+        }
+        let again = fill("AAA", Side::Buy, shares(1), price(95), 0);
+        assert_eq!(
+            traded.trade(&again, open(), Borrow::Available, none),
+            Err(TradeRefusal::Barred {
+                symbol: symbol("AAA"),
+                loss: dollars(50)
+            })
+        );
+        assert_eq!(
+            traded
+                .room(
+                    &symbol("AAA"),
+                    Side::Buy,
+                    price(95),
+                    open(),
+                    Borrow::Available,
+                    none
+                )
+                .unwrap(),
+            Room {
+                shares: Shares::from_units(0),
+                binding: Binding::Barred { loss: dollars(50) }
+            }
+        );
+        assert!(
+            traded
+                .trade(
+                    &fill("BBB", Side::Buy, shares(1), price(95), 0),
+                    open(),
+                    Borrow::Available,
+                    none
+                )
+                .is_ok()
+        );
+        let next = traded.close(SessionDate::at(at())).unwrap();
+        assert!(next.trade(&again, open(), Borrow::Available, none).is_ok());
     }
 
     #[test]

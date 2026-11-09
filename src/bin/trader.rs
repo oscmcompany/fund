@@ -12,7 +12,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::Instrument;
 
 use fund::broker::{Broker, BrokerError, PaperAccount};
-use fund::common::book::ValuationRefusal;
+use fund::common::book::{Fill, ValuationRefusal};
 use fund::common::journal::{Observation, SessionOpened};
 use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
@@ -29,7 +29,7 @@ use fund::records::{Exclusion, RefusedToStart, resolved, ship_logged, start};
 use fund::storage::reference::{SnapshotError, latest_conditions};
 use fund::storage::{Bucket, BucketError, parquet, trade_bars};
 use fund::trader::parameters::Parameters;
-use fund::trader::{Session, SessionError, Standing, last_closes, warm};
+use fund::trader::{Session, SessionError, Standing, last_closes, resumed, warm};
 
 const SERVICE: &str = "trader";
 /// Calendar days read back for the previous session, past any run of holidays and a weekend.
@@ -175,6 +175,10 @@ enum StartRefusal {
     Conditions(SnapshotError),
     #[error("the book was not read: {0}")]
     Book(BrokerError),
+    #[error("the session's fills were not read: {0}")]
+    Fills(BrokerError),
+    #[error("the session's fills moved from {before} to {after} while the book was read")]
+    FillsMoved { before: usize, after: usize },
     #[error("{0}")]
     PreviousSession(PreviousRefusal),
     #[error("the opening was not valued: {0}")]
@@ -284,28 +288,45 @@ async fn trade(
     let (_, conditions) = latest_conditions(archive)
         .await
         .map_err(|error| refused(StartRefusal::Conditions(error)))?;
+    // A run restarted within the session unwinds the fills an earlier run made, so its losses run from the open; read
+    // on both sides of the book, so an order left open that fills between them refuses the start.
+    let read_fills = || async {
+        broker
+            .fills(today.midnight())
+            .await
+            .map_err(|error| refused(StartRefusal::Fills(error)))
+    };
+    let fills = read_fills().await?;
     let book = broker
         .book()
         .await
         .map_err(|error| refused(StartRefusal::Book(error)))?;
-    // Names held outside the universe are watched too, since the book cannot be valued without their prices.
+    let after = read_fills().await?;
+    if after != fills {
+        return Err(refused(StartRefusal::FillsMoved {
+            before: fills.len(),
+            after: after.len(),
+        }));
+    }
+    // Names held outside the universe, or traded earlier in the session, are watched too, since the book cannot be
+    // valued without their prices.
     let symbols: BTreeSet<Symbol> = parameters
         .universe()
         .symbols()
         .iter()
         .chain(book.positions().keys())
+        .chain(fills.iter().map(Fill::symbol))
         .cloned()
         .collect();
     let (previous, closes) = previous_bars(archive, &calendar, today, &symbols)
         .await
         .map_err(|refusal| refused(StartRefusal::PreviousSession(refusal)))?;
-    let opening = book
-        .value(|symbol| closes.get(symbol).copied())
+    let (opened, opening, losses) = resumed(&book, &fills, |symbol| closes.get(symbol).copied())
         .map_err(|refusal| refused(StartRefusal::Opening(refusal)))?;
     journal
         .append(
             Utc::now(),
-            Observation::SessionOpened(SessionOpened::new(today, &book, opening)),
+            Observation::SessionOpened(SessionOpened::new(today, &opened, opening)),
         )
         .map_err(|error| refused(StartRefusal::Journal(error)))?;
     tracing::info!(
@@ -313,6 +334,7 @@ async fn trade(
         %close,
         cash = book.cash().dollars(),
         positions = book.positions().len(),
+        fills = fills.len(),
         opening = opening.dollars(),
         "Session opened"
     );
@@ -327,6 +349,7 @@ async fn trade(
         previous,
         book,
         opening,
+        losses,
         open,
     );
     let mut ticks = tokio::time::interval(TICK);

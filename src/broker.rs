@@ -7,8 +7,9 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::common::book::{Book, Cash, Position};
+use crate::common::book::{Book, Cash, Fill, Position, Side};
 use crate::common::guard::{Shortability, Tradability, TradabilityRead};
+use crate::common::market::DollarVolume;
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol, SymbolRefusal};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderEnding, OrderExecution, OrderReport, OrderRequest,
@@ -252,6 +253,41 @@ pub enum AlpacaOrderStatus {
     Held,
 }
 
+/// One execution as Alpaca's account activities report it.
+#[derive(Deserialize)]
+struct FillActivityPayload {
+    id: String,
+    transaction_time: DateTime<Utc>,
+    price: String,
+    qty: String,
+    side: AlpacaFillSide,
+    symbol: String,
+}
+
+/// A fill's side as Alpaca documents it; any other string fails to parse.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum AlpacaFillSide {
+    Buy,
+    Sell,
+    SellShort,
+}
+
+/// The most activities Alpaca returns on one page.
+const ACTIVITY_PAGE: usize = 100;
+
 #[derive(Deserialize)]
 struct AssetPayload {
     status: AlpacaAssetStatus,
@@ -351,6 +387,84 @@ impl PaperAccount {
     async fn get(&self, path: &str) -> Result<Vec<u8>, BrokerError> {
         Ok(with_retries(|| send(self.alpaca.trading(Method::GET, path))).await?)
     }
+
+    /// Every fill the account reports after `after`, oldest first, read a page at a time.
+    pub async fn fills(&self, after: DateTime<Utc>) -> Result<Vec<Fill>, BrokerError> {
+        let after = after.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let size = ACTIVITY_PAGE.to_string();
+        let (mut fills, mut token) = (Vec::new(), None::<String>);
+        loop {
+            let body = with_retries(|| {
+                let mut query = vec![
+                    ("after", after.as_str()),
+                    ("direction", "asc"),
+                    ("page_size", size.as_str()),
+                ];
+                if let Some(token) = &token {
+                    query.push(("page_token", token.as_str()));
+                }
+                send(
+                    self.alpaca
+                        .trading(Method::GET, "/v2/account/activities/FILL")
+                        .query(&query),
+                )
+            })
+            .await?;
+            let (page, last) = fill_activities(&body)?;
+            let full = page.len() == ACTIVITY_PAGE;
+            fills.extend(page);
+            match (full, last) {
+                (true, Some(last)) => token = Some(last),
+                (true, None) | (false, Some(_) | None) => return Ok(fills),
+            }
+        }
+    }
+}
+
+/// One page of fill activities with the id of its last, from which the next page is asked.
+fn fill_activities(body: &[u8]) -> Result<(Vec<Fill>, Option<String>), BrokerError> {
+    let payloads: Vec<FillActivityPayload> = parse(body)?;
+    let last = payloads.last().map(|payload| payload.id.clone());
+    let fills = payloads
+        .into_iter()
+        .map(|payload| {
+            let units = decimal(&payload.qty, SHARE_DIGITS, Rounding::Exact, "qty")?;
+            let shares = u64::try_from(units)
+                .ok()
+                .filter(|units| *units > 0)
+                .map(Shares::from_units)
+                .ok_or_else(|| BrokerError::Malformed {
+                    field: "qty",
+                    raw: payload.qty.clone(),
+                })?;
+            let ticks = decimal(&payload.price, PRICE_DIGITS, Rounding::Exact, "price")?;
+            let price = i64::try_from(ticks)
+                .ok()
+                .and_then(|ticks| Price::from_ticks(ticks).ok())
+                .ok_or_else(|| BrokerError::Malformed {
+                    field: "price",
+                    raw: payload.price.clone(),
+                })?;
+            let side = match payload.side {
+                AlpacaFillSide::Buy => Side::Buy,
+                AlpacaFillSide::Sell | AlpacaFillSide::SellShort => Side::Sell,
+            };
+            let symbol = Symbol::new(&payload.symbol).map_err(BrokerError::Symbol)?;
+            Fill::new(
+                payload.transaction_time,
+                symbol,
+                side,
+                shares,
+                price,
+                DollarVolume::default(),
+            )
+            .map_err(|_| BrokerError::Malformed {
+                field: "price",
+                raw: payload.price,
+            })
+        })
+        .collect::<Result<_, BrokerError>>()?;
+    Ok((fills, last))
 }
 
 impl Broker for PaperAccount {
@@ -641,6 +755,67 @@ mod tests {
 
     /// A filled order as the paper account returned it on 2026-10-05, trimmed likewise.
     const FILLED: &str = r#"{"id":"a9df02ed-b9da-4955-9b7f-ecd1a427e9cf","updated_at":"2026-08-21T19:45:07.724724Z","qty":"26","filled_qty":"26","filled_avg_price":"37.89","side":"buy","type":"market","status":"filled"}"#;
+
+    /// Two fills as the paper account's activities returned them on 2026-11-06, trimmed to the fields read and one
+    /// beside, the second relabeled a short sale.
+    const ACTIVITIES: &str = r#"[{"id":"20261106154532057::06947db3-04d5-4ba3-b04a-25d223116a13","activity_type":"FILL","transaction_time":"2026-11-06T20:45:32.057791Z","type":"fill","price":"657.95","qty":"1","side":"buy","symbol":"QQQ"},{"id":"20261106154538959::aa313a4e-df4f-4b6a-96c4-c9d69d7c5135","activity_type":"FILL","transaction_time":"2026-11-06T20:45:38.959531Z","type":"partial_fill","price":"737.29","qty":"0.5","side":"sell_short","symbol":"SPY"}]"#;
+
+    #[test]
+    fn test_fill_activities_read_as_the_paper_account_sends_them() {
+        let fill = |time: &str, raw: &str, side, units, ticks| {
+            Fill::new(
+                time.parse().unwrap(),
+                Symbol::new(raw).unwrap(),
+                side,
+                Shares::from_units(units),
+                Price::from_ticks(ticks).unwrap(),
+                DollarVolume::default(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            fill_activities(ACTIVITIES.as_bytes()).unwrap(),
+            (
+                vec![
+                    fill(
+                        "2026-11-06T20:45:32.057791Z",
+                        "QQQ",
+                        Side::Buy,
+                        1_000_000,
+                        657_950_000
+                    ),
+                    fill(
+                        "2026-11-06T20:45:38.959531Z",
+                        "SPY",
+                        Side::Sell,
+                        500_000,
+                        737_290_000
+                    ),
+                ],
+                Some("20261106154538959::aa313a4e-df4f-4b6a-96c4-c9d69d7c5135".to_string())
+            )
+        );
+        assert_eq!(fill_activities(b"[]").unwrap(), (Vec::new(), None));
+        assert!(matches!(
+            fill_activities(
+                ACTIVITIES
+                    .replace(r#""qty":"1""#, r#""qty":"0""#)
+                    .as_bytes()
+            ),
+            Err(BrokerError::Malformed { field: "qty", .. })
+        ));
+        assert!(fill_activities(ACTIVITIES.replace("sell_short", "short").as_bytes()).is_err());
+        use strum::IntoEnumIterator;
+        let sides: Vec<&str> = AlpacaFillSide::iter().map(Into::into).collect();
+        assert_eq!(sides, ["buy", "sell", "sell_short"]);
+        for side in AlpacaFillSide::iter() {
+            let named = format!("\"{side}\"");
+            assert_eq!(
+                serde_json::from_str::<AlpacaFillSide>(&named).unwrap(),
+                side
+            );
+        }
+    }
 
     #[test]
     fn test_an_order_body_carries_a_limit_only_when_priced_by_one() {
@@ -1000,6 +1175,30 @@ mod tests {
             let written = units_to_decimal(u128::from(units), SHARE_DIGITS);
             prop_assert_eq!(decimal(&written, SHARE_DIGITS, Rounding::Exact, "qty").unwrap(), i128::from(units));
         }
+    }
+
+    /// Reads the paper account's fills since 2026-11-06 and keeps that session's, which span two pages: 174 counted by
+    /// hand from the activities endpoint on 2026-11-08.
+    #[tokio::test]
+    #[ignore = "reads the Alpaca paper account; run deliberately under a development secretspec profile"]
+    async fn live_a_sessions_fills_read_across_pages() {
+        let account =
+            PaperAccount::new(Alpaca::from_environment(reqwest::Client::new()).unwrap()).unwrap();
+        let session = crate::common::time::SessionDate::from_date(
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap(),
+        );
+        let (start, end) = session.bounds();
+        let fills = account.fills(start).await.unwrap();
+        let within = fills
+            .iter()
+            .filter(|fill| fill.filled_against() < end)
+            .count();
+        assert_eq!(within, 174);
+        assert!(
+            fills
+                .windows(2)
+                .all(|pair| pair[0].filled_against() <= pair[1].filled_against())
+        );
     }
 
     /// Submits one SPY share on the paper account while the market is closed, reads it back by its client order id,
