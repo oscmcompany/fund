@@ -258,7 +258,7 @@ pub struct Clients {
     archive: Bucket,
     /// Shared by the concurrent security details requests.
     massive: Arc<Massive>,
-    /// Shared by the concurrent one-minute batches, so its secret is held once rather than copied into each.
+    /// Shared by the concurrent per-symbol tick fetches, so its secret is held once rather than copied into each.
     alpaca: Arc<Alpaca>,
     /// Refused only where its contact is unset, which fails the one leg that reads it rather than the run.
     sec: Result<Sec, VariableRefusal>,
@@ -786,33 +786,29 @@ async fn write_security_details(
 ) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
     let provenance = fetched_now(Subscription::StocksStarter, journal);
-    let one = NonZeroUsize::new(1).expect("one is not zero");
     let stopped = Arc::new(AtomicBool::new(false));
     let mut gathered: DetailsGathered =
-        in_batches(&symbols, one, parameters.tick_concurrency, |batch| {
+        each_symbol(&symbols, parameters.tick_concurrency, |symbol| {
             let massive = Arc::clone(&clients.massive);
             let stopped = Arc::clone(&stopped);
             async move {
                 let mut gathered = DetailsGathered::default();
-                for symbol in batch {
-                    // A failed request ends the leg, so the symbols after it are not requested.
-                    if stopped.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let (answer, bodies) = massive
-                        .security_details(&symbol, session)
-                        .await
-                        .into_parts();
-                    gathered.bodies.extend(bodies);
-                    match answer {
-                        Ok(DetailsAnswer::Details(details)) => gathered.details.push(details),
-                        Ok(DetailsAnswer::Missing) => gathered.missing.push(symbol),
-                        Ok(DetailsAnswer::Refused(row)) => gathered.refused.push(row),
-                        Err(error) => {
-                            stopped.store(true, Ordering::Relaxed);
-                            gathered.failed = Some(error);
-                            break;
-                        }
+                // A failed request ends the leg, so the symbols after it are not requested.
+                if stopped.load(Ordering::Relaxed) {
+                    return Ok(gathered);
+                }
+                let (answer, bodies) = massive
+                    .security_details(&symbol, session)
+                    .await
+                    .into_parts();
+                gathered.bodies.extend(bodies);
+                match answer {
+                    Ok(DetailsAnswer::Details(details)) => gathered.details.push(details),
+                    Ok(DetailsAnswer::Missing) => gathered.missing.push(symbol),
+                    Ok(DetailsAnswer::Refused(row)) => gathered.refused.push(row),
+                    Err(error) => {
+                        stopped.store(true, Ordering::Relaxed);
+                        gathered.failed = Some(error);
                     }
                 }
                 Ok(gathered)
@@ -1384,8 +1380,6 @@ where
 }
 
 /// The symbols that traded on `session`, which the tick legs must name since Alpaca's endpoints take a symbol list.
-/// Taken from Massive's grouped daily as of the session, never its prices: Alpaca's asset list describes today, so a
-/// backfill would miss every name delisted since, and nothing would show they were never asked for.
 async fn symbol_list(
     clients: &Clients,
     session: SessionDate,
@@ -1397,31 +1391,27 @@ async fn symbol_list(
     Ok(daily.bars().iter().map(Bar::symbol).cloned().collect())
 }
 
-/// Fetches `symbols` in batches with at most `concurrency` in flight, concatenating the answers in the order the
-/// batches were cut, whatever order they finish in; the first batch to fail fails them all and cancels the rest.
-async fn in_batches<Fetch, Pending, Answer>(
+/// Fetches each of `symbols` with at most `concurrency` in flight, concatenating the answers in the order of
+/// `symbols`, whatever order they finish in; the first fetch to fail fails them all and cancels the rest.
+async fn each_symbol<Fetch, Pending, Answer>(
     symbols: &[Symbol],
-    batch_symbols: NonZeroUsize,
     concurrency: NonZeroUsize,
     fetch: Fetch,
 ) -> Result<Answer, FetchError>
 where
-    Fetch: Fn(Vec<Symbol>) -> Pending,
+    Fetch: Fn(Symbol) -> Pending,
     Pending: Future<Output = Result<Answer, FetchError>> + Send + 'static,
     Answer: Monoid + Send + 'static,
 {
-    let mut batches = symbols
-        .chunks(batch_symbols.get())
-        .map(<[Symbol]>::to_vec)
-        .enumerate();
+    let mut pending_symbols = symbols.iter().cloned().enumerate();
     let mut answered = BTreeMap::new();
     let mut in_flight = JoinSet::new();
     loop {
         while in_flight.len() < concurrency.get() {
-            let Some((index, batch)) = batches.next() else {
+            let Some((index, symbol)) = pending_symbols.next() else {
                 break;
             };
-            let pending = fetch(batch);
+            let pending = fetch(symbol);
             in_flight.spawn(async move { (index, pending.await) });
         }
         match in_flight.join_next().await {
@@ -1444,22 +1434,7 @@ mod tests {
     use crate::common::market::trade_bars::{
         Condition, ConditionCode, ConditionStatus, UpdateRules,
     };
-    use crate::common::monoid::{Tally, laws};
-
-    /// The batches' symbols in the order they were concatenated.
-    #[derive(Debug, Clone, PartialEq)]
-    struct Names(Vec<String>);
-
-    impl Monoid for Names {
-        fn empty() -> Self {
-            Self(Vec::new())
-        }
-
-        fn combine(mut self, other: Self) -> Self {
-            self.0.extend(other.0);
-            self
-        }
-    }
+    use crate::common::monoid::{Sequence, Tally, laws};
 
     fn symbols(count: usize) -> Vec<Symbol> {
         (0..count)
@@ -1950,71 +1925,44 @@ mod tests {
         assert_eq!(*written.lock().unwrap(), Vec::<String>::new());
     }
 
-    /// An empty fold is refused before anything is written, so the session is not marked held.
-    #[tokio::test]
-    async fn test_no_bars_are_refused_unwritten() {
-        let [session, _] = sessions();
-        let provenance = Provenance::new(
-            Subscription::StocksStarter,
-            "2026-09-30T07:00:00Z".parse().unwrap(),
-            RunId::new(uuid::Uuid::from_u128(1)),
-            None,
-        );
-        let written = std::sync::Mutex::new(Vec::new());
-        let put = async |key: &Key, _body| {
-            written.lock().unwrap().push(key.path());
-            Ok(())
-        };
-        let refused = publish_ticks(
-            &put,
-            Vec::<crate::common::market::trade_bars::TradeBar>::new(),
-            |interval| alpaca_trades(session).at_interval(interval),
-            &provenance,
-            trade_bars::encode,
-        )
-        .await;
-        assert!(matches!(refused, Err(PartitionFailure::NoRows)));
-        assert_eq!(*written.lock().unwrap(), Vec::<String>::new());
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn test_batches_concatenate_in_the_order_cut_whatever_order_they_finish() {
+    async fn test_answers_concatenate_in_symbol_order_whatever_order_they_finish() {
         let names = symbols(25);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let most = Arc::new(AtomicUsize::new(0));
-        let answer = in_batches(&names, size(4), size(3), |batch| {
+        let answer = each_symbol(&names, size(3), |symbol| {
             let (in_flight, most) = (Arc::clone(&in_flight), Arc::clone(&most));
             async move {
                 let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 most.fetch_max(now, Ordering::SeqCst);
-                // Later batches finish first.
-                let first = u64::from(batch[0].as_str().as_bytes()[1]);
-                tokio::time::sleep(Duration::from_millis(1_000 - first)).await;
+                // Later symbols finish first.
+                let letter = u64::from(symbol.as_str().as_bytes()[1]);
+                tokio::time::sleep(Duration::from_millis(1_000 - letter)).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
-                Ok(Names(batch.iter().map(ToString::to_string).collect()))
+                Ok(Sequence(vec![symbol.to_string()]))
             }
         })
         .await
         .unwrap();
         let expected: Vec<String> = names.iter().map(ToString::to_string).collect();
-        assert_eq!(answer, Names(expected));
+        assert_eq!(answer, Sequence(expected));
         assert_eq!(most.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_a_failed_batch_fails_the_session_and_cancels_the_rest() {
+    async fn test_a_failed_fetch_fails_the_session_and_cancels_the_rest() {
         let started = Arc::new(AtomicUsize::new(0));
-        let answer = in_batches(&symbols(40), size(4), size(2), |batch| {
+        let answer = each_symbol(&symbols(40), size(2), |symbol| {
             let started = Arc::clone(&started);
             async move {
                 started.fetch_add(1, Ordering::SeqCst);
-                if batch[0].as_str() == "AE" {
+                if symbol.as_str() == "AB" {
                     return Err(FetchError::Malformed {
                         reason: "broken page".to_string(),
                     });
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                Ok(Names(Vec::new()))
+                Ok(Sequence::<String>(Vec::new()))
             }
         })
         .await;
@@ -2024,7 +1972,7 @@ mod tests {
                 reason: "broken page".to_string()
             })
         );
-        // The second batch fails at once, so only the two first in flight ever started.
+        // The second symbol fails at once, so only the two first in flight ever started.
         assert_eq!(started.load(Ordering::SeqCst), 2);
     }
 
@@ -2737,26 +2685,30 @@ mod tests {
             prop::collection::vec(symbol(), 0..4),
             prop::collection::vec(symbol(), 0..4),
             prop::collection::vec(("[A-Z]{1,3}", refusal), 0..4),
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..4), 0..3),
+            prop::option::of("[a-z]{1,8}".prop_map(|reason| FetchError::Malformed { reason })),
         )
-            .prop_map(|(details, missing, refused)| DetailsGathered {
-                details: details
-                    .into_iter()
-                    .map(|symbol| {
-                        SecurityDetails::new(symbol, None, None, None, None, None, None, None)
-                    })
-                    .collect(),
-                missing,
-                bodies: Vec::new(),
-                failed: None,
-                refused: refused
-                    .into_iter()
-                    .map(|(ticker, cause)| RefusedRow::new(&ticker, cause))
-                    .collect(),
-            })
+            .prop_map(
+                |(details, missing, refused, bodies, failed)| DetailsGathered {
+                    details: details
+                        .into_iter()
+                        .map(|symbol| {
+                            SecurityDetails::new(symbol, None, None, None, None, None, None, None)
+                        })
+                        .collect(),
+                    missing,
+                    bodies,
+                    failed,
+                    refused: refused
+                        .into_iter()
+                        .map(|(ticker, cause)| RefusedRow::new(&ticker, cause))
+                        .collect(),
+                },
+            )
     }
 
     proptest::proptest! {
-        /// Batches gather in the order they were asked, whatever grouping the concurrency happened to merge them in.
+        /// Answers gather in the order they were asked, whatever grouping the concurrency happened to merge them in.
         #[test]
         fn property_gathered_details_concatenate_as_a_monoid(
             first in any_gathered(),
@@ -2769,12 +2721,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_symbols_is_the_empty_answer() {
-        let answer = in_batches(&[], size(4), size(2), |_| async {
-            Err::<Names, _>(FetchError::Malformed {
+        let answer = each_symbol(&[], size(2), |_| async {
+            Err::<Sequence<String>, _>(FetchError::Malformed {
                 reason: "fetched nothing".to_string(),
             })
         })
         .await;
-        assert_eq!(answer, Ok(Names(Vec::new())));
+        assert_eq!(answer, Ok(Sequence(Vec::new())));
     }
 }

@@ -1,5 +1,6 @@
-//! The fund's S3 buckets: the shared market-data archive and each profile's own bucket, with objects written under
-//! their `Key`, checked by S3 against a SHA-256 on upload and read back byte for byte before a write counts as done.
+//! The fund's S3 buckets: the shared market-data archive and each profile's own bucket. A Standard-class object is
+//! written under its `Key`, checked by S3 against a SHA-256 on upload and read back byte for byte before the write
+//! counts as done; a Deep Archive object is written through `raw`.
 
 pub mod journal;
 pub mod logs;
@@ -40,7 +41,7 @@ pub enum BucketError {
     /// A create found the key already written, or a replace found it changed since it was read.
     #[error("{path} was written by someone else first; read it again")]
     Contended { path: String },
-    /// The key's storage class cannot be read back, so this path cannot verify it; raw ticks go through `raw`.
+    /// The key's storage class cannot be read back, so this path cannot verify it; Deep Archive keys go through `raw`.
     #[error("{path} lands in Deep Archive, which cannot be read back")]
     Unverifiable { path: String },
     #[error("{path} read back {read} bytes where {written} were written")]

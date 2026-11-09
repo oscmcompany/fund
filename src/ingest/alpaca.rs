@@ -1,5 +1,5 @@
-//! Alpaca's historical SIP bars, fetched for many symbols at once and named as they were on the session, its
-//! published trading calendar, and its asset listing's short-sale flags.
+//! Alpaca's SIP quotes and trades, a session's requested as of that session, its latest quotes, its published trading
+//! calendar, and its asset listing's short-sale flags.
 
 pub mod corporate_actions;
 
@@ -25,7 +25,7 @@ const QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes";
 const TRADES_URL: &str = "https://data.alpaca.markets/v2/stocks/trades";
 const LATEST_QUOTES_URL: &str = "https://data.alpaca.markets/v2/stocks/quotes/latest";
 
-/// Bars per page, the endpoint's maximum.
+/// Rows per page, the endpoint's maximum.
 const PAGE_LIMIT: &str = "10000";
 
 pub struct Alpaca {
@@ -400,11 +400,9 @@ impl Alpaca {
             start.to_rfc3339(),
             (end - TimeDelta::nanoseconds(1)).to_rfc3339(),
         );
-        let mut trades = Vec::new();
-        let mut tokens = PageTokens::default();
-        let mut token: Option<String> = None;
-        loop {
-            let body = with_retries(|| {
+        let (names, start, end) = (&names, &start, &end);
+        let pages = paginate(|page_token| async move {
+            with_retries(|| {
                 let mut query = vec![
                     ("symbols", names.as_str()),
                     ("start", start.as_str()),
@@ -413,7 +411,7 @@ impl Alpaca {
                     ("sort", "asc"),
                     ("limit", PAGE_LIMIT),
                 ];
-                if let Some(token) = token.as_deref() {
+                if let Some(token) = page_token.as_deref() {
                     query.push(("page_token", token));
                 }
                 send(
@@ -422,14 +420,14 @@ impl Alpaca {
                         .query(&query),
                 )
             })
-            .await?;
-            let next = tokens.next(&body)?;
-            trades.extend(requested_trades(&body, symbols)?);
-            match next {
-                Some(next) => token = Some(next),
-                None => return Ok(trades),
-            }
+            .await
+        })
+        .await?;
+        let mut trades = Vec::new();
+        for page in &pages {
+            trades.extend(requested_trades(page, symbols)?);
         }
+        Ok(trades)
     }
 
     /// Each of `symbols`' latest SIP quote, read through transient failures; a symbol with no quote is absent.

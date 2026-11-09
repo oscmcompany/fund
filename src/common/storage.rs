@@ -1,5 +1,5 @@
 //! Object keys for the archive and the records. Each `Key` is a hive path whose partition values a reader surfaces as
-//! columns, each parses back to the parts that built it, and each has exactly one host allowed to write it; a
+//! columns, each parses back to the parts that built it, and each has exactly one producer allowed to write it; a
 //! `ConfigurationKey` is a host's configuration, which an operator writes outside any session.
 
 use chrono::{Datelike, NaiveDate};
@@ -79,7 +79,7 @@ pub enum StorageClass {
     DeepArchive,
 }
 
-/// What the archive client needs of any key: where the object lives and the class it is written in.
+/// What a `Bucket` needs of any key: where the object lives and the class it is written in.
 pub trait ObjectKey {
     fn path(&self) -> String;
     fn storage_class(&self) -> StorageClass;
@@ -151,7 +151,7 @@ impl ObjectKey for NoteKey {
             Host::Researcher,
             self.digest.as_str(),
             self.run,
-            self.name.0
+            self.name.as_str()
         )
     }
 
@@ -644,20 +644,6 @@ impl Key {
         }
     }
 
-    /// The one producer that may write this object: the archiver for data, the producer for a record.
-    pub fn writer(&self) -> Producer {
-        match self {
-            Self::Quotes(..)
-            | Self::Trades(..)
-            | Self::Reference(..)
-            | Self::RawQuotes { .. }
-            | Self::RawTrades { .. }
-            | Self::RawReference(..) => Producer::Host(Host::Archiver),
-            Self::Journal(key) => key.producer,
-            Self::Logs(key) => Producer::Host(key.host),
-        }
-    }
-
     /// The class this key is written in: Deep Archive for raw quotes, trades and reference responses, Standard for
     /// everything else.
     pub fn storage_class(&self) -> StorageClass {
@@ -850,6 +836,20 @@ pub(crate) mod tests {
     use strum::IntoEnumIterator;
 
     use super::*;
+
+    /// The one producer that may write `key`: the archiver for data, the producer for a record.
+    fn writer(key: &Key) -> Producer {
+        match key {
+            Key::Quotes(..)
+            | Key::Trades(..)
+            | Key::Reference(..)
+            | Key::RawQuotes { .. }
+            | Key::RawTrades { .. }
+            | Key::RawReference(..) => Producer::Host(Host::Archiver),
+            Key::Journal(key) => key.producer,
+            Key::Logs(key) => Producer::Host(key.host),
+        }
+    }
 
     #[test]
     fn test_a_provider_serializes_under_its_display_name() {
@@ -1247,7 +1247,7 @@ pub(crate) mod tests {
                     .writable_prefixes()
                     .iter()
                     .any(|prefix| path.starts_with(prefix));
-                prop_assert_eq!(allowed, Producer::Host(host) == key.writer(), "{} {}", host, path);
+                prop_assert_eq!(allowed, Producer::Host(host) == writer(&key), "{} {}", host, path);
             }
         }
     }

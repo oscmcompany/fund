@@ -1,5 +1,5 @@
 //! Vendor bytes stored as served: fetched response pages written a line each into one gzip stream, so no response set
-//! is ever held whole, under a full-object CRC64 that S3 computes and any later copy of the same bytes must match.
+//! is ever held whole, under a full-object CRC64 that S3 computes.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 
 use super::provenance::{MetadataEntry, Provenance};
 use super::{Bucket, BucketError};
-use crate::common::storage::{EntityTag, Key, ReferenceKey, StorageClass};
+use crate::common::storage::{Key, ReferenceKey, StorageClass};
 
 /// The length a gzip part reaches before it is uploaded.
 const PART_LENGTH: usize = 64 * 1024 * 1024;
@@ -21,22 +21,16 @@ const PART_LENGTH: usize = 64 * 1024 * 1024;
 /// Attempts at uploading one part before the upload is abandoned.
 const PART_ATTEMPTS: u32 = 5;
 
-/// What the bucket holds under a key: its length and the checksum S3 holds for it.
+/// What the bucket holds under a key, read from its metadata: its length, the checksum S3 holds, and the fetch time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
     length: u64,
     checksum: Checksum,
-    /// When the vendor's bytes were fetched, from the object's metadata; `None` on a copy that never recorded it.
+    /// `None` on a copy that never recorded it.
     fetched_at: Option<DateTime<Utc>>,
-    /// The version read, which a conditional delete must still match.
-    tag: EntityTag,
 }
 
 impl Stored {
-    pub fn tag(&self) -> &EntityTag {
-        &self.tag
-    }
-
     pub fn fetched_at(&self) -> Option<DateTime<Utc>> {
         self.fetched_at
     }
@@ -53,12 +47,6 @@ impl Stored {
 /// Base64 of the CRC64/NVME over a whole object, the same whatever part size wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Crc64(String);
-
-impl Crc64 {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 /// The checksum S3 holds for an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,13 +142,7 @@ impl Bucket {
                     .and_then(|length| u64::try_from(length).ok())
                     .ok_or_else(|| failed("no length".to_string()))?;
                 let fetched_at = fetched_at(response.metadata()).map_err(failed)?;
-                let tag = EntityTag::new(
-                    response
-                        .e_tag()
-                        .ok_or_else(|| failed("no entity tag".to_string()))?,
-                );
                 Ok(Some(Stored {
-                    tag,
                     length,
                     checksum: Checksum::of(
                         response.checksum_type(),

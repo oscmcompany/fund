@@ -3,15 +3,19 @@
 
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
 use arrow_array::builder::{StringBuilder, TimestampNanosecondBuilder, UInt64Builder};
-use arrow_array::{Array, ArrayRef, StringArray, TimestampNanosecondArray, UInt64Array};
+#[cfg(test)]
+use arrow_array::{Array, StringArray, TimestampNanosecondArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use tracing::Level;
 use uuid::Uuid;
 
-use super::parquet::{self, ReadRefusal};
+use super::parquet;
+#[cfg(test)]
+use super::parquet::ReadRefusal;
 use crate::common::journal::{Commit, RunId};
 use crate::journal::UNKNOWN_COMMIT;
 
@@ -92,12 +96,14 @@ pub enum EncodeRefusal {
 }
 
 /// Why a file was not read as a log.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeRefusal {
     File(ReadRefusal),
     Row { line: u64, reason: String },
 }
 
+#[cfg(test)]
 impl From<ReadRefusal> for DecodeRefusal {
     fn from(refusal: ReadRefusal) -> Self {
         Self::File(refusal)
@@ -288,6 +294,7 @@ pub fn encode(lines: &[LogLine]) -> Result<Vec<u8>, EncodeRefusal> {
     parquet::write(schema(), columns, LAYOUT_VERSION, Vec::new()).map_err(EncodeRefusal::Parquet)
 }
 
+#[cfg(test)]
 pub fn decode(bytes: Vec<u8>) -> Result<Vec<LogLine>, DecodeRefusal> {
     let (batches, _) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let mut lines = Vec::new();
@@ -470,6 +477,65 @@ mod tests {
         assert_eq!(decode(bytes).unwrap(), lines);
     }
 
+    fn any_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            "\\PC{0,12}".prop_map(Value::String),
+        ]
+        .prop_recursive(2, 8, 3, |inner| {
+            prop::collection::btree_map("\\PC{0,6}", inner, 0..3)
+                .prop_map(|object| Value::Object(object.into_iter().collect()))
+        })
+    }
+
+    fn any_read() -> impl Strategy<Value = LogLine> {
+        let level = prop::sample::select(vec![
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ]);
+        let commit = ("[0-9a-f]{40}", any::<bool>()).prop_map(|(sha, dirty)| {
+            Commit::new(&format!("{sha}{}", if dirty { "-dirty" } else { "" })).unwrap()
+        });
+        (
+            any::<u64>(),
+            any::<i64>(),
+            level,
+            "\\PC{0,20}",
+            "\\PC{0,20}",
+            prop::option::of(any::<u128>()),
+            prop::option::of(commit),
+            prop::collection::btree_map("\\PC{0,8}", any_value(), 0..4),
+        )
+            .prop_map(
+                |(line, nanoseconds, level, target, message, run_id, commit, fields)| {
+                    LogLine::Read {
+                        line,
+                        timestamp: DateTime::from_timestamp_nanos(nanoseconds),
+                        level,
+                        target,
+                        message,
+                        run_id: run_id.map(|bits| RunId::new(Uuid::from_u128(bits))),
+                        commit,
+                        fields: Fields(fields.into_iter().collect()),
+                    }
+                },
+            )
+    }
+
+    /// A line that does not read, with the cause reading it gives, since decoding reads it again.
+    fn any_unreadable() -> impl Strategy<Value = LogLine> {
+        (any::<u64>(), "[ -~]{1,30}")
+            .prop_map(|(line, text)| read_one(line, &text))
+            .prop_filter("a line that reads", |line| {
+                matches!(line, LogLine::Unreadable { .. })
+            })
+    }
+
     proptest! {
         /// Whatever the file holds, it reads back as the lines parsed from it.
         #[test]
@@ -482,6 +548,15 @@ mod tests {
             texts.extend(noise);
             let lines = parse(&texts.join("\n"));
             prop_assert_eq!(lines.len(), texts.len());
+            let bytes = encode(&lines).unwrap();
+            prop_assert_eq!(decode(bytes).unwrap(), lines);
+        }
+
+        /// Any line of either kind, at any level and with or without a run, reads back as it was written.
+        #[test]
+        fn property_any_lines_round_trip(
+            lines in prop::collection::vec(prop_oneof![any_read(), any_unreadable()], 0..8),
+        ) {
             let bytes = encode(&lines).unwrap();
             prop_assert_eq!(decode(bytes).unwrap(), lines);
         }

@@ -2,7 +2,6 @@
 //! records and names every row it refused.
 
 pub mod alpaca;
-pub mod flat_files;
 pub mod massive;
 pub(crate) mod retry;
 pub mod sec;
@@ -65,8 +64,8 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-/// What a fetch read, or why it failed, beside every response body it received, so the bodies can be stored as served
-/// even when reading them failed.
+/// What a fetch read, or why it failed, beside the response bodies it kept, so the bodies can be stored as served even
+/// when reading them failed.
 #[derive(Debug)]
 pub struct Fetched<T> {
     value: Result<T, FetchError>,
@@ -116,7 +115,7 @@ pub enum ParseRefusal {
     Malformed { line: Option<u64>, reason: String },
 }
 
-/// Where and when a print was reported, in the vendor's own codes; no fold reads it, so research can.
+/// Where and when a print was reported, in the vendor's own codes, kept beside the record rather than in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrintOrigin {
     /// Absent where the vendor served none.
@@ -132,7 +131,7 @@ pub struct PrintOrigin {
     pub sequence: Option<u64>,
 }
 
-/// Where and when a quote was published, in the vendor's own codes; no fold reads it, so research can.
+/// Where and when a quote was published, in the vendor's own codes, kept beside the record rather than in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuoteOrigin {
     /// Each absent where the vendor served none.
@@ -222,10 +221,6 @@ impl SessionBars {
     /// In symbol, then timestamp, order.
     pub fn bars(&self) -> &[Bar] {
         &self.bars
-    }
-
-    pub fn into_bars(self) -> Vec<Bar> {
-        self.bars
     }
 
     pub fn test_tickers(&self) -> &[String] {

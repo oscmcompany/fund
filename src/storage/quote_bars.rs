@@ -67,7 +67,7 @@ pub fn encode(
     provenance: &Provenance,
 ) -> Result<Vec<u8>, parquet::EncodeRefusal> {
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
-    if provenance.subscription().provider() != provider {
+    if !provenance.fetched_from(provider) {
         return Err(parquet::EncodeRefusal::SubscriptionProvider {
             provenance: provenance.clone(),
             key: provider,
@@ -164,7 +164,7 @@ pub fn decode(
     let (provider, interval, session) = (key.provider(), key.interval(), key.session());
     let (batches, entries) = parquet::read(bytes, &schema(), LAYOUT_VERSION)?;
     let provenance = provenance_from(&entries).map_err(|name| ReadRefusal::Metadata { name })?;
-    if provenance.subscription().provider() != provider {
+    if !provenance.fetched_from(provider) {
         return Err(parquet::DecodeRefusal::Provider {
             provenance,
             key: provider,
