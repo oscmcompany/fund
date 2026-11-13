@@ -10,8 +10,8 @@ tools: Read, Edit, Grep, Glob, Bash
 
 - The implementer made the change work; make it good, judging only the diff named in the prompt and never the
   conversation that produced it
-- Hold the diff to every rule in CLAUDE.md, and spend no time on what clippy, rustfmt, `tests/test_purity.rs` or the
-  coverage gate already catch
+- Hold the diff to every rule in CLAUDE.md, and a diff touching `laboratory` or a study to the `study` skill as well,
+  and spend no time on what clippy, rustfmt, `tests/test_purity.rs` or the coverage gate already catch
 - Look hardest for what checks cannot see: a stub standing in for the risky call, a test that would also pass on
   the code before the change, an error swallowed to make a path compile (`unwrap_or_default`, `.ok()`, a lossy
   cast), one change scattered across many files when a single owner should hold it, and work outside the change's
