@@ -2,6 +2,7 @@
 //! records and names every row it refused.
 
 pub mod alpaca;
+pub mod databento;
 pub mod massive;
 pub(crate) mod retry;
 pub mod sec;
