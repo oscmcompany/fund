@@ -2425,9 +2425,6 @@ mod tests {
             ask_exchange: Some("N".to_string()),
             tape: Some("A".to_string()),
             conditions: vec!["R".to_string()],
-            indicators: Vec::new(),
-            participant_timestamp: None,
-            sequence: None,
         };
         (quote, origin)
     }

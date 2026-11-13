@@ -536,9 +536,6 @@ fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
         ask_exchange: row.ask_exchange.clone(),
         tape: row.tape.clone(),
         conditions: row.conditions.clone(),
-        indicators: vec![],
-        participant_timestamp: None,
-        sequence: None,
     };
     match priced_side((row.bid_price, row.bid_size), (row.ask_price, row.ask_size)) {
         Some(Ok(priced)) => {
@@ -635,9 +632,6 @@ fn trade_outcome(symbol: &Symbol, row: &AlpacaTrade) -> AlpacaTradeOutcome {
         exchange: row.exchange.clone(),
         tape: row.tape.clone(),
         id: row.id.map(|id| id.to_string()),
-        participant_timestamp: None,
-        trade_reporting_facility_timestamp: None,
-        sequence: None,
     };
     AlpacaTradeOutcome::Print {
         print,
@@ -1128,9 +1122,6 @@ mod tests {
                         ask_exchange: Some("Q".to_string()),
                         tape: Some("C".to_string()),
                         conditions: vec!["R".to_string()],
-                        indicators: vec![],
-                        participant_timestamp: None,
-                        sequence: None,
                     }
                 );
             }

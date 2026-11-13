@@ -35,6 +35,8 @@ const CONFIGURATION_ROOT: &str = "configuration";
 #[strum(serialize_all = "snake_case")]
 pub enum Provider {
     Alpaca,
+    /// Its quote and trade families, raw and parsed, have had no writer since 2026-10-26 and stay readable; no heal
+    /// leg keys them, which `common::heal`'s tests check, while its reference tables are still written.
     Massive,
     /// The SEC's EDGAR filings.
     Sec,
@@ -689,7 +691,7 @@ fn date_partition(session: SessionDate) -> String {
     )
 }
 
-/// The file a vendor's tick session is stored as: Massive's flat file, or Alpaca's REST pages one per line.
+/// The file a vendor's tick session is stored as: Massive's historical flat file, or Alpaca's REST pages one per line.
 fn raw_ticks_file(provider: Provider) -> &'static str {
     match provider {
         Provider::Massive => "data.csv.gz",
