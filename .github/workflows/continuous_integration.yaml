@@ -40,6 +40,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'clippy.toml'
+              - 'deny.toml'
               - 'secretspec.toml'
               - 'views.sql'
               - 'checks/**'
