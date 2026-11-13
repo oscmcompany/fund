@@ -34,14 +34,30 @@ FROM read_parquet(
 CREATE OR REPLACE MACRO sessions(bucket, series) AS TABLE
 SELECT * FROM partitions(bucket, series, 'year=*/month=*/day=*');
 
--- A reference table's snapshots, dated by `as_of`.
+-- A nanosecond instant rounded up to the microsecond a `TIMESTAMPTZ` holds, so it is never read as earlier than it was.
+CREATE OR REPLACE MACRO microsecond_ceiling(instant) AS make_timestamptz((epoch_ns(instant) + 999) // 1000);
+
+-- A reference table's snapshots, dated by `as_of`, each row with `known_at`, the instant its file was fetched; a file
+-- whose metadata lacks that instant fails the read.
 CREATE OR REPLACE MACRO snapshots(series) AS TABLE
-SELECT *
+WITH fetched AS (
+    SELECT file_name, microsecond_ceiling(decode(value)::TIMESTAMP_NS) AS known_at
+    FROM parquet_kv_metadata('s3://' || getvariable('archive_bucket') || '/' || series || 'as_of=*/data.parquet')
+    WHERE decode(key) = 'fund.fetched_at'
+)
+SELECT
+    snapshot.* EXCLUDE (filename),
+    CASE
+        WHEN fetched.known_at IS NULL THEN error(snapshot.filename || ' has no fund.fetched_at')
+        ELSE fetched.known_at
+    END AS known_at
 FROM read_parquet(
     's3://' || getvariable('archive_bucket') || '/' || series || 'as_of=*/data.parquet',
     hive_partitioning = true,
-    hive_types = {'as_of': DATE}
-);
+    hive_types = {'as_of': DATE},
+    filename = true
+) AS snapshot
+LEFT JOIN fetched ON fetched.file_name = snapshot.filename;
 
 -- The sessions a market-data series holds, read from its file listing rather than its rows.
 CREATE OR REPLACE MACRO held_sessions(series) AS TABLE
@@ -235,10 +251,12 @@ CREATE OR REPLACE VIEW security_details AS
 SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=massive/table=security_details/');
 
 -- Each quarterly snapshot of the industry code each annual report's header assigned a filer of common stock or a
--- depositary receipt Massive gives no code, one row per report; read a code only from its `accepted_at` on, and a
--- null code as the filer left unclassified, ending any earlier code.
+-- depositary receipt Massive gives no code, one row per report; `known_at` is EDGAR's `accepted_at`, the filing's
+-- publication as DuckDB reads it to the microsecond, and a null code reads as the filer left unclassified, ending any
+-- earlier code.
 CREATE OR REPLACE VIEW filed_industry_codes AS
-SELECT * FROM snapshots('data/equity/stage=parsed/reference/provider=sec/table=filed_industry_codes/');
+SELECT * REPLACE (accepted_at AS known_at)
+FROM snapshots('data/equity/stage=parsed/reference/provider=sec/table=filed_industry_codes/');
 
 -- Each nightly snapshot of Massive's whole split table, dated by the session it was taken after.
 CREATE OR REPLACE VIEW splits AS

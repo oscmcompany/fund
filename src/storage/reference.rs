@@ -862,10 +862,12 @@ pub fn decode_borrow_flags(
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
+    use strum::IntoEnumIterator;
     use uuid::Uuid;
 
     use super::*;
     use crate::common::journal::RunId;
+    use crate::common::storage::KnownAt;
     use crate::common::time::SessionDate;
     use crate::storage::provenance::Subscription;
 
@@ -875,6 +877,41 @@ mod tests {
 
     fn key(table: ReferenceTable) -> ReferenceKey {
         ReferenceKey::new(Provider::Massive, table, session())
+    }
+
+    #[test]
+    fn test_a_published_known_at_names_a_utc_instant_its_table_stores() {
+        let mut published = Vec::new();
+        for table in ReferenceTable::iter() {
+            let schema = match table {
+                ReferenceTable::Conditions => Some(conditions_schema()),
+                ReferenceTable::SecurityDetails => Some(security_details_schema()),
+                ReferenceTable::Splits => Some(splits_schema()),
+                ReferenceTable::SeriesBoundaries => Some(series_boundaries_schema()),
+                ReferenceTable::TradedSymbols => None,
+                ReferenceTable::FiledIndustryCodes => Some(filed_industry_codes_schema()),
+                ReferenceTable::BorrowFlags => Some(borrow_flags_schema()),
+            };
+            match table.known_at() {
+                KnownAt::Fetched => {}
+                KnownAt::Published { column } => {
+                    let field = schema
+                        .as_ref()
+                        .and_then(|schema| schema.field_with_name(column).ok())
+                        .unwrap_or_else(|| panic!("{table} stores no {column}"));
+                    assert!(
+                        matches!(field.data_type(), DataType::Timestamp(_, Some(zone)) if zone.as_ref() == "UTC"),
+                        "{table}'s {column} is {:?}",
+                        field.data_type()
+                    );
+                    published.push((table.to_string(), column));
+                }
+            }
+        }
+        assert_eq!(
+            published,
+            vec![("filed_industry_codes".to_string(), "accepted_at")]
+        );
     }
 
     #[test]
