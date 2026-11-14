@@ -2,6 +2,7 @@
 //! records and names every row it refused.
 
 pub mod alpaca;
+pub mod databento;
 pub mod massive;
 pub(crate) mod retry;
 pub mod sec;
@@ -123,12 +124,6 @@ pub struct PrintOrigin {
     pub tape: String,
     /// Absent where the vendor served none.
     pub id: Option<String>,
-    /// When the reporting venue stamped the print; Alpaca serves none.
-    pub participant_timestamp: Option<DateTime<Utc>>,
-    /// When a trade reporting facility stamped the print; Alpaca serves none.
-    pub trade_reporting_facility_timestamp: Option<DateTime<Utc>>,
-    /// Massive's sequence number, increasing within a ticker's session; Alpaca serves none.
-    pub sequence: Option<u64>,
 }
 
 /// Where and when a quote was published, in the vendor's own codes, kept beside the record rather than in it.
@@ -139,12 +134,6 @@ pub struct QuoteOrigin {
     pub ask_exchange: Option<String>,
     pub tape: Option<String>,
     pub conditions: Vec<String>,
-    /// Massive's quote indicators; Alpaca serves none.
-    pub indicators: Vec<String>,
-    /// When the quoting venue stamped the quote; Alpaca serves none.
-    pub participant_timestamp: Option<DateTime<Utc>>,
-    /// Massive's sequence number, increasing within a ticker's session; Alpaca serves none.
-    pub sequence: Option<u64>,
 }
 
 /// Which side of a one-sided quote is priced; both priced is a two-sided quote, so it is no variant here.

@@ -29,8 +29,8 @@ use crate::common::time::{SessionDate, SessionRange, SessionRangeRefusal};
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DatasetLeg {
-    /// Trade bars folded from ticks, Massive's where it holds the session and Alpaca's otherwise; the three cadences
-    /// are three series.
+    /// Trade bars folded from ticks, Massive's where it holds the session (none after 2026-10-26) and Alpaca's
+    /// otherwise; the three cadences are three series.
     MinuteTradeBars,
     FiveMinuteTradeBars,
     DailyTradeBars,

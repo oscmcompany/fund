@@ -1,7 +1,11 @@
 //! Sends a request through transient failures with exponential backoff.
 
 use std::future::Future;
+use std::io::Write;
 use std::time::Duration;
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 /// Attempts before a transient failure is returned.
 const ATTEMPTS: u32 = 6;
@@ -55,7 +59,7 @@ pub(crate) fn classify(status: reqwest::StatusCode) -> Class {
 /// Sends one request under a deadline, reading a body only once its status says it is wanted. Errors are kept
 /// without their URL, so a credential in a query can never reach a log through one.
 pub(crate) async fn send(request: reqwest::RequestBuilder) -> Outcome {
-    let mut response = match request.timeout(REQUEST_TIMEOUT).send().await {
+    let response = match request.timeout(REQUEST_TIMEOUT).send().await {
         Ok(response) => response,
         Err(error) => return Outcome::Transient(error.without_url().to_string()),
     };
@@ -66,20 +70,55 @@ pub(crate) async fn send(request: reqwest::RequestBuilder) -> Outcome {
             Err(error) => Outcome::Transient(error.without_url().to_string()),
         },
         Class::Transient => Outcome::Transient(format!("status {status}")),
-        Class::Refused => {
-            let mut body = Vec::new();
-            while body.len() < ERROR_BODY_LIMIT {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-                    Ok(None) | Err(_) => break,
+        Class::Refused => refused(response).await,
+    }
+}
+
+/// Sends one request like `send`, gzipping the body as it streams, so a body of gigabytes is never held uncompressed;
+/// `timeout` bounds the whole transfer.
+pub(crate) async fn send_gzipped(request: reqwest::RequestBuilder, timeout: Duration) -> Outcome {
+    let mut response = match request.timeout(timeout).send().await {
+        Ok(response) => response,
+        Err(error) => return Outcome::Transient(error.without_url().to_string()),
+    };
+    let status = response.status();
+    match classify(status) {
+        Class::Success => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            loop {
+                let written = match response.chunk().await {
+                    Ok(Some(chunk)) => encoder.write_all(&chunk),
+                    Ok(None) => break,
+                    Err(error) => return Outcome::Transient(error.without_url().to_string()),
+                };
+                if let Err(error) = written {
+                    return Outcome::Transient(error.to_string());
                 }
             }
-            body.truncate(ERROR_BODY_LIMIT);
-            Outcome::Refused {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&body).into_owned(),
+            match encoder.finish() {
+                Ok(body) => Outcome::Body(body),
+                Err(error) => Outcome::Transient(error.to_string()),
             }
         }
+        Class::Transient => Outcome::Transient(format!("status {status}")),
+        Class::Refused => refused(response).await,
+    }
+}
+
+/// A refused response with the start of the body the vendor sent.
+async fn refused(mut response: reqwest::Response) -> Outcome {
+    let status = response.status();
+    let mut body = Vec::new();
+    while body.len() < ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(ERROR_BODY_LIMIT);
+    Outcome::Refused {
+        status: status.as_u16(),
+        body: String::from_utf8_lossy(&body).into_owned(),
     }
 }
 
@@ -149,6 +188,62 @@ mod tests {
         match send(request).await {
             Outcome::Transient(cause) => assert!(!cause.contains("hidden"), "{cause}"),
             Outcome::Body(_) | Outcome::Refused { .. } => panic!("port 1 answered"),
+        }
+    }
+
+    /// Answers one connection on a local port with `pieces`, flushed one at a time, then closes it.
+    fn serve_once(pieces: Vec<&'static [u8]>) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                line.clear();
+            }
+            for piece in pieces {
+                stream.write_all(piece).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        format!("http://{address}/rows")
+    }
+
+    #[tokio::test]
+    async fn test_a_chunked_body_gzips_to_its_exact_bytes() {
+        let url = serve_once(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            b"6\r\nts,px\n\r\n",
+            b"9\r\n1,100.25\n\r\n",
+            b"9\r\n2,100.50\n\r\n",
+            b"0\r\n\r\n",
+        ]);
+        let outcome = send_gzipped(reqwest::Client::new().get(url), Duration::from_secs(5)).await;
+        let Outcome::Body(gzipped) = outcome else {
+            panic!("a whole body was not returned");
+        };
+        let mut decompressed = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(gzipped.as_slice()),
+            &mut decompressed,
+        )
+        .unwrap();
+        assert_eq!(decompressed, "ts,px\n1,100.25\n2,100.50\n");
+    }
+
+    #[tokio::test]
+    async fn test_a_body_cut_short_is_transient_not_a_partial_file() {
+        let url = serve_once(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            b"ts,px\n1,100.25\n",
+        ]);
+        let outcome = send_gzipped(reqwest::Client::new().get(url), Duration::from_secs(5)).await;
+        match outcome {
+            Outcome::Transient(_) => {}
+            Outcome::Body(_) | Outcome::Refused { .. } => panic!("a truncated body was accepted"),
         }
     }
 

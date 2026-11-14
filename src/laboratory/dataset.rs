@@ -128,7 +128,8 @@ async fn preferred<K, Found, Error>(
     Ok(None)
 }
 
-/// Each provider's trade-bar key at `interval` for `session`, in the order a session is preferred from.
+/// Each provider's trade-bar key at `interval` for `session`, in the order a session is preferred from; Massive's
+/// sessions have had no writer since 2026-10-26, so a later session falls through to Alpaca.
 fn trade_keys(interval: BarInterval, session: SessionDate) -> [(Provider, TradesKey); 2] {
     [Provider::Massive, Provider::Alpaca]
         .map(|provider| (provider, TradesKey::new(provider, interval, session)))

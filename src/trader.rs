@@ -979,9 +979,6 @@ mod tests {
                 exchange: Some("Z".to_string()),
                 tape: "A".to_string(),
                 id: Some("1".to_string()),
-                participant_timestamp: None,
-                trade_reporting_facility_timestamp: None,
-                sequence: None,
             },
         }
     }
