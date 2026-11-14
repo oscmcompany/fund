@@ -1,4 +1,4 @@
-# Checked by `checks:rust:audit`; `cargo deny` reads it from the workspace root.
+# Checked in continuous integration only; `cargo deny` reads it from the workspace root.
 
 [graph]
 all-features = true

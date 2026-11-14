@@ -30,7 +30,7 @@ in {
       hook "Check every derived date has a pinned time zone" "timezones" "(\\.(sql|rs|sh)$|(^|/)[^./]+$)";
     check-rust =
       hook "Check all Rust code" "rust"
-      "(\\.rs|Cargo\\.(toml|lock)|(clippy|deny|secretspec|rust-toolchain)\\.toml|views\\.sql|^checks/.+|^host/.+|devenv\\.(nix|lock|yaml))$";
+      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|^checks/.+|^host/.+|devenv\\.(nix|lock|yaml))$";
     check-markdown = hook "Check all Markdown code" "markdown" "\\.md$";
     check-yaml = hook "Check all YAML code" "yaml" "\\.(yaml|yml)$";
     check-toml = hook "Check all TOML code" "toml" "\\.toml$";
@@ -51,8 +51,6 @@ in {
   packages = with pkgs; [
     alejandra
     awscli2
-    cargo-audit
-    cargo-deny
     cargo-llvm-cov
     cargo-machete
     cargo-mutants
@@ -138,15 +136,6 @@ in {
       '';
       after = ["checks:rust:format"];
     };
-    # Each tool fetches the RustSec advisory database, so it needs the network.
-    "checks:rust:audit" = {
-      exec = ''
-        set -euo pipefail
-        cargo audit --deny warnings
-        cargo deny --workspace check
-      '';
-      after = ["checks:rust:format"];
-    };
 
     # --- Standalone checks ---
 
@@ -198,7 +187,6 @@ in {
         "checks:rust:lint"
         "checks:rust:test"
         "checks:rust:unused-dependencies"
-        "checks:rust:audit"
       ];
     };
   };
@@ -216,8 +204,7 @@ in {
       echo ""
       echo "  Tasks (devenv tasks run <name>):"
       echo "    checks:rust                 All Rust checks (format, lint,"
-      echo "                                test with coverage, unused-deps,"
-      echo "                                advisories, licences, sources)"
+      echo "                                test with coverage, unused-deps)"
       echo "    checks:base                 Non-language checks (nix, markdown,"
       echo "                                yaml, toml)"
       echo "    checks:private-files        Fail on any tracked private file"
