@@ -216,7 +216,7 @@ pub struct Session<S: Strategy> {
     close: DateTime<Utc>,
     /// Built minutes still to be read once more, oldest first.
     rechecks: VecDeque<Recheck>,
-    /// The built minute bars of the decision bar not yet ended, rolled up into it once it ends.
+    /// On five-minute decisions, the built minute bars of the decision bar not yet ended, rolled up into it once it ends.
     unrolled: Vec<TradeBar>,
     state: MarketState,
     book: Book,
@@ -410,11 +410,16 @@ impl<S: Strategy> Session<S> {
                 tracing::warn!(minute = %start, %refused, "Minute rows refused");
             }
             let minutes = self.fold.drain_through(end);
-            self.unrolled.extend(minutes.iter().cloned());
             let decision = self.settings.decision;
-            let rolled = match decision_before(end, decision) == end {
-                true => rolled_up(&std::mem::take(&mut self.unrolled), decision),
-                false => Vec::new(),
+            let rolled = match decision {
+                DecisionInterval::OneMinute => Vec::new(),
+                DecisionInterval::FiveMinute => {
+                    self.unrolled.extend(minutes.iter().cloned());
+                    match decision_before(end, decision) == end {
+                        true => rolled_up(&std::mem::take(&mut self.unrolled), decision),
+                        false => Vec::new(),
+                    }
+                }
             };
             for bar in minutes.into_iter().chain(rolled) {
                 self.record(now, bar, journal)?;

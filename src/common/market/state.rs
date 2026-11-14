@@ -198,6 +198,7 @@ impl MarketState {
     }
 
     /// Each retained bar of the series by its timestamp, with its close, `None` for a bar with no priced print.
+    #[cfg(test)]
     pub fn closes(
         &self,
         symbol: &Symbol,
