@@ -22,14 +22,15 @@ use crate::common::heal::{
     massive_traded_symbols, owed, sec_filed_industry_codes, window,
 };
 use crate::common::journal::{
-    ArchiveSurveyed, ConditionsWritten, ConfigurationResolved, HealFinished, Observation,
-    PartitionFailed, PartitionWritten, Unanswered, quotes_folded, trades_folded,
+    ArchiveSurveyed, ConditionsWritten, ConfigurationResolved, FoldCount, HealFinished,
+    Observation, PartitionFailed, PartitionWritten, Unanswered, quotes_folded, trades_folded,
 };
 use crate::common::market::aggregate::{RollsUp, session_bars};
 use crate::common::market::corporate_actions::refresh_boundaries;
 use crate::common::market::industry::{AccessionNumber, FiledIndustryCode};
 use crate::common::market::quote_bars::{QuoteFold, QuoteFoldRefusal};
 use crate::common::market::record::{Bar, BarInterval, Partition, PartitionRefusal, Quote};
+use crate::common::market::refusal::RowRefusalKind;
 use crate::common::market::restatements::Restatements;
 use crate::common::market::security_details::{
     CentralIndexKey, IndustryCode, SecurityDetails, SecurityType,
@@ -215,9 +216,9 @@ impl PartitionFailure {
         }
     }
 
-    /// The record of this failure, journaled as it happens.
-    fn failed(&self, leg: Leg, session: SessionDate) -> PartitionFailed {
-        PartitionFailed::new(leg, session, self.kind(), self.to_string())
+    /// The record of this failure, journaled as it happens beside every object the write `deleted` before it failed.
+    fn failed(&self, leg: Leg, session: SessionDate, deleted: Vec<Key>) -> PartitionFailed {
+        PartitionFailed::new(leg, session, self.kind(), self.to_string(), deleted)
     }
 
     /// The outcome the journal records, its kind beside its text.
@@ -284,13 +285,17 @@ impl Clients {
         async |key: &Key, body| self.archive.put(key, body).await
     }
 
-    /// Stores a snapshot's response bodies as served under its raw key, deleting the parsed snapshot first so one that
-    /// fails before it is published again reads as owed.
+    /// Stores a snapshot's response bodies as served under its raw key, first deleting the parsed snapshot so one that
+    /// fails before it is published again reads as owed, and adding each key it deletes to `deleted`.
     fn store(
         &self,
-    ) -> impl AsyncFn(ReferenceKey, &Provenance, Vec<Vec<u8>>) -> Result<(), PartitionFailure> {
-        async |key: ReferenceKey, provenance: &Provenance, bodies: Vec<Vec<u8>>| {
-            self.archive.delete(&Key::from(key)).await?;
+        deleted: &mut Vec<Key>,
+    ) -> impl AsyncFnOnce(ReferenceKey, &Provenance, Vec<Vec<u8>>) -> Result<(), PartitionFailure>
+    {
+        async move |key: ReferenceKey, provenance: &Provenance, bodies: Vec<Vec<u8>>| {
+            let parsed = Key::from(key);
+            self.archive.delete(&parsed).await?;
+            deleted.push(parsed);
             self.archive
                 .store_responses(key, provenance, &bodies)
                 .await
@@ -342,8 +347,11 @@ pub async fn run(
             owed(&kept, held.sessions()),
             deadline,
             journal,
-            async |session, journal: &mut Journal| {
-                write(leg, session, &calendar, parameters, clients, journal).await
+            async |session, journal: &mut Journal, deleted: &mut Vec<Key>| {
+                write(
+                    leg, session, &calendar, parameters, clients, journal, deleted,
+                )
+                .await
             },
         )
         .await?;
@@ -392,22 +400,52 @@ pub async fn survey(clients: &Clients, today: SessionDate) -> Result<ArchiveSurv
     ))
 }
 
-/// Writes each of `leg`'s owed sessions with `write` until `deadline`, journaling each outcome as it lands; a journal
-/// error, from the append or from inside `write`, stops the run before another session starts.
+/// What one session's write wrote, which `heal_leg` journals beside the leg, the session and what the write deleted.
+#[derive(Debug, Clone, PartialEq)]
+struct Written {
+    rows: u64,
+    refused: Tally<RowRefusalKind>,
+    unanswered: BTreeMap<Symbol, Unanswered>,
+    folded: BTreeMap<FoldCount, u64>,
+}
+
+impl Written {
+    fn record(self, leg: Leg, session: SessionDate, deleted: Vec<Key>) -> PartitionWritten {
+        PartitionWritten::new(
+            leg,
+            session,
+            self.rows,
+            self.refused,
+            self.unanswered,
+            self.folded,
+            deleted,
+        )
+    }
+}
+
+/// Writes each of `leg`'s owed sessions with `write` until `deadline`, journaling each outcome as it lands with every
+/// object `write` reports deleting; a journal error, from the append or from inside `write`, stops the run before
+/// another session starts.
 async fn heal_leg(
     leg: Leg,
     owed: impl IntoIterator<Item = SessionDate>,
     deadline: Instant,
     journal: &mut Journal,
-    mut write: impl AsyncFnMut(SessionDate, &mut Journal) -> Result<PartitionWritten, PartitionFailure>,
+    mut write: impl AsyncFnMut(
+        SessionDate,
+        &mut Journal,
+        &mut Vec<Key>,
+    ) -> Result<Written, PartitionFailure>,
 ) -> Result<BTreeMap<SessionDate, SessionOutcome>, HealError> {
     let mut sessions = BTreeMap::new();
     for session in owed {
         let outcome = if Instant::now() >= deadline {
             SessionOutcome::Unreached
         } else {
-            match write(session, journal).await {
+            let mut deleted = Vec::new();
+            match write(session, journal, &mut deleted).await {
                 Ok(written) => {
+                    let written = written.record(leg, session, deleted);
                     tracing::info!(%leg, %session, rows = written.rows(), refused = %written.refused(), unanswered = written.unanswered().len(), "Partition written");
                     journal
                         .append(Utc::now(), Observation::PartitionWritten(written))
@@ -420,7 +458,7 @@ async fn heal_leg(
                     journal
                         .append(
                             Utc::now(),
-                            Observation::PartitionFailed(failure.failed(leg, session)),
+                            Observation::PartitionFailed(failure.failed(leg, session, deleted)),
                         )
                         .map_err(HealError::Journal)?;
                     failure.outcome()
@@ -432,7 +470,8 @@ async fn heal_leg(
     Ok(sessions)
 }
 
-/// Fetches one leg's session and writes it, returning its record, or why it was not written.
+/// Fetches one leg's session and writes it, adding every object it deletes to `deleted`, and returns what it wrote, or
+/// why it was not written.
 async fn write(
     leg: Leg,
     session: SessionDate,
@@ -440,24 +479,31 @@ async fn write(
     parameters: &Parameters,
     clients: &Clients,
     journal: &mut Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     match leg {
-        Leg::MassiveTradedSymbols => write_traded_symbols(session, clients, journal).await,
+        Leg::MassiveTradedSymbols => write_traded_symbols(session, clients, journal, deleted).await,
         Leg::AlpacaQuotes => {
             let hours = calendar
                 .session(session)
                 .map(|trading| trading.hours())
                 .ok_or(PartitionFailure::NotInCalendar { session })?;
-            write_quotes(session, hours, parameters, clients, journal).await
+            write_quotes(session, hours, parameters, clients, journal, deleted).await
         }
-        Leg::AlpacaTrades => write_trades(session, parameters, clients, journal).await,
-        Leg::MassiveSplits => write_splits(session, clients, journal).await,
-        Leg::AlpacaSeriesBoundaries => write_series_boundaries(session, clients, journal).await,
-        Leg::AlpacaBorrowFlags => write_borrow_flags(session, calendar, clients, journal).await,
+        Leg::AlpacaTrades => write_trades(session, parameters, clients, journal, deleted).await,
+        Leg::MassiveSplits => write_splits(session, clients, journal, deleted).await,
+        Leg::AlpacaSeriesBoundaries => {
+            write_series_boundaries(session, clients, journal, deleted).await
+        }
+        Leg::AlpacaBorrowFlags => {
+            write_borrow_flags(session, calendar, clients, journal, deleted).await
+        }
         Leg::MassiveSecurityDetails => {
-            write_security_details(session, parameters, clients, journal).await
+            write_security_details(session, parameters, clients, journal, deleted).await
         }
-        Leg::SecFiledIndustryCodes => write_filed_industry_codes(session, clients, journal).await,
+        Leg::SecFiledIndustryCodes => {
+            write_filed_industry_codes(session, clients, journal, deleted).await
+        }
     }
 }
 
@@ -531,23 +577,23 @@ async fn write_traded_symbols(
     session: SessionDate,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let daily = record_traded_symbols(
         session,
         clients.massive.grouped_daily(session).await,
         &provenance,
-        clients.store(),
+        clients.store(deleted),
     )
     .await?;
-    Ok(PartitionWritten::new(
-        Leg::MassiveTradedSymbols,
-        session,
-        u64::try_from(daily.bars().len()).expect("a session lists fewer than u64::MAX symbols"),
-        refused_by_cause(daily.refused()),
-        BTreeMap::new(),
-        BTreeMap::new(),
-    ))
+    Ok(Written {
+        rows: u64::try_from(daily.bars().len())
+            .expect("a session lists fewer than u64::MAX symbols"),
+        refused: refused_by_cause(daily.refused()),
+        unanswered: BTreeMap::new(),
+        folded: BTreeMap::new(),
+    })
 }
 
 /// Stores `fetched` with `store` only once it parses and lists a symbol: the stored object alone marks the session held,
@@ -583,10 +629,11 @@ async fn write_splits(
     session: SessionDate,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let splits = kept(
-        clients.store(),
+        clients.store(deleted),
         massive_splits(session),
         &provenance,
         clients.massive.splits().await,
@@ -600,14 +647,12 @@ async fn write_splits(
         encode_splits,
     )
     .await?;
-    Ok(PartitionWritten::new(
-        Leg::MassiveSplits,
-        session,
+    Ok(Written {
         rows,
-        refused_by_cause(splits.refused()),
-        BTreeMap::new(),
-        BTreeMap::new(),
-    ))
+        refused: refused_by_cause(splits.refused()),
+        unanswered: BTreeMap::new(),
+        folded: BTreeMap::new(),
+    })
 }
 
 /// Stores every body `fetched` received with `store`, even when reading them failed, and returns what was read; a fetch
@@ -642,7 +687,8 @@ async fn write_series_boundaries(
     session: SessionDate,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let previous = latest_snapshot(
         &clients.archive,
         Provider::Alpaca,
@@ -689,7 +735,7 @@ async fn write_series_boundaries(
         }
     }
     let read = kept(
-        clients.store(),
+        clients.store(deleted),
         alpaca_series_boundaries(session),
         &provenance,
         Fetched::new(failed.map_or(Ok(read), Err), bodies),
@@ -704,14 +750,12 @@ async fn write_series_boundaries(
         encode_series_boundaries,
     )
     .await?;
-    Ok(PartitionWritten::new(
-        Leg::AlpacaSeriesBoundaries,
-        session,
+    Ok(Written {
         rows,
-        refused_by_cause(read.refused()),
-        BTreeMap::new(),
-        BTreeMap::new(),
-    ))
+        refused: refused_by_cause(read.refused()),
+        unanswered: BTreeMap::new(),
+        folded: BTreeMap::new(),
+    })
 }
 
 /// Writes the session's borrow flags from the asset listing as it stands now, refused once the next session has
@@ -721,13 +765,14 @@ async fn write_borrow_flags(
     calendar: &TradingCalendar,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let fetched = clients.alpaca.borrow_flags().await;
     let provenance = fetched_now(Subscription::BrokerageAccount, journal);
     lapsed(calendar, session, provenance.fetched_at())
         .map_err(|lapse| PartitionFailure::Lapsed { session, lapse })?;
     let read = kept(
-        clients.store(),
+        clients.store(deleted),
         alpaca_borrow_flags(session),
         &provenance,
         fetched,
@@ -741,14 +786,12 @@ async fn write_borrow_flags(
         encode_borrow_flags,
     )
     .await?;
-    Ok(PartitionWritten::new(
-        Leg::AlpacaBorrowFlags,
-        session,
+    Ok(Written {
         rows,
-        refused_by_cause(&read.refused),
-        BTreeMap::new(),
-        BTreeMap::new(),
-    ))
+        refused: refused_by_cause(&read.refused),
+        unanswered: BTreeMap::new(),
+        folded: BTreeMap::new(),
+    })
 }
 
 /// What the details requests for a session answered, gathered across symbols.
@@ -783,7 +826,8 @@ async fn write_security_details(
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let stopped = Arc::new(AtomicBool::new(false));
@@ -817,7 +861,7 @@ async fn write_security_details(
         .await?;
     let failed = gathered.failed.take();
     kept(
-        clients.store(),
+        clients.store(deleted),
         massive_security_details(session),
         &provenance,
         Fetched::new(
@@ -834,18 +878,16 @@ async fn write_security_details(
         encode_security_details,
     )
     .await?;
-    Ok(PartitionWritten::new(
-        Leg::MassiveSecurityDetails,
-        session,
+    Ok(Written {
         rows,
-        refused_by_cause(&gathered.refused),
-        gathered
+        refused: refused_by_cause(&gathered.refused),
+        unanswered: gathered
             .missing
             .into_iter()
             .map(|symbol| (symbol, Unanswered::Missing))
             .collect(),
-        BTreeMap::new(),
-    ))
+        folded: BTreeMap::new(),
+    })
 }
 
 /// How far back a filer's annual reports are read: the year before the archive's first security details snapshot.
@@ -907,7 +949,8 @@ async fn write_filed_industry_codes(
     session: SessionDate,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let sec = clients
         .sec
         .as_ref()
@@ -952,7 +995,7 @@ async fn write_filed_industry_codes(
     .await;
     codes.extend(filed);
     kept(
-        clients.store(),
+        clients.store(deleted),
         sec_filed_industry_codes(session),
         &provenance,
         fetched,
@@ -966,14 +1009,12 @@ async fn write_filed_industry_codes(
         encode_filed_industry_codes,
     )
     .await?;
-    Ok(PartitionWritten::new(
-        Leg::SecFiledIndustryCodes,
-        session,
+    Ok(Written {
         rows,
-        Tally::empty(),
+        refused: Tally::empty(),
         unanswered,
-        BTreeMap::new(),
-    ))
+        folded: BTreeMap::new(),
+    })
 }
 
 /// The codes each new annual report of `filers` assigned, reading only the filer's reports `held` lacks, beside
@@ -1043,7 +1084,8 @@ async fn write_quotes(
     parameters: &Parameters,
     clients: &Clients,
     journal: &Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
     let mut fold = QuoteFold::new(open, close).map_err(PartitionFailure::Fold)?;
     let mut refused = Vec::new();
@@ -1054,6 +1096,7 @@ async fn write_quotes(
     let unanswered = per_symbol_raw(
         &clients.archive,
         alpaca_quotes(session).into(),
+        deleted,
         Key::RawQuotes {
             provider: Provider::Alpaca,
             session,
@@ -1093,14 +1136,12 @@ async fn write_quotes(
     )
     .await?;
     tracing::info!(%session, quotes = counts.accepted(), out_of_order = counts.out_of_order(), one_sided, restated, "Alpaca quotes folded");
-    Ok(PartitionWritten::new(
-        Leg::AlpacaQuotes,
-        session,
-        minute_bars,
-        refused_by_cause(&refused),
+    Ok(Written {
+        rows: minute_bars,
+        refused: refused_by_cause(&refused),
         unanswered,
-        quotes_folded(counts, one_sided, restated),
-    ))
+        folded: quotes_folded(counts, one_sided, restated),
+    })
 }
 
 /// Everything Alpaca serves of a quote but its symbol and timestamp.
@@ -1168,15 +1209,17 @@ async fn write_trades(
     parameters: &Parameters,
     clients: &Clients,
     journal: &mut Journal,
-) -> Result<PartitionWritten, PartitionFailure> {
+    deleted: &mut Vec<Key>,
+) -> Result<Written, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
-    let conditions = trade_conditions(clients, journal).await?;
+    let conditions = trade_conditions(clients, journal, deleted).await?;
     let mut fold = TradeFold::new(session, conditions);
     let mut refused = Vec::new();
     let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let unanswered = per_symbol_raw(
         &clients.archive,
         alpaca_trades(session).into(),
+        deleted,
         Key::RawTrades {
             provider: Provider::Alpaca,
             session,
@@ -1210,14 +1253,12 @@ async fn write_trades(
     )
     .await?;
     tracing::info!(%session, folded = counts.folded(), withdrawn = counts.withdrawn(), unresolved = counts.unresolved().total(), unresolved_by_cause = %counts.unresolved(), unsized_prints = counts.unsized_prints(), "Alpaca trades folded");
-    Ok(PartitionWritten::new(
-        Leg::AlpacaTrades,
-        session,
-        minute_bars,
-        refused_by_cause(&refused),
+    Ok(Written {
+        rows: minute_bars,
+        refused: refused_by_cause(&refused),
         unanswered,
-        trades_folded(&counts),
-    ))
+        folded: trades_folded(&counts),
+    })
 }
 
 /// The newest conditions snapshot, or, when none reads under this build's layout, today's fetched from Massive and
@@ -1225,6 +1266,7 @@ async fn write_trades(
 async fn trade_conditions(
     clients: &Clients,
     journal: &mut Journal,
+    deleted: &mut Vec<Key>,
 ) -> Result<TradeConditions, PartitionFailure> {
     match latest_conditions(&clients.archive).await {
         Ok((_, conditions)) => Ok(conditions),
@@ -1233,7 +1275,7 @@ async fn trade_conditions(
             write_conditions(
                 journal,
                 async || clients.massive.trade_conditions().await,
-                clients.store(),
+                clients.store(deleted),
                 clients.put(),
             )
             .await
@@ -1274,11 +1316,13 @@ async fn write_conditions(
 
 /// `per_symbol`, storing every page under the raw `key` stamped with `provenance`, the object complete before this
 /// returns so nothing folded from the pages is published without them; a failed fetch abandons the upload. `held_by`
-/// is deleted first, so a session that fails after its new raw object is written reads as owed rather than held.
+/// is deleted first, so a session that fails after its new raw object is written reads as owed rather than held, and
+/// its key is added to `deleted` once the delete succeeds.
 #[allow(clippy::too_many_arguments)]
 async fn per_symbol_raw<Fetch, Pending, Row>(
     archive: &Bucket,
     held_by: Key,
+    deleted: &mut Vec<Key>,
     key: Key,
     provenance: &Provenance,
     symbols: &[Symbol],
@@ -1292,6 +1336,7 @@ where
     Row: Send + 'static,
 {
     archive.delete(&held_by).await?;
+    deleted.push(held_by);
     let mut writer = archive
         .begin_raw(key, provenance)
         .await
@@ -1502,12 +1547,13 @@ mod tests {
             body: "forbidden".to_string(),
         });
         assert_eq!(
-            failure.failed(Leg::AlpacaTrades, session),
+            failure.failed(Leg::AlpacaTrades, session, Vec::new()),
             PartitionFailed::new(
                 Leg::AlpacaTrades,
                 session,
                 PartitionFailureKind::Fetch,
-                "refused with 403: forbidden".to_string()
+                "refused with 403: forbidden".to_string(),
+                Vec::new(),
             )
         );
         assert_eq!(
@@ -1552,19 +1598,12 @@ mod tests {
             [first, second],
             far_deadline(),
             &mut journal,
-            async |session, journal: &mut Journal| {
+            async |session, journal: &mut Journal, _deleted: &mut Vec<Key>| {
                 seen.push((session, event_types(journal)));
                 if session == first {
                     Err(PartitionFailure::NoRows)
                 } else {
-                    Ok(PartitionWritten::new(
-                        Leg::MassiveSplits,
-                        session,
-                        1,
-                        Tally::default(),
-                        BTreeMap::new(),
-                        BTreeMap::new(),
-                    ))
+                    Ok(written_one_row())
                 }
             },
         )
@@ -1591,6 +1630,71 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    fn written_one_row() -> Written {
+        Written {
+            rows: 1,
+            refused: Tally::default(),
+            unanswered: BTreeMap::new(),
+            folded: BTreeMap::new(),
+        }
+    }
+
+    /// Every object a session's write deletes is journaled with that session's outcome, written or failed, and with
+    /// no other session's.
+    #[tokio::test]
+    async fn test_every_delete_is_journaled_with_its_session_outcome() {
+        let [first, second] = sessions();
+        let (mut journal, directory) = temporary_journal();
+        let raw = |session| Key::RawTrades {
+            provider: Provider::Alpaca,
+            session,
+        };
+        heal_leg(
+            Leg::AlpacaTrades,
+            [first, second],
+            far_deadline(),
+            &mut journal,
+            async |session, _journal: &mut Journal, deleted: &mut Vec<Key>| {
+                deleted.push(raw(session));
+                if session == first {
+                    deleted.push(Key::from(massive_splits(session)));
+                    Err(PartitionFailure::NoRows)
+                } else {
+                    Ok(written_one_row())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let journaled: Vec<Observation> = journal
+            .history()
+            .iter()
+            .map(|record| record.observation().clone())
+            .collect();
+        assert_eq!(
+            journaled,
+            [
+                Observation::PartitionFailed(PartitionFailed::new(
+                    Leg::AlpacaTrades,
+                    first,
+                    PartitionFailureKind::NoRows,
+                    "the vendor answered with no rows".to_string(),
+                    vec![raw(first), Key::from(massive_splits(first))],
+                )),
+                Observation::PartitionWritten(PartitionWritten::new(
+                    Leg::AlpacaTrades,
+                    second,
+                    1,
+                    Tally::default(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    vec![raw(second)],
+                )),
+            ]
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// An outcome the journal refuses, or a write the partition could not journal, stops the leg before its next
     /// session.
     #[tokio::test]
@@ -1604,7 +1708,7 @@ mod tests {
             [first, second],
             far_deadline(),
             &mut refusing,
-            async |session, _journal: &mut Journal| {
+            async |session, _journal: &mut Journal, _deleted: &mut Vec<Key>| {
                 attempted.push(session);
                 Err(PartitionFailure::NoRows)
             },
@@ -1620,7 +1724,7 @@ mod tests {
             [first, second],
             far_deadline(),
             &mut journal,
-            async |session, _journal: &mut Journal| {
+            async |session, _journal: &mut Journal, _deleted: &mut Vec<Key>| {
                 attempted.push(session);
                 Err(PartitionFailure::Journal(std::io::Error::other(
                     "disk full",
@@ -1645,7 +1749,7 @@ mod tests {
             [first, second],
             Instant::now(),
             &mut journal,
-            async |session, _journal: &mut Journal| {
+            async |session, _journal: &mut Journal, _deleted: &mut Vec<Key>| {
                 attempted.push(session);
                 Err(PartitionFailure::NoRows)
             },
@@ -2340,11 +2444,12 @@ mod tests {
             None,
         );
         let key = massive_traded_symbols(session);
+        let mut deleted = Vec::new();
         let daily = record_traded_symbols(
             session,
             clients.massive.grouped_daily(session).await,
             &provenance,
-            clients.store(),
+            clients.store(&mut deleted),
         )
         .await
         .unwrap();
@@ -2358,6 +2463,7 @@ mod tests {
             raw.path()
         );
         clients.archive.delete(&raw).await.unwrap();
+        assert_eq!(deleted, [Key::from(key)]);
         assert_eq!(symbols.len(), daily.bars().len());
         assert!(symbols.len() > 10_000);
     }
@@ -2389,7 +2495,10 @@ mod tests {
         let (splits, bodies) = clients.massive.splits().await.into_parts();
         let splits = splits.unwrap();
         let pages = bodies.len();
-        clients.store()(key, &provenance, bodies).await.unwrap();
+        let mut deleted = Vec::new();
+        clients.store(&mut deleted)(key, &provenance, bodies)
+            .await
+            .unwrap();
         let raw = Key::RawReference(key);
         let stored = clients.archive.stored(&raw).await.unwrap().unwrap();
         println!(
@@ -2400,6 +2509,7 @@ mod tests {
         );
         clients.archive.delete(&raw).await.unwrap();
         assert_eq!(clients.archive.get(&Key::from(key)).await.unwrap(), None);
+        assert_eq!(deleted, [Key::from(key)]);
         assert!(pages > 1);
         assert_eq!(stored.fetched_at(), Some(provenance.fetched_at()));
     }
@@ -2640,9 +2750,11 @@ mod tests {
             .await
             .unwrap();
         let mut quotes = 0_u64;
+        let mut deleted = Vec::new();
         let unanswered = per_symbol_raw(
             &profile,
             held_by.clone(),
+            &mut deleted,
             key.clone(),
             &provenance,
             &symbols,
@@ -2664,6 +2776,7 @@ mod tests {
         );
         profile.delete(&key).await.unwrap();
         assert_eq!(profile.get(&held_by).await.unwrap(), None);
+        assert_eq!(deleted, [held_by]);
         assert!(unanswered.is_empty());
         assert!(stored.length() > 64 * 1024 * 1024);
         assert!(matches!(

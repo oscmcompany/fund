@@ -213,8 +213,6 @@ pub enum Observation {
     PartitionWritten(PartitionWritten),
     PartitionFailed(PartitionFailed),
     ConditionsWritten(ConditionsWritten),
-    ObjectWritten(ObjectWritten),
-    ObjectDeleted(ObjectDeleted),
     HealFinished(HealFinished),
     ArchiveSurveyed(ArchiveSurveyed),
     ViewsChecked(ViewsChecked),
@@ -293,6 +291,9 @@ pub struct PartitionWritten {
     unanswered: BTreeMap<Symbol, Unanswered>,
     /// What a tick leg's fold did with each row it was offered; empty for a leg that folds nothing.
     folded: BTreeMap<FoldCount, u64>,
+    /// Every archive object the write deleted before rewriting it, in order; a key may have held nothing, since S3
+    /// answers a delete of an absent object as done.
+    deleted: Vec<Key>,
 }
 
 impl PartitionWritten {
@@ -303,6 +304,7 @@ impl PartitionWritten {
         refused: Tally<RowRefusalKind>,
         unanswered: BTreeMap<Symbol, Unanswered>,
         folded: BTreeMap<FoldCount, u64>,
+        deleted: Vec<Key>,
     ) -> Self {
         Self {
             leg,
@@ -311,6 +313,7 @@ impl PartitionWritten {
             refused,
             unanswered,
             folded,
+            deleted,
         }
     }
 
@@ -393,6 +396,8 @@ pub struct PartitionFailed {
     session: SessionDate,
     failure: PartitionFailureKind,
     cause: String,
+    /// Every archive object the write deleted before it failed, in order, as `PartitionWritten` records them.
+    deleted: Vec<Key>,
 }
 
 impl PartitionFailed {
@@ -401,12 +406,14 @@ impl PartitionFailed {
         session: SessionDate,
         failure: PartitionFailureKind,
         cause: String,
+        deleted: Vec<Key>,
     ) -> Self {
         Self {
             leg,
             session,
             failure,
             cause,
+            deleted,
         }
     }
 }
@@ -421,31 +428,6 @@ pub struct ConditionsWritten {
 impl ConditionsWritten {
     pub fn new(as_of: SessionDate, conditions: u64) -> Self {
         Self { as_of, conditions }
-    }
-}
-
-/// One archive object an operator command wrote, and its size.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectWritten {
-    key: Key,
-    bytes: u64,
-}
-
-impl ObjectWritten {
-    pub fn new(key: Key, bytes: u64) -> Self {
-        Self { key, bytes }
-    }
-}
-
-/// One archive object an operator command deleted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectDeleted {
-    key: Key,
-}
-
-impl ObjectDeleted {
-    pub fn new(key: Key) -> Self {
-        Self { key }
     }
 }
 
@@ -846,6 +828,10 @@ mod tests {
             )
             .encode()
         };
+        let raw_trades = Key::RawTrades {
+            provider: crate::common::storage::Provider::Massive,
+            session,
+        };
         let written = PartitionWritten::new(
             Leg::AlpacaQuotes,
             session,
@@ -863,20 +849,16 @@ mod tests {
                 (Symbol::new("BC.PRC").unwrap(), Unanswered::Invalid),
             ]),
             quotes_folded(QuoteFoldCounts::default(), 3, 2),
+            vec![raw_trades.clone()],
         );
         let failed = PartitionFailed::new(
             Leg::AlpacaTrades,
             session,
             PartitionFailureKind::NoRows,
             "the vendor answered with no rows".to_string(),
+            vec![raw_trades],
         );
         let conditions = ConditionsWritten::new(session, 70);
-        let raw_trades = Key::RawTrades {
-            provider: crate::common::storage::Provider::Massive,
-            session,
-        };
-        let object_written = ObjectWritten::new(raw_trades.clone(), 4_096);
-        let object_deleted = ObjectDeleted::new(raw_trades);
         let finished = HealFinished::new(
             Window::new(vec![session]).unwrap(),
             BTreeMap::from([(
@@ -897,6 +879,8 @@ mod tests {
                 BTreeMap::from([("data/stray.parquet".to_string(), Unrecognized::NotAKey)]),
             )]),
         );
+        let raw_path =
+            "data/equity/stage=raw/trades/provider=massive/year=2026/month=09/day=29/data.csv.gz";
         let prefix = concat!(
             r#"{"schema_version":1,"run_id":"00000000-0000-0000-0000-000000000001","sequence":1,"#,
             r#""timestamp":"2026-09-30T07:00:00Z","commit":null,"#,
@@ -904,25 +888,28 @@ mod tests {
         assert_eq!(
             envelope(Observation::PartitionWritten(written)),
             format!(
-                "{prefix}{}",
+                "{prefix}{}{raw_path}{}",
                 concat!(
                     r#""event_type":"partition_written","payload":{"leg":"alpaca_quotes","#,
                     r#""session":"2026-09-29","rows":1872987,"#,
                     r#""refused":{"dollar_volume":1,"duplicate":2},"#,
                     r#""unanswered":{"ABC":"missing","BC.PRC":"invalid"},"#,
-                    r#""folded":{"accepted":0,"out_of_order":0,"one_sided":3,"restated":2}}}"#,
-                )
+                    r#""folded":{"accepted":0,"out_of_order":0,"one_sided":3,"restated":2},"#,
+                    r#""deleted":[""#,
+                ),
+                r#""]}}"#,
             )
         );
         assert_eq!(
             envelope(Observation::PartitionFailed(failed)),
             format!(
-                "{prefix}{}",
+                "{prefix}{}{raw_path}{}",
                 concat!(
                     r#""event_type":"partition_failed","payload":{"leg":"alpaca_trades","#,
                     r#""session":"2026-09-29","failure":"no_rows","#,
-                    r#""cause":"the vendor answered with no rows"}}"#,
-                )
+                    r#""cause":"the vendor answered with no rows","deleted":[""#,
+                ),
+                r#""]}}"#,
             )
         );
         assert_eq!(
@@ -934,18 +921,6 @@ mod tests {
                     r#""payload":{"as_of":"2026-09-29","conditions":70}}"#,
                 )
             )
-        );
-        let raw_path =
-            "data/equity/stage=raw/trades/provider=massive/year=2026/month=09/day=29/data.csv.gz";
-        assert_eq!(
-            envelope(Observation::ObjectWritten(object_written)),
-            format!(
-                r#"{prefix}"event_type":"object_written","payload":{{"key":"{raw_path}","bytes":4096}}}}"#
-            )
-        );
-        assert_eq!(
-            envelope(Observation::ObjectDeleted(object_deleted)),
-            format!(r#"{prefix}"event_type":"object_deleted","payload":{{"key":"{raw_path}"}}}}"#)
         );
         assert_eq!(
             envelope(Observation::HealFinished(finished)),
@@ -1817,34 +1792,36 @@ mod tests {
                 prop::collection::vec(refusal, 0..6),
                 prop::collection::btree_map(symbol, unanswered, 0..6),
                 prop::collection::btree_map(fold_count, any::<u64>(), 0..4),
+                prop::collection::vec(crate::common::storage::tests::any_key(), 0..3),
             )
-                .prop_map(|(leg, session, rows, refused, unanswered, folded)| {
-                    Observation::PartitionWritten(PartitionWritten::new(
-                        leg,
-                        session,
-                        rows,
-                        concatenate(refused.into_iter().map(Tally::of)),
-                        unanswered,
-                        folded,
-                    ))
-                }),
+                .prop_map(
+                    |(leg, session, rows, refused, unanswered, folded, deleted)| {
+                        Observation::PartitionWritten(PartitionWritten::new(
+                            leg,
+                            session,
+                            rows,
+                            concatenate(refused.into_iter().map(Tally::of)),
+                            unanswered,
+                            folded,
+                            deleted,
+                        ))
+                    },
+                ),
             (
                 leg.clone(),
                 any_session(),
                 prop::sample::select(PartitionFailureKind::iter().collect::<Vec<_>>()),
                 ".{0,20}",
+                prop::collection::vec(crate::common::storage::tests::any_key(), 0..3),
             )
-                .prop_map(|(leg, session, failure, cause)| {
-                    Observation::PartitionFailed(PartitionFailed::new(leg, session, failure, cause))
+                .prop_map(|(leg, session, failure, cause, deleted)| {
+                    Observation::PartitionFailed(PartitionFailed::new(
+                        leg, session, failure, cause, deleted,
+                    ))
                 }),
             (any_session(), any::<u64>()).prop_map(|(as_of, conditions)| {
                 Observation::ConditionsWritten(ConditionsWritten::new(as_of, conditions))
             }),
-            (crate::common::storage::tests::any_key(), any::<u64>()).prop_map(|(key, bytes)| {
-                Observation::ObjectWritten(ObjectWritten::new(key, bytes))
-            }),
-            crate::common::storage::tests::any_key()
-                .prop_map(|key| Observation::ObjectDeleted(ObjectDeleted::new(key))),
             (
                 prop::collection::btree_set(any_session(), 1..6),
                 prop::collection::btree_map(
