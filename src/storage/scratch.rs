@@ -1,5 +1,6 @@
-//! Databento rows a study pulls into the profile bucket's `scratch/` prefix: one gzipped CSV per dataset, schema, symbol
-//! and session, as served, beside a sidecar naming the request. Nothing here is archive, so no `Key` names it.
+//! Databento rows a study pulls into the profile bucket's `scratch/` prefix: gzipped CSV per dataset, schema, symbol
+//! and session, as served, beside a sidecar that claims the key for one fetch. Nothing here is archive, so no `Key`
+//! names it.
 
 use std::io::{BufRead, BufReader};
 
@@ -14,7 +15,7 @@ use crate::common::storage::{ObjectKey, StorageClass};
 use crate::common::time::SessionDate;
 use crate::ingest::databento::{AvailableSession, Dataset, KNOWN_AT_COLUMN, Schema};
 
-/// The scratch place of one symbol's rows over one session; rows and sidecar sit side by side under it.
+/// The scratch place of one symbol's rows over one session; each fetch's rows and the one sidecar sit under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchKey {
     dataset: Dataset,
@@ -25,7 +26,10 @@ pub struct ScratchKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScratchFile {
-    Rows,
+    /// One fetch's rows, named by when it was fetched so overlapping fetches never overwrite each other.
+    Rows {
+        fetched_at: DateTime<Utc>,
+    },
     Sidecar,
 }
 
@@ -54,8 +58,10 @@ impl ObjectKey for ScratchObject<'_> {
         let key = self.key;
         let date = key.session.date();
         let name = match self.file {
-            ScratchFile::Rows => "rows.csv.gz",
-            ScratchFile::Sidecar => "sidecar.json",
+            ScratchFile::Rows { fetched_at } => {
+                format!("rows-{}.csv.gz", fetched_at.format("%Y%m%dT%H%M%S%.9fZ"))
+            }
+            ScratchFile::Sidecar => "sidecar.json".to_string(),
         };
         format!(
             "scratch/databento/dataset={}/schema={}/symbol={}/year={}/month={:02}/day={:02}/{name}",
@@ -85,6 +91,7 @@ pub struct Sidecar {
     end: DateTime<Utc>,
     /// What `get_cost` priced the request at, in millionths of a dollar, rounded up.
     request_cost_millionths: Dollars,
+    /// When the rows were fetched, which also names the rows file this sidecar describes.
     fetched_at: DateTime<Utc>,
     /// The column holding each row's `known_at`, which `land` checked the header names.
     known_at_column: String,
@@ -113,7 +120,8 @@ pub async fn landed(bucket: &Bucket, key: &ScratchKey) -> Result<bool, BucketErr
         .is_some())
 }
 
-/// Writes the rows, then their sidecar, refusing rows whose header names no `known_at` column.
+/// Writes this fetch's rows, then creates the sidecar only if no other fetch has, refusing rows whose header names no
+/// `known_at` column; rows are deleted when another fetch's sidecar already claims the key.
 pub async fn land(
     bucket: &Bucket,
     key: &ScratchKey,
@@ -123,7 +131,8 @@ pub async fn land(
     commit: Option<Commit>,
 ) -> Result<Sidecar, LandRefusal> {
     let rows = count_rows(&gzipped)?;
-    bucket.put(&key.object(ScratchFile::Rows), gzipped).await?;
+    let rows_object = key.object(ScratchFile::Rows { fetched_at });
+    bucket.put(&rows_object, gzipped).await?;
     let (start, end) = key.session.bounds();
     let sidecar = Sidecar {
         dataset: key.dataset.clone(),
@@ -141,8 +150,20 @@ pub async fn land(
     let body = serde_json::to_vec(&sidecar).map_err(|error| LandRefusal::Sidecar {
         reason: error.to_string(),
     })?;
-    bucket.put(&key.object(ScratchFile::Sidecar), body).await?;
-    Ok(sidecar)
+    match bucket.create(&key.object(ScratchFile::Sidecar), body).await {
+        Ok(()) => Ok(sidecar),
+        Err(error @ BucketError::Contended { .. }) => {
+            match bucket.delete(&rows_object).await {
+                Ok(()) => {}
+                Err(cleanup) => {
+                    tracing::warn!(path = rows_object.path(), %cleanup, "Unclaimed rows not deleted")
+                }
+            }
+            Err(LandRefusal::Bucket(error))
+        }
+        // Any other failure may have written the sidecar after all, so its rows stay where it names them.
+        Err(error) => Err(LandRefusal::Bucket(error)),
+    }
 }
 
 /// The data lines beneath a header that names the `known_at` column, read without holding the CSV uncompressed.
@@ -207,7 +228,7 @@ mod tests {
         ));
     }
 
-    /// The rows and sidecar of one key sit side by side under the profile bucket's `scratch/`, by session date.
+    /// A key's sidecar and each fetch's rows sit side by side under the profile bucket's `scratch/`, by session date.
     #[test]
     fn test_a_scratch_key_is_partitioned_by_dataset_schema_symbol_and_session() {
         let key = ScratchKey {
@@ -217,9 +238,16 @@ mod tests {
             session: SessionDate::from_date("2026-03-09".parse().unwrap()),
         };
         let folder = "scratch/databento/dataset=XNAS.ITCH/schema=mbp-10/symbol=BRK.B/year=2026/month=03/day=09";
+        let fetched = |raw: &str| ScratchFile::Rows {
+            fetched_at: DateTime::parse_from_rfc3339(raw).unwrap().to_utc(),
+        };
         assert_eq!(
-            key.object(ScratchFile::Rows).path(),
-            format!("{folder}/rows.csv.gz")
+            key.object(fetched("2026-11-13T15:04:05.000000001Z")).path(),
+            format!("{folder}/rows-20261113T150405.000000001Z.csv.gz")
+        );
+        assert_eq!(
+            key.object(fetched("2026-11-13T15:04:05.000000002Z")).path(),
+            format!("{folder}/rows-20261113T150405.000000002Z.csv.gz")
         );
         assert_eq!(
             key.object(ScratchFile::Sidecar).path(),

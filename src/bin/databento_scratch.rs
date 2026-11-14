@@ -98,6 +98,12 @@ fn parse_symbols(text: &str) -> Result<Vec<Symbol>, SymbolRefusal> {
         .collect()
 }
 
+/// A combined quote raised by one millionth per request, since each request `rows` sends is priced and rounded up on
+/// its own, by less than a millionth each.
+fn ceiling_quote(combined: Dollars, requests: usize) -> Dollars {
+    Dollars::from_millionths(combined.millionths() + requests as u64)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // An operator's command that ships nothing, so it logs to standard output alone.
@@ -174,7 +180,9 @@ async fn main() -> ExitCode {
             "Dataset priced"
         );
         match priced {
-            Priced::Cost(cost) => total += cost.millionths(),
+            Priced::Cost(cost) => {
+                total += ceiling_quote(cost, available.len() * symbols.len()).millionths()
+            }
             Priced::Unresolved => {}
         }
         available_sessions.extend(available);
@@ -317,6 +325,16 @@ mod tests {
                 "{bad} was read"
             );
         }
+    }
+
+    /// Two requests at $0.0100001 each are charged 10,001 millionths apiece, 20,002 in all, while one combined quote
+    /// rounds $0.0200002 up to 20,001.
+    #[test]
+    fn test_a_quote_covers_each_request_rounding_up_on_its_own() {
+        let combined = Dollars::from_millionths(20_001);
+        assert_eq!(ceiling_quote(combined, 2), Dollars::from_millionths(20_003));
+        assert!(ceiling_quote(combined, 2) >= Dollars::from_millionths(10_001 + 10_001));
+        assert_eq!(ceiling_quote(combined, 0), combined);
     }
 
     #[test]
