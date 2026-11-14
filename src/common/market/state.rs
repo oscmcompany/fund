@@ -197,6 +197,20 @@ impl MarketState {
             .find_map(|retained| retained.close)
     }
 
+    /// Each retained bar of the series by its timestamp, with its close, `None` for a bar with no priced print.
+    #[cfg(test)]
+    pub fn closes(
+        &self,
+        symbol: &Symbol,
+        interval: BarInterval,
+    ) -> BTreeMap<DateTime<Utc>, Option<StampedPrice>> {
+        self.bars(symbol, interval)
+            .into_iter()
+            .flatten()
+            .map(|(timestamp, retained)| (*timestamp, retained.close))
+            .collect()
+    }
+
     /// Each symbol's latest quote; a symbol is absent only when none of its quotes was folded.
     pub fn quotes(&self) -> &BTreeMap<Symbol, LastQuote> {
         &self.quotes
