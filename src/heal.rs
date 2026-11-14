@@ -532,14 +532,9 @@ async fn write_traded_symbols(
     clients: &Clients,
     journal: &Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
+    let fetched = clients.massive.grouped_daily(session).await;
     let provenance = fetched_now(Subscription::StocksStarter, journal);
-    let daily = record_traded_symbols(
-        session,
-        clients.massive.grouped_daily(session).await,
-        &provenance,
-        clients.store(),
-    )
-    .await?;
+    let daily = record_traded_symbols(session, fetched, &provenance, clients.store()).await?;
     Ok(PartitionWritten::new(
         Leg::MassiveTradedSymbols,
         session,
@@ -584,12 +579,13 @@ async fn write_splits(
     clients: &Clients,
     journal: &Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
+    let fetched = clients.massive.splits().await;
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let splits = kept(
         clients.store(),
         massive_splits(session),
         &provenance,
-        clients.massive.splits().await,
+        fetched,
     )
     .await?;
     let rows = publish(
@@ -673,7 +669,6 @@ async fn write_series_boundaries(
         }
     };
     let window = SessionRange::single(session).reaching_back_to(first);
-    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let mut read = SeriesBoundaries::empty();
     let mut bodies = Vec::new();
     let mut failed = None;
@@ -688,6 +683,7 @@ async fn write_series_boundaries(
             }
         }
     }
+    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let read = kept(
         clients.store(),
         alpaca_series_boundaries(session),
@@ -785,7 +781,6 @@ async fn write_security_details(
     journal: &Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
-    let provenance = fetched_now(Subscription::StocksStarter, journal);
     let stopped = Arc::new(AtomicBool::new(false));
     let mut gathered: DetailsGathered =
         each_symbol(&symbols, parameters.tick_concurrency, |symbol| {
@@ -816,6 +811,7 @@ async fn write_security_details(
         })
         .await?;
     let failed = gathered.failed.take();
+    let provenance = fetched_now(Subscription::StocksStarter, journal);
     kept(
         clients.store(),
         massive_security_details(session),
@@ -942,7 +938,6 @@ async fn write_filed_industry_codes(
         .with_ymd_and_hms(year, month, day, 0, 0, 0)
         .single()
         .expect("the filings' first day is an instant");
-    let provenance = fetched_now(Subscription::EdgarPublic, journal);
     let (filed, unanswered, fetched) = read_filed_codes(
         &filers,
         &held,
@@ -951,6 +946,7 @@ async fn write_filed_industry_codes(
     )
     .await;
     codes.extend(filed);
+    let provenance = fetched_now(Subscription::EdgarPublic, journal);
     kept(
         clients.store(),
         sec_filed_industry_codes(session),
@@ -1050,15 +1046,14 @@ async fn write_quotes(
     let mut one_sided = 0_u64;
     let mut restatements = Restatements::default();
     let mut restated = 0_u64;
-    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
-    let unanswered = per_symbol_raw(
+    let (unanswered, provenance) = per_symbol_raw(
         &clients.archive,
         alpaca_quotes(session).into(),
         Key::RawQuotes {
             provider: Provider::Alpaca,
             session,
         },
-        &provenance,
+        (Subscription::AlgoTraderPlus, journal),
         &symbols,
         parameters.tick_concurrency,
         |symbol, pages| {
@@ -1173,15 +1168,14 @@ async fn write_trades(
     let conditions = trade_conditions(clients, journal).await?;
     let mut fold = TradeFold::new(session, conditions);
     let mut refused = Vec::new();
-    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
-    let unanswered = per_symbol_raw(
+    let (unanswered, provenance) = per_symbol_raw(
         &clients.archive,
         alpaca_trades(session).into(),
         Key::RawTrades {
             provider: Provider::Alpaca,
             session,
         },
-        &provenance,
+        (Subscription::AlgoTraderPlus, journal),
         &symbols,
         parameters.tick_concurrency,
         |symbol, pages| {
@@ -1249,15 +1243,10 @@ async fn write_conditions(
     store: impl AsyncFnOnce(ReferenceKey, &Provenance, Vec<Vec<u8>>) -> Result<(), PartitionFailure>,
     put: impl AsyncFnOnce(&Key, Vec<u8>) -> Result<(), BucketError>,
 ) -> Result<TradeConditions, PartitionFailure> {
-    let fetched_at = Utc::now();
-    let key = conditions_key(SessionDate::at(fetched_at));
-    let provenance = Provenance::new(
-        Subscription::StocksStarter,
-        fetched_at,
-        journal.run_id(),
-        journal.commit().cloned(),
-    );
-    let conditions = kept(store, key, &provenance, fetch().await).await?;
+    let fetched = fetch().await;
+    let provenance = fetched_now(Subscription::StocksStarter, journal);
+    let key = conditions_key(SessionDate::at(provenance.fetched_at()));
+    let conditions = kept(store, key, &provenance, fetched).await?;
     let body =
         encode_conditions(&key, &conditions, &provenance).map_err(storage::EncodeRefusal::from)?;
     put(&key.into(), body).await?;
@@ -1272,20 +1261,21 @@ async fn write_conditions(
     Ok(conditions)
 }
 
-/// `per_symbol`, storing every page under the raw `key` stamped with `provenance`, the object complete before this
-/// returns so nothing folded from the pages is published without them; a failed fetch abandons the upload. `held_by`
-/// is deleted first, so a session that fails after its new raw object is written reads as owed rather than held.
+/// `per_symbol` from `subscription`, storing every page under the raw `key`, the object complete before this returns
+/// so nothing folded from the pages is published without them; a failed fetch abandons the upload. The object is
+/// stamped when its upload opens, since S3 fixes its metadata there, and `held_by` is deleted first, so a session that
+/// fails after its new raw object is written reads as owed rather than held.
 #[allow(clippy::too_many_arguments)]
 async fn per_symbol_raw<Fetch, Pending, Row>(
     archive: &Bucket,
     held_by: Key,
     key: Key,
-    provenance: &Provenance,
+    (subscription, journal): (Subscription, &Journal),
     symbols: &[Symbol],
     concurrency: NonZeroUsize,
     fetch: Fetch,
     each: impl FnMut(Row),
-) -> Result<BTreeMap<Symbol, Unanswered>, PartitionFailure>
+) -> Result<(BTreeMap<Symbol, Unanswered>, Provenance), PartitionFailure>
 where
     Fetch: Fn(Symbol, Sender<Page<Row>>) -> Pending,
     Pending: Future<Output = Result<bool, FetchError>> + Send + 'static,
@@ -1293,7 +1283,7 @@ where
 {
     archive.delete(&held_by).await?;
     let mut writer = archive
-        .begin_raw(key, provenance)
+        .begin_raw(key, &fetched_now(subscription, journal))
         .await
         .map_err(PartitionFailure::Tee)?;
     let fetched = per_symbol(
@@ -1302,12 +1292,13 @@ where
         fetch,
         async |body: Vec<u8>| writer.push_line(&body).await,
         each,
+        || fetched_now(subscription, journal),
     )
     .await;
     match fetched {
-        Ok(unanswered) => {
+        Ok(answer) => {
             writer.finish().await.map_err(PartitionFailure::Tee)?;
-            Ok(unanswered)
+            Ok(answer)
         }
         Err(failure) => {
             writer.abort().await;
@@ -1319,14 +1310,15 @@ where
 /// Fetches each symbol's rows with at most `concurrency` in flight, handing every page's bytes to `tee` and its rows to
 /// `each` as pages arrive, in order within a symbol but interleaved across symbols. A symbol Alpaca names invalid, or
 /// answers with no row filed under it, is returned as unanswered rather than failing the session; any other failure
-/// fails it.
+/// fails it. The provenance `answered` gives is taken once the last symbol has answered.
 async fn per_symbol<Fetch, Pending, Row>(
     symbols: &[Symbol],
     concurrency: NonZeroUsize,
     fetch: Fetch,
     mut tee: impl AsyncFnMut(Vec<u8>) -> Result<(), TeeError>,
     mut each: impl FnMut(Row),
-) -> Result<BTreeMap<Symbol, Unanswered>, PartitionFailure>
+    answered: impl FnOnce() -> Provenance,
+) -> Result<(BTreeMap<Symbol, Unanswered>, Provenance), PartitionFailure>
 where
     Fetch: Fn(Symbol, Sender<Page<Row>>) -> Pending,
     Pending: Future<Output = Result<bool, FetchError>> + Send + 'static,
@@ -1351,7 +1343,7 @@ where
                 tee(body).await.map_err(PartitionFailure::Tee)?;
                 rows.into_iter().for_each(&mut each);
             }
-            return Ok(unanswered);
+            return Ok((unanswered, answered()));
         }
         tokio::select! {
             Some(page) = pages.recv() => {
@@ -1450,6 +1442,15 @@ mod tests {
 
     fn size(count: usize) -> NonZeroUsize {
         NonZeroUsize::new(count).unwrap()
+    }
+
+    fn stamp() -> Provenance {
+        Provenance::new(
+            Subscription::AlgoTraderPlus,
+            Utc::now(),
+            RunId::new(uuid::Uuid::new_v4()),
+            None,
+        )
     }
 
     /// The journal keeps a failure's kind beside its text, so a night's failures group without matching on prose.
@@ -1661,6 +1662,47 @@ mod tests {
             ])
         );
         assert_eq!(event_types(&journal), Vec::<&str>::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A conditions snapshot is stamped as fetched once its response is in, never when the request starts.
+    #[tokio::test]
+    async fn test_a_conditions_snapshot_is_stamped_after_its_fetch() {
+        let (mut journal, directory) = temporary_journal();
+        let answered = std::sync::Mutex::new(None);
+        let stamped = std::sync::Mutex::new(None);
+        write_conditions(
+            &mut journal,
+            async || {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                *answered.lock().unwrap() = Some(Utc::now());
+                Fetched::new(
+                    Ok(TradeConditions::new(BTreeMap::from([(
+                        ConditionCode::new(37),
+                        Condition::new(
+                            UpdateRules::VOLUME_ONLY,
+                            None,
+                            None,
+                            ConditionStatus::Current,
+                        ),
+                    )]))),
+                    vec![b"{}".to_vec()],
+                )
+            },
+            async |_key: ReferenceKey, provenance: &Provenance, _bodies: Vec<Vec<u8>>| {
+                *stamped.lock().unwrap() = Some(provenance.fetched_at());
+                Ok(())
+            },
+            async |_key: &Key, _body| Ok(()),
+        )
+        .await
+        .unwrap();
+        let answered = answered.into_inner().unwrap().unwrap();
+        let stamped = stamped.into_inner().unwrap().unwrap();
+        assert!(
+            stamped >= answered,
+            "stamped {stamped}, answered {answered}"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -2086,9 +2128,11 @@ mod tests {
                 Ok(())
             },
             |row: i32| rows.push(row),
+            stamp,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         rows.sort();
         assert_eq!(rows, [1, 2, 3, 4]);
         bodies.sort();
@@ -2118,13 +2162,46 @@ mod tests {
             },
             async |_| Ok(()),
             |row: i32| rows.push(row),
+            stamp,
         );
         let unanswered = tokio::time::timeout(Duration::from_secs(5), answer)
             .await
             .expect("the fold drains pages while the fetch runs")
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(rows, [0, 1, 2, 3, 4]);
         assert!(unanswered.is_empty());
+    }
+
+    /// Folded ticks are stamped as fetched once the last symbol has answered, never when the first request starts.
+    #[tokio::test]
+    async fn test_folded_ticks_are_stamped_after_the_last_symbol_answers() {
+        let symbols = [Symbol::new("AAA").unwrap(), Symbol::new("BBB").unwrap()];
+        let answered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (unanswered, provenance) = per_symbol(
+            &symbols,
+            size(1),
+            |_, pages| {
+                let answered = Arc::clone(&answered);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    pages.send(Page::new(Vec::new(), vec![1])).await.unwrap();
+                    answered.lock().unwrap().push(Utc::now());
+                    Ok(true)
+                }
+            },
+            async |_| Ok(()),
+            |_: i32| {},
+            stamp,
+        )
+        .await
+        .unwrap();
+        let answered = answered.lock().unwrap().clone();
+        assert!(unanswered.is_empty());
+        assert_eq!(answered.len(), 2);
+        let last = answered.into_iter().max().unwrap();
+        let stamped = provenance.fetched_at();
+        assert!(stamped >= last, "stamped {stamped}, answered {last}");
     }
 
     #[tokio::test]
@@ -2144,6 +2221,7 @@ mod tests {
                 })
             },
             |row: i32| rows.push(row),
+            stamp,
         )
         .await;
         assert!(matches!(
@@ -2625,23 +2703,19 @@ mod tests {
             provider: Provider::Alpaca,
             session,
         };
-        let provenance = Provenance::new(
-            Subscription::AlgoTraderPlus,
-            Utc::now(),
-            RunId::new(uuid::Uuid::new_v4()),
-            None,
-        );
         let held_by: Key = alpaca_quotes(session).into();
         profile
             .put(&held_by, b"an earlier fetch".to_vec())
             .await
             .unwrap();
         let mut quotes = 0_u64;
-        let unanswered = per_symbol_raw(
+        let (journal, directory) = temporary_journal();
+        let started = Utc::now();
+        let (unanswered, folded) = per_symbol_raw(
             &profile,
             held_by.clone(),
             key.clone(),
-            &provenance,
+            (Subscription::AlgoTraderPlus, &journal),
             &symbols,
             size(5),
             |symbol, pages| {
@@ -2667,7 +2741,12 @@ mod tests {
             stored.checksum(),
             crate::storage::raw::Checksum::FullObject(_)
         ));
-        assert_eq!(stored.fetched_at(), Some(provenance.fetched_at()));
+        assert!(
+            stored.fetched_at().is_some_and(
+                |fetched_at| started <= fetched_at && fetched_at <= folded.fetched_at()
+            )
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// Built field by field rather than through `combine`, so the law test does not lean on what it checks.

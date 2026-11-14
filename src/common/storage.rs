@@ -74,6 +74,33 @@ pub enum ReferenceTable {
     BorrowFlags,
 }
 
+/// Where a reference table's `known_at` comes from: the earliest instant a decision may read one of its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownAt {
+    /// The snapshot's fetch, since the vendor stamps no publication time; earlier sessions may be described, never
+    /// backtested.
+    Fetched,
+    /// The vendor's own publication stamp, held in each row's `column`.
+    Published { column: &'static str },
+}
+
+impl ReferenceTable {
+    /// Where this table's `known_at` comes from, which its view in `views.sql` must derive alike.
+    pub fn known_at(self) -> KnownAt {
+        match self {
+            Self::Conditions
+            | Self::SecurityDetails
+            | Self::Splits
+            | Self::SeriesBoundaries
+            | Self::TradedSymbols
+            | Self::BorrowFlags => KnownAt::Fetched,
+            Self::FiledIndustryCodes => KnownAt::Published {
+                column: "accepted_at",
+            },
+        }
+    }
+}
+
 /// The S3 storage class an object is written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageClass {
