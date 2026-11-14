@@ -292,7 +292,9 @@ pub struct PartitionWritten {
     /// What a tick leg's fold did with each row it was offered; empty for a leg that folds nothing.
     folded: BTreeMap<FoldCount, u64>,
     /// Every archive object the write deleted before rewriting it, in order; a key may have held nothing, since S3
-    /// answers a delete of an absent object as done.
+    /// answers a delete of an absent object as done. Empty on a line journaled before deletes were recorded, which
+    /// leaves the key out rather than writing an empty list.
+    #[serde(default)]
     deleted: Vec<Key>,
 }
 
@@ -396,7 +398,9 @@ pub struct PartitionFailed {
     session: SessionDate,
     failure: PartitionFailureKind,
     cause: String,
-    /// Every archive object the write deleted before it failed, in order, as `PartitionWritten` records them.
+    /// Every archive object the write deleted before it failed, in order, as `PartitionWritten` records them, and
+    /// empty on a line journaled before deletes were recorded.
+    #[serde(default)]
     deleted: Vec<Key>,
 }
 
@@ -935,6 +939,22 @@ mod tests {
                 )
             )
         );
+    }
+
+    #[test]
+    fn test_a_heal_record_written_before_deletes_were_recorded_still_reads() {
+        let written: PartitionWritten = serde_json::from_str(concat!(
+            r#"{"leg":"alpaca_quotes","session":"2026-09-29","rows":3,"refused":{},"#,
+            r#""unanswered":{},"folded":{}}"#,
+        ))
+        .unwrap();
+        assert_eq!(written.deleted, Vec::<Key>::new());
+        let failed: PartitionFailed = serde_json::from_str(concat!(
+            r#"{"leg":"alpaca_trades","session":"2026-09-29","failure":"no_rows","#,
+            r#""cause":"the vendor answered with no rows"}"#,
+        ))
+        .unwrap();
+        assert_eq!(failed.deleted, Vec::<Key>::new());
     }
 
     #[test]
