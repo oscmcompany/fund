@@ -40,6 +40,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'clippy.toml'
+              - 'deny.toml'
               - 'secretspec.toml'
               - 'views.sql'
               - 'checks/**'
@@ -101,3 +102,11 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:rust
+      # CI only, so no laptop or host carries the tool; it fetches the RustSec
+      # database, so a new advisory fails the next Rust pull request by design.
+      # Last, so a fresh advisory never hides the build and test results.
+      - name: Check dependency advisories, licences and sources
+        if: ${{ !cancelled() && steps.changes.outputs.rust == 'true' }}
+        run: |
+          cargo install --locked --version 0.20.2 cargo-deny
+          cargo deny --workspace check
