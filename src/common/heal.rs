@@ -610,6 +610,34 @@ mod tests {
         SessionDate::from_date(text.parse::<NaiveDate>().unwrap())
     }
 
+    /// Every tick key a leg holds a session by is Alpaca's: Massive's tick families have no writer.
+    #[test]
+    fn test_no_leg_keys_a_massive_tick_family() {
+        let session = date("2026-11-12");
+        let tick_providers: Vec<(Leg, Provider)> = Leg::iter()
+            .flat_map(|leg| leg.keys(session).into_iter().map(move |key| (leg, key)))
+            .filter_map(|(leg, key)| match key {
+                Key::Quotes(parsed) => Some((leg, parsed.provider())),
+                Key::Trades(parsed) => Some((leg, parsed.provider())),
+                Key::RawQuotes { provider, .. } | Key::RawTrades { provider, .. } => {
+                    Some((leg, provider))
+                }
+                Key::Reference(..) | Key::RawReference(..) | Key::Journal(..) | Key::Logs(..) => {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            tick_providers,
+            vec![
+                (Leg::AlpacaQuotes, Provider::Alpaca),
+                (Leg::AlpacaQuotes, Provider::Alpaca),
+                (Leg::AlpacaTrades, Provider::Alpaca),
+                (Leg::AlpacaTrades, Provider::Alpaca),
+            ]
+        );
+    }
+
     /// Weekdays over `[first, last]`, less `holidays`.
     fn calendar(first: &str, last: &str, holidays: &[&str]) -> TradingCalendar {
         let (first, last) = (date(first), date(last));

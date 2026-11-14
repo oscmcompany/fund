@@ -52,6 +52,7 @@ FROM (
 );
 
 -- One series both providers carry, Massive's where it holds the session and Alpaca's otherwise; `provider` says which.
+-- Massive's tick series have had no writer since 2026-10-26, so every later session is Alpaca's.
 CREATE OR REPLACE MACRO preferred(massive, alpaca) AS TABLE
 SELECT * FROM sessions('archive_bucket', massive)
 UNION ALL
@@ -159,6 +160,8 @@ SELECT * FROM sessions('archive_bucket', 'data/equity/stage=parsed/trades/provid
 -- Daily trade bars rolled up from Alpaca's one-minute trade bars.
 CREATE OR REPLACE VIEW alpaca_daily_trade_bars AS
 SELECT * FROM sessions('archive_bucket', 'data/equity/stage=parsed/trades/provider=alpaca/interval=one_day/');
+
+-- Massive's tick series below are historical: no writer has added a session since 2026-10-26.
 
 -- One-minute quote bars folded from Massive's quote flat files, time-weighted over regular hours.
 CREATE OR REPLACE VIEW massive_minute_quote_bars AS
