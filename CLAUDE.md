@@ -54,9 +54,9 @@ This is a collection of guidelines and references.
   `producer=` partition its journals and logs are written under: `archiver` collects data, `trader` executes, and
   `researcher` runs experiments and model training; `producer=operator` marks a change a person makes by hand (a
   playbook upload), which no host makes and which never names an instance
-- The host name is the anchor and a binary's name is never a host name — the `archiver` runs `archive_nightly` and
-  the `researcher` runs whatever study `host/researcher` sends it, so the binary appears in the finer key
-  (`service=` for a log) rather than in the host's name
+- The host name is the anchor and stays fixed whatever binary the host runs, which may share its name (the `trader`
+  runs `trader`) or not (the `archiver` runs `archive_nightly`, the `researcher` whatever study `host/researcher`
+  sends it); the binary appears in the finer key (`service=` for a log), never in the host's name
 - `fund-role` and `fund-profile` are different axes and neither absorbs the other: the role is which kind of host
   (`archiver`), the profile is which environment (secretspec's `production`, `development/<name>`), and
   provisioning filters on both so a second environment cannot adopt the first's box; "profile" means an
