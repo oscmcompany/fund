@@ -9,6 +9,7 @@ pub mod provenance;
 pub mod quote_bars;
 pub mod raw;
 pub mod reference;
+pub mod scratch;
 pub mod trade_bars;
 
 use aws_sdk_s3::primitives::ByteStream;
