@@ -29,7 +29,7 @@ use fund::records::{RefusedToStart, resolved, ship_logged, start};
 use fund::storage::reference::{SnapshotError, latest_conditions};
 use fund::storage::{Bucket, BucketError, parquet, trade_bars};
 use fund::trader::parameters::Parameters;
-use fund::trader::{Session, SessionError, Standing, last_closes, resumed, warm};
+use fund::trader::{DecisionInterval, Session, SessionError, Standing, last_closes, resumed, warm};
 
 const SERVICE: &str = "trader";
 /// Calendar days read back for the previous session, past any run of holidays and a weekend.
@@ -315,7 +315,8 @@ async fn trade(
         .chain(fills.iter().map(Fill::symbol))
         .cloned()
         .collect();
-    let (previous, closes) = previous_bars(archive, &calendar, today, &symbols)
+    let decision = parameters.settings().decision();
+    let (previous, closes) = previous_bars(archive, &calendar, today, &symbols, decision)
         .await
         .map_err(|refusal| refused(StartRefusal::PreviousSession(refusal)))?;
     let (opened, opening, losses) = resumed(&book, &fills, |symbol| closes.get(symbol).copied())
@@ -394,13 +395,14 @@ async fn trade(
     }
 }
 
-/// The previous session's one-minute trade bars of `symbols` as the archive derived them, folded into a state, with each
-/// symbol's last close among them.
+/// The previous session's one-minute trade bars of `symbols` as the archive derived them, folded into a state beside
+/// their `decision` bars, with each symbol's last close among them.
 async fn previous_bars(
     archive: &Bucket,
     calendar: &TradingCalendar,
     today: SessionDate,
     symbols: &BTreeSet<Symbol>,
+    decision: DecisionInterval,
 ) -> Result<(MarketState, BTreeMap<Symbol, Price>), PreviousRefusal> {
     let previous = calendar
         .previous_trading_day(today)
@@ -424,7 +426,7 @@ async fn previous_bars(
         .filter(|bar| symbols.contains(bar.symbol()))
         .collect();
     let closes = last_closes(&bars);
-    Ok((warm(bars, symbols), closes))
+    Ok((warm(bars, symbols, decision), closes))
 }
 
 /// Waits for `instant`, returning at once when it has passed.
