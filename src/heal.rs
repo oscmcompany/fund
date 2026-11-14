@@ -532,14 +532,9 @@ async fn write_traded_symbols(
     clients: &Clients,
     journal: &Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
+    let fetched = clients.massive.grouped_daily(session).await;
     let provenance = fetched_now(Subscription::StocksStarter, journal);
-    let daily = record_traded_symbols(
-        session,
-        clients.massive.grouped_daily(session).await,
-        &provenance,
-        clients.store(),
-    )
-    .await?;
+    let daily = record_traded_symbols(session, fetched, &provenance, clients.store()).await?;
     Ok(PartitionWritten::new(
         Leg::MassiveTradedSymbols,
         session,
@@ -584,12 +579,13 @@ async fn write_splits(
     clients: &Clients,
     journal: &Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
+    let fetched = clients.massive.splits().await;
     let provenance = fetched_now(Subscription::StocksStarter, journal);
     let splits = kept(
         clients.store(),
         massive_splits(session),
         &provenance,
-        clients.massive.splits().await,
+        fetched,
     )
     .await?;
     let rows = publish(
@@ -673,7 +669,6 @@ async fn write_series_boundaries(
         }
     };
     let window = SessionRange::single(session).reaching_back_to(first);
-    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let mut read = SeriesBoundaries::empty();
     let mut bodies = Vec::new();
     let mut failed = None;
@@ -688,6 +683,7 @@ async fn write_series_boundaries(
             }
         }
     }
+    let provenance = fetched_now(Subscription::AlgoTraderPlus, journal);
     let read = kept(
         clients.store(),
         alpaca_series_boundaries(session),
@@ -785,7 +781,6 @@ async fn write_security_details(
     journal: &Journal,
 ) -> Result<PartitionWritten, PartitionFailure> {
     let symbols = symbol_list(clients, session).await?;
-    let provenance = fetched_now(Subscription::StocksStarter, journal);
     let stopped = Arc::new(AtomicBool::new(false));
     let mut gathered: DetailsGathered =
         each_symbol(&symbols, parameters.tick_concurrency, |symbol| {
@@ -816,6 +811,7 @@ async fn write_security_details(
         })
         .await?;
     let failed = gathered.failed.take();
+    let provenance = fetched_now(Subscription::StocksStarter, journal);
     kept(
         clients.store(),
         massive_security_details(session),
@@ -942,7 +938,6 @@ async fn write_filed_industry_codes(
         .with_ymd_and_hms(year, month, day, 0, 0, 0)
         .single()
         .expect("the filings' first day is an instant");
-    let provenance = fetched_now(Subscription::EdgarPublic, journal);
     let (filed, unanswered, fetched) = read_filed_codes(
         &filers,
         &held,
@@ -951,6 +946,7 @@ async fn write_filed_industry_codes(
     )
     .await;
     codes.extend(filed);
+    let provenance = fetched_now(Subscription::EdgarPublic, journal);
     kept(
         clients.store(),
         sec_filed_industry_codes(session),
@@ -1249,15 +1245,10 @@ async fn write_conditions(
     store: impl AsyncFnOnce(ReferenceKey, &Provenance, Vec<Vec<u8>>) -> Result<(), PartitionFailure>,
     put: impl AsyncFnOnce(&Key, Vec<u8>) -> Result<(), BucketError>,
 ) -> Result<TradeConditions, PartitionFailure> {
-    let fetched_at = Utc::now();
-    let key = conditions_key(SessionDate::at(fetched_at));
-    let provenance = Provenance::new(
-        Subscription::StocksStarter,
-        fetched_at,
-        journal.run_id(),
-        journal.commit().cloned(),
-    );
-    let conditions = kept(store, key, &provenance, fetch().await).await?;
+    let fetched = fetch().await;
+    let provenance = fetched_now(Subscription::StocksStarter, journal);
+    let key = conditions_key(SessionDate::at(provenance.fetched_at()));
+    let conditions = kept(store, key, &provenance, fetched).await?;
     let body =
         encode_conditions(&key, &conditions, &provenance).map_err(storage::EncodeRefusal::from)?;
     put(&key.into(), body).await?;
@@ -1661,6 +1652,47 @@ mod tests {
             ])
         );
         assert_eq!(event_types(&journal), Vec::<&str>::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A conditions snapshot is stamped as fetched once its response is in, never when the request starts.
+    #[tokio::test]
+    async fn test_a_conditions_snapshot_is_stamped_after_its_fetch() {
+        let (mut journal, directory) = temporary_journal();
+        let answered = std::sync::Mutex::new(None);
+        let stamped = std::sync::Mutex::new(None);
+        write_conditions(
+            &mut journal,
+            async || {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                *answered.lock().unwrap() = Some(Utc::now());
+                Fetched::new(
+                    Ok(TradeConditions::new(BTreeMap::from([(
+                        ConditionCode::new(37),
+                        Condition::new(
+                            UpdateRules::VOLUME_ONLY,
+                            None,
+                            None,
+                            ConditionStatus::Current,
+                        ),
+                    )]))),
+                    vec![b"{}".to_vec()],
+                )
+            },
+            async |_key: ReferenceKey, provenance: &Provenance, _bodies: Vec<Vec<u8>>| {
+                *stamped.lock().unwrap() = Some(provenance.fetched_at());
+                Ok(())
+            },
+            async |_key: &Key, _body| Ok(()),
+        )
+        .await
+        .unwrap();
+        let answered = answered.into_inner().unwrap().unwrap();
+        let stamped = stamped.into_inner().unwrap().unwrap();
+        assert!(
+            stamped >= answered,
+            "stamped {stamped}, answered {answered}"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

@@ -199,6 +199,23 @@ fn test_a_snapshot_without_its_fetch_instant_is_refused() {
 }
 
 #[test]
+fn test_a_snapshot_without_its_fetch_instant_is_refused_whatever_the_query_selects() {
+    let views = reference_views();
+    assert_eq!(views.len(), 6, "{views:?}");
+    for (view, table, provider) in views {
+        let archive = scratch();
+        snapshot(&archive, table, provider, as_of(), None);
+        let script = format!("{}SELECT count(*) FROM {view};", pointed(&archive, &view));
+        let refusal = duckdb(&script).unwrap_err();
+        assert!(
+            refusal.contains("has no fund.fetched_at"),
+            "{view}: {refusal}"
+        );
+        std::fs::remove_dir_all(&archive).unwrap();
+    }
+}
+
+#[test]
 fn test_each_snapshot_reads_its_own_fetch_instant() {
     let archive = scratch();
     let earlier = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 11, 9).unwrap());
