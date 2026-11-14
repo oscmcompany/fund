@@ -318,8 +318,8 @@ fn request_form(
         ("schema", schema.to_string()),
         ("symbols", symbols.join(",")),
         ("stype_in", "raw_symbol".to_string()),
-        ("start", start.to_rfc3339_opts(SecondsFormat::Secs, true)),
-        ("end", end.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        ("start", start.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+        ("end", end.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
     ]
 }
 
@@ -564,6 +564,32 @@ mod tests {
             encode_form(&form),
             "dataset=XNAS.ITCH&schema=mbp-1&symbols=AAPL%2CBRK.B&stype_in=raw_symbol\
              &start=2026-11-10T05%3A00%3A00Z&end=2026-11-11T05%3A00%3A00Z"
+        );
+    }
+
+    #[test]
+    fn test_a_request_form_keeps_fractional_seconds() {
+        let start = DateTime::parse_from_rfc3339("2026-11-10T17:00:00.100Z")
+            .unwrap()
+            .to_utc();
+        let end = DateTime::parse_from_rfc3339("2026-11-10T17:00:00.900Z")
+            .unwrap()
+            .to_utc();
+        let form = request_form(
+            &Dataset::new("XNAS.ITCH").unwrap(),
+            Schema::TopOfBook,
+            &[Symbol::new("AAPL").unwrap()],
+            start,
+            end,
+        );
+        let instants: Vec<&str> = form
+            .iter()
+            .filter(|(name, _)| matches!(*name, "start" | "end"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            instants,
+            ["2026-11-10T17:00:00.100Z", "2026-11-10T17:00:00.900Z"]
         );
     }
 

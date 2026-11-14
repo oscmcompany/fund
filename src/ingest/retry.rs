@@ -191,6 +191,62 @@ mod tests {
         }
     }
 
+    /// Answers one connection on a local port with `pieces`, flushed one at a time, then closes it.
+    fn serve_once(pieces: Vec<&'static [u8]>) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                line.clear();
+            }
+            for piece in pieces {
+                stream.write_all(piece).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        format!("http://{address}/rows")
+    }
+
+    #[tokio::test]
+    async fn test_a_chunked_body_gzips_to_its_exact_bytes() {
+        let url = serve_once(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            b"6\r\nts,px\n\r\n",
+            b"9\r\n1,100.25\n\r\n",
+            b"9\r\n2,100.50\n\r\n",
+            b"0\r\n\r\n",
+        ]);
+        let outcome = send_gzipped(reqwest::Client::new().get(url), Duration::from_secs(5)).await;
+        let Outcome::Body(gzipped) = outcome else {
+            panic!("a whole body was not returned");
+        };
+        let mut decompressed = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(gzipped.as_slice()),
+            &mut decompressed,
+        )
+        .unwrap();
+        assert_eq!(decompressed, "ts,px\n1,100.25\n2,100.50\n");
+    }
+
+    #[tokio::test]
+    async fn test_a_body_cut_short_is_transient_not_a_partial_file() {
+        let url = serve_once(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            b"ts,px\n1,100.25\n",
+        ]);
+        let outcome = send_gzipped(reqwest::Client::new().get(url), Duration::from_secs(5)).await;
+        match outcome {
+            Outcome::Transient(_) => {}
+            Outcome::Body(_) | Outcome::Refused { .. } => panic!("a truncated body was accepted"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_transient_failures_are_retried_with_backoff() {
         let calls = Cell::new(0);
