@@ -1,5 +1,7 @@
-//! A seeded generator and shuffle that never change, so a null drawn from a seed can be drawn again exactly.
+//! A seeded generator and shuffle that never change, so a null drawn from a seed can be drawn again exactly, and the
+//! shuffled null that permutes values only among rows sharing a block.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 /// SplitMix64: one 64-bit state, advanced by a fixed odd constant and finalized; the sequence for a seed is part of
@@ -47,8 +49,30 @@ impl Generator {
     }
 }
 
+/// Each row's value after permuting the values among the rows that share its block, one generator seeded `seed`
+/// shuffling the blocks in key order; a value never leaves its block, so whatever the block holds in common survives
+/// and only the pairing within it is broken.
+pub fn shuffled_within<Key: Ord, Value: Clone>(rows: &[(Key, Value)], seed: u64) -> Vec<Value> {
+    let mut blocks: BTreeMap<&Key, Vec<usize>> = BTreeMap::new();
+    for (index, (key, _)) in rows.iter().enumerate() {
+        blocks.entry(key).or_default().push(index);
+    }
+    let mut generator = Generator::new(seed);
+    let mut shuffled: Vec<Value> = rows.iter().map(|(_, value)| value.clone()).collect();
+    for indices in blocks.values() {
+        let mut sources = indices.clone();
+        generator.shuffle(&mut sources);
+        for (target, source) in indices.iter().zip(sources) {
+            shuffled[*target] = rows[source].1.clone();
+        }
+    }
+    shuffled
+}
+
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     /// The published SplitMix64 outputs from a zero state.
@@ -103,5 +127,86 @@ mod tests {
         }
         let heads = (0..10_000).filter(|_| generator.coin()).count();
         assert!((heads as f64 - 5_000.0).abs() < 4.0 * 50.0, "{heads}");
+    }
+
+    #[test]
+    fn test_a_shuffle_within_blocks_keeps_each_value_in_its_block() {
+        let rows = [
+            ("a", 1),
+            ("b", 10),
+            ("a", 2),
+            ("a", 3),
+            ("c", 100),
+            ("b", 20),
+        ];
+        let shuffled = shuffled_within(&rows, 3);
+        assert_eq!(shuffled, shuffled_within(&rows, 3));
+        assert_eq!(shuffled[4], 100);
+        let mut a: Vec<i32> = [0, 2, 3].map(|index| shuffled[index]).to_vec();
+        a.sort_unstable();
+        assert_eq!(a, [1, 2, 3]);
+        let differs = (0..20).any(|seed| shuffled_within(&rows, seed) != shuffled);
+        assert!(differs);
+    }
+
+    /// Outcomes planted at correlation about 0.8 with the forecast in each of 20 blocks; shuffling the forecasts
+    /// within blocks leaves a correlation within four standard errors of zero.
+    #[test]
+    fn test_the_shuffled_null_destroys_a_planted_signal() {
+        let mut generator = Generator::new(41);
+        let mut uniform = || (generator.next_u64() >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+        let rows: Vec<(u32, f64, f64)> = (0..4_000)
+            .map(|index| {
+                let forecast = uniform();
+                (index % 20, forecast, forecast + 0.8 * uniform())
+            })
+            .collect();
+        let correlation = |forecasts: &[f64]| {
+            let count = forecasts.len() as f64;
+            let outcomes: Vec<f64> = rows.iter().map(|row| row.2).collect();
+            let mean = |values: &[f64]| values.iter().sum::<f64>() / count;
+            let (forecast_mean, outcome_mean) = (mean(forecasts), mean(&outcomes));
+            let covariance: f64 = forecasts
+                .iter()
+                .zip(&outcomes)
+                .map(|(forecast, outcome)| (forecast - forecast_mean) * (outcome - outcome_mean))
+                .sum();
+            let spread = |values: &[f64], center: f64| {
+                values
+                    .iter()
+                    .map(|value| (value - center).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            covariance / (spread(forecasts, forecast_mean) * spread(&outcomes, outcome_mean))
+        };
+        let forecasts: Vec<f64> = rows.iter().map(|row| row.1).collect();
+        let planted = correlation(&forecasts);
+        assert!(planted > 0.5, "{planted}");
+        let keyed: Vec<(u32, f64)> = rows.iter().map(|row| (row.0, row.1)).collect();
+        let null = correlation(&shuffled_within(&keyed, 5));
+        assert!(null.abs() < 4.0 / 4_000f64.sqrt(), "{null}");
+    }
+
+    proptest! {
+        /// Each block holds the same values after the shuffle as before it.
+        #[test]
+        fn test_a_shuffle_within_blocks_permutes_each_block(
+            rows in prop::collection::vec((0u8..5, any::<i32>()), 0..60),
+            seed in any::<u64>(),
+        ) {
+            let shuffled = shuffled_within(&rows, seed);
+            prop_assert_eq!(shuffled.len(), rows.len());
+            for block in 0u8..5 {
+                let values = |values: &mut dyn Iterator<Item = i32>| {
+                    let mut values: Vec<i32> = values.collect();
+                    values.sort_unstable();
+                    values
+                };
+                let before = values(&mut rows.iter().filter(|row| row.0 == block).map(|row| row.1));
+                let after = values(&mut rows.iter().zip(&shuffled).filter(|(row, _)| row.0 == block).map(|(_, value)| *value));
+                prop_assert_eq!(before, after);
+            }
+        }
     }
 }

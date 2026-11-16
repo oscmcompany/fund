@@ -8,6 +8,7 @@ pub mod cost;
 pub mod dataset;
 pub mod estimate;
 pub mod experiment;
+pub mod folds;
 pub mod haircut;
 pub mod ledger;
 pub mod permutation;
