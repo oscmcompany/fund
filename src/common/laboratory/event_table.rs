@@ -4,7 +4,7 @@
 use std::fmt::Write;
 use std::num::NonZeroU16;
 
-use chrono::{DateTime, Datelike, Months, Utc};
+use chrono::{DateTime, Datelike, Months, TimeDelta, Utc};
 use strum::IntoEnumIterator;
 
 use crate::common::laboratory::universe::Universe;
@@ -249,6 +249,8 @@ impl EventTable {
             });
         }
         let (open, close) = (timestamp(opened), timestamp(closed));
+        // The last instant any read, drawn entry or forward probe, may land on.
+        let last_read = timestamp(closed - TimeDelta::seconds(1));
         let Dialect {
             time,
             not_withdrawn,
@@ -267,6 +269,7 @@ impl EventTable {
     FROM {events}
     WHERE ticker IN (SELECT ticker FROM universe)
       AND timestamp >= {open} + INTERVAL {start} MINUTE AND timestamp < {open} + INTERVAL {end} MINUTE
+      AND timestamp + INTERVAL {delay} MILLISECOND <= {last_read}
     QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY hash(ticker || '/{session}/{kind}/' || event_number)) <= {draws};
 "
         );
@@ -276,9 +279,11 @@ CREATE TEMP TABLE universe AS
     SELECT * FROM (VALUES {members}) AS members(ticker, dollar_volume_rank, industry_code, central_index_key, industry);
 COPY (SELECT '{session}' AS session, ticker, industry_code, central_index_key FROM universe) TO 'table/universe_{session}.parquet';
 CREATE TEMP TABLE ranks AS SELECT ticker, dollar_volume_rank FROM universe;
+-- Globbed first so a month not yet written, such as the session's own on its first day, drops out rather than failing.
+SET VARIABLE daily_files = (SELECT list(file) FROM glob([{daily_paths}]));
 CREATE TEMP TABLE bars AS
     SELECT symbol AS ticker, closed_at, close::DOUBLE AS close
-    FROM read_parquet([{daily_paths}])
+    FROM read_parquet(getvariable('daily_files'))
     WHERE (symbol IN (SELECT ticker FROM universe) OR symbol = 'SPY') AND closed_at < {open}
     QUALIFY row_number() OVER (PARTITION BY symbol ORDER BY closed_at DESC) <= 61;
 CREATE TEMP TABLE previous_close AS SELECT ticker, arg_max(close, closed_at) AS close FROM bars GROUP BY ticker;
@@ -390,9 +395,9 @@ CREATE TEMP TABLE quote_probes AS
         ) AS offsets(source, probe, seconds))
     SELECT sources.ticker, kind, key, arrival, sources.source, read_ticker, probe, arrival + to_seconds(seconds) AS probe_time
     FROM sources JOIN offsets USING (source)
-    WHERE arrival + to_seconds(seconds) <= {close} - INTERVAL 1 SECOND
+    WHERE arrival + to_seconds(seconds) <= {last_read}
     UNION ALL
-    SELECT ticker, kind, key, arrival, source, read_ticker, 'forward_close', {close} - INTERVAL 1 SECOND
+    SELECT ticker, kind, key, arrival, source, read_ticker, 'forward_close', {last_read}
     FROM sources WHERE source IN ('own', 'SPY');
 CREATE TEMP TABLE quote_probed AS
     SELECT quote_probes.*, quote_events.* EXCLUDE (ticker)

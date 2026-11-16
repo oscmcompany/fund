@@ -97,6 +97,21 @@ impl Universe {
     pub fn screened(&self) -> Screened {
         self.screened
     }
+
+    /// Names that passed the screen but ranked below the size limit.
+    pub fn beyond_size(&self) -> u32 {
+        let Screened {
+            traded,
+            undescribed,
+            not_common_stock,
+            unheld,
+        } = self.screened;
+        let members = self
+            .members
+            .last()
+            .map_or(0, |member| u32::from(member.rank().get()));
+        traded - undescribed - not_common_stock - unheld - members
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -341,6 +356,7 @@ mod tests {
                 unheld: 1,
             }
         );
+        assert_eq!(universe.beyond_size(), 1);
     }
 
     /// A bar of the session or after it, details postdating it, a bar not daily and a screen leaving nobody are each
@@ -454,6 +470,11 @@ mod tests {
             let smaller = build(&bars, names).unwrap();
             prop_assert!(every.members().starts_with(smaller.members()));
             prop_assert_eq!(smaller.members().len(), every.members().len().min(usize::from(names)));
+            prop_assert_eq!(every.beyond_size(), 0);
+            prop_assert_eq!(
+                usize::try_from(smaller.beyond_size()).unwrap(),
+                every.members().len() - smaller.members().len()
+            );
             for (index, member) in every.members().iter().enumerate() {
                 prop_assert_eq!(usize::from(member.rank().get()), index + 1);
                 prop_assert!(held.contains(member.symbol().as_str()));

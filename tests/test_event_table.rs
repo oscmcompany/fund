@@ -66,8 +66,8 @@ fn named() -> Universe {
 }
 
 /// Quotes every 2 seconds and prints every 3 for AAA, BBB, SPY and QQQ over 2025-06-16's regular hours, the mid rising
-/// a tenth of a cent a quote, and four months of daily closes, all under `directory` as scratch and the archive lay
-/// them out.
+/// a tenth of a cent a quote, and daily closes for March to May with June's month not yet written, all under
+/// `directory` as scratch and the archive lay them out.
 fn fixture(directory: &Path) -> String {
     let quotes = directory.join("scratch/kind=quotes/provider=massive/session=2025-06-16");
     let trades = directory.join("scratch/kind=trades/provider=massive/session=2025-06-16");
@@ -94,7 +94,7 @@ COPY (SELECT ticker, TIMESTAMP_NS '2025-06-16 13:30:01' + to_seconds(3 * step) A
         quotes = quotes.display(),
         trades = trades.display(),
     );
-    for month in 3..=6 {
+    for month in 3..=5 {
         let folder = directory.join(format!(
             "parsed/trades/provider=massive/interval=one_day/year=2025/month={month:02}/day=10"
         ));
@@ -108,36 +108,18 @@ COPY (SELECT ticker, TIMESTAMP_NS '2025-06-16 13:30:01' + to_seconds(3 * step) A
     script
 }
 
-/// Runs `clock`'s statements over the fixture, drawing from minutes 100 to 110, and returns duckdb's output: per kind
-/// the rows, names, read delays seen at the quote, whether every one-minute target rose and whether every draw lies
-/// in the window; then the universe's count and how many of the checked columns exist.
-fn built(clock: EventClock) -> (String, String) {
+/// Runs `table`'s statements over the fixture, then `query`, and returns duckdb's output.
+fn run(table: EventTable, query: &str) -> (String, String) {
     let directory = std::env::temp_dir().join(format!("fund-event-table-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
     let at = |hour, minute| NaiveTime::from_hms_opt(hour, minute, 0).unwrap();
-    let statements = EventTable::new(
-        TickProvider::Massive,
-        clock,
-        ReadDelay::from_milliseconds(500),
-        Draws::new(NonZeroU16::new(3).unwrap()),
-        EntryWindow::new(100, 110).unwrap(),
-    )
-    .statements(
-        &TradingSession::new(date(6, 16), at(9, 30), at(16, 0)).unwrap(),
-        &named(),
-    )
-    .unwrap();
-    let script = format!(
-        "{}{statements}
-SELECT kind, count(*), count(DISTINCT ticker), min(screen_quote_age), max(screen_quote_age), bool_and(raw_1 > 0),
-    min(minutes_since_open) >= 100, max(minutes_since_open) < 110.01
-FROM 'table/rows_massive_2025-06-16.parquet' GROUP BY kind;
-SELECT count(*) FROM 'table/universe_2025-06-16.parquet';
-SELECT count(*) FROM (DESCRIBE SELECT * FROM 'table/rows_massive_2025-06-16.parquet')
-WHERE column_name LIKE 'forward_buy%' OR column_name = 'screen_trailing_spread';
-",
-        fixture(&directory)
-    );
+    let statements = table
+        .statements(
+            &TradingSession::new(date(6, 16), at(9, 30), at(16, 0)).unwrap(),
+            &named(),
+        )
+        .unwrap();
+    let script = format!("{}{statements}{query}", fixture(&directory));
     let output = Command::new("duckdb")
         .current_dir(&directory)
         .args(["-csv", "-noheader", "-c", &script])
@@ -147,6 +129,30 @@ WHERE column_name LIKE 'forward_buy%' OR column_name = 'screen_trailing_spread';
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Runs `clock`'s statements over the fixture, drawing from minutes 100 to 110, and returns duckdb's output: per kind
+/// the rows, names, read delays seen at the quote, whether every one-minute target rose and whether every draw lies
+/// in the window; then the universe's count and how many of the checked columns exist.
+fn built(clock: EventClock) -> (String, String) {
+    let table = EventTable::new(
+        TickProvider::Massive,
+        clock,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(3).unwrap()),
+        EntryWindow::new(100, 110).unwrap(),
+    );
+    run(
+        table,
+        "
+SELECT kind, count(*), count(DISTINCT ticker), min(screen_quote_age), max(screen_quote_age), bool_and(raw_1 > 0),
+    min(minutes_since_open) >= 100, max(minutes_since_open) < 110.01
+FROM 'table/rows_massive_2025-06-16.parquet' GROUP BY kind;
+SELECT count(*) FROM 'table/universe_2025-06-16.parquet';
+SELECT count(*) FROM (DESCRIBE SELECT * FROM 'table/rows_massive_2025-06-16.parquet')
+WHERE column_name LIKE 'forward_buy%' OR column_name = 'screen_trailing_spread';
+",
     )
 }
 
@@ -172,4 +178,26 @@ fn test_the_print_clock_draws_prints() {
     assert_eq!(fields[..3], ["print", "6", "2"], "{stdout}");
     assert_eq!(fields[5..], ["true", "true", "true"], "{stdout}");
     assert_eq!(lines[1..], ["2", "1"], "{stdout}");
+}
+
+/// A window ending at the close draws only events whose delayed read lands by the last second, so the update at
+/// 19:59:58 UTC, read 1.5 seconds later, is left out and each name keeps its other 29 updates of the last minute, every
+/// one with a quote in force.
+#[test]
+fn test_a_delayed_read_past_the_close_is_not_drawn() {
+    let table = EventTable::new(
+        TickProvider::Massive,
+        EventClock::QuoteUpdates,
+        ReadDelay::from_milliseconds(1500),
+        Draws::new(NonZeroU16::new(100).unwrap()),
+        EntryWindow::new(389, 390).unwrap(),
+    );
+    let (stdout, stderr) = run(
+        table,
+        "
+SELECT count(*), count(screen_bid), max(arrival), min(minutes_to_close) > 0
+FROM 'table/rows_massive_2025-06-16.parquet';
+",
+    );
+    assert_eq!(stdout, "58,58,2025-06-16 19:59:57.5,true\n", "{stderr}");
 }
