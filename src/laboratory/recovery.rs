@@ -1,15 +1,18 @@
 //! Runs a model arm on a synthetic market planting its mechanism and on the null market planting nothing, journals
 //! what it recovered, and lets the arm read any other dataset only once it has recovered what was planted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::laboratory::estimate::{Control, EstimateRefusal, Treatment};
 use crate::common::laboratory::experiment::{ExperimentRefusal, Parameters};
 use crate::common::laboratory::recovery::Recovery;
 use crate::common::laboratory::series::Series;
 use crate::common::laboratory::synthetic::generate::GenerationRefusal;
-use crate::common::laboratory::synthetic::{MechanismKind, Specification};
+use crate::common::laboratory::synthetic::{Mechanism, MechanismKind, Specification};
 use crate::common::market::Symbol;
+use crate::common::market::record::Partition;
+use crate::common::market::trade_bars::TradeBar;
+use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingSession;
 use crate::laboratory::dataset::{Dataset, synthetic};
 use crate::laboratory::{Study, StudyError};
@@ -27,8 +30,13 @@ pub trait ModelArm {
     /// The arm's own settings, journaled under `arm.`.
     fn parameters(&self) -> Parameters;
 
-    /// The arm's reading of the mechanism's strength in basis points, one per session of `dataset`.
-    fn read(&self, dataset: &Dataset, harness: &Harness) -> Result<Series, Self::Refusal>;
+    /// The arm's reading of the mechanism's strength in basis points, one per session of `bars`, which carry nothing
+    /// of how they were generated.
+    fn read(
+        &self,
+        bars: &BTreeMap<SessionDate, Partition<TradeBar>>,
+        harness: &Harness,
+    ) -> Result<Series, Self::Refusal>;
 }
 
 /// An arm that recovered what was planted, with the recovery that admitted it.
@@ -49,7 +57,7 @@ impl<A: ModelArm> Recovered<A> {
 
     /// The arm's reading of `dataset`, real sessions included.
     pub fn read(&self, dataset: &Dataset) -> Result<Series, A::Refusal> {
-        self.arm.read(dataset, &Harness(()))
+        self.arm.read(dataset.bars(), &Harness(()))
     }
 }
 
@@ -63,10 +71,21 @@ pub enum RecoveryError<Refusal> {
         mechanism: MechanismKind,
         count: usize,
     },
+    /// Removing every mechanism for the null would credit the arm with what the others moved.
+    #[error("the specification plants {others} mechanisms besides {mechanism}")]
+    PlantedOthers {
+        mechanism: MechanismKind,
+        others: usize,
+    },
     #[error("{0}")]
     Generation(GenerationRefusal),
     #[error("the arm refused to read")]
     Arm(Refusal),
+    #[error("the arm read {session} of the {market} market, which was not requested")]
+    Unrequested {
+        market: SyntheticMarket,
+        session: SessionDate,
+    },
     #[error("{0}")]
     Estimate(EstimateRefusal),
     #[error("{0}")]
@@ -82,6 +101,40 @@ pub enum RecoveryError<Refusal> {
     Unrecovered(Box<Recovery>),
 }
 
+/// Which of the two generated markets an arm read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum SyntheticMarket {
+    Planted,
+    Null,
+}
+
+/// `readings` over exactly the requested `sessions`, a session the arm left out counted as unmeasured.
+fn covering<Refusal>(
+    readings: Series,
+    sessions: &[TradingSession],
+    market: SyntheticMarket,
+) -> Result<Series, RecoveryError<Refusal>> {
+    let requested: BTreeSet<SessionDate> = sessions.iter().map(|session| session.date()).collect();
+    if let Some(session) = readings
+        .readings()
+        .keys()
+        .find(|session| !requested.contains(session))
+    {
+        return Err(RecoveryError::Unrequested {
+            market,
+            session: *session,
+        });
+    }
+    Ok(Series::new(requested.into_iter().map(|session| {
+        (
+            session,
+            readings.readings().get(&session).copied().flatten(),
+        )
+    }))
+    .expect("readings already admitted, each requested session once"))
+}
+
 /// Reads `arm` over the market `specification` generates for `universe` over `sessions` and over its null, journals
 /// the recovery as one experiment of `study`, and returns the arm admitted only if it recovered what was planted.
 pub fn recover<A: ModelArm>(
@@ -92,13 +145,17 @@ pub fn recover<A: ModelArm>(
     sessions: &[TradingSession],
 ) -> Result<Recovered<A>, RecoveryError<A::Refusal>> {
     let mechanism = arm.mechanism();
-    let stated = match specification
+    let (own, others): (Vec<&Mechanism>, Vec<&Mechanism>) = specification
         .mechanisms
         .iter()
-        .filter(|planted| planted.kind() == mechanism)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+        .partition(|planted| planted.kind() == mechanism);
+    if !others.is_empty() {
+        return Err(RecoveryError::PlantedOthers {
+            mechanism,
+            others: others.len(),
+        });
+    }
+    let stated = match own.as_slice() {
         [] => return Err(RecoveryError::NotPlanted { mechanism }),
         [only] => only.flow().strength,
         several => {
@@ -114,8 +171,18 @@ pub fn recover<A: ModelArm>(
     let (planted, events) = generate(specification)?;
     let (null, _) = generate(&specification.null())?;
     let harness = Harness(());
-    let planted_readings = arm.read(&planted, &harness).map_err(RecoveryError::Arm)?;
-    let null_readings = arm.read(&null, &harness).map_err(RecoveryError::Arm)?;
+    let planted_readings = covering(
+        arm.read(planted.bars(), &harness)
+            .map_err(RecoveryError::Arm)?,
+        sessions,
+        SyntheticMarket::Planted,
+    )?;
+    let null_readings = covering(
+        arm.read(null.bars(), &harness)
+            .map_err(RecoveryError::Arm)?,
+        sessions,
+        SyntheticMarket::Null,
+    )?;
     let recovery = Recovery::new(
         stated,
         events
@@ -157,9 +224,8 @@ mod tests {
     use crate::common::laboratory::experiment::Label;
     use crate::common::laboratory::synthetic::draw::{LogNormal, Seed};
     use crate::common::laboratory::synthetic::{
-        Flow, Mechanism, Prevalence, Shapes, Span, Volatility, Window,
+        Flow, Prevalence, Shapes, Span, Volatility, Window,
     };
-    use crate::common::time::SessionDate;
     use crate::laboratory::source::Source;
 
     /// Reads a permanent impact as each session's mean absolute open-to-close log return across names.
@@ -177,8 +243,12 @@ mod tests {
             Parameters::new([("reading", "mean_absolute_session_return")]).unwrap()
         }
 
-        fn read(&self, dataset: &Dataset, _: &Harness) -> Result<Series, Infallible> {
-            let readings = dataset.bars().iter().map(|(session, partition)| {
+        fn read(
+            &self,
+            bars: &BTreeMap<SessionDate, Partition<TradeBar>>,
+            _: &Harness,
+        ) -> Result<Series, Infallible> {
+            let readings = bars.iter().map(|(session, partition)| {
                 let mut moves = std::collections::BTreeMap::new();
                 for bar in partition.rows() {
                     let Some(open_close) = bar.sums().open_close() else {
@@ -329,6 +399,149 @@ mod tests {
             })
         ));
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A second mechanism would move the planted market but not the null, crediting the arm with what it moved.
+    #[test]
+    fn test_an_arm_is_refused_a_specification_planting_another_mechanism() {
+        let directory = directory();
+        let mut study = study(&directory);
+        let mut mixed = specification(0.0);
+        mixed.mechanisms.push(Mechanism::ClosingFlow {
+            flow: Flow {
+                strength: BasisPoints::new(40.0).unwrap(),
+                prevalence: Prevalence::new(1.0).unwrap(),
+                pieces: NonZeroU32::new(5).unwrap(),
+                spacing: Span::new(TimeDelta::seconds(60)).unwrap(),
+            },
+            half_life: Span::new(TimeDelta::hours(10)).unwrap(),
+        });
+        assert!(matches!(
+            recover(&mut study, SessionMove, &mixed, &universe(), &sessions()),
+            Err(RecoveryError::PlantedOthers {
+                mechanism: MechanismKind::WorkedParent,
+                others: 1
+            })
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Reads as `SessionMove` does, then alters the readings it returns from read `from` on, `recover` reading the
+    /// planted market first and the null second.
+    #[derive(Debug)]
+    struct Altered {
+        alter: fn(Series) -> Series,
+        from: usize,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl Altered {
+        fn new(alter: fn(Series) -> Series, from: usize) -> Self {
+            Self {
+                alter,
+                from,
+                reads: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ModelArm for Altered {
+        type Refusal = Infallible;
+
+        fn mechanism(&self) -> MechanismKind {
+            SessionMove.mechanism()
+        }
+
+        fn parameters(&self) -> Parameters {
+            SessionMove.parameters()
+        }
+
+        fn read(
+            &self,
+            bars: &BTreeMap<SessionDate, Partition<TradeBar>>,
+            harness: &Harness,
+        ) -> Result<Series, Infallible> {
+            let read = self.reads.replace(self.reads.get() + 1);
+            SessionMove
+                .read(bars, harness)
+                .map(|series| match read >= self.from {
+                    true => (self.alter)(series),
+                    false => series,
+                })
+        }
+    }
+
+    #[test]
+    fn test_a_session_the_arm_left_out_counts_as_unmeasured() {
+        let directory = directory();
+        let mut study = study(&directory);
+        let recovered = recover(
+            &mut study,
+            Altered::new(
+                |series| {
+                    Series::new(
+                        series
+                            .readings()
+                            .iter()
+                            .skip(1)
+                            .map(|(session, reading)| (*session, *reading)),
+                    )
+                    .unwrap()
+                },
+                0,
+            ),
+            &specification(40.0),
+            &universe(),
+            &sessions(),
+        )
+        .unwrap();
+        let recovery = recovered.recovery();
+        assert_eq!(
+            (
+                recovery.recovered().sessions(),
+                recovery.recovered().undefined()
+            ),
+            (7, 1)
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Each market's readings are checked, the null's after the planted market's pass.
+    #[test]
+    fn test_a_session_that_was_not_requested_is_refused() {
+        for (from, expected) in [(0, SyntheticMarket::Planted), (1, SyntheticMarket::Null)] {
+            let directory = directory();
+            let mut study = study(&directory);
+            let refused = recover(
+                &mut study,
+                Altered::new(
+                    |series| {
+                        let extra =
+                            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+                        Series::new(
+                            series
+                                .readings()
+                                .iter()
+                                .map(|(session, reading)| (*session, *reading))
+                                .chain([(extra, Some(1.0))]),
+                        )
+                        .unwrap()
+                    },
+                    from,
+                ),
+                &specification(40.0),
+                &universe(),
+                &sessions(),
+            );
+            match refused {
+                Err(RecoveryError::Unrequested { market, session }) => {
+                    assert_eq!(market, expected);
+                    assert_eq!(session.to_string(), "2026-04-01");
+                }
+                other => panic!("{other:?}"),
+            }
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
     }
 
     /// The journal names both markets' specifications and the arm's settings, and records no archive read.
