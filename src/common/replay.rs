@@ -11,7 +11,7 @@ use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
 use crate::common::guard::{
     GuardCause, OrderGuarded, Tradability, TradabilityRead, Unclosed, guard,
 };
-use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
+use crate::common::laboratory::cost::{BasisPoints, CostRefusal, FillStyle, RoundTrip};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState, Staleness};
@@ -47,7 +47,7 @@ impl FillModel {
     /// Refused for a style whose cost turns on a fill rate the archive does not measure, or a spread charging more
     /// than the whole notional per crossing.
     pub fn new(style: FillStyle, quoted_spread: BasisPoints) -> Result<Self, CostRefusal> {
-        let round_trip = CostModel::new(style, NonZeroU32::MIN).cost(quoted_spread)?;
+        let round_trip = RoundTrip::new(style, NonZeroU32::MIN).cost(quoted_spread)?;
         // A round trip crosses twice; rounded up so the grid never flatters a strategy.
         let rate = (round_trip.value() / 2.0 * (RATE_SCALE / 10_000) as f64).ceil();
         // Past the whole notional a crossing would cost more than it trades, and the charge could leave `Cash`.

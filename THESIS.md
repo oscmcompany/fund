@@ -30,5 +30,7 @@
 - A reading's error is the largest among its well-supported block groupings, and the bar it is read against rises
   with every test in its family: `QUOTED_BLOCKS` in `src/common/laboratory/blocks.rs` and
   `FAMILY_WISE_ERROR_RATE` in `src/common/laboratory/haircut.rs`
+- Cost is priced per share with its error, and the error is the floor: an edge net of cost that does not clear it
+  is not admitted, by `PricedCost::admit` in `src/common/laboratory/cost/model.rs`
 - The rules for writing code live in `CLAUDE.md`, and the rules for running a study in the `study` skill at
   `.claude/skills/study/SKILL.md`
