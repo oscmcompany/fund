@@ -72,7 +72,8 @@ promoted into the archive.
 - Standard errors assume independent observations, which financial data never is — group readings into blocks that
   move together, by time (minute up to session), by name, by name within a session, and by session and name at once,
   through `common::laboratory::blocks::coarsen`; quote the largest error among groupings with at least 20 blocks,
-  week shown only as a check, since fewer leaves the error itself noisy
+  week shown only as a check, since fewer leaves the error itself noisy; `laboratory::compare` coarsens each
+  traded name's paired gain at each decision, so the name groupings are read whenever either arm trades
 - A measurement reports its population: beside any estimate or difference print the population, the undefined share
   and the boundary values, and the effective sample size rather than the row count — `1254 / 1254 / 0 / 0` is a
   proof and a bare `0` is not, and an estimator silently defined on 60% of its inputs reads exactly like a complete
