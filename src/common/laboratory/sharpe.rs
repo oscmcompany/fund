@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::common::laboratory::score::equal_up_to_rounding;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::Price;
@@ -25,12 +27,45 @@ pub const SHARPE_MARGIN_OVER_INDEX: f64 = 2.0;
 pub const DAILY_RETURN_TARGET_BASIS_POINTS: f64 = 8.0;
 
 /// An annualized Sharpe ratio with the sessions it was read over and how many of the result's sessions had no reading.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SharpeFields")]
 pub struct Sharpe {
     annualized: f64,
     mean_return: f64,
     sessions: usize,
     undefined: usize,
+}
+
+#[derive(Deserialize)]
+struct SharpeFields {
+    annualized: f64,
+    mean_return: f64,
+    sessions: usize,
+    undefined: usize,
+}
+
+/// Why a stored Sharpe or reading beside the index was refused: it is not one `beside_index` could have produced.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("a stored Sharpe is not one beside_index could produce")]
+pub struct Inadmissible;
+
+impl TryFrom<SharpeFields> for Sharpe {
+    type Error = Inadmissible;
+
+    fn try_from(fields: SharpeFields) -> Result<Self, Self::Error> {
+        match fields.annualized.is_finite()
+            && fields.mean_return.is_finite()
+            && fields.sessions >= MINIMUM_SESSIONS
+        {
+            true => Ok(Self {
+                annualized: fields.annualized,
+                mean_return: fields.mean_return,
+                sessions: fields.sessions,
+                undefined: fields.undefined,
+            }),
+            false => Err(Inadmissible),
+        }
+    }
 }
 
 impl Sharpe {
@@ -53,7 +88,8 @@ impl Sharpe {
 }
 
 /// Why a Sharpe could not be read.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
 pub enum SharpeRefusal {
     #[error("{count} sessions is fewer than the {minimum} a Sharpe is read over")]
     TooFewSessions { count: usize, minimum: usize },
@@ -145,14 +181,37 @@ pub fn index_returns(
 }
 
 /// A result's Sharpe and the index's over exactly the sessions the result was measured on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "BesideIndexFields")]
 pub struct BesideIndex {
     result: Sharpe,
     index: Sharpe,
 }
 
+#[derive(Deserialize)]
+struct BesideIndexFields {
+    result: Sharpe,
+    index: Sharpe,
+}
+
+impl TryFrom<BesideIndexFields> for BesideIndex {
+    type Error = Inadmissible;
+
+    /// The index is read over the result's measured sessions, so it has as many and none undefined.
+    fn try_from(fields: BesideIndexFields) -> Result<Self, Self::Error> {
+        match (fields.index.sessions, fields.index.undefined) == (fields.result.sessions, 0) {
+            true => Ok(Self {
+                result: fields.result,
+                index: fields.index,
+            }),
+            false => Err(Inadmissible),
+        }
+    }
+}
+
 /// Why a result could not be set beside the index.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
 pub enum BesideIndexRefusal {
     #[error("the result's Sharpe: {0}")]
     Result(SharpeRefusal),
@@ -198,6 +257,23 @@ pub fn beside_index(
     let matched = Series::new(matched).expect("each reading was admitted by the index's series");
     let index = sharpe(&matched, risk_free).map_err(BesideIndexRefusal::Index)?;
     Ok(BesideIndex { result, index })
+}
+
+/// A result set beside the index, or why it could not be, in the form an experiment journals it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexReading {
+    Read(BesideIndex),
+    Refused { cause: BesideIndexRefusal },
+}
+
+impl From<Result<BesideIndex, BesideIndexRefusal>> for IndexReading {
+    fn from(beside: Result<BesideIndex, BesideIndexRefusal>) -> Self {
+        match beside {
+            Ok(beside) => Self::Read(beside),
+            Err(cause) => Self::Refused { cause },
+        }
+    }
 }
 
 /// Whether a reading reaches its target, and by how much it falls short when it does not.
@@ -320,6 +396,57 @@ mod tests {
         let read = sharpe(&Series::new(readings).unwrap(), &constant(0.0, 60)).unwrap();
         assert_eq!((read.sessions(), read.undefined()), (60, 1));
         assert!((read.annualized() - 15.74166446091391).abs() < 1e-9);
+    }
+
+    /// Both forms of a reading beside the index read back as written, and a stored reading `beside_index` could not
+    /// have produced is refused: the index over other sessions than the result, or a Sharpe under the session floor.
+    #[test]
+    fn test_an_index_reading_round_trips_and_refuses_what_beside_index_cannot_produce() {
+        let beside = beside_index(
+            &series(&alternating()),
+            &series(
+                &alternating()
+                    .iter()
+                    .map(|value| value * 2.0 - 0.001)
+                    .collect::<Vec<_>>(),
+            ),
+            &constant(0.0, 60),
+        )
+        .unwrap();
+        for reading in [
+            IndexReading::Read(beside),
+            IndexReading::Refused {
+                cause: BesideIndexRefusal::IndexMissing {
+                    session: session(3),
+                },
+            },
+            IndexReading::Refused {
+                cause: BesideIndexRefusal::Result(SharpeRefusal::TooFewSessions {
+                    count: 3,
+                    minimum: 60,
+                }),
+            },
+        ] {
+            let written = serde_json::to_string(&reading).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IndexReading>(&written).unwrap(),
+                reading
+            );
+        }
+        let sharpe = |sessions: usize, undefined: usize| {
+            format!(
+                r#"{{"annualized":1.5,"mean_return":0.001,"sessions":{sessions},"undefined":{undefined}}}"#
+            )
+        };
+        let stored = |result: String, index: String| {
+            serde_json::from_str::<IndexReading>(&format!(
+                r#"{{"read":{{"result":{result},"index":{index}}}}}"#
+            ))
+        };
+        assert!(stored(sharpe(60, 1), sharpe(60, 0)).is_ok());
+        assert!(stored(sharpe(60, 0), sharpe(61, 0)).is_err());
+        assert!(stored(sharpe(60, 0), sharpe(60, 1)).is_err());
+        assert!(stored(sharpe(59, 0), sharpe(59, 0)).is_err());
     }
 
     #[test]

@@ -241,7 +241,7 @@ pub(crate) mod tests {
     use crate::ingest::alpaca::Alpaca;
     use crate::laboratory::source::Source;
 
-    fn session(day: i64) -> SessionDate {
+    pub(crate) fn session(day: i64) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
     }
 
@@ -351,6 +351,69 @@ pub(crate) mod tests {
                     DatasetLeg::DailyTradeBars,
                     SessionRange::new(session(0), session(3)).unwrap(),
                     &calendar,
+                    read,
+                )
+                .unwrap(),
+                run,
+            },
+        }
+    }
+
+    /// Sessions `first` to `last` on consecutive days, each trading 09:30 to 16:00 Eastern.
+    pub(crate) fn calendar_between(first: i64, last: i64) -> TradingCalendar {
+        let (open, close) = (
+            chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        );
+        TradingCalendar::new(
+            (first..=last)
+                .map(|day| TradingSession::new(session(day), open, close).unwrap())
+                .collect(),
+            SessionRange::new(session(first), session(last)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Daily bars from session `first` on, read by `run`, one per symbol and session, each bar's open, high, low and
+    /// close all at that session's entry of the symbol's closes.
+    pub(crate) fn daily_dataset(run: RunId, first: i64, closes: &[(&str, Vec<f64>)]) -> Dataset {
+        let sessions = closes[0].1.len() as i64;
+        let last = first + sessions - 1;
+        let bars = (first..=last)
+            .map(|day| {
+                let rows: Vec<TradeBar> = closes
+                    .iter()
+                    .map(|(symbol, closes)| {
+                        let close = closes[(day - first) as usize];
+                        symbol_bar(
+                            symbol,
+                            BarInterval::OneDay,
+                            session(day).regular_close(),
+                            [close; 4],
+                        )
+                    })
+                    .collect();
+                (session(day), Partition::try_from(rows).unwrap())
+            })
+            .collect();
+        let read = (first..=last)
+            .map(|day| {
+                (
+                    session(day),
+                    PartitionRead::new(
+                        Provider::Massive,
+                        EntityTag::new(&format!("\"tag-{day}\"")),
+                    ),
+                )
+            })
+            .collect();
+        Dataset {
+            bars,
+            lineage: Lineage {
+                fingerprint: Fingerprint::new(
+                    DatasetLeg::DailyTradeBars,
+                    SessionRange::new(session(first), session(last)).unwrap(),
+                    &calendar_between(first, last),
                     read,
                 )
                 .unwrap(),

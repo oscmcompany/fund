@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::laboratory::blocks::Coarsening;
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::estimate::Estimate;
+use crate::common::laboratory::sharpe::IndexReading;
 use crate::common::laboratory::verdict::Checks;
 
 /// Free text naming what a study is about, for searching the catalog; it gates nothing.
@@ -298,6 +299,9 @@ pub struct ExperimentRan {
     /// Empty on every record journaled before coarsenings existed.
     #[serde(default)]
     coarsenings: BTreeMap<Name, Coarsening>,
+    /// `None` when the study set nothing beside the index, as every record before comparisons were gated.
+    #[serde(default)]
+    index: Option<IndexReading>,
 }
 
 /// The SHA-256 of a study's captured source as 64 lowercase hexadecimal digits, which keys the object holding it.
@@ -350,6 +354,7 @@ pub struct Outputs {
     metrics: BTreeMap<Name, Metric>,
     checks: Option<Checks>,
     coarsenings: BTreeMap<Name, Coarsening>,
+    index: Option<IndexReading>,
 }
 
 impl Outputs {
@@ -410,6 +415,16 @@ impl Outputs {
             None => Ok(self),
         }
     }
+
+    /// Attaches the result set beside the index; refused a second time, as checks are.
+    pub fn index(mut self, index: IndexReading) -> Result<Self, ExperimentRefusal> {
+        match self.index.replace(index) {
+            Some(..) => Err(ExperimentRefusal::Duplicate {
+                name: "index".to_string(),
+            }),
+            None => Ok(self),
+        }
+    }
 }
 
 impl ExperimentRan {
@@ -433,6 +448,7 @@ impl ExperimentRan {
             source_digest: Some(source_digest),
             checks: outputs.checks,
             coarsenings: outputs.coarsenings,
+            index: outputs.index,
         }
     }
 
@@ -474,6 +490,10 @@ impl ExperimentRan {
 
     pub fn coarsenings(&self) -> &BTreeMap<Name, Coarsening> {
         &self.coarsenings
+    }
+
+    pub fn index(&self) -> Option<&IndexReading> {
+        self.index.as_ref()
     }
 }
 
@@ -657,6 +677,22 @@ mod tests {
                 .map(|_| ()),
             Err(ExperimentRefusal::Duplicate {
                 name: "checks".to_string()
+            })
+        );
+        let index = IndexReading::Refused {
+            cause: crate::common::laboratory::sharpe::BesideIndexRefusal::IndexMissing {
+                session: crate::common::time::SessionDate::from_date(
+                    NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(),
+                ),
+            },
+        };
+        assert_eq!(
+            Outputs::default()
+                .index(index)
+                .and_then(|outputs| outputs.index(index))
+                .map(|_| ()),
+            Err(ExperimentRefusal::Duplicate {
+                name: "index".to_string()
             })
         );
     }
