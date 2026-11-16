@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::laboratory::READING_BOUND;
 use crate::common::laboratory::score::equal_up_to_rounding;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::Price;
@@ -54,7 +55,7 @@ impl TryFrom<SharpeFields> for Sharpe {
 
     fn try_from(fields: SharpeFields) -> Result<Self, Self::Error> {
         match fields.annualized.is_finite()
-            && fields.mean_return.is_finite()
+            && within_reading_bound(fields.mean_return)
             && fields.sessions >= MINIMUM_SESSIONS
         {
             true => Ok(Self {
@@ -66,6 +67,12 @@ impl TryFrom<SharpeFields> for Sharpe {
             false => Err(Inadmissible),
         }
     }
+}
+
+/// Whether `mean` could average readings no larger than `READING_BOUND`, up to the rounding the averaging adds.
+fn within_reading_bound(mean: f64) -> bool {
+    mean.is_finite()
+        && (mean.abs() <= READING_BOUND || equal_up_to_rounding(mean.abs(), READING_BOUND))
 }
 
 impl Sharpe {
@@ -447,6 +454,17 @@ mod tests {
         assert!(stored(sharpe(60, 0), sharpe(61, 0)).is_err());
         assert!(stored(sharpe(60, 0), sharpe(60, 1)).is_err());
         assert!(stored(sharpe(59, 0), sharpe(59, 0)).is_err());
+        let mean = |mean_return: &str| {
+            serde_json::from_str::<Sharpe>(&format!(
+                r#"{{"annualized":1.5,"mean_return":{mean_return},"sessions":60,"undefined":0}}"#
+            ))
+        };
+        assert!(mean("1e50").is_ok());
+        assert!(mean("-1e50").is_ok());
+        assert!(mean("1.0000000000005e50").is_ok());
+        assert!(mean("1.00000000001e50").is_err());
+        assert!(mean("1e51").is_err());
+        assert!(mean("-1e100").is_err());
     }
 
     #[test]

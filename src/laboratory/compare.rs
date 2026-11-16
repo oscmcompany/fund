@@ -268,9 +268,12 @@ pub fn compare<C: Strategy, B: Strategy>(
     .and_then(|outputs| outputs.coarsening(DECISION_DIFFERENCE, coarsening.clone()))
     .and_then(|outputs| outputs.index(index))
     .map_err(ReplayStudyError::Experiment)?;
-    let lineages = match dataset.fingerprint() == benchmark.dataset.fingerprint() {
-        true => vec![dataset.lineage()],
-        false => vec![dataset.lineage(), benchmark.dataset.lineage()],
+    let (read, benchmark_read) = (dataset.lineage(), benchmark.dataset.lineage());
+    let lineages = match read.fingerprint() == benchmark_read.fingerprint()
+        && read.run() == benchmark_read.run()
+    {
+        true => vec![read],
+        false => vec![read, benchmark_read],
     };
     study
         .experiment(parameters, &lineages, outputs)
@@ -1245,6 +1248,41 @@ pub(crate) mod tests {
                 (Some(_), None) | (None, Some(_)) => panic!("{readings:?}"),
             }
         }
+    }
+
+    /// A benchmark over the same partitions that another run read is refused rather than folded into this run's read.
+    #[test]
+    fn test_a_benchmark_another_run_read_is_refused() {
+        let (mut study, directory) = study();
+        let elsewhere = crate::common::journal::RunId::new(uuid::Uuid::new_v4());
+        let other = dataset(elsewhere);
+        let dataset = dataset(study.run_id());
+        assert_eq!(dataset.fingerprint(), other.fingerprint());
+        let risk_free = zero_rate(&sessions(&other));
+        let benchmark = Benchmark::new(
+            &other,
+            Symbol::new("AAPL").unwrap(),
+            &calendar(),
+            &risk_free,
+        )
+        .unwrap();
+        let refused = compare(
+            &mut study,
+            &dataset,
+            Arm::new(OneShare, "one_share", &Parameters::default()).unwrap(),
+            Arm::new(Flat, "flat", &Parameters::default()).unwrap(),
+            fill_model(),
+            BarInterval::OneDay,
+            opening(),
+            Controls::Unrestrained,
+            &benchmark,
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(matches!(
+            refused,
+            Err(ReplayStudyError::Study(crate::laboratory::StudyError::ReadByAnotherRun { run }))
+                if run == elsewhere
+        ));
     }
 
     /// A comparison with no bar to decide on is refused before anything is journaled.
