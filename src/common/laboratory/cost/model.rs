@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use super::PerShare;
 use super::fees::{FeeRegime, Liquidity};
+use super::{PerShare, PerShareRefusal};
 use crate::common::book::Side;
 use crate::common::market::quote_bars::Spread;
 use crate::common::market::{Price, Symbol};
@@ -115,6 +115,8 @@ pub enum CostBasis {
 pub enum PricingRefusal {
     #[error("{symbol} has no measured cost")]
     Unpriced { symbol: Symbol },
+    #[error("the cost with its fees is out of range: {0}")]
+    OutOfRange(#[from] PerShareRefusal),
 }
 
 /// The expected cost of a fill per share, its execution estimate plus its fees, and the floor its error sets.
@@ -124,12 +126,14 @@ pub struct PricedCost {
     floor: PerShare,
 }
 
-/// A candidate whose edge net of cost does not clear the cost's error, with both.
+/// Why a candidate was not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("a net edge of {net} is inside the floor of {floor}")]
-pub struct InsideFloor {
-    pub net: PerShare,
-    pub floor: PerShare,
+pub enum AdmissionRefusal {
+    /// Its edge net of cost does not clear the cost's error, with both.
+    #[error("a net edge of {net} is inside the floor of {floor}")]
+    InsideFloor { net: PerShare, floor: PerShare },
+    #[error("the net edge is out of range: {0}")]
+    OutOfRange(#[from] PerShareRefusal),
 }
 
 impl PricedCost {
@@ -144,11 +148,11 @@ impl PricedCost {
     }
 
     /// The edge per share net of the cost, admitted only when it lies strictly above the floor.
-    pub fn admit(self, gross_edge: PerShare) -> Result<PerShare, InsideFloor> {
-        let net = gross_edge.minus(self.point);
+    pub fn admit(self, gross_edge: PerShare) -> Result<PerShare, AdmissionRefusal> {
+        let net = gross_edge.minus(self.point)?;
         match net > self.floor {
             true => Ok(net),
-            false => Err(InsideFloor {
+            false => Err(AdmissionRefusal::InsideFloor {
                 net,
                 floor: self.floor,
             }),
@@ -203,7 +207,7 @@ impl CostModel {
         Ok(PricedCost {
             point: estimate
                 .point
-                .plus(self.fees.per_share(self.liquidity, side, price)),
+                .plus(self.fees.per_share(self.liquidity, side, price)?)?,
             floor: estimate.error,
         })
     }
@@ -352,7 +356,7 @@ mod tests {
         };
         assert_eq!(
             priced.admit(per_share(3_500)),
-            Err(InsideFloor {
+            Err(AdmissionRefusal::InsideFloor {
                 net: per_share(500),
                 floor: per_share(500)
             })
@@ -360,10 +364,38 @@ mod tests {
         assert_eq!(priced.admit(per_share(3_501)), Ok(per_share(501)));
         assert_eq!(
             priced.admit(per_share(-1_000)),
-            Err(InsideFloor {
+            Err(AdmissionRefusal::InsideFloor {
                 net: per_share(-4_000),
                 floor: per_share(500)
             })
+        );
+    }
+
+    #[test]
+    fn test_a_cost_or_net_edge_past_the_bound_is_refused() {
+        let bound = 10_000_000_000_000;
+        let model = CostModel::new(
+            CostBasis::ByName(BTreeMap::from([(symbol("AAPL"), estimate(bound, 0))])),
+            Liquidity::Removing,
+            FeeRegime::CommissionFree {
+                regulatory: RegulatoryFees::new(Dollars::from_millionths(0), per_share(1)).unwrap(),
+            },
+        );
+        assert_eq!(
+            model.price(&symbol("AAPL"), spread(10_000), price(), Side::Sell),
+            Err(PricingRefusal::OutOfRange(PerShareRefusal {
+                millionths: bound + 1
+            }))
+        );
+        let priced = PricedCost {
+            point: per_share(1),
+            floor: per_share(0),
+        };
+        assert_eq!(
+            priced.admit(per_share(-bound)),
+            Err(AdmissionRefusal::OutOfRange(PerShareRefusal {
+                millionths: -bound - 1
+            }))
         );
     }
 

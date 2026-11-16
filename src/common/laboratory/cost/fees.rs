@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::PerShare;
+use super::{PerShare, PerShareRefusal};
 use crate::common::book::Side;
 use crate::common::market::{Dollars, PRICE_SCALE, Price};
 
@@ -87,9 +87,9 @@ impl RegulatoryFees {
     }
 
     /// The levy on one share sold at `price`, rounded up so rounding never flatters; nothing on a buy.
-    pub fn per_share(self, side: Side, price: Price) -> PerShare {
+    pub fn per_share(self, side: Side, price: Price) -> Result<PerShare, PerShareRefusal> {
         match side {
-            Side::Buy => PerShare::ZERO,
+            Side::Buy => Ok(PerShare::ZERO),
             Side::Sell => {
                 let notional = u128::from(price.ticks_unsigned())
                     * u128::from(self.sale_rate_per_million.millionths());
@@ -123,7 +123,11 @@ impl PassThroughSchedule {
         })
     }
 
-    fn per_share(self, liquidity: Liquidity, access_fee: PerShare) -> PerShare {
+    fn per_share(
+        self,
+        liquidity: Liquidity,
+        access_fee: PerShare,
+    ) -> Result<PerShare, PerShareRefusal> {
         match liquidity {
             Liquidity::Removing => self.commission.plus(access_fee),
             Liquidity::Adding => self.commission.minus(self.rebate),
@@ -162,23 +166,28 @@ pub enum FeeRegime {
 }
 
 impl FeeRegime {
-    /// The fees on one share filled at `price`, signed so a credit is negative.
-    pub fn per_share(self, liquidity: Liquidity, side: Side, price: Price) -> PerShare {
+    /// The fees on one share filled at `price`, signed so a credit is negative, refused when they pass the bound.
+    pub fn per_share(
+        self,
+        liquidity: Liquidity,
+        side: Side,
+        price: Price,
+    ) -> Result<PerShare, PerShareRefusal> {
         match self {
             Self::CommissionFree { regulatory } => regulatory.per_share(side, price),
             Self::PassThrough {
                 regulatory,
                 schedule,
             } => schedule
-                .per_share(liquidity, schedule.access_fee)
-                .plus(regulatory.per_share(side, price)),
+                .per_share(liquidity, schedule.access_fee)?
+                .plus(regulatory.per_share(side, price)?),
             Self::AccessFeeCapped {
                 regulatory,
                 schedule,
                 cap,
             } => schedule
-                .per_share(liquidity, schedule.access_fee.min(cap.0))
-                .plus(regulatory.per_share(side, price)),
+                .per_share(liquidity, schedule.access_fee.min(cap.0))?
+                .plus(regulatory.per_share(side, price)?),
         }
     }
 }
@@ -211,16 +220,19 @@ mod tests {
 
     #[test]
     fn test_the_regulatory_levy_falls_on_the_sale_alone_and_rounds_up() {
-        assert_eq!(regulatory().per_share(Side::Buy, price(100)), per_share(0));
+        assert_eq!(
+            regulatory().per_share(Side::Buy, price(100)),
+            Ok(per_share(0))
+        );
         // $100 at $10 a million is $0.001 a share, plus the per-share charge.
         assert_eq!(
             regulatory().per_share(Side::Sell, price(100)),
-            per_share(1_100)
+            Ok(per_share(1_100))
         );
         let tiny = RegulatoryFees::new(Dollars::from_millionths(1), per_share(0)).unwrap();
         assert_eq!(
             tiny.per_share(Side::Sell, Price::from_ticks(1).unwrap()),
-            per_share(1)
+            Ok(per_share(1))
         );
     }
 
@@ -238,8 +250,9 @@ mod tests {
             schedule: schedule(),
             cap: AccessFeeCap::new(per_share(1_000)).unwrap(),
         };
-        let read =
-            |regime: FeeRegime, liquidity, side| regime.per_share(liquidity, side, price(100));
+        let read = |regime: FeeRegime, liquidity, side| {
+            regime.per_share(liquidity, side, price(100)).unwrap()
+        };
         assert_eq!(read(base, Liquidity::Removing, Side::Buy), per_share(0));
         assert_eq!(read(base, Liquidity::Adding, Side::Sell), per_share(1_100));
         assert_eq!(
@@ -288,6 +301,39 @@ mod tests {
     }
 
     #[test]
+    fn test_fees_past_the_bound_are_refused_rather_than_returned() {
+        let bound = 10_000_000_000_000;
+        let schedule =
+            PassThroughSchedule::new(per_share(bound), per_share(1), per_share(0)).unwrap();
+        let regime = FeeRegime::PassThrough {
+            regulatory: RegulatoryFees::new(Dollars::from_millionths(0), per_share(0)).unwrap(),
+            schedule,
+        };
+        assert_eq!(
+            regime.per_share(Liquidity::Removing, Side::Buy, price(100)),
+            Err(PerShareRefusal {
+                millionths: bound + 1
+            })
+        );
+        assert_eq!(
+            regime.per_share(Liquidity::Adding, Side::Buy, price(100)),
+            Ok(per_share(bound))
+        );
+        let levied = RegulatoryFees::new(Dollars::from_millionths(0), per_share(bound)).unwrap();
+        assert_eq!(
+            FeeRegime::PassThrough {
+                regulatory: levied,
+                schedule: PassThroughSchedule::new(per_share(0), per_share(1), per_share(0))
+                    .unwrap(),
+            }
+            .per_share(Liquidity::Removing, Side::Sell, price(100)),
+            Err(PerShareRefusal {
+                millionths: bound + 1
+            })
+        );
+    }
+
+    #[test]
     fn test_liquidity_names_agree_between_strum_and_serde() {
         for liquidity in Liquidity::iter() {
             let serialized = serde_json::to_string(&liquidity).unwrap();
@@ -311,8 +357,8 @@ mod tests {
             let price = Price::from_ticks(ticks).unwrap();
             let open = FeeRegime::PassThrough { regulatory: regulatory(), schedule };
             let capped = FeeRegime::AccessFeeCapped { regulatory: regulatory(), schedule, cap: AccessFeeCap::new(per_share(cap)).unwrap() };
-            let removing = |regime: FeeRegime| regime.per_share(Liquidity::Removing, side, price);
-            let adding = |regime: FeeRegime| regime.per_share(Liquidity::Adding, side, price);
+            let removing = |regime: FeeRegime| regime.per_share(Liquidity::Removing, side, price).unwrap();
+            let adding = |regime: FeeRegime| regime.per_share(Liquidity::Adding, side, price).unwrap();
             prop_assert_eq!(removing(open).millionths() - removing(capped).millionths(), (access - cap).max(0));
             prop_assert_eq!(adding(open), adding(capped));
         }

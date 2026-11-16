@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::book::Side;
 use crate::common::market::{MAXIMUM_PRICE_TICKS, PRICE_SCALE, Price};
 
-/// The bound on a price, so a sum of a few amounts never overflows.
+/// The bound on a price, so the sum or difference of two amounts fits an `i64` before it is checked against the bound.
 const MAXIMUM_PER_SHARE: i64 = MAXIMUM_PRICE_TICKS;
 
 /// A signed amount of money per share in millionths of a dollar (`PRICE_SCALE`): a cost when charged, an edge when
@@ -50,12 +50,12 @@ impl PerShare {
         10_000.0 * self.0 as f64 / price.ticks() as f64
     }
 
-    fn plus(self, other: Self) -> Self {
-        Self(self.0 + other.0)
+    fn plus(self, other: Self) -> Result<Self, PerShareRefusal> {
+        Self::from_millionths(self.0 + other.0)
     }
 
-    fn minus(self, other: Self) -> Self {
-        Self(self.0 - other.0)
+    fn minus(self, other: Self) -> Result<Self, PerShareRefusal> {
+        Self::from_millionths(self.0 - other.0)
     }
 }
 
@@ -337,6 +337,30 @@ mod tests {
         // A quarter cent is five times more basis points at $5 than at $25.
         assert_eq!(quarter_cent.basis_points(price(5_000_000)), 5.0);
         assert_eq!(quarter_cent.basis_points(price(25_000_000)), 1.0);
+    }
+
+    #[test]
+    fn test_a_sum_or_difference_past_the_bound_is_refused() {
+        let bound = PerShare::from_millionths(10_000_000_000_000).unwrap();
+        let one = PerShare::from_millionths(1).unwrap();
+        let below = PerShare::from_millionths(-10_000_000_000_000).unwrap();
+        assert_eq!(
+            bound.plus(one),
+            Err(PerShareRefusal {
+                millionths: 10_000_000_000_001
+            })
+        );
+        assert_eq!(
+            below.minus(one),
+            Err(PerShareRefusal {
+                millionths: -10_000_000_000_001
+            })
+        );
+        assert_eq!(
+            bound.minus(one).map(PerShare::millionths),
+            Ok(9_999_999_999_999)
+        );
+        assert_eq!(bound.plus(below), Ok(PerShare::ZERO));
     }
 
     #[test]
