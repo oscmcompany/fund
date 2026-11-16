@@ -149,10 +149,18 @@ mod tests {
             second: EvenHolds,
         });
         let book = Book::funded(Cash::from_units(0));
-        let held: Vec<usize> = [at(2), at(3), MarketState::default(), at(4), at(5)]
-            .iter()
-            .map(|state| strategy.decide(state, &book).holdings().len())
-            .collect();
+        // Handed over by reference as a replay takes it, so the counts stay readable after the strategy is consumed.
+        fn decide_all(strategy: impl Strategy, states: &[MarketState], book: &Book) -> Vec<usize> {
+            states
+                .iter()
+                .map(|state| strategy.decide(state, book).holdings().len())
+                .collect()
+        }
+        let held = decide_all(
+            &strategy,
+            &[at(2), at(3), MarketState::default(), at(4), at(5)],
+            &book,
+        );
         assert_eq!(held, [1, 0, 0, 1, 0]);
         let decisions = strategy.decisions();
         assert_eq!(decisions.read(), 5);

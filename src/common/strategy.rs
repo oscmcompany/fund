@@ -18,6 +18,13 @@ pub trait Strategy {
     fn decide(&self, state: &MarketState, book: &Book) -> Target;
 }
 
+/// A borrowed strategy decides as its owner does, so a caller that hands a replay `&strategy` still holds it after.
+impl<S: Strategy + ?Sized> Strategy for &S {
+    fn decide(&self, state: &MarketState, book: &Book) -> Target {
+        (**self).decide(state, book)
+    }
+}
+
 /// The holdings a strategy wants; a symbol absent from it is wanted flat.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(from = "BTreeMap<Symbol, Holding>", into = "BTreeMap<Symbol, Holding>")]

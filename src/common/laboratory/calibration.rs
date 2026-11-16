@@ -184,6 +184,56 @@ fn deciles(order: &[usize]) -> [&[usize]; DECILES] {
     })
 }
 
+/// The mean of nonempty `values`, each divided before summing so large values cannot overflow, and held within
+/// their range so rounding cannot carry it past them.
+fn mean(values: &[f64]) -> f64 {
+    let (lowest, highest) = values.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(lowest, highest), value| (lowest.min(*value), highest.max(*value)),
+    );
+    values
+        .iter()
+        .map(|value| value / values.len() as f64)
+        .sum::<f64>()
+        .clamp(lowest, highest)
+}
+
+/// `value` times two to the `exponent`, in steps so no factor leaves the range of normal `f64`.
+fn scaled(value: f64, exponent: i32) -> f64 {
+    let mut remaining = exponent;
+    let mut result = value;
+    while remaining != 0 {
+        let step = remaining.clamp(f64::MIN_EXP - 1, f64::MAX_EXP - 1);
+        result *= 2_f64.powi(step);
+        remaining -= step;
+    }
+    result
+}
+
+/// Nonempty `values` scaled by a power of two to within a factor of two of one in magnitude, less the first and then
+/// the mean of what remains, so neither a sum of products nor a mean of near-equal values rounds away; the exponent
+/// undoes the scale.
+fn centered(values: Vec<f64>) -> (Vec<f64>, i32) {
+    let largest = values
+        .iter()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let exponent = if largest > 0.0 {
+        largest.log2().ceil() as i32
+    } else {
+        0
+    };
+    let unit: Vec<f64> = values
+        .iter()
+        .map(|value| scaled(*value, -exponent))
+        .collect();
+    let shifted: Vec<f64> = unit.iter().map(|value| value - unit[0]).collect();
+    let center = mean(&shifted);
+    (
+        shifted.iter().map(|value| value - center).collect(),
+        exponent,
+    )
+}
+
 /// One forecast decile's pairs and their mean forecast and mean outcome.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecileMeans {
@@ -198,16 +248,13 @@ pub fn by_forecast_decile(pairs: &[Pair]) -> [Option<DecileMeans>; DECILES] {
     let order = ordered(pairs, |pair| pair.forecast().get());
     deciles(&order).map(|decile| {
         let count = NonZeroU64::new(decile.len() as u64)?;
-        let mean = |value: fn(Pair) -> f64| {
-            decile
-                .iter()
-                .map(|index| value(pairs[*index]) / decile.len() as f64)
-                .sum()
+        let values = |value: fn(Pair) -> f64| -> Vec<f64> {
+            decile.iter().map(|index| value(pairs[*index])).collect()
         };
         Some(DecileMeans {
             pairs: count,
-            forecast: mean(|pair| pair.forecast().get()),
-            outcome: mean(|pair| pair.outcome().get()),
+            forecast: mean(&values(|pair| pair.forecast().get())),
+            outcome: mean(&values(|pair| pair.outcome().get())),
         })
     })
 }
@@ -237,32 +284,25 @@ impl Slope {
         if pairs.len() < 2 {
             return Err(SlopeRefusal::TooFewPairs { pairs: count });
         }
-        let mean = |value: fn(Pair) -> f64| -> f64 {
-            pairs
-                .iter()
-                .map(|pair| value(*pair) / pairs.len() as f64)
-                .sum()
-        };
-        let (forecast_mean, outcome_mean) = (
-            mean(|pair| pair.forecast().get()),
-            mean(|pair| pair.outcome().get()),
+        let (forecasts, forecast_exponent) =
+            centered(pairs.iter().map(|pair| pair.forecast().get()).collect());
+        let (outcomes, outcome_exponent) =
+            centered(pairs.iter().map(|pair| pair.outcome().get()).collect());
+        let (covariance, variance) = forecasts.iter().zip(&outcomes).fold(
+            (0.0, 0.0),
+            |(covariance, variance), (forecast, outcome)| {
+                (
+                    covariance + forecast * outcome,
+                    variance + forecast * forecast,
+                )
+            },
         );
-        let (covariance, variance) =
-            pairs
-                .iter()
-                .fold((0.0, 0.0), |(covariance, variance), pair| {
-                    let forecast = pair.forecast().get() - forecast_mean;
-                    (
-                        covariance + forecast * (pair.outcome().get() - outcome_mean),
-                        variance + forecast * forecast,
-                    )
-                });
-        let raw = covariance / variance;
+        let raw = scaled(covariance / variance, outcome_exponent - forecast_exponent);
         // A rounded mean leaves equal forecasts a variance just above zero, so constancy is read off the forecasts.
         let constant = pairs
             .iter()
             .all(|pair| pair.forecast() == pairs[0].forecast());
-        match (constant, variance.is_finite() && raw.is_finite()) {
+        match (constant, raw.is_finite()) {
             (true, _) => Err(SlopeRefusal::ForecastConstant { pairs: count }),
             (false, true) => Ok(Self { raw, pairs: count }),
             (false, false) => Err(SlopeRefusal::NotFinite { pairs: count }),
@@ -465,9 +505,25 @@ mod tests {
             Ok(0.0)
         );
         assert_eq!(
-            Slope::fit(&[pair(1e200, 1e200), pair(-1e200, -1e200)]),
+            Slope::fit(&[pair(1e200, 1e200), pair(-1e200, -1e200)]).map(Slope::raw),
+            Ok(1.0)
+        );
+        assert_eq!(
+            Slope::fit(&[pair(0.0, 0.0), pair(1e-300, 1e300)]),
             Err(SlopeRefusal::NotFinite { pairs: 2 })
         );
+    }
+
+    /// Forecasts one ulp apart, and inputs whose products fall below the smallest `f64`, still read their exact slope.
+    #[test]
+    fn test_a_slope_survives_near_equal_forecasts_and_disparate_scales() {
+        let near = Slope::fit(&[pair(1.0, 0.0), pair(1.0 + f64::EPSILON, 1.0)]).unwrap();
+        assert_eq!(near.raw(), 2_f64.powi(52));
+        let tiny = Slope::fit(&[pair(0.0, 0.0), pair(1e-100, 1e-250)]).unwrap();
+        assert!((tiny.raw() / 1e-150 - 1.0).abs() < 1e-12, "{}", tiny.raw());
+        // Exponents over two thousand apart: an uncorrelated fit reads zero rather than zero times infinity.
+        let apart = Slope::fit(&[pair(-5e-324, 1e300), pair(0.0, -1e300), pair(5e-324, 1e300)]);
+        assert_eq!(apart.map(Slope::raw), Ok(0.0));
     }
 
     #[test]
@@ -519,6 +575,26 @@ mod tests {
             few[..5]
                 .iter()
                 .all(|decile| decile.is_some_and(|decile| decile.pairs.get() == 1))
+        );
+    }
+
+    /// Deciles of the largest finite values stay finite, and values that cancel read zero.
+    #[test]
+    fn test_forecast_deciles_hold_extreme_values() {
+        let largest: Vec<Pair> = (0..30).map(|_| pair(f64::MAX, f64::MAX)).collect();
+        assert!(by_forecast_decile(&largest).iter().all(|decile| {
+            decile.is_some_and(|decile| decile.forecast == f64::MAX && decile.outcome == f64::MAX)
+        }));
+        let cancelling: Vec<Pair> = [f64::MAX, -f64::MAX]
+            .into_iter()
+            .cycle()
+            .take(20)
+            .map(|value| pair(1.0, value))
+            .collect();
+        assert!(
+            by_forecast_decile(&cancelling)
+                .iter()
+                .all(|decile| decile.is_some_and(|decile| decile.outcome == 0.0))
         );
     }
 

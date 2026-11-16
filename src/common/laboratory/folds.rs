@@ -105,13 +105,14 @@ impl WalkForward {
         training_only: NonZeroUsize,
     ) -> Result<Self, FoldsRefusal> {
         let first_confirm = confirm.first().copied().ok_or(FoldsRefusal::NoConfirm)?;
-        if let Some(last_fit) = fit.last().copied()
-            && first_confirm <= last_fit
-        {
-            return Err(FoldsRefusal::ConfirmNotLater {
-                last_fit,
-                first_confirm,
-            });
+        match fit.last().copied() {
+            Some(last_fit) if first_confirm <= last_fit => {
+                return Err(FoldsRefusal::ConfirmNotLater {
+                    last_fit,
+                    first_confirm,
+                });
+            }
+            Some(_) | None => {}
         }
         let fit: Vec<SessionDate> = fit.into_iter().collect();
         let period_starts: Vec<usize> = (0..fit.len())
