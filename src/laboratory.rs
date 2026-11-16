@@ -3,6 +3,7 @@
 
 pub mod compare;
 pub mod dataset;
+pub mod registry;
 pub mod replay;
 pub mod risk_free;
 pub mod sensitivity;
