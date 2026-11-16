@@ -335,7 +335,7 @@ pub enum ManifestRefusal {
         first: SessionDate,
         last: SessionDate,
     },
-    /// The cutoff falls in a session before the last one trained on, so that session's rows were not yet known.
+    /// The cutoff falls before the last session's close, so that session's rows were not yet all known.
     #[error("rows known by {known_at} cannot include the session {last}")]
     Cutoff {
         known_at: DateTime<Utc>,
@@ -373,7 +373,7 @@ impl Manifest {
         if architecture.is_dirty() {
             return Err(ManifestRefusal::Dirty { architecture });
         }
-        if SessionDate::at(known_at) < window.last() {
+        if known_at < window.last().regular_close() {
             return Err(ManifestRefusal::Cutoff {
                 known_at,
                 last: window.last(),
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_manifest_refuses_a_dirty_commit_and_a_cutoff_before_its_last_session() {
+    fn test_a_manifest_refuses_a_dirty_commit_and_a_cutoff_before_its_last_close() {
         let weights = Weights::new(Inputs::new(&["a"]).unwrap(), ridge(&[1.0])).unwrap();
         let key = ModelKey::new(ModelName::new("tick_fill").unwrap(), NonZeroU32::MIN);
         let window = SessionRange::new(session(2), session(6)).unwrap();
@@ -782,19 +782,22 @@ mod tests {
                 &weights,
             )
         };
-        // 2026-03-06 00:00 Eastern is 05:00 UTC, the first instant of the last session.
-        let opens = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).unwrap();
-        assert!(build(SHA, opens).is_ok());
-        let before = opens - chrono::TimeDelta::seconds(1);
-        assert_eq!(
-            build(SHA, before),
-            Err(ManifestRefusal::Cutoff {
-                known_at: before,
-                last: session(6)
-            })
-        );
+        // 2026-03-06 16:00 Eastern is 21:00 UTC, the close of the last session.
+        let closes = Utc.with_ymd_and_hms(2026, 3, 6, 21, 0, 0).unwrap();
+        assert!(build(SHA, closes).is_ok());
+        // A cutoff inside the last session, even one second before its close, has not seen all of it.
+        let midnight = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).unwrap();
+        for before in [closes - chrono::TimeDelta::seconds(1), midnight] {
+            assert_eq!(
+                build(SHA, before),
+                Err(ManifestRefusal::Cutoff {
+                    known_at: before,
+                    last: session(6)
+                })
+            );
+        }
         assert!(matches!(
-            build(&format!("{SHA}-dirty"), opens),
+            build(&format!("{SHA}-dirty"), closes),
             Err(ManifestRefusal::Dirty { .. })
         ));
     }

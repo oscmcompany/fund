@@ -36,10 +36,24 @@ pub fn write<M: Fitted>(
     let pin = manifest.pin();
     Model::<M>::open(&pin, weights.inputs(), &manifest_bytes, &weights_bytes)?;
     let directory = root.join(manifest.key().directory());
+    // Every directory under the root is synced into its parent on each write, so a rerun finishes a failed sync.
+    let synced: Vec<PathBuf> = directory
+        .ancestors()
+        .take_while(|ancestor| {
+            (ancestor.starts_with(root) && *ancestor != root) || !ancestor.exists()
+        })
+        .map(Path::to_path_buf)
+        .collect();
     std::fs::create_dir_all(&directory).map_err(|cause| RegistryError::Io {
         path: directory.clone(),
         cause,
     })?;
+    for parent in synced.iter().filter_map(|created| created.parent()) {
+        sync_directory(match parent.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => parent,
+        })?;
+    }
     // Weights first, so a manifest on disk always has its weights beside it.
     create(&directory, WEIGHTS_FILE, &weights_bytes)?;
     create(&directory, MANIFEST_FILE, &manifest_bytes)?;
@@ -83,8 +97,19 @@ fn create(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), RegistryErro
         },
         Err(cause) => Err(io(path, cause)),
     });
+    // Syncing the directory makes the new name durable, so the manifest cannot outlive its weights on disk.
+    let linked = linked.and_then(|()| sync_directory(directory));
     let removed = std::fs::remove_file(&staged).map_err(|cause| io(&staged, cause));
     linked.and(removed)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), RegistryError> {
+    std::fs::File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|cause| RegistryError::Io {
+            path: directory.to_path_buf(),
+            cause,
+        })
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, RegistryError> {
