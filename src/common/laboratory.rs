@@ -7,6 +7,7 @@ pub mod calibration;
 pub mod cost;
 pub mod dataset;
 pub mod estimate;
+pub mod event_table;
 pub mod experiment;
 pub mod haircut;
 pub mod ledger;
@@ -18,6 +19,7 @@ pub mod series;
 pub mod share;
 pub mod sharpe;
 pub mod synthetic;
+pub mod universe;
 pub mod verdict;
 
 /// The largest reading magnitude a series admits; no measured quantity comes near it, and below it every sum, square
