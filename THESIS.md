@@ -32,6 +32,9 @@
   `src/common/laboratory/blocks.rs` and `FAMILY_WISE_ERROR_RATE` in `src/common/laboratory/haircut.rs`
 - Cost is priced per share with its error, and the error is the floor: an edge net of cost that does not clear it
   is not admitted, by `PricedCost::admit` in `src/common/cost/model.rs`
+- An instrument is admitted when it measures what was planted, not merely detects it: the stated strength must lie
+  within the recovered interval, in the arm's direction, at a bar raised by every attempt, by `Recovery::admits` in
+  `src/common/laboratory/recovery.rs`
 - The measurement equations decide whether a reading is real, the target equation whether the strategy ships, and
   the decision equation is what the shipped strategy executes on each event
 - The rules for writing code live in `CLAUDE.md`, and the rules for running a study in the `study` skill at

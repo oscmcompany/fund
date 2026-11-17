@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::laboratory::estimate::{Control, EstimateRefusal, Treatment};
 use crate::common::laboratory::experiment::{ExperimentRefusal, Parameters};
-use crate::common::laboratory::recovery::Recovery;
+use crate::common::laboratory::recovery::{Attempt, Direction, Recovery, Shortfall};
 use crate::common::laboratory::series::Series;
 use crate::common::laboratory::synthetic::generate::GenerationRefusal;
 use crate::common::laboratory::synthetic::{Mechanism, MechanismKind, Specification};
@@ -26,6 +26,9 @@ pub trait ModelArm {
 
     /// The mechanism whose strength the arm reads.
     fn mechanism(&self) -> MechanismKind;
+
+    /// Which way the arm's reading moves when its mechanism is planted.
+    fn direction(&self) -> Direction;
 
     /// The arm's own settings, journaled under `arm.`.
     fn parameters(&self) -> Parameters;
@@ -92,13 +95,12 @@ pub enum RecoveryError<Refusal> {
     Experiment(ExperimentRefusal),
     #[error("{0}")]
     Study(StudyError),
-    /// The recovery was journaled, but what the arm recovered did not clear its bar.
-    #[error(
-        "the arm recovered {} of a stated {}, which does not clear its bar",
-        .0.recovered().mean(),
-        .0.stated()
-    )]
-    Unrecovered(Box<Recovery>),
+    /// The recovery was journaled, but it does not admit the arm.
+    #[error("the arm recovered {} of an expected {}: {shortfall}", .recovery.recovered().mean(), .recovery.expected())]
+    Unrecovered {
+        recovery: Box<Recovery>,
+        shortfall: Shortfall,
+    },
 }
 
 /// Which of the two generated markets an arm read.
@@ -136,13 +138,15 @@ fn covering<Refusal>(
 }
 
 /// Reads `arm` over the market `specification` generates for `universe` over `sessions` and over its null, journals
-/// the recovery as one experiment of `study`, and returns the arm admitted only if it recovered what was planted.
+/// the recovery as one experiment of `study`, and returns the arm admitted only if it recovered what was planted at
+/// the bar of its `attempt`, which the caller counts and the journal records.
 pub fn recover<A: ModelArm>(
     study: &mut Study,
     arm: A,
     specification: &Specification,
     universe: &BTreeSet<Symbol>,
     sessions: &[TradingSession],
+    attempt: Attempt,
 ) -> Result<Recovered<A>, RecoveryError<A::Refusal>> {
     let mechanism = arm.mechanism();
     let (own, others): (Vec<&Mechanism>, Vec<&Mechanism>) = specification
@@ -183,8 +187,11 @@ pub fn recover<A: ModelArm>(
         sessions,
         SyntheticMarket::Null,
     )?;
+    let direction = arm.direction();
     let recovery = Recovery::new(
         stated,
+        direction,
+        attempt,
         events
             .iter()
             .filter(|event| event.kind == mechanism)
@@ -198,16 +205,23 @@ pub fn recover<A: ModelArm>(
             .settings()
             .iter()
             .map(|(name, value)| (format!("arm.{}", name.as_str()), value.clone()))
-            .chain([("recovering".to_string(), mechanism.to_string())]),
+            .chain([
+                ("recovering".to_string(), mechanism.to_string()),
+                ("direction".to_string(), direction.to_string()),
+                ("attempt".to_string(), attempt.get().to_string()),
+            ]),
     )
     .map_err(RecoveryError::Experiment)?;
     let outputs = recovery.outputs().map_err(RecoveryError::Experiment)?;
     study
         .experiment(parameters, &[planted.lineage(), null.lineage()], outputs)
         .map_err(RecoveryError::Study)?;
-    match recovery.recovers() {
-        true => Ok(Recovered { arm, recovery }),
-        false => Err(RecoveryError::Unrecovered(Box::new(recovery))),
+    match recovery.admits() {
+        Ok(()) => Ok(Recovered { arm, recovery }),
+        Err(shortfall) => Err(RecoveryError::Unrecovered {
+            recovery: Box::new(recovery),
+            shortfall,
+        }),
     }
 }
 
@@ -221,16 +235,28 @@ mod tests {
     use super::*;
     use crate::common::cost::BasisPoints;
     use crate::common::journal::{Observation, ReadLine, read};
-    use crate::common::laboratory::experiment::Label;
+    use crate::common::laboratory::experiment::{ExperimentRan, Label};
     use crate::common::laboratory::synthetic::draw::{LogNormal, Seed};
     use crate::common::laboratory::synthetic::{
         Flow, Prevalence, Shapes, Span, Volatility, Window,
     };
     use crate::laboratory::source::Source;
 
-    /// Reads a permanent impact as each session's mean absolute open-to-close log return across names.
+    /// Reads a permanent impact as each session's mean across names of the open-to-close log return signed by the
+    /// bar-to-bar jumps wider than the bid-ask bounce, zero for a name with none; an absolute return would read the
+    /// noise's magnitude on the null and recover short of the plant.
     #[derive(Debug)]
     struct SessionMove;
+
+    /// Wider than a one-tick bounce on the quiet names `specification` draws, narrower than one planted piece.
+    const JUMP_BASIS_POINTS: f64 = 4.0;
+
+    /// One name's session so far: its open, its last close, and the signed sum of its jumps.
+    struct NameSession {
+        open: f64,
+        close: f64,
+        jumps: f64,
+    }
 
     impl ModelArm for SessionMove {
         type Refusal = Infallible;
@@ -239,8 +265,16 @@ mod tests {
             MechanismKind::WorkedParent
         }
 
+        fn direction(&self) -> Direction {
+            Direction::Rises
+        }
+
         fn parameters(&self) -> Parameters {
-            Parameters::new([("reading", "mean_absolute_session_return")]).unwrap()
+            Parameters::new([
+                ("reading", "jump_signed_session_return".to_string()),
+                ("jump_basis_points", JUMP_BASIS_POINTS.to_string()),
+            ])
+            .unwrap()
         }
 
         fn read(
@@ -249,18 +283,35 @@ mod tests {
             _: &Harness,
         ) -> Result<Series, Infallible> {
             let readings = bars.iter().map(|(session, partition)| {
-                let mut moves = std::collections::BTreeMap::new();
+                let mut names = BTreeMap::new();
                 for bar in partition.rows() {
                     let Some(open_close) = bar.sums().open_close() else {
                         continue;
                     };
-                    let (open, close) = (open_close.open().price(), open_close.close().price());
-                    let entry = moves.entry(bar.symbol().clone()).or_insert((open, close));
-                    entry.1 = close;
+                    let (open, close) = (
+                        open_close.open().price().dollars(),
+                        open_close.close().price().dollars(),
+                    );
+                    let name = names.entry(bar.symbol().clone()).or_insert(NameSession {
+                        open,
+                        close: open,
+                        jumps: 0.0,
+                    });
+                    let step = (close / name.close).ln() * 10_000.0;
+                    if step.abs() > JUMP_BASIS_POINTS {
+                        name.jumps += step;
+                    }
+                    name.close = close;
                 }
-                let returns: Vec<f64> = moves
+                let returns: Vec<f64> = names
                     .values()
-                    .map(|(open, close)| (close.dollars() / open.dollars()).ln().abs() * 10_000.0)
+                    .map(|name| {
+                        let sign = match name.jumps {
+                            0.0 => 0.0,
+                            jumps => jumps.signum(),
+                        };
+                        sign * (name.close / name.open).ln() * 10_000.0
+                    })
                     .collect();
                 let mean = returns.iter().sum::<f64>() / returns.len() as f64;
                 (*session, (!returns.is_empty()).then_some(mean))
@@ -331,6 +382,30 @@ mod tests {
         std::env::temp_dir().join(format!("fund-recovery-{}", uuid::Uuid::new_v4()))
     }
 
+    /// The one experiment journaled in `directory`.
+    fn journaled(directory: &std::path::Path) -> ExperimentRan {
+        let file = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap();
+        let lines = read(&std::fs::read_to_string(&file).unwrap());
+        let observations: Vec<Observation> = lines
+            .iter()
+            .map(|line| match line {
+                ReadLine::Read(read) => read.record().observation().clone(),
+                ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
+            })
+            .collect();
+        match observations.as_slice() {
+            [Observation::ExperimentRan(ran)] => (**ran).clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn test_a_planted_impact_is_recovered_at_its_stated_strength() {
         let directory = directory();
@@ -341,6 +416,7 @@ mod tests {
             &specification(40.0),
             &universe(),
             &sessions(),
+            Attempt::FIRST,
         )
         .unwrap();
         let recovery = recovered.recovery();
@@ -362,9 +438,10 @@ mod tests {
             &specification(0.0),
             &universe(),
             &sessions(),
+            Attempt::FIRST,
         );
         match refused {
-            Err(RecoveryError::Unrecovered(recovery)) => {
+            Err(RecoveryError::Unrecovered { recovery, .. }) => {
                 assert_eq!(recovery.planted_events(), 80);
                 assert!(recovery.recovered().mean().abs() < 1.0, "{recovery:?}");
             }
@@ -380,7 +457,14 @@ mod tests {
         let mut twice = specification(40.0);
         twice.mechanisms.push(twice.mechanisms[0]);
         assert!(matches!(
-            recover(&mut study, SessionMove, &twice, &universe(), &sessions()),
+            recover(
+                &mut study,
+                SessionMove,
+                &twice,
+                &universe(),
+                &sessions(),
+                Attempt::FIRST
+            ),
             Err(RecoveryError::PlantedMoreThanOnce {
                 mechanism: MechanismKind::WorkedParent,
                 count: 2
@@ -392,7 +476,8 @@ mod tests {
                 SessionMove,
                 &twice.null(),
                 &universe(),
-                &sessions()
+                &sessions(),
+                Attempt::FIRST
             ),
             Err(RecoveryError::NotPlanted {
                 mechanism: MechanismKind::WorkedParent
@@ -417,7 +502,14 @@ mod tests {
             half_life: Span::new(TimeDelta::hours(10)).unwrap(),
         });
         assert!(matches!(
-            recover(&mut study, SessionMove, &mixed, &universe(), &sessions()),
+            recover(
+                &mut study,
+                SessionMove,
+                &mixed,
+                &universe(),
+                &sessions(),
+                Attempt::FIRST
+            ),
             Err(RecoveryError::PlantedOthers {
                 mechanism: MechanismKind::WorkedParent,
                 others: 1
@@ -432,6 +524,7 @@ mod tests {
     struct Altered {
         alter: fn(Series) -> Series,
         from: usize,
+        direction: Direction,
         reads: std::cell::Cell<usize>,
     }
 
@@ -440,9 +533,28 @@ mod tests {
             Self {
                 alter,
                 from,
+                direction: SessionMove.direction(),
                 reads: std::cell::Cell::new(0),
             }
         }
+
+        fn falling(alter: fn(Series) -> Series) -> Self {
+            Self {
+                direction: Direction::Falls,
+                ..Self::new(alter, 0)
+            }
+        }
+    }
+
+    /// Every measured reading multiplied by `factor`.
+    fn scaled(series: Series, factor: f64) -> Series {
+        Series::new(
+            series
+                .readings()
+                .iter()
+                .map(|(session, reading)| (*session, reading.map(|value| value * factor))),
+        )
+        .unwrap()
     }
 
     impl ModelArm for Altered {
@@ -450,6 +562,10 @@ mod tests {
 
         fn mechanism(&self) -> MechanismKind {
             SessionMove.mechanism()
+        }
+
+        fn direction(&self) -> Direction {
+            self.direction
         }
 
         fn parameters(&self) -> Parameters {
@@ -469,6 +585,70 @@ mod tests {
                     false => series,
                 })
         }
+    }
+
+    /// An arm reading a tenth of the move detects the plant far beyond its error, but has not measured it.
+    #[test]
+    fn test_an_arm_recovering_a_tenth_of_the_plant_is_refused() {
+        let directory = directory();
+        let mut study = study(&directory);
+        let refused = recover(
+            &mut study,
+            Altered::new(|series| scaled(series, 0.1), 0),
+            &specification(40.0),
+            &universe(),
+            &sessions(),
+            Attempt::FIRST,
+        );
+        match refused {
+            Err(RecoveryError::Unrecovered {
+                recovery,
+                shortfall: Shortfall::Inaccurate { expected, .. },
+            }) => {
+                assert_eq!(expected, 40.0);
+                let share = recovery.share().unwrap();
+                assert!((0.08..0.12).contains(&share), "{recovery:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_an_arm_whose_reading_falls_is_admitted_on_a_fall_and_journals_its_direction() {
+        let directory = directory();
+        let mut study = study(&directory);
+        let recovered = recover(
+            &mut study,
+            Altered::falling(|series| scaled(series, -1.0)),
+            &specification(40.0),
+            &universe(),
+            &sessions(),
+            Attempt::new(NonZeroU32::new(3).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(recovered.recovery().expected(), -40.0);
+        assert!(recovered.recovery().recovered().mean() < -30.0);
+        let ran = journaled(&directory);
+        let setting = |name: &str| ran.parameters().settings().get(name).cloned();
+        assert_eq!(setting("direction").as_deref(), Some("falls"));
+        assert_eq!(setting("attempt").as_deref(), Some("3"));
+        let refused = recover(
+            &mut study,
+            Altered::new(|series| scaled(series, -1.0), 0),
+            &specification(40.0),
+            &universe(),
+            &sessions(),
+            Attempt::FIRST,
+        );
+        assert!(matches!(
+            refused,
+            Err(RecoveryError::Unrecovered {
+                shortfall: Shortfall::WrongDirection { .. },
+                ..
+            })
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -493,6 +673,7 @@ mod tests {
             &specification(40.0),
             &universe(),
             &sessions(),
+            Attempt::FIRST,
         )
         .unwrap();
         let recovery = recovered.recovery();
@@ -532,6 +713,7 @@ mod tests {
                 &specification(40.0),
                 &universe(),
                 &sessions(),
+                Attempt::FIRST,
             );
             match refused {
                 Err(RecoveryError::Unrequested { market, session }) => {
@@ -555,34 +737,18 @@ mod tests {
             &specification(40.0),
             &universe(),
             &sessions(),
+            Attempt::FIRST,
         )
         .unwrap();
-        let file = std::fs::read_dir(&directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "jsonl")
-            })
-            .unwrap();
-        let lines = read(&std::fs::read_to_string(&file).unwrap());
-        let observations: Vec<Observation> = lines
-            .iter()
-            .map(|line| match line {
-                ReadLine::Read(read) => read.record().observation().clone(),
-                ReadLine::Unreadable { line, cause, .. } => panic!("line {line}: {cause:?}"),
-            })
-            .collect();
-        let ran = match observations.as_slice() {
-            [Observation::ExperimentRan(ran)] => ran,
-            other => panic!("{other:?}"),
-        };
+        let ran = journaled(&directory);
         assert_eq!(ran.fingerprints(), []);
         let setting = |name: &str| ran.parameters().settings().get(name).cloned();
         assert_eq!(setting("recovering").as_deref(), Some("worked_parent"));
+        assert_eq!(setting("direction").as_deref(), Some("rises"));
+        assert_eq!(setting("attempt").as_deref(), Some("1"));
         assert_eq!(
             setting("arm.reading").as_deref(),
-            Some("mean_absolute_session_return")
+            Some("jump_signed_session_return")
         );
         assert_eq!(setting("synthetic.0.mechanisms").as_deref(), Some("1"));
         assert_eq!(
