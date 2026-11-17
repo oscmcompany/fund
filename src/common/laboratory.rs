@@ -4,7 +4,6 @@
 pub mod attribution;
 pub mod blocks;
 pub mod calibration;
-pub mod cost;
 pub mod dataset;
 pub mod estimate;
 pub mod experiment;
@@ -12,6 +11,7 @@ pub mod folds;
 pub mod haircut;
 pub mod ledger;
 pub mod permutation;
+pub mod recovery;
 pub mod residual;
 pub mod risk_free;
 pub mod score;

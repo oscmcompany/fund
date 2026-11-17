@@ -8,7 +8,7 @@ use rand::rngs::StdRng;
 use super::draw::{exponential, standard_normal, uniform};
 use super::{Mechanism, MechanismKind, Specification, Window};
 use crate::common::book::Side;
-use crate::common::laboratory::cost::BasisPoints;
+use crate::common::cost::BasisPoints;
 use crate::common::market::record::Quote;
 use crate::common::market::trade_bars::{Correction, Print, TradeBar, TradeConditions, TradeFold};
 use crate::common::market::{PRICE_SCALE, Price, Shares, Symbol};
