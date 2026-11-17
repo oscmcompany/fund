@@ -3,7 +3,7 @@
 
 use std::num::NonZeroU32;
 
-use crate::common::laboratory::cost::BasisPoints;
+use crate::common::cost::BasisPoints;
 use crate::common::laboratory::estimate::{
     Control, Estimate, EstimateRefusal, Treatment, paired, summarize,
 };
