@@ -134,10 +134,12 @@ mod tests {
     #[test]
     fn test_a_written_model_opens_by_its_pin_once_and_only_in_its_order() {
         let root = std::env::temp_dir().join(format!("registry-{}", Uuid::new_v4()));
-        let ridge: Ridge =
-            serde_json::from_str(r#"{"intercept":0.5,"coefficients":[1.0,2.0]}"#).unwrap();
         let inputs = Inputs::new(&["spread", "size"]).unwrap();
-        let weights = Weights::new(inputs.clone(), ridge).unwrap();
+        let weights = Weights::<Ridge>::decode(
+            br#"{"inputs":["spread","size"],"fitted":{"intercept":0.5,"coefficients":[1.0,2.0]}}"#,
+            &inputs,
+        )
+        .unwrap();
         let session = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 6).unwrap());
         let manifest = Manifest::new(
             ModelKey::new(ModelName::new("tick_fill").unwrap(), NonZeroU32::MIN),
