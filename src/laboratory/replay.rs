@@ -2,7 +2,7 @@
 //! decision interval and the opening cash among its parameters.
 
 use crate::common::book::{Book, Cash};
-use crate::common::cost::{BasisPoints, CostRefusal};
+use crate::common::laboratory::blocks::BlocksRefusal;
 use crate::common::laboratory::estimate::EstimateRefusal;
 use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs, Parameters};
 use crate::common::laboratory::series::SeriesRefusal;
@@ -28,13 +28,8 @@ pub enum ReplayStudyError {
     Replay(ReplayRefusal),
     #[error("the controls were refused: {0}")]
     Controls(ControlsRefusal),
-    #[error("the fill model was refused: {0}")]
-    Cost(CostRefusal),
-    /// A perturbed quoted spread equal to the comparison's own, which would repeat the unperturbed run.
-    #[error(
-        "a perturbed quoted spread of {quoted_spread} is the comparison's own and perturbs nothing"
-    )]
-    UnperturbedSpread { quoted_spread: BasisPoints },
+    #[error("the block errors were refused: {0}")]
+    Blocks(BlocksRefusal),
     #[error("the returns were refused: {0}")]
     Series(SeriesRefusal),
     #[error("the estimate was refused: {0}")]
@@ -223,22 +218,8 @@ pub(crate) fn run<S: Strategy>(
     replayer: &Replayer<S>,
     opening: Opening,
 ) -> Result<Replay, ReplayStudyError> {
-    run_after(dataset, replayer, opening, 0)
-}
-
-/// Replays `dataset` past its first `skipped` sessions, as `run` replays the whole of it.
-pub(crate) fn run_after<S: Strategy>(
-    dataset: &Dataset,
-    replayer: &Replayer<S>,
-    opening: Opening,
-    skipped: usize,
-) -> Result<Replay, ReplayStudyError> {
     let decision = replayer.decision();
-    let bars = dataset
-        .bars()
-        .values()
-        .skip(skipped)
-        .flat_map(Partition::rows);
+    let bars = dataset.bars().values().flat_map(Partition::rows);
     if !bars.clone().any(|bar| bar.interval() == decision) {
         return Err(ReplayStudyError::NoDecisionBars { decision });
     }

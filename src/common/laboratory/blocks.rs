@@ -18,19 +18,35 @@ use crate::common::time::SessionDate;
 /// The fewest blocks a grouping's error is quoted from; below it the error's own relative error exceeds about 16%.
 pub const QUOTED_BLOCKS: u64 = 20;
 
-/// Readings stamped with the instant they were taken and the name they were taken on; `None` is unmeasurable.
+/// Readings stamped with the instant they were taken and whose they are; `None` is unmeasurable.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Observations {
-    readings: Vec<(DateTime<Utc>, Symbol, Option<f64>)>,
+    readings: Vec<(DateTime<Utc>, Holder, Option<f64>)>,
+}
+
+/// Whose a reading is: one name's, or a whole book's, which the name groupings hold as a single name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Holder {
+    Name(Symbol),
+    Book,
+}
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(symbol) => write!(formatter, "{}", symbol.as_str()),
+            Self::Book => write!(formatter, "the book"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum BlocksRefusal {
     /// NaN, or beyond `READING_BOUND`, where sums and squares would stop being finite.
-    #[error("the reading for {symbol} at {at} is out of range: {value}")]
+    #[error("the reading for {holder} at {at} is out of range: {value}")]
     OutOfRange {
         at: DateTime<Utc>,
-        symbol: Symbol,
+        holder: Holder,
         value: f64,
     },
     #[error("{measured} measured readings cannot carry an error")]
@@ -46,13 +62,34 @@ impl Observations {
     pub fn new(
         readings: impl IntoIterator<Item = (DateTime<Utc>, Symbol, Option<f64>)>,
     ) -> Result<Self, BlocksRefusal> {
+        Self::held(
+            readings
+                .into_iter()
+                .map(|(at, symbol, reading)| (at, Holder::Name(symbol), reading)),
+        )
+    }
+
+    /// Readings of a whole book, one per instant.
+    pub fn book(
+        readings: impl IntoIterator<Item = (DateTime<Utc>, Option<f64>)>,
+    ) -> Result<Self, BlocksRefusal> {
+        Self::held(
+            readings
+                .into_iter()
+                .map(|(at, reading)| (at, Holder::Book, reading)),
+        )
+    }
+
+    fn held(
+        readings: impl IntoIterator<Item = (DateTime<Utc>, Holder, Option<f64>)>,
+    ) -> Result<Self, BlocksRefusal> {
         let readings = readings
             .into_iter()
-            .map(|(at, symbol, reading)| match reading {
+            .map(|(at, holder, reading)| match reading {
                 Some(value) if value.is_nan() || value.abs() > READING_BOUND => {
-                    Err(BlocksRefusal::OutOfRange { at, symbol, value })
+                    Err(BlocksRefusal::OutOfRange { at, holder, value })
                 }
-                Some(_) | None => Ok((at, symbol, reading)),
+                Some(_) | None => Ok((at, holder, reading)),
             })
             .collect::<Result<_, _>>()?;
         Ok(Self { readings })
@@ -98,8 +135,8 @@ enum Block {
     Bucket(i64),
     Session(SessionDate),
     Week { year: i32, week: u32 },
-    Name(Symbol),
-    NameSession(Symbol, SessionDate),
+    Name(Holder),
+    NameSession(Holder, SessionDate),
 }
 
 /// One grouping's error of the coarsening's mean, from its block sums, with the blocks behind it.
@@ -360,10 +397,10 @@ pub enum EffectiveSampleSizeRefusal {
 
 /// Every grouping's error over `observations`; refused below two measured readings.
 pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal> {
-    let measured: Vec<(DateTime<Utc>, &Symbol, f64)> = observations
+    let measured: Vec<(DateTime<Utc>, &Holder, f64)> = observations
         .readings
         .iter()
-        .filter_map(|(at, symbol, reading)| reading.map(|value| (*at, symbol, value)))
+        .filter_map(|(at, holder, reading)| reading.map(|value| (*at, holder, value)))
         .collect();
     let count = measured.len() as u64;
     if count < 2 {
@@ -383,8 +420,8 @@ pub fn coarsen(observations: &Observations) -> Result<Coarsening, BlocksRefusal>
     let independent_standard_error = (squared_residuals / ((count - 1) * count) as f64).sqrt();
     let one_way = |grouping: Grouping| -> Result<(f64, u64), GroupingRefusal> {
         let mut sums: BTreeMap<Block, f64> = BTreeMap::new();
-        for (at, symbol, value) in &measured {
-            *sums.entry(block(grouping, *at, symbol)).or_insert(0.0) += value - mean;
+        for (at, holder, value) in &measured {
+            *sums.entry(block(grouping, *at, holder)).or_insert(0.0) += value - mean;
         }
         let blocks = sums.len() as u64;
         match blocks {
@@ -473,12 +510,12 @@ pub fn flipped_block_share(
     }
     let mut sums: BTreeMap<Block, f64> = BTreeMap::new();
     let mut measured = 0;
-    for (at, symbol, value) in observations
+    for (at, holder, value) in observations
         .readings
         .iter()
-        .filter_map(|(at, symbol, reading)| reading.map(|value| (at, symbol, value)))
+        .filter_map(|(at, holder, reading)| reading.map(|value| (at, holder, value)))
     {
-        *sums.entry(block(grouping, *at, symbol)).or_insert(0.0) += value;
+        *sums.entry(block(grouping, *at, holder)).or_insert(0.0) += value;
         measured += 1;
     }
     if measured < 2 {
@@ -506,7 +543,7 @@ pub fn flipped_block_share(
     Ok(share(count, permutations))
 }
 
-fn block(grouping: Grouping, at: DateTime<Utc>, symbol: &Symbol) -> Block {
+fn block(grouping: Grouping, at: DateTime<Utc>, holder: &Holder) -> Block {
     let bucket = |seconds: i64| Block::Bucket(at.timestamp().div_euclid(seconds));
     match grouping {
         Grouping::Minute => bucket(60),
@@ -520,9 +557,9 @@ fn block(grouping: Grouping, at: DateTime<Utc>, symbol: &Symbol) -> Block {
                 week: week.week(),
             }
         }
-        Grouping::Name => Block::Name(symbol.clone()),
+        Grouping::Name => Block::Name(holder.clone()),
         Grouping::NameSession | Grouping::SessionAndName => {
-            Block::NameSession(symbol.clone(), SessionDate::at(at))
+            Block::NameSession(holder.clone(), SessionDate::at(at))
         }
     }
 }
@@ -621,7 +658,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, month, day, hour, minute, second)
                 .unwrap()
         };
-        let name = symbol(0);
+        let name = Holder::Name(symbol(0));
         let same =
             |grouping, left, right| block(grouping, left, &name) == block(grouping, right, &name);
         assert!(same(

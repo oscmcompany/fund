@@ -77,7 +77,7 @@ promoted into the archive.
   and the boundary values, and the effective sample size rather than the row count — `1254 / 1254 / 0 / 0` is a
   proof and a bare `0` is not, and an estimator silently defined on 60% of its inputs reads exactly like a complete
   measurement; journal the population, the undefined count and the null's reading with the experiment through
-  `Outputs::checks`
+  `Outputs::checks`, which `laboratory::compare` attaches itself
 - Screen on the quantity being paid for rather than a correlate of it, and check a screen's units before
   checking its threshold; a cost charged per share is compared with the spread in cents per share and converted
   to basis points only to report, since the same fee is five times larger in basis points at $5 than at $25
