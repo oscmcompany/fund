@@ -1,5 +1,5 @@
-//! Walk-forward folds over sessions: the fit sessions cut into contiguous periods, each tested by a fit on every
-//! session before it, and a confirm block later than every fit session.
+//! Walk-forward folds over sessions: the fit sessions cut into contiguous periods, each tested by a fit on the sessions
+//! before it less an embargo, and a confirm block later than every fit session.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -41,6 +41,24 @@ impl Period {
     }
 }
 
+/// The fit sessions held out of training just before what it is tested on, so a label reaching forward this many
+/// sessions from the last training session cannot overlap the test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Embargo(usize);
+
+impl Embargo {
+    /// No sessions held out, for a label that closes within its own session.
+    pub const NONE: Self = Self(0);
+
+    pub const fn sessions(count: usize) -> Self {
+        Self(count)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
 /// Why sessions cannot be cut into walk-forward folds, with the counts or sessions that refused them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FoldsRefusal {
@@ -56,17 +74,21 @@ pub enum FoldsRefusal {
         periods: usize,
         training_only: usize,
     },
+    #[error("an embargo of {} sessions leaves the first fold nothing of its {warm_up} to train on", .embargo.get())]
+    EmbargoEmptiesTraining { embargo: Embargo, warm_up: usize },
 }
 
-/// Fit sessions in ascending order, the index of each fold's first, and the confirm block after them all.
+/// Fit sessions in ascending order, the index of each fold's first, the embargo before each, and the confirm block
+/// after them all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkForward {
     fit: Vec<SessionDate>,
     starts: Vec<usize>,
+    embargo: Embargo,
     confirm: Vec<SessionDate>,
 }
 
-/// One fold: every fit session before its test, and the test's contiguous sessions of one period.
+/// One fold: the fit sessions before its test less the embargo, and the test's contiguous sessions of one period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fold<'a> {
     train: &'a [SessionDate],
@@ -88,7 +110,7 @@ impl<'a> Fold<'a> {
 pub enum Placement {
     /// A fit session in the first periods, which only ever train.
     TrainingOnly,
-    /// A fit session tested by the fold at this index.
+    /// A fit session tested by the fold at this index, which also trains every later fold outside its embargo.
     Fold(usize),
     Confirm,
     /// Neither fit nor confirm, so no part of the split reads it.
@@ -96,13 +118,15 @@ pub enum Placement {
 }
 
 impl WalkForward {
-    /// Cuts `fit` into one fold per `period` after the first `training_only` periods; every confirm session must lie
-    /// after every fit session.
+    /// Cuts `fit` into one fold per `period` after the first `training_only` periods, each training on the fit
+    /// sessions before it less the `embargo` fit sessions just before it; every confirm session must lie after every
+    /// fit session, and the embargo is counted in fit sessions, so a gap of unlisted sessions adds to it.
     pub fn new(
         fit: BTreeSet<SessionDate>,
         confirm: BTreeSet<SessionDate>,
         period: Period,
         training_only: NonZeroUsize,
+        embargo: Embargo,
     ) -> Result<Self, FoldsRefusal> {
         let first_confirm = confirm.first().copied().ok_or(FoldsRefusal::NoConfirm)?;
         match fit.last().copied() {
@@ -124,9 +148,18 @@ impl WalkForward {
                 training_only: training_only.get(),
             });
         }
+        let starts = period_starts[training_only.get()..].to_vec();
+        // Folds start later and later, so the first trains on the least.
+        if embargo.get() >= starts[0] {
+            return Err(FoldsRefusal::EmbargoEmptiesTraining {
+                embargo,
+                warm_up: starts[0],
+            });
+        }
         Ok(Self {
-            starts: period_starts[training_only.get()..].to_vec(),
+            starts,
             fit,
+            embargo,
             confirm: confirm.into_iter().collect(),
         })
     }
@@ -139,6 +172,11 @@ impl WalkForward {
         &self.confirm
     }
 
+    /// The fit sessions a model read on the confirm block trains on: every one less the embargo before it.
+    pub fn confirm_training(&self) -> &[SessionDate] {
+        &self.fit[..self.fit.len() - self.embargo.get()]
+    }
+
     pub fn folds(&self) -> impl Iterator<Item = Fold<'_>> {
         self.starts.iter().enumerate().map(|(index, start)| {
             let end = self
@@ -147,7 +185,7 @@ impl WalkForward {
                 .copied()
                 .unwrap_or(self.fit.len());
             Fold {
-                train: &self.fit[..*start],
+                train: &self.fit[..*start - self.embargo.get()],
                 test: &self.fit[*start..end],
             }
         })
@@ -204,6 +242,7 @@ mod tests {
             sessions(&[(2024, 6, 3)]),
             Period::Month,
             NonZeroUsize::MIN,
+            Embargo::NONE,
         )
         .unwrap();
         let shapes: Vec<(usize, usize)> = split
@@ -237,6 +276,7 @@ mod tests {
                 sessions(confirm),
                 Period::Month,
                 NonZeroUsize::new(training_only).unwrap(),
+                Embargo::NONE,
             )
             .map_err(|refusal| refusal.to_string())
         };
@@ -267,10 +307,63 @@ mod tests {
             sessions(&[(2025, 1, 7)]),
             Period::Week,
             NonZeroUsize::MIN,
+            Embargo::NONE,
         )
         .unwrap();
         let tests: Vec<usize> = split.folds().map(|fold| fold.test.len()).collect();
         assert_eq!(tests, [2, 1]);
+    }
+
+    /// Two warm-up sessions in January and a two-session embargo: February trains on nothing and is refused, while
+    /// with one held out each fold trains on all but the fit session just before it.
+    #[test]
+    fn test_an_embargo_holds_out_the_sessions_just_before_each_test() {
+        let fit = sessions(&[
+            (2024, 1, 2),
+            (2024, 1, 30),
+            (2024, 2, 1),
+            (2024, 2, 2),
+            (2024, 3, 4),
+        ]);
+        let confirm = sessions(&[(2024, 4, 1)]);
+        let embargoed = |count: usize| {
+            WalkForward::new(
+                fit.clone(),
+                confirm.clone(),
+                Period::Month,
+                NonZeroUsize::MIN,
+                Embargo::sessions(count),
+            )
+        };
+        assert_eq!(
+            embargoed(2).map_err(|refusal| refusal.to_string()),
+            Err(
+                "an embargo of 2 sessions leaves the first fold nothing of its 2 to train on"
+                    .to_string()
+            )
+        );
+        let split = embargoed(1).unwrap();
+        let trains: Vec<&[SessionDate]> = split.folds().map(|fold| fold.train).collect();
+        assert_eq!(
+            trains,
+            [
+                &[session(2024, 1, 2)][..],
+                &[
+                    session(2024, 1, 2),
+                    session(2024, 1, 30),
+                    session(2024, 2, 1)
+                ][..]
+            ]
+        );
+        assert_eq!(
+            split.confirm_training(),
+            [
+                session(2024, 1, 2),
+                session(2024, 1, 30),
+                session(2024, 2, 1),
+                session(2024, 2, 2)
+            ]
+        );
     }
 
     #[test]
@@ -283,15 +376,23 @@ mod tests {
         assert_eq!(iterated, names);
     }
 
-    fn split()
-    -> impl Strategy<Value = (BTreeSet<SessionDate>, BTreeSet<SessionDate>, Period, usize)> {
+    type Split = (
+        BTreeSet<SessionDate>,
+        BTreeSet<SessionDate>,
+        Period,
+        usize,
+        usize,
+    );
+
+    fn split() -> impl Strategy<Value = Split> {
         (
             prop::collection::btree_set(0i64..400, 1..60),
             prop::collection::btree_set(0i64..40, 1..10),
             prop::sample::select(Period::iter().collect::<Vec<_>>()),
             1usize..4,
+            0usize..6,
         )
-            .prop_map(|(fit, confirm, period, training_only)| {
+            .prop_map(|(fit, confirm, period, training_only, embargo)| {
                 let day = |offset: i64| {
                     SessionDate::from_date(
                         NaiveDate::from_ymd_opt(2024, 1, 1).unwrap() + TimeDelta::days(offset),
@@ -306,26 +407,42 @@ mod tests {
                         .collect(),
                     period,
                     training_only,
+                    embargo,
                 )
             })
     }
 
     proptest! {
         /// The tests partition the fit sessions after the warm-up, each one contiguous period, each trained on every
-        /// fit session strictly before it, and `place` agrees.
+        /// fit session before it but the `embargo` just before it, the confirm block trained on every fit session but
+        /// the last `embargo` and starting after them all, and `place` agrees.
         #[test]
-        fn test_folds_partition_the_sessions_and_train_strictly_before_they_test(
-            (fit, confirm, period, training_only) in split(),
+        fn test_folds_partition_the_sessions_and_train_before_their_embargo(
+            (fit, confirm, period, training_only, embargo) in split(),
         ) {
             let split = match WalkForward::new(
                 fit.clone(),
                 confirm.clone(),
                 period,
                 NonZeroUsize::new(training_only).unwrap(),
+                Embargo::sessions(embargo),
             ) {
                 Ok(split) => split,
                 Err(FoldsRefusal::TooFewPeriods { periods, .. }) => {
                     prop_assert!(periods <= training_only);
+                    return Ok(());
+                }
+                Err(FoldsRefusal::EmbargoEmptiesTraining { warm_up, .. }) => {
+                    let mut warm_up_periods = BTreeSet::new();
+                    let counted = fit
+                        .iter()
+                        .take_while(|session| {
+                            warm_up_periods.insert(period.of(**session));
+                            warm_up_periods.len() <= training_only
+                        })
+                        .count();
+                    prop_assert_eq!(warm_up, counted);
+                    prop_assert!(embargo >= warm_up);
                     return Ok(());
                 }
                 Err(refusal) => return Err(TestCaseError::fail(refusal.to_string())),
@@ -338,10 +455,14 @@ mod tests {
             for (index, fold) in folds.iter().enumerate() {
                 prop_assert!(!fold.test.is_empty());
                 prop_assert!(fold.test.iter().all(|session| period.of(*session) == period.of(fold.test[0])));
-                prop_assert!(fold.train.iter().all(|train| *train < fold.test[0]));
+                let before: Vec<SessionDate> = fit.iter().copied().filter(|session| *session < fold.test[0]).collect();
+                prop_assert!(!fold.train.is_empty());
+                prop_assert_eq!(fold.train, &before[..before.len() - embargo]);
+                // No training session lies within the embargo: `embargo` fit sessions sit between the two.
+                let last_train = *fold.train.last().unwrap();
                 prop_assert_eq!(
-                    fold.train,
-                    &fit.iter().copied().filter(|session| *session < fold.test[0]).collect::<Vec<_>>()[..]
+                    fit.iter().filter(|session| **session > last_train && **session < fold.test[0]).count(),
+                    embargo
                 );
                 prop_assert!(fold.test.iter().all(|session| split.place(*session) == Placement::Fold(index)));
             }
@@ -350,6 +471,12 @@ mod tests {
             prop_assert_eq!(periods.len(), training_only);
             prop_assert!(fit.iter().take(warm_up).all(|session| split.place(*session) == Placement::TrainingOnly));
             prop_assert!(split.confirm().iter().all(|session| *session > *fit.last().unwrap()));
+            let confirm_training = split.confirm_training();
+            prop_assert_eq!(confirm_training, &fit.iter().copied().collect::<Vec<_>>()[..fit.len() - embargo]);
+            prop_assert_eq!(
+                fit.iter().filter(|session| **session > *confirm_training.last().unwrap()).count(),
+                embargo
+            );
             prop_assert!(confirm.iter().all(|session| split.place(*session) == Placement::Confirm));
         }
     }
