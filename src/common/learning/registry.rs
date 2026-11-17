@@ -5,7 +5,6 @@
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -19,9 +18,30 @@ pub const MODELS_ROOT: &str = "models";
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const WEIGHTS_FILE: &str = "model.weights.json";
 
-/// A fitted model the registry stores, which reads rows of a fixed width.
-pub trait Fitted: Serialize + DeserializeOwned {
+/// A fitted model the registry stores, which reads rows of a fixed width; outside this crate only `Weights::decode`
+/// reads one back, since reading one takes a `Sealed` that only this crate can build.
+pub trait Fitted: Serialize + stored::Stored {
     fn width(&self) -> usize;
+}
+
+pub(crate) mod stored {
+    /// Proof the caller is in this crate; a `Fitted` bound reaches `Stored::read` from outside, but cannot build this.
+    pub struct Sealed(());
+
+    /// Reads a fitted model from its stored form, without the input names its rows were fitted on.
+    pub trait Stored: Sized {
+        fn read<'de, D: serde::Deserializer<'de>>(
+            sealed: Sealed,
+            deserializer: D,
+        ) -> Result<Self, D::Error>;
+    }
+
+    /// Reads a fitted model from its stored form, for `Weights::decode` and this crate's tests.
+    pub(crate) fn read<'de, M: Stored, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<M, D::Error> {
+        M::read(Sealed(()), deserializer)
+    }
 }
 
 impl Fitted for Booster {
@@ -111,9 +131,10 @@ pub struct Weights<M> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, bound = "M: stored::Stored")]
 struct WeightsFields<M> {
     inputs: Inputs,
+    #[serde(deserialize_with = "stored::read")]
     fitted: M,
 }
 
@@ -543,6 +564,11 @@ impl<M: Fitted> Model<M> {
         &self.manifest
     }
 
+    /// The input names in the order a row holds them, for building rows rather than restating the order.
+    pub fn inputs(&self) -> &Inputs {
+        self.weights.inputs()
+    }
+
     pub fn fitted(&self) -> &M {
         self.weights.fitted()
     }
@@ -554,6 +580,7 @@ mod tests {
 
     use chrono::{NaiveDate, TimeZone};
     use proptest::prelude::*;
+    use serde::de::DeserializeOwned;
     use uuid::Uuid;
 
     use super::*;
@@ -566,7 +593,7 @@ mod tests {
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn ridge(coefficients: &[f64]) -> Ridge {
-        serde_json::from_value(serde_json::json!({
+        stored::read::<Ridge, _>(serde_json::json!({
             "intercept": 0.5,
             "coefficients": coefficients,
         }))
@@ -619,6 +646,20 @@ mod tests {
         let same = Inputs::new(&["spread", "size", "imbalance"]).unwrap();
         let model = Model::<Ridge>::open(&pin, &same, &manifest, &weights).unwrap();
         assert_eq!(model.fitted().coefficients(), [0.0, 1.0, 2.0]);
+        assert_eq!(model.inputs().names(), ["spread", "size", "imbalance"]);
+    }
+
+    /// Names one impl only while `T` has no public deserializer; with one, `_` is ambiguous and the crate fails to build.
+    trait Undeserializable<Marker> {
+        fn check() {}
+    }
+    impl<T> Undeserializable<()> for T {}
+    impl<T: DeserializeOwned> Undeserializable<u8> for T {}
+
+    #[test]
+    fn test_fitted_models_load_only_through_their_weights() {
+        <Booster as Undeserializable<_>>::check();
+        <Ridge as Undeserializable<_>>::check();
     }
 
     #[test]
