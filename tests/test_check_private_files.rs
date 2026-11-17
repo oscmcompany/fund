@@ -52,7 +52,7 @@ fn check(paths: &[&str]) -> (i32, String) {
     )
 }
 
-const PUBLIC: [&str; 9] = [
+const PUBLIC: [&str; 10] = [
     "src/journal.rs",
     "src/common/journal.rs",
     "src/common/journal/record.rs",
@@ -62,6 +62,7 @@ const PUBLIC: [&str; 9] = [
     "secretspec.toml",
     "views.sql",
     ".claude/skills/report-findings/glossary.md",
+    "src/models/registry.rs",
 ];
 
 #[test]
@@ -81,6 +82,8 @@ fn test_each_private_file_fails_and_is_named() {
         "data/raw/quotes.jsonl.gz",
         "models/weights.safetensors",
         "models/model.weights.json",
+        "models/tick_fill/3/manifest.json",
+        "studies/models/tick_fill/12/notes.md",
         "data/capital_flows.toml",
         "studies/journal/README.md",
         "studies/src/bin/null_check.rs",
