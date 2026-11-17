@@ -3,40 +3,103 @@
 
 use std::collections::BTreeMap;
 
-use super::fees::{FeeRegime, Liquidity};
+use super::fees::{ChargeRefusal, FeeRegime, Liquidity};
 use super::{PerShare, PerShareRefusal};
 use crate::common::book::Side;
 use crate::common::market::quote_bars::Spread;
 use crate::common::market::{Price, Symbol};
+use crate::common::monoid::Monoid;
 
-/// A measured execution cost per share and its error, both fitted outside the code and passed in.
+/// A measured execution cost per share folded from fills: their count, sum and sum of squares in millionths, so
+/// estimates from any grouping of fills combine exactly, and each fill of a steady cost shrinks the error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostEstimate {
-    point: PerShare,
-    error: PerShare,
+    fills: u64,
+    sum: i128,
+    sum_of_squares: u128,
 }
 
-/// An estimate refused for a negative error, with the error offered.
+/// Why an estimate has no point or error yet, with the fills it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("an error of {error} is negative")]
-pub struct CostEstimateRefusal {
-    pub error: PerShare,
+pub enum EstimateRefusal {
+    #[error("{fills} fill(s) cannot measure a cost: a point takes one and an error two")]
+    TooFewFills { fills: u64 },
+    #[error("the cost of {fills} fills is not representable per share")]
+    Unrepresentable { fills: u64 },
 }
 
 impl CostEstimate {
-    pub fn new(point: PerShare, error: PerShare) -> Result<Self, CostEstimateRefusal> {
-        match error >= PerShare::ZERO {
-            true => Ok(Self { point, error }),
-            false => Err(CostEstimateRefusal { error }),
+    /// One fill's execution cost per share.
+    pub fn of(cost: PerShare) -> Self {
+        let millionths = cost.millionths();
+        Self {
+            fills: 1,
+            sum: i128::from(millionths),
+            sum_of_squares: u128::from(millionths.unsigned_abs()).pow(2),
         }
     }
 
-    pub fn point(self) -> PerShare {
-        self.point
+    pub fn fills(self) -> u64 {
+        self.fills
     }
 
-    pub fn error(self) -> PerShare {
-        self.error
+    /// The mean cost, rounded up so rounding never flatters.
+    pub fn point(self) -> Result<PerShare, EstimateRefusal> {
+        let fills = i128::from(self.fills);
+        match fills {
+            0 => Err(EstimateRefusal::TooFewFills { fills: self.fills }),
+            _ => i64::try_from(-(-self.sum).div_euclid(fills))
+                .ok()
+                .and_then(|mean| PerShare::from_millionths(mean).ok())
+                .ok_or(EstimateRefusal::Unrepresentable { fills: self.fills }),
+        }
+    }
+
+    /// The standard error of the mean, `sqrt((n * squares - sum^2) / (n^2 * (n - 1)))`, computed in integers and
+    /// rounded up.
+    pub fn error(self) -> Result<PerShare, EstimateRefusal> {
+        let fills = u128::from(self.fills);
+        if fills < 2 {
+            return Err(EstimateRefusal::TooFewFills { fills: self.fills });
+        }
+        let unrepresentable = EstimateRefusal::Unrepresentable { fills: self.fills };
+        let spread = fills
+            .checked_mul(self.sum_of_squares)
+            .and_then(|scaled| scaled.checked_sub(self.sum.unsigned_abs().checked_pow(2)?))
+            .ok_or(unrepresentable)?;
+        // Successive ceilings equal the ceiling of the whole quotient, and the root of a ceiling rounds up the same.
+        let variance = spread.div_ceil(fills).div_ceil(fills).div_ceil(fills - 1);
+        let root = variance.isqrt();
+        let error = root + u128::from(root * root < variance);
+        i64::try_from(error)
+            .ok()
+            .and_then(|error| PerShare::from_millionths(error).ok())
+            .ok_or(unrepresentable)
+    }
+}
+
+impl Monoid for CostEstimate {
+    fn empty() -> Self {
+        Self {
+            fills: 0,
+            sum: 0,
+            sum_of_squares: 0,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            fills: self
+                .fills
+                .checked_add(other.fills)
+                .expect("an estimate holds fewer than u64::MAX fills"),
+            // At most `u64::MAX` fills of at most 10^13 each, inside an `i128`.
+            sum: self.sum + other.sum,
+            sum_of_squares: self
+                .sum_of_squares
+                .checked_add(other.sum_of_squares)
+                .expect("an estimate's squares fit a u128"),
+        }
     }
 }
 
@@ -115,6 +178,10 @@ pub enum CostBasis {
 pub enum PricingRefusal {
     #[error("{symbol} has no measured cost")]
     Unpriced { symbol: Symbol },
+    #[error("the cost is unmeasured: {0}")]
+    Unmeasured(#[from] EstimateRefusal),
+    #[error("the fees could not be charged: {0}")]
+    Uncharged(#[from] ChargeRefusal),
     #[error("the cost with its fees is out of range: {0}")]
     OutOfRange(#[from] PerShareRefusal),
 }
@@ -199,9 +266,9 @@ impl CostModel {
         };
         Ok(PricedCost {
             point: estimate
-                .point
+                .point()?
                 .plus(self.fees.per_share(liquidity, side, price)?)?,
-            floor: estimate.error,
+            floor: estimate.error()?,
         })
     }
 }
@@ -214,13 +281,20 @@ mod tests {
 
     use crate::common::cost::fees::{PassThroughSchedule, RegulatoryFees};
     use crate::common::market::{Dollars, PRICE_SCALE};
+    use crate::common::monoid::{concatenate, laws};
 
     fn per_share(millionths: i64) -> PerShare {
         PerShare::from_millionths(millionths).unwrap()
     }
 
+    /// Two fills either side of `point`, whose mean is `point` and whose standard error is exactly `error`.
     fn estimate(point: i64, error: i64) -> CostEstimate {
-        CostEstimate::new(per_share(point), per_share(error)).unwrap()
+        CostEstimate::of(per_share(point - error))
+            .combine(CostEstimate::of(per_share(point + error)))
+    }
+
+    fn fills(costs: &[i64]) -> CostEstimate {
+        concatenate(costs.iter().map(|cost| CostEstimate::of(per_share(*cost))))
     }
 
     fn spread(ticks: u64) -> Spread {
@@ -277,14 +351,84 @@ mod tests {
     }
 
     #[test]
-    fn test_a_negative_error_is_refused() {
+    fn test_an_estimate_needs_a_fill_for_its_point_and_two_for_its_error() {
+        let empty = CostEstimate::empty();
         assert_eq!(
-            CostEstimate::new(per_share(5), per_share(-1)),
-            Err(CostEstimateRefusal {
-                error: per_share(-1)
-            })
+            empty.point(),
+            Err(EstimateRefusal::TooFewFills { fills: 0 })
         );
-        assert!(CostEstimate::new(per_share(-5), per_share(0)).is_ok());
+        assert_eq!(
+            empty.error(),
+            Err(EstimateRefusal::TooFewFills { fills: 0 })
+        );
+        let single = fills(&[4_000]);
+        assert_eq!(single.point(), Ok(per_share(4_000)));
+        assert_eq!(
+            single.error(),
+            Err(EstimateRefusal::TooFewFills { fills: 1 })
+        );
+        assert_eq!(estimate(4_000, 500).point(), Ok(per_share(4_000)));
+        assert_eq!(estimate(4_000, 500).error(), Ok(per_share(500)));
+    }
+
+    #[test]
+    fn test_the_point_and_error_round_up() {
+        // Variance of the mean 20,000,000 / 48 = 416,666.7, whose root 645.5 rounds up.
+        let measured = fills(&[1_000, 2_000, 3_000, 4_000]);
+        assert_eq!(
+            (measured.fills(), measured.point(), measured.error()),
+            (4, Ok(per_share(2_500)), Ok(per_share(646)))
+        );
+        assert_eq!(fills(&[-1, -2]).point(), Ok(per_share(-1)));
+        assert_eq!(fills(&[1, 2]).point(), Ok(per_share(2)));
+        assert_eq!(fills(&[7, 7, 7]).error(), Ok(per_share(0)));
+    }
+
+    #[test]
+    fn test_a_spread_past_an_i128_is_refused_rather_than_wrapped() {
+        // A million fills at each end of the bound.
+        let wide = CostEstimate {
+            fills: 2_000_000,
+            sum: 0,
+            sum_of_squares: 2_000_000 * 10_000_000_000_000u128.pow(2),
+        };
+        assert_eq!(wide.point(), Ok(PerShare::ZERO));
+        assert_eq!(
+            wide.error(),
+            Err(EstimateRefusal::Unrepresentable { fills: 2_000_000 })
+        );
+    }
+
+    #[test]
+    fn test_each_fill_of_a_steady_cost_lowers_the_floor() {
+        let model = |estimate: CostEstimate| {
+            CostModel::new(
+                CostBasis::ByName(BTreeMap::from([(symbol("AAPL"), estimate)])),
+                free(),
+            )
+            .price(
+                &symbol("AAPL"),
+                spread(10_000),
+                price(),
+                Side::Buy,
+                Liquidity::Removing,
+            )
+        };
+        let batch = fills(&[3_000, 5_000]);
+        assert_eq!(
+            model(CostEstimate::of(per_share(3_000))),
+            Err(PricingRefusal::Unmeasured(EstimateRefusal::TooFewFills {
+                fills: 1
+            }))
+        );
+        let floors = [1, 2, 4, 16].map(|copies| {
+            model(concatenate(std::iter::repeat_n(batch, copies)))
+                .unwrap()
+                .floor()
+                .millionths()
+        });
+        // sqrt(1,000,000 / (2 * copies - 1)), rounded up.
+        assert_eq!(floors, [1_000, 578, 378, 180]);
     }
 
     #[test]
@@ -405,7 +549,58 @@ mod tests {
         );
     }
 
+    /// Built from sums directly rather than through `combine`, so the law test does not lean on what it checks.
+    fn any_estimate() -> impl Strategy<Value = CostEstimate> {
+        (
+            0u64..1_000,
+            -1_000_000_000i128..1_000_000_000,
+            0u128..1_000_000_000_000_000_000,
+        )
+            .prop_map(|(fills, sum, sum_of_squares)| CostEstimate {
+                fills,
+                sum,
+                sum_of_squares,
+            })
+    }
+
     proptest! {
+        #[test]
+        fn property_a_cost_estimate_is_a_commutative_monoid(
+            first in any_estimate(),
+            second in any_estimate(),
+            third in any_estimate(),
+        ) {
+            laws::check(first, second, third)?;
+        }
+
+        /// The point lies within the fills, and the error is the floating-point standard error rounded up.
+        #[test]
+        fn test_the_estimate_agrees_with_the_textbook_formulas(
+            costs in prop::collection::vec(-10_000_000i64..10_000_000, 2..50),
+        ) {
+            let estimate = fills(&costs);
+            let point = estimate.point().unwrap().millionths();
+            prop_assert!(*costs.iter().min().unwrap() <= point && point <= *costs.iter().max().unwrap());
+            let count = costs.len() as f64;
+            let mean = costs.iter().sum::<i64>() as f64 / count;
+            let variance = costs.iter().map(|cost| (*cost as f64 - mean).powi(2)).sum::<f64>() / (count - 1.0);
+            let expected = (variance / count).sqrt();
+            let error = estimate.error().unwrap().millionths() as f64;
+            prop_assert!(error >= expected - 1e-6 && error < expected + 1.0 + 1e-6, "{error} against {expected}");
+        }
+
+        /// Repeating a batch of fills never raises the error.
+        #[test]
+        fn test_more_fills_of_the_same_costs_never_raise_the_error(
+            costs in prop::collection::vec(-10_000_000i64..10_000_000, 2..20),
+            copies in 1usize..20,
+        ) {
+            let batch = fills(&costs);
+            let fewer = concatenate(std::iter::repeat_n(batch, copies)).error().unwrap();
+            let more = concatenate(std::iter::repeat_n(batch, copies + 1)).error().unwrap();
+            prop_assert!(more <= fewer);
+        }
+
         /// A wider spread never lands in a narrower decile, and every spread lands in one of the ten.
         #[test]
         fn test_deciles_are_monotone_in_the_spread(
