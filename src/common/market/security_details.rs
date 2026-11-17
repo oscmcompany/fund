@@ -4,6 +4,7 @@
 use std::num::NonZeroU64;
 
 use super::{Dollars, Shares, Symbol};
+use crate::common::time::SessionDate;
 
 /// The kind of security a symbol names, in our terms.
 #[derive(
@@ -198,6 +199,28 @@ impl SecurityDetails {
 
     pub fn central_index_key(&self) -> Option<CentralIndexKey> {
         self.central_index_key
+    }
+}
+
+/// A security details snapshot with the session it was taken as of; outside the crate only the archive's reader builds
+/// one, stamping it from the key the snapshot was read under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailsSnapshot {
+    as_of: SessionDate,
+    details: Vec<SecurityDetails>,
+}
+
+impl DetailsSnapshot {
+    pub(crate) fn new(as_of: SessionDate, details: Vec<SecurityDetails>) -> Self {
+        Self { as_of, details }
+    }
+
+    pub fn as_of(&self) -> SessionDate {
+        self.as_of
+    }
+
+    pub fn details(&self) -> &[SecurityDetails] {
+        &self.details
     }
 }
 

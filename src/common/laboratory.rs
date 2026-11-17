@@ -6,6 +6,7 @@ pub mod blocks;
 pub mod calibration;
 pub mod dataset;
 pub mod estimate;
+pub mod event_table;
 pub mod experiment;
 pub mod folds;
 pub mod haircut;
