@@ -18,6 +18,7 @@ pub mod series;
 pub mod share;
 pub mod sharpe;
 pub mod synthetic;
+pub mod universe;
 pub mod verdict;
 
 /// The largest reading magnitude a series admits; no measured quantity comes near it, and below it every sum, square
