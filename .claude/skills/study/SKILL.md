@@ -13,7 +13,8 @@ promoted into the archive.
 - Prove an instrument can see before trusting it: before reading a measurement that reports nothing, confirm it
   reports something when something is there; write a model change as a `laboratory::recovery::ModelArm`, which reads
   real sessions only through the `Recovered` that `laboratory::recovery::recover` returns once the arm recovers what
-  `common::laboratory::synthetic` planted at a stated strength, against the null that planted nothing
+  `common::laboratory::synthetic` planted at a stated strength, against the null that planted nothing; count every
+  attempt, since each retry raises the bar
 - Before believing a result, try to produce it from nothing — permute the labels, shuffle the target, feed the
   pipeline noise, or run it on an input that cannot contain the effect — and confirm the effect disappears;
   whatever it still reports is the machinery's own bias, and every real reading has to clear it

@@ -4,12 +4,51 @@ use crate::common::learning::boosting::Penalty;
 use crate::common::learning::boosting::ensemble::WidthError;
 use crate::common::learning::loss::{Loss, Prediction, Score};
 use crate::common::learning::matrix::{Matrix, Sample};
+use crate::common::learning::registry::stored::{Sealed, Stored};
 
 /// A fitted ridge regression: the intercept and one coefficient per input, read under squared error.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(into = "Parts")]
 pub struct Ridge {
     intercept: f64,
     coefficients: Vec<f64>,
+}
+
+/// A ridge regression as stored.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Parts {
+    intercept: f64,
+    coefficients: Vec<f64>,
+}
+
+impl From<Ridge> for Parts {
+    fn from(
+        Ridge {
+            intercept,
+            coefficients,
+        }: Ridge,
+    ) -> Self {
+        Self {
+            intercept,
+            coefficients,
+        }
+    }
+}
+
+impl Stored for Ridge {
+    fn read<'de, D: serde::Deserializer<'de>>(
+        _sealed: Sealed,
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let Parts {
+            intercept,
+            coefficients,
+        } = serde::Deserialize::deserialize(deserializer)?;
+        Ok(Self {
+            intercept,
+            coefficients,
+        })
+    }
 }
 
 /// Why a ridge regression could not be fit.
@@ -227,7 +266,10 @@ mod tests {
         )
         .unwrap();
         let text = serde_json::to_string(&ridge).unwrap();
-        let restored: Ridge = serde_json::from_str(&text).unwrap();
+        let restored = crate::common::learning::registry::stored::read::<Ridge, _>(
+            &mut serde_json::Deserializer::from_str(&text),
+        )
+        .unwrap();
         assert_eq!(restored, ridge);
         let matrix = Matrix::new(&values, NonZeroUsize::new(2).unwrap()).unwrap();
         assert_eq!(restored.predict(&matrix), ridge.predict(&matrix));
