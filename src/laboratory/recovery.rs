@@ -96,7 +96,7 @@ pub enum RecoveryError<Refusal> {
     #[error("{0}")]
     Study(StudyError),
     /// The recovery was journaled, but it does not admit the arm.
-    #[error("the arm recovered {} of an expected {}: {shortfall}", .recovery.recovered().mean(), .recovery.expected())]
+    #[error("the arm recovered {}bp of an expected {}: {shortfall}", .recovery.recovered().mean(), .recovery.expected())]
     Unrecovered {
         recovery: Box<Recovery>,
         shortfall: Shortfall,
@@ -236,6 +236,7 @@ mod tests {
     use crate::common::cost::BasisPoints;
     use crate::common::journal::{Observation, ReadLine, read};
     use crate::common::laboratory::experiment::{ExperimentRan, Label};
+    use crate::common::laboratory::recovery::SignedBasisPoints;
     use crate::common::laboratory::synthetic::draw::{LogNormal, Seed};
     use crate::common::laboratory::synthetic::{
         Flow, Prevalence, Shapes, Span, Volatility, Window,
@@ -248,7 +249,7 @@ mod tests {
     #[derive(Debug)]
     struct SessionMove;
 
-    /// Wider than a one-tick bounce on the quiet names `specification` draws, narrower than one planted piece.
+    /// Splits a one-tick bounce, 1bp at `specification`'s $100 price, from one of a 40bp plant's five pieces at 8bp.
     const JUMP_BASIS_POINTS: f64 = 4.0;
 
     /// One name's session so far: its open, its last close, and the signed sum of its jumps.
@@ -605,7 +606,7 @@ mod tests {
                 recovery,
                 shortfall: Shortfall::Inaccurate { expected, .. },
             }) => {
-                assert_eq!(expected, 40.0);
+                assert_eq!(expected, SignedBasisPoints::new(40.0).unwrap());
                 let share = recovery.share().unwrap();
                 assert!((0.08..0.12).contains(&share), "{recovery:?}");
             }
@@ -627,7 +628,10 @@ mod tests {
             Attempt::new(NonZeroU32::new(3).unwrap()),
         )
         .unwrap();
-        assert_eq!(recovered.recovery().expected(), -40.0);
+        assert_eq!(
+            recovered.recovery().expected(),
+            SignedBasisPoints::new(-40.0).unwrap()
+        );
         assert!(recovered.recovery().recovered().mean() < -30.0);
         let ran = journaled(&directory);
         let setting = |name: &str| ran.parameters().settings().get(name).cloned();

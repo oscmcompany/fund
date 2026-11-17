@@ -53,6 +53,36 @@ impl Direction {
     }
 }
 
+/// A finite reading in basis points that, unlike `BasisPoints`, may be negative, since an arm's reading has a direction.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct SignedBasisPoints(f64);
+
+/// A signed basis-point reading refused for not being finite, with the value read.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("{value} is not a finite basis-point reading")]
+pub struct SignedBasisPointsRefusal {
+    pub value: f64,
+}
+
+impl SignedBasisPoints {
+    pub fn new(value: f64) -> Result<Self, SignedBasisPointsRefusal> {
+        match value.is_finite() {
+            true => Ok(Self(value + 0.0)),
+            false => Err(SignedBasisPointsRefusal { value }),
+        }
+    }
+
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SignedBasisPoints {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}bp", self.0)
+    }
+}
+
 /// Which try of an arm against the synthetic market this is, earlier tries included, so each retry raises the bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Attempt(NonZeroU32);
@@ -75,7 +105,7 @@ pub enum Shortfall {
     #[error("the recovered strength never varied, so it has no error to clear a bar by")]
     NoError,
     #[error("the arm recovered {recovered} against its expected direction")]
-    WrongDirection { recovered: f64 },
+    WrongDirection { recovered: SignedBasisPoints },
     #[error(
         "the recovery is {standard_errors} standard errors from zero, short of the {required} its attempt needs"
     )]
@@ -83,9 +113,9 @@ pub enum Shortfall {
     /// Detected but not measured: the expected reading lies outside a single test's interval around the recovered one.
     #[error("the expected {expected} lies outside the recovered interval from {lower} to {upper}")]
     Inaccurate {
-        expected: f64,
-        lower: f64,
-        upper: f64,
+        expected: SignedBasisPoints,
+        lower: SignedBasisPoints,
+        upper: SignedBasisPoints,
     },
 }
 
@@ -136,8 +166,9 @@ impl Recovery {
     }
 
     /// The reading a perfect arm would recover: the stated strength in the arm's direction.
-    pub fn expected(&self) -> f64 {
-        self.direction.sign() * self.stated.value()
+    pub fn expected(&self) -> SignedBasisPoints {
+        SignedBasisPoints::new(self.direction.sign() * self.stated.value())
+            .expect("a stated strength is finite")
     }
 
     pub fn planted_events(&self) -> u64 {
@@ -159,7 +190,7 @@ impl Recovery {
 
     /// The recovered strength over the expected one, `None` for a stated strength of zero.
     pub fn share(&self) -> Option<f64> {
-        (self.stated.value() > 0.0).then(|| self.recovered.mean() / self.expected())
+        (self.stated.value() > 0.0).then(|| self.recovered.mean() / self.expected().value())
     }
 
     /// Admits the arm where the recovered strength moves in its direction, clears the bar of a family as large as its
@@ -168,22 +199,31 @@ impl Recovery {
         let Some(standard_errors) = self.recovered.t() else {
             return Err(Shortfall::NoError);
         };
+        let reading = |value: f64| {
+            SignedBasisPoints::new(value).expect("an estimate's mean and error are finite")
+        };
         let mean = self.recovered.mean();
         if mean * self.direction.sign() <= 0.0 {
-            return Err(Shortfall::WrongDirection { recovered: mean });
+            return Err(Shortfall::WrongDirection {
+                recovered: reading(mean),
+            });
         }
         let freedom = self.recovered.degrees_of_freedom();
-        let required = Haircut::new(self.attempt.get()).required_standard_errors(freedom);
-        if standard_errors.abs() < required {
+        let haircut = Haircut::new(self.attempt.get());
+        if !haircut.clears(standard_errors, freedom) {
             return Err(Shortfall::BelowBar {
                 standard_errors: standard_errors.abs(),
-                required,
+                required: haircut.required_standard_errors(freedom),
             });
         }
         // A single test's width, so a retry raises the bar above without widening what counts as accurate.
         let half_width = Haircut::new(NonZeroU32::MIN).required_standard_errors(freedom)
             * self.recovered.standard_error();
-        let (lower, upper, expected) = (mean - half_width, mean + half_width, self.expected());
+        let (lower, upper, expected) = (
+            reading(mean - half_width),
+            reading(mean + half_width),
+            self.expected(),
+        );
         match (lower..=upper).contains(&expected) {
             true => Ok(()),
             false => Err(Shortfall::Inaccurate {
@@ -304,7 +344,7 @@ mod tests {
         let below = [Some(0.5), Some(1.0), Some(-0.5), Some(1.0), Some(0.0)];
         match recovery(20.0, &below, &NULL).admits() {
             Err(Shortfall::WrongDirection { recovered }) => {
-                assert!((recovered + 1.6).abs() < 1e-9, "{recovered}");
+                assert!((recovered.value() + 1.6).abs() < 1e-9, "{recovered}");
             }
             other => panic!("{other:?}"),
         }
@@ -320,8 +360,11 @@ mod tests {
                 lower,
                 upper,
             }) => {
-                assert_eq!(expected, 40.0);
-                assert!(lower > 3.0 && upper < 5.0, "{lower} to {upper}");
+                assert_eq!(expected, SignedBasisPoints::new(40.0).unwrap());
+                assert!(
+                    lower.value() > 3.0 && upper.value() < 5.0,
+                    "{lower} to {upper}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -362,7 +405,7 @@ mod tests {
     fn test_an_arm_expecting_its_reading_to_fall_is_admitted_only_on_a_fall() {
         let fall = shifted(&NULL, &[-19.5, -20.5, -20.0, -19.75, -20.25]);
         let falling = attempted(20.0, Direction::Falls, 1, &fall, &NULL);
-        assert_eq!(falling.expected(), -20.0);
+        assert_eq!(falling.expected(), SignedBasisPoints::new(-20.0).unwrap());
         assert_eq!(falling.admits(), Ok(()));
         assert!((falling.share().unwrap() - 1.0).abs() < 1e-9);
         assert!(matches!(
@@ -380,6 +423,21 @@ mod tests {
                 standard_errors, ..
             }) => assert!((standard_errors - 10.0 / 8f64.sqrt()).abs() < 1e-9),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_signed_reading_refuses_only_what_is_not_finite() {
+        assert_eq!(SignedBasisPoints::new(-1.5).unwrap().value(), -1.5);
+        assert!(
+            SignedBasisPoints::new(-0.0)
+                .unwrap()
+                .value()
+                .is_sign_positive()
+        );
+        assert_eq!(SignedBasisPoints::new(-2.0).unwrap().to_string(), "-2bp");
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(SignedBasisPoints::new(value).is_err(), "{value}");
         }
     }
 
