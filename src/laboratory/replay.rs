@@ -2,7 +2,7 @@
 //! decision interval and the opening cash among its parameters.
 
 use crate::common::book::{Book, Cash};
-use crate::common::laboratory::cost::{BasisPoints, CostRefusal};
+use crate::common::cost::{BasisPoints, CostRefusal};
 use crate::common::laboratory::estimate::EstimateRefusal;
 use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs, Parameters};
 use crate::common::laboratory::series::SeriesRefusal;
@@ -310,9 +310,9 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::guard::Tradability;
     use crate::common::journal::{Observation, ReadLine, RunId, read};
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::Label;
     use crate::common::market::Symbol;
     use crate::common::market::record::BarInterval;

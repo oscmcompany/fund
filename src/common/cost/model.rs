@@ -160,38 +160,31 @@ impl PricedCost {
     }
 }
 
-/// The cost of filling with `liquidity` under `fees`, its execution estimate read from `basis`.
+/// The cost of a fill under `fees`, its execution estimate read from `basis`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostModel {
     basis: CostBasis,
-    liquidity: Liquidity,
     fees: FeeRegime,
 }
 
 impl CostModel {
-    pub fn new(basis: CostBasis, liquidity: Liquidity, fees: FeeRegime) -> Self {
-        Self {
-            basis,
-            liquidity,
-            fees,
-        }
-    }
-
-    pub fn liquidity(&self) -> Liquidity {
-        self.liquidity
+    pub fn new(basis: CostBasis, fees: FeeRegime) -> Self {
+        Self { basis, fees }
     }
 
     pub fn fees(&self) -> FeeRegime {
         self.fees
     }
 
-    /// A share of `symbol` filled on `side` at `price` while the book quotes `spread`.
+    /// A share of `symbol` filled on `side` at `price`, taking or resting per `liquidity`, while the book quotes
+    /// `spread`.
     pub fn price(
         &self,
         symbol: &Symbol,
         spread: Spread,
         price: Price,
         side: Side,
+        liquidity: Liquidity,
     ) -> Result<PricedCost, PricingRefusal> {
         let estimate = match &self.basis {
             CostBasis::ByName(estimates) => {
@@ -207,7 +200,7 @@ impl CostModel {
         Ok(PricedCost {
             point: estimate
                 .point
-                .plus(self.fees.per_share(self.liquidity, side, price)?)?,
+                .plus(self.fees.per_share(liquidity, side, price)?)?,
             floor: estimate.error,
         })
     }
@@ -219,7 +212,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use crate::common::laboratory::cost::fees::{PassThroughSchedule, RegulatoryFees};
+    use crate::common::cost::fees::{PassThroughSchedule, RegulatoryFees};
     use crate::common::market::{Dollars, PRICE_SCALE};
 
     fn per_share(millionths: i64) -> PerShare {
@@ -298,18 +291,29 @@ mod tests {
     fn test_a_name_outside_the_map_is_unpriced_rather_than_free() {
         let model = CostModel::new(
             CostBasis::ByName(BTreeMap::from([(symbol("AAPL"), estimate(4_000, 500))])),
-            Liquidity::Removing,
             free(),
         );
         let priced = model
-            .price(&symbol("AAPL"), spread(10_000), price(), Side::Buy)
+            .price(
+                &symbol("AAPL"),
+                spread(10_000),
+                price(),
+                Side::Buy,
+                Liquidity::Removing,
+            )
             .unwrap();
         assert_eq!(
             (priced.point(), priced.floor()),
             (per_share(4_000), per_share(500))
         );
         assert_eq!(
-            model.price(&symbol("MSFT"), spread(10_000), price(), Side::Buy),
+            model.price(
+                &symbol("MSFT"),
+                spread(10_000),
+                price(),
+                Side::Buy,
+                Liquidity::Removing
+            ),
             Err(PricingRefusal::Unpriced {
                 symbol: symbol("MSFT")
             })
@@ -326,26 +330,23 @@ mod tests {
             regulatory,
             schedule,
         };
-        let removing = CostModel::new(
-            CostBasis::BySpreadDecile(Box::new(deciles())),
-            Liquidity::Removing,
-            fees,
-        );
-        let adding = CostModel::new(
-            CostBasis::BySpreadDecile(Box::new(deciles())),
-            Liquidity::Adding,
-            fees,
-        );
+        let model = CostModel::new(CostBasis::BySpreadDecile(Box::new(deciles())), fees);
         // Decile 2's 2 cents, plus 5,000 removing or less 500 adding, plus a $50 sale's 600 levy.
-        let sold = |model: &CostModel| {
+        let sold = |liquidity: Liquidity| {
             model
-                .price(&symbol("AAPL"), spread(15_000), price(), Side::Sell)
+                .price(
+                    &symbol("AAPL"),
+                    spread(15_000),
+                    price(),
+                    Side::Sell,
+                    liquidity,
+                )
                 .unwrap()
         };
-        assert_eq!(sold(&removing).point(), per_share(25_600));
-        assert_eq!(sold(&adding).point(), per_share(20_100));
-        assert_eq!(sold(&removing).floor(), per_share(2_000));
-        assert_eq!(sold(&adding).floor(), per_share(2_000));
+        assert_eq!(sold(Liquidity::Removing).point(), per_share(25_600));
+        assert_eq!(sold(Liquidity::Adding).point(), per_share(20_100));
+        assert_eq!(sold(Liquidity::Removing).floor(), per_share(2_000));
+        assert_eq!(sold(Liquidity::Adding).floor(), per_share(2_000));
     }
 
     #[test]
@@ -376,13 +377,18 @@ mod tests {
         let bound = 10_000_000_000_000;
         let model = CostModel::new(
             CostBasis::ByName(BTreeMap::from([(symbol("AAPL"), estimate(bound, 0))])),
-            Liquidity::Removing,
             FeeRegime::CommissionFree {
                 regulatory: RegulatoryFees::new(Dollars::from_millionths(0), per_share(1)).unwrap(),
             },
         );
         assert_eq!(
-            model.price(&symbol("AAPL"), spread(10_000), price(), Side::Sell),
+            model.price(
+                &symbol("AAPL"),
+                spread(10_000),
+                price(),
+                Side::Sell,
+                Liquidity::Removing
+            ),
             Err(PricingRefusal::OutOfRange(PerShareRefusal {
                 millionths: bound + 1
             }))

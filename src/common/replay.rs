@@ -8,10 +8,10 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
+use crate::common::cost::{BasisPoints, CostRefusal, FillStyle, RoundTrip};
 use crate::common::guard::{
     GuardCause, OrderGuarded, Tradability, TradabilityRead, Unclosed, guard,
 };
-use crate::common::laboratory::cost::{BasisPoints, CostRefusal, FillStyle, RoundTrip};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState, Staleness};

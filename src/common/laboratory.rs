@@ -4,7 +4,6 @@
 pub mod attribution;
 pub mod blocks;
 pub mod calibration;
-pub mod cost;
 pub mod dataset;
 pub mod estimate;
 pub mod experiment;
