@@ -3,6 +3,7 @@
 
 pub mod compare;
 pub mod dataset;
+pub mod recovery;
 pub mod registry;
 pub mod replay;
 pub mod risk_free;
@@ -21,7 +22,8 @@ use uuid::Uuid;
 use crate::common::journal::{Observation, RunId};
 use crate::common::laboratory::dataset::Fingerprint;
 use crate::common::laboratory::experiment::{
-    DatasetRead, Elapsed, ExperimentRan, Label, Machine, Name, Outputs, Parameters, SourceDigest,
+    DatasetRead, Elapsed, ExperimentRan, ExperimentRefusal, Label, Machine, Name, Outputs,
+    Parameters, SourceDigest,
 };
 use crate::common::laboratory::verdict::{
     Bar, Outcome, Question, QuestionDeclared, VerdictReached,
@@ -29,7 +31,7 @@ use crate::common::laboratory::verdict::{
 use crate::common::storage::{Host, JournalKey, Key, NoteKey, NoteName, ObjectKey, SourceKey};
 use crate::common::time::SessionDate;
 use crate::journal::{Journal, file_name};
-use crate::laboratory::dataset::Lineage;
+use crate::laboratory::dataset::{Lineage, Origin};
 use crate::laboratory::source::{Source, digest_of};
 use crate::records::{RESHIPPED_DAYS, ShipFailure, contents, merge_into};
 use crate::storage::{Bucket, BucketError};
@@ -56,6 +58,9 @@ pub enum StudyError {
     /// The dataset was read by another run, whose journal holds its `dataset_read`.
     #[error("the dataset was read by run {run}, not this one")]
     ReadByAnotherRun { run: RunId },
+    /// A parameter shares its name with one a synthetic dataset's specification is journaled under.
+    #[error("{0}")]
+    Parameters(ExperimentRefusal),
 }
 
 impl Study {
@@ -125,7 +130,8 @@ impl Study {
     }
 
     /// Journals one experiment over the datasets `lineages` came from, which only the loader builds, so the record
-    /// names exactly what was read; refused for a dataset another run read.
+    /// names exactly what was read, and each synthetic dataset's specification, universe and sessions under
+    /// `synthetic.<index>.`, counting synthetic datasets in order; refused for a dataset another run read.
     pub fn experiment(
         &mut self,
         parameters: Parameters,
@@ -138,14 +144,56 @@ impl Study {
         {
             return Err(StudyError::ReadByAnotherRun { run: lineage.run() });
         }
+        let (mut fingerprints, mut synthetic, mut index) = (Vec::new(), Vec::new(), 0);
+        for lineage in lineages {
+            match lineage.origin() {
+                Origin::Archive(fingerprint) => fingerprints.push(fingerprint.clone()),
+                Origin::Synthetic {
+                    specification,
+                    universe,
+                    sessions,
+                } => {
+                    let prefix = format!("synthetic.{index}");
+                    index += 1;
+                    let universe = universe
+                        .iter()
+                        .map(|symbol| symbol.as_str())
+                        .collect::<Vec<_>>();
+                    let sessions = sessions
+                        .iter()
+                        .map(|session| {
+                            format!("{} {}-{}", session.date(), session.open(), session.close())
+                        })
+                        .collect::<Vec<_>>();
+                    synthetic.extend(
+                        specification
+                            .parameters()
+                            .settings()
+                            .iter()
+                            .map(|(name, value)| {
+                                (format!("{prefix}.{}", name.as_str()), value.clone())
+                            })
+                            .chain([
+                                (format!("{prefix}.universe"), universe.join(",")),
+                                (format!("{prefix}.sessions"), sessions.join(",")),
+                            ]),
+                    );
+                }
+            }
+        }
+        let parameters = Parameters::new(
+            parameters
+                .settings()
+                .iter()
+                .map(|(name, value)| (name.as_str().to_string(), value.clone()))
+                .chain(synthetic),
+        )
+        .map_err(StudyError::Parameters)?;
         let ran = ExperimentRan::new(
             self.label.clone(),
             self.machine.clone(),
             parameters,
-            lineages
-                .iter()
-                .map(|lineage| lineage.fingerprint().clone())
-                .collect(),
+            fingerprints,
             outputs,
             Elapsed::from_milliseconds(
                 u64::try_from(self.opened.elapsed().as_millis()).unwrap_or(u64::MAX),
