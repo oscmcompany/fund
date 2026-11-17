@@ -9,6 +9,7 @@ use crate::common::learning::boosting::tree::{Grower, Node, Tree};
 use crate::common::learning::boosting::{Fraction, Penalty};
 use crate::common::learning::loss::{Label, Loss, Prediction, Score};
 use crate::common::learning::matrix::{Input, Matrix, Sample};
+use crate::common::learning::registry::stored::{Sealed, Stored};
 use crate::common::monoid::{Fold, Monoid, Sequence};
 
 /// Trees in the order they were fit; combining concatenates, and a combination scores the sum of the parts' scores.
@@ -98,8 +99,8 @@ pub struct WidthError {
 }
 
 /// A fitted model: the loss it descended, the constant it starts from, and the trees that correct it.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "Parts", into = "Parts")]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(into = "Parts")]
 pub struct Booster {
     loss: Loss,
     width: usize,
@@ -301,6 +302,16 @@ impl TryFrom<Parts> for Booster {
     }
 }
 
+impl Stored for Booster {
+    fn read<'de, D: serde::Deserializer<'de>>(
+        _sealed: Sealed,
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let parts: Parts = serde::Deserialize::deserialize(deserializer)?;
+        Self::try_from(parts).map_err(serde::de::Error::custom)
+    }
+}
+
 impl From<Booster> for Parts {
     fn from(
         Booster {
@@ -408,6 +419,12 @@ mod tests {
             rounds: 200,
             patience: NonZeroUsize::new(20).unwrap(),
         }
+    }
+
+    fn restore(text: &str) -> Result<Booster, serde_json::Error> {
+        crate::common::learning::registry::stored::read(&mut serde_json::Deserializer::from_str(
+            text,
+        ))
     }
 
     fn predicted(booster: &Booster, matrix: &Matrix) -> Vec<f64> {
@@ -779,18 +796,18 @@ mod tests {
         .unwrap();
         assert!(booster.rounds() > 0);
         let text = serde_json::to_string(&booster).unwrap();
-        let read = serde_json::from_str::<Booster>(&text).unwrap();
+        let read = restore(&text).unwrap();
         assert_eq!(read, booster);
         let matrix = Matrix::new(&values, NonZeroUsize::new(2).unwrap()).unwrap();
         assert_eq!(read.predict(&matrix), booster.predict(&matrix));
         let stored = r#"{"loss":"SquaredError","width":1,"base":0.5,"ensemble":[[{"Split":{"input":0,"threshold":1.5,"missing_left":true,"gain":2.0,"left":1,"right":2}},{"Leaf":{"value":-0.25}},{"Leaf":{"value":0.25}}]]}"#;
-        let read = serde_json::from_str::<Booster>(stored).unwrap();
+        let read = restore(stored).unwrap();
         assert_eq!(serde_json::to_string(&read).unwrap(), stored);
         let matrix = Matrix::new(&[1.0, 2.0], NonZeroUsize::MIN).unwrap();
         assert_eq!(predicted(&read, &matrix), [0.25, 0.75]);
         let narrowed = text.replacen(r#""width":2"#, r#""width":1"#, 1);
         assert!(
-            serde_json::from_str::<Booster>(&narrowed)
+            restore(&narrowed)
                 .unwrap_err()
                 .to_string()
                 .contains("of rows 1 wide")
@@ -818,8 +835,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let read: Booster =
-            serde_json::from_str(&serde_json::to_string(&booster).unwrap()).unwrap();
+        let read = restore(&serde_json::to_string(&booster).unwrap()).unwrap();
         let matrix = Matrix::new(&values, NonZeroUsize::MIN).unwrap();
         for predictions in [predicted(&booster, &matrix), predicted(&read, &matrix)] {
             let rounded: Vec<f64> = predictions.iter().map(|value| value.round()).collect();
