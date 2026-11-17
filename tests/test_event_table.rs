@@ -1,6 +1,7 @@
 //! The event table's statements run by a real `duckdb` over synthetic ticks laid out as scratch and the archive hold
-//! them, so the draw, the read delay and the session's bounds are read off the rows written rather than off the SQL text.
+//! them, so the draw, the read delay, the session's bounds and what a print may set are read off the rows written.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 use std::path::Path;
 use std::process::Command;
@@ -8,25 +9,35 @@ use std::process::Command;
 use chrono::{NaiveDate, NaiveTime};
 use fund::common::journal::RunId;
 use fund::common::laboratory::event_table::{
-    DRAW_ORDER_MACROS, Draws, EntryWindow, EventClock, EventTable, ReadDelay, draw_order, draw_seed,
+    DRAW_ORDER_MACROS, Draws, EntryWindow, EventClock, EventTable, EventTableRefusal, ReadDelay,
+    draw_order, draw_seed,
 };
 use fund::common::laboratory::universe::{Universe, UniverseSize, universe};
 use fund::common::market::aggregate::TradeTotals;
-use fund::common::market::record::BarInterval;
+use fund::common::market::record::{BarInterval, Partition};
 use fund::common::market::security_details::{SecurityDetails, SecurityType};
-use fund::common::market::trade_bars::{TradeBar, TradeSums};
-use fund::common::market::{DollarVolume, Price, Shares, Symbol, TradeCount};
+use fund::common::market::trade_bars::{
+    Condition, ConditionCode, ConditionLetter, ConditionStatus, HighLow, OpenClose, TradeBar,
+    TradeConditions, TradeSums, UpdateRules,
+};
+use fund::common::market::{DollarVolume, Price, Shares, StampedPrice, Symbol, TradeCount};
 use fund::common::storage::{Key, Provider, ReferenceKey, ReferenceTable, TickProvider, TradesKey};
 use fund::common::time::calendar::{TradingCalendar, TradingSession};
 use fund::common::time::{SessionDate, SessionRange};
 use fund::storage::provenance::{Provenance, Subscription};
-use fund::storage::reference::{decode_details_snapshot, encode_security_details};
+use fund::storage::reference::{
+    decode_details_snapshot, encode_conditions, encode_security_details,
+};
+use fund::storage::trade_bars;
 use proptest::prelude::*;
 use uuid::Uuid;
 
 fn date(month: u32, day: u32) -> SessionDate {
     SessionDate::from_date(NaiveDate::from_ymd_opt(2025, month, day).unwrap())
 }
+
+/// The conditions snapshot every run reads, taken the Friday before the session.
+const CONDITIONS_AS_OF: (u32, u32) = (6, 13);
 
 /// Every weekday from March to June 2025, trading 09:30 to 16:00 Eastern.
 fn calendar() -> TradingCalendar {
@@ -39,6 +50,22 @@ fn calendar() -> TradingCalendar {
             .map(|day| TradingSession::new(day, at(9, 30), at(16, 0)).unwrap())
             .collect();
     TradingCalendar::new(sessions, range).unwrap()
+}
+
+fn provenance(subscription: Subscription) -> Provenance {
+    Provenance::new(
+        subscription,
+        "2025-06-13T22:00:00Z".parse().unwrap(),
+        RunId::new(Uuid::from_u128(1)),
+        None,
+    )
+}
+
+fn subscription(provider: TickProvider) -> Subscription {
+    match provider {
+        TickProvider::Massive => Subscription::StocksAdvanced,
+        TickProvider::Alpaca => Subscription::AlgoTraderPlus,
+    }
 }
 
 /// AAA and BBB, two common stocks traded in May, as 2025-06-16's universe, described by a snapshot read back from
@@ -79,13 +106,8 @@ fn named() -> Universe {
         ReferenceTable::SecurityDetails,
         date(6, 13),
     );
-    let provenance = Provenance::new(
-        Subscription::StocksAdvanced,
-        "2025-06-13T22:00:00Z".parse().unwrap(),
-        RunId::new(Uuid::from_u128(1)),
-        None,
-    );
-    let written = encode_security_details(&key, &details, &provenance).unwrap();
+    let written =
+        encode_security_details(&key, &details, &provenance(Subscription::StocksAdvanced)).unwrap();
     let (snapshot, _) = decode_details_snapshot(&key, written).unwrap();
     universe(
         date(6, 16),
@@ -97,65 +119,253 @@ fn named() -> Universe {
     .unwrap()
 }
 
-/// Massive's daily bars of every weekday from March to the Friday before 2025-06-16.
-fn daily_bars() -> Vec<TradesKey> {
+/// `provider`'s daily bars of every weekday from its first to the Friday before 2025-06-16: Massive's from March,
+/// Alpaca's from mid-April.
+fn daily_bars(provider: TickProvider) -> Vec<TradesKey> {
+    let first = match provider {
+        TickProvider::Massive => date(3, 3),
+        TickProvider::Alpaca => date(4, 14),
+    };
     calendar()
-        .trading_days_in_range(SessionRange::new(date(3, 3), date(6, 13)).unwrap())
+        .trading_days_in_range(SessionRange::new(first, date(6, 13)).unwrap())
         .into_iter()
-        .map(|day| TradesKey::new(Provider::Massive, BarInterval::OneDay, day))
+        .map(|day| TradesKey::new(provider.provider(), BarInterval::OneDay, day))
         .collect()
 }
 
+/// The days Alpaca's daily files lack SPY, one inside the lookback and the session before.
+const SPY_ABSENT: [(u32, u32); 2] = [(5, 14), (6, 13)];
+
+/// Each of `daily_bars(provider)` as the archive's writer encodes it, every name closing at 100 plus the day's index
+/// at 16:00 Eastern, and Alpaca's without SPY on `SPY_ABSENT`.
+fn write_daily_bars(directory: &Path, provider: TickProvider) {
+    for (index, key) in daily_bars(provider).into_iter().enumerate() {
+        let day = key.session();
+        let absent = SPY_ABSENT.map(|(month, day)| date(month, day));
+        let bars: Vec<TradeBar> = ["AAA", "BBB", "SPY", "QQQ"]
+            .into_iter()
+            .filter(|raw| match provider {
+                TickProvider::Massive => true,
+                TickProvider::Alpaca => !(*raw == "SPY" && absent.contains(&day)),
+            })
+            .map(|raw| {
+                let close = Price::from_dollars(100.0 + index as f64).unwrap();
+                let shares = Shares::whole(1000).unwrap();
+                let stamped = StampedPrice::new(day.regular_close(), close);
+                TradeBar::new(
+                    Symbol::new(raw).unwrap(),
+                    BarInterval::OneDay,
+                    day.regular_close(),
+                    TradeSums::new(
+                        TradeTotals::new(
+                            TradeCount::new(10),
+                            shares,
+                            DollarVolume::of(close, shares),
+                        ),
+                        Some(OpenClose::new(stamped, stamped).unwrap()),
+                        Some(HighLow::new(close, close).unwrap()),
+                    ),
+                )
+                .unwrap()
+            })
+            .collect();
+        let written = trade_bars::encode(
+            &key,
+            &Partition::try_from(bars).unwrap(),
+            &provenance(subscription(provider)),
+        )
+        .unwrap();
+        let file = directory.join(Key::from(key).path());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, written).unwrap();
+    }
+}
+
+/// A conditions snapshot as the archive's writer encodes it, modeled on Massive's: F a sweep that sets prices, I an
+/// odd lot that does not beside a retired I that did, T an extended-hours print, X a current letter whose retired twin
+/// disagrees, and Z two current conditions that disagree.
+fn write_conditions(directory: &Path) {
+    let rules = |volume, high_low, open_close| UpdateRules {
+        volume,
+        high_low,
+        open_close,
+    };
+    let letter = |spelled: &str| Some(ConditionLetter::new(spelled).unwrap());
+    let conditions: BTreeMap<ConditionCode, Condition> = [
+        (
+            14,
+            rules(true, true, true),
+            letter("F"),
+            letter("F"),
+            ConditionStatus::Current,
+        ),
+        (
+            37,
+            rules(true, false, false),
+            letter("I"),
+            letter("I"),
+            ConditionStatus::Current,
+        ),
+        (
+            6,
+            rules(true, true, true),
+            letter("I"),
+            None,
+            ConditionStatus::Retired,
+        ),
+        (
+            12,
+            rules(true, false, false),
+            letter("T"),
+            letter("T"),
+            ConditionStatus::Current,
+        ),
+        (
+            9,
+            rules(true, true, true),
+            letter("X"),
+            letter("X"),
+            ConditionStatus::Current,
+        ),
+        (
+            61,
+            rules(true, false, false),
+            letter("X"),
+            None,
+            ConditionStatus::Retired,
+        ),
+        (
+            32,
+            rules(true, true, false),
+            letter("Z"),
+            letter("Z"),
+            ConditionStatus::Current,
+        ),
+        (
+            60,
+            rules(true, true, true),
+            letter("Z"),
+            None,
+            ConditionStatus::Current,
+        ),
+    ]
+    .into_iter()
+    .map(|(code, rules, consolidated, unlisted, status)| {
+        (
+            ConditionCode::new(code),
+            Condition::new(rules, consolidated, unlisted, status),
+        )
+    })
+    .collect();
+    let (month, day) = CONDITIONS_AS_OF;
+    let key = ReferenceKey::new(
+        Provider::Massive,
+        ReferenceTable::Conditions,
+        date(month, day),
+    );
+    let written = encode_conditions(
+        &key,
+        &TradeConditions::new(conditions),
+        &provenance(Subscription::StocksAdvanced),
+    )
+    .unwrap();
+    let file = directory.join(Key::from(key).path());
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, written).unwrap();
+}
+
+/// Whether AAA also prints the probes of what may set the high, at 13:50 UTC; they shift its later print numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probes {
+    Without,
+    With,
+}
+
 /// Quotes every 2 seconds and prints every 3, from 13:30:00 and 13:30:01 UTC, for AAA, BBB, SPY and QQQ over
-/// 2025-06-16's regular hours, the mid rising a tenth of a cent a quote, and a daily close for each of `daily_bars`,
-/// all under `directory` as scratch and the archive lay them out.
-fn fixture(directory: &Path) -> String {
-    let quotes = directory.join("scratch/kind=quotes/provider=massive/session=2025-06-16");
-    let trades = directory.join("scratch/kind=trades/provider=massive/session=2025-06-16");
+/// 2025-06-16's regular hours in `provider`'s cleaned spelling, the mid rising a tenth of a cent a quote, with the
+/// conditions snapshot and `provider`'s daily bars, all under `directory` as scratch and the archive lay them out.
+fn fixture(directory: &Path, provider: TickProvider, probes: Probes) -> String {
+    let quotes = directory.join(format!(
+        "scratch/kind=quotes/provider={provider}/session=2025-06-16"
+    ));
+    let trades = directory.join(format!(
+        "scratch/kind=trades/provider={provider}/session=2025-06-16"
+    ));
     for folder in [&quotes, &trades, &directory.join("table")] {
         std::fs::create_dir_all(folder).unwrap();
     }
-    let mut script = format!(
+    write_conditions(directory);
+    write_daily_bars(directory, provider);
+    // Each probe: seconds after 13:50:00, price, and how the provider spells its conditions and correction.
+    let (quote_columns, grid_trade_columns, probe_trades) = match provider {
+        TickProvider::Massive => (
+            "TIMESTAMP_NS '2025-06-16 13:30:00' + to_seconds(2 * step) AS sip_timestamp,
+        100 + 0.001 * step - 0.01 AS bid_price, 100 + 0.001 * step + 0.01 AS ask_price,
+        100.0 AS bid_size, 200.0 AS ask_size",
+            "TIMESTAMP_NS '2025-06-16 13:30:01' + to_seconds(3 * step) AS sip_timestamp,
+        100 + 0.0015 * step AS price, 100.0 AS size, '' AS conditions, NULL::VARCHAR AS correction,
+        CASE WHEN step % 2 = 0 THEN '4' ELSE '11' END AS exchange",
+            "SELECT 'AAA', TIMESTAMP_NS '2025-06-16 13:50:00' + to_seconds(seconds), price, 100.0, conditions, correction, '11'
+    FROM (VALUES (0.5, 130, '14', NULL), (1.5, 135, '6', NULL), (2.5, 150, '37', NULL), (3.5, 160, '14', '1'),
+        (4.5, 170, '14,99', NULL), (5.5, 180, '', '10')) AS probes(seconds, price, conditions, correction)",
+        ),
+        TickProvider::Alpaca => (
+            "TIMESTAMP_NS '2025-06-16 13:30:00' + to_seconds(2 * step) AS timestamp,
+        (100 + 0.001 * step - 0.01)::DECIMAL(18, 6) AS bid_price, 100::DECIMAL(20, 6) AS bid_size,
+        (100 + 0.001 * step + 0.01)::DECIMAL(18, 6) AS ask_price, 200::DECIMAL(20, 6) AS ask_size,
+        'Q' AS bid_exchange, 'P' AS ask_exchange, ['R'] AS conditions, 'A' AS tape",
+            "TIMESTAMP_NS '2025-06-16 13:30:01' + to_seconds(3 * step) AS timestamp,
+        (100 + 0.0015 * step)::DECIMAL(18, 6) AS price, 100::DECIMAL(20, 6) AS size,
+        CASE step % 3 WHEN 0 THEN [' '] WHEN 1 THEN [' ', 'F'] ELSE ['@'] END AS conditions,
+        CASE WHEN step % 2 = 0 THEN 'D' ELSE 'N' END AS exchange,
+        CASE step % 3 WHEN 0 THEN 'A' WHEN 1 THEN 'B' ELSE 'C' END AS tape,
+        step::UBIGINT AS id, NULL::VARCHAR AS \"update\"",
+            "SELECT 'AAA', TIMESTAMP_NS '2025-06-16 13:50:00' + to_seconds(seconds), price::DECIMAL(18, 6),
+        100::DECIMAL(20, 6), conditions, 'N', tape, (100000 + price)::UBIGINT, \"update\"
+    FROM (VALUES (0.5, 130, [' ', 'X'], 'A', NULL), (1.5, 135, [' '], 'B', 'incorrect'), (2.5, 140, []::VARCHAR[], 'C', NULL),
+        (3.5, 150, [' ', 'I'], 'A', NULL), (4.5, 160, [' '], 'B', 'canceled'), (5.5, 170, [' ', 'Z'], 'A', NULL),
+        (6.5, 175, ['@', 'T'], 'C', NULL), (7.5, 180, [' ', 'F'], 'B', 'corrected'), (8.5, 145, ['@', 'Q'], 'C', NULL),
+        (9.5, 190, [' ', NULL], 'A', NULL))
+        AS probes(seconds, price, conditions, tape, \"update\")",
+        ),
+    };
+    let probe_trades = match probes {
+        Probes::Without => String::new(),
+        Probes::With => format!("UNION ALL {probe_trades}"),
+    };
+    format!(
         "SET TimeZone='UTC';
 SET VARIABLE scratch = '{scratch}';
 SET VARIABLE archive = '{archive}';
-CREATE MACRO eligible(conditions, correction) AS true;
 CREATE TEMP TABLE names AS SELECT * FROM (VALUES ('AAA'), ('BBB'), ('SPY'), ('QQQ')) AS names(ticker);
-COPY (SELECT ticker, TIMESTAMP_NS '2025-06-16 13:30:00' + to_seconds(2 * step) AS sip_timestamp,
-        100 + 0.001 * step - 0.01 AS bid_price, 100 + 0.001 * step + 0.01 AS ask_price,
-        100.0 AS bid_size, 200.0 AS ask_size
-    FROM names, range(11700) AS steps(step)) TO '{quotes}/data.parquet';
-COPY (SELECT ticker, TIMESTAMP_NS '2025-06-16 13:30:01' + to_seconds(3 * step) AS sip_timestamp,
-        100 + 0.0015 * step AS price, 100.0 AS size, '' AS conditions, NULL::VARCHAR AS correction,
-        CASE WHEN step % 2 = 0 THEN '4' ELSE '11' END AS exchange
-    FROM names, range(7800) AS steps(step)) TO '{trades}/data.parquet';
+COPY (SELECT ticker, {quote_columns} FROM names, range(11700) AS steps(step)) TO '{quotes}/data.parquet';
+COPY (SELECT ticker, {grid_trade_columns} FROM names, range(7800) AS steps(step) {probe_trades})
+    TO '{trades}/data.parquet';
 ",
         scratch = directory.join("scratch").display(),
         archive = directory.display(),
         quotes = quotes.display(),
         trades = trades.display(),
-    );
-    for (index, key) in daily_bars().into_iter().enumerate() {
-        let file = directory.join(Key::from(key).path());
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        script.push_str(&format!(
-            "COPY (SELECT ticker AS symbol, TIMESTAMPTZ '{} 20:00:00+00' AS closed_at, 100.0 + {index} AS close FROM names)
-    TO '{}';\n",
-            key.session(),
-            file.display()
-        ));
-    }
-    script
+    )
 }
 
-/// Runs `table`'s statements over the fixture, then `query`, and returns duckdb's output.
-fn run(table: EventTable, query: &str) -> (String, String) {
+/// Runs `table`'s statements over `provider`'s fixture, then `query`, and returns duckdb's output.
+fn run(table: EventTable, provider: TickProvider, probes: Probes, query: &str) -> (String, String) {
     let directory = std::env::temp_dir().join(format!("fund-event-table-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
+    let (month, day) = CONDITIONS_AS_OF;
     let statements = table
-        .statements(&calendar(), &named(), &daily_bars())
+        .statements(
+            &calendar(),
+            &named(),
+            &daily_bars(provider),
+            date(month, day),
+        )
         .unwrap();
-    let script = format!("{}{statements}{query}", fixture(&directory));
+    let script = format!(
+        "{}{statements}{query}",
+        fixture(&directory, provider, probes)
+    );
     let output = Command::new("duckdb")
         .current_dir(&directory)
         .args(["-csv", "-noheader", "-c", &script])
@@ -168,9 +378,9 @@ fn run(table: EventTable, query: &str) -> (String, String) {
     )
 }
 
-/// Runs `clock`'s statements over the fixture, drawing from minutes 100 to 110, and returns duckdb's output: per kind
-/// the rows, names, read delays seen at the quote, whether every one-minute target rose and whether every draw lies
-/// in the window; then the universe's count, how many of the checked columns exist, and the beta's day count.
+/// Runs `clock`'s statements over the Massive fixture, drawing from minutes 100 to 110, and returns duckdb's output:
+/// per kind the rows, names, read delays seen at the quote, whether every one-minute target rose and whether every
+/// draw lies in the window; then the universe's count, how many of the checked columns exist, and the daily features.
 fn built(clock: EventClock) -> (String, String) {
     let table = EventTable::new(
         TickProvider::Massive,
@@ -181,6 +391,8 @@ fn built(clock: EventClock) -> (String, String) {
     );
     run(
         table,
+        TickProvider::Massive,
+        Probes::Without,
         "
 SELECT kind, count(*), count(DISTINCT ticker), min(screen_quote_age), max(screen_quote_age), bool_and(raw_1 > 0),
     min(minutes_since_open) >= 100, max(minutes_since_open) < 110.01
@@ -217,6 +429,118 @@ fn test_the_print_clock_draws_prints() {
     assert_eq!(lines[1..], ["2", "1", "57.8035,60"], "{stdout}");
 }
 
+/// Alpaca's ticks and daily bars, in Alpaca's spelling and with no Massive file on disk, build the table: the
+/// lookback runs from Alpaca's first bar, 45 closes, and the Friday's return, 144 over 143, is read although SPY's
+/// close of that day is absent; beta reads only the 41 days whose returns span the same two closes as SPY's, so SPY's
+/// hole on 2025-05-14 drops that day and the next.
+#[test]
+fn test_alpaca_ticks_and_daily_bars_build_the_table() {
+    let table = EventTable::new(
+        TickProvider::Alpaca,
+        EventClock::QuoteUpdates,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(3).unwrap()),
+        EntryWindow::new(100, 110).unwrap(),
+    );
+    let (stdout, stderr) = run(
+        table,
+        TickProvider::Alpaca,
+        Probes::Without,
+        "
+SELECT kind, count(*), count(DISTINCT ticker), min(screen_quote_age), max(screen_quote_age), bool_and(raw_1 > 0),
+    round(min(previous_return), 4), round(max(previous_return), 4), min(beta_days), max(beta_days),
+    count(daily_volatility_20), round(min(beta), 6), round(max(beta), 6)
+FROM 'table/rows_alpaca_2025-06-16.parquet' GROUP BY kind;
+",
+    );
+    assert_eq!(
+        stdout, "quote,6,2,0.5,0.5,true,69.9301,69.9301,41,41,6,1.0,1.0\n",
+        "{stderr}"
+    );
+}
+
+/// Alpaca's letters decide per tape what may set the high: a regular sale with no letter or a current letter whose
+/// retired twin disagrees sets it, as does the record replacing a correction; an odd lot, an ambiguous, unknown or
+/// missing letter and an extended-hours print do not; a corrected or canceled print is left out entirely.
+#[test]
+fn test_alpaca_letters_decide_what_sets_the_high() {
+    let table = EventTable::new(
+        TickProvider::Alpaca,
+        EventClock::Prints,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(3).unwrap()),
+        EntryWindow::new(100, 110).unwrap(),
+    );
+    let (stdout, stderr) = run(
+        table,
+        TickProvider::Alpaca,
+        Probes::With,
+        "
+SELECT string_agg(price::INTEGER || ':' || eligible, ' ' ORDER BY timestamp) FROM signed
+WHERE ticker = 'AAA' AND price >= 120;
+SELECT count(*) FILTER (WHERE ticker = 'AAA'), count(*) FILTER (WHERE ticker = 'BBB') FROM signed;
+SELECT max(session_high) FROM trade_events WHERE ticker = 'AAA';
+",
+    );
+    assert_eq!(
+        stdout,
+        "130:true 135:true 140:true 150:false 170:false 175:false 145:false 190:false\n7808,7800\n140.0\n",
+        "{stderr}"
+    );
+}
+
+/// Massive's codes decide the same: a sweep or a retired code that set prices sets it, an odd lot or an unknown code
+/// does not, and a print its correction withdraws is left out.
+#[test]
+fn test_massive_codes_decide_what_sets_the_high() {
+    let table = EventTable::new(
+        TickProvider::Massive,
+        EventClock::Prints,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(3).unwrap()),
+        EntryWindow::new(100, 110).unwrap(),
+    );
+    let (stdout, stderr) = run(
+        table,
+        TickProvider::Massive,
+        Probes::With,
+        "
+SELECT string_agg(price::INTEGER || ':' || eligible, ' ' ORDER BY timestamp) FROM signed
+WHERE ticker = 'AAA' AND price >= 120;
+SELECT count(*) FILTER (WHERE ticker = 'AAA'), count(*) FILTER (WHERE ticker = 'BBB') FROM signed;
+SELECT max(session_high) FROM trade_events WHERE ticker = 'AAA';
+",
+    );
+    assert_eq!(
+        stdout, "130:true 135:true 150:false 170:false\n7804,7800\n135.0\n",
+        "{stderr}"
+    );
+}
+
+/// An Alpaca table is refused when Alpaca's bars of the session before are absent, though Massive's are held.
+#[test]
+fn test_alpaca_refuses_a_session_without_its_daily_bars() {
+    let table = EventTable::new(
+        TickProvider::Alpaca,
+        EventClock::QuoteUpdates,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(3).unwrap()),
+        EntryWindow::new(100, 110).unwrap(),
+    );
+    let held: Vec<TradesKey> = daily_bars(TickProvider::Alpaca)
+        .into_iter()
+        .filter(|key| key.session() != date(6, 13))
+        .chain(daily_bars(TickProvider::Massive))
+        .collect();
+    assert_eq!(
+        table.statements(&calendar(), &named(), &held, date(6, 13)),
+        Err(EventTableRefusal::DailyBarsAbsent {
+            provider: TickProvider::Alpaca,
+            absent: date(6, 13),
+        })
+    );
+}
+
 /// A window ending at the close draws only events whose delayed read lands by the last second, so the update at
 /// 19:59:58 UTC, read 1.5 seconds later, is left out and each name keeps its other 29 updates of the last minute, every
 /// one with a quote in force.
@@ -231,6 +555,8 @@ fn test_a_delayed_read_past_the_close_is_not_drawn() {
     );
     let (stdout, stderr) = run(
         table,
+        TickProvider::Massive,
+        Probes::Without,
         "
 SELECT count(*), count(screen_bid), max(arrival), min(minutes_to_close) > 0
 FROM 'table/rows_massive_2025-06-16.parquet';
@@ -337,6 +663,8 @@ proptest! {
         let open = "TIMESTAMP '2025-06-16 13:30:00'";
         let (stdout, stderr) = run(
             table,
+            TickProvider::Massive,
+            Probes::Without,
             &format!(
                 "
 SELECT names.ticker, coalesce(string_agg(key::VARCHAR, ' ' ORDER BY key), ''),

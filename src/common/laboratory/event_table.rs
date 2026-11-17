@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::num::NonZeroU16;
+use std::ops::RangeInclusive;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use strum::IntoEnumIterator;
@@ -21,46 +22,78 @@ use crate::common::time::calendar::TradingCalendar;
 /// The trading days of daily closes the table reads before a session, giving sixty daily returns.
 const DAILY_LOOKBACK: usize = 61;
 
-/// Binds the scratch ticks, the archive and the eligibility macros the table reads, for a run against the buckets
-/// named by `AWS_S3_PROFILE_BUCKET_NAME` and `AWS_S3_ARCHIVE_BUCKET_NAME`, with Massive's conditions snapshot of
-/// `conditions_as_of`.
-pub fn bucket_preamble(conditions_as_of: SessionDate) -> String {
-    let conditions = Key::from(ReferenceKey::new(
-        Provider::Massive,
-        ReferenceTable::Conditions,
-        conditions_as_of,
-    ))
-    .path();
-    format!(
-        r#"
+/// Binds the scratch ticks and the archive the table reads to the buckets named by `AWS_S3_PROFILE_BUCKET_NAME` and
+/// `AWS_S3_ARCHIVE_BUCKET_NAME`.
+pub const BUCKET_PREAMBLE: &str = "
 SET TimeZone='UTC';
 INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;
 CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');
 SET VARIABLE scratch = 's3://' || getenv('AWS_S3_PROFILE_BUCKET_NAME') || '/scratch/ticks';
 SET VARIABLE archive = 's3://' || getenv('AWS_S3_ARCHIVE_BUCKET_NAME');
-CREATE TEMP TABLE letters AS SELECT * FROM read_parquet(getvariable('archive') || '/{conditions}');
-SET VARIABLE eligible_codes = (SELECT list(code::VARCHAR) FROM letters WHERE updates_high_low);
-CREATE MACRO eligible(conditions, correction) AS
-    coalesce(correction, '0') NOT IN ('1', '8', '10')
-    AND list_bool_and(list_transform(string_split(coalesce(conditions, ''), ','),
+";
+
+/// A daily return this large or larger in either direction is left out of the daily features.
+const DAILY_RETURN_LIMIT: f64 = 0.4;
+
+/// A print of at least this many shares, or of at least `BLOCK_DOLLARS`, is a block.
+const BLOCK_SHARES: u32 = 10_000;
+
+const BLOCK_DOLLARS: u32 = 200_000;
+
+/// A print of fewer shares is an odd lot.
+const ROUND_LOT_SHARES: u32 = 100;
+
+/// The hundredths of a cent an off-exchange print's price ends in that mark it a retail buy, and a retail sell.
+const RETAIL_BUY_HUNDREDTHS: RangeInclusive<u8> = 61..=99;
+
+const RETAIL_SELL_HUNDREDTHS: RangeInclusive<u8> = 1..=39;
+
+/// Massive's correction codes, and Alpaca's update labels, of a print withdrawn by a later correction or cancel.
+const MASSIVE_WITHDRAWN_CORRECTIONS: [&str; 3] = ["1", "8", "10"];
+
+const ALPACA_WITHDRAWN_UPDATES: [&str; 2] = ["corrected", "canceled"];
+
+/// `values` as a SQL list of string literals.
+fn quoted(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The macros saying whether a print may set the session's high and low, by Massive's codes and by Alpaca's letters,
+/// from the archive's conditions snapshot of `as_of`; a withdrawn print never reaches them.
+fn eligibility_macros(as_of: SessionDate) -> String {
+    let conditions = Key::from(ReferenceKey::new(
+        Provider::Massive,
+        ReferenceTable::Conditions,
+        as_of,
+    ))
+    .path();
+    format!(
+        r#"CREATE TEMP TABLE condition_rules AS SELECT * FROM read_parquet(getvariable('archive') || '/{conditions}');
+SET VARIABLE eligible_codes = (SELECT list(code::VARCHAR) FROM condition_rules WHERE updates_high_low);
+CREATE MACRO eligible(conditions) AS
+    list_bool_and(list_transform(string_split(coalesce(conditions, ''), ','),
         lambda code: code = '' OR list_contains(getvariable('eligible_codes'), code)));
 -- Alpaca's letters, per tape, that set a price; a letter two current conditions share with different rules sets none.
-DELETE FROM letters WHERE retired;
+DELETE FROM condition_rules WHERE retired;
 SET VARIABLE consolidated_letters = (
     SELECT list(consolidated_tape_letter) FROM (
-        SELECT consolidated_tape_letter FROM letters WHERE consolidated_tape_letter IS NOT NULL GROUP BY ALL
+        SELECT consolidated_tape_letter FROM condition_rules WHERE consolidated_tape_letter IS NOT NULL GROUP BY ALL
         HAVING count(DISTINCT (updates_volume, updates_high_low, updates_open_close)) = 1 AND bool_and(updates_high_low)));
 SET VARIABLE unlisted_letters = (
     SELECT list(unlisted_trading_letter) FROM (
-        SELECT unlisted_trading_letter FROM letters WHERE unlisted_trading_letter IS NOT NULL GROUP BY ALL
+        SELECT unlisted_trading_letter FROM condition_rules WHERE unlisted_trading_letter IS NOT NULL GROUP BY ALL
         HAVING count(DISTINCT (updates_volume, updates_high_low, updates_open_close)) = 1 AND bool_and(updates_high_low)));
-CREATE MACRO eligible_letters(conditions, tape, update_label) AS
-    coalesce(update_label, '') NOT IN ('corrected', 'canceled')
-    AND CASE
-        WHEN tape IN ('A', 'B') THEN list_bool_and(list_transform(coalesce(conditions, []),
-            lambda letter: letter = ' ' OR list_contains(getvariable('consolidated_letters'), letter)))
-        WHEN tape = 'C' THEN list_bool_and(list_transform(coalesce(conditions, []),
-            lambda letter: letter = '@' OR list_contains(getvariable('unlisted_letters'), letter)))
+-- A print with no letters is unrestricted, as in the trade fold; a letter that cannot be placed restricts it.
+CREATE MACRO eligible_letters(conditions, tape) AS
+    CASE
+        WHEN tape IN ('A', 'B') THEN len(list_filter(coalesce(conditions, []),
+            lambda letter: NOT coalesce(letter = ' ' OR list_contains(getvariable('consolidated_letters'), letter), false))) = 0
+        WHEN tape = 'C' THEN len(list_filter(coalesce(conditions, []),
+            lambda letter: NOT coalesce(letter = '@' OR list_contains(getvariable('unlisted_letters'), letter), false))) = 0
         ELSE false END;
 "#
     )
@@ -104,7 +137,7 @@ pub fn draw_order(seed: u32, event_number: u64) -> u32 {
 /// How one provider's cleaned ticks spell what the table reads of them.
 struct Dialect {
     time: &'static str,
-    not_withdrawn: &'static str,
+    not_withdrawn: String,
     sweep: &'static str,
     off_exchange: &'static str,
     eligible: &'static str,
@@ -114,17 +147,23 @@ fn dialect(provider: TickProvider) -> Dialect {
     match provider {
         TickProvider::Massive => Dialect {
             time: "sip_timestamp",
-            not_withdrawn: "coalesce(correction, '0') NOT IN ('1', '8', '10')",
+            not_withdrawn: format!(
+                "coalesce(correction, '0') NOT IN ({})",
+                quoted(&MASSIVE_WITHDRAWN_CORRECTIONS)
+            ),
             sweep: "list_contains(string_split(coalesce(conditions, ''), ','), '14')",
             off_exchange: "exchange = '4'",
-            eligible: "eligible(conditions, correction)",
+            eligible: "eligible(conditions)",
         },
         TickProvider::Alpaca => Dialect {
             time: "timestamp",
-            not_withdrawn: "coalesce(\"update\", '') NOT IN ('corrected', 'canceled')",
+            not_withdrawn: format!(
+                "coalesce(\"update\", '') NOT IN ({})",
+                quoted(&ALPACA_WITHDRAWN_UPDATES)
+            ),
             sweep: "list_contains(coalesce(conditions, []), 'F')",
             off_exchange: "exchange = 'D'",
-            eligible: "eligible_letters(conditions, tape, \"update\")",
+            eligible: "eligible_letters(conditions, tape)",
         },
     }
 }
@@ -224,6 +263,11 @@ pub enum EventTableRefusal {
         end: u16,
         session_minutes: i64,
     },
+    #[error("the conditions snapshot of {as_of} was not taken before {session}")]
+    ConditionsNotBeforeSession {
+        as_of: SessionDate,
+        session: SessionDate,
+    },
     #[error("the calendar holds no trading day before {session}")]
     NoEarlierTradingDay { session: SessionDate },
     /// The trading day before the session, or one between it and an earlier day that is held, whose bars are not.
@@ -253,17 +297,25 @@ impl EventTable {
 
     /// The statements writing the universe's session's rows to `table/rows_<provider>_<session>.parquet` and its
     /// members to `table/universe_<session>.parquet`, reading the daily bars among `daily_bars` that are the table's
-    /// provider's; run after `bucket_preamble` or another binding of the names it reads.
+    /// provider's and the conditions snapshot of `conditions_as_of`; run after `BUCKET_PREAMBLE` or another binding of
+    /// `scratch` and `archive`.
     pub fn statements(
         &self,
         calendar: &TradingCalendar,
         universe: &Universe,
         daily_bars: &[TradesKey],
+        conditions_as_of: SessionDate,
     ) -> Result<String, EventTableRefusal> {
         let session = universe.session();
         let trading = calendar
             .session(session)
             .ok_or(EventTableRefusal::NotATradingDay { session })?;
+        if conditions_as_of >= session {
+            return Err(EventTableRefusal::ConditionsNotBeforeSession {
+                as_of: conditions_as_of,
+                session,
+            });
+        }
         let (opened, closed) = trading.hours();
         let session_minutes = (closed - opened).num_minutes();
         if i64::from(self.window.end) > session_minutes {
@@ -292,7 +344,15 @@ impl EventTable {
             eligible,
         } = dialect(self.provider);
         let provider = self.provider.provider();
+        let eligibility = eligibility_macros(conditions_as_of);
         let members = members(universe, self.clock);
+        let between =
+            |range: RangeInclusive<u8>| format!("BETWEEN {} AND {}", range.start(), range.end());
+        let (retail_buy, retail_sell) = (
+            between(RETAIL_BUY_HUNDREDTHS),
+            between(RETAIL_SELL_HUNDREDTHS),
+        );
+        let block = format!("size >= {BLOCK_SHARES} OR price * size >= {BLOCK_DOLLARS}");
         let (events, kind) = self.clock.source();
         let (delay, draws) = (self.delay.0, self.draws.0);
         let EntryWindow { start, end } = self.window;
@@ -307,7 +367,7 @@ impl EventTable {
         );
         Ok(format!(
             r#"
-{DRAW_ORDER_MACROS}CREATE TEMP TABLE universe AS
+{DRAW_ORDER_MACROS}{eligibility}CREATE TEMP TABLE universe AS
     SELECT * FROM (VALUES {members})
         AS members(ticker, dollar_volume_rank, industry_code, central_index_key, industry, draw_seed);
 COPY (SELECT '{session}' AS session, ticker, industry_code, central_index_key FROM universe ORDER BY dollar_volume_rank)
@@ -321,19 +381,30 @@ CREATE TEMP TABLE previous_close AS SELECT ticker, arg_max(close, closed_at) AS 
 CREATE TEMP TABLE daily AS
     WITH returns AS (
         SELECT ticker, (closed_at AT TIME ZONE 'America/New_York')::DATE AS day,
+            (lag(closed_at) OVER daily_order AT TIME ZONE 'America/New_York')::DATE AS previous_day,
             close / lag(close) OVER daily_order - 1 AS daily_return,
             row_number() OVER (PARTITION BY ticker ORDER BY closed_at DESC) AS recency
         FROM bars WINDOW daily_order AS (PARTITION BY ticker ORDER BY closed_at)),
-    kept AS (SELECT * FROM returns WHERE abs(daily_return) < 0.4)
-    SELECT name.ticker, regr_slope(name.daily_return, spy.daily_return) OVER whole AS beta,
-        10000 * stddev_samp(name.daily_return) FILTER (WHERE name.recency <= 20) OVER whole AS daily_volatility_20,
-        10000 * max(name.daily_return) FILTER (WHERE name.recency = 1) OVER whole AS previous_return,
-        count(*) OVER whole AS beta_days
-    FROM kept name JOIN kept spy ON spy.ticker = 'SPY' AND spy.day = name.day
-    WHERE name.ticker <> 'SPY'
+    kept AS (SELECT * FROM returns WHERE abs(daily_return) < {DAILY_RETURN_LIMIT}),
     -- Windows over one ordered frame rather than GROUP BY, so floating sums run in the same order on every build.
-    WINDOW whole AS (PARTITION BY name.ticker ORDER BY name.day ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-    QUALIFY row_number() OVER whole = 1;
+    own AS (
+        SELECT ticker,
+            10000 * stddev_samp(daily_return) FILTER (WHERE recency <= 20) OVER whole AS daily_volatility_20,
+            10000 * max(daily_return) FILTER (WHERE recency = 1) OVER whole AS previous_return
+        FROM kept WHERE ticker <> 'SPY'
+        WINDOW whole AS (PARTITION BY ticker ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+        QUALIFY row_number() OVER whole = 1),
+    -- Beta reads only days where the name's and SPY's returns span the same two closes, so a hole in either drops both.
+    matched AS (
+        SELECT name.ticker, regr_slope(name.daily_return, spy.daily_return) OVER whole AS beta,
+            count(*) OVER whole AS beta_days
+        FROM kept name JOIN kept spy
+          ON spy.ticker = 'SPY' AND spy.day = name.day AND spy.previous_day = name.previous_day
+        WHERE name.ticker <> 'SPY'
+        WINDOW whole AS (PARTITION BY name.ticker ORDER BY name.day ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+        QUALIFY row_number() OVER whole = 1)
+    SELECT own.ticker, matched.beta, own.daily_volatility_20, own.previous_return, coalesce(matched.beta_days, 0) AS beta_days
+    FROM own LEFT JOIN matched USING (ticker);
 CREATE TEMP TABLE quote_events AS
     WITH quotes AS (
         SELECT ticker, {time} AS timestamp, bid_price::DOUBLE AS bid, ask_price::DOUBLE AS ask,
@@ -376,9 +447,10 @@ CREATE TEMP TABLE signed AS
         WHERE ticker IN (SELECT ticker FROM universe) AND {not_withdrawn} AND size > 0
           AND {time} >= {open} AND {time} < {close})
     SELECT prints.*, sign(prints.price - quote_states.mid) AS print_sign,
-        CASE WHEN off_exchange AND hundredths_of_a_cent BETWEEN 61 AND 99 THEN 1
-             WHEN off_exchange AND hundredths_of_a_cent BETWEEN 1 AND 39 THEN -1 END AS retail_sign
+        CASE WHEN off_exchange AND hundredths_of_a_cent {retail_buy} THEN 1
+             WHEN off_exchange AND hundredths_of_a_cent {retail_sell} THEN -1 END AS retail_sign
     FROM prints ASOF LEFT JOIN quote_states
+      -- Strictly before, unlike every other read: a quote stamped with the print may be the book the print left.
       ON prints.ticker = quote_states.ticker AND prints.timestamp > quote_states.timestamp;
 CREATE TEMP TABLE trade_events AS
     SELECT ticker, timestamp, sweep, print_sign, size, price, eligible,
@@ -389,24 +461,20 @@ CREATE TEMP TABLE trade_events AS
         sum(CASE WHEN sweep THEN size ELSE 0 END) OVER print_order AS cumulative_sweep_volume,
         sum(coalesce(retail_sign, 0) * size) OVER print_order AS cumulative_retail_signed,
         sum(CASE WHEN retail_sign IS NOT NULL THEN size ELSE 0 END) OVER print_order AS cumulative_retail_volume,
-        sum(CASE WHEN size >= 10000 OR price * size >= 200000 THEN coalesce(print_sign, 0) * size ELSE 0 END) OVER print_order AS cumulative_block_signed,
-        sum(CASE WHEN size >= 10000 OR price * size >= 200000 THEN size ELSE 0 END) OVER print_order AS cumulative_block_volume,
-        sum(CASE WHEN size < 100 THEN coalesce(print_sign, 0) * size ELSE 0 END) OVER print_order AS cumulative_odd_signed,
-        sum(CASE WHEN size < 100 THEN size ELSE 0 END) OVER print_order AS cumulative_odd_volume,
+        sum(CASE WHEN {block} THEN coalesce(print_sign, 0) * size ELSE 0 END) OVER print_order AS cumulative_block_signed,
+        sum(CASE WHEN {block} THEN size ELSE 0 END) OVER print_order AS cumulative_block_volume,
+        sum(CASE WHEN size < {ROUND_LOT_SHARES} THEN coalesce(print_sign, 0) * size ELSE 0 END) OVER print_order AS cumulative_odd_lot_signed,
+        sum(CASE WHEN size < {ROUND_LOT_SHARES} THEN size ELSE 0 END) OVER print_order AS cumulative_odd_lot_volume,
         sum(CASE WHEN off_exchange THEN size ELSE 0 END) OVER print_order AS cumulative_off_exchange_volume,
         sum(CASE WHEN print_sign = 0 THEN 1 ELSE 0 END) OVER print_order AS cumulative_midpoint_count,
         sum(price * size) OVER print_order AS cumulative_dollars,
         max(CASE WHEN eligible THEN price END) OVER print_order AS session_high,
         min(CASE WHEN eligible THEN price END) OVER print_order AS session_low,
         last_value(CASE WHEN sweep AND print_sign <> 0 THEN timestamp END IGNORE NULLS) OVER print_order AS last_sweep_time,
-        last_value(CASE WHEN sweep AND print_sign <> 0 THEN print_sign END IGNORE NULLS) OVER print_order AS last_sweep_sign,
-        sum(coalesce(print_sign, 0)) OVER last_ten AS sign_sum,
-        count(*) OVER last_ten AS sign_count,
-        sum(coalesce(print_sign, 0) * size) OVER last_ten AS last_ten_signed
+        last_value(CASE WHEN sweep AND print_sign <> 0 THEN print_sign END IGNORE NULLS) OVER print_order AS last_sweep_sign
     FROM signed
     WINDOW print_order AS (
-            PARTITION BY ticker ORDER BY timestamp, price, size, sweep, off_exchange, eligible ROWS UNBOUNDED PRECEDING),
-        last_ten AS (PARTITION BY ticker ORDER BY timestamp, price, size, sweep, off_exchange, eligible ROWS 9 PRECEDING);
+        PARTITION BY ticker ORDER BY timestamp, price, size, sweep, off_exchange, eligible ROWS UNBOUNDED PRECEDING);
 CREATE TEMP TABLE trade_states AS
     SELECT * FROM trade_events
     QUALIFY row_number() OVER (PARTITION BY ticker, timestamp ORDER BY event_number DESC) = 1;
@@ -526,18 +594,18 @@ CREATE TEMP TABLE quotes_wide AS
         max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_30') AS spy_forward_30,
         max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_60') AS spy_forward_60,
         max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_close') AS spy_forward_close,
-        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'now') AS spy_micro,
-        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_5') AS spy_micro_5,
-        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_30') AS spy_micro_30,
-        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_120') AS spy_micro_120,
+        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'now') AS spy_microprice,
+        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_5') AS spy_microprice_5,
+        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_30') AS spy_microprice_30,
+        max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_120') AS spy_microprice_120,
         max(cumulative_flow) FILTER (WHERE source = 'SPY' AND probe = 'now') AS spy_flow_now,
         max(cumulative_absolute_flow) FILTER (WHERE source = 'SPY' AND probe = 'now') AS spy_absolute_flow_now,
         max(cumulative_flow) FILTER (WHERE source = 'SPY' AND probe = 'back_30') AS spy_flow_30,
         max(cumulative_absolute_flow) FILTER (WHERE source = 'SPY' AND probe = 'back_30') AS spy_absolute_flow_30,
-        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'now') AS qqq_micro,
-        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'back_5') AS qqq_micro_5,
-        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'back_30') AS qqq_micro_30,
-        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'back_120') AS qqq_micro_120
+        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'now') AS qqq_microprice,
+        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'back_5') AS qqq_microprice_5,
+        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'back_30') AS qqq_microprice_30,
+        max(microprice) FILTER (WHERE source = 'QQQ' AND probe = 'back_120') AS qqq_microprice_120
     FROM quote_probed GROUP BY ticker, kind, key;
 CREATE TEMP TABLE trades_wide AS
     SELECT now.ticker, now.kind, now.key, now.event_number AS print_number, now.cumulative_volume AS volume_now,
@@ -546,25 +614,25 @@ CREATE TEMP TABLE trades_wide AS
         now.cumulative_sweep_volume AS sweep_volume_now,
         now.cumulative_retail_signed AS retail_signed_now, now.cumulative_retail_volume AS retail_volume_now,
         now.cumulative_block_signed AS block_signed_now, now.cumulative_block_volume AS block_volume_now,
-        now.cumulative_odd_signed AS odd_signed_now, now.cumulative_odd_volume AS odd_volume_now,
+        now.cumulative_odd_lot_signed AS odd_lot_signed_now, now.cumulative_odd_lot_volume AS odd_lot_volume_now,
         now.cumulative_off_exchange_volume AS off_exchange_now, now.cumulative_midpoint_count AS midpoint_now,
-        seconds_5.event_number AS print_number_s5, seconds_5.cumulative_signed AS signed_s5, seconds_5.cumulative_volume AS volume_s5,
-        seconds_5.cumulative_sweep_signed AS sweep_signed_s5, seconds_5.cumulative_sweep_volume AS sweep_volume_s5,
-        seconds_30.event_number AS print_number_s30, seconds_30.cumulative_signed AS signed_s30, seconds_30.cumulative_volume AS volume_s30,
-        seconds_30.cumulative_sweep_signed AS sweep_signed_s30, seconds_30.cumulative_sweep_volume AS sweep_volume_s30,
-        seconds_120.event_number AS print_number_s120, seconds_120.cumulative_signed AS signed_s120, seconds_120.cumulative_volume AS volume_s120,
-        seconds_120.cumulative_sweep_signed AS sweep_signed_s120, seconds_120.cumulative_sweep_volume AS sweep_volume_s120,
-        seconds_120.cumulative_block_signed AS block_signed_s120, seconds_120.cumulative_block_volume AS block_volume_s120,
-        events_10.cumulative_signed AS signed_e10, events_10.cumulative_volume AS volume_e10,
-        events_10.cumulative_sweep_signed AS sweep_signed_e10, events_10.cumulative_sweep_volume AS sweep_volume_e10,
-        events_50.cumulative_signed AS signed_e50, events_50.cumulative_volume AS volume_e50,
-        events_50.cumulative_sweep_signed AS sweep_signed_e50, events_50.cumulative_sweep_volume AS sweep_volume_e50,
-        events_50.cumulative_retail_signed AS retail_signed_e50, events_50.cumulative_retail_volume AS retail_volume_e50,
-        events_50.cumulative_odd_signed AS odd_signed_e50, events_50.cumulative_odd_volume AS odd_volume_e50,
-        events_250.cumulative_signed AS signed_e250, events_250.cumulative_volume AS volume_e250,
-        events_250.cumulative_sweep_signed AS sweep_signed_e250, events_250.cumulative_sweep_volume AS sweep_volume_e250,
-        events_250.cumulative_retail_volume AS retail_volume_e250, events_250.cumulative_off_exchange_volume AS off_exchange_e250,
-        events_250.cumulative_midpoint_count AS midpoint_e250
+        seconds_5.event_number AS print_number_seconds_5, seconds_5.cumulative_signed AS signed_seconds_5, seconds_5.cumulative_volume AS volume_seconds_5,
+        seconds_5.cumulative_sweep_signed AS sweep_signed_seconds_5, seconds_5.cumulative_sweep_volume AS sweep_volume_seconds_5,
+        seconds_30.event_number AS print_number_seconds_30, seconds_30.cumulative_signed AS signed_seconds_30, seconds_30.cumulative_volume AS volume_seconds_30,
+        seconds_30.cumulative_sweep_signed AS sweep_signed_seconds_30, seconds_30.cumulative_sweep_volume AS sweep_volume_seconds_30,
+        seconds_120.event_number AS print_number_seconds_120, seconds_120.cumulative_signed AS signed_seconds_120, seconds_120.cumulative_volume AS volume_seconds_120,
+        seconds_120.cumulative_sweep_signed AS sweep_signed_seconds_120, seconds_120.cumulative_sweep_volume AS sweep_volume_seconds_120,
+        seconds_120.cumulative_block_signed AS block_signed_seconds_120, seconds_120.cumulative_block_volume AS block_volume_seconds_120,
+        events_10.cumulative_signed AS signed_events_10, events_10.cumulative_volume AS volume_events_10,
+        events_10.cumulative_sweep_signed AS sweep_signed_events_10, events_10.cumulative_sweep_volume AS sweep_volume_events_10,
+        events_50.cumulative_signed AS signed_events_50, events_50.cumulative_volume AS volume_events_50,
+        events_50.cumulative_sweep_signed AS sweep_signed_events_50, events_50.cumulative_sweep_volume AS sweep_volume_events_50,
+        events_50.cumulative_retail_signed AS retail_signed_events_50, events_50.cumulative_retail_volume AS retail_volume_events_50,
+        events_50.cumulative_odd_lot_signed AS odd_lot_signed_events_50, events_50.cumulative_odd_lot_volume AS odd_lot_volume_events_50,
+        events_250.cumulative_signed AS signed_events_250, events_250.cumulative_volume AS volume_events_250,
+        events_250.cumulative_sweep_signed AS sweep_signed_events_250, events_250.cumulative_sweep_volume AS sweep_volume_events_250,
+        events_250.cumulative_retail_volume AS retail_volume_events_250, events_250.cumulative_off_exchange_volume AS off_exchange_events_250,
+        events_250.cumulative_midpoint_count AS midpoint_events_250
     FROM (SELECT * FROM trade_probed WHERE probe = 'now') now
     LEFT JOIN (SELECT * FROM trade_probed WHERE probe = 'back_5') seconds_5 USING (ticker, kind, key)
     LEFT JOIN (SELECT * FROM trade_probed WHERE probe = 'back_30') seconds_30 USING (ticker, kind, key)
@@ -575,9 +643,9 @@ CREATE TEMP TABLE trades_wide AS
 COPY (
     WITH joined AS (
         SELECT quotes_wide.*, trades_wide.* EXCLUDE (ticker, kind, key),
-            quote_10.cumulative_flow AS flow_e10, quote_10.cumulative_absolute_flow AS absolute_flow_e10,
-            quote_50.cumulative_flow AS flow_e50, quote_50.cumulative_absolute_flow AS absolute_flow_e50,
-            quote_250.cumulative_flow AS flow_e250, quote_250.cumulative_absolute_flow AS absolute_flow_e250,
+            quote_10.cumulative_flow AS flow_events_10, quote_10.cumulative_absolute_flow AS absolute_flow_events_10,
+            quote_50.cumulative_flow AS flow_events_50, quote_50.cumulative_absolute_flow AS absolute_flow_events_50,
+            quote_250.cumulative_flow AS flow_events_250, quote_250.cumulative_absolute_flow AS absolute_flow_events_250,
             market_now.cumulative_signed_dollars - coalesce(market_30.cumulative_signed_dollars, 0) AS market_signed_30,
             market_now.cumulative_dollars - coalesce(market_30.cumulative_dollars, 0) AS market_dollars_30,
             ranks.dollar_volume_rank, previous_close.close AS previous_close,
@@ -606,49 +674,49 @@ COPY (
         spread_forward_30 AS forward_spread_30, spread_forward_60 AS forward_spread_60, spread_forward_close AS forward_spread_close,
         (quote_number - coalesce(quote_number_30, 0)) / 30.0 AS quote_rate,
         -- flow
-        (flow_now - coalesce(flow_5, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_5, 0), 0) AS order_flow_s5,
-        (flow_now - coalesce(flow_30, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_30, 0), 0) AS order_flow_s30,
-        (flow_now - coalesce(flow_120, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_120, 0), 0) AS order_flow_s120,
-        (flow_now - flow_e10) / nullif(absolute_flow_now - absolute_flow_e10, 0) AS order_flow_e10,
-        (flow_now - flow_e50) / nullif(absolute_flow_now - absolute_flow_e50, 0) AS order_flow_e50,
-        (flow_now - flow_e250) / nullif(absolute_flow_now - absolute_flow_e250, 0) AS order_flow_e250,
-        (signed_now - coalesce(signed_s5, 0)) / nullif(volume_now - coalesce(volume_s5, 0), 0) AS trade_sign_s5,
-        (signed_now - coalesce(signed_s30, 0)) / nullif(volume_now - coalesce(volume_s30, 0), 0) AS trade_sign_s30,
-        (signed_now - coalesce(signed_s120, 0)) / nullif(volume_now - coalesce(volume_s120, 0), 0) AS trade_sign_s120,
-        (signed_now - signed_e10) / nullif(volume_now - volume_e10, 0) AS trade_sign_e10,
-        (signed_now - signed_e50) / nullif(volume_now - volume_e50, 0) AS trade_sign_e50,
-        (signed_now - signed_e250) / nullif(volume_now - volume_e250, 0) AS trade_sign_e250,
-        (sweep_signed_now - coalesce(sweep_signed_s5, 0)) / nullif(sweep_volume_now - coalesce(sweep_volume_s5, 0), 0) AS sweep_s5,
-        (sweep_signed_now - coalesce(sweep_signed_s30, 0)) / nullif(sweep_volume_now - coalesce(sweep_volume_s30, 0), 0) AS sweep_s30,
-        (sweep_signed_now - coalesce(sweep_signed_s120, 0)) / nullif(sweep_volume_now - coalesce(sweep_volume_s120, 0), 0) AS sweep_s120,
-        (sweep_signed_now - sweep_signed_e10) / nullif(sweep_volume_now - sweep_volume_e10, 0) AS sweep_e10,
-        (sweep_signed_now - sweep_signed_e50) / nullif(sweep_volume_now - sweep_volume_e50, 0) AS sweep_e50,
-        (sweep_signed_now - sweep_signed_e250) / nullif(sweep_volume_now - sweep_volume_e250, 0) AS sweep_e250,
+        (flow_now - coalesce(flow_5, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_5, 0), 0) AS order_flow_seconds_5,
+        (flow_now - coalesce(flow_30, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_30, 0), 0) AS order_flow_seconds_30,
+        (flow_now - coalesce(flow_120, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_120, 0), 0) AS order_flow_seconds_120,
+        (flow_now - flow_events_10) / nullif(absolute_flow_now - absolute_flow_events_10, 0) AS order_flow_events_10,
+        (flow_now - flow_events_50) / nullif(absolute_flow_now - absolute_flow_events_50, 0) AS order_flow_events_50,
+        (flow_now - flow_events_250) / nullif(absolute_flow_now - absolute_flow_events_250, 0) AS order_flow_events_250,
+        (signed_now - coalesce(signed_seconds_5, 0)) / nullif(volume_now - coalesce(volume_seconds_5, 0), 0) AS trade_sign_seconds_5,
+        (signed_now - coalesce(signed_seconds_30, 0)) / nullif(volume_now - coalesce(volume_seconds_30, 0), 0) AS trade_sign_seconds_30,
+        (signed_now - coalesce(signed_seconds_120, 0)) / nullif(volume_now - coalesce(volume_seconds_120, 0), 0) AS trade_sign_seconds_120,
+        (signed_now - signed_events_10) / nullif(volume_now - volume_events_10, 0) AS trade_sign_events_10,
+        (signed_now - signed_events_50) / nullif(volume_now - volume_events_50, 0) AS trade_sign_events_50,
+        (signed_now - signed_events_250) / nullif(volume_now - volume_events_250, 0) AS trade_sign_events_250,
+        (sweep_signed_now - coalesce(sweep_signed_seconds_5, 0)) / nullif(sweep_volume_now - coalesce(sweep_volume_seconds_5, 0), 0) AS sweep_seconds_5,
+        (sweep_signed_now - coalesce(sweep_signed_seconds_30, 0)) / nullif(sweep_volume_now - coalesce(sweep_volume_seconds_30, 0), 0) AS sweep_seconds_30,
+        (sweep_signed_now - coalesce(sweep_signed_seconds_120, 0)) / nullif(sweep_volume_now - coalesce(sweep_volume_seconds_120, 0), 0) AS sweep_seconds_120,
+        (sweep_signed_now - sweep_signed_events_10) / nullif(sweep_volume_now - sweep_volume_events_10, 0) AS sweep_events_10,
+        (sweep_signed_now - sweep_signed_events_50) / nullif(sweep_volume_now - sweep_volume_events_50, 0) AS sweep_events_50,
+        (sweep_signed_now - sweep_signed_events_250) / nullif(sweep_volume_now - sweep_volume_events_250, 0) AS sweep_events_250,
         epoch_ns(arrival - last_sweep_time) / 1e9 AS seconds_since_sweep,
         last_sweep_sign AS last_sweep_side,
-        (block_signed_now - coalesce(block_signed_s120, 0)) / nullif(block_volume_now - coalesce(block_volume_s120, 0), 0) AS block_s120,
-        (odd_signed_now - odd_signed_e50) / nullif(odd_volume_now - odd_volume_e50, 0) AS odd_lot_e50,
-        (retail_signed_now - retail_signed_e50) / nullif(retail_volume_now - retail_volume_e50, 0) AS retail_e50,
-        (retail_volume_now - retail_volume_e250) / nullif(volume_now - volume_e250, 0) AS retail_share_e250,
-        (off_exchange_now - off_exchange_e250) / nullif(volume_now - volume_e250, 0) AS off_exchange_share_e250,
-        (midpoint_now - midpoint_e250) / 250.0 AS midpoint_share_e250,
-        ((volume_now - volume_e50) / 50.0) / nullif(volume_now / nullif(print_number, 0), 0) AS print_size_relative,
+        (block_signed_now - coalesce(block_signed_seconds_120, 0)) / nullif(block_volume_now - coalesce(block_volume_seconds_120, 0), 0) AS block_seconds_120,
+        (odd_lot_signed_now - odd_lot_signed_events_50) / nullif(odd_lot_volume_now - odd_lot_volume_events_50, 0) AS odd_lot_events_50,
+        (retail_signed_now - retail_signed_events_50) / nullif(retail_volume_now - retail_volume_events_50, 0) AS retail_events_50,
+        (retail_volume_now - retail_volume_events_250) / nullif(volume_now - volume_events_250, 0) AS retail_share_events_250,
+        (off_exchange_now - off_exchange_events_250) / nullif(volume_now - volume_events_250, 0) AS off_exchange_share_events_250,
+        (midpoint_now - midpoint_events_250) / 250.0 AS midpoint_share_events_250,
+        ((volume_now - volume_events_50) / 50.0) / nullif(volume_now / nullif(print_number, 0), 0) AS print_size_relative,
         -- activity
-        ((print_number - coalesce(print_number_s30, 0)) / 30.0) / nullif(print_number / nullif(minutes_since_open * 60, 0), 0) AS intensity_s30,
-        ((print_number - coalesce(print_number_s120, 0)) / 120.0) / nullif(print_number / nullif(minutes_since_open * 60, 0), 0) AS intensity_s120,
+        ((print_number - coalesce(print_number_seconds_30, 0)) / 30.0) / nullif(print_number / nullif(minutes_since_open * 60, 0), 0) AS intensity_seconds_30,
+        ((print_number - coalesce(print_number_seconds_120, 0)) / 120.0) / nullif(print_number / nullif(minutes_since_open * 60, 0), 0) AS intensity_seconds_120,
         10000 * sqrt(greatest(squared_now - coalesce(squared_60, 0), 0)) AS volatility_60,
         10000 * sqrt(greatest(squared_now - coalesce(squared_300, 0), 0)) AS volatility_300,
         10000 * sqrt(greatest(squared_now - coalesce(squared_1800, 0), 0)) AS volatility_1800,
         10000 * sqrt(squared_now / nullif(minutes_since_open, 0)) AS volatility_per_minute,
         -- cross-name
-        10000 * (spy_micro / spy_micro_5 - 1) AS spy_lead_s5,
-        10000 * (spy_micro / spy_micro_30 - 1) AS spy_lead_s30,
-        10000 * (spy_micro / spy_micro_120 - 1) AS spy_lead_s120,
-        10000 * (qqq_micro / qqq_micro_5 - 1) AS qqq_lead_s5,
-        10000 * (qqq_micro / qqq_micro_30 - 1) AS qqq_lead_s30,
-        10000 * (qqq_micro / qqq_micro_120 - 1) AS qqq_lead_s120,
-        (spy_flow_now - spy_flow_30) / nullif(spy_absolute_flow_now - spy_absolute_flow_30, 0) AS spy_order_flow_s30,
-        market_signed_30 / nullif(market_dollars_30, 0) AS market_trade_sign_s30,
+        10000 * (spy_microprice / spy_microprice_5 - 1) AS spy_lead_seconds_5,
+        10000 * (spy_microprice / spy_microprice_30 - 1) AS spy_lead_seconds_30,
+        10000 * (spy_microprice / spy_microprice_120 - 1) AS spy_lead_seconds_120,
+        10000 * (qqq_microprice / qqq_microprice_5 - 1) AS qqq_lead_seconds_5,
+        10000 * (qqq_microprice / qqq_microprice_30 - 1) AS qqq_lead_seconds_30,
+        10000 * (qqq_microprice / qqq_microprice_120 - 1) AS qqq_lead_seconds_120,
+        (spy_flow_now - spy_flow_30) / nullif(spy_absolute_flow_now - spy_absolute_flow_30, 0) AS spy_order_flow_seconds_30,
+        market_signed_30 / nullif(market_dollars_30, 0) AS market_trade_sign_seconds_30,
         10000 * (mid / mid_1800 - 1) - 10000 * (spy_mid / spy_mid_1800 - 1) AS residual_return_1800,
         -- context
         minutes_since_open,
@@ -899,13 +967,13 @@ mod tests {
             (
                 TickProvider::Alpaca,
                 "/kind=trades/provider=alpaca/session=2025-06-16/",
-                "eligible_letters(conditions, tape, \"update\")",
+                "eligible_letters(conditions, tape) AS eligible",
                 "sip_timestamp",
             ),
         ] {
             let bars = held(&calendar, provider.provider(), date(2025, 1, 1), day);
             let statements = table(provider, 360)
-                .statements(&calendar, &named(day), &bars)
+                .statements(&calendar, &named(day), &bars, date(2025, 6, 13))
                 .unwrap();
             assert!(statements.contains(path), "{provider}");
             assert!(statements.contains(spelled), "{provider}");
@@ -928,8 +996,9 @@ mod tests {
         let day = date(2025, 11, 28);
         let calendar = calendar(day);
         let bars = held(&calendar, Provider::Massive, date(2025, 1, 1), day);
+        let conditions = date(2025, 11, 27);
         assert_eq!(
-            table(TickProvider::Massive, 360).statements(&calendar, &named(day), &bars),
+            table(TickProvider::Massive, 360).statements(&calendar, &named(day), &bars, conditions),
             Err(EventTableRefusal::WindowPastClose {
                 session: day,
                 end: 360,
@@ -937,7 +1006,7 @@ mod tests {
             })
         );
         let statements = table(TickProvider::Massive, 210)
-            .statements(&calendar, &named(day), &bars)
+            .statements(&calendar, &named(day), &bars, conditions)
             .unwrap();
         assert!(statements.contains("TIMESTAMP '2025-11-28 14:30:00' + INTERVAL 210 MINUTE"));
         assert!(statements.contains("< TIMESTAMP '2025-11-28 18:00:00'"));
@@ -945,19 +1014,67 @@ mod tests {
         assert!(statements.contains("timestamp + INTERVAL 1000 MILLISECOND AS arrival"));
         let saturday = date(2025, 11, 29);
         assert_eq!(
-            table(TickProvider::Massive, 210).statements(&calendar, &named(saturday), &bars),
+            table(TickProvider::Massive, 210).statements(
+                &calendar,
+                &named(saturday),
+                &bars,
+                conditions
+            ),
             Err(EventTableRefusal::NotATradingDay { session: saturday })
         );
     }
 
+    /// The statements read the conditions snapshot of the date they are given, and refuse one not taken before the
+    /// session, as a snapshot of the session's own date may already know its prints.
     #[test]
-    fn test_the_preamble_reads_the_conditions_snapshot_it_is_given() {
-        let preamble = bucket_preamble(date(2026, 10, 5));
-        assert!(preamble.contains(
+    fn test_the_conditions_snapshot_must_precede_the_session() {
+        let day = date(2026, 10, 16);
+        let calendar = calendar(date(2025, 11, 28));
+        let bars = held(&calendar, Provider::Alpaca, date(2026, 9, 14), day);
+        let build = |as_of| {
+            table(TickProvider::Alpaca, 360).statements(&calendar, &named(day), &bars, as_of)
+        };
+        assert!(build(date(2026, 10, 15)).unwrap().contains(
             "getvariable('archive') || \
-             '/data/equity/stage=parsed/reference/provider=massive/table=conditions/as_of=2026-10-05/data.parquet'"
+             '/data/equity/stage=parsed/reference/provider=massive/table=conditions/as_of=2026-10-15/data.parquet'"
         ));
-        assert!(!preamble.contains(['{', '}']));
+        for as_of in [day, date(2026, 10, 17)] {
+            assert_eq!(
+                build(as_of),
+                Err(EventTableRefusal::ConditionsNotBeforeSession {
+                    as_of,
+                    session: day
+                })
+            );
+        }
+    }
+
+    /// The thresholds reach the SQL as the constants spell them.
+    #[test]
+    fn test_the_thresholds_are_spelled_into_the_statements() {
+        let day = date(2025, 6, 16);
+        let calendar = calendar(date(2025, 11, 28));
+        let bars = held(&calendar, Provider::Massive, date(2025, 1, 1), day);
+        let statements = table(TickProvider::Massive, 360)
+            .statements(&calendar, &named(day), &bars, date(2025, 6, 13))
+            .unwrap();
+        for spelled in [
+            "abs(daily_return) < 0.4)",
+            "WHEN size >= 10000 OR price * size >= 200000 THEN size",
+            "WHEN size < 100 THEN size",
+            "hundredths_of_a_cent BETWEEN 61 AND 99 THEN 1",
+            "hundredths_of_a_cent BETWEEN 1 AND 39 THEN -1",
+            "coalesce(correction, '0') NOT IN ('1', '8', '10')",
+        ] {
+            assert!(statements.contains(spelled), "{spelled}");
+        }
+        let alpaca = held(&calendar, Provider::Alpaca, date(2025, 1, 1), day);
+        assert!(
+            table(TickProvider::Alpaca, 360)
+                .statements(&calendar, &named(day), &alpaca, date(2025, 6, 13))
+                .unwrap()
+                .contains("coalesce(\"update\", '') NOT IN ('corrected', 'canceled')")
+        );
     }
 
     #[test]
