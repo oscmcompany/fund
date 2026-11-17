@@ -56,7 +56,7 @@ mod tests {
 
     use super::*;
     use crate::common::book::Cash;
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::market::aggregate::TradeTotals;
     use crate::common::market::record::BarInterval;
     use crate::common::market::state::MarketEvent;

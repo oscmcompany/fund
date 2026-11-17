@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 
 use chrono::{NaiveTime, TimeDelta};
 
-use crate::common::laboratory::cost::BasisPoints;
+use crate::common::cost::BasisPoints;
 use crate::common::laboratory::experiment::Parameters;
 use draw::{LogNormal, Seed};
 

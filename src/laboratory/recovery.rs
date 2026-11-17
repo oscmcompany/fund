@@ -219,8 +219,8 @@ mod tests {
     use chrono::{NaiveDate, TimeDelta};
 
     use super::*;
+    use crate::common::cost::BasisPoints;
     use crate::common::journal::{Observation, ReadLine, read};
-    use crate::common::laboratory::cost::BasisPoints;
     use crate::common::laboratory::experiment::Label;
     use crate::common::laboratory::synthetic::draw::{LogNormal, Seed};
     use crate::common::laboratory::synthetic::{

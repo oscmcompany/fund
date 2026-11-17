@@ -3,7 +3,7 @@
 
 use std::num::NonZeroUsize;
 
-use crate::common::laboratory::cost::BasisPoints;
+use crate::common::cost::BasisPoints;
 use crate::common::laboratory::estimate::Estimate;
 use crate::common::laboratory::experiment::{ExperimentRefusal, Outputs};
 use crate::common::market::record::BarInterval;

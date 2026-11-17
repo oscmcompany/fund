@@ -202,8 +202,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::common::book::{Book, Cash};
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::journal::{Observation, ReadLine, read};
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::{ExperimentRan, Label};
     use crate::common::market::state::MarketState;
     use crate::common::market::{Shares, Symbol};
