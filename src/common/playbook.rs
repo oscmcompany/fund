@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::Book;
 use crate::common::journal::RunId;
+use crate::common::learning::registry::{ModelName, ModelPin};
 use crate::common::market::state::MarketState;
 use crate::common::market::{Shares, Symbol};
 use crate::common::storage::EntityTag;
@@ -45,12 +46,13 @@ pub struct Entry {
     runs: Vec<RunId>,
 }
 
-/// Entries covering the regular session from the open to the 16:00 close exactly once, in order, and how long a
-/// switch between two of them takes.
+/// Entries covering the regular session from the open to the 16:00 close exactly once, in order, how long a switch
+/// between two of them takes, and at most one pinned version of each model they read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Playbook {
     roll_off: TimeDelta,
     entries: Vec<Entry>,
+    models: Vec<ModelPin>,
 }
 
 /// Why a playbook was refused, with the times or values that refused it.
@@ -88,6 +90,8 @@ pub enum PlaybookRefusal {
         until: NaiveTime,
         roll_off: TimeDelta,
     },
+    #[error("the model {name} is pinned twice")]
+    RepeatedModel { name: ModelName },
 }
 
 #[derive(Deserialize)]
@@ -95,6 +99,8 @@ pub enum PlaybookRefusal {
 struct PlaybookFields {
     roll_off_minutes: u32,
     entries: Vec<EntryFields>,
+    #[serde(default)]
+    models: Vec<ModelPin>,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +128,15 @@ impl Playbook {
             .collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.from);
         let roll_off = TimeDelta::minutes(i64::from(fields.roll_off_minutes));
+        for (index, pin) in fields.models.iter().enumerate() {
+            let name = pin.key().name();
+            if fields.models[..index]
+                .iter()
+                .any(|earlier| earlier.key().name() == name)
+            {
+                return Err(PlaybookRefusal::RepeatedModel { name: name.clone() });
+            }
+        }
         if let Some(short) = entries
             .iter()
             .skip(1)
@@ -158,8 +173,17 @@ impl Playbook {
             (false, std::cmp::Ordering::Greater) => {
                 Err(PlaybookRefusal::OutsideTheSession { at: covered })
             }
-            (false, std::cmp::Ordering::Equal) => Ok(Self { roll_off, entries }),
+            (false, std::cmp::Ordering::Equal) => Ok(Self {
+                roll_off,
+                entries,
+                models: fields.models,
+            }),
         }
+    }
+
+    /// The model versions the playbook pins, each opened only from the bytes its pin names.
+    pub fn models(&self) -> &[ModelPin] {
+        &self.models
     }
 
     /// The strategy that trades this playbook over `universe`.
@@ -414,6 +438,7 @@ note = "Hold nothing in the afternoon"
                         runs: vec![],
                     },
                 ],
+                models: vec![],
             }
         );
         let reversed = written(&[
@@ -427,6 +452,34 @@ note = "Hold nothing in the afternoon"
             .map(|entry| entry.from)
             .collect();
         assert_eq!(froms, [time(9, 30), time(12, 0)]);
+    }
+
+    #[test]
+    fn test_a_playbook_pins_each_model_at_most_once() {
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let pins = |versions: &[u32]| {
+            versions
+                .iter()
+                .map(|version| {
+                    format!(
+                        "\n[[models]]\nname = \"tick_fill\"\nversion = {version}\nmanifest_sha256 = \"{digest}\"\n"
+                    )
+                })
+                .collect::<String>()
+        };
+        let pinned = Playbook::parse(&format!("{TWO_ENTRIES}{}", pins(&[3]))).unwrap();
+        let directories: Vec<String> = pinned
+            .models()
+            .iter()
+            .map(|pin| pin.key().directory())
+            .collect();
+        assert_eq!(directories, ["models/tick_fill/3"]);
+        assert_eq!(
+            Playbook::parse(&format!("{TWO_ENTRIES}{}", pins(&[3, 4]))),
+            Err(PlaybookRefusal::RepeatedModel {
+                name: ModelName::new("tick_fill").unwrap()
+            })
+        );
     }
 
     #[test]

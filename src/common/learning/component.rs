@@ -2,6 +2,7 @@
 //! switched to the arm it replaces, and every application reports each component's diagnostics by name.
 
 use std::convert::Infallible;
+use std::fmt::Debug;
 
 use crate::common::laboratory::experiment::{ExperimentRefusal, Name, Outputs};
 use crate::common::learning::boosting::ensemble::{Booster, WidthError};
@@ -19,6 +20,28 @@ pub trait Component<Input> {
         input: Input,
         diagnostics: &mut Diagnostics,
     ) -> Result<Self::Output, Self::Refusal>;
+}
+
+/// A refusal's kind: why it refused without the numbers that produced it, so refusals are counted by kind.
+pub trait Cause {
+    type Kind: Ord + Clone + Debug;
+
+    fn kind(&self) -> Self::Kind;
+}
+
+impl Cause for Infallible {
+    type Kind = Infallible;
+
+    fn kind(&self) -> Infallible {
+        match *self {}
+    }
+}
+
+/// A width mismatch has one kind whatever the widths.
+impl Cause for WidthError {
+    type Kind = ();
+
+    fn kind(&self) {}
 }
 
 /// The readings components record as they apply, in order, each under its components' names joined by dots.
@@ -74,12 +97,23 @@ pub struct Then<First, Second> {
 }
 
 /// Which of two wired components refused.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, thiserror::Error)]
 pub enum ThenRefusal<First, Second> {
     #[error("the first component refused: {0}")]
     First(First),
     #[error("the second component refused: {0}")]
     Second(Second),
+}
+
+impl<First: Cause, Second: Cause> Cause for ThenRefusal<First, Second> {
+    type Kind = ThenRefusal<First::Kind, Second::Kind>;
+
+    fn kind(&self) -> Self::Kind {
+        match self {
+            Self::First(first) => ThenRefusal::First(first.kind()),
+            Self::Second(second) => ThenRefusal::Second(second.kind()),
+        }
+    }
 }
 
 impl<Input, First, Second> Component<Input> for Then<First, Second>
@@ -132,12 +166,23 @@ pub struct Switch<On, Off> {
 }
 
 /// Which arm of a switch refused.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, thiserror::Error)]
 pub enum SwitchRefusal<On, Off> {
     #[error("the component refused: {0}")]
     On(On),
     #[error("the arm it replaces refused: {0}")]
     Off(Off),
+}
+
+impl<On: Cause, Off: Cause> Cause for SwitchRefusal<On, Off> {
+    type Kind = SwitchRefusal<On::Kind, Off::Kind>;
+
+    fn kind(&self) -> Self::Kind {
+        match self {
+            Self::On(on) => SwitchRefusal::On(on.kind()),
+            Self::Off(off) => SwitchRefusal::Off(off.kind()),
+        }
+    }
 }
 
 impl<Input, On, Off> Component<Input> for Switch<On, Off>

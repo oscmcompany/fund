@@ -8,7 +8,10 @@ version = 2
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, not vulnerable; replacing it is its own task (2026-11-17)" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, not vulnerable; replaced with chrono (2026-11-17)" },
+]
 
 [licenses]
 version = 2

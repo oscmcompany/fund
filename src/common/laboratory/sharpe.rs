@@ -3,6 +3,9 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+use crate::common::laboratory::READING_BOUND;
 use crate::common::laboratory::score::equal_up_to_rounding;
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::Price;
@@ -25,12 +28,51 @@ pub const SHARPE_MARGIN_OVER_INDEX: f64 = 2.0;
 pub const DAILY_RETURN_TARGET_BASIS_POINTS: f64 = 8.0;
 
 /// An annualized Sharpe ratio with the sessions it was read over and how many of the result's sessions had no reading.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SharpeFields")]
 pub struct Sharpe {
     annualized: f64,
     mean_return: f64,
     sessions: usize,
     undefined: usize,
+}
+
+#[derive(Deserialize)]
+struct SharpeFields {
+    annualized: f64,
+    mean_return: f64,
+    sessions: usize,
+    undefined: usize,
+}
+
+/// Why a stored Sharpe or reading beside the index was refused: it is not one `beside_index` could have produced.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("a stored Sharpe is not one beside_index could produce")]
+pub struct Inadmissible;
+
+impl TryFrom<SharpeFields> for Sharpe {
+    type Error = Inadmissible;
+
+    fn try_from(fields: SharpeFields) -> Result<Self, Self::Error> {
+        match fields.annualized.is_finite()
+            && within_reading_bound(fields.mean_return)
+            && fields.sessions >= MINIMUM_SESSIONS
+        {
+            true => Ok(Self {
+                annualized: fields.annualized,
+                mean_return: fields.mean_return,
+                sessions: fields.sessions,
+                undefined: fields.undefined,
+            }),
+            false => Err(Inadmissible),
+        }
+    }
+}
+
+/// Whether `mean` could average readings no larger than `READING_BOUND`, up to the rounding the averaging adds.
+fn within_reading_bound(mean: f64) -> bool {
+    mean.is_finite()
+        && (mean.abs() <= READING_BOUND || equal_up_to_rounding(mean.abs(), READING_BOUND))
 }
 
 impl Sharpe {
@@ -53,7 +95,8 @@ impl Sharpe {
 }
 
 /// Why a Sharpe could not be read.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
 pub enum SharpeRefusal {
     #[error("{count} sessions is fewer than the {minimum} a Sharpe is read over")]
     TooFewSessions { count: usize, minimum: usize },
@@ -145,14 +188,37 @@ pub fn index_returns(
 }
 
 /// A result's Sharpe and the index's over exactly the sessions the result was measured on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "BesideIndexFields")]
 pub struct BesideIndex {
     result: Sharpe,
     index: Sharpe,
 }
 
+#[derive(Deserialize)]
+struct BesideIndexFields {
+    result: Sharpe,
+    index: Sharpe,
+}
+
+impl TryFrom<BesideIndexFields> for BesideIndex {
+    type Error = Inadmissible;
+
+    /// The index is read over the result's measured sessions, so it has as many and none undefined.
+    fn try_from(fields: BesideIndexFields) -> Result<Self, Self::Error> {
+        match (fields.index.sessions, fields.index.undefined) == (fields.result.sessions, 0) {
+            true => Ok(Self {
+                result: fields.result,
+                index: fields.index,
+            }),
+            false => Err(Inadmissible),
+        }
+    }
+}
+
 /// Why a result could not be set beside the index.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
 pub enum BesideIndexRefusal {
     #[error("the result's Sharpe: {0}")]
     Result(SharpeRefusal),
@@ -200,19 +266,56 @@ pub fn beside_index(
     Ok(BesideIndex { result, index })
 }
 
+/// A result set beside the index, or why it could not be, in the form an experiment journals it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexReading {
+    Read(BesideIndex),
+    Refused { cause: BesideIndexRefusal },
+}
+
+impl From<Result<BesideIndex, BesideIndexRefusal>> for IndexReading {
+    fn from(beside: Result<BesideIndex, BesideIndexRefusal>) -> Self {
+        match beside {
+            Ok(beside) => Self::Read(beside),
+            Err(cause) => Self::Refused { cause },
+        }
+    }
+}
+
 /// Whether a reading reaches its target, and by how much it falls short when it does not.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Gate {
+pub enum Verdict {
     Clears,
     Short { by: f64 },
 }
 
+/// A reading beside the target it is gated on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gate {
+    reading: f64,
+    target: f64,
+}
+
 impl Gate {
     fn of(reading: f64, target: f64) -> Self {
-        match reading >= target {
-            true => Self::Clears,
-            false => Self::Short {
-                by: target - reading,
+        Self { reading, target }
+    }
+
+    pub fn reading(self) -> f64 {
+        self.reading
+    }
+
+    pub fn target(self) -> f64 {
+        self.target
+    }
+
+    /// A reading exactly at its target clears it.
+    pub fn verdict(self) -> Verdict {
+        match self.reading >= self.target {
+            true => Verdict::Clears,
+            false => Verdict::Short {
+                by: self.target - self.reading,
             },
         }
     }
@@ -221,8 +324,27 @@ impl Gate {
 /// A result against both targets; a target is a gate a result passes, never a quantity to search toward.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Targets {
-    pub sharpe_margin: Gate,
-    pub daily_return: Gate,
+    sharpe_margin: Gate,
+    daily_return: Gate,
+}
+
+impl Targets {
+    /// The result's annualized Sharpe less the index's, against `SHARPE_MARGIN_OVER_INDEX`.
+    pub fn sharpe_margin(self) -> Gate {
+        self.sharpe_margin
+    }
+
+    /// The result's mean daily return on capital in basis points, against `DAILY_RETURN_TARGET_BASIS_POINTS`.
+    pub fn daily_return(self) -> Gate {
+        self.daily_return
+    }
+}
+
+/// Why a result could not be gated on its targets: it was never set beside the index.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("no reading beside the index to gate: {cause}")]
+pub struct IndexUnread {
+    pub cause: BesideIndexRefusal,
 }
 
 /// The result's Sharpe margin over the index and its mean daily return on capital, each against its target.
@@ -233,6 +355,16 @@ pub fn against_targets(beside: BesideIndex) -> Targets {
             beside.result.mean_return * 10_000.0,
             DAILY_RETURN_TARGET_BASIS_POINTS,
         ),
+    }
+}
+
+impl IndexReading {
+    /// The reading against both targets, or the cause it was never set beside the index.
+    pub fn against_targets(self) -> Result<Targets, IndexUnread> {
+        match self {
+            Self::Read(beside) => Ok(against_targets(beside)),
+            Self::Refused { cause } => Err(IndexUnread { cause }),
+        }
     }
 }
 
@@ -322,6 +454,68 @@ mod tests {
         assert!((read.annualized() - 15.74166446091391).abs() < 1e-9);
     }
 
+    /// Both forms of a reading beside the index read back as written, and a stored reading `beside_index` could not
+    /// have produced is refused: the index over other sessions than the result, or a Sharpe under the session floor.
+    #[test]
+    fn test_an_index_reading_round_trips_and_refuses_what_beside_index_cannot_produce() {
+        let beside = beside_index(
+            &series(&alternating()),
+            &series(
+                &alternating()
+                    .iter()
+                    .map(|value| value * 2.0 - 0.001)
+                    .collect::<Vec<_>>(),
+            ),
+            &constant(0.0, 60),
+        )
+        .unwrap();
+        for reading in [
+            IndexReading::Read(beside),
+            IndexReading::Refused {
+                cause: BesideIndexRefusal::IndexMissing {
+                    session: session(3),
+                },
+            },
+            IndexReading::Refused {
+                cause: BesideIndexRefusal::Result(SharpeRefusal::TooFewSessions {
+                    count: 3,
+                    minimum: 60,
+                }),
+            },
+        ] {
+            let written = serde_json::to_string(&reading).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IndexReading>(&written).unwrap(),
+                reading
+            );
+        }
+        let sharpe = |sessions: usize, undefined: usize| {
+            format!(
+                r#"{{"annualized":1.5,"mean_return":0.001,"sessions":{sessions},"undefined":{undefined}}}"#
+            )
+        };
+        let stored = |result: String, index: String| {
+            serde_json::from_str::<IndexReading>(&format!(
+                r#"{{"read":{{"result":{result},"index":{index}}}}}"#
+            ))
+        };
+        assert!(stored(sharpe(60, 1), sharpe(60, 0)).is_ok());
+        assert!(stored(sharpe(60, 0), sharpe(61, 0)).is_err());
+        assert!(stored(sharpe(60, 0), sharpe(60, 1)).is_err());
+        assert!(stored(sharpe(59, 0), sharpe(59, 0)).is_err());
+        let mean = |mean_return: &str| {
+            serde_json::from_str::<Sharpe>(&format!(
+                r#"{{"annualized":1.5,"mean_return":{mean_return},"sessions":60,"undefined":0}}"#
+            ))
+        };
+        assert!(mean("1e50").is_ok());
+        assert!(mean("-1e50").is_ok());
+        assert!(mean("1.0000000000005e50").is_ok());
+        assert!(mean("1.00000000001e50").is_err());
+        assert!(mean("1e51").is_err());
+        assert!(mean("-1e100").is_err());
+    }
+
     #[test]
     fn test_the_index_is_read_over_exactly_the_results_sessions() {
         // Over a 5bp daily rate, the result's excess alternates +15bp and -5bp (Sharpe half the base √(252 × 59 / 60))
@@ -368,10 +562,19 @@ mod tests {
             },
         };
         let targets = against_targets(beside);
-        assert_eq!(targets.daily_return, Gate::Clears);
-        match targets.sharpe_margin {
-            Gate::Short { by } => assert!((by - 0.5).abs() < 1e-12),
-            Gate::Clears => panic!("a margin of 1.5 is short of 2"),
+        assert_eq!(targets.daily_return().verdict(), Verdict::Clears);
+        assert!((targets.daily_return().reading() - 10.0).abs() < 1e-12);
+        assert!((targets.sharpe_margin().reading() - 1.5).abs() < 1e-12);
+        assert_eq!(
+            (
+                targets.sharpe_margin().target(),
+                targets.daily_return().target()
+            ),
+            (2.0, 8.0)
+        );
+        match targets.sharpe_margin().verdict() {
+            Verdict::Short { by } => assert!((by - 0.5).abs() < 1e-12),
+            Verdict::Clears => panic!("a margin of 1.5 is short of 2"),
         }
         let pinned = [
             SHARPE_MARGIN_OVER_INDEX,
@@ -399,8 +602,22 @@ mod tests {
         };
         let reached = against_targets(at_the_targets);
         assert_eq!(
-            (reached.sharpe_margin, reached.daily_return),
-            (Gate::Clears, Gate::Clears)
+            (
+                reached.sharpe_margin().verdict(),
+                reached.daily_return().verdict()
+            ),
+            (Verdict::Clears, Verdict::Clears)
+        );
+    }
+
+    #[test]
+    fn test_an_unread_index_refuses_the_targets_with_its_cause() {
+        let cause = BesideIndexRefusal::IndexMissing {
+            session: session(3),
+        };
+        assert_eq!(
+            IndexReading::Refused { cause }.against_targets(),
+            Err(IndexUnread { cause })
         );
     }
 

@@ -1,15 +1,19 @@
-//! Loads archive series for studies, each with the fingerprint of exactly what was read.
+//! Loads archive series for studies, each with the fingerprint of exactly what was read, and builds a synthetic one
+//! from the specification that generates it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::journal::RunId;
 use crate::common::laboratory::dataset::{
     Contamination, DatasetLeg, Fingerprint, FingerprintRefusal, PartitionRead, Symbols,
 };
-use crate::common::market::record::{BarInterval, Partition};
+use crate::common::laboratory::synthetic::Specification;
+use crate::common::laboratory::synthetic::generate::{GenerationRefusal, Market, Planted};
+use crate::common::market::Symbol;
+use crate::common::market::record::{BarInterval, Partition, PartitionRefusal};
 use crate::common::market::trade_bars::TradeBar;
 use crate::common::storage::{Key, Provider, TradesKey};
-use crate::common::time::calendar::TradingCalendar;
+use crate::common::time::calendar::{TradingCalendar, TradingSession};
 use crate::common::time::{SessionDate, SessionRange};
 use crate::laboratory::Study;
 use crate::storage::provenance::Provenance;
@@ -22,16 +26,36 @@ pub struct Dataset {
     lineage: Lineage,
 }
 
-/// What a dataset read: the fingerprint of its partitions and the run whose journal holds the read.
+/// Where a dataset came from and the run that holds it.
 #[derive(Debug)]
 pub struct Lineage {
-    fingerprint: Fingerprint,
+    origin: Origin,
     run: RunId,
 }
 
+/// The archive partitions a dataset read, or the specification, universe and sessions that generated it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Origin {
+    Archive(Fingerprint),
+    /// Nothing is stored, since these and the commit rebuild it.
+    Synthetic {
+        specification: Specification,
+        universe: BTreeSet<Symbol>,
+        sessions: Vec<TradingSession>,
+    },
+}
+
 impl Lineage {
-    pub fn fingerprint(&self) -> &Fingerprint {
-        &self.fingerprint
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    /// The partitions read, `None` for a synthetic dataset, which read none.
+    pub fn fingerprint(&self) -> Option<&Fingerprint> {
+        match &self.origin {
+            Origin::Archive(fingerprint) => Some(fingerprint),
+            Origin::Synthetic { .. } => None,
+        }
     }
 
     pub fn run(&self) -> RunId {
@@ -48,9 +72,42 @@ impl Dataset {
         &self.lineage
     }
 
-    pub fn fingerprint(&self) -> &Fingerprint {
+    pub fn fingerprint(&self) -> Option<&Fingerprint> {
         self.lineage.fingerprint()
     }
+}
+
+/// The one-minute trade bars `specification` generates for `universe` over `sessions`, held by `study`'s run, with
+/// what it planted returned apart so a model reading the dataset cannot see it.
+pub fn synthetic(
+    study: &Study,
+    specification: &Specification,
+    universe: &BTreeSet<Symbol>,
+    sessions: &[TradingSession],
+) -> Result<(Dataset, Vec<Planted>), GenerationRefusal> {
+    let (mut bars, mut planted) = (BTreeMap::new(), Vec::new());
+    for session in Market::new(specification, universe, sessions)? {
+        planted.extend_from_slice(session.planted());
+        // A session that printed nothing has no partition, as an archive session with no rows has none.
+        match Partition::try_from(session.trade_bars()) {
+            Ok(partition) => {
+                bars.insert(session.date(), partition);
+            }
+            Err(PartitionRefusal::Empty) => {}
+        }
+    }
+    let dataset = Dataset {
+        bars,
+        lineage: Lineage {
+            origin: Origin::Synthetic {
+                specification: specification.clone(),
+                universe: universe.clone(),
+                sessions: sessions.to_vec(),
+            },
+            run: study.run_id(),
+        },
+    };
+    Ok((dataset, planted))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,7 +227,7 @@ async fn load(
     Ok(Dataset {
         bars,
         lineage: Lineage {
-            fingerprint,
+            origin: Origin::Archive(fingerprint),
             run: study.run_id(),
         },
     })
@@ -241,7 +298,7 @@ pub(crate) mod tests {
     use crate::ingest::alpaca::Alpaca;
     use crate::laboratory::source::Source;
 
-    fn session(day: i64) -> SessionDate {
+    pub(crate) fn session(day: i64) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap()).plus_calendar_days(day)
     }
 
@@ -347,13 +404,80 @@ pub(crate) mod tests {
         Dataset {
             bars: [bars(0, 1), bars(1, 2), bars(3, 3)].into(),
             lineage: Lineage {
-                fingerprint: Fingerprint::new(
-                    DatasetLeg::DailyTradeBars,
-                    SessionRange::new(session(0), session(3)).unwrap(),
-                    &calendar,
-                    read,
+                origin: Origin::Archive(
+                    Fingerprint::new(
+                        DatasetLeg::DailyTradeBars,
+                        SessionRange::new(session(0), session(3)).unwrap(),
+                        &calendar,
+                        read,
+                    )
+                    .unwrap(),
+                ),
+                run,
+            },
+        }
+    }
+
+    /// Sessions `first` to `last` on consecutive days, each trading 09:30 to 16:00 Eastern.
+    pub(crate) fn calendar_between(first: i64, last: i64) -> TradingCalendar {
+        let (open, close) = (
+            chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+        );
+        TradingCalendar::new(
+            (first..=last)
+                .map(|day| TradingSession::new(session(day), open, close).unwrap())
+                .collect(),
+            SessionRange::new(session(first), session(last)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Daily bars from session `first` on, read by `run`, one per symbol and session, each bar's open, high, low and
+    /// close all at that session's entry of the symbol's closes.
+    pub(crate) fn daily_dataset(run: RunId, first: i64, closes: &[(&str, Vec<f64>)]) -> Dataset {
+        let sessions = closes[0].1.len() as i64;
+        let last = first + sessions - 1;
+        let bars = (first..=last)
+            .map(|day| {
+                let rows: Vec<TradeBar> = closes
+                    .iter()
+                    .map(|(symbol, closes)| {
+                        let close = closes[(day - first) as usize];
+                        symbol_bar(
+                            symbol,
+                            BarInterval::OneDay,
+                            session(day).regular_close(),
+                            [close; 4],
+                        )
+                    })
+                    .collect();
+                (session(day), Partition::try_from(rows).unwrap())
+            })
+            .collect();
+        let read = (first..=last)
+            .map(|day| {
+                (
+                    session(day),
+                    PartitionRead::new(
+                        Provider::Massive,
+                        EntityTag::new(&format!("\"tag-{day}\"")),
+                    ),
                 )
-                .unwrap(),
+            })
+            .collect();
+        Dataset {
+            bars,
+            lineage: Lineage {
+                origin: Origin::Archive(
+                    Fingerprint::new(
+                        DatasetLeg::DailyTradeBars,
+                        SessionRange::new(session(first), session(last)).unwrap(),
+                        &calendar_between(first, last),
+                        read,
+                    )
+                    .unwrap(),
+                ),
                 run,
             },
         }
@@ -465,14 +589,15 @@ pub(crate) mod tests {
         assert_eq!(
             dataset
                 .fingerprint()
+                .unwrap()
                 .partitions()
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
             [session(0), session(1)]
         );
-        assert_eq!(dataset.fingerprint().missing(), [session(2)]);
-        assert_eq!(dataset.fingerprint().symbols(), &symbols);
+        assert_eq!(dataset.fingerprint().unwrap().missing(), [session(2)]);
+        assert_eq!(dataset.fingerprint().unwrap().symbols(), &symbols);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -488,7 +613,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let dataset = dataset(study.run_id());
-        study.read(dataset.fingerprint()).unwrap();
+        study.read(dataset.fingerprint().unwrap()).unwrap();
         let series = Series::new([
             (session(0), Some(1.0)),
             (session(1), Some(2.0)),
@@ -538,7 +663,10 @@ pub(crate) mod tests {
             }
             other => panic!("{other:?}"),
         };
-        assert_eq!(first.fingerprints(), [dataset.fingerprint().clone()]);
+        assert_eq!(
+            first.fingerprints(),
+            [dataset.fingerprint().unwrap().clone()]
+        );
         assert_eq!(first.parameters().settings()["variant"], "all");
         assert_eq!(first.estimates()["bars per session"], estimate);
         assert!(!first.machine().hostname().is_empty());
@@ -620,7 +748,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let fingerprint = dataset.fingerprint();
+        let fingerprint = dataset.fingerprint().unwrap();
         assert!(!fingerprint.partitions().is_empty(), "{fingerprint:?}");
         let mut sessions: Vec<SessionDate> = fingerprint.partitions().keys().copied().collect();
         sessions.extend(fingerprint.missing());

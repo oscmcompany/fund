@@ -97,10 +97,30 @@ fn kept(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    /// A zero rate for each of `sessions`, read through the loader's own path from a yield dated the day before each,
+    /// keeping no note.
+    pub(crate) fn zero_rate(sessions: &[SessionDate]) -> RiskFree {
+        let yields = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.plus_calendar_days(-1).date(),
+                    AnnualYield::new(0.0).unwrap(),
+                )
+            })
+            .collect();
+        kept(
+            Path::new("unused"),
+            Fetched::new(Ok(yields), Vec::new()),
+            sessions,
+        )
+        .unwrap()
+    }
 
     fn session(day: u32) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 11, day).unwrap())

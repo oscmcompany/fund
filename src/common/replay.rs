@@ -8,10 +8,10 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::common::book::{Book, Cash, Fill, Side, ValuationRefusal};
+use crate::common::cost::{BasisPoints, CostRefusal, FillStyle, RoundTrip};
 use crate::common::guard::{
     GuardCause, OrderGuarded, Tradability, TradabilityRead, Unclosed, guard,
 };
-use crate::common::laboratory::cost::{BasisPoints, CostModel, CostRefusal, FillStyle};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::record::BarInterval;
 use crate::common::market::state::{MarketEvent, MarketState, Staleness};
@@ -47,7 +47,7 @@ impl FillModel {
     /// Refused for a style whose cost turns on a fill rate the archive does not measure, or a spread charging more
     /// than the whole notional per crossing.
     pub fn new(style: FillStyle, quoted_spread: BasisPoints) -> Result<Self, CostRefusal> {
-        let round_trip = CostModel::new(style, NonZeroU32::MIN).cost(quoted_spread)?;
+        let round_trip = RoundTrip::new(style, NonZeroU32::MIN).cost(quoted_spread)?;
         // A round trip crosses twice; rounded up so the grid never flatters a strategy.
         let rate = (round_trip.value() / 2.0 * (RATE_SCALE / 10_000) as f64).ceil();
         // Past the whole notional a crossing would cost more than it trades, and the charge could leave `Cash`.
@@ -223,6 +223,9 @@ pub struct Replay {
     fills: Vec<Fill>,
     unfilled: Vec<Unfilled>,
     marks: BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
+    /// Each name's share of the book: its opening position, combined with each of its fills' `Book::of`.
+    names: BTreeMap<Symbol, Book>,
+    name_marks: BTreeMap<DateTime<Utc>, BTreeMap<Symbol, Result<Cash, ValuationRefusal>>>,
     /// The session decided in and each name's gain since its open, opened at the session's first decision from the
     /// closes before it, or why a position had no close, retried at each later decision until it has one; `None`
     /// before the first decision or when unrestrained.
@@ -251,6 +254,16 @@ pub enum ReplayRefusal {
 impl Replay {
     /// A replay that has seen nothing, holding `book`.
     pub fn open(book: Book) -> Self {
+        let names = book
+            .positions()
+            .iter()
+            .map(|(symbol, position)| {
+                (
+                    symbol.clone(),
+                    Book::reported(Cash::empty(), [(symbol.clone(), *position)]),
+                )
+            })
+            .collect();
         Self {
             state: MarketState::empty(),
             book,
@@ -259,6 +272,8 @@ impl Replay {
             fills: Vec::new(),
             unfilled: Vec::new(),
             marks: BTreeMap::new(),
+            names,
+            name_marks: BTreeMap::new(),
             losses: None,
             restraints: BTreeMap::new(),
             held: Vec::new(),
@@ -281,6 +296,14 @@ impl Replay {
     /// The book marked at each decision, to the decision interval's closes, before that decision's orders fill.
     pub fn marks(&self) -> &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>> {
         &self.marks
+    }
+
+    /// Each name held at the opening or filled since, marked at each decision like `marks`: its position at the closes
+    /// plus the cash its fills paid and took in, so the opening's cash and the names' marks sum to the book's.
+    pub fn name_marks(
+        &self,
+    ) -> &BTreeMap<DateTime<Utc>, BTreeMap<Symbol, Result<Cash, ValuationRefusal>>> {
+        &self.name_marks
     }
 
     /// Under restraint, what the solver cut at each decision, or why risk could not judge it.
@@ -481,6 +504,10 @@ impl<S: Strategy> Replayer<S> {
             match filled {
                 Ok(fill) => {
                     replay.book = replay.book.combine(Book::of(&fill));
+                    let name = replay.names.remove(fill.symbol()).unwrap_or_default();
+                    replay
+                        .names
+                        .insert(fill.symbol().clone(), name.combine(Book::of(&fill)));
                     match &mut replay.losses {
                         Some((_, Ok(losses))) => losses.take(&fill),
                         Some((_, Err(_))) | None => {}
@@ -503,6 +530,15 @@ impl<S: Strategy> Replayer<S> {
                 .book
                 .value(|symbol| state.last_price(symbol, self.decision));
             replay.marks.insert(ends, mark);
+            let name_marks = replay
+                .names
+                .iter()
+                .map(|(symbol, name)| {
+                    let mark = name.value(|symbol| state.last_price(symbol, self.decision));
+                    (symbol.clone(), mark)
+                })
+                .collect();
+            replay.name_marks.insert(ends, name_marks);
             let wanted = self.strategy.decide(state, &replay.book);
             replay.pending = match &self.controls {
                 Controls::Unrestrained => orders(&replay.book, &wanted),
@@ -1716,6 +1752,36 @@ mod tests {
                 replay.book(),
                 &opening.combine(concatenate(replay.fills().iter().map(Book::of)))
             );
+        }
+
+        /// The opening's cash and each name's mark sum to the book's mark at every decision, and a decision whose book
+        /// went unpriced has a name that did, so no gain is lost or invented in dividing the book among its names.
+        #[test]
+        fn property_the_names_marks_sum_to_the_books(
+            bars in arbitrary_stream(12),
+            spread in 0.0..50.0f64,
+            held in -3..4i128,
+        ) {
+            let replayer = Replayer::new(
+                Even,
+                FillModel::new(FillStyle::Aggressive, BasisPoints::new(spread).unwrap()).unwrap(),
+                BarInterval::OneDay,
+            );
+            let opening = Book::reported(
+                cash(1_000),
+                [(Symbol::new("MSFT").unwrap(), Position::from_units(held * 1_000_000))],
+            );
+            let replay = replayer.act(Replay::open(opening.clone()), bars).unwrap();
+            prop_assert!(!replay.marks().is_empty());
+            prop_assert!(replay.marks().keys().eq(replay.name_marks().keys()));
+            for (at, mark) in replay.marks() {
+                let summed = replay.name_marks()[at]
+                    .values()
+                    .try_fold(opening.cash(), |total, mark| {
+                        mark.as_ref().ok().map(|mark| total.combine(*mark))
+                    });
+                prop_assert_eq!(mark.as_ref().ok().copied(), summed, "at {}", at);
+            }
         }
     }
 }

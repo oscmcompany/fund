@@ -1,13 +1,16 @@
-//! Whether a forecast's quantile band holds the share of outcomes its levels promise, overall and by decile of the
-//! band's width, since a band can be right on average and wrong at every width.
+//! Whether a forecast means what it says: a quantile band's coverage overall and by decile of width, the mean outcome
+//! by decile of the forecast, and the slope that rescales a forecast to the outcomes it was fit against.
 
-use crate::common::laboratory::score::{Forecast, Outcome};
+use std::num::NonZeroU64;
+
+use crate::common::laboratory::score::{Forecast, ForecastRefusal, Outcome, Pair};
 use crate::common::laboratory::share::Share;
+use crate::common::learning::component::{Component, Diagnostics};
 use crate::common::learning::loss::Level;
 use crate::common::monoid::{Monoid, concatenate};
 
-/// Width deciles a calibration is read in.
-pub const WIDTH_DECILES: usize = 10;
+/// Deciles a calibration is read in.
+pub const DECILES: usize = 10;
 
 /// The two quantile levels a band forecasts, the lower strictly below the upper.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,7 +136,7 @@ impl Coverage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
     levels: Levels,
-    by_width: [Coverage; WIDTH_DECILES],
+    by_width: [Coverage; DECILES],
 }
 
 impl Calibration {
@@ -146,7 +149,7 @@ impl Calibration {
         concatenate(self.by_width)
     }
 
-    pub fn by_width(&self) -> &[Coverage; WIDTH_DECILES] {
+    pub fn by_width(&self) -> &[Coverage; DECILES] {
         &self.by_width
     }
 }
@@ -154,21 +157,189 @@ impl Calibration {
 /// Reads `bands` overall and in width deciles whose sizes differ by at most one, the larger first; bands of equal
 /// width at a decile boundary are split in the order given.
 pub fn calibrate(levels: Levels, bands: &[Band]) -> Calibration {
-    let mut order: Vec<usize> = (0..bands.len()).collect();
-    order.sort_by(|left, right| bands[*left].width().total_cmp(&bands[*right].width()));
-    let (size, larger) = (bands.len() / WIDTH_DECILES, bands.len() % WIDTH_DECILES);
-    let mut by_width = [Coverage::empty(); WIDTH_DECILES];
-    let mut start = 0;
-    for (decile, coverage) in by_width.iter_mut().enumerate() {
-        let end = start + size + usize::from(decile < larger);
-        *coverage = concatenate(
-            order[start..end]
-                .iter()
-                .map(|index| Coverage::of(bands[*index])),
-        );
-        start = end;
+    let order = ordered(bands, |band| band.width());
+    let mut by_width = [Coverage::empty(); DECILES];
+    for (coverage, decile) in by_width.iter_mut().zip(deciles(&order)) {
+        *coverage = concatenate(decile.iter().map(|index| Coverage::of(bands[*index])));
     }
     Calibration { levels, by_width }
+}
+
+/// The indices of `items` sorted by `key`, ties kept in the order given.
+fn ordered<T: Copy>(items: &[T], key: impl Fn(T) -> f64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|left, right| key(items[*left]).total_cmp(&key(items[*right])));
+    order
+}
+
+/// `order` cut into deciles whose sizes differ by at most one, the larger first.
+fn deciles(order: &[usize]) -> [&[usize]; DECILES] {
+    let (size, larger) = (order.len() / DECILES, order.len() % DECILES);
+    let mut start = 0;
+    std::array::from_fn(|decile| {
+        let end = start + size + usize::from(decile < larger);
+        let slice = &order[start..end];
+        start = end;
+        slice
+    })
+}
+
+/// The mean of nonempty `values`, each divided before summing so large values cannot overflow, and held within
+/// their range so rounding cannot carry it past them.
+fn mean(values: &[f64]) -> f64 {
+    let (lowest, highest) = values.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(lowest, highest), value| (lowest.min(*value), highest.max(*value)),
+    );
+    values
+        .iter()
+        .map(|value| value / values.len() as f64)
+        .sum::<f64>()
+        .clamp(lowest, highest)
+}
+
+/// `value` times two to the `exponent`, in steps so no factor leaves the range of normal `f64`.
+fn scaled(value: f64, exponent: i32) -> f64 {
+    let mut remaining = exponent;
+    let mut result = value;
+    while remaining != 0 {
+        let step = remaining.clamp(f64::MIN_EXP - 1, f64::MAX_EXP - 1);
+        result *= 2_f64.powi(step);
+        remaining -= step;
+    }
+    result
+}
+
+/// Nonempty `values` scaled by a power of two to within a factor of two of one in magnitude, less the first and then
+/// the mean of what remains, so neither a sum of products nor a mean of near-equal values rounds away; the exponent
+/// undoes the scale.
+fn centered(values: Vec<f64>) -> (Vec<f64>, i32) {
+    let largest = values
+        .iter()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let exponent = if largest > 0.0 {
+        largest.log2().ceil() as i32
+    } else {
+        0
+    };
+    let unit: Vec<f64> = values
+        .iter()
+        .map(|value| scaled(*value, -exponent))
+        .collect();
+    let shifted: Vec<f64> = unit.iter().map(|value| value - unit[0]).collect();
+    let center = mean(&shifted);
+    (
+        shifted.iter().map(|value| value - center).collect(),
+        exponent,
+    )
+}
+
+/// One forecast decile's pairs and their mean forecast and mean outcome.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecileMeans {
+    pub pairs: NonZeroU64,
+    pub forecast: f64,
+    pub outcome: f64,
+}
+
+/// The mean forecast beside the mean outcome in each decile of the forecast, lowest first, `None` for a decile
+/// fewer than ten pairs leave empty; a calibrated forecast's two means agree in every decile.
+pub fn by_forecast_decile(pairs: &[Pair]) -> [Option<DecileMeans>; DECILES] {
+    let order = ordered(pairs, |pair| pair.forecast().get());
+    deciles(&order).map(|decile| {
+        let count = NonZeroU64::new(decile.len() as u64)?;
+        let values = |value: fn(Pair) -> f64| -> Vec<f64> {
+            decile.iter().map(|index| value(pairs[*index])).collect()
+        };
+        Some(DecileMeans {
+            pairs: count,
+            forecast: mean(&values(|pair| pair.forecast().get())),
+            outcome: mean(&values(|pair| pair.outcome().get())),
+        })
+    })
+}
+
+/// The least-squares slope, with an intercept, of outcome on forecast over the pairs it was fit on; a forecast is
+/// rescaled by the slope floored at zero, so a forecast that points the wrong way calibrates to no forecast.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slope {
+    raw: f64,
+    pairs: u64,
+}
+
+/// Why no slope was fit, with the pairs read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SlopeRefusal {
+    #[error("a slope needs two pairs, and {pairs} were given")]
+    TooFewPairs { pairs: u64 },
+    #[error("all {pairs} forecasts were equal")]
+    ForecastConstant { pairs: u64 },
+    #[error("the slope over {pairs} pairs is not finite")]
+    NotFinite { pairs: u64 },
+}
+
+impl Slope {
+    pub fn fit(pairs: &[Pair]) -> Result<Self, SlopeRefusal> {
+        let count = pairs.len() as u64;
+        if pairs.len() < 2 {
+            return Err(SlopeRefusal::TooFewPairs { pairs: count });
+        }
+        let (forecasts, forecast_exponent) =
+            centered(pairs.iter().map(|pair| pair.forecast().get()).collect());
+        let (outcomes, outcome_exponent) =
+            centered(pairs.iter().map(|pair| pair.outcome().get()).collect());
+        let (covariance, variance) = forecasts.iter().zip(&outcomes).fold(
+            (0.0, 0.0),
+            |(covariance, variance), (forecast, outcome)| {
+                (
+                    covariance + forecast * outcome,
+                    variance + forecast * forecast,
+                )
+            },
+        );
+        let raw = scaled(covariance / variance, outcome_exponent - forecast_exponent);
+        // A rounded mean leaves equal forecasts a variance just above zero, so constancy is read off the forecasts.
+        let constant = pairs
+            .iter()
+            .all(|pair| pair.forecast() == pairs[0].forecast());
+        match (constant, raw.is_finite()) {
+            (true, _) => Err(SlopeRefusal::ForecastConstant { pairs: count }),
+            (false, true) => Ok(Self { raw, pairs: count }),
+            (false, false) => Err(SlopeRefusal::NotFinite { pairs: count }),
+        }
+    }
+
+    /// The fitted slope before flooring, negative when the forecast pointed the wrong way.
+    pub fn raw(self) -> f64 {
+        self.raw
+    }
+
+    pub fn pairs(self) -> u64 {
+        self.pairs
+    }
+
+    pub fn calibrate(self, forecast: Forecast) -> Result<Forecast, ForecastRefusal> {
+        Forecast::new(self.raw.max(0.0) * forecast.get())
+    }
+}
+
+impl Component<Vec<Forecast>> for Slope {
+    type Output = Vec<Forecast>;
+    type Refusal = ForecastRefusal;
+
+    /// Records the raw slope and the pairs it was fit on.
+    fn apply(
+        &self,
+        input: Vec<Forecast>,
+        diagnostics: &mut Diagnostics,
+    ) -> Result<Vec<Forecast>, ForecastRefusal> {
+        diagnostics.record("slope", self.raw);
+        diagnostics.record("slope_pairs", self.pairs as f64);
+        input
+            .into_iter()
+            .map(|forecast| self.calibrate(forecast))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +462,151 @@ mod tests {
         assert_eq!(shifted.above().map(Share::get), Some(0.0));
     }
 
+    fn pair(forecast: f64, outcome: f64) -> Pair {
+        Pair::new(
+            Forecast::new(forecast).unwrap(),
+            Outcome::new(outcome).unwrap(),
+        )
+    }
+
+    /// Outcomes on the line 3 + 2x read slope 2, a forecast pointing the wrong way calibrates to zero, and the
+    /// component records the slope it applied.
+    #[test]
+    fn test_a_slope_rescales_a_forecast_and_floors_at_zero() {
+        let line: Vec<Pair> = (0..5)
+            .map(|x| pair(f64::from(x), 3.0 + 2.0 * f64::from(x)))
+            .collect();
+        let slope = Slope::fit(&line).unwrap();
+        assert_eq!((slope.raw(), slope.pairs()), (2.0, 5));
+        let mut diagnostics = Diagnostics::default();
+        let calibrated = slope
+            .apply(
+                vec![Forecast::new(1.5).unwrap(), Forecast::new(-4.0).unwrap()],
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(
+            calibrated
+                .iter()
+                .map(|forecast| forecast.get())
+                .collect::<Vec<_>>(),
+            [3.0, -8.0]
+        );
+        assert_eq!(
+            diagnostics.readings(),
+            [("slope".to_string(), 2.0), ("slope_pairs".to_string(), 5.0)]
+        );
+        let backwards = Slope::fit(&[pair(0.0, 1.0), pair(1.0, 0.0)]).unwrap();
+        assert_eq!(backwards.raw(), -1.0);
+        assert_eq!(
+            backwards
+                .calibrate(Forecast::new(7.0).unwrap())
+                .map(Forecast::get),
+            Ok(0.0)
+        );
+        assert_eq!(
+            Slope::fit(&[pair(1e200, 1e200), pair(-1e200, -1e200)]).map(Slope::raw),
+            Ok(1.0)
+        );
+        assert_eq!(
+            Slope::fit(&[pair(0.0, 0.0), pair(1e-300, 1e300)]),
+            Err(SlopeRefusal::NotFinite { pairs: 2 })
+        );
+    }
+
+    /// Forecasts one ulp apart, and inputs whose products fall below the smallest `f64`, still read their exact slope.
+    #[test]
+    fn test_a_slope_survives_near_equal_forecasts_and_disparate_scales() {
+        let near = Slope::fit(&[pair(1.0, 0.0), pair(1.0 + f64::EPSILON, 1.0)]).unwrap();
+        assert_eq!(near.raw(), 2_f64.powi(52));
+        let tiny = Slope::fit(&[pair(0.0, 0.0), pair(1e-100, 1e-250)]).unwrap();
+        assert!((tiny.raw() / 1e-150 - 1.0).abs() < 1e-12, "{}", tiny.raw());
+        // Exponents over two thousand apart: an uncorrelated fit reads zero rather than zero times infinity.
+        let apart = Slope::fit(&[pair(-5e-324, 1e300), pair(0.0, -1e300), pair(5e-324, 1e300)]);
+        assert_eq!(apart.map(Slope::raw), Ok(0.0));
+    }
+
+    #[test]
+    fn test_a_slope_refuses_what_has_none() {
+        let refused = |pairs: &[Pair]| Slope::fit(pairs).map_err(|refusal| refusal.to_string());
+        assert_eq!(
+            refused(&[pair(1.0, 2.0)]),
+            Err("a slope needs two pairs, and 1 were given".to_string())
+        );
+        assert_eq!(
+            refused(&[pair(1.0, 2.0), pair(1.0, 5.0)]),
+            Err("all 2 forecasts were equal".to_string())
+        );
+        let constant: Vec<Pair> = (0..11).map(|x| pair(0.1, f64::from(x))).collect();
+        assert_eq!(
+            Slope::fit(&constant),
+            Err(SlopeRefusal::ForecastConstant { pairs: 11 })
+        );
+    }
+
+    /// Forecasts 0 to 22 against outcomes twice them fill deciles of 3, 3, 3 and then 2, each reading its own means;
+    /// five pairs leave the last five deciles unmeasured.
+    #[test]
+    fn test_forecast_deciles_read_each_decile_mean() {
+        let pairs: Vec<Pair> = (0..23)
+            .rev()
+            .map(|x| pair(f64::from(x), 2.0 * f64::from(x)))
+            .collect();
+        let deciles = by_forecast_decile(&pairs);
+        let read: Vec<(u64, f64, f64)> = deciles
+            .iter()
+            .map(|decile| {
+                let decile = decile.unwrap();
+                (
+                    decile.pairs.get(),
+                    (decile.forecast * 1e9).round() / 1e9,
+                    (decile.outcome * 1e9).round() / 1e9,
+                )
+            })
+            .collect();
+        assert_eq!(
+            &read[..4],
+            [(3, 1.0, 2.0), (3, 4.0, 8.0), (3, 7.0, 14.0), (2, 9.5, 19.0)]
+        );
+        assert_eq!(read[9], (2, 21.5, 43.0));
+        let few = by_forecast_decile(&pairs[..5]);
+        assert_eq!(few.iter().filter(|decile| decile.is_none()).count(), 5);
+        assert!(
+            few[..5]
+                .iter()
+                .all(|decile| decile.is_some_and(|decile| decile.pairs.get() == 1))
+        );
+    }
+
+    /// Deciles of the largest finite values stay finite, and values that cancel read zero.
+    #[test]
+    fn test_forecast_deciles_hold_extreme_values() {
+        let largest: Vec<Pair> = (0..30).map(|_| pair(f64::MAX, f64::MAX)).collect();
+        assert!(by_forecast_decile(&largest).iter().all(|decile| {
+            decile.is_some_and(|decile| decile.forecast == f64::MAX && decile.outcome == f64::MAX)
+        }));
+        let cancelling: Vec<Pair> = [f64::MAX, -f64::MAX]
+            .into_iter()
+            .cycle()
+            .take(20)
+            .map(|value| pair(1.0, value))
+            .collect();
+        assert!(
+            by_forecast_decile(&cancelling)
+                .iter()
+                .all(|decile| decile.is_some_and(|decile| decile.outcome == 0.0))
+        );
+    }
+
+    fn pairs() -> impl Strategy<Value = Vec<Pair>> {
+        prop::collection::vec((-1e3_f64..1e3, -1e3_f64..1e3), 2..60).prop_map(|values| {
+            values
+                .into_iter()
+                .map(|(forecast, outcome)| pair(forecast, outcome))
+                .collect()
+        })
+    }
+
     fn coverage() -> impl Strategy<Value = Coverage> {
         (0..1_000u64, 0..1_000u64, 0..1_000u64, 0..1_000u64).prop_map(
             |(bands, below, above, crossed)| Coverage {
@@ -330,6 +646,44 @@ mod tests {
             prop_assert!(sizes.windows(2).all(|pair| pair[0] >= pair[1]));
             let below: u64 = bands.iter().map(|band| u64::from(band.outcome.get() < band.lower.get())).sum();
             prop_assert_eq!(calibration.overall().below, below);
+        }
+
+        /// Scaling outcomes scales the slope, shifting either side leaves it, and a forecast calibrated by a positive
+        /// slope refits to a slope of one.
+        #[test]
+        fn test_a_slope_is_equivariant_and_calibration_is_idempotent(
+            pairs in pairs(),
+            scale in 0.1_f64..10.0,
+            shift in -1e3_f64..1e3,
+        ) {
+            let Ok(slope) = Slope::fit(&pairs) else {
+                return Ok(());
+            };
+            let tolerance = |value: f64| 1e-6 * value.abs().max(1.0);
+            let moved: Vec<Pair> = pairs
+                .iter()
+                .map(|each| pair(each.forecast().get() + shift, scale * each.outcome().get() - shift))
+                .collect();
+            let refit = Slope::fit(&moved).unwrap().raw();
+            prop_assert!((refit - scale * slope.raw()).abs() < tolerance(refit), "{refit} {}", slope.raw());
+            if slope.raw() > 1e-3 {
+                let calibrated: Vec<Pair> = pairs
+                    .iter()
+                    .map(|each| Pair::new(slope.calibrate(each.forecast()).unwrap(), each.outcome()))
+                    .collect();
+                let unit = Slope::fit(&calibrated).unwrap().raw();
+                prop_assert!((unit - 1.0).abs() < 1e-6, "{unit}");
+            }
+        }
+
+        /// Every pair lands in one decile, and decile mean forecasts never fall.
+        #[test]
+        fn test_forecast_deciles_partition_the_pairs_in_forecast_order(pairs in pairs()) {
+            let deciles = by_forecast_decile(&pairs);
+            let counted: u64 = deciles.iter().flatten().map(|decile| decile.pairs.get()).sum();
+            prop_assert_eq!(counted, pairs.len() as u64);
+            let forecasts: Vec<f64> = deciles.iter().flatten().map(|decile| decile.forecast).collect();
+            prop_assert!(forecasts.windows(2).all(|two| two[0] <= two[1] + 1e-9), "{forecasts:?}");
         }
     }
 }
