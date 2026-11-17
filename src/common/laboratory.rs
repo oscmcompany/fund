@@ -11,6 +11,7 @@ pub mod experiment;
 pub mod haircut;
 pub mod ledger;
 pub mod permutation;
+pub mod recovery;
 pub mod residual;
 pub mod risk_free;
 pub mod score;
