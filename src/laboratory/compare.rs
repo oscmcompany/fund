@@ -268,12 +268,11 @@ pub fn compare<C: Strategy, B: Strategy>(
     .and_then(|outputs| outputs.index(index))
     .map_err(ReplayStudyError::Experiment)?;
     let (read, benchmark_read) = (dataset.lineage(), benchmark.dataset.lineage());
-    let lineages = match read.fingerprint() == benchmark_read.fingerprint()
-        && read.run() == benchmark_read.run()
-    {
-        true => vec![read],
-        false => vec![read, benchmark_read],
-    };
+    let lineages =
+        match read.origin() == benchmark_read.origin() && read.run() == benchmark_read.run() {
+            true => vec![read],
+            false => vec![read, benchmark_read],
+        };
     study
         .experiment(parameters, &lineages, outputs)
         .map_err(ReplayStudyError::Study)?;
@@ -383,9 +382,9 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::common::book::{Book, Cash};
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::journal::{Observation, ReadLine, read};
     use crate::common::laboratory::blocks::{Grouping, GroupingRefusal};
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::{ExperimentRan, Label};
     use crate::common::laboratory::sharpe::{BesideIndexRefusal, SharpeRefusal, Verdict};
     use crate::common::market::state::MarketState;
@@ -682,7 +681,10 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
         assert_eq!(
             ran.fingerprints(),
-            [dataset.fingerprint().clone(), index.fingerprint().clone()]
+            [
+                dataset.fingerprint().unwrap().clone(),
+                index.fingerprint().unwrap().clone()
+            ]
         );
         let IndexReading::Read(beside) = comparison.index() else {
             panic!("{:?}", comparison.index());
@@ -755,7 +757,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let ran = journaled(&directory);
-        assert_eq!(ran.fingerprints(), [dataset.fingerprint().clone()]);
+        assert_eq!(ran.fingerprints(), [dataset.fingerprint().unwrap().clone()]);
         assert_eq!(
             comparison.index(),
             IndexReading::Refused {

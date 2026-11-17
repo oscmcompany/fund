@@ -291,9 +291,9 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::guard::Tradability;
     use crate::common::journal::{Observation, ReadLine, RunId, read};
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::Label;
     use crate::common::market::Symbol;
     use crate::common::market::record::BarInterval;

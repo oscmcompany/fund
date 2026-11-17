@@ -5,4 +5,5 @@ pub mod boosting;
 pub mod component;
 pub mod loss;
 pub mod matrix;
+pub mod registry;
 pub mod ridge;

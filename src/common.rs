@@ -2,6 +2,7 @@
 
 pub mod book;
 pub mod constraint;
+pub mod cost;
 pub mod guard;
 pub mod heal;
 pub mod journal;
