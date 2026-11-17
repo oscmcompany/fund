@@ -14,7 +14,9 @@ use crate::common::laboratory::estimate::{
 };
 use crate::common::laboratory::experiment::{ExperimentRefusal, Metric, Name, Outputs, Parameters};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
-use crate::common::laboratory::sharpe::{IndexReading, beside_index, index_returns};
+use crate::common::laboratory::sharpe::{
+    IndexReading, IndexUnread, Targets, beside_index, index_returns,
+};
 use crate::common::laboratory::verdict::{Cause, Checks, NullReading};
 use crate::common::market::Symbol;
 use crate::common::market::record::{BarInterval, Partition};
@@ -172,6 +174,11 @@ impl Comparison {
     /// The candidate's Sharpe beside the index's over the candidate's measured sessions, or why it could not be read.
     pub fn index(&self) -> IndexReading {
         self.index
+    }
+
+    /// The candidate against the Sharpe-over-index and daily-return targets, or why it was never set beside the index.
+    pub fn against_targets(&self) -> Result<Targets, IndexUnread> {
+        self.index.against_targets()
     }
 }
 
@@ -380,7 +387,7 @@ pub(crate) mod tests {
     use crate::common::laboratory::blocks::{Grouping, GroupingRefusal};
     use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::{ExperimentRan, Label};
-    use crate::common::laboratory::sharpe::{BesideIndexRefusal, SharpeRefusal};
+    use crate::common::laboratory::sharpe::{BesideIndexRefusal, SharpeRefusal, Verdict};
     use crate::common::market::state::MarketState;
     use crate::common::market::{Shares, Symbol};
     use crate::common::strategy::Target;
@@ -698,6 +705,22 @@ pub(crate) mod tests {
             comparison.checks().null(),
             &NullReading::Measured(Metric::new(1.0 / 10_000.0).unwrap())
         );
+        let targets = comparison.against_targets().unwrap();
+        let (margin, daily_return) = (targets.sharpe_margin(), targets.daily_return());
+        assert_eq!((margin.target(), daily_return.target()), (2.0, 8.0));
+        assert!(
+            (margin.reading() - 15.132372936280528).abs() < 1e-9,
+            "{targets:?}"
+        );
+        // Each session's gain over the equity before it, from $100 with the $10 share and its 5bp entry.
+        assert!(
+            (daily_return.reading() - 9.400663127295928).abs() < 1e-9,
+            "{targets:?}"
+        );
+        assert_eq!(
+            (margin.verdict(), daily_return.verdict()),
+            (Verdict::Clears, Verdict::Clears)
+        );
     }
 
     /// An index read from the comparison's own sessions has no return for the first of them, so the candidate is not
@@ -740,6 +763,14 @@ pub(crate) mod tests {
                     session: session(0)
                 }
             }
+        );
+        assert_eq!(
+            comparison.against_targets(),
+            Err(IndexUnread {
+                cause: BesideIndexRefusal::IndexMissing {
+                    session: session(0)
+                }
+            })
         );
         assert!(matches!(
             Benchmark::new(

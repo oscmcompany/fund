@@ -285,17 +285,37 @@ impl From<Result<BesideIndex, BesideIndexRefusal>> for IndexReading {
 
 /// Whether a reading reaches its target, and by how much it falls short when it does not.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Gate {
+pub enum Verdict {
     Clears,
     Short { by: f64 },
 }
 
+/// A reading beside the target it is gated on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gate {
+    reading: f64,
+    target: f64,
+}
+
 impl Gate {
     fn of(reading: f64, target: f64) -> Self {
-        match reading >= target {
-            true => Self::Clears,
-            false => Self::Short {
-                by: target - reading,
+        Self { reading, target }
+    }
+
+    pub fn reading(self) -> f64 {
+        self.reading
+    }
+
+    pub fn target(self) -> f64 {
+        self.target
+    }
+
+    /// A reading exactly at its target clears it.
+    pub fn verdict(self) -> Verdict {
+        match self.reading >= self.target {
+            true => Verdict::Clears,
+            false => Verdict::Short {
+                by: self.target - self.reading,
             },
         }
     }
@@ -304,8 +324,27 @@ impl Gate {
 /// A result against both targets; a target is a gate a result passes, never a quantity to search toward.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Targets {
-    pub sharpe_margin: Gate,
-    pub daily_return: Gate,
+    sharpe_margin: Gate,
+    daily_return: Gate,
+}
+
+impl Targets {
+    /// The result's annualized Sharpe less the index's, against `SHARPE_MARGIN_OVER_INDEX`.
+    pub fn sharpe_margin(self) -> Gate {
+        self.sharpe_margin
+    }
+
+    /// The result's mean daily return on capital in basis points, against `DAILY_RETURN_TARGET_BASIS_POINTS`.
+    pub fn daily_return(self) -> Gate {
+        self.daily_return
+    }
+}
+
+/// Why a result could not be gated on its targets: it was never set beside the index.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("no reading beside the index to gate: {cause}")]
+pub struct IndexUnread {
+    pub cause: BesideIndexRefusal,
 }
 
 /// The result's Sharpe margin over the index and its mean daily return on capital, each against its target.
@@ -316,6 +355,16 @@ pub fn against_targets(beside: BesideIndex) -> Targets {
             beside.result.mean_return * 10_000.0,
             DAILY_RETURN_TARGET_BASIS_POINTS,
         ),
+    }
+}
+
+impl IndexReading {
+    /// The reading against both targets, or the cause it was never set beside the index.
+    pub fn against_targets(self) -> Result<Targets, IndexUnread> {
+        match self {
+            Self::Read(beside) => Ok(against_targets(beside)),
+            Self::Refused { cause } => Err(IndexUnread { cause }),
+        }
     }
 }
 
@@ -513,10 +562,19 @@ mod tests {
             },
         };
         let targets = against_targets(beside);
-        assert_eq!(targets.daily_return, Gate::Clears);
-        match targets.sharpe_margin {
-            Gate::Short { by } => assert!((by - 0.5).abs() < 1e-12),
-            Gate::Clears => panic!("a margin of 1.5 is short of 2"),
+        assert_eq!(targets.daily_return().verdict(), Verdict::Clears);
+        assert!((targets.daily_return().reading() - 10.0).abs() < 1e-12);
+        assert!((targets.sharpe_margin().reading() - 1.5).abs() < 1e-12);
+        assert_eq!(
+            (
+                targets.sharpe_margin().target(),
+                targets.daily_return().target()
+            ),
+            (2.0, 8.0)
+        );
+        match targets.sharpe_margin().verdict() {
+            Verdict::Short { by } => assert!((by - 0.5).abs() < 1e-12),
+            Verdict::Clears => panic!("a margin of 1.5 is short of 2"),
         }
         let pinned = [
             SHARPE_MARGIN_OVER_INDEX,
@@ -544,8 +602,22 @@ mod tests {
         };
         let reached = against_targets(at_the_targets);
         assert_eq!(
-            (reached.sharpe_margin, reached.daily_return),
-            (Gate::Clears, Gate::Clears)
+            (
+                reached.sharpe_margin().verdict(),
+                reached.daily_return().verdict()
+            ),
+            (Verdict::Clears, Verdict::Clears)
+        );
+    }
+
+    #[test]
+    fn test_an_unread_index_refuses_the_targets_with_its_cause() {
+        let cause = BesideIndexRefusal::IndexMissing {
+            session: session(3),
+        };
+        assert_eq!(
+            IndexReading::Refused { cause }.against_targets(),
+            Err(IndexUnread { cause })
         );
     }
 
