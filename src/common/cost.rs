@@ -50,11 +50,14 @@ impl PerShare {
         10_000.0 * self.0 as f64 / price.ticks() as f64
     }
 
-    fn plus(self, other: Self) -> Result<Self, PerShareRefusal> {
+    /// The sum, refused past the bound; `ZERO` is its identity, and it is associative wherever both groupings are in
+    /// range.
+    pub fn plus(self, other: Self) -> Result<Self, PerShareRefusal> {
         Self::from_millionths(self.0 + other.0)
     }
 
-    fn minus(self, other: Self) -> Result<Self, PerShareRefusal> {
+    /// The difference, refused past the bound.
+    pub fn minus(self, other: Self) -> Result<Self, PerShareRefusal> {
         Self::from_millionths(self.0 - other.0)
     }
 }
@@ -231,6 +234,7 @@ mod tests {
 
     use std::str::FromStr;
 
+    use proptest::strategy::Strategy;
     use strum::IntoEnumIterator;
 
     fn names(count: u32) -> NonZeroU32 {
@@ -394,7 +398,38 @@ mod tests {
         assert_eq!(FillBound::Conservative.to_string(), "conservative");
     }
 
+    fn any_per_share() -> impl Strategy<Value = PerShare> {
+        (-10_000_000_000_000i64..=10_000_000_000_000).prop_map(PerShare)
+    }
+
     proptest::proptest! {
+        /// `ZERO` is the identity of the sum on either side and of the difference on the right.
+        #[test]
+        fn test_zero_changes_no_amount(amount in any_per_share()) {
+            proptest::prop_assert_eq!(amount.plus(PerShare::ZERO), Ok(amount));
+            proptest::prop_assert_eq!(PerShare::ZERO.plus(amount), Ok(amount));
+            proptest::prop_assert_eq!(amount.minus(PerShare::ZERO), Ok(amount));
+        }
+
+        /// The sum commutes, regroups to the same amount wherever both groupings are in range, and the difference
+        /// undoes it.
+        #[test]
+        fn test_the_sum_is_associative_where_defined(
+            first in any_per_share(),
+            second in any_per_share(),
+            third in any_per_share(),
+        ) {
+            proptest::prop_assert_eq!(first.plus(second), second.plus(first));
+            let left = first.plus(second).and_then(|sum| sum.plus(third));
+            let right = second.plus(third).and_then(|sum| first.plus(sum));
+            if let (Ok(left), Ok(right)) = (left, right) {
+                proptest::prop_assert_eq!(left, right);
+            }
+            if let Ok(sum) = first.plus(second) {
+                proptest::prop_assert_eq!(sum.minus(second), Ok(first));
+            }
+        }
+
         /// Whatever fills the conservative bound fills the optimistic one.
         #[test]
         fn test_a_conservative_fill_is_an_optimistic_fill(

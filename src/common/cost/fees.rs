@@ -135,7 +135,7 @@ impl PassThroughSchedule {
     }
 }
 
-/// The most a venue may charge to remove a share, never negative.
+/// The most a venue may charge to remove a share priced at a dollar or more, never negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccessFeeCap(PerShare);
 
@@ -143,6 +143,25 @@ impl AccessFeeCap {
     pub fn new(cap: PerShare) -> Result<Self, FeeRefusal> {
         magnitude(FeeComponent::AccessFeeCap, cap).map(Self)
     }
+
+    /// The access fee `charged` held at the cap, refused below a dollar, where the published cap is a share of the
+    /// price instead.
+    fn hold(self, charged: PerShare, price: Price) -> Result<PerShare, ChargeRefusal> {
+        match price.ticks() >= PRICE_SCALE {
+            true => Ok(charged.min(self.0)),
+            false => Err(ChargeRefusal::CapBelowDollar { price }),
+        }
+    }
+}
+
+/// Why the fees on a fill could not be charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChargeRefusal {
+    #[error("the fees are out of range: {0}")]
+    OutOfRange(#[from] PerShareRefusal),
+    /// A flat cap would charge a removing fill below a dollar a fee known to be wrong, with the price offered.
+    #[error("a flat access fee cap does not apply to a removing fill at {price}, below a dollar")]
+    CapBelowDollar { price: Price },
 }
 
 /// The fee arms a cost is read under, each carrying its own rates.
@@ -157,7 +176,7 @@ pub enum FeeRegime {
         schedule: PassThroughSchedule,
     },
     /// `PassThrough` with the access fee held at `cap`, as Rule 610's lowered cap does. Below a dollar the published cap is
-    /// a share of the price, which this arm does not apply.
+    /// a share of the price, so a removing fill there is refused.
     AccessFeeCapped {
         regulatory: RegulatoryFees,
         schedule: PassThroughSchedule,
@@ -172,23 +191,29 @@ impl FeeRegime {
         liquidity: Liquidity,
         side: Side,
         price: Price,
-    ) -> Result<PerShare, PerShareRefusal> {
-        match self {
-            Self::CommissionFree { regulatory } => regulatory.per_share(side, price),
+    ) -> Result<PerShare, ChargeRefusal> {
+        let (regulatory, venue) = match self {
+            Self::CommissionFree { regulatory } => (regulatory, PerShare::ZERO),
             Self::PassThrough {
                 regulatory,
                 schedule,
-            } => schedule
-                .per_share(liquidity, schedule.access_fee)?
-                .plus(regulatory.per_share(side, price)?),
+            } => (
+                regulatory,
+                schedule.per_share(liquidity, schedule.access_fee)?,
+            ),
             Self::AccessFeeCapped {
                 regulatory,
                 schedule,
                 cap,
-            } => schedule
-                .per_share(liquidity, schedule.access_fee.min(cap.0))?
-                .plus(regulatory.per_share(side, price)?),
-        }
+            } => {
+                let access_fee = match liquidity {
+                    Liquidity::Removing => cap.hold(schedule.access_fee, price)?,
+                    Liquidity::Adding => schedule.access_fee,
+                };
+                (regulatory, schedule.per_share(liquidity, access_fee)?)
+            }
+        };
+        Ok(venue.plus(regulatory.per_share(side, price)?)?)
     }
 }
 
@@ -311,9 +336,9 @@ mod tests {
         };
         assert_eq!(
             regime.per_share(Liquidity::Removing, Side::Buy, price(100)),
-            Err(PerShareRefusal {
+            Err(ChargeRefusal::OutOfRange(PerShareRefusal {
                 millionths: bound + 1
-            })
+            }))
         );
         assert_eq!(
             regime.per_share(Liquidity::Adding, Side::Buy, price(100)),
@@ -327,9 +352,39 @@ mod tests {
                     .unwrap(),
             }
             .per_share(Liquidity::Removing, Side::Sell, price(100)),
-            Err(PerShareRefusal {
+            Err(ChargeRefusal::OutOfRange(PerShareRefusal {
                 millionths: bound + 1
-            })
+            }))
+        );
+    }
+
+    #[test]
+    fn test_the_capped_arm_refuses_a_removing_fill_below_a_dollar() {
+        let capped = FeeRegime::AccessFeeCapped {
+            regulatory: regulatory(),
+            schedule: schedule(),
+            cap: AccessFeeCap::new(per_share(1_000)).unwrap(),
+        };
+        let below = Price::from_ticks(999_999).unwrap();
+        assert_eq!(
+            capped.per_share(Liquidity::Removing, Side::Buy, below),
+            Err(ChargeRefusal::CapBelowDollar { price: below })
+        );
+        assert_eq!(
+            capped.per_share(Liquidity::Removing, Side::Buy, price(1)),
+            Ok(per_share(3_000))
+        );
+        assert_eq!(
+            capped.per_share(Liquidity::Adding, Side::Buy, below),
+            Ok(per_share(-500))
+        );
+        let pass_through = FeeRegime::PassThrough {
+            regulatory: regulatory(),
+            schedule: schedule(),
+        };
+        assert_eq!(
+            pass_through.per_share(Liquidity::Removing, Side::Buy, below),
+            Ok(per_share(5_000))
         );
     }
 
@@ -344,12 +399,13 @@ mod tests {
     }
 
     proptest! {
-        /// The cap only lowers a removing fill's fee, never touches an adding one, and binds only above itself.
+        /// At a dollar or more, the cap only lowers a removing fill's fee, never touches an adding one, and binds only
+        /// above itself.
         #[test]
         fn test_the_cap_never_charges_more_than_passing_through(
             access in 0i64..10_000,
             cap in 0i64..10_000,
-            ticks in 1i64..1_000_000_000,
+            ticks in 1_000_000i64..1_000_000_000,
             sell in any::<bool>(),
         ) {
             let schedule = PassThroughSchedule::new(per_share(2_000), per_share(access), per_share(1_000)).unwrap();
