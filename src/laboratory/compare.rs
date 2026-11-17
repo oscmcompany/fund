@@ -2,7 +2,7 @@
 //! experiment: the paired difference of their session returns with its checks and block errors, and the candidate
 //! set beside the index over the same sessions, none of which a study can leave out.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
@@ -20,6 +20,7 @@ use crate::common::laboratory::sharpe::{
 use crate::common::laboratory::verdict::{Cause, Checks, NullReading};
 use crate::common::market::Symbol;
 use crate::common::market::record::{BarInterval, Partition};
+use crate::common::monoid::Monoid;
 use crate::common::replay::{Controls, FillModel, Replay, Replayer};
 use crate::common::strategy::Strategy;
 use crate::common::time::calendar::TradingCalendar;
@@ -31,7 +32,7 @@ use crate::laboratory::risk_free::RiskFree;
 /// The estimate a comparison's paired difference is journaled under.
 const DIFFERENCE: &str = "session_return_difference";
 
-/// The coarsening of the arms' difference in gain at each decision, journaled beside the session difference.
+/// The coarsening of the arms' difference in each name's gain at each decision, journaled beside the session difference.
 const DECISION_DIFFERENCE: &str = "decision_gain_difference";
 
 /// The setting the index's symbol is journaled under.
@@ -166,7 +167,8 @@ impl Comparison {
         &self.checks
     }
 
-    /// The difference in gain over the opening cash at each decision, its error read under each block grouping.
+    /// The difference in each traded name's gain over the opening cash at each decision, or in the book's when neither
+    /// arm traded, its error read under each block grouping and quoted at the largest well-supported one.
     pub fn coarsening(&self) -> &Coarsening {
         &self.coarsening
     }
@@ -240,15 +242,21 @@ pub fn compare<C: Strategy, B: Strategy>(
     let difference = paired(Treatment(&candidate_returns), Control(&baseline_returns))
         .map_err(ReplayStudyError::Estimate)?;
     let checks = checks(&candidate_returns, &baseline_returns, difference)?;
-    let coarsening = coarsen(
-        &Observations::book(decision_differences(
+    let by_name = name_differences(
+        candidate_replay.name_marks(),
+        baseline_replay.name_marks(),
+        opening.cash(),
+    );
+    let observations = match by_name.is_empty() {
+        true => Observations::book(decision_differences(
             candidate_replay.marks(),
             baseline_replay.marks(),
             opening.cash(),
-        ))
-        .map_err(ReplayStudyError::Blocks)?,
-    )
+        )),
+        false => Observations::new(by_name),
+    }
     .map_err(ReplayStudyError::Blocks)?;
+    let coarsening = coarsen(&observations).map_err(ReplayStudyError::Blocks)?;
     let index = IndexReading::from(beside_index(
         &candidate_returns,
         &benchmark.returns,
@@ -312,42 +320,96 @@ fn checks(
     .map_err(ReplayStudyError::Experiment)
 }
 
-/// Each arm's gain at each decision mark over the opening cash, from the mark before it or the opening before the
-/// first, candidate less baseline; `None` where either arm's mark, or the one before it, was unpriced or absent.
+/// Each arm's gain at each decision mark over `opening`, from the mark before it or `start` before the first.
+fn gains(
+    marks: impl Iterator<Item = (DateTime<Utc>, Option<Cash>)>,
+    start: Cash,
+    opening: Cash,
+) -> BTreeMap<DateTime<Utc>, Option<f64>> {
+    let mut previous = Some(start);
+    marks
+        .map(|(at, mark)| {
+            // Taken in exact units first, so only the ratio rounds.
+            let gain = previous.zip(mark).map(|(previous, mark)| {
+                (mark.units() - previous.units()) as f64 / opening.units() as f64
+            });
+            previous = mark;
+            (at, gain)
+        })
+        .collect()
+}
+
+/// Candidate less baseline at every instant either arm marked; `None` where only one did or either gain is.
+fn paired_gains(
+    candidate: &BTreeMap<DateTime<Utc>, Option<f64>>,
+    baseline: &BTreeMap<DateTime<Utc>, Option<f64>>,
+) -> impl Iterator<Item = (DateTime<Utc>, Option<f64>)> {
+    let instants: BTreeSet<DateTime<Utc>> =
+        candidate.keys().chain(baseline.keys()).copied().collect();
+    instants.into_iter().map(|at| {
+        let gain = |gains: &BTreeMap<DateTime<Utc>, Option<f64>>| gains.get(&at).copied().flatten();
+        (
+            at,
+            gain(candidate)
+                .zip(gain(baseline))
+                .map(|(candidate, baseline)| candidate - baseline),
+        )
+    })
+}
+
+/// Each arm's book gain at each decision mark over the opening cash, candidate less baseline; `None` where either
+/// arm's mark, or the one before it, was unpriced or absent.
 fn decision_differences(
     candidate: &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
     baseline: &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>,
     opening: Cash,
 ) -> Vec<(DateTime<Utc>, Option<f64>)> {
-    let gains = |marks: &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>| {
-        let mut previous = Some(opening);
-        marks
-            .iter()
-            .map(|(at, mark)| {
-                let mark = mark.as_ref().ok().copied();
-                // Taken in exact units first, so only the ratio rounds.
-                let gain = previous.zip(mark).map(|(previous, mark)| {
-                    (mark.units() - previous.units()) as f64 / opening.units() as f64
-                });
-                previous = mark;
-                (*at, gain)
-            })
-            .collect::<BTreeMap<DateTime<Utc>, Option<f64>>>()
+    let book = |marks: &BTreeMap<DateTime<Utc>, Result<Cash, ValuationRefusal>>| {
+        gains(
+            marks
+                .iter()
+                .map(|(at, mark)| (*at, mark.as_ref().ok().copied())),
+            opening,
+            opening,
+        )
     };
-    let (candidate, baseline) = (gains(candidate), gains(baseline));
-    let instants: std::collections::BTreeSet<DateTime<Utc>> =
-        candidate.keys().chain(baseline.keys()).copied().collect();
-    instants
-        .into_iter()
-        .map(|at| {
-            let gain =
-                |gains: &BTreeMap<DateTime<Utc>, Option<f64>>| gains.get(&at).copied().flatten();
-            (
-                at,
-                gain(&candidate)
-                    .zip(gain(&baseline))
-                    .map(|(candidate, baseline)| candidate - baseline),
+    paired_gains(&book(candidate), &book(baseline)).collect()
+}
+
+/// Each name either arm traded, its gain at each decision mark over the opening cash, candidate less baseline; a
+/// name is worth nothing to an arm until it trades it, since a comparison opens on cash alone.
+fn name_differences(
+    candidate: &BTreeMap<DateTime<Utc>, BTreeMap<Symbol, Result<Cash, ValuationRefusal>>>,
+    baseline: &BTreeMap<DateTime<Utc>, BTreeMap<Symbol, Result<Cash, ValuationRefusal>>>,
+    opening: Cash,
+) -> Vec<(DateTime<Utc>, Symbol, Option<f64>)> {
+    let names: BTreeSet<&Symbol> = candidate
+        .values()
+        .chain(baseline.values())
+        .flat_map(BTreeMap::keys)
+        .collect();
+    let name =
+        |marks: &BTreeMap<DateTime<Utc>, BTreeMap<Symbol, Result<Cash, ValuationRefusal>>>,
+         symbol: &Symbol| {
+            gains(
+                marks.iter().map(|(at, names)| {
+                    let mark = match names.get(symbol) {
+                        Some(Ok(mark)) => Some(*mark),
+                        Some(Err(_)) => None,
+                        None => Some(Cash::empty()),
+                    };
+                    (*at, mark)
+                }),
+                Cash::empty(),
+                opening,
             )
+        };
+    names
+        .into_iter()
+        .flat_map(|symbol| {
+            paired_gains(&name(candidate, symbol), &name(baseline, symbol))
+                .map(|(at, gain)| (at, symbol.clone(), gain))
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -379,6 +441,8 @@ fn outputs(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeMap;
+
+    use strum::IntoEnumIterator;
 
     use super::*;
     use crate::common::book::{Book, Cash};
@@ -972,6 +1036,251 @@ pub(crate) mod tests {
                 .map(|clustered| clustered.blocks()),
             Ok(3)
         );
+    }
+
+    /// Wants one share of each of its names, whatever it has seen.
+    #[derive(Clone)]
+    struct OneEach(Vec<Symbol>);
+
+    impl Strategy for OneEach {
+        fn decide(&self, _: &MarketState, _: &Book) -> Target {
+            Target::new(
+                self.0
+                    .iter()
+                    .map(|symbol| (symbol.clone(), Shares::whole(1).unwrap()))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        }
+    }
+
+    /// One share of each of 24 names held over 30 sessions against a flat baseline, each name moving $1 a session up
+    /// or down: by name alone when `persistent`, so each name drifts one way throughout, or by name and session
+    /// together otherwise; half the names rise in every session either way. Returns the journaled coarsening and the
+    /// book-level one over the same replays.
+    fn name_shocked(persistent: bool) -> (Coarsening, Coarsening) {
+        let (mut study, directory) = study();
+        let names: Vec<String> = (0..24u8)
+            .map(|name| format!("A{}", (b'A' + name) as char))
+            .collect();
+        let closes: Vec<(&str, Vec<f64>)> = names
+            .iter()
+            .enumerate()
+            .map(|(name, symbol)| {
+                let mut closes = vec![100.0];
+                for session in 1..30 {
+                    let rises = match persistent {
+                        true => name % 2 == 0,
+                        false => (name + session) % 2 == 0,
+                    };
+                    closes.push(closes[session - 1] + if rises { 1.0 } else { -1.0 });
+                }
+                (symbol.as_str(), closes)
+            })
+            .collect();
+        let dataset = daily_dataset(study.run_id(), 0, &closes);
+        let risk_free = zero_rate(&sessions(&dataset));
+        let benchmark = Benchmark::new(
+            &dataset,
+            Symbol::new("AA").unwrap(),
+            &calendar_between(0, 29),
+            &risk_free,
+        )
+        .unwrap();
+        let opening = Opening::new(Cash::from_units(10_000 * 1_000_000_000_000)).unwrap();
+        let comparison = compare(
+            &mut study,
+            &dataset,
+            Arm::new(
+                OneEach(
+                    names
+                        .iter()
+                        .map(|name| Symbol::new(name).unwrap())
+                        .collect(),
+                ),
+                "one_each",
+                &Parameters::default(),
+            )
+            .unwrap(),
+            Arm::new(Flat, "flat", &Parameters::default()).unwrap(),
+            fill_model(),
+            BarInterval::OneDay,
+            opening,
+            Controls::Unrestrained,
+            &benchmark,
+        )
+        .unwrap();
+        let ran = journaled(&directory);
+        std::fs::remove_dir_all(&directory).unwrap();
+        let book = coarsen(
+            &Observations::book(decision_differences(
+                comparison.candidate().marks(),
+                comparison.baseline().marks(),
+                opening.cash(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        (ran.coarsenings()[DECISION_DIFFERENCE].clone(), book)
+    }
+
+    /// A shock that follows each name across sessions shows only in the name groupings: it widens the name error well
+    /// past the same names moving by name and session together, and the journaled coarsening quotes the name
+    /// grouping, where the unshocked one quotes name within session.
+    #[test]
+    fn test_a_name_shock_widens_the_name_error_and_is_quoted() {
+        let (shocked, _) = name_shocked(true);
+        let (control, _) = name_shocked(false);
+        for coarsening in [&shocked, &control] {
+            assert_eq!((coarsening.measured(), coarsening.undefined()), (720, 0));
+            assert!(coarsening.groupings().keys().copied().eq(Grouping::iter()));
+            let blocks: Vec<_> = coarsening
+                .groupings()
+                .values()
+                .map(|reading| reading.as_ref().map(|clustered| clustered.blocks()).ok())
+                .collect();
+            assert_eq!(
+                blocks,
+                [
+                    Some(30),
+                    Some(30),
+                    Some(30),
+                    Some(30),
+                    Some(5),
+                    Some(24),
+                    Some(720),
+                    Some(24)
+                ]
+            );
+        }
+        let name_error = |coarsening: &Coarsening| {
+            coarsening.groupings()[&Grouping::Name]
+                .as_ref()
+                .unwrap()
+                .standard_error()
+        };
+        assert!(
+            name_error(&shocked) > 10.0 * name_error(&control),
+            "{} against {}",
+            name_error(&shocked),
+            name_error(&control)
+        );
+        let quoted = |coarsening: &Coarsening| {
+            let quoted = coarsening.quoted().unwrap();
+            (quoted.grouping(), quoted.blocks())
+        };
+        assert_eq!(quoted(&shocked), (Grouping::Name, 24));
+        assert_eq!(quoted(&control), (Grouping::NameSession, 720));
+        assert_eq!(
+            shocked.quoted().unwrap().standard_error(),
+            name_error(&shocked)
+        );
+    }
+
+    /// With every traded name read at every decision, each time grouping's error over the names is the book's own
+    /// over its 24 names, since a time block's name residuals sum to the book's residual.
+    #[test]
+    fn test_time_groupings_over_names_are_the_books_over_the_name_count() {
+        for persistent in [true, false] {
+            let (names, book) = name_shocked(persistent);
+            assert_eq!(book.measured(), 30);
+            assert!((names.mean() * 24.0 - book.mean()).abs() < 1e-15);
+            for grouping in [
+                Grouping::Minute,
+                Grouping::FiveMinutes,
+                Grouping::Hour,
+                Grouping::Session,
+                Grouping::Week,
+            ] {
+                let error = |coarsening: &Coarsening| {
+                    coarsening.groupings()[&grouping]
+                        .as_ref()
+                        .unwrap()
+                        .standard_error()
+                };
+                assert!(
+                    (error(&names) * 24.0 - error(&book)).abs() <= 1e-12 * error(&book).max(1e-12),
+                    "{grouping}: {} against {}",
+                    error(&names) * 24.0,
+                    error(&book)
+                );
+            }
+        }
+    }
+
+    /// A name only the candidate traded gains nothing for the baseline, an unpriced name mark leaves that name's gain
+    /// and the next undefined while the other name reads on, and a name is worth nothing before its first mark.
+    #[test]
+    fn test_name_differences_read_each_name_from_its_own_previous_mark() {
+        let at = |minute: u32| {
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 3, 2, 15, minute, 0).unwrap()
+        };
+        let (apple, microsoft) = (Symbol::new("AAPL").unwrap(), Symbol::new("MSFT").unwrap());
+        let cash = |dollars: i128| Ok(Cash::from_units(dollars * 1_000));
+        let unpriced = || {
+            Err(ValuationRefusal::Unpriced {
+                symbol: Symbol::new("AAPL").unwrap(),
+            })
+        };
+        let candidate = BTreeMap::from([
+            (at(1), BTreeMap::new()),
+            (
+                at(2),
+                BTreeMap::from([(apple.clone(), cash(2)), (microsoft.clone(), cash(-1))]),
+            ),
+            (
+                at(3),
+                BTreeMap::from([(apple.clone(), unpriced()), (microsoft.clone(), cash(3))]),
+            ),
+            (
+                at(4),
+                BTreeMap::from([(apple.clone(), cash(5)), (microsoft.clone(), cash(4))]),
+            ),
+            (
+                at(5),
+                BTreeMap::from([(apple.clone(), cash(9)), (microsoft.clone(), cash(4))]),
+            ),
+        ]);
+        let baseline = BTreeMap::from([
+            (at(1), BTreeMap::new()),
+            (at(2), BTreeMap::new()),
+            (at(3), BTreeMap::from([(microsoft.clone(), cash(1))])),
+            (at(4), BTreeMap::from([(microsoft.clone(), cash(1))])),
+            (at(5), BTreeMap::from([(microsoft.clone(), cash(2))])),
+        ]);
+        let differences = name_differences(&candidate, &baseline, Cash::from_units(100_000));
+        let keys: Vec<_> = differences
+            .iter()
+            .map(|(at, symbol, _)| (*at, symbol.as_str()))
+            .collect();
+        let expected_keys: Vec<_> = ["AAPL", "MSFT"]
+            .into_iter()
+            .flat_map(|symbol| (1..=5).map(move |minute| (at(minute), symbol)))
+            .collect();
+        assert_eq!(keys, expected_keys);
+        let readings: Vec<_> = differences.iter().map(|(.., reading)| *reading).collect();
+        // AAPL: nothing, 2%, unpriced, after unpriced, 4%; MSFT: nothing, -1%, 4% less 1%, 1% less 0%, 0% less 1%.
+        let expected = [
+            Some(0.0),
+            Some(0.02),
+            None,
+            None,
+            Some(0.04),
+            Some(0.0),
+            Some(-0.01),
+            Some(0.03),
+            Some(0.01),
+            Some(-0.01),
+        ];
+        assert_eq!(readings.len(), expected.len());
+        for (reading, expected) in readings.iter().zip(expected) {
+            match (reading, expected) {
+                (Some(reading), Some(expected)) => {
+                    assert!((reading - expected).abs() < 1e-15, "{readings:?}")
+                }
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => panic!("{readings:?}"),
+            }
+        }
     }
 
     /// A benchmark over the same partitions that another run read is refused rather than folded into this run's read.
