@@ -24,7 +24,8 @@ use crate::common::market::corporate_actions::{
 };
 use crate::common::market::industry::{AccessionNumber, FiledIndustryCode};
 use crate::common::market::security_details::{
-    CentralIndexKey, IndustryCode, MarketIdentifierCode, SecurityDetails, SecurityType,
+    CentralIndexKey, DetailsSnapshot, IndustryCode, MarketIdentifierCode, SecurityDetails,
+    SecurityType,
 };
 use crate::common::market::trade_bars::{
     Condition, ConditionCode, ConditionLetter, ConditionStatus, TradeConditions, UpdateRules,
@@ -423,6 +424,15 @@ pub fn decode_security_details(
         }
     }
     Ok((details, provenance))
+}
+
+/// The snapshot under `key` stamped with the session `key` names, the only stamp a `DetailsSnapshot` carries.
+pub fn decode_details_snapshot(
+    key: &ReferenceKey,
+    bytes: Vec<u8>,
+) -> Result<(DetailsSnapshot, Provenance), ReferenceRefusal> {
+    let (details, provenance) = decode_security_details(key, bytes)?;
+    Ok((DetailsSnapshot::new(key.as_of(), details), provenance))
 }
 
 fn filed_industry_codes_schema() -> Schema {
@@ -1053,6 +1063,18 @@ mod tests {
         assert_eq!(read[0], details[1]);
         assert_eq!(read[1], details[0]);
         assert_eq!(read_provenance, provenance);
+        let later = ReferenceKey::new(
+            Provider::Massive,
+            ReferenceTable::SecurityDetails,
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 6).unwrap()),
+        );
+        let written = encode_security_details(&later, &details, &provenance).unwrap();
+        let (snapshot, _) = decode_details_snapshot(&later, written).unwrap();
+        assert_eq!(
+            snapshot.as_of(),
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 6).unwrap())
+        );
+        assert_eq!(snapshot.details(), [details[1].clone(), details[0].clone()]);
         let twice = [details[0].clone(), details[0].clone()];
         assert_eq!(
             encode_security_details(&key, &twice, &provenance),

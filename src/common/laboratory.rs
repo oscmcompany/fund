@@ -7,6 +7,7 @@ pub mod calibration;
 pub mod cost;
 pub mod dataset;
 pub mod estimate;
+pub mod event_table;
 pub mod experiment;
 pub mod haircut;
 pub mod ledger;

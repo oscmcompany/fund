@@ -11,7 +11,7 @@ use strum::IntoEnumIterator;
 use crate::common::market::industry::Industry;
 use crate::common::market::record::BarInterval;
 use crate::common::market::security_details::{
-    CentralIndexKey, IndustryCode, SecurityDetails, SecurityType,
+    CentralIndexKey, DetailsSnapshot, IndustryCode, SecurityDetails, SecurityType,
 };
 use crate::common::market::trade_bars::TradeBar;
 use crate::common::market::{DollarVolume, Symbol};
@@ -198,14 +198,13 @@ pub enum UniverseRefusal {
 pub fn universe<'a>(
     session: SessionDate,
     daily_bars: impl IntoIterator<Item = &'a TradeBar>,
-    details_as_of: SessionDate,
-    details: &[SecurityDetails],
+    details: &DetailsSnapshot,
     held: impl Fn(TickProvider, &Symbol) -> bool,
     size: UniverseSize,
 ) -> Result<Universe, UniverseRefusal> {
-    if details_as_of >= session {
+    if details.as_of() >= session {
         return Err(UniverseRefusal::DetailsNotBeforeSession {
-            as_of: details_as_of,
+            as_of: details.as_of(),
             session,
         });
     }
@@ -243,7 +242,7 @@ pub fn universe<'a>(
         }
     }
     let mut described: BTreeMap<&Symbol, &SecurityDetails> = BTreeMap::new();
-    for detail in details {
+    for detail in details.details() {
         if described.insert(detail.symbol(), detail).is_some() {
             return Err(UniverseRefusal::RepeatedDetails {
                 symbol: detail.symbol().clone(),
@@ -397,8 +396,7 @@ mod tests {
         let universe = universe(
             session(6, 16),
             &bars,
-            session(6, 13),
-            &described,
+            &DetailsSnapshot::new(session(6, 13), described.to_vec()),
             held,
             size(2),
         )
@@ -426,7 +424,8 @@ mod tests {
     fn test_a_universe_refuses_what_the_session_could_not_know() {
         let common = [details("AAA", Some(SecurityType::CommonStock))];
         let build = |bars: &[TradeBar], as_of: SessionDate| {
-            universe(session(6, 16), bars, as_of, &common, |_, _| true, size(5))
+            let snapshot = DetailsSnapshot::new(as_of, common.to_vec());
+            universe(session(6, 16), bars, &snapshot, |_, _| true, size(5))
         };
         assert_eq!(
             build(&[bar("AAA", session(6, 16), 1)], session(6, 13)),
@@ -475,8 +474,7 @@ mod tests {
             universe(
                 session(6, 16),
                 &[bar("AAA", session(5, 2), 1)],
-                session(6, 13),
-                &twice,
+                &DetailsSnapshot::new(session(6, 13), twice.to_vec()),
                 |_, _| true,
                 size(5)
             ),
@@ -561,8 +559,9 @@ mod tests {
             names in 1..8u16,
         ) {
             let held_by = |_: TickProvider, symbol: &Symbol| held.contains(symbol.as_str());
+            let snapshot = DetailsSnapshot::new(session(6, 1), described);
             let build = |bars: &[TradeBar], names: u16| {
-                universe(session(6, 16), bars, session(6, 1), &described, held_by, size(names))
+                universe(session(6, 16), bars, &snapshot, held_by, size(names))
             };
             let mut reversed = bars.clone();
             reversed.reverse();
@@ -586,7 +585,7 @@ mod tests {
             for (index, member) in every.members().iter().enumerate() {
                 prop_assert_eq!(usize::from(member.rank().get()), index + 1);
                 prop_assert!(held.contains(member.symbol().as_str()));
-                prop_assert!(described.iter().any(|detail| detail.symbol() == member.symbol()
+                prop_assert!(snapshot.details().iter().any(|detail| detail.symbol() == member.symbol()
                     && detail.security_type() == Some(SecurityType::CommonStock)));
             }
             prop_assert!(every.members().windows(2).all(|pair| pair[0].dollar_volume() >= pair[1].dollar_volume()));
