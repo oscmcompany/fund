@@ -42,6 +42,35 @@ pub enum Provider {
     Sec,
 }
 
+/// A provider whose cleaned ticks a study reads, the subset of `Provider` that sells quotes and trades.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum TickProvider {
+    Massive,
+    Alpaca,
+}
+
+impl TickProvider {
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::Massive => Provider::Massive,
+            Self::Alpaca => Provider::Alpaca,
+        }
+    }
+}
+
 /// Which reference table a snapshot holds.
 #[derive(
     Debug,
@@ -901,6 +930,26 @@ pub(crate) mod tests {
         for provider in Provider::iter() {
             let json = serde_json::to_string(&provider).unwrap();
             assert_eq!(serde_json::from_str::<Provider>(&json).unwrap(), provider);
+        }
+    }
+
+    #[test]
+    fn test_a_tick_provider_names_its_provider() {
+        let names: Vec<(String, Provider)> = TickProvider::iter()
+            .map(|tick_provider| (tick_provider.to_string(), tick_provider.provider()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("massive".to_string(), Provider::Massive),
+                ("alpaca".to_string(), Provider::Alpaca),
+            ]
+        );
+        for tick_provider in TickProvider::iter() {
+            assert_eq!(
+                tick_provider.to_string(),
+                tick_provider.provider().to_string()
+            );
         }
     }
 
