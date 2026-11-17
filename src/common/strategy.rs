@@ -1,6 +1,7 @@
 //! A strategy as an arrow from what is known, the market state and the book, to the holdings it wants; the roll that
 //! blends one such target into another; and the orders that close the gap between a book and a target.
 
+pub mod modelled;
 pub mod noise;
 
 use std::cmp::Ordering;
@@ -15,6 +16,13 @@ use crate::common::market::{SHARE_SCALE, Shares, Symbol};
 /// Decides the holdings wanted after each decision bar; pure, so replay and the live loop share one `decide`.
 pub trait Strategy {
     fn decide(&self, state: &MarketState, book: &Book) -> Target;
+}
+
+/// A borrowed strategy decides as its owner does, so a caller that hands a replay `&strategy` still holds it after.
+impl<S: Strategy + ?Sized> Strategy for &S {
+    fn decide(&self, state: &MarketState, book: &Book) -> Target {
+        (**self).decide(state, book)
+    }
 }
 
 /// The holdings a strategy wants; a symbol absent from it is wanted flat.

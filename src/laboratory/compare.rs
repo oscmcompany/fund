@@ -14,7 +14,9 @@ use crate::common::laboratory::estimate::{
 };
 use crate::common::laboratory::experiment::{ExperimentRefusal, Metric, Name, Outputs, Parameters};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
-use crate::common::laboratory::sharpe::{IndexReading, beside_index, index_returns};
+use crate::common::laboratory::sharpe::{
+    IndexReading, IndexUnread, Targets, beside_index, index_returns,
+};
 use crate::common::laboratory::verdict::{Cause, Checks, NullReading};
 use crate::common::market::Symbol;
 use crate::common::market::record::{BarInterval, Partition};
@@ -175,6 +177,11 @@ impl Comparison {
     pub fn index(&self) -> IndexReading {
         self.index
     }
+
+    /// The candidate against the Sharpe-over-index and daily-return targets, or why it was never set beside the index.
+    pub fn against_targets(&self) -> Result<Targets, IndexUnread> {
+        self.index.against_targets()
+    }
 }
 
 /// Replays both arms over `dataset` with one fill model, decision interval, opening and controls, so they differ only
@@ -269,12 +276,11 @@ pub fn compare<C: Strategy, B: Strategy>(
     .and_then(|outputs| outputs.index(index))
     .map_err(ReplayStudyError::Experiment)?;
     let (read, benchmark_read) = (dataset.lineage(), benchmark.dataset.lineage());
-    let lineages = match read.fingerprint() == benchmark_read.fingerprint()
-        && read.run() == benchmark_read.run()
-    {
-        true => vec![read],
-        false => vec![read, benchmark_read],
-    };
+    let lineages =
+        match read.origin() == benchmark_read.origin() && read.run() == benchmark_read.run() {
+            true => vec![read],
+            false => vec![read, benchmark_read],
+        };
     study
         .experiment(parameters, &lineages, outputs)
         .map_err(ReplayStudyError::Study)?;
@@ -440,11 +446,11 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::common::book::{Book, Cash};
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::journal::{Observation, ReadLine, read};
     use crate::common::laboratory::blocks::{Grouping, GroupingRefusal};
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::laboratory::experiment::{ExperimentRan, Label};
-    use crate::common::laboratory::sharpe::{BesideIndexRefusal, SharpeRefusal};
+    use crate::common::laboratory::sharpe::{BesideIndexRefusal, SharpeRefusal, Verdict};
     use crate::common::market::state::MarketState;
     use crate::common::market::{Shares, Symbol};
     use crate::common::strategy::Target;
@@ -739,7 +745,10 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
         assert_eq!(
             ran.fingerprints(),
-            [dataset.fingerprint().clone(), index.fingerprint().clone()]
+            [
+                dataset.fingerprint().unwrap().clone(),
+                index.fingerprint().unwrap().clone()
+            ]
         );
         let IndexReading::Read(beside) = comparison.index() else {
             panic!("{:?}", comparison.index());
@@ -761,6 +770,22 @@ pub(crate) mod tests {
         assert_eq!(
             comparison.checks().null(),
             &NullReading::Measured(Metric::new(1.0 / 10_000.0).unwrap())
+        );
+        let targets = comparison.against_targets().unwrap();
+        let (margin, daily_return) = (targets.sharpe_margin(), targets.daily_return());
+        assert_eq!((margin.target(), daily_return.target()), (2.0, 8.0));
+        assert!(
+            (margin.reading() - 15.132372936280528).abs() < 1e-9,
+            "{targets:?}"
+        );
+        // Each session's gain over the equity before it, from $100 with the $10 share and its 5bp entry.
+        assert!(
+            (daily_return.reading() - 9.400663127295928).abs() < 1e-9,
+            "{targets:?}"
+        );
+        assert_eq!(
+            (margin.verdict(), daily_return.verdict()),
+            (Verdict::Clears, Verdict::Clears)
         );
     }
 
@@ -796,7 +821,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let ran = journaled(&directory);
-        assert_eq!(ran.fingerprints(), [dataset.fingerprint().clone()]);
+        assert_eq!(ran.fingerprints(), [dataset.fingerprint().unwrap().clone()]);
         assert_eq!(
             comparison.index(),
             IndexReading::Refused {
@@ -804,6 +829,14 @@ pub(crate) mod tests {
                     session: session(0)
                 }
             }
+        );
+        assert_eq!(
+            comparison.against_targets(),
+            Err(IndexUnread {
+                cause: BesideIndexRefusal::IndexMissing {
+                    session: session(0)
+                }
+            })
         );
         assert!(matches!(
             Benchmark::new(

@@ -231,6 +231,11 @@ impl Booster {
             .collect())
     }
 
+    /// How many inputs each row it reads holds.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
     /// The trees kept, which early stopping may leave below the rounds asked for.
     pub fn rounds(&self) -> usize {
         self.ensemble.trees().len()
