@@ -22,7 +22,7 @@ use crate::common::monoid::Monoid;
 pub const PRICE_SCALE: i64 = 1_000_000;
 
 /// Ten million dollars, far above any listed share, keeping price × shares well inside `u128`.
-const MAXIMUM_PRICE_TICKS: i64 = 10_000_000 * PRICE_SCALE;
+pub(crate) const MAXIMUM_PRICE_TICKS: i64 = 10_000_000 * PRICE_SCALE;
 
 /// `scaled` rounded to the nearest integer, or `None` when it misses by more than float noise explains: twice the
 /// float's spacing at that magnitude, and never less than a thousandth of a unit.

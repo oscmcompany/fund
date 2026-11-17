@@ -11,9 +11,9 @@ These rules sit beside CLAUDE.md, which still holds where studies live, how they
 promoted into the archive.
 
 - Prove an instrument can see before trusting it: before reading a measurement that reports nothing, confirm it
-  reports something when something is there; a model change shows it can see by recovering what
-  `common::laboratory::synthetic` planted at a stated strength, against the null arm that planted nothing, before it
-  is read on real sessions
+  reports something when something is there; write a model change as a `laboratory::recovery::ModelArm`, which reads
+  real sessions only through the `Recovered` that `laboratory::recovery::recover` returns once the arm recovers what
+  `common::laboratory::synthetic` planted at a stated strength, against the null that planted nothing
 - Before believing a result, try to produce it from nothing — permute the labels, shuffle the target, feed the
   pipeline noise, or run it on an input that cannot contain the effect — and confirm the effect disappears;
   whatever it still reports is the machinery's own bias, and every real reading has to clear it
@@ -72,12 +72,13 @@ promoted into the archive.
 - Standard errors assume independent observations, which financial data never is — group readings into blocks that
   move together, by time (minute up to session), by name, by name within a session, and by session and name at once,
   through `common::laboratory::blocks::coarsen`; quote the largest error among groupings with at least 20 blocks,
-  week shown only as a check, since fewer leaves the error itself noisy
+  week shown only as a check, since fewer leaves the error itself noisy; `laboratory::compare` coarsens each
+  traded name's paired gain at each decision, so the name groupings are read whenever either arm trades
 - A measurement reports its population: beside any estimate or difference print the population, the undefined share
   and the boundary values, and the effective sample size rather than the row count — `1254 / 1254 / 0 / 0` is a
   proof and a bare `0` is not, and an estimator silently defined on 60% of its inputs reads exactly like a complete
   measurement; journal the population, the undefined count and the null's reading with the experiment through
-  `Outputs::checks`
+  `Outputs::checks`, which `laboratory::compare` attaches itself
 - Screen on the quantity being paid for rather than a correlate of it, and check a screen's units before
   checking its threshold; a cost charged per share is compared with the spread in cents per share and converted
   to basis points only to report, since the same fee is five times larger in basis points at $5 than at $25

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Fails when git tracks a file holding private state: a playbook, a journal, vendor data, fitted weights, the capital
-# ledger, a study, a researcher job, the plans or a skill's measured values. `.gitignore` keeps them out, so this
-# catches a forced add or a pattern it lacks.
+# Fails when git tracks a file holding private state: a playbook, a journal, vendor data, fitted weights, a model's
+# registry entry, the capital ledger, a study, a researcher job, the plans or a skill's measured values. `.gitignore`
+# keeps them out, so this catches a forced add or a pattern it lacks.
 # Exits 0 when none is tracked, 3 when any is, and 1 when the check could not be made. Checks the repository given
 # as the argument, or the one holding this script.
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 export LC_ALL=C
 
 repository="${1:-$(dirname "${BASH_SOURCE[0]}")/..}"
-private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl(\.gz)?$|\.safetensors?$|\.weights\.json$|(^|/)capital_flows\.toml$|^studies/(src/bin|jobs|journal)/|^(jobs|journal)/|^\.scratchpad/|^\.claude/skills/[^/]+/measurements\.md$'
+private='(^|/)playbook[^/]*\.toml$|\.parquet$|\.csv\.gz$|\.jsonl(\.gz)?$|\.safetensors?$|\.weights\.json$|(^|/)models/[^/]+/[0-9]+/|(^|/)capital_flows\.toml$|^studies/(src/bin|jobs|journal)/|^(jobs|journal)/|^\.scratchpad/|^\.claude/skills/[^/]+/measurements\.md$'
 
 listing="$(mktemp)"
 trap 'rm -f "${listing}"' EXIT

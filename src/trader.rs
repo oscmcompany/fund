@@ -729,9 +729,9 @@ mod tests {
     use super::*;
     use crate::broker::{BrokerError, BrokerOrder, BrokerOrderId};
     use crate::common::book::Position;
+    use crate::common::cost::{BasisPoints, FillStyle};
     use crate::common::guard::{Shortability, Tradability, TradabilityRead};
     use crate::common::journal::{ReadLine, Record, RunId, read};
-    use crate::common::laboratory::cost::{BasisPoints, FillStyle};
     use crate::common::market::aggregate::{TradeTotals, session_bars};
     use crate::common::market::record::{Partition, Quote, Trade};
     use crate::common::market::trade_bars::{
