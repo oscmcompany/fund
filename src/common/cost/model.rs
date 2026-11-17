@@ -10,22 +10,36 @@ use crate::common::market::quote_bars::Spread;
 use crate::common::market::{Price, Symbol};
 use crate::common::monoid::Monoid;
 
-/// A measured execution cost per share folded from fills: their count, sum and sum of squares in millionths, so
-/// estimates from any grouping of fills combine exactly, and each fill of a steady cost shrinks the error.
+/// The fewest fills whose error is read as a floor, since fewer leave the error itself noisy.
+pub const MINIMUM_FILLS: u64 = 20;
+
+/// A measured execution cost per share folded from fills: their count and, in millionths, their sum and sum of
+/// squares, so estimates from any grouping of fills combine exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostEstimate {
+    /// Saturates rather than wraps, and a count that would wrap marks the sums overflowed.
     fills: u64,
-    sum: i128,
-    sum_of_squares: u128,
+    sums: Sums,
+}
+
+/// The sums a cost estimate holds, or their loss to overflow, which no further fill undoes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sums {
+    Exact { sum: i128, sum_of_squares: u128 },
+    Overflowed,
 }
 
 /// Why an estimate has no point or error yet, with the fills it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EstimateRefusal {
-    #[error("{fills} fill(s) cannot measure a cost: a point takes one and an error two")]
+    #[error(
+        "{fills} fill(s) cannot measure a cost: a point takes one and an error {MINIMUM_FILLS}"
+    )]
     TooFewFills { fills: u64 },
     #[error("the cost of {fills} fills is not representable per share")]
     Unrepresentable { fills: u64 },
+    #[error("the sums of {fills} fills overflowed")]
+    Overflowed { fills: u64 },
 }
 
 impl CostEstimate {
@@ -34,8 +48,10 @@ impl CostEstimate {
         let millionths = cost.millionths();
         Self {
             fills: 1,
-            sum: i128::from(millionths),
-            sum_of_squares: u128::from(millionths.unsigned_abs()).pow(2),
+            sums: Sums::Exact {
+                sum: i128::from(millionths),
+                sum_of_squares: u128::from(millionths.unsigned_abs()).pow(2),
+            },
         }
     }
 
@@ -43,12 +59,23 @@ impl CostEstimate {
         self.fills
     }
 
+    fn exact(self) -> Result<(i128, u128), EstimateRefusal> {
+        match self.sums {
+            Sums::Exact {
+                sum,
+                sum_of_squares,
+            } => Ok((sum, sum_of_squares)),
+            Sums::Overflowed => Err(EstimateRefusal::Overflowed { fills: self.fills }),
+        }
+    }
+
     /// The mean cost, rounded up so rounding never flatters.
     pub fn point(self) -> Result<PerShare, EstimateRefusal> {
+        let (sum, _) = self.exact()?;
         let fills = i128::from(self.fills);
         match fills {
             0 => Err(EstimateRefusal::TooFewFills { fills: self.fills }),
-            _ => i64::try_from(-(-self.sum).div_euclid(fills))
+            _ => i64::try_from(-(-sum).div_euclid(fills))
                 .ok()
                 .and_then(|mean| PerShare::from_millionths(mean).ok())
                 .ok_or(EstimateRefusal::Unrepresentable { fills: self.fills }),
@@ -56,16 +83,17 @@ impl CostEstimate {
     }
 
     /// The standard error of the mean, `sqrt((n * squares - sum^2) / (n^2 * (n - 1)))`, computed in integers and
-    /// rounded up.
+    /// rounded up, refused below `MINIMUM_FILLS`.
     pub fn error(self) -> Result<PerShare, EstimateRefusal> {
-        let fills = u128::from(self.fills);
-        if fills < 2 {
+        let (sum, sum_of_squares) = self.exact()?;
+        if self.fills < MINIMUM_FILLS {
             return Err(EstimateRefusal::TooFewFills { fills: self.fills });
         }
+        let fills = u128::from(self.fills);
         let unrepresentable = EstimateRefusal::Unrepresentable { fills: self.fills };
         let spread = fills
-            .checked_mul(self.sum_of_squares)
-            .and_then(|scaled| scaled.checked_sub(self.sum.unsigned_abs().checked_pow(2)?))
+            .checked_mul(sum_of_squares)
+            .and_then(|scaled| scaled.checked_sub(sum.unsigned_abs().checked_pow(2)?))
             .ok_or(unrepresentable)?;
         // Successive ceilings equal the ceiling of the whole quotient, and the root of a ceiling rounds up the same.
         let variance = spread.div_ceil(fills).div_ceil(fills).div_ceil(fills - 1);
@@ -78,27 +106,46 @@ impl CostEstimate {
     }
 }
 
+/// Overflow absorbs, so the laws hold through it: the count and squares only grow, and a sum of fills built by `of`
+/// cannot overflow an `i128` before the count overflows a `u64`, so whether a combination overflows is independent
+/// of its grouping.
 impl Monoid for CostEstimate {
     fn empty() -> Self {
         Self {
             fills: 0,
-            sum: 0,
-            sum_of_squares: 0,
+            sums: Sums::Exact {
+                sum: 0,
+                sum_of_squares: 0,
+            },
         }
     }
 
     fn combine(self, other: Self) -> Self {
-        Self {
-            fills: self
+        let sums = match (self.sums, other.sums) {
+            (
+                Sums::Exact {
+                    sum,
+                    sum_of_squares,
+                },
+                Sums::Exact {
+                    sum: other_sum,
+                    sum_of_squares: other_sum_of_squares,
+                },
+            ) => self
                 .fills
                 .checked_add(other.fills)
-                .expect("an estimate holds fewer than u64::MAX fills"),
-            // At most `u64::MAX` fills of at most 10^13 each, inside an `i128`.
-            sum: self.sum + other.sum,
-            sum_of_squares: self
-                .sum_of_squares
-                .checked_add(other.sum_of_squares)
-                .expect("an estimate's squares fit a u128"),
+                .and(sum.checked_add(other_sum))
+                .zip(sum_of_squares.checked_add(other_sum_of_squares))
+                .map_or(Sums::Overflowed, |(sum, sum_of_squares)| Sums::Exact {
+                    sum,
+                    sum_of_squares,
+                }),
+            (Sums::Overflowed, Sums::Exact { .. } | Sums::Overflowed)
+            | (Sums::Exact { .. }, Sums::Overflowed) => Sums::Overflowed,
+        };
+        Self {
+            fills: self.fills.saturating_add(other.fills),
+            sums,
         }
     }
 }
@@ -287,10 +334,22 @@ mod tests {
         PerShare::from_millionths(millionths).unwrap()
     }
 
-    /// Two fills either side of `point`, whose mean is `point` and whose standard error is exactly `error`.
+    /// Thirteen fills either side of `point` by five times `error`, whose mean is `point` and whose standard error
+    /// is exactly `error`.
     fn estimate(point: i64, error: i64) -> CostEstimate {
-        CostEstimate::of(per_share(point - error))
-            .combine(CostEstimate::of(per_share(point + error)))
+        let pair = CostEstimate::of(per_share(point - 5 * error))
+            .combine(CostEstimate::of(per_share(point + 5 * error)));
+        concatenate(std::iter::repeat_n(pair, 13))
+    }
+
+    fn exact(fills: u64, sum: i128, sum_of_squares: u128) -> CostEstimate {
+        CostEstimate {
+            fills,
+            sums: Sums::Exact {
+                sum,
+                sum_of_squares,
+            },
+        }
     }
 
     fn fills(costs: &[i64]) -> CostEstimate {
@@ -351,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_estimate_needs_a_fill_for_its_point_and_two_for_its_error() {
+    fn test_an_estimate_needs_a_fill_for_its_point_and_twenty_for_its_error() {
         let empty = CostEstimate::empty();
         assert_eq!(
             empty.point(),
@@ -367,31 +426,79 @@ mod tests {
             single.error(),
             Err(EstimateRefusal::TooFewFills { fills: 1 })
         );
+        let nineteen = fills(&[4_000; 19]);
+        assert_eq!(nineteen.point(), Ok(per_share(4_000)));
+        assert_eq!(
+            nineteen.error(),
+            Err(EstimateRefusal::TooFewFills { fills: 19 })
+        );
+        assert_eq!(fills(&[4_000; 20]).error(), Ok(per_share(0)));
         assert_eq!(estimate(4_000, 500).point(), Ok(per_share(4_000)));
         assert_eq!(estimate(4_000, 500).error(), Ok(per_share(500)));
     }
 
     #[test]
+    fn test_two_equal_fills_cannot_admit_a_positive_edge() {
+        let model = CostModel::new(
+            CostBasis::ByName(BTreeMap::from([(symbol("AAPL"), fills(&[3_000, 3_000]))])),
+            free(),
+        );
+        assert_eq!(
+            model.price(
+                &symbol("AAPL"),
+                spread(10_000),
+                price(),
+                Side::Buy,
+                Liquidity::Removing
+            ),
+            Err(PricingRefusal::Unmeasured(EstimateRefusal::TooFewFills {
+                fills: 2
+            }))
+        );
+    }
+
+    #[test]
+    fn test_overflowing_squares_are_refused_rather_than_panicking() {
+        let half = exact(10, 0, u128::MAX / 2 + 1);
+        let overflowed = half.combine(half);
+        assert_eq!(overflowed.fills(), 20);
+        assert_eq!(
+            overflowed.point(),
+            Err(EstimateRefusal::Overflowed { fills: 20 })
+        );
+        assert_eq!(
+            overflowed.error(),
+            Err(EstimateRefusal::Overflowed { fills: 20 })
+        );
+        let absorbed = overflowed.combine(fills(&[1_000; 30]));
+        assert_eq!(
+            absorbed.error(),
+            Err(EstimateRefusal::Overflowed { fills: 50 })
+        );
+        let counted = exact(u64::MAX, 0, 0).combine(fills(&[1_000]));
+        assert_eq!(
+            counted.point(),
+            Err(EstimateRefusal::Overflowed { fills: u64::MAX })
+        );
+    }
+
+    #[test]
     fn test_the_point_and_error_round_up() {
-        // Variance of the mean 20,000,000 / 48 = 416,666.7, whose root 645.5 rounds up.
-        let measured = fills(&[1_000, 2_000, 3_000, 4_000]);
+        // Variance of the mean 25,000,000 / 380 = 65,789.5, whose root 256.5 rounds up.
+        let measured = fills(&[1_000, 2_000, 3_000, 4_000].repeat(5));
         assert_eq!(
             (measured.fills(), measured.point(), measured.error()),
-            (4, Ok(per_share(2_500)), Ok(per_share(646)))
+            (20, Ok(per_share(2_500)), Ok(per_share(257)))
         );
         assert_eq!(fills(&[-1, -2]).point(), Ok(per_share(-1)));
         assert_eq!(fills(&[1, 2]).point(), Ok(per_share(2)));
-        assert_eq!(fills(&[7, 7, 7]).error(), Ok(per_share(0)));
+        assert_eq!(fills(&[7; 20]).error(), Ok(per_share(0)));
     }
 
     #[test]
     fn test_a_spread_past_an_i128_is_refused_rather_than_wrapped() {
         // A million fills at each end of the bound.
-        let wide = CostEstimate {
-            fills: 2_000_000,
-            sum: 0,
-            sum_of_squares: 2_000_000 * 10_000_000_000_000u128.pow(2),
-        };
+        let wide = exact(2_000_000, 0, 2_000_000 * 10_000_000_000_000u128.pow(2));
         assert_eq!(wide.point(), Ok(PerShare::ZERO));
         assert_eq!(
             wide.error(),
@@ -400,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn test_each_fill_of_a_steady_cost_lowers_the_floor() {
+    fn test_repeating_a_batch_of_fills_lowers_the_floor() {
         let model = |estimate: CostEstimate| {
             CostModel::new(
                 CostBasis::ByName(BTreeMap::from([(symbol("AAPL"), estimate)])),
@@ -421,14 +528,14 @@ mod tests {
                 fills: 1
             }))
         );
-        let floors = [1, 2, 4, 16].map(|copies| {
+        let floors = [10, 20, 40, 160].map(|copies| {
             model(concatenate(std::iter::repeat_n(batch, copies)))
                 .unwrap()
                 .floor()
                 .millionths()
         });
         // sqrt(1,000,000 / (2 * copies - 1)), rounded up.
-        assert_eq!(floors, [1_000, 578, 378, 180]);
+        assert_eq!(floors, [230, 161, 113, 56]);
     }
 
     #[test]
@@ -549,18 +656,30 @@ mod tests {
         );
     }
 
-    /// Built from sums directly rather than through `combine`, so the law test does not lean on what it checks.
+    /// Built from sums directly rather than through `combine`, so the law test does not lean on what it checks;
+    /// counts and squares near half their range overflow when combined, so the laws are read through overflow too.
     fn any_estimate() -> impl Strategy<Value = CostEstimate> {
-        (
-            0u64..1_000,
-            -1_000_000_000i128..1_000_000_000,
+        let fills = prop_oneof![0u64..1_000, u64::MAX / 3..=u64::MAX / 2 + 1];
+        let sum_of_squares = prop_oneof![
             0u128..1_000_000_000_000_000_000,
-        )
-            .prop_map(|(fills, sum, sum_of_squares)| CostEstimate {
+            u128::MAX / 3..=u128::MAX / 2 + 1,
+        ];
+        prop_oneof![
+            (
+                fills.clone(),
+                -1_000_000_000i128..1_000_000_000,
+                sum_of_squares
+            )
+                .prop_map(|(fills, sum, sum_of_squares)| exact(
+                    fills,
+                    sum,
+                    sum_of_squares
+                )),
+            fills.prop_map(|fills| CostEstimate {
                 fills,
-                sum,
-                sum_of_squares,
-            })
+                sums: Sums::Overflowed,
+            }),
+        ]
     }
 
     proptest! {
@@ -576,7 +695,7 @@ mod tests {
         /// The point lies within the fills, and the error is the floating-point standard error rounded up.
         #[test]
         fn test_the_estimate_agrees_with_the_textbook_formulas(
-            costs in prop::collection::vec(-10_000_000i64..10_000_000, 2..50),
+            costs in prop::collection::vec(-10_000_000i64..10_000_000, 20..60),
         ) {
             let estimate = fills(&costs);
             let point = estimate.point().unwrap().millionths();
@@ -592,7 +711,7 @@ mod tests {
         /// Repeating a batch of fills never raises the error.
         #[test]
         fn test_more_fills_of_the_same_costs_never_raise_the_error(
-            costs in prop::collection::vec(-10_000_000i64..10_000_000, 2..20),
+            costs in prop::collection::vec(-10_000_000i64..10_000_000, 20..40),
             copies in 1usize..20,
         ) {
             let batch = fills(&costs);
