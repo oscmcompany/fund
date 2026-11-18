@@ -41,7 +41,7 @@ pub enum FlattenCause {
     ClosingBackstop,
 }
 
-/// What the broker reported once the closing attempts stopped.
+/// What the broker reported once a close request had its wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlatReading {
@@ -50,8 +50,8 @@ pub enum FlatReading {
     Unread(BrokerFailure),
 }
 
-/// A session's one closing of every position through the broker: why, how many close requests it sent, and what the
-/// broker held when it stopped.
+/// One attempt at closing every position through the broker: why, how many close requests the session has sent with
+/// this one, and what the broker held once this request had its wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookFlattened {
     cause: FlattenCause,
@@ -66,6 +66,10 @@ impl BookFlattened {
             closes,
             reading,
         }
+    }
+
+    pub fn reading(&self) -> &FlatReading {
+        &self.reading
     }
 }
 

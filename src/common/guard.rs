@@ -120,7 +120,8 @@ impl OrderGuarded {
 }
 
 /// The tradability the broker reported for every symbol an execution would trade, and the shortability of each it
-/// lists, journaled when there was one; the record's time is when the borrow was read.
+/// lists, journaled each time an execution guards with one; a broker may have read it earlier in the run, so the
+/// record's time is when it was used rather than when the borrow was read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradabilityRead {
     readings: BTreeMap<Symbol, Tradability>,

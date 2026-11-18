@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::time::Instant;
 
 use crate::broker::{Broker, BrokerError, BrokerOrder, BrokerOrderId};
@@ -367,50 +367,62 @@ impl<B: Broker + Sync> Broker for CachedTradability<B> {
     }
 }
 
-/// Close requests sent before positions still reported are left held.
-const CLOSES: u32 = 3;
+/// The longest any close request waits before the next, in `Patience` open windows; each waits twice the last.
+const LONGEST_CLOSE_WAIT: u32 = 8;
 
-/// Reads the broker's book every poll and, while it is not flat, asks the broker to close everything, again only once
-/// an earlier request has had `patience`'s open window; stops flat, after `CLOSES` requests have each had that window,
-/// or once `left` has passed, reporting what the last read found.
+/// Asks the broker to close everything, a flat book included since the request also cancels open orders, then reads
+/// the book every poll until it reads flat or the request's wait passes, journaling each attempt, and asks again; the
+/// first request waits `patience`'s open window, each later one twice the last up to `LONGEST_CLOSE_WAIT` of them. Stops
+/// flat or once `left` has passed, every await bounded by it, returning the last attempt.
 pub async fn flatten(
     broker: &impl Broker,
+    journal: &mut Journal,
+    clock: &impl Fn() -> DateTime<Utc>,
     cause: FlattenCause,
     patience: Patience,
     left: Duration,
 ) -> BookFlattened {
-    let started = Instant::now();
-    let (mut closes, mut last_close) = (0, started);
+    let deadline = Instant::now() + left;
+    let mut closes = 0;
     loop {
-        let reading = match broker.book().await {
-            Ok(book) if book.positions().is_empty() => FlatReading::Flat,
-            Ok(book) => FlatReading::Held {
-                positions: book.positions().len(),
-            },
-            Err(error) => FlatReading::Unread(BrokerFailure::from(&error)),
-        };
-        let waiting = closes > 0 && last_close.elapsed() < patience.open_for();
-        match (
-            &reading,
-            started.elapsed() >= left,
-            waiting,
-            closes >= CLOSES,
-        ) {
-            (FlatReading::Flat, _, _, _)
-            | (FlatReading::Held { .. } | FlatReading::Unread(_), true, _, _)
-            | (FlatReading::Held { .. } | FlatReading::Unread(_), false, false, true) => {
-                return BookFlattened::new(cause, closes, reading);
-            }
-            (FlatReading::Held { .. } | FlatReading::Unread(_), false, true, _) => {}
-            (FlatReading::Held { .. } | FlatReading::Unread(_), false, false, false) => {
-                if let Err(error) = broker.close_all().await {
-                    tracing::warn!(%error, "Positions not closed");
-                }
-                closes += 1;
-                last_close = Instant::now();
-            }
+        let wait = patience.open_for() * 2u32.saturating_pow(closes).min(LONGEST_CLOSE_WAIT);
+        closes += 1;
+        match tokio::time::timeout_at(deadline, broker.close_all()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, closes, "Positions not closed"),
+            Err(_) => tracing::warn!(closes, "Close request unanswered before its time passed"),
         }
-        tokio::time::sleep(patience.poll()).await;
+        let waited = (Instant::now() + wait).min(deadline);
+        let reading = loop {
+            let reading = match tokio::time::timeout_at(deadline, broker.book()).await {
+                Ok(Ok(book)) if book.positions().is_empty() => FlatReading::Flat,
+                Ok(Ok(book)) => FlatReading::Held {
+                    positions: book.positions().len(),
+                },
+                Ok(Err(error)) => FlatReading::Unread(BrokerFailure::from(&error)),
+                Err(_) => FlatReading::Unread(BrokerFailure::Unanswered {
+                    cause: "no answer before the close".to_string(),
+                }),
+            };
+            match (&reading, Instant::now() >= waited) {
+                (FlatReading::Flat, _)
+                | (FlatReading::Held { .. } | FlatReading::Unread(_), true) => break reading,
+                (FlatReading::Held { .. } | FlatReading::Unread(_), false) => {
+                    tokio::time::sleep_until((Instant::now() + patience.poll()).min(waited)).await;
+                }
+            }
+        };
+        let flattened = BookFlattened::new(cause, closes, reading);
+        // The journal may be what halted the session, so a refused record is logged instead.
+        if let Err(error) = journal.append(clock(), Observation::BookFlattened(flattened.clone())) {
+            tracing::error!(%error, ?flattened, "Flattening attempt was not journaled");
+        }
+        match (flattened.reading(), Instant::now() >= deadline) {
+            (FlatReading::Flat, _) | (FlatReading::Held { .. } | FlatReading::Unread(_), true) => {
+                return flattened;
+            }
+            (FlatReading::Held { .. } | FlatReading::Unread(_), false) => {}
+        }
     }
 }
 
@@ -549,6 +561,8 @@ mod tests {
         reads: Mutex<VecDeque<Answer>>,
         cancel_fails: bool,
         submit_takes: Duration,
+        /// How long each book read takes to answer.
+        book_takes: Duration,
         /// The tradability reported, every symbol tradable in any amount when `None`.
         readings: Option<BTreeMap<Symbol, Tradability>>,
         /// The shortability reported, none unless set.
@@ -570,6 +584,7 @@ mod tests {
                 reads: Mutex::new(reads.iter().copied().collect()),
                 cancel_fails: false,
                 submit_takes: Duration::ZERO,
+                book_takes: Duration::ZERO,
                 readings: None,
                 borrow: BTreeMap::new(),
                 tradability_fails: false,
@@ -650,6 +665,7 @@ mod tests {
 
         async fn book(&self) -> Result<Book, BrokerError> {
             self.calls.lock().unwrap().push("book");
+            tokio::time::sleep(self.book_takes).await;
             let mut books = self.books.lock().unwrap();
             Ok(match books.len() {
                 0 => panic!("the script has no book"),
@@ -1451,34 +1467,66 @@ mod tests {
         (reconciliation, events)
     }
 
-    /// Flattens against a broker reporting `books` in turn, the last repeating, polling every second with each close
-    /// request given ten seconds and the whole `left` seconds, returning the record, the calls and the time taken.
+    /// Flattens against `broker` reporting `books` in turn, the last repeating, polling every second with the first close
+    /// request given ten seconds and the whole `left` seconds, returning the record, the calls, the time taken and each
+    /// attempt journaled as its payload and its seconds after the start.
     async fn flattening(
+        mut broker: Scripted,
         books: Vec<Book>,
         left: u64,
-    ) -> (BookFlattened, Vec<&'static str>, Duration) {
-        let broker = Scripted::new(&[], &[]);
-        *broker.books.lock().unwrap() = books.into();
-        let started = Instant::now();
+    ) -> (
+        BookFlattened,
+        Vec<&'static str>,
+        Duration,
+        Vec<(serde_json::Value, i64)>,
+    ) {
+        broker.books = Mutex::new(books.into());
+        let directory = std::env::temp_dir().join(format!("fund-execution-{}", Uuid::new_v4()));
+        let mut journal = Journal::open(&directory, RunId::new(Uuid::new_v4())).unwrap();
+        let (started, origin) = (Instant::now(), Utc::now());
+        let clock = || origin + chrono::TimeDelta::from_std(started.elapsed()).unwrap();
         let flattened = flatten(
             &broker,
+            &mut journal,
+            &clock,
             FlattenCause::ClosingBackstop,
             patience((1_000, 10_000)),
             Duration::from_secs(left),
         )
         .await;
-        (flattened, broker.calls(), started.elapsed())
+        let elapsed = started.elapsed();
+        let attempts = journal_records(&directory)
+            .iter()
+            .map(|record| {
+                (
+                    serde_json::to_value(record.observation()).unwrap(),
+                    (record.timestamp() - origin).num_seconds(),
+                )
+            })
+            .collect();
+        std::fs::remove_dir_all(&directory).unwrap();
+        (flattened, broker.calls(), elapsed, attempts)
     }
 
-    /// A book already flat is read once and nothing is asked closed.
+    /// The journal line of one attempt: its request count and what the broker held once the request had its window.
+    fn attempt(closes: u32, reading: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": "book_flattened",
+            "payload": {"cause": "closing_backstop", "closes": closes, "reading": reading},
+        })
+    }
+
+    /// A book already flat is still asked closed once, since the request cancels whatever order is left open.
     #[tokio::test(start_paused = true)]
-    async fn test_a_flat_book_is_left_alone() {
-        let (flattened, calls, _) = flattening(vec![holding(1, &[])], 120).await;
+    async fn test_a_flat_book_is_still_asked_closed_for_its_open_orders() {
+        let (flattened, calls, _, attempts) =
+            flattening(Scripted::new(&[], &[]), vec![holding(1, &[])], 120).await;
         assert_eq!(
             flattened,
-            BookFlattened::new(FlattenCause::ClosingBackstop, 0, FlatReading::Flat)
+            BookFlattened::new(FlattenCause::ClosingBackstop, 1, FlatReading::Flat)
         );
-        assert_eq!(calls, ["book"]);
+        assert_eq!(calls, ["close_all", "book"]);
+        assert_eq!(attempts, [(attempt(1, serde_json::json!("flat")), 0)]);
     }
 
     /// A held book is asked closed once and read each poll until it reads flat.
@@ -1489,38 +1537,44 @@ mod tests {
             holding(1, &[("SPY", 1_000_000)]),
             holding(2, &[]),
         ];
-        let (flattened, calls, _) = flattening(books, 120).await;
+        let (flattened, calls, _, attempts) = flattening(Scripted::new(&[], &[]), books, 120).await;
         assert_eq!(
             flattened,
             BookFlattened::new(FlattenCause::ClosingBackstop, 1, FlatReading::Flat)
         );
-        assert_eq!(calls, ["book", "close_all", "book", "book"]);
+        assert_eq!(calls, ["close_all", "book", "book", "book"]);
+        assert_eq!(attempts, [(attempt(1, serde_json::json!("flat")), 2)]);
     }
 
-    /// A book that never reads flat is asked closed again only after each request's window, and left held after the
-    /// last request's window has passed.
+    /// A book that never reads flat is asked closed again each time a request's window passes, each window twice the
+    /// last up to eight open windows, until the time left has passed, and every attempt is journaled.
     #[tokio::test(start_paused = true)]
-    async fn test_a_book_that_stays_held_is_asked_closed_three_times() {
+    async fn test_a_book_that_stays_held_is_asked_closed_until_its_time_passes() {
         let books = vec![holding(1, &[("SPY", 1_000_000), ("QQQ", -1_000_000)])];
-        let (flattened, calls, elapsed) = flattening(books, 120).await;
+        let (flattened, calls, elapsed, attempts) =
+            flattening(Scripted::new(&[], &[]), books, 320).await;
+        let held = FlatReading::Held { positions: 2 };
         assert_eq!(
             flattened,
-            BookFlattened::new(
-                FlattenCause::ClosingBackstop,
-                3,
-                FlatReading::Held { positions: 2 }
-            )
+            BookFlattened::new(FlattenCause::ClosingBackstop, 7, held)
         );
-        let closes = calls.iter().filter(|call| **call == "close_all").count();
-        assert_eq!(closes, 3);
-        assert_eq!(elapsed, Duration::from_secs(30));
+        assert_eq!(calls.iter().filter(|call| **call == "close_all").count(), 7);
+        assert_eq!(elapsed, Duration::from_secs(320));
+        let held = serde_json::json!({"held": {"positions": 2}});
+        let ends: Vec<_> = attempts.iter().map(|(_, seconds)| *seconds).collect();
+        assert_eq!(ends, [10, 30, 70, 150, 230, 310, 320]);
+        let lines: Vec<_> = attempts.into_iter().map(|(line, _)| line).collect();
+        let expected: Vec<_> = (1..=7)
+            .map(|closes| attempt(closes, held.clone()))
+            .collect();
+        assert_eq!(lines, expected);
     }
 
-    /// Flattening stops at the first read once the time left has passed, whatever requests remain.
+    /// Flattening stops once the time left has passed, whatever window its last request had left.
     #[tokio::test(start_paused = true)]
     async fn test_flattening_stops_once_its_time_has_passed() {
         let books = vec![holding(1, &[("SPY", 1_000_000)])];
-        let (flattened, calls, elapsed) = flattening(books, 5).await;
+        let (flattened, calls, elapsed, _) = flattening(Scripted::new(&[], &[]), books, 5).await;
         assert_eq!(
             flattened,
             BookFlattened::new(
@@ -1531,6 +1585,28 @@ mod tests {
         );
         assert_eq!(calls.iter().filter(|call| **call == "close_all").count(), 1);
         assert_eq!(elapsed, Duration::from_secs(5));
+    }
+
+    /// A book read that never answers in time neither keeps the close request from being sent first nor holds
+    /// flattening past its time.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_stalled_book_read_neither_skips_the_close_nor_outlasts_the_time() {
+        let mut broker = Scripted::new(&[], &[]);
+        broker.book_takes = Duration::from_secs(3_600);
+        let books = vec![holding(1, &[("SPY", 1_000_000)])];
+        let (flattened, calls, elapsed, _) = flattening(broker, books, 120).await;
+        assert_eq!(
+            flattened,
+            BookFlattened::new(
+                FlattenCause::ClosingBackstop,
+                1,
+                FlatReading::Unread(BrokerFailure::Unanswered {
+                    cause: "no answer before the close".to_string()
+                })
+            )
+        );
+        assert_eq!(calls, ["close_all", "book"]);
+        assert_eq!(elapsed, Duration::from_secs(120));
     }
 
     /// Each symbol is read once: a second ask reads nothing, an ask adding a name reads only that name, and a failed
