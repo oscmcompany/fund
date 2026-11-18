@@ -1,4 +1,4 @@
-//! What a trading session journals of its own standing: why it halted and how it ended.
+//! What a trading session journals of its own standing: why it halted, how it went flat, and how it ended.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,44 @@ pub struct SessionHalted {
 impl SessionHalted {
     pub fn new(cause: HaltCause) -> Self {
         Self { cause }
+    }
+}
+
+/// Why a session closed its positions through the broker rather than by a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlattenCause {
+    /// The session halted, after which it decides nothing more.
+    Halted,
+    /// The close was near, whatever the flat window's decisions left.
+    ClosingBackstop,
+}
+
+/// What the broker reported once the closing attempts stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlatReading {
+    Flat,
+    Held { positions: usize },
+    Unread(BrokerFailure),
+}
+
+/// A session's one closing of every position through the broker: why, how many close requests it sent, and what the
+/// broker held when it stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookFlattened {
+    cause: FlattenCause,
+    closes: u32,
+    reading: FlatReading,
+}
+
+impl BookFlattened {
+    pub fn new(cause: FlattenCause, closes: u32, reading: FlatReading) -> Self {
+        Self {
+            cause,
+            closes,
+            reading,
+        }
     }
 }
 

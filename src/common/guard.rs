@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Side};
 use crate::common::market::{DollarVolume, PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol};
+use crate::common::monoid::Monoid;
 use crate::common::order::BrokerFailure;
 use crate::common::risk::DollarLimit;
 use crate::common::strategy::{Leg, Order, Target, orders};
@@ -140,6 +141,44 @@ impl TradabilityRead {
 
     pub fn is_empty(&self) -> bool {
         self.readings.is_empty()
+    }
+
+    /// What this read holds of `symbols`, and those of them it never read.
+    pub fn split(&self, symbols: &[Symbol]) -> (Self, Vec<Symbol>) {
+        let (read, unread): (Vec<Symbol>, Vec<Symbol>) = symbols
+            .iter()
+            .cloned()
+            .partition(|symbol| self.readings.contains_key(symbol));
+        let held = Self {
+            shortability: read
+                .iter()
+                .filter_map(|symbol| Some((symbol.clone(), *self.shortability.get(symbol)?)))
+                .collect(),
+            readings: read
+                .into_iter()
+                .map(|symbol| {
+                    let reading = self.readings[&symbol];
+                    (symbol, reading)
+                })
+                .collect(),
+        };
+        (held, unread)
+    }
+}
+
+/// Reads merged symbol by symbol, the later read of a symbol replacing the earlier whole.
+impl Monoid for TradabilityRead {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    fn combine(mut self, other: Self) -> Self {
+        for symbol in other.readings.keys() {
+            self.shortability.remove(symbol);
+        }
+        self.readings.extend(other.readings);
+        self.shortability.extend(other.shortability);
+        self
     }
 }
 
@@ -994,5 +1033,76 @@ mod tests {
             }
             prop_assert_eq!(next, None);
         }
+    }
+
+    /// A read over three names, any of them read or not and any read one carrying a borrow or not.
+    fn any_read() -> impl Strategy<Value = TradabilityRead> {
+        use strum::IntoEnumIterator;
+        let names = ["AAA", "BBB", "CCC"].map(|raw| Symbol::new(raw).unwrap());
+        let reading = prop::option::of(prop::sample::select(
+            Tradability::iter().collect::<Vec<_>>(),
+        ));
+        let borrow = prop::option::of(prop::sample::select(
+            Shortability::iter().collect::<Vec<_>>(),
+        ));
+        prop::collection::vec((reading, borrow), 3).prop_map(move |rows| {
+            let mut read = TradabilityRead::default();
+            for (symbol, (reading, borrow)) in names.iter().zip(rows) {
+                if let Some(reading) = reading {
+                    read.readings.insert(symbol.clone(), reading);
+                    if let Some(borrow) = borrow {
+                        read.shortability.insert(symbol.clone(), borrow);
+                    }
+                }
+            }
+            read
+        })
+    }
+
+    proptest! {
+        /// Merging reads is a monoid: the empty read changes nothing, and grouping does not matter.
+        #[test]
+        fn property_tradability_reads_merge_as_a_monoid(
+            first in any_read(),
+            second in any_read(),
+            third in any_read(),
+        ) {
+            prop_assert_eq!(TradabilityRead::empty().combine(first.clone()), first.clone());
+            prop_assert_eq!(first.clone().combine(TradabilityRead::empty()), first.clone());
+            prop_assert_eq!(
+                first.clone().combine(second.clone()).combine(third.clone()),
+                first.combine(second.combine(third))
+            );
+        }
+
+        /// Splitting a read over its own names and merging back what it holds returns it whole, and nothing it read is
+        /// left unread.
+        #[test]
+        fn property_a_read_split_over_its_names_returns_whole(read in any_read()) {
+            let names: Vec<Symbol> = read.readings.keys().cloned().collect();
+            let (held, unread) = read.split(&names);
+            prop_assert!(unread.is_empty());
+            prop_assert_eq!(TradabilityRead::empty().combine(held), read);
+        }
+    }
+
+    /// A later read of a name replaces the earlier whole, its borrow dropped when the later read has none, and a split
+    /// names exactly the symbols never read.
+    #[test]
+    fn test_a_later_read_replaces_a_name_whole_and_a_split_names_the_unread() {
+        let (aaa, bbb) = (Symbol::new("AAA").unwrap(), Symbol::new("BBB").unwrap());
+        let earlier = TradabilityRead::new(
+            BTreeMap::from([(aaa.clone(), Tradability::Fractionable)]),
+            BTreeMap::from([(aaa.clone(), Shortability::EasyToBorrow)]),
+        );
+        let later = TradabilityRead::new(
+            BTreeMap::from([(aaa.clone(), Tradability::Untradable)]),
+            BTreeMap::new(),
+        );
+        let merged = earlier.combine(later.clone());
+        assert_eq!(merged, later);
+        let (held, unread) = merged.split(&[aaa, bbb.clone()]);
+        assert_eq!(held, later);
+        assert_eq!(unread, [bbb]);
     }
 }

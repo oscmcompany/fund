@@ -45,6 +45,10 @@ pub trait Broker {
 
     /// The account's cash and positions as a book, the authority a journal's fills are reconciled against.
     fn book(&self) -> impl Future<Output = Result<Book, BrokerError>> + Send;
+
+    /// Asks the broker to cancel every open order and close every position at the market, as orders the journal does
+    /// not record; `Ok` proves only that the request was taken, so the book is read back to see it flat.
+    fn close_all(&self) -> impl Future<Output = Result<(), BrokerError>> + Send;
 }
 
 /// Digits after the point in a `Cash` unit: ticks times millionths of a share.
@@ -489,6 +493,20 @@ impl Broker for PaperAccount {
     async fn cancel(&self, id: &BrokerOrderId) -> Result<(), BrokerError> {
         let path = format!("/v2/orders/{}", id.0);
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
+    }
+
+    /// Asks Alpaca once to cancel open orders and then close every position, never retried, since a resend cancels
+    /// the closes the first one sent and sizes new ones from a position they may be filling against.
+    async fn close_all(&self) -> Result<(), BrokerError> {
+        let request = self
+            .alpaca
+            .trading(Method::DELETE, "/v2/positions")
+            .query(&[("cancel_orders", "true")]);
+        match send(request).await {
+            Outcome::Body(_) => Ok(()),
+            Outcome::Transient(cause) => Err(BrokerError::Unanswered { cause }),
+            Outcome::Refused { status, body } => Err(FetchError::Refused { status, body }.into()),
+        }
     }
 
     /// What Alpaca reports of each symbol's trading and short sale, one asset read apiece.

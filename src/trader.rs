@@ -21,12 +21,12 @@ use crate::common::problem::formulate;
 use crate::common::reconcile::rounding_allowance;
 use crate::common::risk::{Limits, NameLosses, TargetDecided};
 use crate::common::solver::Solver;
-use crate::common::standing::{HaltCause, SessionHalted};
+use crate::common::standing::{BookFlattened, FlattenCause, HaltCause, SessionHalted};
 use crate::common::strategy::Strategy;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
 use crate::execution::{
-    JournalFailure, OrderOutcome, Patience, ReconcileFailure, Reconciliation, execute,
+    JournalFailure, OrderOutcome, Patience, ReconcileFailure, Reconciliation, execute, flatten,
     reconcile_and_close,
 };
 use crate::ingest::FetchError;
@@ -41,6 +41,9 @@ const RECHECK_AFTER: TimeDelta = TimeDelta::minutes(2);
 const OPENING_WAIT: TimeDelta = RECHECK_AFTER;
 
 const MINUTE: TimeDelta = TimeDelta::minutes(1);
+
+/// How long before the close a session closes whatever it still holds through the broker, decisions or none.
+const FLAT_BACKSTOP: TimeDelta = TimeDelta::minutes(2);
 
 pub mod parameters;
 
@@ -229,6 +232,8 @@ pub struct Session<S: Strategy> {
     next_decision: DateTime<Utc>,
     sequence: OrderSequence,
     standing: Standing,
+    /// What closing every position through the broker left, once it has run; the session decides nothing after.
+    flattened: Option<BookFlattened>,
 }
 
 /// A built minute starting at `start` and the rows its first read returned.
@@ -313,6 +318,7 @@ impl<S: Strategy> Session<S> {
             fills: Vec::new(),
             sequence: OrderSequence::default(),
             standing: Standing::Trading,
+            flattened: None,
         }
     }
 
@@ -326,8 +332,9 @@ impl<S: Strategy> Session<S> {
     }
 
     /// Builds every minute whose wait has passed by the clock, and once a decision bar is built, trades the book toward
-    /// the strategy's target within the limits and reconciles it with the broker's; then reads again each built minute
-    /// due a recheck. A late call decides once, for the latest bar built, rather than for each it passed.
+    /// the strategy's target within the limits and reconciles it with the broker's; closes every position through the
+    /// broker once halted or `FLAT_BACKSTOP` before the close; then reads again each built minute due a recheck. A late
+    /// call decides once, for the latest bar built, rather than for each it passed.
     pub async fn advance(
         &mut self,
         clock: &impl Fn() -> DateTime<Utc>,
@@ -337,13 +344,45 @@ impl<S: Strategy> Session<S> {
     ) -> Result<(), SessionError> {
         let started = clock();
         self.fold_in(MarketEvent::Clock(started));
-        self.build(started, tape, journal).await?;
-        // Building awaits REST, so the decision reads the clock again rather than trusting the instant it began at.
-        let now = clock();
-        self.fold_in(MarketEvent::Clock(now));
-        let decided = self.decide(now, broker, journal).await;
+        let decided = match self.build(started, tape, journal).await {
+            Ok(()) => {
+                // Building awaits REST, so the decision reads the clock again rather than trusting when it began.
+                let now = clock();
+                self.fold_in(MarketEvent::Clock(now));
+                self.decide(now, broker, journal).await
+            }
+            Err(error) => Err(error),
+        };
+        self.backstop(clock, broker, journal).await;
         self.recheck(clock(), tape).await;
         decided
+    }
+
+    /// Closes every position through the broker, once, when the session has halted or the close is `FLAT_BACKSTOP`
+    /// away, and journals what the broker held after; never past the close, where orders would rest a session.
+    async fn backstop(
+        &mut self,
+        clock: &impl Fn() -> DateTime<Utc>,
+        broker: &impl Broker,
+        journal: &mut Journal,
+    ) {
+        let now = clock();
+        let left = match (self.flattened.is_some(), (self.close - now).to_std()) {
+            (false, Ok(left)) if !left.is_zero() => left,
+            (true, _) | (false, Ok(_) | Err(_)) => return,
+        };
+        let cause = match (&self.standing, now >= self.close - FLAT_BACKSTOP) {
+            (Standing::Halted(_), _) => FlattenCause::Halted,
+            (Standing::Trading, true) => FlattenCause::ClosingBackstop,
+            (Standing::Trading, false) => return,
+        };
+        let flattened = flatten(broker, cause, self.settings.patience, left).await;
+        // The journal may be what halted the session, so a refused record is logged instead.
+        let journaled = Observation::BookFlattened(flattened.clone());
+        if let Err(error) = journal.append(clock(), journaled) {
+            tracing::error!(%error, ?flattened, "Flattening was not journaled");
+        }
+        self.flattened = Some(flattened);
     }
 
     /// How long the minute starting at `start` waits after it ends before it is first read. The closing minute waits no
@@ -481,9 +520,9 @@ impl<S: Strategy> Session<S> {
         broker: &impl Broker,
         journal: &mut Journal,
     ) -> Result<(), SessionError> {
-        match self.standing {
-            Standing::Trading => {}
-            Standing::Halted(_) => return Ok(()),
+        match (&self.standing, &self.flattened) {
+            (Standing::Trading, None) => {}
+            (Standing::Halted(_), _) | (Standing::Trading, Some(_)) => return Ok(()),
         }
         if self.built_through < self.next_decision {
             return Ok(());
@@ -778,6 +817,8 @@ mod tests {
         book_unreadable: bool,
         book: Mutex<Book>,
         last: Mutex<Option<BrokerOrder>>,
+        /// How many times every position was asked closed.
+        closes: Mutex<u32>,
     }
 
     impl Filling {
@@ -789,6 +830,7 @@ mod tests {
                 book_unreadable: false,
                 book: Mutex::new(book),
                 last: Mutex::new(None),
+                closes: Mutex::new(0),
             }
         }
     }
@@ -864,6 +906,15 @@ mod tests {
             }
             Ok(self.book.lock().unwrap().clone())
         }
+
+        /// Closes every position at `ticks` and counts the request.
+        async fn close_all(&self) -> Result<(), BrokerError> {
+            *self.closes.lock().unwrap() += 1;
+            let price = Price::from_ticks(*self.ticks.lock().unwrap()).unwrap();
+            let mut book = self.book.lock().unwrap();
+            *book = Book::funded(book.value(|_| Some(price)).unwrap());
+            Ok(())
+        }
     }
 
     fn session(stale_after: TimeDelta, funded: Book) -> Session<OneShare> {
@@ -932,10 +983,20 @@ mod tests {
             Staleness::new(stale_after).unwrap(),
             MinuteWait::new(TimeDelta::seconds(2)).unwrap(),
         );
-        session_of(OneShare, settings, vec![spy()], book, opening, losses, open)
+        let close = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+        session_of(
+            OneShare,
+            settings,
+            vec![spy()],
+            book,
+            opening,
+            losses,
+            (open, close),
+        )
     }
 
-    /// A session of the 2026-10-07 calendar playing `strategy` over `symbols`, from an empty state.
+    /// A session of the 2026-10-07 calendar closing at `close` Eastern, playing `strategy` over `symbols` from an empty
+    /// state and building from `open`.
     fn session_of<S: Strategy>(
         strategy: S,
         settings: SessionSettings,
@@ -943,17 +1004,13 @@ mod tests {
         book: Book,
         opening: Cash,
         losses: NameLosses,
-        open: DateTime<Utc>,
+        (open, close): (DateTime<Utc>, NaiveTime),
     ) -> Session<S> {
         let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
         let calendar = TradingCalendar::new(
             vec![
-                TradingSession::new(
-                    date,
-                    NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
-                    NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
-                )
-                .unwrap(),
+                TradingSession::new(date, NaiveTime::from_hms_opt(9, 30, 0).unwrap(), close)
+                    .unwrap(),
             ],
             SessionRange::single(date),
         )
@@ -1496,7 +1553,7 @@ mod tests {
                 .count()
         };
         assert_eq!(count(&directory, "target_decided"), 1);
-        assert_eq!(journaled(&directory).last(), Some(&"session_halted"));
+        assert_eq!(count(&directory, "session_halted"), 1);
         tape.file(print("14:09:30", 701_000_000));
         session
             .advance(&|| at("14:10:02"), &tape, &broker, &mut journal)
@@ -1508,6 +1565,186 @@ mod tests {
             session.book.cash(),
             Cash::from_units(9_000 * DOLLAR - 701 * DOLLAR)
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A halted session decides nothing more, so it closes every position through the broker at once rather than hold
+    /// them to the close, journals what the broker held after, and never closes again.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_halted_session_closes_every_position() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let strayed = Book::funded(Cash::from_units(9_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, strayed);
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        tape.file(print("14:04:30", 701_000_000));
+        session
+            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
+        assert_eq!(*broker.closes.lock().unwrap(), 1);
+        assert!(broker.book.lock().unwrap().positions().is_empty());
+        let events = journaled(&directory);
+        assert_eq!(
+            events[events.len() - 2..],
+            ["session_halted", "book_flattened"]
+        );
+        assert_eq!(
+            payloads(&directory).last().unwrap(),
+            &serde_json::json!({"cause": "halted", "closes": 1, "reading": "flat"})
+        );
+        tape.file(print("14:09:30", 701_000_000));
+        session
+            .advance(&|| at("14:10:02"), &tape, &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(*broker.closes.lock().unwrap(), 1);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A session whose step fails halts, and still closes every position before the call returns its error.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_step_still_closes_every_position() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let mut broker = Filling::new(701_000_000, funded.clone());
+        broker.book_unreadable = true;
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        tape.file(print("14:04:30", 701_000_000));
+        let failed = session
+            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(*broker.closes.lock().unwrap(), 3);
+        assert!(broker.book.lock().unwrap().positions().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The SPY share a session buys at 14:05 on a calendar closing at `close` Eastern, under a flat window of
+    /// `flat_before_close`, with the broker that filled it.
+    async fn holding_one_share(
+        close: NaiveTime,
+        flat_before_close: TimeDelta,
+    ) -> (Session<OneShare>, Filling, Journal, std::path::PathBuf) {
+        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
+        let funded = Book::funded(dollars(10_000));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let limits = Limits::new(
+            dollars(10_000),
+            dollars(5_000),
+            dollars(1_000),
+            dollars(1_000),
+            flat_before_close,
+        )
+        .unwrap();
+        let settings = SessionSettings::new(
+            DecisionInterval::FiveMinute,
+            limits,
+            Patience::new(Duration::from_secs(1), Duration::from_secs(30)).unwrap(),
+            Staleness::new(TimeDelta::minutes(5)).unwrap(),
+            MinuteWait::new(TimeDelta::seconds(2)).unwrap(),
+        );
+        let losses = NameLosses::open(&funded, |_| None).unwrap();
+        let mut session = session_of(
+            OneShare,
+            settings,
+            vec![spy()],
+            funded,
+            dollars(10_000),
+            losses,
+            (at("14:00:00"), close),
+        );
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        tape.file(print("14:04:30", 701_000_000));
+        session
+            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(
+            broker.book.lock().unwrap().position(&spy()).units(),
+            1_000_000
+        );
+        (session, broker, journal, directory)
+    }
+
+    /// The closes the backstop has asked for once the session advances at each of `instants`, building nothing past
+    /// 14:05, as when the tape falls silent.
+    async fn closes_by(
+        session: &mut Session<OneShare>,
+        broker: &Filling,
+        journal: &mut Journal,
+        instants: &[&str],
+    ) -> Vec<u32> {
+        let tape = Scripted::default();
+        let mut closes = Vec::new();
+        for instant in instants {
+            session
+                .advance(&|| at(instant), &tape, broker, journal)
+                .await
+                .unwrap();
+            closes.push(*broker.closes.lock().unwrap());
+        }
+        closes
+    }
+
+    /// A flat window of zero holds no decision at all, and a silent tape none either, so the backstop closes the book
+    /// through the broker two minutes before the close, not a second earlier, and once.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_zero_flat_window_is_closed_out_before_the_close() {
+        let (mut session, broker, mut journal, directory) = holding_one_share(
+            NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            TimeDelta::zero(),
+        )
+        .await;
+        let closes = closes_by(
+            &mut session,
+            &broker,
+            &mut journal,
+            &["19:57:59", "19:58:00", "19:59:00"],
+        )
+        .await;
+        assert_eq!(closes, [0, 1, 1]);
+        assert!(broker.book.lock().unwrap().positions().is_empty());
+        assert_eq!(
+            payloads(&directory).last().unwrap(),
+            &serde_json::json!({"cause": "closing_backstop", "closes": 1, "reading": "flat"})
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A session the calendar closes early, at 13:00 Eastern, is closed out two minutes before that close.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_early_close_is_closed_out_before_its_own_close() {
+        let (mut session, broker, mut journal, directory) = holding_one_share(
+            NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
+            TimeDelta::minutes(15),
+        )
+        .await;
+        let closes = closes_by(
+            &mut session,
+            &broker,
+            &mut journal,
+            &["16:57:59", "16:58:00"],
+        )
+        .await;
+        assert_eq!(closes, [0, 1]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Orders sent past the close would rest until the next session, so a run first advancing then closes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_backstop_closes_nothing_past_the_close() {
+        let (mut session, broker, mut journal, directory) = holding_one_share(
+            NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            TimeDelta::zero(),
+        )
+        .await;
+        let closes = closes_by(&mut session, &broker, &mut journal, &["20:00:00"]).await;
+        assert_eq!(closes, [0]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1547,16 +1784,21 @@ mod tests {
         };
         let events = journaled(&directory);
         assert_eq!(
-            events[events.len() - 3..],
-            ["order_unresolved", "session_halted", "book_reconciled"]
+            events[events.len() - 4..],
+            [
+                "order_unresolved",
+                "session_halted",
+                "book_reconciled",
+                "book_flattened"
+            ]
         );
         let records = payloads(&directory);
         assert_eq!(
-            records[records.len() - 3]["client_order_id"],
+            records[records.len() - 4]["client_order_id"],
             serde_json::json!(client_order_id)
         );
         assert_eq!(
-            records[records.len() - 2]["cause"]["unresolved"]["client_order_id"],
+            records[records.len() - 3]["cause"]["unresolved"]["client_order_id"],
             serde_json::json!(client_order_id)
         );
         std::fs::remove_dir_all(&directory).unwrap();
@@ -1606,9 +1848,13 @@ mod tests {
                 raw: "unreadable".to_string(),
             }))
         );
-        assert_eq!(journaled(&directory).last(), Some(&"session_halted"));
+        let events = journaled(&directory);
         assert_eq!(
-            payloads(&directory).last(),
+            events[events.len() - 2..],
+            ["session_halted", "book_flattened"]
+        );
+        assert_eq!(
+            payloads(&directory).iter().nth_back(1),
             Some(&serde_json::json!({
                 "cause": {"reconcile_unread": {"malformed": {"field": "cash", "raw": "unreadable"}}}
             }))
@@ -2256,14 +2502,17 @@ mod tests {
             .advance(&|| at("19:59:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
-        assert!(journaled(&directory).is_empty());
+        assert_eq!(journaled(&directory), ["book_flattened"]);
         tape.failing.lock().unwrap().clear();
         tape.failing.lock().unwrap().insert(at("19:56:00"));
         session
             .advance(&|| at("20:00:30"), &tape, &broker, &mut journal)
             .await
             .unwrap();
-        assert_eq!(journaled(&directory), ["bar_built", "bar_built"]);
+        assert_eq!(
+            journaled(&directory),
+            ["book_flattened", "bar_built", "bar_built"]
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -2533,7 +2782,7 @@ mod tests {
             funded.clone(),
             dollars(10_000),
             NameLosses::open(&funded, |_| None).unwrap(),
-            at("14:00:00"),
+            (at("14:00:00"), NaiveTime::from_hms_opt(16, 0, 0).unwrap()),
         );
         let scripted = Scripted::default();
         for outcome in &tape {

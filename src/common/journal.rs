@@ -25,7 +25,7 @@ use crate::common::parameter::Parameter;
 use crate::common::playbook::{PlaybookRead, PlaybookUploaded};
 use crate::common::reconcile::BookReconciled;
 use crate::common::risk::TargetDecided;
-use crate::common::standing::{SessionClosed, SessionHalted};
+use crate::common::standing::{BookFlattened, SessionClosed, SessionHalted};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 
@@ -234,6 +234,7 @@ pub enum Observation {
     PlaybookRead(PlaybookRead),
     PlaybookUploaded(PlaybookUploaded),
     SessionHalted(SessionHalted),
+    BookFlattened(BookFlattened),
     SessionClosed(SessionClosed),
 }
 
@@ -1464,6 +1465,45 @@ mod tests {
         for (observation, payload) in observations.iter().zip(&payloads) {
             assert_eq!(
                 &serde_json::from_str::<Observation>(payload).unwrap(),
+                observation
+            );
+        }
+    }
+
+    /// Each way a book can be left by closing every position, pinned to its wire format and read back.
+    #[test]
+    fn test_a_flattened_book_encodes_to_its_wire_format() {
+        use crate::common::order::BrokerFailure;
+        use crate::common::standing::{BookFlattened, FlatReading, FlattenCause};
+
+        let lines = [
+            (
+                BookFlattened::new(FlattenCause::Halted, 1, FlatReading::Flat),
+                r#"{"cause":"halted","closes":1,"reading":"flat"}"#,
+            ),
+            (
+                BookFlattened::new(
+                    FlattenCause::ClosingBackstop,
+                    3,
+                    FlatReading::Held { positions: 2 },
+                ),
+                r#"{"cause":"closing_backstop","closes":3,"reading":{"held":{"positions":2}}}"#,
+            ),
+            (
+                BookFlattened::new(
+                    FlattenCause::Halted,
+                    0,
+                    FlatReading::Unread(BrokerFailure::NotPaper),
+                ),
+                r#"{"cause":"halted","closes":0,"reading":{"unread":"not_paper"}}"#,
+            ),
+        ];
+        for (flattened, payload) in lines {
+            let line = format!(r#"{{"event_type":"book_flattened","payload":{payload}}}"#);
+            let observation = Observation::BookFlattened(flattened);
+            assert_eq!(serde_json::to_string(&observation).unwrap(), line);
+            assert_eq!(
+                serde_json::from_str::<Observation>(&line).unwrap(),
                 observation
             );
         }

@@ -1,14 +1,15 @@
 //! Takes a book to a target at a broker: each order is submitted, followed to its close, canceled when it outlives its
-//! patience, and journaled, and the fills of the orders that closed are handed back for the book.
+//! patience, and journaled, and the fills of the orders that closed are handed back for the book; or, as a backstop,
+//! every position is closed through the broker.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
 use tokio::time::Instant;
 
-use crate::broker::Broker;
-use crate::broker::BrokerError;
+use crate::broker::{Broker, BrokerError, BrokerOrder, BrokerOrderId};
 use crate::common::book::{Book, Fill};
 use crate::common::guard::{
     GuardCause, OrderGuarded, TradabilityRead, TradabilityUnread, Unclosed, guard,
@@ -16,12 +17,14 @@ use crate::common::guard::{
 use crate::common::journal::Observation;
 use crate::common::market::state::LastQuote;
 use crate::common::market::{Price, Symbol};
+use crate::common::monoid::Monoid;
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
     OrderSequence, OrderState, OrderSubmitted, OrderTrouble, OrderUnresolved, UnresolvedCause,
 };
 use crate::common::reconcile::{Allowance, BookReconciled, reconcile};
 use crate::common::risk::DollarLimit;
+use crate::common::standing::{BookFlattened, FlatReading, FlattenCause};
 use crate::common::strategy::{Holding, Target, orders};
 use crate::ingest::FetchError;
 use crate::journal::Journal;
@@ -309,6 +312,108 @@ pub async fn reconcile_and_close(
     })
 }
 
+/// A broker whose tradability and borrow are read once per symbol and kept for the run, so each decision reads only
+/// names it has not seen; a failed read keeps nothing and is tried again.
+pub struct CachedTradability<B> {
+    broker: B,
+    read: Mutex<TradabilityRead>,
+}
+
+impl<B> CachedTradability<B> {
+    pub fn new(broker: B) -> Self {
+        Self {
+            broker,
+            read: Mutex::new(TradabilityRead::default()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TradabilityRead> {
+        self.read
+            .lock()
+            .expect("no read panics while holding the lock")
+    }
+}
+
+impl<B: Broker + Sync> Broker for CachedTradability<B> {
+    async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
+        self.broker.submit(request).await
+    }
+
+    async fn order(&self, id: ClientOrderId) -> Result<BrokerOrder, BrokerError> {
+        self.broker.order(id).await
+    }
+
+    async fn cancel(&self, id: &BrokerOrderId) -> Result<(), BrokerError> {
+        self.broker.cancel(id).await
+    }
+
+    async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
+        let (held, unread) = self.lock().split(symbols);
+        if unread.is_empty() {
+            return Ok(held);
+        }
+        let fresh = self.broker.tradability(&unread).await?;
+        let mut read = self.lock();
+        *read = std::mem::take(&mut *read).combine(fresh);
+        Ok(read.split(symbols).0)
+    }
+
+    async fn book(&self) -> Result<Book, BrokerError> {
+        self.broker.book().await
+    }
+
+    async fn close_all(&self) -> Result<(), BrokerError> {
+        self.broker.close_all().await
+    }
+}
+
+/// Close requests sent before positions still reported are left held.
+const CLOSES: u32 = 3;
+
+/// Reads the broker's book every poll and, while it is not flat, asks the broker to close everything, again only once
+/// an earlier request has had `patience`'s open window; stops flat, after `CLOSES` requests have each had that window,
+/// or once `left` has passed, reporting what the last read found.
+pub async fn flatten(
+    broker: &impl Broker,
+    cause: FlattenCause,
+    patience: Patience,
+    left: Duration,
+) -> BookFlattened {
+    let started = Instant::now();
+    let (mut closes, mut last_close) = (0, started);
+    loop {
+        let reading = match broker.book().await {
+            Ok(book) if book.positions().is_empty() => FlatReading::Flat,
+            Ok(book) => FlatReading::Held {
+                positions: book.positions().len(),
+            },
+            Err(error) => FlatReading::Unread(BrokerFailure::from(&error)),
+        };
+        let waiting = closes > 0 && last_close.elapsed() < patience.open_for();
+        match (
+            &reading,
+            started.elapsed() >= left,
+            waiting,
+            closes >= CLOSES,
+        ) {
+            (FlatReading::Flat, _, _, _)
+            | (FlatReading::Held { .. } | FlatReading::Unread(_), true, _, _)
+            | (FlatReading::Held { .. } | FlatReading::Unread(_), false, false, true) => {
+                return BookFlattened::new(cause, closes, reading);
+            }
+            (FlatReading::Held { .. } | FlatReading::Unread(_), false, true, _) => {}
+            (FlatReading::Held { .. } | FlatReading::Unread(_), false, false, false) => {
+                if let Err(error) = broker.close_all().await {
+                    tracing::warn!(%error, "Positions not closed");
+                }
+                closes += 1;
+                last_close = Instant::now();
+            }
+        }
+        tokio::time::sleep(patience.poll()).await;
+    }
+}
+
 /// Submits one order and follows it to its close, returning what to journal and its outcome. Once the order is found,
 /// a failed read, failed cancel or refused report spends its patience, so it is canceled and read back.
 async fn follow(
@@ -449,6 +554,8 @@ mod tests {
         /// The shortability reported, none unless set.
         borrow: BTreeMap<Symbol, Shortability>,
         tradability_fails: bool,
+        /// The symbols each tradability read asked for.
+        tradability_asked: Mutex<Vec<Vec<Symbol>>>,
         /// The books reported, the last repeating.
         books: Mutex<VecDeque<Book>>,
         calls: Mutex<Vec<&'static str>>,
@@ -466,6 +573,7 @@ mod tests {
                 readings: None,
                 borrow: BTreeMap::new(),
                 tradability_fails: false,
+                tradability_asked: Mutex::new(Vec::new()),
                 books: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
@@ -550,8 +658,22 @@ mod tests {
             })
         }
 
+        async fn close_all(&self) -> Result<(), BrokerError> {
+            self.calls.lock().unwrap().push("close_all");
+            match self.cancel_fails {
+                true => Err(BrokerError::Unanswered {
+                    cause: "timed out".to_string(),
+                }),
+                false => Ok(()),
+            }
+        }
+
         async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
             self.calls.lock().unwrap().push("tradability");
+            self.tradability_asked
+                .lock()
+                .unwrap()
+                .push(symbols.to_vec());
             if self.tradability_fails {
                 return Err(BrokerError::Fetch(FetchError::Exhausted {
                     attempts: 3,
@@ -1329,6 +1451,138 @@ mod tests {
         (reconciliation, events)
     }
 
+    /// Flattens against a broker reporting `books` in turn, the last repeating, polling every second with each close
+    /// request given ten seconds and the whole `left` seconds, returning the record, the calls and the time taken.
+    async fn flattening(
+        books: Vec<Book>,
+        left: u64,
+    ) -> (BookFlattened, Vec<&'static str>, Duration) {
+        let broker = Scripted::new(&[], &[]);
+        *broker.books.lock().unwrap() = books.into();
+        let started = Instant::now();
+        let flattened = flatten(
+            &broker,
+            FlattenCause::ClosingBackstop,
+            patience((1_000, 10_000)),
+            Duration::from_secs(left),
+        )
+        .await;
+        (flattened, broker.calls(), started.elapsed())
+    }
+
+    /// A book already flat is read once and nothing is asked closed.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_flat_book_is_left_alone() {
+        let (flattened, calls, _) = flattening(vec![holding(1, &[])], 120).await;
+        assert_eq!(
+            flattened,
+            BookFlattened::new(FlattenCause::ClosingBackstop, 0, FlatReading::Flat)
+        );
+        assert_eq!(calls, ["book"]);
+    }
+
+    /// A held book is asked closed once and read each poll until it reads flat.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_held_book_is_closed_and_read_until_flat() {
+        let books = vec![
+            holding(1, &[("SPY", 1_000_000)]),
+            holding(1, &[("SPY", 1_000_000)]),
+            holding(2, &[]),
+        ];
+        let (flattened, calls, _) = flattening(books, 120).await;
+        assert_eq!(
+            flattened,
+            BookFlattened::new(FlattenCause::ClosingBackstop, 1, FlatReading::Flat)
+        );
+        assert_eq!(calls, ["book", "close_all", "book", "book"]);
+    }
+
+    /// A book that never reads flat is asked closed again only after each request's window, and left held after the
+    /// last request's window has passed.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_book_that_stays_held_is_asked_closed_three_times() {
+        let books = vec![holding(1, &[("SPY", 1_000_000), ("QQQ", -1_000_000)])];
+        let (flattened, calls, elapsed) = flattening(books, 120).await;
+        assert_eq!(
+            flattened,
+            BookFlattened::new(
+                FlattenCause::ClosingBackstop,
+                3,
+                FlatReading::Held { positions: 2 }
+            )
+        );
+        let closes = calls.iter().filter(|call| **call == "close_all").count();
+        assert_eq!(closes, 3);
+        assert_eq!(elapsed, Duration::from_secs(30));
+    }
+
+    /// Flattening stops at the first read once the time left has passed, whatever requests remain.
+    #[tokio::test(start_paused = true)]
+    async fn test_flattening_stops_once_its_time_has_passed() {
+        let books = vec![holding(1, &[("SPY", 1_000_000)])];
+        let (flattened, calls, elapsed) = flattening(books, 5).await;
+        assert_eq!(
+            flattened,
+            BookFlattened::new(
+                FlattenCause::ClosingBackstop,
+                1,
+                FlatReading::Held { positions: 1 }
+            )
+        );
+        assert_eq!(calls.iter().filter(|call| **call == "close_all").count(), 1);
+        assert_eq!(elapsed, Duration::from_secs(5));
+    }
+
+    /// Each symbol is read once: a second ask reads nothing, an ask adding a name reads only that name, and a failed
+    /// read keeps nothing, so the next ask reads its names again.
+    #[tokio::test(start_paused = true)]
+    async fn test_tradability_is_read_once_per_symbol() {
+        let (spy, qqq, iwm) = (
+            Symbol::new("SPY").unwrap(),
+            Symbol::new("QQQ").unwrap(),
+            Symbol::new("IWM").unwrap(),
+        );
+        let mut cached = CachedTradability::new(Scripted::new(&[], &[]));
+        cached
+            .tradability(std::slice::from_ref(&spy))
+            .await
+            .unwrap();
+        cached
+            .tradability(std::slice::from_ref(&spy))
+            .await
+            .unwrap();
+        let read = cached
+            .tradability(&[spy.clone(), qqq.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            read,
+            TradabilityRead::new(
+                BTreeMap::from([
+                    (spy.clone(), Tradability::Fractionable),
+                    (qqq.clone(), Tradability::Fractionable),
+                ]),
+                BTreeMap::new(),
+            )
+        );
+        cached.broker.tradability_fails = true;
+        assert!(
+            cached
+                .tradability(std::slice::from_ref(&iwm))
+                .await
+                .is_err()
+        );
+        cached.broker.tradability_fails = false;
+        cached
+            .tradability(std::slice::from_ref(&iwm))
+            .await
+            .unwrap();
+        assert_eq!(
+            *cached.broker.tradability_asked.lock().unwrap(),
+            [vec![spy], vec![qqq], vec![iwm.clone()], vec![iwm]]
+        );
+    }
+
     /// A journal that cannot record a submission stops the run before anything is sent.
     #[tokio::test(start_paused = true)]
     async fn test_a_journal_that_refuses_a_write_stops_the_run_before_sending() {
@@ -1433,6 +1687,7 @@ mod tests {
                 | Observation::BarBuilt(_)
                 | Observation::TradabilityRead(_)
                 | Observation::SessionHalted(_)
+                | Observation::BookFlattened(_)
                 | Observation::SessionClosed(_)
                 | Observation::PlaybookRead(_)
                 | Observation::PlaybookUploaded(_) => None,
@@ -1588,6 +1843,10 @@ mod tests {
 
         async fn book(&self) -> Result<Book, BrokerError> {
             unreachable!("execute never reads the book")
+        }
+
+        async fn close_all(&self) -> Result<(), BrokerError> {
+            unreachable!("execute never closes everything")
         }
 
         async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
