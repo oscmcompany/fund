@@ -30,7 +30,7 @@ in {
       hook "Check every derived date has a pinned time zone" "timezones" "(\\.(sql|rs|sh)$|(^|/)[^./]+$)";
     check-rust =
       hook "Check all Rust code" "rust"
-      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|^checks/.+|^host/.+|devenv\\.(nix|lock|yaml))$";
+      "(\\.rs|Cargo\\.(toml|lock)|(clippy|secretspec|rust-toolchain)\\.toml|views\\.sql|^checks/.+|^host/.+|^tools/.+|devenv\\.(nix|lock|yaml))$";
     check-markdown = hook "Check all Markdown code" "markdown" "\\.md$";
     check-yaml = hook "Check all YAML code" "yaml" "\\.(yaml|yml)$";
     check-toml = hook "Check all TOML code" "toml" "\\.toml$";
@@ -38,6 +38,9 @@ in {
   };
 
   env = {
+    # The font snapshot renders with, so a render reads no system font.
+    SNAPSHOT_FONTS = "${pkgs.ibm-plex}/share/fonts/truetype";
+
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
@@ -54,12 +57,14 @@ in {
     cargo-llvm-cov
     cargo-machete
     cargo-mutants
+    charm-freeze # snapshot
     curl
     duckdb # start-duckdb and check-views
     gh
     git
     jq
     markdownlint-cli
+    resvg # snapshot rasterizes freeze's SVG
     secretspec # run-role reads each profile's secrets through it on every host
     ssm-session-manager-plugin # researcher tunnels SSH through SSM
     statix
@@ -86,6 +91,10 @@ in {
 
   scripts.researcher.exec = ''
     "$DEVENV_ROOT/host/researcher" "$@"
+  '';
+
+  scripts.snapshot.exec = ''
+    "$DEVENV_ROOT/tools/snapshot" "$@"
   '';
 
   scripts.update-rust-dependencies.exec = ''
@@ -219,6 +228,8 @@ in {
       echo "    mutate-rust <diff>          Mutation-test the lines a diff changes"
       echo "    researcher <command>        Hold, push to and run studies on the"
       echo "                                FUND_PROFILE researcher (--help)"
+      echo "    snapshot <mode> <target>    Render public code, a fixture or a"
+      echo "                                commit as a branded PNG"
     } >&2
   '';
 }

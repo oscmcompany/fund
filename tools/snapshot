@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Renders lines of a public file, the first rows of a public CSV, or a commit on origin/master as a branded PNG under
+# .scratchpad/snapshots/, printing its path. Exits 0 when rendered, 3 when the target is not public (naming the reason
+# and writing nothing), and 1 when the render could not be made.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: snapshot code <path>:<start>-<end>
+       snapshot data <path.csv> [rows]
+       snapshot commit <hash>
+Paths are relative to the repository root, and every target must be public on origin/master.
+USAGE
+  exit 1
+}
+
+refuse() {
+  echo "Refused: $1: $2" >&2
+  exit 3
+}
+
+# The remote-tracking ref in full, so a local branch named origin/master cannot shadow it.
+published=refs/remotes/origin/master
+
+# A path is public when origin/master holds it as a regular file and the working copy is byte-identical to it. The
+# published blob is copied to ${checked} and that copy is what renders, so a later edit to the working copy cannot leak.
+require_public_file() {
+  local path="$1" entry mode object name
+  entry="$(git ls-tree "${published}" -- "${path}")" || refuse "${path}" "origin/master could not be read"
+  [[ -n "${entry}" ]] || refuse "${path}" "not tracked on origin/master"
+  [[ "${entry}" != *$'\n'* ]] || refuse "${path}" "not a regular file on origin/master"
+  read -r mode _ object _ <<<"${entry}"
+  name="${entry#*$'\t'}"
+  # ls-tree matches by prefix and normalises the path, so the entry it names must be the path itself.
+  [[ "${name}" == "${path}" ]] || refuse "${path}" "not tracked on origin/master under that exact path"
+  [[ "${mode}" == 100644 || "${mode}" == 100755 ]] || refuse "${path}" "not a regular file on origin/master"
+  [[ -f "${path}" && ! -L "${path}" && "$(git hash-object --no-filters -- "${path}")" == "${object}" ]] ||
+    refuse "${path}" "differs from origin/master"
+  checked="${work}/published/$(basename "${path}")"
+  mkdir -p "$(dirname "${checked}")"
+  git cat-file blob "${object}" >"${checked}"
+}
+
+render() {
+  local source="$1" name="$2"
+  shift 2
+  local output="${repository}/.scratchpad/snapshots/${name}.png"
+  mkdir -p "$(dirname "${output}")"
+  # freeze's own PNG export hangs on a hard shadow, so it writes an SVG and resvg rasterizes it with the pinned font.
+  freeze -c "${theme}" "$@" -o "${work}/snapshot.svg" "${source}" </dev/null >/dev/null ||
+    exit 1
+  if ! resvg --zoom 2 --skip-system-fonts --use-fonts-dir "${SNAPSHOT_FONTS:?the font directory devenv sets}" \
+    "${work}/snapshot.svg" "${output}" 2>"${work}/resvg.log"; then
+    cat "${work}/resvg.log" >&2
+    exit 1
+  fi
+  echo "${output}"
+}
+
+theme="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/snapshot.json"
+repository="$(git rev-parse --show-toplevel)"
+cd "${repository}"
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+mode="${1:-}"
+target="${2:-}"
+[[ -n "${target}" ]] || usage
+case "${mode}" in
+code)
+  [[ "${target}" =~ ^(.+):([0-9]+)-([0-9]+)$ ]] || usage
+  path="${BASH_REMATCH[1]}"
+  start="${BASH_REMATCH[2]}"
+  end="${BASH_REMATCH[3]}"
+  ((start >= 1 && start <= end)) || refuse "${target}" "the line range is empty"
+  require_public_file "${path}"
+  render "${checked}" "$(basename "${path}")-${start}-${end}" --lines "${start},${end}"
+  ;;
+data)
+  rows="${3:-10}"
+  [[ "${target}" == *.csv ]] || refuse "${target}" "not a CSV file"
+  [[ "${rows}" =~ ^[1-9][0-9]*$ ]] || usage
+  require_public_file "${target}"
+  # DuckDB keeps a quoted comma or line break inside its field, and breaks are flattened so the table stays aligned;
+  # -init /dev/null skips ~/.duckdbrc, whose settings (a timer, a mode) would otherwise print into the image.
+  cp "${checked}" "${work}/table.csv"
+  duckdb -init /dev/null -c ".mode column" -c "SELECT regexp_replace(coalesce(COLUMNS(*), ''), '[\r\n\t]+', ' ', 'g')
+    FROM read_csv('${work}/table.csv', header = true, all_varchar = true, delim = ',', quote = '\"') LIMIT ${rows}" \
+    >"${work}/table.txt" 2>"${work}/duckdb.log" || {
+    cat "${work}/duckdb.log" >&2
+    exit 1
+  }
+  render "${work}/table.txt" "$(basename "${target}" .csv)" --language text --show-line-numbers=false
+  ;;
+commit)
+  [[ "${target}" =~ ^[0-9a-fA-F]{4,40}$ ]] || refuse "${target}" "not a commit hash"
+  commit="$(git rev-parse --verify --quiet "${target}^{commit}")" || refuse "${target}" "no such commit"
+  git merge-base --is-ancestor "${commit}" "${published}" || refuse "${target}" "not on origin/master"
+  git show --no-patch --format='%h%n%n%s%n%n%b' "${commit}" >"${work}/commit.txt"
+  render "${work}/commit.txt" "commit-${commit:0:8}" --language text --show-line-numbers=false
+  ;;
+*) usage ;;
+esac
