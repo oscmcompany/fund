@@ -2,6 +2,7 @@
 //! calendar, and its asset listing's short-sale flags.
 
 pub mod corporate_actions;
+pub mod stream;
 
 use std::collections::{BTreeMap, BTreeSet};
 

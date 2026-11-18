@@ -819,7 +819,13 @@ mod tests {
                 ),
                 (
                     serde_json::json!("SPY"),
-                    serde_json::json!({"quoted": {"quoted_at": "2026-10-05T14:00:00Z", "bid": 670_000_000, "ask": 670_010_000}})
+                    serde_json::json!({"quoted": {
+                        "quoted_at": "2026-10-05T14:00:00Z",
+                        "bid": 670_000_000,
+                        "ask": 670_010_000,
+                        "bid_size": 1_000_000,
+                        "ask_size": 1_000_000
+                    }})
                 ),
             ]
         );

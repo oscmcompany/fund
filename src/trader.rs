@@ -1,6 +1,6 @@
 //! One trading session: each minute's trades read once the minute has ended and folded into minute bars, rolled up into
-//! decision bars as each ends, the market state those bars build, and at each decision bar the strategy's target taken
-//! through risk, the guard and the broker, then reconciled, all journaled.
+//! decision bars as each ends, the market state those bars and the streamed quotes build, and at each decision bar the
+//! strategy's target taken through risk, the guard and the broker, then reconciled, all journaled.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -30,7 +30,8 @@ use crate::execution::{
     reconcile_and_close,
 };
 use crate::ingest::FetchError;
-use crate::ingest::alpaca::{Alpaca, AlpacaTradeOutcome};
+use crate::ingest::alpaca::stream::StreamMessage;
+use crate::ingest::alpaca::{Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome};
 use crate::journal::Journal;
 
 /// How long after a minute's first read falls due it is read once more, to measure what that read missed.
@@ -636,8 +637,13 @@ impl<S: Strategy> Session<S> {
     }
 
     fn fold_in(&mut self, event: MarketEvent) {
+        self.fold_streamed(MarketState::of(event));
+    }
+
+    /// Folds in a state built apart from the session, such as the quotes streamed since the last call.
+    pub fn fold_streamed(&mut self, streamed: MarketState) {
         let state = std::mem::take(&mut self.state);
-        self.state = state.combine(MarketState::of(event));
+        self.state = state.combine(streamed);
     }
 
     /// The symbol's last one-minute close, unless the print that set it is older than the settings allow.
@@ -696,6 +702,31 @@ pub fn last_closes(bars: &[TradeBar]) -> BTreeMap<Symbol, Price> {
         .into_iter()
         .map(|(symbol, close)| (symbol, close.price()))
         .collect()
+}
+
+/// The two-sided quotes among `outcomes` folded into a state, as the live stream and the archive's quotes both fold; a
+/// one-sided quote is no top of book and leaves its symbol's last, and a refused row is logged.
+pub fn quotes_folded(outcomes: impl IntoIterator<Item = AlpacaQuoteOutcome>) -> MarketState {
+    concatenate(outcomes.into_iter().filter_map(|outcome| match outcome {
+        AlpacaQuoteOutcome::Quote { quote, .. } => Some(MarketState::of(MarketEvent::Quote(quote))),
+        AlpacaQuoteOutcome::OneSided { .. } => None,
+        AlpacaQuoteOutcome::Refused(row) => {
+            tracing::warn!(?row, "Quote refused");
+            None
+        }
+    }))
+}
+
+/// The quotes among a stream frame's messages, folded as `quotes_folded` folds them.
+pub fn streamed_quotes(messages: Vec<StreamMessage>) -> MarketState {
+    quotes_folded(messages.into_iter().filter_map(|message| match message {
+        StreamMessage::Quote(outcome) => Some(outcome),
+        StreamMessage::Success { .. }
+        | StreamMessage::Error { .. }
+        | StreamMessage::Subscription
+        | StreamMessage::Trade(_)
+        | StreamMessage::Unread => None,
+    }))
 }
 
 /// The end of the latest decision bar ended by `instant`, which is at or before it.
@@ -1167,14 +1198,20 @@ mod tests {
             at("14:04:50"),
             Price::from_ticks(700_990_000).unwrap(),
             Price::from_ticks(701_010_000).unwrap(),
-            Shares::whole(1).unwrap(),
-            Shares::whole(1).unwrap(),
+            Shares::whole(300).unwrap(),
+            Shares::whole(40).unwrap(),
         )
         .unwrap();
         for (quote, expected) in [
             (
                 Some(quoted),
-                serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:50Z", "bid": 700_990_000, "ask": 701_010_000}}),
+                serde_json::json!({"quoted": {
+                    "quoted_at": "2026-10-07T14:04:50Z",
+                    "bid": 700_990_000,
+                    "ask": 701_010_000,
+                    "bid_size": 300_000_000,
+                    "ask_size": 40_000_000
+                }}),
             ),
             (
                 None,
@@ -1248,7 +1285,13 @@ mod tests {
                 ),
                 (
                     serde_json::json!("AAPL"),
-                    serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:40Z", "bid": 250_000_000, "ask": 250_020_000}})
+                    serde_json::json!({"quoted": {
+                        "quoted_at": "2026-10-07T14:04:40Z",
+                        "bid": 250_000_000,
+                        "ask": 250_020_000,
+                        "bid_size": 1_000_000,
+                        "ask_size": 1_000_000
+                    }})
                 ),
             ]
         );
@@ -2606,6 +2649,281 @@ mod tests {
         );
         proptest::prop_assert_eq!(live_seen, replayed_seen);
         Ok(())
+    }
+
+    /// The kinds of message a swarm tape may hold; each case draws which are on, so some cases hold one kind alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+    enum TapeKind {
+        TwoSided,
+        OneSided,
+        Crossed,
+        Trade,
+        /// A correction, which only the stream sends and nothing here reads.
+        Unread,
+    }
+
+    /// One message of a synthetic tape, with where the stream ends its frame and the raw tee its page after it.
+    #[derive(Debug, Clone)]
+    struct Tick {
+        kind: TapeKind,
+        is_spy: bool,
+        nanoseconds_after_14: i64,
+        /// The bid of a quote, or the price of a trade.
+        cents: i64,
+        width_cents: i64,
+        bid_size: u64,
+        ask_size: u64,
+        bid_side: bool,
+        ends_frame: bool,
+        ends_page: bool,
+    }
+
+    impl Tick {
+        fn ticker(&self) -> &'static str {
+            match self.is_spy {
+                true => "SPY",
+                false => "QQQ",
+            }
+        }
+
+        /// The row as the raw tee files it under its ticker; the stream sends it with its kind and ticker added.
+        fn row(&self, index: usize) -> serde_json::Value {
+            let stamp = (at("14:00:00") + TimeDelta::nanoseconds(self.nanoseconds_after_14))
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+            let dollars = |cents: i64| cents as f64 / 100.0;
+            let (bid, ask) = match self.kind {
+                TapeKind::TwoSided => (self.cents, self.cents + self.width_cents),
+                TapeKind::Crossed => (self.cents + self.width_cents + 1, self.cents),
+                TapeKind::OneSided => match self.bid_side {
+                    true => (self.cents, 0),
+                    false => (0, self.cents),
+                },
+                TapeKind::Trade => {
+                    return serde_json::json!({
+                        "t": stamp, "x": "D", "p": dollars(self.cents), "s": self.bid_size,
+                        "c": ["@"], "z": "C", "i": index,
+                    });
+                }
+                TapeKind::Unread => {
+                    return serde_json::json!({
+                        "t": stamp, "x": "D", "oi": index, "op": dollars(self.cents), "os": 1, "oc": ["@"],
+                        "ci": index + 1, "cp": dollars(self.cents), "cs": 1, "cc": ["@"], "z": "C",
+                    });
+                }
+            };
+            serde_json::json!({
+                "t": stamp, "bx": "V", "bp": dollars(bid), "bs": self.bid_size,
+                "ax": "Q", "ap": dollars(ask), "as": self.ask_size, "c": ["R"], "z": "C",
+            })
+        }
+
+        /// The stream's kind letter, and the raw tee's family, `None` for a kind the tee never carries.
+        fn letter_and_family(&self) -> (&'static str, Option<&'static str>) {
+            match self.kind {
+                TapeKind::TwoSided | TapeKind::OneSided | TapeKind::Crossed => {
+                    ("q", Some("quotes"))
+                }
+                TapeKind::Trade => ("t", Some("trades")),
+                TapeKind::Unread => ("c", None),
+            }
+        }
+    }
+
+    /// The tape as the stream sends it: arrays of messages, split where a tick ends its frame.
+    fn stream_frames(tape: &[Tick]) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut frame = Vec::new();
+        for (index, tick) in tape.iter().enumerate() {
+            let mut message = tick.row(index);
+            message["T"] = serde_json::json!(tick.letter_and_family().0);
+            message["S"] = serde_json::json!(tick.ticker());
+            frame.push(message);
+            if tick.ends_frame || index + 1 == tape.len() {
+                frames.push(serde_json::Value::Array(std::mem::take(&mut frame)).to_string());
+            }
+        }
+        frames
+    }
+
+    /// The tape's `family` as the raw tee writes it gzipped: each ticker's rows in tape order, one page per line.
+    fn raw_tee(tape: &[Tick], family: &str) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut lines = Vec::new();
+        for ticker in ["SPY", "QQQ"] {
+            let mut rows = Vec::new();
+            let filed: Vec<(usize, &Tick)> = tape
+                .iter()
+                .enumerate()
+                .filter(|(_, tick)| {
+                    tick.ticker() == ticker && tick.letter_and_family().1 == Some(family)
+                })
+                .collect();
+            for (position, (index, tick)) in filed.iter().enumerate() {
+                rows.push(tick.row(*index));
+                if tick.ends_page || position + 1 == filed.len() {
+                    let page = serde_json::json!({
+                        family: {ticker: std::mem::take(&mut rows)},
+                        "next_page_token": null,
+                    });
+                    lines.push(page.to_string());
+                }
+            }
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(lines.join("\n").as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Ticks of the kinds a case turned on, packed within a microsecond, so stamps collide, or spread over five minutes.
+    fn any_swarm_tape() -> impl proptest::strategy::Strategy<Value = Vec<Tick>> {
+        use proptest::strategy::Strategy as _;
+        use strum::IntoEnumIterator as _;
+
+        let kinds = proptest::sample::subsequence(TapeKind::iter().collect::<Vec<_>>(), 1..=5);
+        let span = proptest::prop_oneof![
+            proptest::strategy::Just(1_000_i64),
+            proptest::strategy::Just(300_000_000_000_i64)
+        ];
+        (kinds, span).prop_flat_map(|(kinds, span)| {
+            let tick = (
+                proptest::sample::select(kinds),
+                proptest::bool::ANY,
+                0..span,
+                (1_000..1_010_i64, 0..3_i64),
+                (1..500_u64, 1..500_u64),
+                (
+                    proptest::bool::ANY,
+                    proptest::bool::ANY,
+                    proptest::bool::ANY,
+                ),
+            )
+                .prop_map(
+                    |(
+                        kind,
+                        is_spy,
+                        nanoseconds_after_14,
+                        (cents, width_cents),
+                        (bid_size, ask_size),
+                        (bid_side, ends_frame, ends_page),
+                    )| Tick {
+                        kind,
+                        is_spy,
+                        nanoseconds_after_14,
+                        cents,
+                        width_cents,
+                        bid_size,
+                        ask_size,
+                        bid_side,
+                        ends_frame,
+                        ends_page,
+                    },
+                );
+            proptest::collection::vec(tick, 0..60)
+        })
+    }
+
+    /// The tape streamed frame by frame into a live session that then decides, against the same tape read from the raw
+    /// tee and folded as the archive's quotes: the same latest quote per name, the decision carrying the replayed one,
+    /// and each name's trades read alike.
+    async fn streamed_and_replayed(
+        tape: Vec<Tick>,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        use crate::ingest::alpaca::stream::read_frame;
+        use crate::ingest::alpaca::{read_raw_quotes, read_raw_trades};
+
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let mut streamed_trades: BTreeMap<Symbol, Vec<AlpacaTradeOutcome>> = BTreeMap::new();
+        for frame in stream_frames(&tape) {
+            let messages = read_frame(&frame).unwrap();
+            for message in &messages {
+                if let StreamMessage::Trade(outcome @ AlpacaTradeOutcome::Print { print, .. }) =
+                    message
+                {
+                    streamed_trades
+                        .entry(print.symbol().clone())
+                        .or_default()
+                        .push(outcome.clone());
+                }
+            }
+            session.fold_streamed(streamed_quotes(messages));
+        }
+
+        let mut outcomes = Vec::new();
+        read_raw_quotes(&raw_tee(&tape, "quotes")[..], |outcome| {
+            outcomes.push(outcome)
+        })
+        .unwrap();
+        let replayed = quotes_folded(outcomes);
+        let mut replayed_trades: BTreeMap<Symbol, Vec<AlpacaTradeOutcome>> = BTreeMap::new();
+        read_raw_trades(&raw_tee(&tape, "trades")[..], |outcome| match &outcome {
+            AlpacaTradeOutcome::Print { print, .. } => replayed_trades
+                .entry(print.symbol().clone())
+                .or_default()
+                .push(outcome.clone()),
+            AlpacaTradeOutcome::Refused(row) => panic!("{row:?}"),
+        })
+        .unwrap();
+
+        let quoted: BTreeSet<&str> = tape
+            .iter()
+            .filter(|tick| tick.kind == TapeKind::TwoSided)
+            .map(Tick::ticker)
+            .collect();
+        let tickers =
+            |quotes: &BTreeMap<Symbol, crate::common::market::state::LastQuote>| -> Vec<String> {
+                quotes
+                    .keys()
+                    .map(|symbol| symbol.as_str().to_string())
+                    .collect()
+            };
+        proptest::prop_assert_eq!(tickers(replayed.quotes()), tickers(session.state.quotes()));
+        proptest::prop_assert_eq!(tickers(replayed.quotes()).len(), quoted.len());
+        proptest::prop_assert_eq!(replayed.quotes(), session.state.quotes());
+        proptest::prop_assert_eq!(
+            replayed_trades.keys().collect::<Vec<_>>(),
+            streamed_trades.keys().collect::<Vec<_>>()
+        );
+        proptest::prop_assert_eq!(&replayed_trades, &streamed_trades);
+
+        let (mut journal, directory) = journal();
+        let scripted = Scripted::default();
+        scripted.file(print("14:04:30", 701_000_000));
+        session
+            .advance(&|| at("14:05:02"), &scripted, &broker, &mut journal)
+            .await
+            .unwrap();
+        let kinds = journaled(&directory);
+        let submitted = payloads(&directory)[kinds
+            .iter()
+            .position(|kind| *kind == "order_submitted")
+            .unwrap()]["quote"]
+            .clone();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let expected = match replayed.quotes().get(&spy()) {
+            Some(quote) => serde_json::json!({"quoted": quote}),
+            None => serde_json::json!({"unquoted": {"cause": "none_folded"}}),
+        };
+        proptest::prop_assert_eq!(submitted, expected);
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// A swarm tape streamed live leaves the latest quotes, and the decision's quote, that the same tape replayed
+        /// from the raw tee leaves, whichever kinds of message the case holds and however its frames and pages split.
+        #[test]
+        fn property_live_and_replay_fold_the_same_quotes(tape in any_swarm_tape()) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(streamed_and_replayed(tape))?;
+        }
     }
 
     proptest::proptest! {

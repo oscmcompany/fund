@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -17,6 +18,7 @@ use fund::common::journal::{Observation, SessionOpened};
 use fund::common::market::record::BarInterval;
 use fund::common::market::state::MarketState;
 use fund::common::market::{Price, Symbol};
+use fund::common::monoid::Monoid;
 use fund::common::playbook::{Playbook, PlaybookRead, PlaybookRefusal, Played};
 use fund::common::standing::{HaltCause, SessionClosed, SessionEnding};
 use fund::common::storage::{ConfigurationKey, Host, Key, ObjectKey, Provider, Service, TradesKey};
@@ -29,7 +31,9 @@ use fund::records::{RefusedToStart, resolved, ship_logged, start};
 use fund::storage::reference::{SnapshotError, latest_conditions};
 use fund::storage::{Bucket, BucketError, parquet, trade_bars};
 use fund::trader::parameters::Parameters;
-use fund::trader::{DecisionInterval, Session, SessionError, Standing, last_closes, resumed, warm};
+use fund::trader::{
+    DecisionInterval, Session, SessionError, Standing, last_closes, resumed, streamed_quotes, warm,
+};
 
 const SERVICE: &str = "trader";
 /// Calendar days read back for the previous session, past any run of holidays and a weekend.
@@ -37,6 +41,8 @@ const CALENDAR_DAYS_BACK: i64 = 14;
 /// How long past the close a run waits for the last minutes to be built before it reads the book regardless.
 const CLOSE_GRACE: TimeDelta = TimeDelta::minutes(5);
 const TICK: Duration = Duration::from_secs(1);
+/// How long after the quote stream stops or refuses it is opened again.
+const RECONNECT_WAIT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -258,12 +264,13 @@ async fn trade(
         .await
         .map_err(refused)?;
     let http_client = reqwest::Client::new();
-    let (tape, account) = match (
+    let (tape, account, streaming) = match (
+        Alpaca::from_environment(http_client.clone()),
         Alpaca::from_environment(http_client.clone()),
         Alpaca::from_environment(http_client),
     ) {
-        (Ok(tape), Ok(account)) => (tape, account),
-        (Err(refusal), _) | (_, Err(refusal)) => {
+        (Ok(tape), Ok(account), Ok(streaming)) => (tape, account, streaming),
+        (Err(refusal), _, _) | (_, Err(refusal), _) | (_, _, Err(refusal)) => {
             return Err(refused(StartRefusal::Alpaca(refusal)));
         }
     };
@@ -337,6 +344,12 @@ async fn trade(
         "Session opened"
     );
     sleep_until(open).await;
+    let streamed = Arc::new(Mutex::new(MarketState::empty()));
+    let streaming = tokio::spawn(stream_quotes(
+        streaming,
+        symbols.iter().cloned().collect(),
+        Arc::clone(&streamed),
+    ));
     let mut session = Session::new(
         strategy,
         parameters.settings(),
@@ -353,46 +366,55 @@ async fn trade(
     let mut ticks = tokio::time::interval(TICK);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let deadline = close + CLOSE_GRACE;
-    loop {
-        ticks.tick().await;
-        let now = Utc::now();
-        let remaining = (deadline - now)
-            .to_std()
-            .ok()
-            .filter(|remaining| !remaining.is_zero());
-        // Nothing is decided once the clock is past the close, so bounding a later advance cuts off only its reads.
-        let advanced = match (remaining, now >= close) {
-            (None, _) => None,
-            (Some(_), false) => Some(session.advance(&Utc::now, &tape, &broker, journal).await),
-            (Some(remaining), true) => tokio::time::timeout(
-                remaining,
-                session.advance(&Utc::now, &tape, &broker, journal),
-            )
-            .await
-            .ok(),
-        };
-        let Some(advanced) = advanced else {
-            tracing::warn!(%close, "Last minutes not built by the close grace");
-            break;
-        };
-        if let Err(error) = advanced {
-            return Err(Stopped::Trading(TradingStop::Session(error)));
+    // The stream is stopped on every way out of the session, so it never outlives the trading it feeds.
+    let ran = async {
+        loop {
+            ticks.tick().await;
+            session.fold_streamed(std::mem::take(
+                &mut *streamed.lock().unwrap_or_else(PoisonError::into_inner),
+            ));
+            let now = Utc::now();
+            let remaining = (deadline - now)
+                .to_std()
+                .ok()
+                .filter(|remaining| !remaining.is_zero());
+            // Nothing is decided once the clock is past the close, so bounding a later advance cuts off only its reads.
+            let advanced = match (remaining, now >= close) {
+                (None, _) => None,
+                (Some(_), false) => Some(session.advance(&Utc::now, &tape, &broker, journal).await),
+                (Some(remaining), true) => tokio::time::timeout(
+                    remaining,
+                    session.advance(&Utc::now, &tape, &broker, journal),
+                )
+                .await
+                .ok(),
+            };
+            let Some(advanced) = advanced else {
+                tracing::warn!(%close, "Last minutes not built by the close grace");
+                break;
+            };
+            if let Err(error) = advanced {
+                return Err(Stopped::Trading(TradingStop::Session(error)));
+            }
+            match session.standing() {
+                Standing::Trading => {}
+                Standing::Halted(cause) => return Ok(Ran::Halted(cause.clone())),
+            }
+            if session.built_through_close() {
+                break;
+            }
         }
-        match session.standing() {
-            Standing::Trading => {}
-            Standing::Halted(cause) => return Ok(Ran::Halted(cause.clone())),
-        }
-        if session.built_through_close() {
-            break;
+        match broker.book().await {
+            Ok(held) if held.positions().is_empty() => Ok(Ran::ToTheClose),
+            Ok(held) => Ok(Ran::HeldAtTheClose {
+                positions: held.positions().len(),
+            }),
+            Err(error) => Err(Stopped::Trading(TradingStop::Book(error))),
         }
     }
-    match broker.book().await {
-        Ok(held) if held.positions().is_empty() => Ok(Ran::ToTheClose),
-        Ok(held) => Ok(Ran::HeldAtTheClose {
-            positions: held.positions().len(),
-        }),
-        Err(error) => Err(Stopped::Trading(TradingStop::Book(error))),
-    }
+    .await;
+    streaming.abort();
+    ran
 }
 
 /// The previous session's one-minute trade bars of `symbols` as the archive derived them, folded into a state beside
@@ -427,6 +449,33 @@ async fn previous_bars(
         .collect();
     let closes = last_closes(&bars);
     Ok((warm(bars, symbols, decision), closes))
+}
+
+/// Folds each quote the SIP stream sends for `symbols` into `streamed`, connecting again `RECONNECT_WAIT` after the
+/// stream stops or refuses, for as long as the run lasts.
+async fn stream_quotes(alpaca: Alpaca, symbols: Vec<Symbol>, streamed: Arc<Mutex<MarketState>>) {
+    loop {
+        match alpaca.stream(&symbols, &[]).await {
+            Ok(mut stream) => {
+                tracing::info!(symbols = symbols.len(), "Quote stream subscribed");
+                loop {
+                    match stream.next().await {
+                        Ok(messages) => {
+                            let folded = streamed_quotes(messages);
+                            let mut held = streamed.lock().unwrap_or_else(PoisonError::into_inner);
+                            *held = std::mem::take(&mut *held).combine(folded);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Quote stream stopped");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "Quote stream not opened"),
+        }
+        tokio::time::sleep(RECONNECT_WAIT).await;
+    }
 }
 
 /// Waits for `instant`, returning at once when it has passed.

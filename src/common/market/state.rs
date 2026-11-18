@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::record::{BarInterval, Quote, QuoteRefusal};
 use super::trade_bars::TradeBar;
-use super::{Price, StampedPrice, Symbol};
+use super::{Price, Shares, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
 
 /// The latest bars a state keeps for each symbol and interval.
@@ -25,13 +25,15 @@ pub enum MarketEvent {
 }
 
 /// A symbol's latest quote as a state holds it, its bid never above its ask; ordered by when it was quoted first, so a
-/// combine keeps the latest and breaks a tie on the sides.
+/// combine keeps the latest and breaks a tie on the sides and then the sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedLastQuote")]
 pub struct LastQuote {
     quoted_at: DateTime<Utc>,
     bid: Price,
     ask: Price,
+    bid_size: Shares,
+    ask_size: Shares,
 }
 
 /// A `LastQuote` as read, before its sides are checked.
@@ -40,6 +42,8 @@ struct UncheckedLastQuote {
     quoted_at: DateTime<Utc>,
     bid: Price,
     ask: Price,
+    bid_size: Shares,
+    ask_size: Shares,
 }
 
 impl TryFrom<UncheckedLastQuote> for LastQuote {
@@ -51,6 +55,8 @@ impl TryFrom<UncheckedLastQuote> for LastQuote {
             quoted_at: unchecked.quoted_at,
             bid: unchecked.bid,
             ask: unchecked.ask,
+            bid_size: unchecked.bid_size,
+            ask_size: unchecked.ask_size,
         })
     }
 }
@@ -61,7 +67,17 @@ impl LastQuote {
             quoted_at: quote.timestamp(),
             bid: quote.bid(),
             ask: quote.ask(),
+            bid_size: quote.bid_size(),
+            ask_size: quote.ask_size(),
         }
+    }
+
+    pub fn bid_size(self) -> Shares {
+        self.bid_size
+    }
+
+    pub fn ask_size(self) -> Shares {
+        self.ask_size
     }
 
     pub fn quoted_at(self) -> DateTime<Utc> {
@@ -463,15 +479,20 @@ mod tests {
         }
     }
 
-    /// A quote `minute` minutes after the session's 13:30 UTC open, its sides in ticks.
-    fn quote(raw: &str, minute: i64, bid: i64, ask: i64) -> Quote {
+    /// A quote `minute` minutes after the session's 13:30 UTC open, its sides in ticks and its sizes in whole shares.
+    fn quote(
+        raw: &str,
+        minute: i64,
+        (bid, ask): (i64, i64),
+        (bid_size, ask_size): (u64, u64),
+    ) -> Quote {
         Quote::new(
             symbol(raw),
             "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute),
             Price::from_ticks(bid).unwrap(),
             Price::from_ticks(ask).unwrap(),
-            Shares::whole(1).unwrap(),
-            Shares::whole(1).unwrap(),
+            Shares::whole(bid_size).unwrap(),
+            Shares::whole(ask_size).unwrap(),
         )
         .unwrap()
     }
@@ -479,18 +500,26 @@ mod tests {
     /// A symbol keeps its latest quote whatever order the quotes arrive in, and a symbol never quoted has none.
     #[test]
     fn test_a_symbol_keeps_its_latest_quote() {
-        let early = MarketEvent::Quote(quote("AAPL", 1, 1_000_000, 1_010_000));
-        let late = MarketEvent::Quote(quote("AAPL", 2, 1_020_000, 1_030_000));
+        let early = MarketEvent::Quote(quote("AAPL", 1, (1_000_000, 1_010_000), (500, 600)));
+        let late = MarketEvent::Quote(quote("AAPL", 2, (1_020_000, 1_030_000), (300, 400)));
         for events in [[early.clone(), late.clone()], [late, early]] {
             let state = fold(events);
             assert_eq!(state.quotes().keys().collect::<Vec<_>>(), [&symbol("AAPL")]);
             let kept = state.quotes()[&symbol("AAPL")];
             assert_eq!(
-                (kept.quoted_at(), kept.bid().ticks(), kept.ask().ticks()),
+                (
+                    kept.quoted_at(),
+                    kept.bid().ticks(),
+                    kept.ask().ticks(),
+                    kept.bid_size().units(),
+                    kept.ask_size().units()
+                ),
                 (
                     "2026-09-25T13:32:00Z".parse::<DateTime<Utc>>().unwrap(),
                     1_020_000,
-                    1_030_000
+                    1_030_000,
+                    300_000_000,
+                    400_000_000
                 )
             );
         }
@@ -518,8 +547,8 @@ mod tests {
                 .prop_map(|(raw, minute, close, volume)| MarketEvent::Trades(minute_trade_bar(raw, minute, close, volume))),
             2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_u64..1_000)
                 .prop_map(|(raw, day, close, volume)| MarketEvent::Trades(daily_bar(raw, day, close, volume))),
-            2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_i64..3)
-                .prop_map(|(raw, minute, bid, width)| MarketEvent::Quote(quote(raw, minute, bid, bid + width))),
+            2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_i64..3, (1_u64..3, 1_u64..3))
+                .prop_map(|(raw, minute, bid, width, sizes)| MarketEvent::Quote(quote(raw, minute, (bid, bid + width), sizes))),
             1 => (0_i64..1_000).prop_map(|minute| MarketEvent::Clock(session().regular_close() + TimeDelta::minutes(minute))),
         ]
     }

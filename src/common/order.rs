@@ -792,7 +792,7 @@ mod tests {
             (
                 Some(LastQuote::of(&quote)),
                 format!(
-                    r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670000000,"ask":670010000}}}}}}"#
+                    r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670000000,"ask":670010000,"bid_size":1000000,"ask_size":2000000}}}}}}"#
                 ),
             ),
             (
@@ -808,7 +808,7 @@ mod tests {
             );
         }
         let crossed = format!(
-            r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670010001,"ask":670010000}}}}}}"#
+            r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670010001,"ask":670010000,"bid_size":1000000,"ask_size":2000000}}}}}}"#
         );
         assert!(serde_json::from_str::<OrderSubmitted>(&crossed).is_err());
     }
