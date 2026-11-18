@@ -1,5 +1,5 @@
 //! What `snapshot` refuses against a scratch repository: anything not public on `origin/master` exits 3, names its
-//! reason and writes nothing, while a public target passes the check.
+//! reason and writes nothing, while a public target renders from its published bytes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,7 +59,7 @@ impl Scratch {
         write(
             &repository,
             "tests/fixtures/sample.csv",
-            "name,value\na,1\n",
+            "name,note\na,\"one, two\"\nb,\"line\r\nbreak\"\nc,beyond\n",
         );
         git(&repository, &["add", "."]);
         git(&repository, &["commit", "--quiet", "-m", "Public"]);
@@ -184,16 +184,85 @@ fn ignores_a_local_branch_named_origin_master() {
     scratch.assert_refused(&["commit", &scratch.unpublished], "not on origin/master");
 }
 
+/// Stand-ins for `freeze` and `resvg`: the first requires the theme, edits the working copy as a race would, then
+/// copies its source to the output, so the PNG holds exactly the bytes the script chose to render.
+const FREEZE: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+  case "$1" in
+  -c) theme="$2"; shift 2 ;;
+  -o) output="$2"; shift 2 ;;
+  --lines | --language) shift 2 ;;
+  *) source="$1"; shift ;;
+  esac
+done
+[[ -f "${theme}" ]]
+printf 'unpublished\n' >src/public.rs
+cp "${source}" "${output}"
+"#;
+const RESVG: &str = "#!/usr/bin/env bash\ncp \"${@: -2:1}\" \"${@: -1}\"\n";
+
 #[test]
-fn passes_public_targets_through_the_check() {
+fn renders_the_published_bytes_of_each_public_target() {
     let scratch = Scratch::new();
-    for arguments in [
-        vec!["code", "src/public.rs:1-1"],
-        vec!["data", "tests/fixtures/sample.csv", "5"],
-        vec!["commit", scratch.published.as_str()],
-    ] {
-        let (code, stderr) = scratch.run(&arguments);
-        assert_ne!(code, 3, "{arguments:?}: {stderr}");
-        assert!(!stderr.contains("Refused"), "{arguments:?}: {stderr}");
+    let stubs = scratch.repository.join(".stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    for (name, body) in [("freeze", FREEZE), ("resvg", RESVG)] {
+        let stub = stubs.join(name);
+        std::fs::write(&stub, body).unwrap();
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
     }
+    // A user's DuckDB settings must not reach the rendered table.
+    std::fs::write(stubs.join(".duckdbrc"), ".timer on\n").unwrap();
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let snapshots = scratch
+        .repository
+        .canonicalize()
+        .unwrap()
+        .join(".scratchpad/snapshots");
+    let render = |arguments: &[&str], name: &str| -> String {
+        let output = isolated(script())
+            .current_dir(&scratch.repository)
+            .env("PATH", &path)
+            .env("SNAPSHOT_FONTS", &stubs)
+            .env("HOME", &stubs)
+            .args(arguments)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{arguments:?}: {stderr}");
+        let printed = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(printed.trim(), snapshots.join(name).to_str().unwrap());
+        std::fs::read_to_string(snapshots.join(name)).unwrap()
+    };
+
+    assert_eq!(
+        render(&["code", "src/public.rs:1-1"], "public.rs-1-1.png"),
+        "fn main() {}\n"
+    );
+    let table = render(&["data", "tests/fixtures/sample.csv", "2"], "sample.png");
+    let lines: Vec<&str> = table.lines().map(str::trim_end).collect();
+    assert_eq!(lines.len(), 4, "{table}");
+    assert_eq!(
+        lines[0].split_whitespace().collect::<Vec<_>>(),
+        ["name", "note"]
+    );
+    assert!(
+        lines[2].starts_with('a') && lines[2].ends_with(" one, two"),
+        "{table}"
+    );
+    assert!(
+        lines[3].starts_with('b') && lines[3].ends_with(" line break"),
+        "{table}"
+    );
+    let commit = render(
+        &["commit", &scratch.published],
+        &format!("commit-{}.png", &scratch.published[..8]),
+    );
+    assert!(commit.contains("Public"), "{commit}");
 }

@@ -22,7 +22,8 @@ refuse() {
 # The remote-tracking ref in full, so a local branch named origin/master cannot shadow it.
 published=refs/remotes/origin/master
 
-# A path is public when origin/master holds it as a regular file and the working copy is byte-identical to it.
+# A path is public when origin/master holds it as a regular file and the working copy is byte-identical to it. The
+# published blob is copied to ${checked} and that copy is what renders, so a later edit to the working copy cannot leak.
 require_public_file() {
   local path="$1" entry mode object name
   entry="$(git ls-tree "${published}" -- "${path}")" || refuse "${path}" "origin/master could not be read"
@@ -35,6 +36,9 @@ require_public_file() {
   [[ "${mode}" == 100644 || "${mode}" == 100755 ]] || refuse "${path}" "not a regular file on origin/master"
   [[ -f "${path}" && ! -L "${path}" && "$(git hash-object --no-filters -- "${path}")" == "${object}" ]] ||
     refuse "${path}" "differs from origin/master"
+  checked="${work}/published/$(basename "${path}")"
+  mkdir -p "$(dirname "${checked}")"
+  git cat-file blob "${object}" >"${checked}"
 }
 
 render() {
@@ -43,7 +47,7 @@ render() {
   local output="${repository}/.scratchpad/snapshots/${name}.png"
   mkdir -p "$(dirname "${output}")"
   # freeze's own PNG export hangs on a hard shadow, so it writes an SVG and resvg rasterizes it with the pinned font.
-  freeze -c "${repository}/tools/snapshot.json" "$@" -o "${work}/snapshot.svg" "${source}" </dev/null >/dev/null ||
+  freeze -c "${theme}" "$@" -o "${work}/snapshot.svg" "${source}" </dev/null >/dev/null ||
     exit 1
   if ! resvg --zoom 2 --skip-system-fonts --use-fonts-dir "${SNAPSHOT_FONTS:?the font directory devenv sets}" \
     "${work}/snapshot.svg" "${output}" 2>"${work}/resvg.log"; then
@@ -53,6 +57,7 @@ render() {
   echo "${output}"
 }
 
+theme="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/snapshot.json"
 repository="$(git rev-parse --show-toplevel)"
 cd "${repository}"
 work="$(mktemp -d)"
@@ -69,14 +74,22 @@ code)
   end="${BASH_REMATCH[3]}"
   ((start >= 1 && start <= end)) || refuse "${target}" "the line range is empty"
   require_public_file "${path}"
-  render "${path}" "$(basename "${path}")-${start}-${end}" --lines "${start},${end}"
+  render "${checked}" "$(basename "${path}")-${start}-${end}" --lines "${start},${end}"
   ;;
 data)
   rows="${3:-10}"
   [[ "${target}" == *.csv ]] || refuse "${target}" "not a CSV file"
   [[ "${rows}" =~ ^[1-9][0-9]*$ ]] || usage
   require_public_file "${target}"
-  head -n "$((rows + 1))" "${target}" | column -s, -t >"${work}/table.txt"
+  # DuckDB keeps a quoted comma or line break inside its field, and breaks are flattened so the table stays aligned;
+  # -init /dev/null skips ~/.duckdbrc, whose settings (a timer, a mode) would otherwise print into the image.
+  cp "${checked}" "${work}/table.csv"
+  duckdb -init /dev/null -c ".mode column" -c "SELECT regexp_replace(coalesce(COLUMNS(*), ''), '[\r\n\t]+', ' ', 'g')
+    FROM read_csv('${work}/table.csv', header = true, all_varchar = true, delim = ',', quote = '\"') LIMIT ${rows}" \
+    >"${work}/table.txt" 2>"${work}/duckdb.log" || {
+    cat "${work}/duckdb.log" >&2
+    exit 1
+  }
   render "${work}/table.txt" "$(basename "${target}" .csv)" --language text --show-line-numbers=false
   ;;
 commit)
