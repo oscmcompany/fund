@@ -10,6 +10,7 @@ use super::record::{BarInterval, Quote, QuoteRefusal};
 use super::trade_bars::TradeBar;
 use super::{Price, Shares, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
+use crate::common::order::{DecisionQuote, QuoteAbsence};
 
 /// The latest bars a state keeps for each symbol and interval.
 pub const RETAINED_BARS: usize = 100;
@@ -21,6 +22,11 @@ pub enum MarketEvent {
     Trades(TradeBar),
     /// A top-of-book quote, of which the state keeps each symbol's latest.
     Quote(Quote),
+    /// A quote missing a side, which leaves its symbol with no top of book until a two-sided quote at or after it.
+    OneSided {
+        symbol: Symbol,
+        quoted_at: DateTime<Utc>,
+    },
     Clock(DateTime<Utc>),
 }
 
@@ -144,6 +150,8 @@ pub struct MarketState {
     clock: Option<DateTime<Utc>>,
     series: BTreeMap<(Symbol, BarInterval), BTreeMap<DateTime<Utc>, Retained>>,
     quotes: BTreeMap<Symbol, LastQuote>,
+    /// Each symbol's latest one-sided quote, which outdates any two-sided quote before it.
+    one_sided: BTreeMap<Symbol, DateTime<Utc>>,
 }
 
 impl MarketState {
@@ -156,6 +164,10 @@ impl MarketState {
             },
             MarketEvent::Quote(quote) => Self {
                 quotes: BTreeMap::from([(quote.symbol().clone(), LastQuote::of(&quote))]),
+                ..Self::default()
+            },
+            MarketEvent::OneSided { symbol, quoted_at } => Self {
+                one_sided: BTreeMap::from([(symbol, quoted_at)]),
                 ..Self::default()
             },
             MarketEvent::Trades(bar) => Self::retaining(
@@ -227,9 +239,28 @@ impl MarketState {
             .collect()
     }
 
-    /// Each symbol's latest quote; a symbol is absent only when none of its quotes was folded.
+    /// Each symbol's latest two-sided quote; a symbol is absent only when none of its two-sided quotes was folded.
+    #[cfg(test)]
     pub fn quotes(&self) -> &BTreeMap<Symbol, LastQuote> {
         &self.quotes
+    }
+
+    /// The symbol's top of book: its latest two-sided quote, unless a one-sided quote came after it.
+    pub fn decision_quote(&self, symbol: &Symbol) -> DecisionQuote {
+        match (self.quotes.get(symbol), self.one_sided.get(symbol)) {
+            (Some(quote), Some(one_sided)) if *one_sided > quote.quoted_at() => {
+                DecisionQuote::OneSided {
+                    quoted_at: *one_sided,
+                }
+            }
+            (Some(quote), _) => DecisionQuote::Quoted(*quote),
+            (None, Some(one_sided)) => DecisionQuote::OneSided {
+                quoted_at: *one_sided,
+            },
+            (None, None) => DecisionQuote::Unquoted {
+                cause: QuoteAbsence::NoneFolded,
+            },
+        }
     }
 
     fn bars(
@@ -264,6 +295,12 @@ impl Monoid for MarketState {
                 .entry(symbol)
                 .and_modify(|kept| *kept = (*kept).max(quote))
                 .or_insert(quote);
+        }
+        for (symbol, quoted_at) in other.one_sided {
+            self.one_sided
+                .entry(symbol)
+                .and_modify(|kept| *kept = (*kept).max(quoted_at))
+                .or_insert(quoted_at);
         }
         self
     }
@@ -525,6 +562,49 @@ mod tests {
         }
     }
 
+    /// A one-sided quote `minute` minutes after the session's 13:30 UTC open.
+    fn one_sided(raw: &str, minute: i64) -> MarketEvent {
+        MarketEvent::OneSided {
+            symbol: symbol(raw),
+            quoted_at: "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap()
+                + TimeDelta::minutes(minute),
+        }
+    }
+
+    /// A one-sided quote after a symbol's two-sided one leaves it with no top of book, one at or before it leaves the
+    /// two-sided quote standing, whatever order they arrive in, and a symbol never quoted holds none.
+    #[test]
+    fn test_a_later_one_sided_quote_outdates_the_top_of_book() {
+        let two_sided = quote("AAPL", 2, (1_000_000, 1_010_000), (5, 6));
+        let quoted = DecisionQuote::Quoted(LastQuote::of(&two_sided));
+        let at = |minute: i64| {
+            "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute)
+        };
+        for (minute, expected) in [
+            (1, quoted),
+            (2, quoted),
+            (3, DecisionQuote::OneSided { quoted_at: at(3) }),
+        ] {
+            let events = [
+                MarketEvent::Quote(two_sided.clone()),
+                one_sided("AAPL", minute),
+            ];
+            for state in [fold(events.clone()), fold(events.into_iter().rev())] {
+                assert_eq!(state.decision_quote(&symbol("AAPL")), expected, "{minute}");
+            }
+        }
+        assert_eq!(
+            fold([one_sided("AAPL", 3)]).decision_quote(&symbol("AAPL")),
+            DecisionQuote::OneSided { quoted_at: at(3) }
+        );
+        assert_eq!(
+            fold([one_sided("AAPL", 3)]).decision_quote(&symbol("MSFT")),
+            DecisionQuote::Unquoted {
+                cause: QuoteAbsence::NoneFolded
+            }
+        );
+    }
+
     /// The clock is the latest reported, whatever order the reports arrive in.
     #[test]
     fn test_the_clock_is_the_latest_reported() {
@@ -549,6 +629,8 @@ mod tests {
                 .prop_map(|(raw, day, close, volume)| MarketEvent::Trades(daily_bar(raw, day, close, volume))),
             2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_i64..3, (1_u64..3, 1_u64..3))
                 .prop_map(|(raw, minute, bid, width, sizes)| MarketEvent::Quote(quote(raw, minute, (bid, bid + width), sizes))),
+            1 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5)
+                .prop_map(|(raw, minute)| one_sided(raw, minute)),
             1 => (0_i64..1_000).prop_map(|minute| MarketEvent::Clock(session().regular_close() + TimeDelta::minutes(minute))),
         ]
     }
@@ -612,6 +694,7 @@ mod tests {
                 .map(|event| match event {
                     MarketEvent::Trades(bar) => bar.timestamp(),
                     MarketEvent::Quote(quote) => quote.timestamp(),
+                    MarketEvent::OneSided { quoted_at, .. } => *quoted_at,
                     MarketEvent::Clock(instant) => *instant,
                 })
                 .collect();

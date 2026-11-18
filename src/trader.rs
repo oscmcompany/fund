@@ -326,13 +326,15 @@ impl<S: Strategy> Session<S> {
         self.built_through >= self.close
     }
 
-    /// Builds every minute whose wait has passed by the clock, and once a decision bar is built, trades the book toward
-    /// the strategy's target within the limits and reconciles it with the broker's; then reads again each built minute
-    /// due a recheck. A late call decides once, for the latest bar built, rather than for each it passed.
+    /// Builds every minute whose wait has passed by the clock, folds in what `streamed` hands over, and once a decision
+    /// bar is built, trades the book toward the strategy's target within the limits and reconciles it with the broker's;
+    /// then reads again each built minute due a recheck. A late call decides once, for the latest bar built, rather than
+    /// for each it passed.
     pub async fn advance(
         &mut self,
         clock: &impl Fn() -> DateTime<Utc>,
         tape: &impl MinuteTape,
+        streamed: &impl Fn() -> MarketState,
         broker: &impl Broker,
         journal: &mut Journal,
     ) -> Result<(), SessionError> {
@@ -342,6 +344,7 @@ impl<S: Strategy> Session<S> {
         // Building awaits REST, so the decision reads the clock again rather than trusting the instant it began at.
         let now = clock();
         self.fold_in(MarketEvent::Clock(now));
+        self.fold_streamed(streamed());
         let decided = self.decide(now, broker, journal).await;
         self.recheck(clock(), tape).await;
         decided
@@ -548,7 +551,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             solution.target(),
             &prices,
-            self.state.quotes(),
+            &self.state,
             self.settings.limits.per_name(),
             self.settings.patience,
         )
@@ -570,7 +573,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             rounding_allowance(&self.fills),
             &prices,
-            self.state.quotes(),
+            &self.state,
             self.settings.limits.per_name(),
             self.settings.patience,
         )
@@ -641,7 +644,7 @@ impl<S: Strategy> Session<S> {
     }
 
     /// Folds in a state built apart from the session, such as the quotes streamed since the last call.
-    pub fn fold_streamed(&mut self, streamed: MarketState) {
+    fn fold_streamed(&mut self, streamed: MarketState) {
         let state = std::mem::take(&mut self.state);
         self.state = state.combine(streamed);
     }
@@ -704,12 +707,17 @@ pub fn last_closes(bars: &[TradeBar]) -> BTreeMap<Symbol, Price> {
         .collect()
 }
 
-/// The two-sided quotes among `outcomes` folded into a state, as the live stream and the archive's quotes both fold; a
-/// one-sided quote is no top of book and leaves its symbol's last, and a refused row is logged.
+/// The quotes among `outcomes` folded into a state, as the live stream and the archive's quotes both fold; a one-sided
+/// quote leaves its symbol with no top of book until the next two-sided one, and a refused row is logged.
 pub fn quotes_folded(outcomes: impl IntoIterator<Item = AlpacaQuoteOutcome>) -> MarketState {
     concatenate(outcomes.into_iter().filter_map(|outcome| match outcome {
         AlpacaQuoteOutcome::Quote { quote, .. } => Some(MarketState::of(MarketEvent::Quote(quote))),
-        AlpacaQuoteOutcome::OneSided { .. } => None,
+        AlpacaQuoteOutcome::OneSided { quote, .. } => {
+            Some(MarketState::of(MarketEvent::OneSided {
+                symbol: quote.symbol,
+                quoted_at: quote.timestamp,
+            }))
+        }
         AlpacaQuoteOutcome::Refused(row) => {
             tracing::warn!(?row, "Quote refused");
             None
@@ -1148,18 +1156,36 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:01:10", 700_000_000));
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:03:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:01"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:01"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1182,7 +1208,13 @@ mod tests {
         );
         assert_eq!(session.standing(), &Standing::Trading);
         session
-            .advance(&|| at("14:09:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:09:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory).len(), 8);
@@ -1228,7 +1260,13 @@ mod tests {
             let tape = Scripted::default();
             tape.file(print("14:04:30", 701_000_000));
             session
-                .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+                .advance(
+                    &|| at("14:05:02"),
+                    &tape,
+                    &MarketState::empty,
+                    &broker,
+                    &mut journal,
+                )
                 .await
                 .unwrap();
             let kinds = journaled(&directory);
@@ -1239,6 +1277,79 @@ mod tests {
             assert_eq!(submitted["quote"], expected);
             std::fs::remove_dir_all(&directory).unwrap();
         }
+    }
+
+    /// A tape that streams `quote` into `streamed` while each minute read is pending, as the stream does during a slow read.
+    struct QuotingWhileRead<'a> {
+        tape: Scripted,
+        streamed: &'a Mutex<MarketState>,
+        quote: Quote,
+    }
+
+    impl MinuteTape for QuotingWhileRead<'_> {
+        async fn trades_between(
+            &self,
+            symbols: &[Symbol],
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
+        ) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
+            {
+                let mut streamed = self.streamed.lock().unwrap();
+                *streamed = std::mem::take(&mut *streamed)
+                    .combine(MarketState::of(MarketEvent::Quote(self.quote.clone())));
+            }
+            self.tape.trades_between(symbols, start, end).await
+        }
+    }
+
+    /// A quote streamed while the minute reads are pending reaches the decision those reads end in.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_quote_streamed_during_the_minute_reads_reaches_the_decision() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let streamed = Mutex::new(MarketState::empty());
+        let tape = QuotingWhileRead {
+            tape: Scripted::default(),
+            streamed: &streamed,
+            quote: Quote::new(
+                spy(),
+                at("14:05:01"),
+                Price::from_ticks(700_990_000).unwrap(),
+                Price::from_ticks(701_010_000).unwrap(),
+                Shares::whole(300).unwrap(),
+                Shares::whole(40).unwrap(),
+            )
+            .unwrap(),
+        };
+        tape.tape.file(print("14:04:30", 701_000_000));
+        let (mut journal, directory) = journal();
+        session
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &|| std::mem::take(&mut *streamed.lock().unwrap()),
+                &broker,
+                &mut journal,
+            )
+            .await
+            .unwrap();
+        let kinds = journaled(&directory);
+        let submitted = &payloads(&directory)[kinds
+            .iter()
+            .position(|kind| *kind == "order_submitted")
+            .unwrap()];
+        assert_eq!(
+            submitted["quote"],
+            serde_json::json!({"quoted": {
+                "quoted_at": "2026-10-07T14:05:01Z",
+                "bid": 700_990_000,
+                "ask": 701_010_000,
+                "bid_size": 300_000_000,
+                "ask_size": 40_000_000
+            }})
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// A holding the broker reports outside the session's book and target is closed at reconciliation, and the close's
@@ -1267,7 +1378,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let submitted: Vec<(serde_json::Value, serde_json::Value)> = journaled(&directory)
@@ -1310,7 +1427,13 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:05:01", 700_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1367,7 +1490,13 @@ mod tests {
         ] {
             tape.file(print(when, ticks));
             session
-                .advance(&|| at(decided), &tape, &broker, &mut journal)
+                .advance(
+                    &|| at(decided),
+                    &tape,
+                    &MarketState::empty,
+                    &broker,
+                    &mut journal,
+                )
                 .await
                 .unwrap();
         }
@@ -1433,7 +1562,13 @@ mod tests {
             *broker.ticks.lock().unwrap() = ticks;
             tape.file(print(when, ticks));
             first
-                .advance(&|| at(decided), &tape, &broker, &mut journal)
+                .advance(
+                    &|| at(decided),
+                    &tape,
+                    &MarketState::empty,
+                    &broker,
+                    &mut journal,
+                )
                 .await
                 .unwrap();
         }
@@ -1461,7 +1596,13 @@ mod tests {
         );
         tape.file(print("14:19:30", 800_000_000));
         second
-            .advance(&|| at("14:20:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:20:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let last: serde_json::Value = records(&directory)
@@ -1502,7 +1643,13 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:05:01", 700_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1528,7 +1675,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
@@ -1542,7 +1695,13 @@ mod tests {
         assert_eq!(journaled(&directory).last(), Some(&"session_halted"));
         tape.file(print("14:09:30", 701_000_000));
         session
-            .advance(&|| at("14:10:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:10:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(count(&directory, "target_decided"), 1);
@@ -1564,7 +1723,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:59", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(session.book.position(&spy()).units(), 1_000_000);
@@ -1582,7 +1747,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let Standing::Halted(HaltCause::Unresolved { client_order_id }) = session.standing() else {
@@ -1616,7 +1787,13 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
         tape.file(print("14:04:30", 701_000_000));
         let failed = session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
         assert!(matches!(
@@ -1636,7 +1813,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         let failed = session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await;
         assert!(matches!(
             failed,
@@ -1670,7 +1853,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let records = records(&directory);
@@ -1719,7 +1908,13 @@ mod tests {
         tape.file(print("14:04:30", 701_000_000));
         tape.file(print("14:10:01", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1729,7 +1924,13 @@ mod tests {
         assert_eq!(broker.filled.lock().unwrap().len(), 1);
         std::fs::remove_dir_all(&gone).unwrap();
         let failed = session
-            .advance(&|| at("14:10:02"), &tape, &broker, &mut refusing)
+            .advance(
+                &|| at("14:10:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut refusing,
+            )
             .await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
         assert!(matches!(
@@ -1884,7 +2085,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1914,7 +2121,13 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:01:40", 702_000_000));
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:03:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let payloads: Vec<serde_json::Value> = std::fs::read_dir(&directory)
@@ -1965,13 +2178,25 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:03:10", 700_000_000));
         session
-            .advance(&|| at("14:04:01"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:01"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), Vec::<&str>::new());
         assert_eq!(tape.times_asked("14:03:00", "14:04:00"), 0);
         session
-            .advance(&|| at("14:04:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -1990,7 +2215,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:00:10", 700_000_000));
         session
-            .advance(&|| at("14:02:59"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:02:59"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2001,7 +2232,13 @@ mod tests {
             (0, 0)
         );
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:03:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2015,7 +2252,13 @@ mod tests {
         // Its recheck comes `RECHECK_AFTER` after it was built, not in the same call that built it.
         for (now, asked) in [("14:04:59", 1), ("14:05:00", 2)] {
             session
-                .advance(&|| at(now), &tape, &broker, &mut journal)
+                .advance(
+                    &|| at(now),
+                    &tape,
+                    &MarketState::empty,
+                    &broker,
+                    &mut journal,
+                )
                 .await
                 .unwrap();
             assert_eq!(tape.times_asked("14:00:00", "14:01:00"), asked);
@@ -2041,12 +2284,24 @@ mod tests {
         tape.file(print("14:00:10", 700_000_000));
         tape.file(print("14:02:30", 700_000_000));
         session
-            .advance(&|| at("14:02:59"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:02:59"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(tape.times_asked("14:00:00", "14:01:00"), 0);
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:03:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(session.built_through, at("14:02:00"));
@@ -2072,7 +2327,13 @@ mod tests {
         tape.file(print("14:04:30", 701_000_000));
         tape.failing.lock().unwrap().insert(at("14:02:00"));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2080,7 +2341,13 @@ mod tests {
         assert_eq!(tape.times_asked("14:04:00", "14:05:00"), 0);
         tape.failing.lock().unwrap().clear();
         session
-            .advance(&|| at("14:05:03"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:03"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         // Failed, then read once; its recheck waits behind the older minutes'.
@@ -2104,7 +2371,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:01:10", 700_000_000));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:05"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2113,7 +2386,13 @@ mod tests {
         tape.file(print("14:02:30", 700_500_000));
         tape.file(print("14:03:30", 701_000_000));
         session
-            .advance(&|| at("14:04:06"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:06"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2136,7 +2415,13 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:03:30", 701_000_000));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:05"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "bar_built"]);
@@ -2157,7 +2442,13 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:05:00", 701_000_000));
         session
-            .advance(&|| at("14:06:05"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:06:05"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(session.built_through, at("14:06:00"));
@@ -2181,7 +2472,13 @@ mod tests {
             RowRefusal::Unrequested,
         )));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:05"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2201,7 +2498,13 @@ mod tests {
         tape.file(print("14:03:30", 701_000_000));
         tape.failing.lock().unwrap().insert(at("14:03:00"));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:04:05"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2227,13 +2530,25 @@ mod tests {
         tape.file(print("19:57:30", 701_000_000));
         tape.file(print("19:58:30", 701_000_000));
         session
-            .advance(&|| at("20:00:20"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("20:00:20"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert!(!session.built_through_close());
         tape.file(print("20:00:30", 701_000_000));
         session
-            .advance(&|| at("20:00:40"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("20:00:40"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert!(session.built_through_close());
@@ -2262,12 +2577,24 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("19:59:30", 701_000_000));
         session
-            .advance(&|| at("20:00:01"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("20:00:01"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert!(!session.built_through_close());
         session
-            .advance(&|| at("20:10:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("20:10:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert!(session.built_through_close());
@@ -2296,14 +2623,26 @@ mod tests {
         // The 19:55 decision bar's last minute fails until past the close, then the minute after it fails instead.
         tape.failing.lock().unwrap().insert(at("19:54:00"));
         session
-            .advance(&|| at("19:59:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("19:59:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert!(journaled(&directory).is_empty());
         tape.failing.lock().unwrap().clear();
         tape.failing.lock().unwrap().insert(at("19:56:00"));
         session
-            .advance(&|| at("20:00:30"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("20:00:30"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "bar_built"]);
@@ -2336,7 +2675,7 @@ mod tests {
             }
         };
         session
-            .advance(&clock, &tape, &broker, &mut journal)
+            .advance(&clock, &tape, &MarketState::empty, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "bar_built"]);
@@ -2357,7 +2696,7 @@ mod tests {
         let mut now = at("14:06:10");
         while now <= at("14:09:30") {
             session
-                .advance(&|| now, &tape, &broker, &mut journal)
+                .advance(&|| now, &tape, &MarketState::empty, &broker, &mut journal)
                 .await
                 .unwrap();
             asked.insert(now, tape.times_asked("14:05:00", "14:06:00"));
@@ -2381,7 +2720,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:09:30", 700_000_000));
         session
-            .advance(&|| at("14:10:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:10:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let reads = |tape: &Scripted| {
@@ -2394,7 +2739,13 @@ mod tests {
         };
         assert_eq!(reads(&tape), [2, 1, 1]);
         session
-            .advance(&|| at("14:10:01"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("14:10:01"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         assert_eq!(reads(&tape), [2, 2, 1]);
@@ -2463,7 +2814,13 @@ mod tests {
             tape.file(outcome);
         }
         session
-            .advance(&|| at("19:00:00"), &tape, &broker, &mut journal)
+            .advance(
+                &|| at("19:00:00"),
+                &tape,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let live: Vec<serde_json::Value> = records(&directory)
@@ -2584,7 +2941,13 @@ mod tests {
         }
         let (mut journal, directory) = journal();
         session
-            .advance(&|| at("14:35:02"), &scripted, &broker, &mut journal)
+            .advance(
+                &|| at("14:35:02"),
+                &scripted,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let live_bars: Vec<serde_json::Value> = payloads(&directory)
@@ -2829,6 +3192,7 @@ mod tests {
     async fn streamed_and_replayed(
         tape: Vec<Tick>,
     ) -> Result<(), proptest::test_runner::TestCaseError> {
+        use crate::common::order::DecisionQuote;
         use crate::ingest::alpaca::stream::read_frame;
         use crate::ingest::alpaca::{read_raw_quotes, read_raw_trades};
 
@@ -2882,6 +3246,23 @@ mod tests {
         proptest::prop_assert_eq!(tickers(replayed.quotes()), tickers(session.state.quotes()));
         proptest::prop_assert_eq!(tickers(replayed.quotes()).len(), quoted.len());
         proptest::prop_assert_eq!(replayed.quotes(), session.state.quotes());
+        for ticker in ["SPY", "QQQ"] {
+            let symbol = Symbol::new(ticker).unwrap();
+            let latest = |kind: TapeKind| {
+                tape.iter()
+                    .filter(|tick| tick.kind == kind && tick.ticker() == ticker)
+                    .map(|tick| tick.nanoseconds_after_14)
+                    .max()
+            };
+            let one_sided = match (latest(TapeKind::TwoSided), latest(TapeKind::OneSided)) {
+                (Some(two_sided), Some(one_sided)) => one_sided > two_sided,
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            let held = session.state.decision_quote(&symbol);
+            proptest::prop_assert_eq!(matches!(held, DecisionQuote::OneSided { .. }), one_sided);
+            proptest::prop_assert_eq!(replayed.decision_quote(&symbol), held);
+        }
         proptest::prop_assert_eq!(
             replayed_trades.keys().collect::<Vec<_>>(),
             streamed_trades.keys().collect::<Vec<_>>()
@@ -2892,7 +3273,13 @@ mod tests {
         let scripted = Scripted::default();
         scripted.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &scripted, &broker, &mut journal)
+            .advance(
+                &|| at("14:05:02"),
+                &scripted,
+                &MarketState::empty,
+                &broker,
+                &mut journal,
+            )
             .await
             .unwrap();
         let kinds = journaled(&directory);
@@ -2902,9 +3289,14 @@ mod tests {
             .unwrap()]["quote"]
             .clone();
         std::fs::remove_dir_all(&directory).unwrap();
-        let expected = match replayed.quotes().get(&spy()) {
-            Some(quote) => serde_json::json!({"quoted": quote}),
-            None => serde_json::json!({"unquoted": {"cause": "none_folded"}}),
+        let expected = match replayed.decision_quote(&spy()) {
+            DecisionQuote::Quoted(quote) => serde_json::json!({"quoted": quote}),
+            DecisionQuote::OneSided { quoted_at } => {
+                serde_json::json!({"one_sided": {"quoted_at": quoted_at}})
+            }
+            DecisionQuote::Unquoted { .. } => {
+                serde_json::json!({"unquoted": {"cause": "none_folded"}})
+            }
         };
         proptest::prop_assert_eq!(submitted, expected);
         Ok(())

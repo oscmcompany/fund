@@ -32,7 +32,8 @@ use fund::storage::reference::{SnapshotError, latest_conditions};
 use fund::storage::{Bucket, BucketError, parquet, trade_bars};
 use fund::trader::parameters::Parameters;
 use fund::trader::{
-    DecisionInterval, Session, SessionError, Standing, last_closes, resumed, streamed_quotes, warm,
+    DecisionInterval, Session, SessionError, Standing, last_closes, quotes_folded, resumed,
+    streamed_quotes, warm,
 };
 
 const SERVICE: &str = "trader";
@@ -366,13 +367,11 @@ async fn trade(
     let mut ticks = tokio::time::interval(TICK);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let deadline = close + CLOSE_GRACE;
+    let drained = || std::mem::take(&mut *streamed.lock().unwrap_or_else(PoisonError::into_inner));
     // The stream is stopped on every way out of the session, so it never outlives the trading it feeds.
     let ran = async {
         loop {
             ticks.tick().await;
-            session.fold_streamed(std::mem::take(
-                &mut *streamed.lock().unwrap_or_else(PoisonError::into_inner),
-            ));
             let now = Utc::now();
             let remaining = (deadline - now)
                 .to_std()
@@ -381,10 +380,14 @@ async fn trade(
             // Nothing is decided once the clock is past the close, so bounding a later advance cuts off only its reads.
             let advanced = match (remaining, now >= close) {
                 (None, _) => None,
-                (Some(_), false) => Some(session.advance(&Utc::now, &tape, &broker, journal).await),
+                (Some(_), false) => Some(
+                    session
+                        .advance(&Utc::now, &tape, &drained, &broker, journal)
+                        .await,
+                ),
                 (Some(remaining), true) => tokio::time::timeout(
                     remaining,
-                    session.advance(&Utc::now, &tape, &broker, journal),
+                    session.advance(&Utc::now, &tape, &drained, &broker, journal),
                 )
                 .await
                 .ok(),
@@ -452,19 +455,25 @@ async fn previous_bars(
 }
 
 /// Folds each quote the SIP stream sends for `symbols` into `streamed`, connecting again `RECONNECT_WAIT` after the
-/// stream stops or refuses, for as long as the run lasts.
+/// stream stops or refuses, for as long as the run lasts. Each subscription also folds in the latest quotes REST
+/// serves, so a quote missed while disconnected, or a quiet symbol's, is not left out until it next updates.
 async fn stream_quotes(alpaca: Alpaca, symbols: Vec<Symbol>, streamed: Arc<Mutex<MarketState>>) {
+    let fold = |folded: MarketState| {
+        let mut held = streamed.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = std::mem::take(&mut *held).combine(folded);
+    };
     loop {
         match alpaca.stream(&symbols, &[]).await {
             Ok(mut stream) => {
                 tracing::info!(symbols = symbols.len(), "Quote stream subscribed");
+                // Read after subscribing, so no quote falls between; the fold keeps the later of it and a streamed one.
+                match alpaca.latest_quotes(&symbols).await {
+                    Ok(outcomes) => fold(quotes_folded(outcomes)),
+                    Err(error) => tracing::warn!(%error, "Latest quotes not read"),
+                }
                 loop {
                     match stream.next().await {
-                        Ok(messages) => {
-                            let folded = streamed_quotes(messages);
-                            let mut held = streamed.lock().unwrap_or_else(PoisonError::into_inner);
-                            *held = std::mem::take(&mut *held).combine(folded);
-                        }
+                        Ok(messages) => fold(streamed_quotes(messages)),
                         Err(error) => {
                             tracing::warn!(%error, "Quote stream stopped");
                             break;

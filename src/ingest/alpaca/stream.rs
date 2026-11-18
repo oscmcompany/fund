@@ -18,6 +18,8 @@ use crate::ingest::{RefusedRow, RowRefusal};
 const SIP_STREAM_URL: &str = "wss://stream.data.alpaca.markets/v2/sip";
 /// How long the connection, authentication and subscription together may take before the attempt is abandoned.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the connection is pinged; a connection that sends no frame between two pings is taken as lost.
+const HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// One message of a frame as the stream spells it; a frame is an array of them.
 #[derive(Deserialize)]
@@ -123,6 +125,9 @@ pub enum StreamError {
     Closed,
     #[error("the handshake did not finish within {0:?}")]
     HandshakeTimedOut(Duration),
+    /// No frame, not even the pong, arrived within one heartbeat of a ping, as a half-open connection leaves it.
+    #[error("no frame arrived within {0:?} of a ping")]
+    Silent(Duration),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for StreamError {
@@ -134,6 +139,11 @@ impl From<tokio_tungstenite::tungstenite::Error> for StreamError {
 /// An authenticated connection to the SIP stream, subscribed to its symbols.
 pub struct SipStream {
     socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    /// Messages a handshake frame carried beside its reply, handed on by the first `next`.
+    held: Vec<StreamMessage>,
+    heartbeat: tokio::time::Interval,
+    /// Whether a ping has gone unanswered by any frame.
+    pinged: bool,
 }
 
 impl Alpaca {
@@ -155,7 +165,7 @@ impl Alpaca {
         trades: &[Symbol],
     ) -> Result<SipStream, StreamError> {
         let (socket, _) = tokio_tungstenite::connect_async(SIP_STREAM_URL).await?;
-        let mut stream = SipStream { socket };
+        let mut stream = SipStream::new(socket, HEARTBEAT);
         stream.await_reply("the connection", |message| {
             matches!(message, StreamMessage::Success { message } if message == "connected")
         })
@@ -193,10 +203,50 @@ impl Alpaca {
 }
 
 impl SipStream {
-    /// The messages of the next frame carrying any; an error message from the stream is returned as its refusal.
+    fn new(
+        socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        heartbeat: Duration,
+    ) -> Self {
+        let mut heartbeat =
+            tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            socket,
+            held: Vec::new(),
+            heartbeat,
+            pinged: false,
+        }
+    }
+
+    /// The messages of the next frame carrying any; an error message from the stream is returned as its refusal, and a
+    /// connection silent through a heartbeat after a ping as `Silent`.
     pub async fn next(&mut self) -> Result<Vec<StreamMessage>, StreamError> {
+        match self.held.is_empty() {
+            true => self.receive().await,
+            false => Ok(std::mem::take(&mut self.held)),
+        }
+    }
+
+    /// The messages of the next frame read from the socket, past any `held`.
+    async fn receive(&mut self) -> Result<Vec<StreamMessage>, StreamError> {
         loop {
-            let text = match self.socket.next().await {
+            // A frame already waiting is read before a due heartbeat, so a slow reader is not taken as a silent stream.
+            let received = tokio::select! {
+                biased;
+                received = self.socket.next() => received,
+                _ = self.heartbeat.tick() => {
+                    match self.pinged {
+                        true => return Err(StreamError::Silent(self.heartbeat.period())),
+                        false => {
+                            self.socket.send(Frame::Ping(Default::default())).await?;
+                            self.pinged = true;
+                            continue;
+                        }
+                    }
+                }
+            };
+            self.pinged = false;
+            let text = match received {
                 None => return Err(StreamError::Closed),
                 Some(frame) => match frame? {
                     Frame::Text(text) => text,
@@ -238,17 +288,32 @@ impl SipStream {
         Ok(self.socket.send(Frame::text(message.to_string())).await?)
     }
 
-    /// Reads the next frame, refused unless it is the single message `expected` accepts.
+    /// Reads the next frame, refused unless it holds the reply `expected` accepts; the frame's other messages are kept
+    /// for `next` to hand on.
     async fn await_reply(
         &mut self,
         awaiting: &'static str,
         expected: impl Fn(&StreamMessage) -> bool,
     ) -> Result<(), StreamError> {
-        let received = self.next().await?;
-        match received.as_slice() {
-            [message] if expected(message) => Ok(()),
-            _ => Err(StreamError::Unexpected { awaiting, received }),
+        let received = self.receive().await?;
+        self.held.extend(past_reply(awaiting, received, expected)?);
+        Ok(())
+    }
+}
+
+/// The messages of a handshake frame other than the reply `expected` accepts, refused when it holds no such reply.
+fn past_reply(
+    awaiting: &'static str,
+    received: Vec<StreamMessage>,
+    expected: impl Fn(&StreamMessage) -> bool,
+) -> Result<Vec<StreamMessage>, StreamError> {
+    match received.iter().position(expected) {
+        Some(reply) => {
+            let mut rest = received;
+            rest.remove(reply);
+            Ok(rest)
         }
+        None => Err(StreamError::Unexpected { awaiting, received }),
     }
 }
 
@@ -358,6 +423,105 @@ mod tests {
             .unwrap(),
             [StreamMessage::Subscription]
         );
+    }
+
+    /// A handshake reply batched with other messages is accepted, those messages kept in order, and a frame without the
+    /// reply is refused.
+    #[test]
+    fn test_a_reply_batched_with_quotes_is_accepted_and_the_quotes_kept() {
+        let subscribed = |message: &StreamMessage| matches!(message, StreamMessage::Subscription);
+        let batched = read_frame(&format!(
+            r#"[{{"T":"subscription","quotes":["ABC"]}},{},{}]"#,
+            r#"{"T":"q","S":"ABC","bx":"V","bp":1,"bs":1,"ax":"V","ap":2,"as":1,"c":["R"],"z":"C","t":"2026-10-07T16:40:09Z"}"#,
+            r#"{"T":"q","S":"ABC","bx":"V","bp":1,"bs":2,"ax":"V","ap":2,"as":1,"c":["R"],"z":"C","t":"2026-10-07T16:40:10Z"}"#,
+        ))
+        .unwrap();
+        assert_eq!(batched.len(), 3);
+        assert_eq!(
+            past_reply("the subscription", batched.clone(), subscribed).unwrap(),
+            batched[1..]
+        );
+        assert_eq!(
+            past_reply("the subscription", batched[..1].to_vec(), subscribed).unwrap(),
+            []
+        );
+        assert!(matches!(
+            past_reply("the subscription", batched[1..].to_vec(), subscribed),
+            Err(StreamError::Unexpected { awaiting: "the subscription", received }) if received.len() == 2
+        ));
+    }
+
+    /// A connection to a local server that answers the handshake and then reads frames only when `answers_pings`.
+    async fn local_stream(answers_pings: bool) -> SipStream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut server = tokio_tungstenite::accept_async(connection).await.unwrap();
+            // Reading is what answers a ping, so a server that never reads is a half-open connection's far end.
+            match answers_pings {
+                true => while let Some(Ok(_)) = server.next().await {},
+                false => std::future::pending::<()>().await,
+            }
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        SipStream::new(socket, Duration::from_millis(50))
+    }
+
+    /// A message batched with an early handshake reply waits behind the later replies, which are still read in turn.
+    #[tokio::test]
+    async fn test_a_message_batched_with_an_early_reply_waits_for_the_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut server = tokio_tungstenite::accept_async(connection).await.unwrap();
+            for frame in [
+                r#"[{"T":"success","msg":"connected"},{"T":"subscription"}]"#,
+                r#"[{"T":"success","msg":"authenticated"}]"#,
+            ] {
+                server.send(Frame::text(frame)).await.unwrap();
+            }
+            while let Some(Ok(_)) = server.next().await {}
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut stream = SipStream::new(socket, Duration::from_secs(5));
+        let success = |expected: &'static str| move |message: &StreamMessage| matches!(message, StreamMessage::Success { message } if message == expected);
+        stream
+            .await_reply("the connection", success("connected"))
+            .await
+            .unwrap();
+        stream
+            .await_reply("the authentication", success("authenticated"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().as_slice(),
+            [StreamMessage::Subscription]
+        ));
+    }
+
+    /// A connection whose far end stops answering is reported silent within two heartbeats rather than read forever.
+    #[tokio::test]
+    async fn test_a_connection_that_stops_answering_is_silent() {
+        let mut stream = local_stream(false).await;
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+        assert!(
+            matches!(read, Ok(Err(StreamError::Silent(heartbeat))) if heartbeat == Duration::from_millis(50)),
+            "{read:?}"
+        );
+    }
+
+    /// A connection that answers its pings but sends nothing, as a quiet symbol's would, stays open.
+    #[tokio::test]
+    async fn test_a_quiet_connection_that_answers_pings_stays_open() {
+        let mut stream = local_stream(true).await;
+        let read = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+        assert!(read.is_err(), "{read:?}");
     }
 
     /// A frame that is not an array of whole messages is refused whole rather than read in part.

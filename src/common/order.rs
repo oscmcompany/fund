@@ -379,14 +379,8 @@ pub struct OrderSubmitted {
 }
 
 impl OrderSubmitted {
-    /// `quote` is the decision's latest quote for the order's symbol, `None` when it held none.
-    pub fn of(request: &OrderRequest, quote: Option<LastQuote>) -> Self {
-        let quote = match quote {
-            Some(quote) => DecisionQuote::Quoted(quote),
-            None => DecisionQuote::Unquoted {
-                cause: QuoteAbsence::NoneFolded,
-            },
-        };
+    /// `quote` is the decision's top of book for the order's symbol, or why it held none.
+    pub fn of(request: &OrderRequest, quote: DecisionQuote) -> Self {
         Self {
             client_order_id: request.client_order_id,
             symbol: request.order.symbol().clone(),
@@ -402,7 +396,13 @@ impl OrderSubmitted {
 #[serde(rename_all = "snake_case")]
 pub enum DecisionQuote {
     Quoted(LastQuote),
-    Unquoted { cause: QuoteAbsence },
+    /// The symbol's latest quote, at `quoted_at`, was missing a side, so any two-sided quote before it is outdated.
+    OneSided {
+        quoted_at: DateTime<Utc>,
+    },
+    Unquoted {
+        cause: QuoteAbsence,
+    },
 }
 
 /// Why a decision held no quote for a symbol.
@@ -790,13 +790,23 @@ mod tests {
         let prefix = r#"{"client_order_id":"fund:67e55044-10b1-426f-9247-bb680e5fe0c8:42","symbol":"SPY","side":"buy","shares":5000000"#;
         for (quote, written) in [
             (
-                Some(LastQuote::of(&quote)),
+                DecisionQuote::Quoted(LastQuote::of(&quote)),
                 format!(
                     r#"{prefix},"quote":{{"quoted":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670000000,"ask":670010000,"bid_size":1000000,"ask_size":2000000}}}}}}"#
                 ),
             ),
             (
-                None,
+                DecisionQuote::OneSided {
+                    quoted_at: instant(0),
+                },
+                format!(
+                    r#"{prefix},"quote":{{"one_sided":{{"quoted_at":"2026-10-05T14:00:00Z"}}}}}}"#
+                ),
+            ),
+            (
+                DecisionQuote::Unquoted {
+                    cause: QuoteAbsence::NoneFolded,
+                },
                 format!(r#"{prefix},"quote":{{"unquoted":{{"cause":"none_folded"}}}}}}"#),
             ),
         ] {
