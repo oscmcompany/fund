@@ -5,6 +5,7 @@
 **/*.json
 !/tests/**/*.csv
 !/tests/**/*.json
+!/tools/snapshot.json
 .claude/tasks/
 .claude/settings.local.json*
 .claude/skills/*/measurements.md

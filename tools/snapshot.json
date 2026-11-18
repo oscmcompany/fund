@@ -1,0 +1,12 @@
+{
+  "theme": "native",
+  "window": false,
+  "background": "#1a1a1a",
+  "margin": [40, 52, 52, 40],
+  "padding": [24, 32, 24, 24],
+  "border": { "radius": 0, "width": 2, "color": "#ff9900" },
+  "shadow": { "blur": 0, "x": 12, "y": 12 },
+  "font": { "family": "IBM Plex Mono", "size": 16, "ligatures": false },
+  "line_height": 1.25,
+  "show_line_numbers": true
+}
