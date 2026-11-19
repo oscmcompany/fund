@@ -103,6 +103,15 @@ impl Position {
     fn of(shares: Shares) -> Self {
         Self(i128::from(shares.units()))
     }
+
+    /// The holding marked at `price`, negative when short.
+    pub fn worth(self, price: Price) -> Cash {
+        Cash(
+            self.0
+                .checked_mul(i128::from(price.ticks()))
+                .expect("a position's worth fits i128"),
+        )
+    }
 }
 
 impl Monoid for Position {
@@ -209,6 +218,17 @@ impl Fill {
     pub fn notional(&self) -> DollarVolume {
         DollarVolume::of(self.price, self.shares)
     }
+
+    /// The cash this fill moves, its cost included, and the holding it moves, each signed by its side.
+    fn change(&self) -> (Cash, Position) {
+        let (notional, cost) = (Cash::of(self.notional()), Cash::of(self.cost));
+        let shares = Position::of(self.shares);
+        let (cash, position) = match self.side {
+            Side::Buy => (notional.negated(), shares),
+            Side::Sell => (notional, Position(-shares.0)),
+        };
+        (cash.combine(cost.negated()), position)
+    }
 }
 
 /// Why a book could not be marked: it holds a symbol with no price.
@@ -254,14 +274,9 @@ impl Book {
 
     /// The change one fill makes, so a book after fills is `funded(cash)` combined with each fill's `of`.
     pub fn of(fill: &Fill) -> Self {
-        let (notional, cost) = (Cash::of(fill.notional()), Cash::of(fill.cost));
-        let shares = Position::of(fill.shares);
-        let (cash, position) = match fill.side {
-            Side::Buy => (notional.negated(), shares),
-            Side::Sell => (notional, Position(-shares.0)),
-        };
+        let (cash, position) = fill.change();
         Self {
-            cash: cash.combine(cost.negated()),
+            cash,
             positions: BTreeMap::from([(fill.symbol.clone(), position)]),
         }
         .canonical()
@@ -291,11 +306,7 @@ impl Book {
                 let price = price(symbol).ok_or_else(|| ValuationRefusal::Unpriced {
                     symbol: symbol.clone(),
                 })?;
-                let worth = position
-                    .0
-                    .checked_mul(i128::from(price.ticks()))
-                    .expect("a position's worth fits i128");
-                Ok(total.combine(Cash(worth)))
+                Ok(total.combine(position.worth(price)))
             })
     }
 
@@ -329,6 +340,67 @@ impl Monoid for Book {
             *held = held.combine(position);
         }
         self.canonical()
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn any_price() -> Price {
+        let price = Price::from_ticks(kani::any());
+        kani::assume(price.is_ok());
+        price.expect("assumed valid")
+    }
+
+    fn any_side() -> Side {
+        match kani::any() {
+            true => Side::Buy,
+            false => Side::Sell,
+        }
+    }
+
+    /// Any one fill, of any size at any price and cost, changes a book without overflow: the cash it moves is its
+    /// notional and cost, and the holding its shares, signed by its side.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn one_fill_changes_a_book_without_overflow() {
+        let side = any_side();
+        let fill = Fill::new(
+            DateTime::<Utc>::UNIX_EPOCH,
+            Symbol::new("AAA").expect("a valid symbol"),
+            side,
+            Shares::from_units(kani::any()),
+            any_price(),
+            DollarVolume::from_units(kani::any()),
+        );
+        kani::assume(fill.is_ok());
+        let fill = fill.expect("assumed valid");
+        let (moved, held) = fill.change();
+        let notional = i128::try_from(fill.notional().units()).expect("a notional fits i128");
+        let cost = i128::try_from(fill.cost().units()).expect("a cost fits i128");
+        let units = i128::from(fill.shares().units());
+        let (cash, position) = match side {
+            Side::Buy => (-notional - cost, units),
+            Side::Sell => (notional - cost, -units),
+        };
+        assert_eq!(moved.units(), cash);
+        assert_eq!(held.units(), position);
+    }
+
+    /// Any holding one fill can open, long or short, marks at any price without overflow.
+    #[kani::proof]
+    fn one_fills_position_marks_without_overflow() {
+        let units = i128::from(kani::any::<u64>());
+        let position = Position::from_units(match any_side() {
+            Side::Buy => units,
+            Side::Sell => -units,
+        });
+        let price = any_price();
+        assert_eq!(
+            position.worth(price).units().signum(),
+            position.units().signum()
+        );
     }
 }
 

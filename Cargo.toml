@@ -9,6 +9,7 @@ members = ["studies"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.lints.clippy]
 match_wildcard_for_single_variants = "deny"
@@ -36,6 +37,11 @@ chrono = { version = "0.4.44", default-features = false, features = [
 chrono-tz = "0.10"
 # Gzips the raw response pages the archive keeps as served, and reads them back.
 flate2 = "1.1"
+# Sends the stream's subscription and reads its frames, traits `tokio-tungstenite` does not re-export.
+futures-util = { version = "0.3.34", default-features = false, features = [
+  "sink",
+  "std",
+] }
 parquet = { version = "60.0.0", default-features = false, features = [
   "arrow",
   "snap",
@@ -62,6 +68,11 @@ tokio = { version = "1.53.1", features = [
   "rt-multi-thread",
   "sync",
   "time",
+] }
+# Reads Alpaca's SIP quote and trade stream.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
+  "connect",
+  "rustls-tls-native-roots",
 ] }
 toml = { version = "1.1.7", default-features = false, features = [
   "parse",

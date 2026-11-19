@@ -616,6 +616,48 @@ impl std::fmt::Display for Dollars {
     }
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Any valid price times any share count fits a `DollarVolume`, and fits the `i128` that `Cash` holds.
+    #[kani::proof]
+    fn dollar_volume_of_any_price_and_shares_fits() {
+        let price = Price::from_ticks(kani::any());
+        kani::assume(price.is_ok());
+        let price = price.expect("assumed valid");
+        let shares = Shares::from_units(kani::any());
+        let volume = DollarVolume::of(price, shares);
+        assert!(volume.units() <= 10_000_000_000_000 * u128::from(u64::MAX));
+        assert!(i128::try_from(volume.units()).is_ok());
+    }
+
+    /// The checked sum is the exact sum whenever it is `Some`, and `None` only when the exact sum passes `u64`.
+    #[kani::proof]
+    fn checked_share_sum_is_exact_or_refused() {
+        let (left, right): (u64, u64) = (kani::any(), kani::any());
+        let exact = u128::from(left) + u128::from(right);
+        match Shares::from_units(left).checked_plus(Shares::from_units(right)) {
+            Some(sum) => assert_eq!(u128::from(sum.units()), exact),
+            None => assert!(exact > u128::from(u64::MAX)),
+        }
+    }
+
+    /// Whole shares scale exactly to millionths, and are refused only when the millionths pass `u64`.
+    #[kani::proof]
+    fn whole_shares_scale_exactly_or_are_refused() {
+        let count: u64 = kani::any();
+        let exact = u128::from(count) * 1_000_000;
+        match Shares::whole(count) {
+            Ok(shares) => assert_eq!(u128::from(shares.units()), exact),
+            Err(SharesRefusal::OutOfRange { .. }) => assert!(exact > u128::from(u64::MAX)),
+            Err(refusal @ (SharesRefusal::NotFinite { .. } | SharesRefusal::OffGrid { .. })) => {
+                panic!("a whole count is refused only as out of range, not {refusal:?}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;

@@ -1,6 +1,6 @@
 //! One trading session: each minute's trades read once the minute has ended and folded into minute bars, rolled up into
-//! decision bars as each ends, the market state those bars build, and at each decision bar the strategy's target taken
-//! through risk, the guard and the broker, then reconciled, all journaled.
+//! decision bars as each ends, the market state those bars and the streamed quotes build, and at each decision bar the
+//! strategy's target taken through risk, the guard and the broker, then reconciled, all journaled.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -33,7 +33,8 @@ use crate::execution::{
     reconcile_and_close,
 };
 use crate::ingest::FetchError;
-use crate::ingest::alpaca::{Alpaca, AlpacaTradeOutcome};
+use crate::ingest::alpaca::stream::StreamMessage;
+use crate::ingest::alpaca::{Alpaca, AlpacaQuoteOutcome, AlpacaTradeOutcome};
 use crate::journal::Journal;
 
 /// How long after a minute's first read falls due it is read once more, to measure what that read missed.
@@ -324,15 +325,17 @@ impl<S: Strategy> Session<S> {
         self.built_through >= self.close
     }
 
-    /// Builds every minute whose wait has passed by the clock, and once a decision bar is built, trades the book toward
-    /// the strategy's target within the limits and reconciles it with the broker's, then reads again each built minute
-    /// due a recheck; closes every position through the broker once halted or `FLAT_BACKSTOP` before the close. A late
-    /// call decides once, for the latest bar built, rather than for each it passed, and work still running when the
-    /// backstop falls due is dropped so it cannot hold the backstop past the close.
+    /// Builds every minute whose wait has passed by the clock, folds in what `streamed` hands over, and once a decision
+    /// bar is built, trades the book toward the strategy's target within the limits and reconciles it with the broker's,
+    /// then reads again each built minute due a recheck; closes every position through the broker once halted or
+    /// `FLAT_BACKSTOP` before the close. A late call decides once, for the latest bar built, rather than for each it
+    /// passed, and work still running when the backstop falls due is dropped so it cannot hold the backstop past the
+    /// close.
     pub async fn advance(
         &mut self,
         clock: &impl Fn() -> DateTime<Utc>,
         tape: &impl MinuteTape,
+        streamed: &impl Fn() -> MarketState,
         broker: &impl Broker,
         journal: &mut Journal,
     ) -> Result<(), SessionError> {
@@ -353,13 +356,16 @@ impl<S: Strategy> Session<S> {
             // Biased toward the step, so a step that finishes without waiting is never dropped for a lapsed deadline.
             Some(deadline) => tokio::select! {
                 biased;
-                stepped = self.step(started, clock, tape, broker, journal) => stepped,
+                stepped = self.step(started, clock, tape, streamed, broker, journal) => stepped,
                 () = tokio::time::sleep_until(deadline) => {
                     tracing::warn!("Step left for the backstop");
                     Ok(())
                 }
             },
-            None => self.step(started, clock, tape, broker, journal).await,
+            None => {
+                self.step(started, clock, tape, streamed, broker, journal)
+                    .await
+            }
         };
         self.backstop(clock, broker, journal).await;
         stepped
@@ -373,6 +379,7 @@ impl<S: Strategy> Session<S> {
         started: DateTime<Utc>,
         clock: &impl Fn() -> DateTime<Utc>,
         tape: &impl MinuteTape,
+        streamed: &impl Fn() -> MarketState,
         broker: &impl Broker,
         journal: &mut Journal,
     ) -> Result<(), SessionError> {
@@ -381,6 +388,7 @@ impl<S: Strategy> Session<S> {
                 // Building awaits REST, so the decision reads the clock again rather than trusting when it began.
                 let now = clock();
                 self.fold_in(MarketEvent::Clock(now));
+                self.fold_streamed(streamed());
                 self.decide(now, broker, journal).await
             }
             Err(error) => Err(error),
@@ -613,7 +621,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             solution.target(),
             &prices,
-            self.state.quotes(),
+            &self.state,
             self.settings.limits.per_name(),
             self.settings.patience,
         )
@@ -635,7 +643,7 @@ impl<S: Strategy> Session<S> {
             &self.book,
             rounding_allowance(&self.fills),
             &prices,
-            self.state.quotes(),
+            &self.state,
             self.settings.limits.per_name(),
             self.settings.patience,
         )
@@ -702,8 +710,13 @@ impl<S: Strategy> Session<S> {
     }
 
     fn fold_in(&mut self, event: MarketEvent) {
+        self.fold_streamed(MarketState::of(event));
+    }
+
+    /// Folds in a state built apart from the session, such as the quotes streamed since the last call.
+    fn fold_streamed(&mut self, streamed: MarketState) {
         let state = std::mem::take(&mut self.state);
-        self.state = state.combine(MarketState::of(event));
+        self.state = state.combine(streamed);
     }
 
     /// The symbol's last one-minute close, unless the print that set it is older than the settings allow.
@@ -764,6 +777,44 @@ pub fn last_closes(bars: &[TradeBar]) -> BTreeMap<Symbol, Price> {
         .collect()
 }
 
+/// The quotes among `outcomes` folded into a state, as the live stream and the archive's quotes both fold; a one-sided
+/// or crossed quote leaves its symbol with no top of book until the next two-sided one, and a refused row is logged.
+pub fn quote_outcomes_folded(
+    outcomes: impl IntoIterator<Item = AlpacaQuoteOutcome>,
+) -> MarketState {
+    concatenate(outcomes.into_iter().filter_map(|outcome| match outcome {
+        AlpacaQuoteOutcome::Quote { quote, .. } => Some(MarketState::of(MarketEvent::Quote(quote))),
+        AlpacaQuoteOutcome::OneSided { quote, .. } => {
+            Some(MarketState::of(MarketEvent::OneSided {
+                symbol: quote.symbol,
+                quoted_at: quote.timestamp,
+            }))
+        }
+        AlpacaQuoteOutcome::Crossed(quote) => Some(MarketState::of(MarketEvent::Crossed {
+            symbol: quote.symbol().clone(),
+            quoted_at: quote.timestamp(),
+            bid: quote.bid(),
+            ask: quote.ask(),
+        })),
+        AlpacaQuoteOutcome::Refused(row) => {
+            tracing::warn!(?row, "Quote refused");
+            None
+        }
+    }))
+}
+
+/// The quotes among a stream frame's messages, folded as `quote_outcomes_folded` folds them.
+pub fn streamed_quotes(messages: Vec<StreamMessage>) -> MarketState {
+    quote_outcomes_folded(messages.into_iter().filter_map(|message| match message {
+        StreamMessage::Quote(outcome) => Some(outcome),
+        StreamMessage::Success { .. }
+        | StreamMessage::Error { .. }
+        | StreamMessage::Subscription
+        | StreamMessage::Trade(_)
+        | StreamMessage::Unread => None,
+    }))
+}
+
 /// The end of the latest decision bar ended by `instant`, which is at or before it.
 fn decision_before(instant: DateTime<Utc>, interval: DecisionInterval) -> DateTime<Utc> {
     decision_after(instant, interval) - interval.length()
@@ -815,6 +866,20 @@ mod tests {
     use crate::ingest::{PrintOrigin, RefusedRow, RowRefusal};
 
     const DOLLAR: i128 = 1_000_000_000_000;
+
+    impl<S: Strategy> Session<S> {
+        /// `advance` with nothing streamed.
+        async fn advance_unstreamed(
+            &mut self,
+            clock: &impl Fn() -> DateTime<Utc>,
+            tape: &impl MinuteTape,
+            broker: &impl Broker,
+            journal: &mut Journal,
+        ) -> Result<(), SessionError> {
+            self.advance(clock, tape, &MarketState::empty, broker, journal)
+                .await
+        }
+    }
 
     fn at(text: &str) -> DateTime<Utc> {
         format!("2026-10-07T{text}Z").parse().unwrap()
@@ -1211,18 +1276,18 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:01:10", 700_000_000));
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:03:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:01"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:01"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -1245,7 +1310,7 @@ mod tests {
         );
         assert_eq!(session.standing(), &Standing::Trading);
         session
-            .advance(&|| at("14:09:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:09:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory).len(), 8);
@@ -1261,14 +1326,20 @@ mod tests {
             at("14:04:50"),
             Price::from_ticks(700_990_000).unwrap(),
             Price::from_ticks(701_010_000).unwrap(),
-            Shares::whole(1).unwrap(),
-            Shares::whole(1).unwrap(),
+            Shares::whole(300).unwrap(),
+            Shares::whole(40).unwrap(),
         )
         .unwrap();
         for (quote, expected) in [
             (
                 Some(quoted),
-                serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:50Z", "bid": 700_990_000, "ask": 701_010_000}}),
+                serde_json::json!({"quoted": {
+                    "quoted_at": "2026-10-07T14:04:50Z",
+                    "bid": 700_990_000,
+                    "ask": 701_010_000,
+                    "bid_size": 300_000_000,
+                    "ask_size": 40_000_000
+                }}),
             ),
             (
                 None,
@@ -1285,7 +1356,7 @@ mod tests {
             let tape = Scripted::default();
             tape.file(print("14:04:30", 701_000_000));
             session
-                .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+                .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
                 .await
                 .unwrap();
             let kinds = journaled(&directory);
@@ -1296,6 +1367,79 @@ mod tests {
             assert_eq!(submitted["quote"], expected);
             std::fs::remove_dir_all(&directory).unwrap();
         }
+    }
+
+    /// A tape that streams `quote` into `streamed` while each minute read is pending, as the stream does during a slow read.
+    struct QuotingWhileRead<'a> {
+        tape: Scripted,
+        streamed: &'a Mutex<MarketState>,
+        quote: Quote,
+    }
+
+    impl MinuteTape for QuotingWhileRead<'_> {
+        async fn trades_between(
+            &self,
+            symbols: &[Symbol],
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
+        ) -> Result<Vec<AlpacaTradeOutcome>, FetchError> {
+            {
+                let mut streamed = self.streamed.lock().unwrap();
+                *streamed = std::mem::take(&mut *streamed)
+                    .combine(MarketState::of(MarketEvent::Quote(self.quote.clone())));
+            }
+            self.tape.trades_between(symbols, start, end).await
+        }
+    }
+
+    /// A quote streamed while the minute reads are pending reaches the decision those reads end in.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_quote_streamed_during_the_minute_reads_reaches_the_decision() {
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let streamed = Mutex::new(MarketState::empty());
+        let tape = QuotingWhileRead {
+            tape: Scripted::default(),
+            streamed: &streamed,
+            quote: Quote::new(
+                spy(),
+                at("14:05:01"),
+                Price::from_ticks(700_990_000).unwrap(),
+                Price::from_ticks(701_010_000).unwrap(),
+                Shares::whole(300).unwrap(),
+                Shares::whole(40).unwrap(),
+            )
+            .unwrap(),
+        };
+        tape.tape.file(print("14:04:30", 701_000_000));
+        let (mut journal, directory) = journal();
+        session
+            .advance(
+                &|| at("14:05:02"),
+                &tape,
+                &|| std::mem::take(&mut *streamed.lock().unwrap()),
+                &broker,
+                &mut journal,
+            )
+            .await
+            .unwrap();
+        let kinds = journaled(&directory);
+        let submitted = &payloads(&directory)[kinds
+            .iter()
+            .position(|kind| *kind == "order_submitted")
+            .unwrap()];
+        assert_eq!(
+            submitted["quote"],
+            serde_json::json!({"quoted": {
+                "quoted_at": "2026-10-07T14:05:01Z",
+                "bid": 700_990_000,
+                "ask": 701_010_000,
+                "bid_size": 300_000_000,
+                "ask_size": 40_000_000
+            }})
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// A holding the broker reports outside the session's book and target is closed at reconciliation, and the close's
@@ -1324,7 +1468,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let submitted: Vec<(serde_json::Value, serde_json::Value)> = journaled(&directory)
@@ -1342,7 +1486,13 @@ mod tests {
                 ),
                 (
                     serde_json::json!("AAPL"),
-                    serde_json::json!({"quoted": {"quoted_at": "2026-10-07T14:04:40Z", "bid": 250_000_000, "ask": 250_020_000}})
+                    serde_json::json!({"quoted": {
+                        "quoted_at": "2026-10-07T14:04:40Z",
+                        "bid": 250_000_000,
+                        "ask": 250_020_000,
+                        "bid_size": 1_000_000,
+                        "ask_size": 1_000_000
+                    }})
                 ),
             ]
         );
@@ -1361,7 +1511,7 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:05:01", 700_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -1418,7 +1568,7 @@ mod tests {
         ] {
             tape.file(print(when, ticks));
             session
-                .advance(&|| at(decided), &tape, &broker, &mut journal)
+                .advance_unstreamed(&|| at(decided), &tape, &broker, &mut journal)
                 .await
                 .unwrap();
         }
@@ -1484,7 +1634,7 @@ mod tests {
             *broker.ticks.lock().unwrap() = ticks;
             tape.file(print(when, ticks));
             first
-                .advance(&|| at(decided), &tape, &broker, &mut journal)
+                .advance_unstreamed(&|| at(decided), &tape, &broker, &mut journal)
                 .await
                 .unwrap();
         }
@@ -1512,7 +1662,7 @@ mod tests {
         );
         tape.file(print("14:19:30", 800_000_000));
         second
-            .advance(&|| at("14:20:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:20:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let last: serde_json::Value = records(&directory)
@@ -1553,7 +1703,7 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:05:01", 700_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -1579,7 +1729,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
@@ -1593,7 +1743,7 @@ mod tests {
         assert_eq!(count(&directory, "session_halted"), 1);
         tape.file(print("14:09:30", 701_000_000));
         session
-            .advance(&|| at("14:10:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:10:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(count(&directory, "target_decided"), 1);
@@ -1617,7 +1767,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
@@ -1635,7 +1785,7 @@ mod tests {
         );
         tape.file(print("14:09:30", 701_000_000));
         session
-            .advance(&|| at("14:10:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:10:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(*broker.closes.lock().unwrap(), 1);
@@ -1655,7 +1805,7 @@ mod tests {
         tape.file(print("14:04:30", 701_000_000));
         let started = tokio::time::Instant::now();
         let failed = session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await;
         assert!(failed.is_err());
         assert!(started.elapsed() >= Duration::from_secs(21_298));
@@ -1696,7 +1846,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let clock = || at("19:57:30") + TimeDelta::from_std(started.elapsed()).unwrap();
         session
-            .advance(&clock, &Stalled, &broker, &mut journal)
+            .advance_unstreamed(&clock, &Stalled, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(*broker.closes.lock().unwrap(), 1);
@@ -1739,7 +1889,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let clock = || at("19:55:02") + TimeDelta::from_std(started.elapsed()).unwrap();
         session
-            .advance(&clock, &tape, &broker, &mut journal)
+            .advance_unstreamed(&clock, &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(*broker.closes.lock().unwrap(), 1);
@@ -1791,7 +1941,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -1813,7 +1963,7 @@ mod tests {
         let mut closes = Vec::new();
         for instant in instants {
             session
-                .advance(&|| at(instant), &tape, broker, journal)
+                .advance_unstreamed(&|| at(instant), &tape, broker, journal)
                 .await
                 .unwrap();
             closes.push(*broker.closes.lock().unwrap());
@@ -1888,7 +2038,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:59", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(session.book.position(&spy()).units(), 1_000_000);
@@ -1906,7 +2056,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let Standing::Halted(HaltCause::Unresolved { client_order_id }) = session.standing() else {
@@ -1945,7 +2095,7 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
         tape.file(print("14:04:30", 701_000_000));
         let failed = session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
         assert!(matches!(
@@ -1965,7 +2115,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         let failed = session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await;
         assert!(matches!(
             failed,
@@ -2002,7 +2152,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let records = records(&directory);
@@ -2051,7 +2201,7 @@ mod tests {
         tape.file(print("14:04:30", 701_000_000));
         tape.file(print("14:10:01", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -2061,7 +2211,7 @@ mod tests {
         assert_eq!(broker.filled.lock().unwrap().len(), 1);
         std::fs::remove_dir_all(&gone).unwrap();
         let failed = session
-            .advance(&|| at("14:10:02"), &tape, &broker, &mut refusing)
+            .advance_unstreamed(&|| at("14:10:02"), &tape, &broker, &mut refusing)
             .await;
         assert!(matches!(failed, Err(SessionError::Journal(_))));
         assert!(matches!(
@@ -2216,7 +2366,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:04:30", 701_000_000));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -2246,7 +2396,7 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:01:40", 702_000_000));
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:03:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let payloads: Vec<serde_json::Value> = std::fs::read_dir(&directory)
@@ -2297,13 +2447,13 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:03:10", 700_000_000));
         session
-            .advance(&|| at("14:04:01"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:01"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), Vec::<&str>::new());
         assert_eq!(tape.times_asked("14:03:00", "14:04:00"), 0);
         session
-            .advance(&|| at("14:04:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2322,7 +2472,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:00:10", 700_000_000));
         session
-            .advance(&|| at("14:02:59"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:02:59"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -2333,7 +2483,7 @@ mod tests {
             (0, 0)
         );
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:03:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2347,7 +2497,7 @@ mod tests {
         // Its recheck comes `RECHECK_AFTER` after it was built, not in the same call that built it.
         for (now, asked) in [("14:04:59", 1), ("14:05:00", 2)] {
             session
-                .advance(&|| at(now), &tape, &broker, &mut journal)
+                .advance_unstreamed(&|| at(now), &tape, &broker, &mut journal)
                 .await
                 .unwrap();
             assert_eq!(tape.times_asked("14:00:00", "14:01:00"), asked);
@@ -2373,12 +2523,12 @@ mod tests {
         tape.file(print("14:00:10", 700_000_000));
         tape.file(print("14:02:30", 700_000_000));
         session
-            .advance(&|| at("14:02:59"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:02:59"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(tape.times_asked("14:00:00", "14:01:00"), 0);
         session
-            .advance(&|| at("14:03:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:03:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(session.built_through, at("14:02:00"));
@@ -2404,7 +2554,7 @@ mod tests {
         tape.file(print("14:04:30", 701_000_000));
         tape.failing.lock().unwrap().insert(at("14:02:00"));
         session
-            .advance(&|| at("14:05:02"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:02"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2412,7 +2562,7 @@ mod tests {
         assert_eq!(tape.times_asked("14:04:00", "14:05:00"), 0);
         tape.failing.lock().unwrap().clear();
         session
-            .advance(&|| at("14:05:03"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:05:03"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         // Failed, then read once; its recheck waits behind the older minutes'.
@@ -2436,7 +2586,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:01:10", 700_000_000));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:05"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2445,7 +2595,7 @@ mod tests {
         tape.file(print("14:02:30", 700_500_000));
         tape.file(print("14:03:30", 701_000_000));
         session
-            .advance(&|| at("14:04:06"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:06"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -2468,7 +2618,7 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:03:30", 701_000_000));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:05"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "bar_built"]);
@@ -2489,7 +2639,7 @@ mod tests {
         tape.file(print("14:01:10", 700_000_000));
         tape.file(print("14:05:00", 701_000_000));
         session
-            .advance(&|| at("14:06:05"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:06:05"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(session.built_through, at("14:06:00"));
@@ -2513,7 +2663,7 @@ mod tests {
             RowRefusal::Unrequested,
         )));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:05"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2533,7 +2683,7 @@ mod tests {
         tape.file(print("14:03:30", 701_000_000));
         tape.failing.lock().unwrap().insert(at("14:03:00"));
         session
-            .advance(&|| at("14:04:05"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:04:05"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built"]);
@@ -2559,13 +2709,13 @@ mod tests {
         tape.file(print("19:57:30", 701_000_000));
         tape.file(print("19:58:30", 701_000_000));
         session
-            .advance(&|| at("20:00:20"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("20:00:20"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert!(!session.built_through_close());
         tape.file(print("20:00:30", 701_000_000));
         session
-            .advance(&|| at("20:00:40"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("20:00:40"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert!(session.built_through_close());
@@ -2594,12 +2744,12 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("19:59:30", 701_000_000));
         session
-            .advance(&|| at("20:00:01"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("20:00:01"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert!(!session.built_through_close());
         session
-            .advance(&|| at("20:10:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("20:10:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert!(session.built_through_close());
@@ -2628,14 +2778,14 @@ mod tests {
         // The 19:55 decision bar's last minute fails until past the close, then the minute after it fails instead.
         tape.failing.lock().unwrap().insert(at("19:54:00"));
         session
-            .advance(&|| at("19:59:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("19:59:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["book_flattened"]);
         tape.failing.lock().unwrap().clear();
         tape.failing.lock().unwrap().insert(at("19:56:00"));
         session
-            .advance(&|| at("20:00:30"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("20:00:30"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(
@@ -2671,7 +2821,7 @@ mod tests {
             }
         };
         session
-            .advance(&clock, &tape, &broker, &mut journal)
+            .advance_unstreamed(&clock, &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(journaled(&directory), ["bar_built", "bar_built"]);
@@ -2692,7 +2842,7 @@ mod tests {
         let mut now = at("14:06:10");
         while now <= at("14:09:30") {
             session
-                .advance(&|| now, &tape, &broker, &mut journal)
+                .advance_unstreamed(&|| now, &tape, &broker, &mut journal)
                 .await
                 .unwrap();
             asked.insert(now, tape.times_asked("14:05:00", "14:06:00"));
@@ -2716,7 +2866,7 @@ mod tests {
         let tape = Scripted::default();
         tape.file(print("14:09:30", 700_000_000));
         session
-            .advance(&|| at("14:10:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:10:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let reads = |tape: &Scripted| {
@@ -2729,7 +2879,7 @@ mod tests {
         };
         assert_eq!(reads(&tape), [2, 1, 1]);
         session
-            .advance(&|| at("14:10:01"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:10:01"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         assert_eq!(reads(&tape), [2, 2, 1]);
@@ -2798,7 +2948,7 @@ mod tests {
             tape.file(outcome);
         }
         session
-            .advance(&|| at("19:00:00"), &tape, &broker, &mut journal)
+            .advance_unstreamed(&|| at("19:00:00"), &tape, &broker, &mut journal)
             .await
             .unwrap();
         let live: Vec<serde_json::Value> = records(&directory)
@@ -2919,7 +3069,7 @@ mod tests {
         }
         let (mut journal, directory) = journal();
         session
-            .advance(&|| at("14:35:02"), &scripted, &broker, &mut journal)
+            .advance_unstreamed(&|| at("14:35:02"), &scripted, &broker, &mut journal)
             .await
             .unwrap();
         let live_bars: Vec<serde_json::Value> = payloads(&directory)
@@ -3034,7 +3184,7 @@ mod tests {
         let (mut journal, directory) = journal();
         for instant in instants {
             session
-                .advance(&|| at(instant), &scripted, &broker, &mut journal)
+                .advance_unstreamed(&|| at(instant), &scripted, &broker, &mut journal)
                 .await
                 .unwrap();
         }
@@ -3143,6 +3293,325 @@ mod tests {
         assert_eq!(live, replayed);
         assert_eq!(broker_book, Book::funded(Cash::from_units(-701 * DOLLAR)));
         assert_eq!(broker_book, *replay.book());
+    }
+
+    /// The kinds of message a swarm tape may hold; each case draws which are on, so some cases hold one kind alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+    enum TapeKind {
+        TwoSided,
+        OneSided,
+        Crossed,
+        Trade,
+        /// A correction, which only the stream sends and nothing here reads.
+        Unread,
+    }
+
+    /// One message of a synthetic tape, with where the stream ends its frame and the raw tee its page after it.
+    #[derive(Debug, Clone)]
+    struct Tick {
+        kind: TapeKind,
+        is_spy: bool,
+        nanoseconds_after_14: i64,
+        /// The bid of a quote, or the price of a trade.
+        cents: i64,
+        width_cents: i64,
+        bid_size: u64,
+        ask_size: u64,
+        bid_side: bool,
+        ends_frame: bool,
+        ends_page: bool,
+    }
+
+    impl Tick {
+        fn ticker(&self) -> &'static str {
+            match self.is_spy {
+                true => "SPY",
+                false => "QQQ",
+            }
+        }
+
+        /// The row as the raw tee files it under its ticker; the stream sends it with its kind and ticker added.
+        fn row(&self, index: usize) -> serde_json::Value {
+            let stamp = (at("14:00:00") + TimeDelta::nanoseconds(self.nanoseconds_after_14))
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+            let dollars = |cents: i64| cents as f64 / 100.0;
+            let (bid, ask) = match self.kind {
+                TapeKind::TwoSided => (self.cents, self.cents + self.width_cents),
+                TapeKind::Crossed => (self.cents + self.width_cents + 1, self.cents),
+                TapeKind::OneSided => match self.bid_side {
+                    true => (self.cents, 0),
+                    false => (0, self.cents),
+                },
+                TapeKind::Trade => {
+                    return serde_json::json!({
+                        "t": stamp, "x": "D", "p": dollars(self.cents), "s": self.bid_size,
+                        "c": ["@"], "z": "C", "i": index,
+                    });
+                }
+                TapeKind::Unread => {
+                    return serde_json::json!({
+                        "t": stamp, "x": "D", "oi": index, "op": dollars(self.cents), "os": 1, "oc": ["@"],
+                        "ci": index + 1, "cp": dollars(self.cents), "cs": 1, "cc": ["@"], "z": "C",
+                    });
+                }
+            };
+            serde_json::json!({
+                "t": stamp, "bx": "V", "bp": dollars(bid), "bs": self.bid_size,
+                "ax": "Q", "ap": dollars(ask), "as": self.ask_size, "c": ["R"], "z": "C",
+            })
+        }
+
+        /// The stream's kind letter, and the raw tee's family, `None` for a kind the tee never carries.
+        fn letter_and_family(&self) -> (&'static str, Option<&'static str>) {
+            match self.kind {
+                TapeKind::TwoSided | TapeKind::OneSided | TapeKind::Crossed => {
+                    ("q", Some("quotes"))
+                }
+                TapeKind::Trade => ("t", Some("trades")),
+                TapeKind::Unread => ("c", None),
+            }
+        }
+    }
+
+    /// The tape as the stream sends it: arrays of messages, split where a tick ends its frame.
+    fn stream_frames(tape: &[Tick]) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut frame = Vec::new();
+        for (index, tick) in tape.iter().enumerate() {
+            let mut message = tick.row(index);
+            message["T"] = serde_json::json!(tick.letter_and_family().0);
+            message["S"] = serde_json::json!(tick.ticker());
+            frame.push(message);
+            if tick.ends_frame || index + 1 == tape.len() {
+                frames.push(serde_json::Value::Array(std::mem::take(&mut frame)).to_string());
+            }
+        }
+        frames
+    }
+
+    /// The tape's `family` as the raw tee writes it gzipped: each ticker's rows in tape order, one page per line.
+    fn raw_tee(tape: &[Tick], family: &str) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut lines = Vec::new();
+        for ticker in ["SPY", "QQQ"] {
+            let mut rows = Vec::new();
+            let filed: Vec<(usize, &Tick)> = tape
+                .iter()
+                .enumerate()
+                .filter(|(_, tick)| {
+                    tick.ticker() == ticker && tick.letter_and_family().1 == Some(family)
+                })
+                .collect();
+            for (position, (index, tick)) in filed.iter().enumerate() {
+                rows.push(tick.row(*index));
+                if tick.ends_page || position + 1 == filed.len() {
+                    let page = serde_json::json!({
+                        family: {ticker: std::mem::take(&mut rows)},
+                        "next_page_token": null,
+                    });
+                    lines.push(page.to_string());
+                }
+            }
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(lines.join("\n").as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Ticks of the kinds a case turned on, packed within a microsecond, so stamps collide, or spread over five minutes.
+    fn any_swarm_tape() -> impl proptest::strategy::Strategy<Value = Vec<Tick>> {
+        use proptest::strategy::Strategy as _;
+        use strum::IntoEnumIterator as _;
+
+        let kinds = proptest::sample::subsequence(TapeKind::iter().collect::<Vec<_>>(), 1..=5);
+        let span = proptest::prop_oneof![
+            proptest::strategy::Just(1_000_i64),
+            proptest::strategy::Just(300_000_000_000_i64)
+        ];
+        (kinds, span).prop_flat_map(|(kinds, span)| {
+            let tick = (
+                proptest::sample::select(kinds),
+                proptest::bool::ANY,
+                0..span,
+                (1_000..1_010_i64, 0..3_i64),
+                (1..500_u64, 1..500_u64),
+                (
+                    proptest::bool::ANY,
+                    proptest::bool::ANY,
+                    proptest::bool::ANY,
+                ),
+            )
+                .prop_map(
+                    |(
+                        kind,
+                        is_spy,
+                        nanoseconds_after_14,
+                        (cents, width_cents),
+                        (bid_size, ask_size),
+                        (bid_side, ends_frame, ends_page),
+                    )| Tick {
+                        kind,
+                        is_spy,
+                        nanoseconds_after_14,
+                        cents,
+                        width_cents,
+                        bid_size,
+                        ask_size,
+                        bid_side,
+                        ends_frame,
+                        ends_page,
+                    },
+                );
+            proptest::collection::vec(tick, 0..60)
+        })
+    }
+
+    /// The tape streamed frame by frame into a live session that then decides, against the same tape read from the raw
+    /// tee and folded as the archive's quotes: the same latest quote per name, the decision carrying the replayed one,
+    /// and each name's trades read alike.
+    async fn streamed_and_replayed(
+        tape: Vec<Tick>,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        use crate::common::order::{DecisionQuote, QuoteAbsence};
+        use crate::ingest::alpaca::stream::read_frame;
+        use crate::ingest::alpaca::{read_raw_quotes, read_raw_trades};
+
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let broker = Filling::new(701_000_000, funded.clone());
+        let mut session = session(TimeDelta::minutes(5), funded);
+        let mut streamed_trades: BTreeMap<Symbol, Vec<AlpacaTradeOutcome>> = BTreeMap::new();
+        for frame in stream_frames(&tape) {
+            let messages = read_frame(&frame).unwrap();
+            for message in &messages {
+                if let StreamMessage::Trade(outcome @ AlpacaTradeOutcome::Print { print, .. }) =
+                    message
+                {
+                    streamed_trades
+                        .entry(print.symbol().clone())
+                        .or_default()
+                        .push(outcome.clone());
+                }
+            }
+            session.fold_streamed(streamed_quotes(messages));
+        }
+
+        let mut outcomes = Vec::new();
+        read_raw_quotes(&raw_tee(&tape, "quotes")[..], |outcome| {
+            outcomes.push(outcome)
+        })
+        .unwrap();
+        let replayed = quote_outcomes_folded(outcomes);
+        let mut replayed_trades: BTreeMap<Symbol, Vec<AlpacaTradeOutcome>> = BTreeMap::new();
+        read_raw_trades(&raw_tee(&tape, "trades")[..], |outcome| match &outcome {
+            AlpacaTradeOutcome::Print { print, .. } => replayed_trades
+                .entry(print.symbol().clone())
+                .or_default()
+                .push(outcome.clone()),
+            AlpacaTradeOutcome::Refused(row) => panic!("{row:?}"),
+        })
+        .unwrap();
+
+        let quoted: BTreeSet<&str> = tape
+            .iter()
+            .filter(|tick| tick.kind == TapeKind::TwoSided)
+            .map(Tick::ticker)
+            .collect();
+        let tickers =
+            |quotes: &BTreeMap<Symbol, crate::common::market::state::LastQuote>| -> Vec<String> {
+                quotes
+                    .keys()
+                    .map(|symbol| symbol.as_str().to_string())
+                    .collect()
+            };
+        proptest::prop_assert_eq!(tickers(replayed.quotes()), tickers(session.state.quotes()));
+        proptest::prop_assert_eq!(tickers(replayed.quotes()).len(), quoted.len());
+        proptest::prop_assert_eq!(replayed.quotes(), session.state.quotes());
+        for ticker in ["SPY", "QQQ"] {
+            let symbol = Symbol::new(ticker).unwrap();
+            let latest = |kind: TapeKind| {
+                tape.iter()
+                    .filter(|tick| tick.kind == kind && tick.ticker() == ticker)
+                    .map(|tick| tick.nanoseconds_after_14)
+                    .max()
+            };
+            let outdating = latest(TapeKind::OneSided).max(latest(TapeKind::Crossed));
+            let outdated = match (latest(TapeKind::TwoSided), outdating) {
+                (Some(two_sided), Some(outdating)) => outdating > two_sided,
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            let held = session.state.decision_quote(&symbol);
+            proptest::prop_assert_eq!(
+                matches!(
+                    held,
+                    DecisionQuote::OneSided { .. } | DecisionQuote::Crossed { .. }
+                ),
+                outdated
+            );
+            proptest::prop_assert_eq!(replayed.decision_quote(&symbol), held);
+        }
+        proptest::prop_assert_eq!(
+            replayed_trades.keys().collect::<Vec<_>>(),
+            streamed_trades.keys().collect::<Vec<_>>()
+        );
+        proptest::prop_assert_eq!(&replayed_trades, &streamed_trades);
+
+        let (mut journal, directory) = journal();
+        let scripted = Scripted::default();
+        scripted.file(print("14:04:30", 701_000_000));
+        session
+            .advance_unstreamed(&|| at("14:05:02"), &scripted, &broker, &mut journal)
+            .await
+            .unwrap();
+        let kinds = journaled(&directory);
+        let submitted = payloads(&directory)[kinds
+            .iter()
+            .position(|kind| *kind == "order_submitted")
+            .unwrap()]["quote"]
+            .clone();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let expected = match replayed.decision_quote(&spy()) {
+            DecisionQuote::Quoted(quote) => serde_json::json!({"quoted": quote}),
+            DecisionQuote::OneSided { quoted_at } => {
+                serde_json::json!({"one_sided": {"quoted_at": quoted_at}})
+            }
+            DecisionQuote::Crossed {
+                quoted_at,
+                bid,
+                ask,
+            } => {
+                serde_json::json!({"crossed": {"quoted_at": quoted_at, "bid": bid.ticks(), "ask": ask.ticks()}})
+            }
+            DecisionQuote::Unquoted {
+                cause: QuoteAbsence::NoneFolded,
+            } => {
+                serde_json::json!({"unquoted": {"cause": "none_folded"}})
+            }
+            DecisionQuote::Unquoted {
+                cause: QuoteAbsence::StreamLost { since },
+            } => {
+                serde_json::json!({"unquoted": {"cause": {"stream_lost": {"since": since}}}})
+            }
+        };
+        proptest::prop_assert_eq!(submitted, expected);
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// A swarm tape streamed live leaves the latest quotes, and the decision's quote, that the same tape replayed
+        /// from the raw tee leaves, whichever kinds of message the case holds and however its frames and pages split.
+        #[test]
+        fn property_live_and_replay_fold_the_same_quotes(tape in any_swarm_tape()) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(streamed_and_replayed(tape))?;
+        }
     }
 
     proptest::proptest! {

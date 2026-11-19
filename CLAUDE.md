@@ -110,6 +110,8 @@ This is a collection of guidelines and references.
 - Judge new code on whether a mutation to it fails a test rather than on the coverage line rate alone; CI does
   not run mutations, so run `mutate-rust <diff>` locally over a slice's diff when it adds logic worth guarding,
   and expect a function that only wraps a network call to survive
+- Run `prove-rust` locally when a change touches money arithmetic, the ledger or the book; its Kani harnesses
+  under `cfg(kani)` are compiled by nothing else, so CI never sees a proof break
 - When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after
   the fix
 - Pin test expectations to literals, never to the constant or list the test is checking — an expectation
