@@ -24,6 +24,7 @@ use fund::common::standing::{HaltCause, SessionClosed, SessionEnding};
 use fund::common::storage::{ConfigurationKey, Host, Key, ObjectKey, Provider, Service, TradesKey};
 use fund::common::time::calendar::TradingCalendar;
 use fund::common::time::{SessionDate, SessionRange};
+use fund::execution::CachedTradability;
 use fund::ingest::alpaca::Alpaca;
 use fund::ingest::{FetchError, VariableRefusal};
 use fund::journal::Journal;
@@ -345,6 +346,7 @@ async fn trade(
         "Session opened"
     );
     sleep_until(open).await;
+    let broker = CachedTradability::new(broker);
     let streamed = Arc::new(Mutex::new(MarketState::empty()));
     let streaming = tokio::spawn(stream_quotes(
         streaming,

@@ -11,6 +11,7 @@ use crate::common::book::{Book, Cash, Fill, Position, Side};
 use crate::common::guard::{Shortability, Tradability, TradabilityRead};
 use crate::common::market::DollarVolume;
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol, SymbolRefusal};
+use crate::common::monoid::Monoid;
 use crate::common::order::{
     BrokerFailure, ClientOrderId, LimitPrice, OrderEnding, OrderExecution, OrderReport,
     OrderRequest, OrderStatus,
@@ -45,6 +46,13 @@ pub trait Broker {
 
     /// The account's cash and positions as a book, the authority a journal's fills are reconciled against.
     fn book(&self) -> impl Future<Output = Result<Book, BrokerError>> + Send;
+
+    /// Asks the broker to cancel every open order and close every position at the market, as orders the journal does
+    /// not record; `Ok` proves only that the request was taken, so the book is read back to see it flat.
+    fn close_all(&self) -> impl Future<Output = Result<(), BrokerError>> + Send;
+
+    /// Whether the account has any order open, which a further close request would cancel and could close against.
+    fn any_order_open(&self) -> impl Future<Output = Result<bool, BrokerError>> + Send;
 }
 
 /// Digits after the point in a `Cash` unit: ticks times millionths of a share.
@@ -491,19 +499,53 @@ impl Broker for PaperAccount {
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
     }
 
-    /// What Alpaca reports of each symbol's trading and short sale, one asset read apiece.
+    /// Asks Alpaca once to cancel open orders and then close every position. Never retried here, since a resend while
+    /// the first request's closes are open cancels them and sizes new ones from a position they may be filling against.
+    async fn close_all(&self) -> Result<(), BrokerError> {
+        let request = self
+            .alpaca
+            .trading(Method::DELETE, "/v2/positions")
+            .query(&[("cancel_orders", "true")]);
+        match send(request).await {
+            Outcome::Body(_) => Ok(()),
+            Outcome::Transient(cause) => Err(BrokerError::Unanswered { cause }),
+            Outcome::Refused { status, body } => Err(FetchError::Refused { status, body }.into()),
+        }
+    }
+
+    /// Whether Alpaca lists any open order, read through transient failures.
+    async fn any_order_open(&self) -> Result<bool, BrokerError> {
+        let body = with_retries(|| {
+            send(
+                self.alpaca
+                    .trading(Method::GET, "/v2/orders")
+                    .query(&[("status", "open"), ("limit", "1")]),
+            )
+        })
+        .await?;
+        let orders: Vec<serde::de::IgnoredAny> =
+            serde_json::from_slice(&body).map_err(|_| BrokerError::Malformed {
+                field: "orders",
+                raw: String::from_utf8_lossy(&body).into_owned(),
+            })?;
+        Ok(!orders.is_empty())
+    }
+
+    /// What Alpaca reports of each symbol's trading and short sale, one asset read apiece, each stamped when it was read.
     async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
-        let (mut readings, mut shortability) = (BTreeMap::new(), BTreeMap::new());
+        let mut read = TradabilityRead::empty();
         for symbol in symbols {
             let path = format!("/v2/assets/{}", symbol.as_str());
             let outcome = with_retries(|| send(self.alpaca.trading(Method::GET, &path))).await;
             let (tradability, borrow) = asset(outcome)?;
-            readings.insert(symbol.clone(), tradability);
-            if let Some(borrow) = borrow {
-                shortability.insert(symbol.clone(), borrow);
-            }
+            let shortability = borrow.map(|borrow| (symbol.clone(), borrow));
+            let one = TradabilityRead::new(
+                BTreeMap::from([(symbol.clone(), tradability)]),
+                shortability.into_iter().collect(),
+            );
+            read = read.combine(one.stamped(Utc::now()));
         }
-        Ok(TradabilityRead::new(readings, shortability))
+        Ok(read)
     }
 }
 
@@ -1249,6 +1291,57 @@ mod tests {
                 )
             }
         }
+        assert_eq!(account.book().await.unwrap(), before);
+    }
+
+    /// On a flat paper account while the market is closed, places one SPY order, reads it as open, asks for every
+    /// position closed, and reads no order open after; refuses a held book rather than close it.
+    #[tokio::test]
+    #[ignore = "trades on the Alpaca paper account; run deliberately under a development secretspec profile"]
+    async fn live_close_all_cancels_open_orders_on_a_flat_paper_account() {
+        let alpaca = Alpaca::from_environment(reqwest::Client::new()).unwrap();
+        let clock: serde_json::Value = parse(
+            &with_retries(|| send(alpaca.trading(Method::GET, "/v2/clock")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            clock["is_open"], false,
+            "run while the market is closed, so the order cannot fill"
+        );
+        let account = PaperAccount::new(alpaca).unwrap();
+        let before = account.book().await.unwrap();
+        assert!(
+            before.positions().is_empty(),
+            "the paper book holds positions; this test only closes orders"
+        );
+        assert!(
+            !account.any_order_open().await.unwrap(),
+            "an order is already open"
+        );
+        let spy = Symbol::new("SPY").unwrap();
+        let order = orders(
+            &Book::empty(),
+            &Target::new(BTreeMap::from([(spy, Shares::whole(1).unwrap())])),
+        )
+        .remove(0);
+        let id = ClientOrderId::new(RunId::new(Uuid::new_v4()), 0);
+        account.submit(&OrderRequest::new(order, id)).await.unwrap();
+        assert!(account.any_order_open().await.unwrap());
+        account.close_all().await.unwrap();
+        let mut open = true;
+        for _ in 0..20 {
+            open = account.any_order_open().await.unwrap();
+            match open {
+                true => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                false => break,
+            }
+        }
+        assert!(
+            !open,
+            "close_all left the order open; cancel it on the paper account by hand"
+        );
         assert_eq!(account.book().await.unwrap(), before);
     }
 }

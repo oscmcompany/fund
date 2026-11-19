@@ -541,6 +541,7 @@ pub(crate) mod tests {
                         | Observation::BarBuilt(_)
                         | Observation::TradabilityRead(_)
                         | Observation::SessionHalted(_)
+                        | Observation::BookFlattened(_)
                         | Observation::SessionClosed(_)
                         | Observation::PlaybookRead(_)
                         | Observation::PlaybookUploaded(_) => {}

@@ -25,7 +25,7 @@ use crate::common::parameter::Parameter;
 use crate::common::playbook::{PlaybookRead, PlaybookUploaded};
 use crate::common::reconcile::BookReconciled;
 use crate::common::risk::TargetDecided;
-use crate::common::standing::{SessionClosed, SessionHalted};
+use crate::common::standing::{BookFlattened, SessionClosed, SessionHalted};
 use crate::common::storage::Key;
 use crate::common::time::SessionDate;
 
@@ -234,6 +234,7 @@ pub enum Observation {
     PlaybookRead(PlaybookRead),
     PlaybookUploaded(PlaybookUploaded),
     SessionHalted(SessionHalted),
+    BookFlattened(BookFlattened),
     SessionClosed(SessionClosed),
 }
 
@@ -1080,7 +1081,8 @@ mod tests {
         let whole_only = TradabilityRead::new(
             BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Tradability::WholeSharesOnly)]),
             BTreeMap::from([(Symbol::new("VWDRY").unwrap(), Shortability::EasyToBorrow)]),
-        );
+        )
+        .stamped("2026-10-07T14:04:59Z".parse().unwrap());
         let guarded =
             guard(&Book::default(), &fraction, &whole_only, wide, |_| None).held()[0].clone();
         let sliver = Target::new(BTreeMap::from([(
@@ -1234,7 +1236,7 @@ mod tests {
                 ),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"VWDRY","side":"buy","shares":1500000,"cause":"fractional"}}"#.to_string(),
                 r#"{"event_type":"order_guarded","payload":{"symbol":"DIA","side":"buy","shares":19,"cause":{"below_minimum":{"price":470000000}}}}"#.to_string(),
-                r#"{"event_type":"tradability_read","payload":{"readings":{"VWDRY":"whole_shares_only"},"shortability":{"VWDRY":"easy_to_borrow"}}}"#.to_string(),
+                r#"{"event_type":"tradability_read","payload":{"readings":{"VWDRY":"whole_shares_only"},"shortability":{"VWDRY":"easy_to_borrow"},"read_at":{"VWDRY":"2026-10-07T14:04:59Z"}}}"#.to_string(),
                 r#"{"event_type":"tradability_unread","payload":{"cause":{"exhausted":{"attempts":3,"last":"timed out"}}}}"#.to_string(),
                 r#"{"event_type":"book_reconciled","payload":{"expected_cash":"1000","reported_cash":"-5","allowance":"0","gaps":[{"symbol":"SPY","expected":"0","reported":"-2000000"}]}}"#.to_string(),
                 r#"{"event_type":"target_decided","payload":{"bar":"2026-10-07T14:05:00Z","stretch":{"from":"12:00:00","progress":500000},"wanted":{"SPY":5000000},"solver":"clip","solution":{"target":{},"cuts":[{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}],"risk":{"flat":{"outside_trading_window":{"phase":{"before_open":{"until_open":300000000000}}}}}}}}"#.to_string(),
@@ -1469,6 +1471,48 @@ mod tests {
         for (observation, payload) in observations.iter().zip(&payloads) {
             assert_eq!(
                 &serde_json::from_str::<Observation>(payload).unwrap(),
+                observation
+            );
+        }
+    }
+
+    /// Each way a book can be left by closing every position, pinned to its wire format and read back.
+    #[test]
+    fn test_a_flattened_book_encodes_to_its_wire_format() {
+        use crate::common::order::BrokerFailure;
+        use crate::common::standing::{BookFlattened, FlatReading, FlattenCause};
+        use std::num::NonZeroU32;
+
+        let one = NonZeroU32::MIN;
+
+        let lines = [
+            (
+                BookFlattened::new(FlattenCause::Halted, one, FlatReading::Flat),
+                r#"{"cause":"halted","closes":1,"reading":"flat"}"#,
+            ),
+            (
+                BookFlattened::new(
+                    FlattenCause::ClosingBackstop,
+                    NonZeroU32::new(3).unwrap(),
+                    FlatReading::Held { positions: 2 },
+                ),
+                r#"{"cause":"closing_backstop","closes":3,"reading":{"held":{"positions":2}}}"#,
+            ),
+            (
+                BookFlattened::new(
+                    FlattenCause::Halted,
+                    one,
+                    FlatReading::Unread(BrokerFailure::NotPaper),
+                ),
+                r#"{"cause":"halted","closes":1,"reading":{"unread":"not_paper"}}"#,
+            ),
+        ];
+        for (flattened, payload) in lines {
+            let line = format!(r#"{{"event_type":"book_flattened","payload":{payload}}}"#);
+            let observation = Observation::BookFlattened(flattened);
+            assert_eq!(serde_json::to_string(&observation).unwrap(), line);
+            assert_eq!(
+                serde_json::from_str::<Observation>(&line).unwrap(),
                 observation
             );
         }
