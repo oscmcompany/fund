@@ -14,7 +14,7 @@ use crate::common::guard::{
     GuardCause, OrderGuarded, TradabilityRead, TradabilityUnread, Unclosed, guard,
 };
 use crate::common::journal::Observation;
-use crate::common::market::state::LastQuote;
+use crate::common::market::state::MarketState;
 use crate::common::market::{Price, Symbol};
 use crate::common::order::{
     BrokerFailure, ClientOrderId, OrderClosed, OrderExecution, OrderRefused, OrderRequest,
@@ -149,7 +149,7 @@ impl JournalFailure {
 /// Sends the orders that take `book` to `target` that the guard passes at `prices`, sells first, journaling the
 /// held-back ones first and stopping after an unresolved order so none overlaps it. Ids are drawn from `sequence`, and
 /// an open beyond zero is held unless the close before it filled whole. A failed tradability read is journaled and
-/// holds every order as unread; each submission carries its symbol's quote from `quotes`, or that it had none.
+/// holds every order as unread; each submission carries its symbol's top of book from `quotes`, or why it had none.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one independent input an execution runs from"
@@ -161,7 +161,7 @@ pub async fn execute(
     book: &Book,
     target: &Target,
     prices: &BTreeMap<Symbol, Price>,
-    quotes: &BTreeMap<Symbol, LastQuote>,
+    quotes: &MarketState,
     per_name: DollarLimit,
     patience: Patience,
 ) -> Result<Vec<OrderOutcome>, JournalFailure> {
@@ -207,7 +207,7 @@ pub async fn execute(
             continue;
         }
         let request = OrderRequest::new(order.clone(), sequence.draw(journal.run_id()));
-        let quote = quotes.get(request.order().symbol()).copied();
+        let quote = quotes.decision_quote(request.order().symbol());
         if let Err(error) = journal.append(
             Utc::now(),
             Observation::OrderSubmitted(OrderSubmitted::of(&request, quote)),
@@ -269,7 +269,7 @@ pub async fn reconcile_and_close(
     expected: &Book,
     allowance: Allowance,
     prices: &BTreeMap<Symbol, Price>,
-    quotes: &BTreeMap<Symbol, LastQuote>,
+    quotes: &MarketState,
     per_name: DollarLimit,
     patience: Patience,
 ) -> Result<Reconciliation, ReconcileFailure> {
@@ -424,6 +424,7 @@ mod tests {
     use crate::common::book::{Cash, Position, Side};
     use crate::common::guard::{OrderGuarded, Shortability, Tradability};
     use crate::common::journal::{ReadLine, Record, RunId, read};
+    use crate::common::market::state::MarketEvent;
     use crate::common::market::{DollarVolume, Price, Shares, Symbol};
     use crate::common::monoid::{Monoid, concatenate};
     use crate::common::order::{OrderEnding, OrderReport, OrderStatus};
@@ -651,7 +652,7 @@ mod tests {
             &Book::default(),
             target,
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patience,
         )
@@ -793,7 +794,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
-            &BTreeMap::from([(Symbol::new("SPY").unwrap(), LastQuote::of(&quote))]),
+            &MarketState::of(MarketEvent::Quote(quote)),
             wide(),
             patient(),
         )
@@ -819,7 +820,13 @@ mod tests {
                 ),
                 (
                     serde_json::json!("SPY"),
-                    serde_json::json!({"quoted": {"quoted_at": "2026-10-05T14:00:00Z", "bid": 670_000_000, "ask": 670_010_000}})
+                    serde_json::json!({"quoted": {
+                        "quoted_at": "2026-10-05T14:00:00Z",
+                        "bid": 670_000_000,
+                        "ask": 670_010_000,
+                        "bid_size": 1_000_000,
+                        "ask_size": 1_000_000
+                    }})
                 ),
             ]
         );
@@ -1065,7 +1072,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patient(),
         )
@@ -1111,7 +1118,7 @@ mod tests {
             &Book::default(),
             &buying(&["AAPL", "SPY"], 1),
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patient(),
         )
@@ -1252,7 +1259,7 @@ mod tests {
             book,
             &target,
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patient(),
         )
@@ -1318,7 +1325,7 @@ mod tests {
             expected,
             Allowance::NONE,
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patient(),
         )
@@ -1344,7 +1351,7 @@ mod tests {
             &Book::default(),
             &buying(&["SPY"], 1),
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patient(),
         )
@@ -1388,7 +1395,7 @@ mod tests {
             &before,
             &target,
             &BTreeMap::new(),
-            &BTreeMap::new(),
+            &MarketState::empty(),
             wide(),
             patience,
         )
@@ -1497,7 +1504,7 @@ mod tests {
                 from,
                 &Target::new(to),
                 &BTreeMap::new(),
-                &BTreeMap::new(),
+                &MarketState::empty(),
                 wide(),
                 patience((500, 30_000)),
             )
@@ -1667,7 +1674,7 @@ mod tests {
                     &book,
                     &target,
                     &prices,
-                    &BTreeMap::new(),
+                    &MarketState::empty(),
                     wide(),
                     patient(),
                 ))

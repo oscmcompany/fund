@@ -15,7 +15,7 @@ pub use crate::common::market::refusal::{RowRefusal, RowRefusalKind};
 
 use chrono::{DateTime, Utc};
 
-use crate::common::market::record::Bar;
+use crate::common::market::record::{Bar, QuoteRefusal};
 use crate::common::market::{Price, Shares, Symbol};
 use crate::common::monoid::Tally;
 
@@ -150,6 +150,56 @@ pub struct OneSidedQuote {
     pub symbol: Symbol,
     pub timestamp: DateTime<Utc>,
     pub priced: PricedSide,
+}
+
+/// A quote whose bid is above its ask, which is no top of book.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossedQuote {
+    symbol: Symbol,
+    timestamp: DateTime<Utc>,
+    bid: Price,
+    ask: Price,
+}
+
+impl CrossedQuote {
+    /// The quote `Quote::new` refused with `refusal`, which names the crossed sides.
+    pub(crate) fn of(symbol: Symbol, timestamp: DateTime<Utc>, refusal: QuoteRefusal) -> Self {
+        match refusal {
+            QuoteRefusal::Crossed { bid, ask } => Self {
+                symbol,
+                timestamp,
+                bid,
+                ask,
+            },
+        }
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn bid(&self) -> Price {
+        self.bid
+    }
+
+    pub fn ask(&self) -> Price {
+        self.ask
+    }
+
+    /// The quote as the row an archive pass refuses it as.
+    pub fn refused(&self) -> RefusedRow {
+        RefusedRow {
+            ticker: self.symbol.as_str().to_string(),
+            cause: RowRefusal::Quote(QuoteRefusal::Crossed {
+                bid: self.bid,
+                ask: self.ask,
+            }),
+        }
+    }
 }
 
 /// The priced side of a quote `one_sided` accepts, none for any other quote; the priced side is refused when its

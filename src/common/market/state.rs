@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use super::record::{BarInterval, Quote, QuoteRefusal};
 use super::trade_bars::TradeBar;
-use super::{Price, StampedPrice, Symbol};
+use super::{Price, Shares, StampedPrice, Symbol};
 use crate::common::monoid::Monoid;
+use crate::common::order::{DecisionQuote, QuoteAbsence};
 
 /// The latest bars a state keeps for each symbol and interval.
 pub const RETAINED_BARS: usize = 100;
@@ -21,17 +22,63 @@ pub enum MarketEvent {
     Trades(TradeBar),
     /// A top-of-book quote, of which the state keeps each symbol's latest.
     Quote(Quote),
+    /// A quote missing a side, which leaves its symbol with no top of book until a two-sided quote at or after it.
+    OneSided {
+        symbol: Symbol,
+        quoted_at: DateTime<Utc>,
+    },
+    /// A quote with its bid above its ask, which outdates its symbol's top of book as a one-sided quote does.
+    Crossed {
+        symbol: Symbol,
+        quoted_at: DateTime<Utc>,
+        bid: Price,
+        ask: Price,
+    },
+    /// The quote stream stopped, so no symbol has a top of book until a quote for it stamped after `at` is folded.
+    StreamLost {
+        at: DateTime<Utc>,
+    },
     Clock(DateTime<Utc>),
 }
 
+/// A quote that left its symbol with no top of book; ordered by when it was quoted first, so a combine keeps the latest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Outdating {
+    quoted_at: DateTime<Utc>,
+    kind: OutdatingKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OutdatingKind {
+    OneSided,
+    Crossed { bid: Price, ask: Price },
+}
+
+impl Outdating {
+    fn decision(self) -> DecisionQuote {
+        match self.kind {
+            OutdatingKind::OneSided => DecisionQuote::OneSided {
+                quoted_at: self.quoted_at,
+            },
+            OutdatingKind::Crossed { bid, ask } => DecisionQuote::Crossed {
+                quoted_at: self.quoted_at,
+                bid,
+                ask,
+            },
+        }
+    }
+}
+
 /// A symbol's latest quote as a state holds it, its bid never above its ask; ordered by when it was quoted first, so a
-/// combine keeps the latest and breaks a tie on the sides.
+/// combine keeps the latest and breaks a tie on the sides and then the sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedLastQuote")]
 pub struct LastQuote {
     quoted_at: DateTime<Utc>,
     bid: Price,
     ask: Price,
+    bid_size: Shares,
+    ask_size: Shares,
 }
 
 /// A `LastQuote` as read, before its sides are checked.
@@ -40,6 +87,8 @@ struct UncheckedLastQuote {
     quoted_at: DateTime<Utc>,
     bid: Price,
     ask: Price,
+    bid_size: Shares,
+    ask_size: Shares,
 }
 
 impl TryFrom<UncheckedLastQuote> for LastQuote {
@@ -51,6 +100,8 @@ impl TryFrom<UncheckedLastQuote> for LastQuote {
             quoted_at: unchecked.quoted_at,
             bid: unchecked.bid,
             ask: unchecked.ask,
+            bid_size: unchecked.bid_size,
+            ask_size: unchecked.ask_size,
         })
     }
 }
@@ -61,7 +112,17 @@ impl LastQuote {
             quoted_at: quote.timestamp(),
             bid: quote.bid(),
             ask: quote.ask(),
+            bid_size: quote.bid_size(),
+            ask_size: quote.ask_size(),
         }
+    }
+
+    pub fn bid_size(self) -> Shares {
+        self.bid_size
+    }
+
+    pub fn ask_size(self) -> Shares {
+        self.ask_size
     }
 
     pub fn quoted_at(self) -> DateTime<Utc> {
@@ -121,13 +182,17 @@ impl Staleness {
     }
 }
 
-/// The latest clock, each series' latest `RETAINED_BARS` bars, and each symbol's latest quote.
+/// The latest clock, each series' latest `RETAINED_BARS` bars, each symbol's latest quote, and when the quote stream was
+/// last lost.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarketState {
     /// The latest instant a clock event reported; a bar's timestamp names its period, not when it was seen.
     clock: Option<DateTime<Utc>>,
     series: BTreeMap<(Symbol, BarInterval), BTreeMap<DateTime<Utc>, Retained>>,
     quotes: BTreeMap<Symbol, LastQuote>,
+    /// Each symbol's latest one-sided or crossed quote, which outdates any two-sided quote before it.
+    outdated: BTreeMap<Symbol, Outdating>,
+    stream_lost: Option<DateTime<Utc>>,
 }
 
 impl MarketState {
@@ -142,6 +207,29 @@ impl MarketState {
                 quotes: BTreeMap::from([(quote.symbol().clone(), LastQuote::of(&quote))]),
                 ..Self::default()
             },
+            MarketEvent::OneSided { symbol, quoted_at } => Self::outdating(
+                symbol,
+                Outdating {
+                    quoted_at,
+                    kind: OutdatingKind::OneSided,
+                },
+            ),
+            MarketEvent::Crossed {
+                symbol,
+                quoted_at,
+                bid,
+                ask,
+            } => Self::outdating(
+                symbol,
+                Outdating {
+                    quoted_at,
+                    kind: OutdatingKind::Crossed { bid, ask },
+                },
+            ),
+            MarketEvent::StreamLost { at } => Self {
+                stream_lost: Some(at),
+                ..Self::default()
+            },
             MarketEvent::Trades(bar) => Self::retaining(
                 bar.symbol(),
                 bar.interval(),
@@ -150,6 +238,13 @@ impl MarketState {
                     close: bar.sums().open_close().map(|prices| prices.close()),
                 },
             ),
+        }
+    }
+
+    fn outdating(symbol: Symbol, outdating: Outdating) -> Self {
+        Self {
+            outdated: BTreeMap::from([(symbol, outdating)]),
+            ..Self::default()
         }
     }
 
@@ -211,9 +306,43 @@ impl MarketState {
             .collect()
     }
 
-    /// Each symbol's latest quote; a symbol is absent only when none of its quotes was folded.
+    /// Each symbol's latest two-sided quote; a symbol is absent only when none of its two-sided quotes was folded.
+    #[cfg(test)]
     pub fn quotes(&self) -> &BTreeMap<Symbol, LastQuote> {
         &self.quotes
+    }
+
+    /// The symbol's top of book: its latest two-sided quote, unless a one-sided or crossed quote came after it, or the
+    /// stream was lost at or after all of them.
+    pub fn decision_quote(&self, symbol: &Symbol) -> DecisionQuote {
+        let (quote, outdating) = (self.quotes.get(symbol), self.outdated.get(symbol));
+        let latest = quote
+            .map(|quote| quote.quoted_at())
+            .max(outdating.map(|outdating| outdating.quoted_at));
+        match (self.stream_lost, quote, outdating) {
+            (Some(since), _, _) if latest.is_none_or(|latest| latest <= since) => {
+                DecisionQuote::Unquoted {
+                    cause: QuoteAbsence::StreamLost { since },
+                }
+            }
+            (_, Some(quote), Some(outdating)) if outdating.quoted_at > quote.quoted_at() => {
+                outdating.decision()
+            }
+            (_, Some(quote), _) => DecisionQuote::Quoted(*quote),
+            (_, None, Some(outdating)) => outdating.decision(),
+            (_, None, None) => DecisionQuote::Unquoted {
+                cause: QuoteAbsence::NoneFolded,
+            },
+        }
+    }
+
+    /// The latest stamp among the state's quotes, one-sided and crossed included; `None` when it holds no quote.
+    pub fn latest_quoted_at(&self) -> Option<DateTime<Utc>> {
+        self.quotes
+            .values()
+            .map(|quote| quote.quoted_at())
+            .chain(self.outdated.values().map(|outdating| outdating.quoted_at))
+            .max()
     }
 
     fn bars(
@@ -249,6 +378,13 @@ impl Monoid for MarketState {
                 .and_modify(|kept| *kept = (*kept).max(quote))
                 .or_insert(quote);
         }
+        for (symbol, outdating) in other.outdated {
+            self.outdated
+                .entry(symbol)
+                .and_modify(|kept| *kept = (*kept).max(outdating))
+                .or_insert(outdating);
+        }
+        self.stream_lost = self.stream_lost.max(other.stream_lost);
         self
     }
 }
@@ -463,15 +599,20 @@ mod tests {
         }
     }
 
-    /// A quote `minute` minutes after the session's 13:30 UTC open, its sides in ticks.
-    fn quote(raw: &str, minute: i64, bid: i64, ask: i64) -> Quote {
+    /// A quote `minute` minutes after the session's 13:30 UTC open, its sides in ticks and its sizes in whole shares.
+    fn quote(
+        raw: &str,
+        minute: i64,
+        (bid, ask): (i64, i64),
+        (bid_size, ask_size): (u64, u64),
+    ) -> Quote {
         Quote::new(
             symbol(raw),
             "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute),
             Price::from_ticks(bid).unwrap(),
             Price::from_ticks(ask).unwrap(),
-            Shares::whole(1).unwrap(),
-            Shares::whole(1).unwrap(),
+            Shares::whole(bid_size).unwrap(),
+            Shares::whole(ask_size).unwrap(),
         )
         .unwrap()
     }
@@ -479,21 +620,199 @@ mod tests {
     /// A symbol keeps its latest quote whatever order the quotes arrive in, and a symbol never quoted has none.
     #[test]
     fn test_a_symbol_keeps_its_latest_quote() {
-        let early = MarketEvent::Quote(quote("AAPL", 1, 1_000_000, 1_010_000));
-        let late = MarketEvent::Quote(quote("AAPL", 2, 1_020_000, 1_030_000));
+        let early = MarketEvent::Quote(quote("AAPL", 1, (1_000_000, 1_010_000), (500, 600)));
+        let late = MarketEvent::Quote(quote("AAPL", 2, (1_020_000, 1_030_000), (300, 400)));
         for events in [[early.clone(), late.clone()], [late, early]] {
             let state = fold(events);
             assert_eq!(state.quotes().keys().collect::<Vec<_>>(), [&symbol("AAPL")]);
             let kept = state.quotes()[&symbol("AAPL")];
             assert_eq!(
-                (kept.quoted_at(), kept.bid().ticks(), kept.ask().ticks()),
+                (
+                    kept.quoted_at(),
+                    kept.bid().ticks(),
+                    kept.ask().ticks(),
+                    kept.bid_size().units(),
+                    kept.ask_size().units()
+                ),
                 (
                     "2026-09-25T13:32:00Z".parse::<DateTime<Utc>>().unwrap(),
                     1_020_000,
-                    1_030_000
+                    1_030_000,
+                    300_000_000,
+                    400_000_000
                 )
             );
         }
+    }
+
+    /// The instant `minute` minutes after the session's 13:30 UTC open.
+    fn minute_at(minute: i64) -> DateTime<Utc> {
+        "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute)
+    }
+
+    /// A one-sided quote `minute` minutes after the session's 13:30 UTC open.
+    fn one_sided(raw: &str, minute: i64) -> MarketEvent {
+        MarketEvent::OneSided {
+            symbol: symbol(raw),
+            quoted_at: minute_at(minute),
+        }
+    }
+
+    /// A crossed quote `minute` minutes after the session's 13:30 UTC open, its sides in ticks.
+    fn crossed(raw: &str, minute: i64, (bid, ask): (i64, i64)) -> MarketEvent {
+        MarketEvent::Crossed {
+            symbol: symbol(raw),
+            quoted_at: minute_at(minute),
+            bid: Price::from_ticks(bid).unwrap(),
+            ask: Price::from_ticks(ask).unwrap(),
+        }
+    }
+
+    /// A crossed quote after a symbol's two-sided one leaves it with no top of book and names its sides, one at or
+    /// before it leaves the two-sided quote standing, and a crossed quote after a one-sided one is the latest cause.
+    #[test]
+    fn test_a_later_crossed_quote_outdates_the_top_of_book() {
+        let two_sided = quote("AAPL", 2, (1_000_000, 1_010_000), (5, 6));
+        let quoted = DecisionQuote::Quoted(LastQuote::of(&two_sided));
+        let crossed_at = |minute: i64| DecisionQuote::Crossed {
+            quoted_at: minute_at(minute),
+            bid: Price::from_ticks(1_010_001).unwrap(),
+            ask: Price::from_ticks(1_010_000).unwrap(),
+        };
+        for (minute, expected) in [(1, quoted), (2, quoted), (3, crossed_at(3))] {
+            let events = [
+                MarketEvent::Quote(two_sided.clone()),
+                crossed("AAPL", minute, (1_010_001, 1_010_000)),
+            ];
+            for state in [fold(events.clone()), fold(events.into_iter().rev())] {
+                assert_eq!(state.decision_quote(&symbol("AAPL")), expected, "{minute}");
+            }
+        }
+        let events = [
+            MarketEvent::Quote(two_sided),
+            one_sided("AAPL", 3),
+            crossed("AAPL", 4, (1_010_001, 1_010_000)),
+        ];
+        for state in [fold(events.clone()), fold(events.into_iter().rev())] {
+            assert_eq!(state.decision_quote(&symbol("AAPL")), crossed_at(4));
+        }
+    }
+
+    /// A lost stream refuses every symbol until a quote for it stamped after the loss, naming when it was lost: a quote
+    /// stamped at the loss, as the last one delivered before it is, stays refused, and the order of arrival changes
+    /// nothing.
+    #[test]
+    fn test_a_lost_stream_refuses_each_symbol_until_it_quotes_after_the_loss() {
+        let lost = DecisionQuote::Unquoted {
+            cause: QuoteAbsence::StreamLost {
+                since: minute_at(5),
+            },
+        };
+        let held = |events: Vec<MarketEvent>| {
+            let forward = fold(events.clone());
+            assert_eq!(forward, fold(events.into_iter().rev()));
+            ["AAPL", "MSFT", "QQQ"].map(|raw| forward.decision_quote(&symbol(raw)))
+        };
+        let aapl = quote("AAPL", 2, (1_000_000, 1_010_000), (5, 6));
+        let msft_at_loss = quote("MSFT", 5, (2_000_000, 2_010_000), (5, 6));
+        let msft_after = quote("MSFT", 6, (2_000_000, 2_010_000), (5, 6));
+        let before = vec![
+            MarketEvent::Quote(aapl.clone()),
+            MarketEvent::Quote(msft_at_loss.clone()),
+        ];
+        let with = |extra: &[MarketEvent]| {
+            let mut events = before.clone();
+            events.extend_from_slice(extra);
+            events
+        };
+        let loss = MarketEvent::StreamLost { at: minute_at(5) };
+        assert_eq!(
+            held(with(&[])),
+            [
+                DecisionQuote::Quoted(LastQuote::of(&aapl)),
+                DecisionQuote::Quoted(LastQuote::of(&msft_at_loss)),
+                DecisionQuote::Unquoted {
+                    cause: QuoteAbsence::NoneFolded
+                }
+            ]
+        );
+        assert_eq!(held(with(std::slice::from_ref(&loss))), [lost, lost, lost]);
+        assert_eq!(
+            held(with(&[
+                loss.clone(),
+                MarketEvent::Quote(msft_after.clone())
+            ])),
+            [
+                lost,
+                DecisionQuote::Quoted(LastQuote::of(&msft_after)),
+                lost
+            ]
+        );
+        assert_eq!(
+            held(with(&[loss, one_sided("AAPL", 6)])),
+            [
+                DecisionQuote::OneSided {
+                    quoted_at: minute_at(6)
+                },
+                lost,
+                lost
+            ]
+        );
+    }
+
+    /// The latest instant any quote in a state was stamped, one-sided and crossed quotes included, and none for a state
+    /// holding no quote.
+    #[test]
+    fn test_the_latest_quote_time_covers_every_kind_of_quote() {
+        assert_eq!(
+            fold([MarketEvent::Clock(minute_at(9))]).latest_quoted_at(),
+            None
+        );
+        let two_sided = MarketEvent::Quote(quote("AAPL", 2, (1_000_000, 1_010_000), (5, 6)));
+        for (last, expected) in [
+            (one_sided("MSFT", 3), 3),
+            (crossed("MSFT", 4, (2, 1)), 4),
+            (one_sided("MSFT", 1), 2),
+        ] {
+            assert_eq!(
+                fold([two_sided.clone(), last]).latest_quoted_at(),
+                Some(minute_at(expected))
+            );
+        }
+    }
+
+    /// A one-sided quote after a symbol's two-sided one leaves it with no top of book, one at or before it leaves the
+    /// two-sided quote standing, whatever order they arrive in, and a symbol never quoted holds none.
+    #[test]
+    fn test_a_later_one_sided_quote_outdates_the_top_of_book() {
+        let two_sided = quote("AAPL", 2, (1_000_000, 1_010_000), (5, 6));
+        let quoted = DecisionQuote::Quoted(LastQuote::of(&two_sided));
+        let at = |minute: i64| {
+            "2026-09-25T13:30:00Z".parse::<DateTime<Utc>>().unwrap() + TimeDelta::minutes(minute)
+        };
+        for (minute, expected) in [
+            (1, quoted),
+            (2, quoted),
+            (3, DecisionQuote::OneSided { quoted_at: at(3) }),
+        ] {
+            let events = [
+                MarketEvent::Quote(two_sided.clone()),
+                one_sided("AAPL", minute),
+            ];
+            for state in [fold(events.clone()), fold(events.into_iter().rev())] {
+                assert_eq!(state.decision_quote(&symbol("AAPL")), expected, "{minute}");
+            }
+        }
+        assert_eq!(
+            fold([one_sided("AAPL", 3)]).decision_quote(&symbol("AAPL")),
+            DecisionQuote::OneSided { quoted_at: at(3) }
+        );
+        assert_eq!(
+            fold([one_sided("AAPL", 3)]).decision_quote(&symbol("MSFT")),
+            DecisionQuote::Unquoted {
+                cause: QuoteAbsence::NoneFolded
+            }
+        );
     }
 
     /// The clock is the latest reported, whatever order the reports arrive in.
@@ -518,8 +837,13 @@ mod tests {
                 .prop_map(|(raw, minute, close, volume)| MarketEvent::Trades(minute_trade_bar(raw, minute, close, volume))),
             2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_u64..1_000)
                 .prop_map(|(raw, day, close, volume)| MarketEvent::Trades(daily_bar(raw, day, close, volume))),
-            2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_i64..3)
-                .prop_map(|(raw, minute, bid, width)| MarketEvent::Quote(quote(raw, minute, bid, bid + width))),
+            2 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4, 0_i64..3, (1_u64..3, 1_u64..3))
+                .prop_map(|(raw, minute, bid, width, sizes)| MarketEvent::Quote(quote(raw, minute, (bid, bid + width), sizes))),
+            1 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5)
+                .prop_map(|(raw, minute)| one_sided(raw, minute)),
+            1 => (prop::sample::select(vec!["AAPL", "MSFT"]), 0_i64..5, 1_i64..4)
+                .prop_map(|(raw, minute, ask)| crossed(raw, minute, (ask + 1, ask))),
+            1 => (0_i64..5).prop_map(|minute| MarketEvent::StreamLost { at: minute_at(minute) }),
             1 => (0_i64..1_000).prop_map(|minute| MarketEvent::Clock(session().regular_close() + TimeDelta::minutes(minute))),
         ]
     }
@@ -583,6 +907,10 @@ mod tests {
                 .map(|event| match event {
                     MarketEvent::Trades(bar) => bar.timestamp(),
                     MarketEvent::Quote(quote) => quote.timestamp(),
+                    MarketEvent::OneSided { quoted_at, .. } | MarketEvent::Crossed { quoted_at, .. } => {
+                        *quoted_at
+                    }
+                    MarketEvent::StreamLost { at } => *at,
                     MarketEvent::Clock(instant) => *instant,
                 })
                 .collect();

@@ -1107,7 +1107,12 @@ mod tests {
         .held()[0]
             .clone();
         let observations = [
-            Observation::OrderSubmitted(OrderSubmitted::of(&OrderRequest::new(order, id), None)),
+            Observation::OrderSubmitted(OrderSubmitted::of(
+                &OrderRequest::new(order, id),
+                crate::common::order::DecisionQuote::Unquoted {
+                    cause: crate::common::order::QuoteAbsence::NoneFolded,
+                },
+            )),
             Observation::OrderClosed(OrderClosed::of(id, closed).unwrap()),
             Observation::OrderRefused(OrderRefused::new(
                 id,
