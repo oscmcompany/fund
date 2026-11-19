@@ -1293,4 +1293,55 @@ mod tests {
         }
         assert_eq!(account.book().await.unwrap(), before);
     }
+
+    /// On a flat paper account while the market is closed, places one SPY order, reads it as open, asks for every
+    /// position closed, and reads no order open after; refuses a held book rather than close it.
+    #[tokio::test]
+    #[ignore = "trades on the Alpaca paper account; run deliberately under a development secretspec profile"]
+    async fn live_close_all_cancels_open_orders_on_a_flat_paper_account() {
+        let alpaca = Alpaca::from_environment(reqwest::Client::new()).unwrap();
+        let clock: serde_json::Value = parse(
+            &with_retries(|| send(alpaca.trading(Method::GET, "/v2/clock")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            clock["is_open"], false,
+            "run while the market is closed, so the order cannot fill"
+        );
+        let account = PaperAccount::new(alpaca).unwrap();
+        let before = account.book().await.unwrap();
+        assert!(
+            before.positions().is_empty(),
+            "the paper book holds positions; this test only closes orders"
+        );
+        assert!(
+            !account.any_order_open().await.unwrap(),
+            "an order is already open"
+        );
+        let spy = Symbol::new("SPY").unwrap();
+        let order = orders(
+            &Book::empty(),
+            &Target::new(BTreeMap::from([(spy, Shares::whole(1).unwrap())])),
+        )
+        .remove(0);
+        let id = ClientOrderId::new(RunId::new(Uuid::new_v4()), 0);
+        account.submit(&OrderRequest::new(order, id)).await.unwrap();
+        assert!(account.any_order_open().await.unwrap());
+        account.close_all().await.unwrap();
+        let mut open = true;
+        for _ in 0..20 {
+            open = account.any_order_open().await.unwrap();
+            match open {
+                true => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                false => break,
+            }
+        }
+        assert!(
+            !open,
+            "close_all left the order open; cancel it on the paper account by hand"
+        );
+        assert_eq!(account.book().await.unwrap(), before);
+    }
 }
