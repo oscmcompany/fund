@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::common::book::{Book, Side};
@@ -119,14 +120,16 @@ impl OrderGuarded {
     }
 }
 
-/// The tradability the broker reported for every symbol an execution would trade, and the shortability of each it
-/// lists, journaled each time an execution guards with one; a broker may have read it earlier in the run, so the
-/// record's time is when it was used rather than when the borrow was read.
+/// The tradability the broker reported for every symbol an execution would trade, the shortability of each it lists,
+/// and when each was read where a broker stamped it, journaled each time an execution guards with one; a reading kept
+/// from earlier in the run carries the time it was taken, not the record's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradabilityRead {
     readings: BTreeMap<Symbol, Tradability>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     shortability: BTreeMap<Symbol, Shortability>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    read_at: BTreeMap<Symbol, DateTime<Utc>>,
 }
 
 impl TradabilityRead {
@@ -137,7 +140,18 @@ impl TradabilityRead {
         Self {
             readings,
             shortability,
+            read_at: BTreeMap::new(),
         }
+    }
+
+    /// This read with every symbol it holds stamped as read at `at`.
+    pub fn stamped(mut self, at: DateTime<Utc>) -> Self {
+        self.read_at = self
+            .readings
+            .keys()
+            .map(|symbol| (symbol.clone(), at))
+            .collect();
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -151,6 +165,10 @@ impl TradabilityRead {
             .cloned()
             .partition(|symbol| self.readings.contains_key(symbol));
         let held = Self {
+            read_at: read
+                .iter()
+                .filter_map(|symbol| Some((symbol.clone(), *self.read_at.get(symbol)?)))
+                .collect(),
             shortability: read
                 .iter()
                 .filter_map(|symbol| Some((symbol.clone(), *self.shortability.get(symbol)?)))
@@ -176,9 +194,11 @@ impl Monoid for TradabilityRead {
     fn combine(mut self, other: Self) -> Self {
         for symbol in other.readings.keys() {
             self.shortability.remove(symbol);
+            self.read_at.remove(symbol);
         }
         self.readings.extend(other.readings);
         self.shortability.extend(other.shortability);
+        self.read_at.extend(other.read_at);
         self
     }
 }
@@ -1046,13 +1066,18 @@ mod tests {
         let borrow = prop::option::of(prop::sample::select(
             Shortability::iter().collect::<Vec<_>>(),
         ));
-        prop::collection::vec((reading, borrow), 3).prop_map(move |rows| {
+        let stamp = prop::option::of(0..1_000_i64);
+        prop::collection::vec((reading, borrow, stamp), 3).prop_map(move |rows| {
             let mut read = TradabilityRead::default();
-            for (symbol, (reading, borrow)) in names.iter().zip(rows) {
+            for (symbol, (reading, borrow, stamp)) in names.iter().zip(rows) {
                 if let Some(reading) = reading {
                     read.readings.insert(symbol.clone(), reading);
                     if let Some(borrow) = borrow {
                         read.shortability.insert(symbol.clone(), borrow);
+                    }
+                    if let Some(seconds) = stamp {
+                        let at = DateTime::UNIX_EPOCH + chrono::TimeDelta::seconds(seconds);
+                        read.read_at.insert(symbol.clone(), at);
                     }
                 }
             }
@@ -1087,15 +1112,16 @@ mod tests {
         }
     }
 
-    /// A later read of a name replaces the earlier whole, its borrow dropped when the later read has none, and a split
-    /// names exactly the symbols never read.
+    /// A later read of a name replaces the earlier whole, its borrow and read time dropped when the later read has none,
+    /// and a split names exactly the symbols never read.
     #[test]
     fn test_a_later_read_replaces_a_name_whole_and_a_split_names_the_unread() {
         let (aaa, bbb) = (Symbol::new("AAA").unwrap(), Symbol::new("BBB").unwrap());
         let earlier = TradabilityRead::new(
             BTreeMap::from([(aaa.clone(), Tradability::Fractionable)]),
             BTreeMap::from([(aaa.clone(), Shortability::EasyToBorrow)]),
-        );
+        )
+        .stamped(DateTime::UNIX_EPOCH);
         let later = TradabilityRead::new(
             BTreeMap::from([(aaa.clone(), Tradability::Untradable)]),
             BTreeMap::new(),

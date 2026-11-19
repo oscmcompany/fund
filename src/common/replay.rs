@@ -21,9 +21,10 @@ use crate::common::monoid::{Monoid, concatenate};
 use crate::common::problem::formulate;
 use crate::common::risk::{Cut, Limits, NameLosses};
 use crate::common::solver::Solver;
-use crate::common::strategy::{Order, Strategy, orders};
-use crate::common::time::SessionDate;
+use crate::common::standing::{BookFlattened, FlatReading, Standing, backstop_at, backstop_due};
+use crate::common::strategy::{Order, Strategy, Target, orders};
 use crate::common::time::calendar::TradingCalendar;
+use crate::common::time::{SessionDate, SessionRange};
 
 /// The price an order reaching `bar` fills at, absent when the bar holds no priced print.
 fn opening_price(bar: &TradeBar) -> Option<Price> {
@@ -93,6 +94,8 @@ pub enum UnfilledCause {
     InsufficientCash { needed: DollarVolume, held: Cash },
     /// The stream ended before another bar arrived.
     EndOfData,
+    /// The backstop closed the book before the next bar it would have filled at.
+    Flattened,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +196,27 @@ impl Restraint {
             .collect();
         TradabilityRead::new(readings, BTreeMap::new())
     }
+
+    /// The close of each session whose backstop falls at or after `reached` and before `ends`, where a step to `ends`
+    /// runs it first, so each runs once however the stream is cut into stretches.
+    fn backstops_crossed(
+        &self,
+        reached: Option<DateTime<Utc>>,
+        ends: DateTime<Utc>,
+    ) -> Vec<DateTime<Utc>> {
+        let last = SessionDate::at(ends);
+        let first = reached.map_or(last, SessionDate::at);
+        let sessions = SessionRange::new(first, last).expect("a step ends after what it reached");
+        self.calendar
+            .trading_days_in_range(sessions)
+            .into_iter()
+            .filter_map(|date| Some(self.calendar.session(date)?.hours().1))
+            .filter(|close| {
+                let at = backstop_at(*close);
+                reached.is_none_or(|reached| reached <= at) && at < ends
+            })
+            .collect()
+    }
 }
 
 /// Why a replayer was refused its controls.
@@ -233,6 +257,8 @@ pub struct Replay {
     /// Under restraint, what the solver cut at each decision, or why risk could not judge it and nothing was sent.
     restraints: BTreeMap<DateTime<Utc>, Result<Vec<Cut>, ValuationRefusal>>,
     held: Vec<(DateTime<Utc>, OrderGuarded)>,
+    /// Under restraint, each session's backstop and what the book held after it, as the trader journals it live.
+    flattened: Vec<(DateTime<Utc>, BookFlattened)>,
 }
 
 /// Why a stretch of bars was refused.
@@ -277,6 +303,7 @@ impl Replay {
             losses: None,
             restraints: BTreeMap::new(),
             held: Vec::new(),
+            flattened: Vec::new(),
         }
     }
 
@@ -315,6 +342,32 @@ impl Replay {
     /// was due to fill after its symbol's close did not.
     pub fn held(&self) -> &[(DateTime<Utc>, OrderGuarded)] {
         &self.held
+    }
+
+    /// Under restraint, each session's backstop: when it ran and what the book held once every position was closed at
+    /// the last price before it.
+    pub fn flattened(&self) -> &[(DateTime<Utc>, BookFlattened)] {
+        &self.flattened
+    }
+
+    /// Whether `session`'s backstop has run, read from the last since backstops run in order.
+    fn flattened_in(&self, session: SessionDate) -> bool {
+        self.flattened
+            .last()
+            .is_some_and(|(at, _)| SessionDate::at(*at) == session)
+    }
+
+    /// Folds `fill` into the book, its name's share and the session's losses.
+    fn take(&mut self, fill: Fill) {
+        self.book = std::mem::take(&mut self.book).combine(Book::of(&fill));
+        let name = self.names.remove(fill.symbol()).unwrap_or_default();
+        self.names
+            .insert(fill.symbol().clone(), name.combine(Book::of(&fill)));
+        match &mut self.losses {
+            Some((_, Ok(losses))) => losses.take(&fill),
+            Some((_, Err(_))) | None => {}
+        }
+        self.fills.push(fill);
     }
 
     /// Each marked session's return from the previous session's last mark, or `opening` before the first, to its own
@@ -467,8 +520,17 @@ impl<S: Strategy> Replayer<S> {
             .fold(replay, |replay, (ends, bars)| self.step(replay, ends, bars)))
     }
 
-    /// When a decision bar closes here, fills the pending orders at these bars' opens, folds the bars in and decides.
+    /// Runs each backstop this step crosses; then, when a decision bar closes here, fills the pending orders at these
+    /// bars' opens, folds the bars in and decides, unless the session's backstop has run.
     fn step(&self, mut replay: Replay, ends: DateTime<Utc>, bars: Vec<TradeBar>) -> Replay {
+        match &self.controls {
+            Controls::Unrestrained => {}
+            Controls::Restrained(restraint) => {
+                for close in restraint.backstops_crossed(replay.reached, ends) {
+                    replay = self.flatten(replay, close);
+                }
+            }
+        }
         let decides = bars.iter().any(|bar| bar.interval() == self.decision);
         let pending = if decides {
             std::mem::take(&mut replay.pending)
@@ -502,18 +564,7 @@ impl<S: Strategy> Replayer<S> {
             let filled = self.fill(&replay.book, order.clone(), opening, ends);
             unclosed.record(&order, filled.is_ok());
             match filled {
-                Ok(fill) => {
-                    replay.book = replay.book.combine(Book::of(&fill));
-                    let name = replay.names.remove(fill.symbol()).unwrap_or_default();
-                    replay
-                        .names
-                        .insert(fill.symbol().clone(), name.combine(Book::of(&fill)));
-                    match &mut replay.losses {
-                        Some((_, Ok(losses))) => losses.take(&fill),
-                        Some((_, Err(_))) | None => {}
-                    }
-                    replay.fills.push(fill);
-                }
+                Ok(fill) => replay.take(fill),
                 Err(unfilled) => replay.unfilled.push(unfilled),
             }
         }
@@ -539,6 +590,9 @@ impl<S: Strategy> Replayer<S> {
                 })
                 .collect();
             replay.name_marks.insert(ends, name_marks);
+            if replay.flattened_in(session) {
+                return replay;
+            }
             let wanted = self.strategy.decide(state, &replay.book);
             replay.pending = match &self.controls {
                 Controls::Unrestrained => orders(&replay.book, &wanted),
@@ -614,11 +668,71 @@ impl<S: Strategy> Replayer<S> {
                 cause: UnfilledCause::NoPrice,
             });
         };
-        let notional = DollarVolume::of(price, order.shares());
-        let cost = self.fill_model.charge(notional);
+        self.fill_at(book, order, price, bar.timestamp(), at)
+    }
+
+    /// Closes every position the book holds at the backstop before `close`, at each name's last price before it, as
+    /// the trader's close request does live: orders pending then are canceled by it, and a short is covered whatever
+    /// cash the book holds, since the broker covers it on the account's margin.
+    fn flatten(&self, mut replay: Replay, close: DateTime<Utc>) -> Replay {
+        let at = backstop_at(close);
+        let cause = backstop_due(
+            &Standing::Trading,
+            replay.flattened_in(SessionDate::at(at)),
+            close,
+            at,
+        )
+        .expect("a trading session's backstop falls due at its own instant");
+        replay
+            .unfilled
+            .extend(replay.pending.drain(..).map(|order| Unfilled {
+                order,
+                at,
+                cause: UnfilledCause::Flattened,
+            }));
+        let closing: Vec<(Order, Option<Price>)> = orders(&replay.book, &Target::default())
+            .into_iter()
+            .map(|order| {
+                let price = replay.state.last_price(order.symbol(), self.decision);
+                (order, price)
+            })
+            .collect();
+        for (order, price) in closing {
+            let filled = match price {
+                Some(price) => Ok(self.priced(&order, price, at)),
+                None => Err(Unfilled {
+                    order,
+                    at,
+                    cause: UnfilledCause::NoPrice,
+                }),
+            };
+            match filled {
+                Ok(fill) => replay.take(fill),
+                Err(unfilled) => replay.unfilled.push(unfilled),
+            }
+        }
+        let reading = match replay.book.positions().len() {
+            0 => FlatReading::Flat,
+            positions => FlatReading::Held { positions },
+        };
+        let flattened = BookFlattened::new(cause, NonZeroU32::MIN, reading);
+        replay.flattened.push((at, flattened));
+        replay
+    }
+
+    /// Fills `order` at `price`, stamped `timestamp`, unless a buy needs more cash than `book` holds.
+    fn fill_at(
+        &self,
+        book: &Book,
+        order: Order,
+        price: Price,
+        timestamp: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Result<Fill, Unfilled> {
+        let fill = self.priced(&order, price, timestamp);
         match order.side() {
             Side::Buy => {
-                let needed = notional.plus(cost);
+                let needed = fill.notional().plus(fill.cost());
                 let held = book.cash();
                 if i128::try_from(needed.units()).map_or(true, |units| units > held.units()) {
                     return Err(Unfilled {
@@ -630,15 +744,23 @@ impl<S: Strategy> Replayer<S> {
             }
             Side::Sell => {}
         }
-        Ok(Fill::new(
-            bar.timestamp(),
+        Ok(fill)
+    }
+
+    /// `order` filled whole at `price`, stamped `timestamp` and charged the fill model's cost, whatever cash it needs.
+    fn priced(&self, order: &Order, price: Price, timestamp: DateTime<Utc>) -> Fill {
+        let cost = self
+            .fill_model
+            .charge(DollarVolume::of(price, order.shares()));
+        Fill::new(
+            timestamp,
             order.symbol().clone(),
             order.side(),
             order.shares(),
             price,
             cost,
         )
-        .expect("a charge is at most its notional"))
+        .expect("a charge is at most its notional")
     }
 }
 
@@ -1199,6 +1321,131 @@ mod tests {
             [Cut::OutsideTradingWindow { .. }]
         ));
         assert_eq!(one_minute_of(Controls::Unrestrained, 10).fills().len(), 1);
+    }
+
+    /// A share still held when a step crosses the backstop is sold at its last price two minutes before the close, as
+    /// the trader's close request sells it live, and the session decides nothing after; an unrestrained replay has no
+    /// calendar and so no backstop.
+    #[test]
+    fn test_a_restrained_replay_closes_what_it_holds_at_the_backstop() {
+        let bars = [
+            bar(
+                "AAPL",
+                BarInterval::OneMinute,
+                before_close(120),
+                1000,
+                1000,
+            ),
+            bar(
+                "AAPL",
+                BarInterval::OneMinute,
+                before_close(119),
+                1000,
+                1100,
+            ),
+            bar("MSFT", BarInterval::OneMinute, before_close(1), 1000, 1000),
+        ];
+        let replay = |controls: Controls| {
+            Replayer::controlled(
+                Hold(vec![("AAPL", 1)]),
+                free(),
+                BarInterval::OneMinute,
+                controls,
+            )
+            .unwrap()
+            .act(Replay::open(Book::funded(cash(100))), bars.clone())
+            .unwrap()
+            .finish()
+        };
+        let restrained = replay(restraint(BTreeMap::new()));
+        assert_eq!(
+            restrained.flattened(),
+            [(
+                before_close(2),
+                BookFlattened::new(
+                    crate::common::standing::FlattenCause::ClosingBackstop,
+                    NonZeroU32::MIN,
+                    FlatReading::Flat
+                )
+            )]
+        );
+        assert!(restrained.book().positions().is_empty());
+        let sold = restrained.fills().last().unwrap();
+        assert_eq!(
+            (sold.side(), sold.filled_against(), sold.price()),
+            (
+                Side::Sell,
+                before_close(2),
+                Price::from_ticks(1100).unwrap()
+            )
+        );
+        assert!(!restrained.restraints().contains_key(&day(0)));
+        let unrestrained = replay(Controls::Unrestrained);
+        assert!(unrestrained.flattened().is_empty());
+        assert!(!unrestrained.book().positions().is_empty());
+    }
+
+    /// Monday to Wednesday's backstops each run once however the stretch is cut, a cut landing on a backstop leaving it
+    /// to the step after, and Tuesday's runs though no step ends inside it.
+    #[test]
+    fn test_each_backstop_is_crossed_once_however_the_stream_is_cut() {
+        let days: Vec<SessionDate> = (0..3).map(|offset| SessionDate::at(day(offset))).collect();
+        let sessions = days
+            .iter()
+            .map(|date| {
+                crate::common::time::calendar::TradingSession::new(
+                    *date,
+                    chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+                    chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let calendar =
+            TradingCalendar::new(sessions, SessionRange::new(days[0], days[2]).unwrap()).unwrap();
+        let limits = Limits::new(
+            cash(1_000),
+            cash(1_000),
+            cash(1_000),
+            cash(1_000),
+            TimeDelta::minutes(15),
+        )
+        .unwrap();
+        let restraint = Restraint::new(
+            limits,
+            calendar,
+            BTreeMap::new(),
+            Staleness::new(TimeDelta::minutes(2)).unwrap(),
+        );
+        let backstop = |offset: i64| day(offset) - TimeDelta::minutes(2);
+        let crossed = |cuts: &[DateTime<Utc>]| {
+            let mut reached = None;
+            let mut closes = Vec::new();
+            for &ends in cuts {
+                closes.extend(restraint.backstops_crossed(reached, ends));
+                reached = Some(ends);
+            }
+            closes
+        };
+        let whole = [day(0), day(1), day(2)];
+        let ends = day(2) + TimeDelta::minutes(1);
+        assert_eq!(crossed(&[ends]), [day(2)]);
+        assert_eq!(crossed(&[day(0) - TimeDelta::hours(6), ends]), whole);
+        assert_eq!(
+            crossed(&[backstop(0) - TimeDelta::minutes(1), backstop(0), ends]),
+            whole
+        );
+        assert_eq!(
+            restraint.backstops_crossed(Some(backstop(0)), backstop(0) + TimeDelta::seconds(1)),
+            [day(0)]
+        );
+        assert_eq!(
+            restraint.backstops_crossed(
+                Some(day(0) - TimeDelta::minutes(1)),
+                day(2) - TimeDelta::hours(1)
+            ),
+            [day(1)]
+        );
     }
 
     /// The guard holds the untradable buy at each decision, as the trader retries it each tick.

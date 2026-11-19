@@ -11,6 +11,7 @@ use crate::common::book::{Book, Cash, Fill, Position, Side};
 use crate::common::guard::{Shortability, Tradability, TradabilityRead};
 use crate::common::market::DollarVolume;
 use crate::common::market::{PRICE_SCALE, Price, SHARE_SCALE, Shares, Symbol, SymbolRefusal};
+use crate::common::monoid::Monoid;
 use crate::common::order::{
     BrokerFailure, ClientOrderId, LimitPrice, OrderEnding, OrderExecution, OrderReport,
     OrderRequest, OrderStatus,
@@ -49,6 +50,9 @@ pub trait Broker {
     /// Asks the broker to cancel every open order and close every position at the market, as orders the journal does
     /// not record; `Ok` proves only that the request was taken, so the book is read back to see it flat.
     fn close_all(&self) -> impl Future<Output = Result<(), BrokerError>> + Send;
+
+    /// Whether the account has any order open, which a further close request would cancel and could close against.
+    fn any_order_open(&self) -> impl Future<Output = Result<bool, BrokerError>> + Send;
 }
 
 /// Digits after the point in a `Cash` unit: ticks times millionths of a share.
@@ -495,8 +499,8 @@ impl Broker for PaperAccount {
         canceled(with_retries(|| send(self.alpaca.trading(Method::DELETE, &path))).await)
     }
 
-    /// Asks Alpaca once to cancel open orders and then close every position, never retried, since a resend cancels
-    /// the closes the first one sent and sizes new ones from a position they may be filling against.
+    /// Asks Alpaca once to cancel open orders and then close every position. Never retried here, since a resend while
+    /// the first request's closes are open cancels them and sizes new ones from a position they may be filling against.
     async fn close_all(&self) -> Result<(), BrokerError> {
         let request = self
             .alpaca
@@ -509,19 +513,39 @@ impl Broker for PaperAccount {
         }
     }
 
-    /// What Alpaca reports of each symbol's trading and short sale, one asset read apiece.
+    /// Whether Alpaca lists any open order, read through transient failures.
+    async fn any_order_open(&self) -> Result<bool, BrokerError> {
+        let body = with_retries(|| {
+            send(
+                self.alpaca
+                    .trading(Method::GET, "/v2/orders")
+                    .query(&[("status", "open"), ("limit", "1")]),
+            )
+        })
+        .await?;
+        let orders: Vec<serde::de::IgnoredAny> =
+            serde_json::from_slice(&body).map_err(|_| BrokerError::Malformed {
+                field: "orders",
+                raw: String::from_utf8_lossy(&body).into_owned(),
+            })?;
+        Ok(!orders.is_empty())
+    }
+
+    /// What Alpaca reports of each symbol's trading and short sale, one asset read apiece, each stamped when it was read.
     async fn tradability(&self, symbols: &[Symbol]) -> Result<TradabilityRead, BrokerError> {
-        let (mut readings, mut shortability) = (BTreeMap::new(), BTreeMap::new());
+        let mut read = TradabilityRead::empty();
         for symbol in symbols {
             let path = format!("/v2/assets/{}", symbol.as_str());
             let outcome = with_retries(|| send(self.alpaca.trading(Method::GET, &path))).await;
             let (tradability, borrow) = asset(outcome)?;
-            readings.insert(symbol.clone(), tradability);
-            if let Some(borrow) = borrow {
-                shortability.insert(symbol.clone(), borrow);
-            }
+            let shortability = borrow.map(|borrow| (symbol.clone(), borrow));
+            let one = TradabilityRead::new(
+                BTreeMap::from([(symbol.clone(), tradability)]),
+                shortability.into_iter().collect(),
+            );
+            read = read.combine(one.stamped(Utc::now()));
         }
-        Ok(TradabilityRead::new(readings, shortability))
+        Ok(read)
     }
 }
 

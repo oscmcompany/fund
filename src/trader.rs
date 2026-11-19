@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
+use tokio::time::Instant;
 
 use crate::broker::Broker;
 use crate::common::book::{Book, Cash, Fill, ValuationRefusal};
@@ -22,7 +23,8 @@ use crate::common::problem::formulate;
 use crate::common::reconcile::rounding_allowance;
 use crate::common::risk::{Limits, NameLosses, TargetDecided};
 use crate::common::solver::Solver;
-use crate::common::standing::{BookFlattened, FlattenCause, HaltCause, SessionHalted};
+pub use crate::common::standing::Standing;
+use crate::common::standing::{BookFlattened, HaltCause, SessionHalted, backstop_at, backstop_due};
 use crate::common::strategy::Strategy;
 use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
@@ -43,18 +45,7 @@ const OPENING_WAIT: TimeDelta = RECHECK_AFTER;
 
 const MINUTE: TimeDelta = TimeDelta::minutes(1);
 
-/// How long before the close a session closes whatever it still holds through the broker, decisions or none.
-const FLAT_BACKSTOP: TimeDelta = TimeDelta::minutes(2);
-
 pub mod parameters;
-
-/// Runs `work` to its end, or for at most `limit` when there is one, returning `None` when the limit cut it off.
-async fn within<T>(limit: Option<Duration>, work: impl Future<Output = T>) -> Option<T> {
-    match limit {
-        Some(limit) => tokio::time::timeout(limit, work).await.ok(),
-        None => Some(work.await),
-    }
-}
 
 /// How often a session decides: the bars it decides at the end of, always within the day.
 #[derive(
@@ -252,13 +243,6 @@ struct Recheck {
     rows: usize,
 }
 
-/// Whether a session still decides, or the cause of its first halt, after which it decides nothing more.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Standing {
-    Trading,
-    Halted(HaltCause),
-}
-
 /// A halt on a journal write refused with `error`.
 fn journal_refused(error: &std::io::Error) -> HaltCause {
     HaltCause::JournalRefused {
@@ -341,10 +325,10 @@ impl<S: Strategy> Session<S> {
     }
 
     /// Builds every minute whose wait has passed by the clock, and once a decision bar is built, trades the book toward
-    /// the strategy's target within the limits and reconciles it with the broker's; closes every position through the
-    /// broker once halted or `FLAT_BACKSTOP` before the close; then reads again each built minute due a recheck. A late
-    /// call decides once, for the latest bar built, rather than for each it passed, and reads still waiting when the
-    /// backstop falls due are left so they cannot hold it past the close.
+    /// the strategy's target within the limits and reconciles it with the broker's, then reads again each built minute
+    /// due a recheck; closes every position through the broker once halted or `FLAT_BACKSTOP` before the close. A late
+    /// call decides once, for the latest bar built, rather than for each it passed, and work still running when the
+    /// backstop falls due is dropped so it cannot hold the backstop past the close.
     pub async fn advance(
         &mut self,
         clock: &impl Fn() -> DateTime<Utc>,
@@ -354,50 +338,62 @@ impl<S: Strategy> Session<S> {
     ) -> Result<(), SessionError> {
         let started = clock();
         self.fold_in(MarketEvent::Clock(started));
-        // A backstop already due runs before any read that could hold it past the close.
+        // A backstop already due runs before any read, so a step past it cannot act before it.
         self.backstop(clock, broker, journal).await;
-        let until_backstop = self.until_backstop(started);
-        let decided = match within(until_backstop, self.build(started, tape, journal)).await {
-            Some(Ok(())) => {
+        let deadline = match (&self.flattened, started < self.close) {
+            (None, true) => Some(
+                Instant::now()
+                    + (backstop_at(self.close) - started)
+                        .to_std()
+                        .unwrap_or(Duration::ZERO),
+            ),
+            (Some(_), _) | (None, false) => None,
+        };
+        let stepped = match deadline {
+            // Biased toward the step, so a step that finishes without waiting is never dropped for a lapsed deadline.
+            Some(deadline) => tokio::select! {
+                biased;
+                stepped = self.step(started, clock, tape, broker, journal) => stepped,
+                () = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!("Step left for the backstop");
+                    Ok(())
+                }
+            },
+            None => self.step(started, clock, tape, broker, journal).await,
+        };
+        self.backstop(clock, broker, journal).await;
+        stepped
+    }
+
+    /// Builds, decides and, unless halted so the backstop runs at once, rechecks; dropped at any await, it leaves the
+    /// session as the last finished change left it, with an order in flight then canceled or closed out by the
+    /// backstop's close request.
+    async fn step(
+        &mut self,
+        started: DateTime<Utc>,
+        clock: &impl Fn() -> DateTime<Utc>,
+        tape: &impl MinuteTape,
+        broker: &impl Broker,
+        journal: &mut Journal,
+    ) -> Result<(), SessionError> {
+        let decided = match self.build(started, tape, journal).await {
+            Ok(()) => {
                 // Building awaits REST, so the decision reads the clock again rather than trusting when it began.
                 let now = clock();
                 self.fold_in(MarketEvent::Clock(now));
                 self.decide(now, broker, journal).await
             }
-            Some(Err(error)) => Err(error),
-            None => {
-                tracing::warn!("Building left for the backstop");
-                Ok(())
-            }
+            Err(error) => Err(error),
         };
-        self.backstop(clock, broker, journal).await;
-        let now = clock();
-        let until_backstop = self.until_backstop(now);
-        if within(until_backstop, self.recheck(now, tape))
-            .await
-            .is_none()
-        {
-            tracing::warn!("Recheck left for the backstop");
+        match self.standing {
+            Standing::Trading => self.recheck(clock(), tape).await,
+            Standing::Halted(_) => {}
         }
         decided
     }
 
-    /// How long reads may run before the backstop falls due, or `None` when they are unbounded because the backstop has
-    /// run or the close has passed.
-    fn until_backstop(&self, now: DateTime<Utc>) -> Option<Duration> {
-        match (&self.flattened, now < self.close) {
-            (None, true) => Some(
-                (self.close - FLAT_BACKSTOP - now)
-                    .to_std()
-                    .unwrap_or(Duration::ZERO),
-            ),
-            (Some(_), _) | (None, false) => None,
-        }
-    }
-
-    /// Closes every position through the broker when the session has halted or the close is `FLAT_BACKSTOP` away,
-    /// retrying until the book reads flat or the close passes, journaling each attempt; then never again, nor past the
-    /// close, where orders would rest a session.
+    /// Closes every position through the broker once `backstop_due` says so, retrying until the book reads flat or the
+    /// close passes, journaling each reading; then never again.
     async fn backstop(
         &mut self,
         clock: &impl Fn() -> DateTime<Utc>,
@@ -405,15 +401,13 @@ impl<S: Strategy> Session<S> {
         journal: &mut Journal,
     ) {
         let now = clock();
-        let left = match (self.flattened.is_some(), (self.close - now).to_std()) {
-            (false, Ok(left)) if !left.is_zero() => left,
-            (true, _) | (false, Ok(_) | Err(_)) => return,
+        let cause = match backstop_due(&self.standing, self.flattened.is_some(), self.close, now) {
+            Some(cause) => cause,
+            None => return,
         };
-        let cause = match (&self.standing, now >= self.close - FLAT_BACKSTOP) {
-            (Standing::Halted(_), _) => FlattenCause::Halted,
-            (Standing::Trading, true) => FlattenCause::ClosingBackstop,
-            (Standing::Trading, false) => return,
-        };
+        let left = (self.close - now)
+            .to_std()
+            .expect("a backstop falls due only before the close");
         let patience = self.settings.patience;
         self.flattened = Some(flatten(broker, journal, clock, cause, patience, left).await);
     }
@@ -831,6 +825,7 @@ mod tests {
     }
 
     /// A strategy that always wants one SPY share.
+    #[derive(Clone)]
     struct OneShare;
 
     impl Strategy for OneShare {
@@ -852,6 +847,8 @@ mod tests {
         last: Mutex<Option<BrokerOrder>>,
         /// How many times every position was asked closed.
         closes: Mutex<u32>,
+        /// How long each submission takes to answer.
+        submit_takes: Duration,
     }
 
     impl Filling {
@@ -864,12 +861,14 @@ mod tests {
                 book: Mutex::new(book),
                 last: Mutex::new(None),
                 closes: Mutex::new(0),
+                submit_takes: Duration::ZERO,
             }
         }
     }
 
     impl Broker for Filling {
         async fn submit(&self, request: &OrderRequest) -> Result<BrokerOrder, BrokerError> {
+            tokio::time::sleep(self.submit_takes).await;
             let order = request.order();
             let price = Price::from_ticks(*self.ticks.lock().unwrap()).unwrap();
             if !self.fills {
@@ -947,6 +946,11 @@ mod tests {
             let mut book = self.book.lock().unwrap();
             *book = Book::funded(book.value(|_| Some(price)).unwrap());
             Ok(())
+        }
+
+        /// Every order fills on submit, so none is ever open.
+        async fn any_order_open(&self) -> Result<bool, BrokerError> {
+            Ok(false)
         }
     }
 
@@ -1601,8 +1605,8 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A halted session decides nothing more, so it closes every position through the broker at once rather than hold
-    /// them to the close, journals what the broker held after, and never closes again.
+    /// A halted session decides nothing more, so it closes every position through the broker at once, before a recheck
+    /// then due, rather than hold them to the close, journals what the broker held after, and never closes again.
     #[tokio::test(start_paused = true)]
     async fn test_a_halted_session_closes_every_position() {
         let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
@@ -1619,6 +1623,7 @@ mod tests {
         assert_eq!(session.standing(), &Standing::Halted(HaltCause::Diverged));
         assert_eq!(*broker.closes.lock().unwrap(), 1);
         assert!(broker.book.lock().unwrap().positions().is_empty());
+        assert_eq!(tape.times_asked("14:00:00", "14:01:00"), 1);
         let events = journaled(&directory);
         assert_eq!(
             events[events.len() - 2..],
@@ -1702,6 +1707,49 @@ mod tests {
             .map(|record| record.timestamp())
             .collect::<Vec<_>>();
         assert_eq!(flattened, [at("19:58:00")]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A decision whose order goes unanswered for an hour, as one retrying through an outage would, is dropped when the
+    /// backstop falls due, so the book is still closed out two minutes before the close.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_stalled_decision_does_not_delay_the_backstop() {
+        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
+        let funded = Book::funded(dollars(10_000));
+        let mut broker = Filling::new(701_000_000, funded.clone());
+        broker.submit_takes = Duration::from_secs(3_600);
+        let limits = Limits::new(
+            dollars(10_000),
+            dollars(5_000),
+            dollars(1_000),
+            dollars(1_000),
+            TimeDelta::zero(),
+        )
+        .unwrap();
+        let mut session = session_limited(
+            TimeDelta::minutes(5),
+            funded,
+            limits,
+            at("19:50:00"),
+            DecisionInterval::FiveMinute,
+        );
+        let (mut journal, directory) = journal();
+        let tape = Scripted::default();
+        tape.file(print("19:54:30", 701_000_000));
+        let started = tokio::time::Instant::now();
+        let clock = || at("19:55:02") + TimeDelta::from_std(started.elapsed()).unwrap();
+        session
+            .advance(&clock, &tape, &broker, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(*broker.closes.lock().unwrap(), 1);
+        let flattened = records(&directory)
+            .into_iter()
+            .filter(|record| record.observation().event_type() == "book_flattened")
+            .map(|record| record.timestamp())
+            .collect::<Vec<_>>();
+        assert_eq!(flattened, [at("19:58:00")]);
+        assert!(journaled(&directory).contains(&"order_submitted"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -2936,6 +2984,165 @@ mod tests {
         );
         proptest::prop_assert_eq!(live_seen, replayed_seen);
         Ok(())
+    }
+
+    /// Each `book_flattened` record a live session and a restrained replay of the same tape's five-minute bars made,
+    /// both opening on `book` and playing `strategy`, with the broker's book and the replay after; live is advanced at
+    /// each of `instants`.
+    async fn backstop_seam<S: Strategy + Clone>(
+        strategy: S,
+        book: Book,
+        tape: &[AlpacaTradeOutcome],
+        instants: &[&str],
+    ) -> (
+        Vec<(DateTime<Utc>, serde_json::Value)>,
+        Vec<(DateTime<Utc>, serde_json::Value)>,
+        Book,
+        Replay,
+    ) {
+        let dollars = |count: i128| Cash::from_units(count * DOLLAR);
+        let broker = Filling::new(701_000_000, book.clone());
+        let limits = Limits::new(
+            dollars(10_000),
+            dollars(5_000),
+            dollars(1_000),
+            dollars(1_000),
+            TimeDelta::minutes(15),
+        )
+        .unwrap();
+        let stale_after = Staleness::new(TimeDelta::minutes(5)).unwrap();
+        let settings = SessionSettings::new(
+            DecisionInterval::FiveMinute,
+            limits,
+            Patience::new(Duration::from_secs(1), Duration::from_secs(30)).unwrap(),
+            stale_after,
+            MinuteWait::new(TimeDelta::seconds(2)).unwrap(),
+        );
+        let mut session = session_of(
+            strategy.clone(),
+            settings,
+            vec![spy(), qqq()],
+            book.clone(),
+            dollars(10_000),
+            NameLosses::open(&book, |_| Price::from_ticks(701_000_000).ok()).unwrap(),
+            (at("14:00:00"), NaiveTime::from_hms_opt(16, 0, 0).unwrap()),
+        );
+        let scripted = Scripted::default();
+        for outcome in tape {
+            scripted.file(outcome.clone());
+        }
+        let (mut journal, directory) = journal();
+        for instant in instants {
+            session
+                .advance(&|| at(instant), &scripted, &broker, &mut journal)
+                .await
+                .unwrap();
+        }
+        let live = records(&directory)
+            .into_iter()
+            .filter(|record| record.observation().event_type() == "book_flattened")
+            .map(|record| {
+                let line = serde_json::to_value(record.observation()).unwrap();
+                (record.timestamp(), line["payload"].clone())
+            })
+            .collect();
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 10, 7).unwrap());
+        let mut fold = TradeFold::new(date, TradeConditions::new(BTreeMap::new()));
+        for outcome in tape {
+            match outcome {
+                AlpacaTradeOutcome::Print {
+                    print,
+                    tape,
+                    letters,
+                    correction,
+                    ..
+                } => fold.push_lettered(print, *tape, letters, *correction),
+                AlpacaTradeOutcome::Refused(row) => panic!("{row:?}"),
+            }
+        }
+        let (minutes, _) = fold.finish();
+        let [_, (_, five_minutes), _] = session_bars(Partition::try_from(minutes).unwrap());
+        let calendar = TradingCalendar::new(
+            vec![
+                TradingSession::new(
+                    date,
+                    NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+                    NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+                )
+                .unwrap(),
+            ],
+            SessionRange::single(date),
+        )
+        .unwrap();
+        let restraint =
+            crate::common::replay::Restraint::new(limits, calendar, BTreeMap::new(), stale_after);
+        let fill_model =
+            FillModel::new(FillStyle::Aggressive, BasisPoints::new(0.0).unwrap()).unwrap();
+        let replay = Replayer::controlled(
+            strategy,
+            fill_model,
+            BarInterval::FiveMinute,
+            crate::common::replay::Controls::Restrained(restraint),
+        )
+        .unwrap()
+        .act(Replay::open(book), five_minutes.into_rows())
+        .unwrap();
+        let replayed = replay
+            .flattened()
+            .iter()
+            .map(|(instant, flattened)| (*instant, serde_json::to_value(flattened).unwrap()))
+            .collect();
+        let broker_book = broker.book.lock().unwrap().clone();
+        (live, replayed, broker_book, replay)
+    }
+
+    /// The one record each side should make: closing at 15:58 Eastern and reading flat.
+    fn flat_at_the_backstop() -> Vec<(DateTime<Utc>, serde_json::Value)> {
+        vec![(
+            at("19:58:00"),
+            serde_json::json!({"cause": "closing_backstop", "closes": 1, "reading": "flat"}),
+        )]
+    }
+
+    /// A SPY share bought at 14:05 whose price goes stale before the flat window can sell it, so only the backstop
+    /// closes it: live through the broker when advanced at 15:58 Eastern, and a restrained replay at its last price,
+    /// each journaling one flattening at the same instant and ending on one book.
+    #[tokio::test(start_paused = true)]
+    async fn test_live_and_replay_agree_where_the_backstop_fires() {
+        let tape = [
+            print_of(&spy(), at("14:04:30"), 701_000_000, 1, ' '),
+            print_of(&spy(), at("14:09:30"), 701_000_000, 1, ' '),
+            print_of(&qqq(), at("19:59:30"), 500_000_000, 1, ' '),
+        ];
+        let funded = Book::funded(Cash::from_units(10_000 * DOLLAR));
+        let (live, replayed, broker_book, replay) =
+            backstop_seam(OneShare, funded, &tape, &["14:05:02", "19:58:00"]).await;
+        assert_eq!(live, flat_at_the_backstop());
+        assert_eq!(live, replayed);
+        assert_eq!(replay.fills().len(), 2);
+        assert_eq!(broker_book, *replay.book());
+    }
+
+    /// A short held with no cash to cover it, which a replayed decision would leave unfilled for want of cash, is still
+    /// covered at the backstop, since the broker's close request covers whatever the account holds.
+    #[tokio::test(start_paused = true)]
+    async fn test_live_and_replay_both_cover_a_short_without_cash_at_the_backstop() {
+        let tape = [
+            print_of(&spy(), at("14:04:30"), 701_000_000, 1, ' '),
+            print_of(&qqq(), at("19:59:30"), 500_000_000, 1, ' '),
+        ];
+        let short = Book::reported(
+            Cash::from_units(0),
+            [(spy(), crate::common::book::Position::from_units(-1_000_000))],
+        );
+        let (live, replayed, broker_book, replay) =
+            backstop_seam(Watching::default(), short, &tape, &["19:58:00"]).await;
+        assert_eq!(live, flat_at_the_backstop());
+        assert_eq!(live, replayed);
+        assert_eq!(broker_book, Book::funded(Cash::from_units(-701 * DOLLAR)));
+        assert_eq!(broker_book, *replay.book());
     }
 
     proptest::proptest! {

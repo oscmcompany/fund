@@ -84,6 +84,7 @@ pub(crate) enum ReplayMetric {
     RiskCuts,
     RiskRefusals,
     OrdersHeld,
+    BooksFlattened,
 }
 
 /// The cash a replay opens with, positive so a return and a turnover are measurable against it.
@@ -280,6 +281,10 @@ pub(crate) fn metrics(
                 (ReplayMetric::RiskCuts, cuts as f64),
                 (ReplayMetric::RiskRefusals, refusals as f64),
                 (ReplayMetric::OrdersHeld, replay.held().len() as f64),
+                (
+                    ReplayMetric::BooksFlattened,
+                    replay.flattened().len() as f64,
+                ),
             ]);
         }
     }
