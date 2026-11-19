@@ -12,8 +12,8 @@ use tokio::sync::mpsc::Sender;
 
 use super::retry::{FetchError, send, with_retries};
 use super::{
-    Fetched, OneSidedQuote, ParseRefusal, PrintOrigin, QuoteOrigin, RefusedRow, RowRefusal, Secret,
-    VariableRefusal, priced_side, variable,
+    CrossedQuote, Fetched, OneSidedQuote, ParseRefusal, PrintOrigin, QuoteOrigin, RefusedRow,
+    RowRefusal, Secret, VariableRefusal, priced_side, variable,
 };
 use crate::common::market::borrow::BorrowFlags;
 use crate::common::market::record::Quote;
@@ -274,6 +274,7 @@ pub enum AlpacaQuoteOutcome {
         quote: OneSidedQuote,
         origin: QuoteOrigin,
     },
+    Crossed(CrossedQuote),
     Refused(RefusedRow),
 }
 
@@ -564,7 +565,11 @@ fn quote_outcome(symbol: &Symbol, row: &AlpacaQuote) -> AlpacaQuoteOutcome {
         Ok((bid, ask, bid_size, ask_size)) => {
             match Quote::new(symbol.clone(), row.timestamp, bid, ask, bid_size, ask_size) {
                 Ok(quote) => AlpacaQuoteOutcome::Quote { quote, origin },
-                Err(cause) => refused(RowRefusal::Quote(cause)),
+                Err(refusal) => AlpacaQuoteOutcome::Crossed(CrossedQuote::of(
+                    symbol.clone(),
+                    row.timestamp,
+                    refusal,
+                )),
             }
         }
         Err(cause) => refused(cause),
@@ -1126,7 +1131,9 @@ mod tests {
                     }
                 );
             }
-            other @ (AlpacaQuoteOutcome::OneSided { .. } | AlpacaQuoteOutcome::Refused(_)) => {
+            other @ (AlpacaQuoteOutcome::OneSided { .. }
+            | AlpacaQuoteOutcome::Crossed(_)
+            | AlpacaQuoteOutcome::Refused(_)) => {
                 panic!("{other:?}")
             }
         }
@@ -1140,7 +1147,9 @@ mod tests {
                     )
                 );
             }
-            other @ (AlpacaQuoteOutcome::Quote { .. } | AlpacaQuoteOutcome::Refused(_)) => {
+            other @ (AlpacaQuoteOutcome::Quote { .. }
+            | AlpacaQuoteOutcome::Crossed(_)
+            | AlpacaQuoteOutcome::Refused(_)) => {
                 panic!("{other:?}")
             }
         }
@@ -1164,7 +1173,9 @@ mod tests {
                     "2026-11-07T00:59:51.009613177+00:00"
                 );
             }
-            other @ (AlpacaQuoteOutcome::OneSided { .. } | AlpacaQuoteOutcome::Refused(_)) => {
+            other @ (AlpacaQuoteOutcome::OneSided { .. }
+            | AlpacaQuoteOutcome::Crossed(_)
+            | AlpacaQuoteOutcome::Refused(_)) => {
                 panic!("{other:?}")
             }
         }
@@ -1173,7 +1184,9 @@ mod tests {
                 assert_eq!(row.ticker(), "XYZ");
                 assert_eq!(*row.cause(), RowRefusal::Unrequested);
             }
-            other @ (AlpacaQuoteOutcome::Quote { .. } | AlpacaQuoteOutcome::OneSided { .. }) => {
+            other @ (AlpacaQuoteOutcome::Quote { .. }
+            | AlpacaQuoteOutcome::OneSided { .. }
+            | AlpacaQuoteOutcome::Crossed(_)) => {
                 panic!("{other:?}")
             }
         }
@@ -1256,6 +1269,9 @@ mod tests {
                 ),
                 AlpacaQuoteOutcome::OneSided { quote, .. } => {
                     format!("{} one-sided", quote.symbol.as_str())
+                }
+                AlpacaQuoteOutcome::Crossed(quote) => {
+                    format!("{} crossed", quote.symbol().as_str())
                 }
                 AlpacaQuoteOutcome::Refused(row) => format!("refused {}", row.ticker()),
             });

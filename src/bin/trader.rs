@@ -16,7 +16,7 @@ use fund::broker::{Broker, BrokerError, PaperAccount};
 use fund::common::book::{Fill, ValuationRefusal};
 use fund::common::journal::{Observation, SessionOpened};
 use fund::common::market::record::BarInterval;
-use fund::common::market::state::MarketState;
+use fund::common::market::state::{MarketEvent, MarketState};
 use fund::common::market::{Price, Symbol};
 use fund::common::monoid::Monoid;
 use fund::common::playbook::{Playbook, PlaybookRead, PlaybookRefusal, Played};
@@ -32,7 +32,7 @@ use fund::storage::reference::{SnapshotError, latest_conditions};
 use fund::storage::{Bucket, BucketError, parquet, trade_bars};
 use fund::trader::parameters::Parameters;
 use fund::trader::{
-    DecisionInterval, Session, SessionError, Standing, last_closes, quotes_folded, resumed,
+    DecisionInterval, Session, SessionError, Standing, last_closes, quote_outcomes_folded, resumed,
     streamed_quotes, warm,
 };
 
@@ -455,27 +455,39 @@ async fn previous_bars(
 }
 
 /// Folds each quote the SIP stream sends for `symbols` into `streamed`, connecting again `RECONNECT_WAIT` after the
-/// stream stops or refuses, for as long as the run lasts. Each subscription also folds in the latest quotes REST
-/// serves, so a quote missed while disconnected, or a quiet symbol's, is not left out until it next updates.
+/// stream stops or refuses, for as long as the run lasts. A stop folds in the stream's loss, stamped with the latest
+/// quote folded so far, or the host's clock before any, and each subscription the latest quotes REST serves, which
+/// restore each symbol whose quote is newer than the loss.
 async fn stream_quotes(alpaca: Alpaca, symbols: Vec<Symbol>, streamed: Arc<Mutex<MarketState>>) {
     let fold = |folded: MarketState| {
         let mut held = streamed.lock().unwrap_or_else(PoisonError::into_inner);
         *held = std::mem::take(&mut *held).combine(folded);
     };
+    let mut latest_folded: Option<DateTime<Utc>> = None;
     loop {
         match alpaca.stream(&symbols, &[]).await {
             Ok(mut stream) => {
                 tracing::info!(symbols = symbols.len(), "Quote stream subscribed");
                 // Read after subscribing, so no quote falls between; the fold keeps the later of it and a streamed one.
                 match alpaca.latest_quotes(&symbols).await {
-                    Ok(outcomes) => fold(quotes_folded(outcomes)),
+                    Ok(outcomes) => {
+                        let served = quote_outcomes_folded(outcomes);
+                        latest_folded = latest_folded.max(served.latest_quoted_at());
+                        fold(served);
+                    }
                     Err(error) => tracing::warn!(%error, "Latest quotes not read"),
                 }
                 loop {
                     match stream.next().await {
-                        Ok(messages) => fold(streamed_quotes(messages)),
+                        Ok(messages) => {
+                            let frame = streamed_quotes(messages);
+                            latest_folded = latest_folded.max(frame.latest_quoted_at());
+                            fold(frame);
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "Quote stream stopped");
+                            let at = latest_folded.unwrap_or_else(Utc::now);
+                            fold(MarketState::of(MarketEvent::StreamLost { at }));
                             break;
                         }
                     }

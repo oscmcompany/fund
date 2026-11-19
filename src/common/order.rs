@@ -400,30 +400,26 @@ pub enum DecisionQuote {
     OneSided {
         quoted_at: DateTime<Utc>,
     },
+    /// The symbol's latest quote, at `quoted_at`, had its bid above its ask, so any two-sided quote before it is
+    /// outdated.
+    Crossed {
+        quoted_at: DateTime<Utc>,
+        bid: Price,
+        ask: Price,
+    },
     Unquoted {
         cause: QuoteAbsence,
     },
 }
 
 /// Why a decision held no quote for a symbol.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    strum::Display,
-    strum::EnumString,
-    strum::IntoStaticStr,
-    strum::EnumIter,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
 pub enum QuoteAbsence {
     /// No quote for the symbol had been folded into the market state.
     NoneFolded,
+    /// The quote stream was lost at `since`, and no quote for the symbol stamped after it had been folded.
+    StreamLost { since: DateTime<Utc> },
 }
 
 /// An order closed at the broker at `closed_at`, having executed `executed`.
@@ -711,15 +707,6 @@ mod tests {
             assert_eq!(serde_json::to_string(&side).unwrap(), format!("\"{side}\""));
             assert_eq!(side.to_string().parse(), Ok(side));
         }
-        let absences: Vec<&str> = QuoteAbsence::iter().map(Into::into).collect();
-        assert_eq!(absences, ["none_folded"]);
-        for absence in QuoteAbsence::iter() {
-            assert_eq!(
-                serde_json::to_string(&absence).unwrap(),
-                format!("\"{absence}\"")
-            );
-            assert_eq!(absence.to_string().parse(), Ok(absence));
-        }
         assert!(
             serde_json::from_str::<OrderExecution>(r#"{"shares":0,"average_price":1}"#).is_err()
         );
@@ -804,10 +791,28 @@ mod tests {
                 ),
             ),
             (
+                DecisionQuote::Crossed {
+                    quoted_at: instant(0),
+                    bid: Price::from_ticks(670_010_001).unwrap(),
+                    ask: Price::from_ticks(670_010_000).unwrap(),
+                },
+                format!(
+                    r#"{prefix},"quote":{{"crossed":{{"quoted_at":"2026-10-05T14:00:00Z","bid":670010001,"ask":670010000}}}}}}"#
+                ),
+            ),
+            (
                 DecisionQuote::Unquoted {
                     cause: QuoteAbsence::NoneFolded,
                 },
                 format!(r#"{prefix},"quote":{{"unquoted":{{"cause":"none_folded"}}}}}}"#),
+            ),
+            (
+                DecisionQuote::Unquoted {
+                    cause: QuoteAbsence::StreamLost { since: instant(0) },
+                },
+                format!(
+                    r#"{prefix},"quote":{{"unquoted":{{"cause":{{"stream_lost":{{"since":"2026-10-05T14:00:00Z"}}}}}}}}}}"#
+                ),
             ),
         ] {
             let submitted = OrderSubmitted::of(&request, quote);

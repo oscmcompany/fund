@@ -1115,6 +1115,11 @@ async fn write_quotes(
                 restatements.interrupt(&quote.symbol);
                 one_sided += 1;
             }
+            AlpacaQuoteOutcome::Crossed(quote) => {
+                let row = quote.refused();
+                interrupt_refused(&mut restatements, &row);
+                refused.push(row);
+            }
             AlpacaQuoteOutcome::Refused(row) => {
                 interrupt_refused(&mut restatements, &row);
                 refused.push(row);
@@ -2780,6 +2785,7 @@ mod tests {
                         AlpacaQuoteOutcome::OneSided { quote, .. } => {
                             restatements.interrupt(&quote.symbol);
                         }
+                        AlpacaQuoteOutcome::Crossed(quote) => panic!("{quote:?}"),
                         AlpacaQuoteOutcome::Refused(row) => panic!("{row:?}"),
                     }
                 }

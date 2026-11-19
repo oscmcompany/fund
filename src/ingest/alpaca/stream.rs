@@ -149,6 +149,7 @@ pub struct SipStream {
 impl Alpaca {
     /// Connects to the SIP stream and subscribes to the quotes of `quotes` and the trades of `trades`, refused when the
     /// handshake takes longer than `HANDSHAKE_TIMEOUT`.
+    // Alpaca allows one SIP connection per account, so a live probe or test during a session takes the trader's.
     pub async fn stream(
         &self,
         quotes: &[Symbol],
@@ -393,11 +394,19 @@ mod tests {
             StreamMessage::Quote(AlpacaQuoteOutcome::Refused(row))
                 if matches!(row.cause(), RowRefusal::Symbol(_))
         ));
-        assert!(matches!(
-            &messages[4],
-            StreamMessage::Quote(AlpacaQuoteOutcome::Refused(row))
-                if matches!(row.cause(), RowRefusal::Quote(_))
-        ));
+        assert_eq!(
+            messages[4],
+            StreamMessage::Quote(AlpacaQuoteOutcome::Crossed(
+                crate::ingest::CrossedQuote::of(
+                    Symbol::new("XYZ").unwrap(),
+                    instant("2026-10-07T16:40:09Z"),
+                    crate::common::market::record::QuoteRefusal::Crossed {
+                        bid: Price::from_ticks(3_000_000).unwrap(),
+                        ask: Price::from_ticks(2_000_000).unwrap(),
+                    },
+                )
+            ))
+        );
     }
 
     /// The handshake's replies read as the live stream words them, a refusal with its code.
@@ -558,7 +567,9 @@ mod tests {
                         quotes += 1;
                     }
                     other @ (StreamMessage::Quote(
-                        AlpacaQuoteOutcome::OneSided { .. } | AlpacaQuoteOutcome::Refused(_),
+                        AlpacaQuoteOutcome::OneSided { .. }
+                        | AlpacaQuoteOutcome::Crossed(_)
+                        | AlpacaQuoteOutcome::Refused(_),
                     )
                     | StreamMessage::Success { .. }
                     | StreamMessage::Error { .. }
