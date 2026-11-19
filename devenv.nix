@@ -79,6 +79,17 @@ in {
     echo "Every mutant in the diff was caught"
   '';
 
+  # Kani is not in nixpkgs: its driver is a cargo install, and its first run fetches a pinned nightly through rustup.
+  scripts.prove-rust.exec = ''
+    set -euo pipefail
+    export PATH="$PATH:${pkgs.rustup}/bin"
+    if ! cargo kani --version 2>/dev/null | grep ' 0\.68\.0 ' >/dev/null; then
+      cargo install --locked kani-verifier --version 0.68.0
+    fi
+    cargo kani --lib --output-format terse ''${1:+--harness "$1"}
+    echo "Every Kani harness''${1:+ matching $1} is proved"
+  '';
+
   scripts.start-duckdb.exec = ''
     set -euo pipefail
     cd "$DEVENV_ROOT"
@@ -226,6 +237,8 @@ in {
       echo "    start-duckdb                DuckDB with the archive views"
       echo "    check-views                 Fail on any archive view that is empty"
       echo "    mutate-rust <diff>          Mutation-test the lines a diff changes"
+      echo "    prove-rust [harness]        Run the Kani proofs in src/common, or"
+      echo "                                those whose name contains harness"
       echo "    researcher <command>        Hold, push to and run studies on the"
       echo "                                FUND_PROFILE researcher (--help)"
       echo "    snapshot <mode> <target>    Render public code, a fixture or a"

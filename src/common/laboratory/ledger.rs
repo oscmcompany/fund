@@ -131,11 +131,7 @@ pub struct Ledger {
 
 /// A position's worth at `price` whichever side it is on, in cash units.
 fn exposure(position: Position, price: Price) -> i128 {
-    position
-        .units()
-        .abs()
-        .checked_mul(i128::from(price.ticks()))
-        .expect("a position's worth fits i128")
+    position.worth(price).units().abs()
 }
 
 /// Every holding's exposure summed, refused for the first holding `price` cannot answer.

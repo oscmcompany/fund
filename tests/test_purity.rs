@@ -7,9 +7,10 @@ use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// Crates a pure module may name, with `prop` for proptest's prelude alias; adding one is the review.
-const PURE_CRATES: [&str; 12] = [
+const PURE_CRATES: [&str; 13] = [
     "chrono",
     "chrono_tz",
+    "kani",
     "proptest",
     "prop",
     "rand",
