@@ -1,6 +1,7 @@
 //! Whether a forecast means what it says: a quantile band's coverage overall and by decile of width, the mean outcome
 //! by decile of the forecast, and the slope that rescales a forecast to the outcomes it was fit against.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 use crate::common::laboratory::score::{Forecast, ForecastRefusal, Outcome, Pair};
@@ -307,6 +308,24 @@ impl Slope {
             (false, true) => Ok(Self { raw, pairs: count }),
             (false, false) => Err(SlopeRefusal::NotFinite { pairs: count }),
         }
+    }
+
+    /// One slope per fold, each fit on every other fold's pairs and none of its own.
+    pub fn held_out<F: Ord + Clone>(
+        pairs: &[(F, Pair)],
+    ) -> Result<BTreeMap<F, Self>, SlopeRefusal> {
+        let folds: BTreeSet<&F> = pairs.iter().map(|(fold, _)| fold).collect();
+        folds
+            .into_iter()
+            .map(|held| {
+                let others: Vec<Pair> = pairs
+                    .iter()
+                    .filter(|(fold, _)| fold != held)
+                    .map(|(_, pair)| *pair)
+                    .collect();
+                Ok((held.clone(), Self::fit(&others)?))
+            })
+            .collect()
     }
 
     /// The fitted slope before flooring, negative when the forecast pointed the wrong way.
@@ -684,6 +703,61 @@ mod tests {
             prop_assert_eq!(counted, pairs.len() as u64);
             let forecasts: Vec<f64> = deciles.iter().flatten().map(|decile| decile.forecast).collect();
             prop_assert!(forecasts.windows(2).all(|two| two[0] <= two[1] + 1e-9), "{forecasts:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_held_out_slope_is_fit_on_the_other_folds_only() {
+        let pairs: Vec<(u8, Pair)> = (1..=3)
+            .flat_map(|fold| {
+                (1..=4).map(move |forecast| (fold, pair(forecast as f64, (fold * forecast) as f64)))
+            })
+            .collect();
+        let slopes = Slope::held_out(&pairs).unwrap();
+        assert_eq!(slopes.keys().copied().collect::<Vec<_>>(), [1, 2, 3]);
+        let raws: Vec<f64> = slopes.values().map(|slope| slope.raw()).collect();
+        for (raw, expected) in raws.iter().zip([2.5, 2.0, 1.5]) {
+            assert!((raw - expected).abs() < 1e-12, "{raws:?}");
+        }
+        assert_eq!(slopes[&1].pairs(), 8);
+        assert_eq!(
+            Slope::held_out(&pairs[..4]),
+            Err(SlopeRefusal::TooFewPairs { pairs: 0 })
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn property_a_held_out_slope_never_reads_its_own_fold(
+            rows in prop::collection::vec((0u8..4, -100.0f64..100.0, -100.0f64..100.0), 12..60),
+            held in 0u8..4,
+            planted_forecast in -1e6f64..1e6,
+            planted in -1e6f64..1e6,
+        ) {
+            let pairs: Vec<(u8, Pair)> =
+                rows.iter().map(|(fold, forecast, outcome)| (*fold, pair(*forecast, *outcome))).collect();
+            // Both the held fold's forecasts and its outcomes are replanted, since either could leak into its slope;
+            // two forecasts alternate so the other folds' training sets do not turn constant.
+            let mut alternate = 0.0;
+            let replanted: Vec<(u8, Pair)> = rows
+                .iter()
+                .map(|(fold, forecast, outcome)| match *fold == held {
+                    true => {
+                        alternate = 1.0 - alternate;
+                        (*fold, pair(planted_forecast + alternate, planted))
+                    }
+                    false => (*fold, pair(*forecast, *outcome)),
+                })
+                .collect();
+            match (Slope::held_out(&pairs), Slope::held_out(&replanted)) {
+                (Ok(slopes), Ok(replanted_slopes)) => {
+                    let folds: BTreeSet<u8> = rows.iter().map(|(fold, _, _)| *fold).collect();
+                    prop_assert_eq!(slopes.keys().copied().collect::<BTreeSet<_>>(), folds);
+                    prop_assert_eq!(slopes.get(&held), replanted_slopes.get(&held));
+                }
+                (Err(refusal), Err(replanted_refusal)) => prop_assert_eq!(refusal, replanted_refusal),
+                (left, right) => prop_assert!(false, "{left:?} against {right:?}"),
+            }
         }
     }
 }
