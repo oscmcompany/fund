@@ -6,6 +6,7 @@ pub mod attribution;
 pub mod blocks;
 pub mod calibration;
 pub mod dataset;
+pub mod entry;
 pub mod estimate;
 pub mod event_table;
 pub mod experiment;
