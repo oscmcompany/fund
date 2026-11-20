@@ -2,15 +2,17 @@
 //! them, so the draw, the read delay, the session's bounds and what a print may set are read off the rows written.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::path::Path;
 use std::process::Command;
 
 use chrono::{NaiveDate, NaiveTime};
+use fund::common::book::Side;
+use fund::common::cost::FillBound;
 use fund::common::journal::RunId;
 use fund::common::laboratory::event_table::{
-    DRAW_ORDER_MACROS, Draws, EntryWindow, EventClock, EventTable, EventTableRefusal, ReadDelay,
-    draw_order, draw_seed,
+    DRAW_ORDER_MACROS, Draws, EntryWindow, EventClock, EventTable, EventTableRefusal,
+    ForwardHorizons, ReadDelay, RestingWindow, draw_order, draw_seed,
 };
 use fund::common::laboratory::universe::{Universe, UniverseSize, universe};
 use fund::common::market::aggregate::TradeTotals;
@@ -30,6 +32,7 @@ use fund::storage::reference::{
 };
 use fund::storage::trade_bars;
 use proptest::prelude::*;
+use strum::IntoEnumIterator;
 use uuid::Uuid;
 
 fn date(month: u32, day: u32) -> SessionDate {
@@ -274,11 +277,31 @@ fn write_conditions(directory: &Path) {
     std::fs::write(file, written).unwrap();
 }
 
-/// Whether AAA also prints the probes of what may set the high, at 13:50 UTC; they shift its later print numbers.
+/// Whether AAA also prints the probes of what may set the high, at 13:50 UTC, or `DIPS` at 13:40 UTC, either shifting
+/// its later print numbers, or BBB quotes nothing before 13:35 UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probes {
     Without,
     With,
+    Dips,
+    Unquoted,
+}
+
+/// AAA's prints below the grid's, as milliseconds after the open, price in ten-thousandths of a dollar, and whether
+/// it may fill: an odd lot that may not, a withdrawn print, a print through every bid, and one at the bid in force
+/// for the two seconds before it, so whatever the delay one drawn row rests at that bid.
+const DIPS: [(i64, i64, Dip); 4] = [
+    (600_500, 990_000, Dip::Ineligible),
+    (620_500, 990_000, Dip::Withdrawn),
+    (640_500, 990_000, Dip::Eligible),
+    (651_999, 1_003_150, Dip::Eligible),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dip {
+    Eligible,
+    Ineligible,
+    Withdrawn,
 }
 
 /// Quotes every 2 seconds and prints every 3, from 13:30:00 and 13:30:01 UTC, for AAA, BBB, SPY and QQQ over
@@ -329,16 +352,50 @@ fn fixture(directory: &Path, provider: TickProvider, probes: Probes) -> String {
         AS probes(seconds, price, conditions, tape, \"update\")",
         ),
     };
+    let dips = DIPS
+        .iter()
+        .enumerate()
+        .map(|(index, (milliseconds, price, dip))| {
+            let (time, price) = (
+                format!("TIMESTAMP_NS '2025-06-16 13:30:00' + INTERVAL {milliseconds} MILLISECOND"),
+                format!("{}.{:04}", price / 10_000, price % 10_000),
+            );
+            match (provider, dip) {
+                (TickProvider::Massive, Dip::Eligible) => format!("('AAA', {time}, {price}, 100.0, '', NULL, '11')"),
+                (TickProvider::Massive, Dip::Ineligible) => format!("('AAA', {time}, {price}, 100.0, '37', NULL, '11')"),
+                (TickProvider::Massive, Dip::Withdrawn) => format!("('AAA', {time}, {price}, 100.0, '14', '1', '11')"),
+                (TickProvider::Alpaca, Dip::Eligible) => format!(
+                    "('AAA', {time}, {price}::DECIMAL(18, 6), 100::DECIMAL(20, 6), [' '], 'N', 'A', {}::UBIGINT, NULL)",
+                    200_000 + index
+                ),
+                (TickProvider::Alpaca, Dip::Ineligible) => format!(
+                    "('AAA', {time}, {price}::DECIMAL(18, 6), 100::DECIMAL(20, 6), [' ', 'I'], 'N', 'A', {}::UBIGINT, NULL)",
+                    200_000 + index
+                ),
+                (TickProvider::Alpaca, Dip::Withdrawn) => format!(
+                    "('AAA', {time}, {price}::DECIMAL(18, 6), 100::DECIMAL(20, 6), [' '], 'N', 'B', {}::UBIGINT, 'canceled')",
+                    200_000 + index
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let probe_trades = match probes {
         Probes::Without => String::new(),
         Probes::With => format!("UNION ALL {probe_trades}"),
+        Probes::Dips => format!("UNION ALL SELECT * FROM (VALUES {dips})"),
+        Probes::Unquoted => String::new(),
+    };
+    let unquoted = match probes {
+        Probes::Without | Probes::With | Probes::Dips => "",
+        Probes::Unquoted => "WHERE NOT (ticker = 'BBB' AND step < 150)",
     };
     format!(
         "SET TimeZone='UTC';
 SET VARIABLE scratch = '{scratch}';
 SET VARIABLE archive = '{archive}';
 CREATE TEMP TABLE names AS SELECT * FROM (VALUES ('AAA'), ('BBB'), ('SPY'), ('QQQ')) AS names(ticker);
-COPY (SELECT ticker, {quote_columns} FROM names, range(11700) AS steps(step)) TO '{quotes}/data.parquet';
+COPY (SELECT ticker, {quote_columns} FROM names, range(11700) AS steps(step) {unquoted}) TO '{quotes}/data.parquet';
 COPY (SELECT ticker, {grid_trade_columns} FROM names, range(7800) AS steps(step) {probe_trades})
     TO '{trades}/data.parquet';
 ",
@@ -406,13 +463,13 @@ SELECT round(min(previous_return), 4), max(beta_days) FROM 'table/rows_massive_2
 }
 
 /// Three quote updates per name, each read half a second after it, so the quote in force at the read is the drawn
-/// one; the universe file holds both names, the screen's columns are present while the grid's resting labels are
-/// not, and the daily features read the Friday's return, 174 over 173, and sixty returns.
+/// one; the universe file holds both names, the screen's column and the buy side's six resting labels are present,
+/// and the daily features read the Friday's return, 174 over 173, and sixty returns.
 #[test]
 fn test_the_quote_clock_reads_each_drawn_update_after_the_delay() {
     let (stdout, stderr) = built(EventClock::QuoteUpdates);
     assert_eq!(
-        stdout, "quote,6,2,0.5,0.5,true,true,true\n2\n1\n57.8035,60\n",
+        stdout, "quote,6,2,0.5,0.5,true,true,true\n2\n7\n57.8035,60\n",
         "{stderr}"
     );
 }
@@ -426,7 +483,7 @@ fn test_the_print_clock_draws_prints() {
     let fields: Vec<&str> = lines[0].split(',').collect();
     assert_eq!(fields[..3], ["print", "6", "2"], "{stdout}");
     assert_eq!(fields[5..], ["true", "true", "true"], "{stdout}");
-    assert_eq!(lines[1..], ["2", "1", "57.8035,60"], "{stdout}");
+    assert_eq!(lines[1..], ["2", "7", "57.8035,60"], "{stdout}");
 }
 
 /// Alpaca's ticks and daily bars, in Alpaca's spelling and with no Massive file on disk, build the table: the
@@ -541,9 +598,39 @@ fn test_alpaca_refuses_a_session_without_its_daily_bars() {
     );
 }
 
+/// A print read before its name's first quote rests at no touch, so each side's fill label, seconds and entry price
+/// are unknown, though the window's end, from 13:34 UTC on, finds a quote; AAA, quoted throughout, fills every sell
+/// and no buy, and an unfilled buy enters at the window's ask.
+#[test]
+fn test_an_order_with_no_quote_at_arrival_has_unknown_resting_labels() {
+    let table = EventTable::new(
+        TickProvider::Massive,
+        EventClock::Prints,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(100).unwrap()),
+        EntryWindow::new(0, 5).unwrap(),
+    );
+    let (stdout, stderr) = run(
+        table,
+        TickProvider::Massive,
+        Probes::Unquoted,
+        "
+SELECT ticker, count(*), max(arrival) < TIMESTAMP '2025-06-16 13:35:00',
+    count(COLUMNS('forward_(buy|sell)_.*')), count(forward_bid_at_window)
+FROM 'table/rows_massive_2025-06-16.parquet' GROUP BY ticker ORDER BY ticker;
+",
+    );
+    assert_eq!(
+        stdout,
+        "AAA,100,true,100,0,100,100,0,100,100,100,100,100,100,100,100\n\
+         BBB,100,true,0,0,0,0,0,0,0,0,0,0,0,0,20\n",
+        "{stderr}"
+    );
+}
+
 /// A window ending at the close draws only events whose delayed read lands by the last second, so the update at
 /// 19:59:58 UTC, read 1.5 seconds later, is left out and each name keeps its other 29 updates of the last minute, every
-/// one with a quote in force.
+/// one with a quote in force and none with resting labels, as a sixty-second rest would outlast the last read.
 #[test]
 fn test_a_delayed_read_past_the_close_is_not_drawn() {
     let table = EventTable::new(
@@ -558,11 +645,12 @@ fn test_a_delayed_read_past_the_close_is_not_drawn() {
         TickProvider::Massive,
         Probes::Without,
         "
-SELECT count(*), count(screen_bid), max(arrival), min(minutes_to_close) > 0
+SELECT count(*), count(screen_bid), max(arrival), min(minutes_to_close) > 0,
+    count(forward_sell_filled_optimistic), count(forward_ask_at_window)
 FROM 'table/rows_massive_2025-06-16.parquet';
 ",
     );
-    assert_eq!(stdout, "58,58,2025-06-16 19:59:57.5,true\n", "{stderr}");
+    assert_eq!(stdout, "58,58,2025-06-16 19:59:57.5,true,0,0\n", "{stderr}");
 }
 
 /// The SQL `draw_order` the table sorts by agrees with the Rust one on every pair drawn, the full 32-bit seed and
@@ -691,6 +779,150 @@ GROUP BY ALL ORDER BY names.ticker;
             stderr
         );
     }
+}
+
+/// The fixture's bid and ask in force `milliseconds` after the open, in ten-thousandths of a dollar.
+fn touch_at(milliseconds: i64) -> (i64, i64) {
+    let quote = (milliseconds / 2000).min(11_699);
+    (1_000_000 + 10 * quote - 100, 1_000_000 + 10 * quote + 100)
+}
+
+/// AAA's or BBB's prints that may fill, as milliseconds after the open and price in ten-thousandths of a dollar.
+fn fillable_prints(raw: &str) -> Vec<(i64, i64)> {
+    let dips = DIPS
+        .iter()
+        .filter(|(_, _, dip)| raw == "AAA" && *dip == Dip::Eligible)
+        .map(|(milliseconds, price, _)| (*milliseconds, *price));
+    (0..7800)
+        .map(|print| (1000 + 3000 * print, 1_000_000 + 15 * print))
+        .chain(dips)
+        .collect()
+}
+
+/// A row's resting labels as the fixture implies them, each side then each bound in the table's order, decided by
+/// `FillBound::fills` rather than the SQL: filled, seconds to fill and entry price, then the window's bid and ask.
+fn resting_labels(raw: &str, arrival: i64, window_seconds: i64) -> Vec<String> {
+    let end = arrival + 1000 * window_seconds;
+    let ((bid, ask), (window_bid, window_ask)) = (touch_at(arrival), touch_at(end));
+    let price = |ticks: i64| Price::from_ticks(100 * ticks).unwrap();
+    let dollars = |ticks: i64| format!("{}", ticks as f64 / 10_000.0);
+    let mut prints: Vec<(i64, i64)> = fillable_prints(raw)
+        .into_iter()
+        .filter(|(milliseconds, _)| *milliseconds > arrival && *milliseconds <= end)
+        .collect();
+    prints.sort_unstable();
+    let mut labels = Vec::new();
+    for side in Side::iter() {
+        let (limit, cross) = match side {
+            Side::Buy => (bid, window_ask),
+            Side::Sell => (ask, window_bid),
+        };
+        for bound in FillBound::iter() {
+            match prints
+                .iter()
+                .find(|(_, print)| bound.fills(side, price(limit), price(*print)))
+            {
+                Some((milliseconds, _)) => labels.extend([
+                    "true".to_string(),
+                    format!("{}", (milliseconds - arrival) as f64 / 1000.0),
+                    dollars(limit),
+                ]),
+                None => labels.extend(["false".to_string(), "NULL".to_string(), dollars(cross)]),
+            }
+        }
+    }
+    labels.extend([dollars(window_bid), dollars(window_ask)]);
+    labels
+}
+
+/// The forward return a horizon of `seconds` reads, in basis points of the mid at `arrival`.
+fn forward_return(arrival: i64, seconds: i64) -> f64 {
+    let mid = |milliseconds: i64| {
+        let (bid, ask) = touch_at(milliseconds);
+        (bid as f64 / 10_000.0 + ask as f64 / 10_000.0) / 2.0
+    };
+    10_000.0 * (mid(arrival + 1000 * seconds) / mid(arrival) - 1.0)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// Every quote update of minutes nine to eleven, read after any delay, carries the resting labels the fixture
+    /// implies for any window, past a print at its arrival, an odd lot and a withdrawn print, and fills at the bid
+    /// only under the optimistic bound; a horizon of any seconds reads the mid that far ahead.
+    #[test]
+    fn test_resting_labels_and_horizons_agree_with_the_fixture(
+        delay in prop_oneof![Just(1000_u32), Just(500), 0..3000_u32],
+        window_seconds in 1..90_u32,
+        horizon in 1..600_u32,
+    ) {
+        let table = EventTable::new(
+            TickProvider::Massive,
+            EventClock::QuoteUpdates,
+            ReadDelay::from_milliseconds(delay),
+            Draws::new(NonZeroU16::new(100).unwrap()),
+            EntryWindow::new(9, 11).unwrap(),
+        )
+        .with_resting_window(RestingWindow::from_seconds(NonZeroU32::new(window_seconds).unwrap()))
+        .with_horizons(ForwardHorizons::from_seconds([NonZeroU32::new(horizon).unwrap()].into()));
+        let suffix = match horizon % 60 {
+            0 => format!("{}", horizon / 60),
+            _ => format!("seconds_{horizon}"),
+        };
+        let (stdout, stderr) = run(
+            table,
+            TickProvider::Massive,
+            Probes::Dips,
+            &format!(
+                "
+SELECT ticker, epoch_ms(arrival) - epoch_ms(TIMESTAMP '2025-06-16 13:30:00'),
+    COLUMNS('forward_(buy|sell)_.*|forward_(bid|ask)_at_window'), raw_{suffix}
+FROM 'table/rows_massive_2025-06-16.parquet' ORDER BY ticker, key;
+"
+            ),
+        );
+        let rows: Vec<Vec<&str>> = stdout.lines().map(|line| line.split(',').collect()).collect();
+        prop_assert_eq!(rows.len(), 120, "{}{}", stdout, stderr);
+        let mut filled = [0_usize; 4];
+        for row in &rows {
+            let arrival: i64 = row[1].parse().unwrap();
+            let expected = resting_labels(row[0], arrival, i64::from(window_seconds));
+            prop_assert_eq!(row.len(), 2 + expected.len() + 1, "{:?}", row);
+            for (column, (read, implied)) in row[2..row.len() - 1].iter().zip(&expected).enumerate() {
+                match (read.parse::<f64>(), implied.parse::<f64>()) {
+                    (Ok(read), Ok(implied)) => {
+                        prop_assert!((read - implied).abs() < 1e-9, "column {} of {:?}: {:?}", column, row, expected);
+                    }
+                    (Ok(_) | Err(_), Ok(_) | Err(_)) => {
+                        prop_assert_eq!(read, implied, "column {} of {:?}", column, row);
+                    }
+                }
+            }
+            for (count, column) in filled.iter_mut().zip([0, 3, 6, 9]) {
+                *count += usize::from(expected[column] == "true");
+            }
+            let read: f64 = row[row.len() - 1].parse().unwrap();
+            let implied = forward_return(arrival, i64::from(horizon));
+            prop_assert!((read - implied).abs() < 1e-6, "{} against {}", read, implied);
+        }
+        // Rising prints reach every sell's ask within 25 seconds, so a longer window must see fills.
+        prop_assert!(window_seconds < 30 || filled[2] == 120, "{:?}", filled);
+        // The print at the bid fills the buy resting there under the optimistic bound alone.
+        prop_assert!(window_seconds < 2 || filled[0] > filled[1], "{:?}", filled);
+    }
+}
+
+/// The resting oracle agrees with windows read by hand: AAA's buy resting at 13:40:30's bid of 100.305 is filled
+/// through its limit at 13:40:40.5 by the dip to 99, and BBB's, with no dip, crosses to the ask of 100.355 at 13:41:30.
+#[test]
+fn test_the_resting_oracle_matches_a_window_read_by_hand() {
+    let labels = resting_labels("AAA", 630_000, 60);
+    assert_eq!(
+        labels[..6],
+        ["true", "10.5", "100.305", "true", "10.5", "100.305"]
+    );
+    let labels = resting_labels("BBB", 630_000, 60);
+    assert_eq!(labels[..3], ["false", "NULL", "100.355"]);
 }
 
 /// The property's count agrees with windows counted by hand: the last minute's 29 quote updates read by the last

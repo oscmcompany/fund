@@ -3,12 +3,14 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::RangeInclusive;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use strum::IntoEnumIterator;
 
+use crate::common::book::Side;
+use crate::common::cost::FillBound;
 use crate::common::laboratory::universe::Universe;
 use crate::common::market::Symbol;
 use crate::common::market::industry::Industry;
@@ -243,14 +245,72 @@ impl EntryWindow {
     }
 }
 
-/// What a table draws and how it reads it, the same for every session it is built over.
+/// The delays after arrival at which the forward targets are read, each named by its whole minutes or else by
+/// `seconds_` and its seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardHorizons(BTreeSet<NonZeroU32>);
+
+impl ForwardHorizons {
+    pub fn from_seconds(seconds: BTreeSet<NonZeroU32>) -> Self {
+        Self(seconds)
+    }
+
+    /// Each horizon's name in the columns it adds beside its seconds, shortest first.
+    fn named(&self) -> Vec<(String, u32)> {
+        self.0
+            .iter()
+            .map(|seconds| match seconds.get() % 60 {
+                0 => ((seconds.get() / 60).to_string(), seconds.get()),
+                _ => (format!("seconds_{seconds}"), seconds.get()),
+            })
+            .collect()
+    }
+}
+
+/// One, five, fifteen, thirty and sixty minutes.
+impl Default for ForwardHorizons {
+    fn default() -> Self {
+        Self(
+            [60, 300, 900, 1800, 3600]
+                .into_iter()
+                .filter_map(NonZeroU32::new)
+                .collect(),
+        )
+    }
+}
+
+/// How long each side's order rests at the touch in force at arrival; a row whose window passes the last read has no
+/// resting labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestingWindow(NonZeroU32);
+
+impl RestingWindow {
+    pub fn from_seconds(seconds: NonZeroU32) -> Self {
+        Self(seconds)
+    }
+
+    pub fn seconds(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Sixty seconds.
+impl Default for RestingWindow {
+    fn default() -> Self {
+        Self(NonZeroU32::new(60).expect("sixty is not zero"))
+    }
+}
+
+/// What a table draws and how it reads it, the same for every session it is built over.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTable {
     provider: TickProvider,
     clock: EventClock,
     delay: ReadDelay,
     draws: Draws,
     window: EntryWindow,
+    horizons: ForwardHorizons,
+    resting: RestingWindow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -292,7 +352,17 @@ impl EventTable {
             delay,
             draws,
             window,
+            horizons: ForwardHorizons::default(),
+            resting: RestingWindow::default(),
         }
+    }
+
+    pub fn with_horizons(self, horizons: ForwardHorizons) -> Self {
+        Self { horizons, ..self }
+    }
+
+    pub fn with_resting_window(self, resting: RestingWindow) -> Self {
+        Self { resting, ..self }
     }
 
     /// The statements writing the universe's session's rows to `table/rows_<provider>_<session>.parquet` and its
@@ -365,6 +435,59 @@ impl EventTable {
     QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY draw_order(draw_seed, event_number), event_number) <= {draws};
 "
         );
+        let horizons = self.horizons.named();
+        // Each horizon's spelling of `template`, each followed by a comma, so no horizon spells nothing.
+        let each = |template: &dyn Fn(&str, u32) -> String| -> String {
+            horizons
+                .iter()
+                .map(|(name, seconds)| format!("{}, ", template(name, *seconds)))
+                .collect()
+        };
+        let forward_offsets = each(&|name, seconds| {
+            format!("('own', 'forward_{name}', {seconds}), ('SPY', 'forward_{name}', {seconds})")
+        });
+        let forward_pivots = each(&|name, _| {
+            format!(
+                "max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_{name}') AS mid_forward_{name},
+        max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_{name}') AS spread_forward_{name},
+        max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_{name}') AS spy_forward_{name}"
+            )
+        });
+        let forward_spreads =
+            each(&|name, _| format!("spread_forward_{name} AS forward_spread_{name}"));
+        let raw = each(&|name, _| format!("10000 * (mid_forward_{name} / mid - 1) AS raw_{name}"));
+        let net = each(&|name, _| {
+            format!("raw_{name} - 10000 * (spy_forward_{name} / spy_mid - 1) AS net_{name}")
+        });
+        let forward_spy = each(&|name, _| {
+            format!("10000 * (spy_forward_{name} / spy_mid - 1) AS forward_spy_{name}")
+        });
+        let resting = self.resting.seconds();
+        let (mut fill_times, mut resting_labels, mut resting_columns) =
+            (String::new(), String::new(), String::new());
+        for (side, bound) in
+            Side::iter().flat_map(|side| FillBound::iter().map(move |bound| (side, bound)))
+        {
+            let (touch, cross, through) = resting_spelling(side, bound);
+            let time = format!("{side}_{bound}_time");
+            let _ = write!(
+                fill_times,
+                "min(trade_events.timestamp) FILTER (WHERE trade_events.price {through} spans.{touch}) AS {time}, "
+            );
+            let _ = write!(
+                resting_labels,
+                "CASE WHEN {touch} IS NOT NULL THEN {time} IS NOT NULL END AS forward_{side}_filled_{bound},
+        epoch_ns({time} - arrival) / 1e9 AS forward_{side}_fill_seconds_{bound},
+        CASE WHEN {time} IS NOT NULL THEN {touch} WHEN {touch} IS NOT NULL THEN {cross}_at_window END AS forward_{side}_entry_price_{bound},
+        "
+            );
+            let _ = write!(
+                resting_columns,
+                "forward_{side}_filled_{bound}, forward_{side}_fill_seconds_{bound}, forward_{side}_entry_price_{bound},
+        "
+            );
+        }
+        let fill_times = fill_times.trim_end_matches(", ");
         Ok(format!(
             r#"
 {DRAW_ORDER_MACROS}{eligibility}CREATE TEMP TABLE universe AS
@@ -497,14 +620,10 @@ CREATE TEMP TABLE quote_probes AS
         SELECT entries.*, sources.source, CASE sources.source WHEN 'own' THEN entries.ticker ELSE sources.source END AS read_ticker
         FROM entries, (VALUES ('own'), ('SPY'), ('QQQ')) AS sources(source)),
     offsets AS (
-        SELECT * FROM (VALUES
+        SELECT * FROM (VALUES {forward_offsets}
             ('own', 'now', 0), ('own', 'back_5', -5), ('own', 'back_30', -30), ('own', 'back_60', -60), ('own', 'back_120', -120),
             ('own', 'back_300', -300), ('own', 'back_900', -900), ('own', 'back_1800', -1800),
-            ('own', 'forward_1', 60), ('own', 'forward_5', 300), ('own', 'forward_15', 900), ('own', 'forward_30', 1800),
-            ('own', 'forward_60', 3600),
             ('SPY', 'now', 0), ('SPY', 'back_5', -5), ('SPY', 'back_30', -30), ('SPY', 'back_120', -120), ('SPY', 'back_1800', -1800),
-            ('SPY', 'forward_1', 60), ('SPY', 'forward_5', 300), ('SPY', 'forward_15', 900), ('SPY', 'forward_30', 1800),
-            ('SPY', 'forward_60', 3600),
             ('QQQ', 'now', 0), ('QQQ', 'back_5', -5), ('QQQ', 'back_30', -30), ('QQQ', 'back_120', -120)
         ) AS offsets(source, probe, seconds))
     SELECT sources.ticker, kind, key, arrival, sources.source, read_ticker, probe, arrival + to_seconds(seconds) AS probe_time
@@ -541,6 +660,38 @@ CREATE TEMP TABLE market_probed AS
         FROM entries, (VALUES ('now', 0), ('back_30', -30)) AS offsets(probe, seconds))
     SELECT probes.*, market_flow.cumulative_signed_dollars, market_flow.cumulative_dollars
     FROM probes ASOF LEFT JOIN market_flow ON probes.probe_time >= market_flow.timestamp;
+-- Each side rests at the touch in force at arrival, filled by the first eligible print after it through its limit
+-- (conservative) or at it (optimistic); no such print is unfilled, while no touch or a window past the last read is
+-- unknown. An unfilled buy's entry is the ask at the window's end, and a sell's the bid.
+CREATE TEMP TABLE resting AS
+    WITH touched AS (
+        SELECT entries.ticker, entries.kind, entries.key, entries.arrival, quote_states.bid, quote_states.ask
+        FROM entries ASOF LEFT JOIN quote_states
+          ON entries.ticker = quote_states.ticker AND entries.arrival >= quote_states.timestamp
+        WHERE entries.arrival + INTERVAL {resting} SECOND <= {last_read}),
+    started AS (
+        SELECT touched.*, start_print.event_number AS start_event
+        FROM touched ASOF LEFT JOIN trade_states start_print
+          ON touched.ticker = start_print.ticker AND touched.arrival >= start_print.timestamp),
+    ended AS (
+        SELECT started.*, end_print.event_number AS end_event
+        FROM started ASOF LEFT JOIN trade_states end_print
+          ON started.ticker = end_print.ticker AND started.arrival + INTERVAL {resting} SECOND >= end_print.timestamp),
+    windowed AS (
+        SELECT ended.*, window_quote.bid AS bid_at_window, window_quote.ask AS ask_at_window
+        FROM ended ASOF LEFT JOIN quote_states window_quote
+          ON ended.ticker = window_quote.ticker AND ended.arrival + INTERVAL {resting} SECOND >= window_quote.timestamp),
+    spans AS (
+        SELECT ticker, kind, key, bid, ask, unnest(range(coalesce(start_event, 0) + 1, end_event + 1)) AS event_number
+        FROM windowed WHERE bid IS NOT NULL AND end_event > coalesce(start_event, 0)),
+    fills AS (
+        SELECT spans.ticker, spans.kind, spans.key, {fill_times}
+        FROM spans JOIN trade_events
+          ON trade_events.ticker = spans.ticker AND trade_events.event_number = spans.event_number AND trade_events.eligible
+        GROUP BY spans.ticker, spans.kind, spans.key)
+    SELECT windowed.ticker, windowed.kind, windowed.key, {resting_labels}
+        bid_at_window AS forward_bid_at_window, ask_at_window AS forward_ask_at_window
+    FROM windowed LEFT JOIN fills USING (ticker, kind, key);
 -- Pivots: one column per (source, probe, field) a feature reads, so the features below are plain arithmetic.
 CREATE TEMP TABLE quotes_wide AS
     SELECT ticker, kind, key, any_value(arrival) AS arrival,
@@ -574,25 +725,10 @@ CREATE TEMP TABLE quotes_wide AS
         max(mid) FILTER (WHERE source = 'own' AND probe = 'back_300') AS mid_300,
         max(mid) FILTER (WHERE source = 'own' AND probe = 'back_900') AS mid_900,
         max(mid) FILTER (WHERE source = 'own' AND probe = 'back_1800') AS mid_1800,
-        max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_1') AS mid_forward_1,
-        max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_5') AS mid_forward_5,
-        max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_15') AS mid_forward_15,
-        max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_30') AS mid_forward_30,
-        max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_60') AS mid_forward_60,
-        max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_close') AS mid_forward_close,
-        max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_1') AS spread_forward_1,
-        max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_5') AS spread_forward_5,
-        max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_15') AS spread_forward_15,
-        max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_30') AS spread_forward_30,
-        max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_60') AS spread_forward_60,
+        {forward_pivots}max(mid) FILTER (WHERE source = 'own' AND probe = 'forward_close') AS mid_forward_close,
         max(spread_basis_points) FILTER (WHERE source = 'own' AND probe = 'forward_close') AS spread_forward_close,
         max(mid) FILTER (WHERE source = 'SPY' AND probe = 'now') AS spy_mid,
         max(mid) FILTER (WHERE source = 'SPY' AND probe = 'back_1800') AS spy_mid_1800,
-        max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_1') AS spy_forward_1,
-        max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_5') AS spy_forward_5,
-        max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_15') AS spy_forward_15,
-        max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_30') AS spy_forward_30,
-        max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_60') AS spy_forward_60,
         max(mid) FILTER (WHERE source = 'SPY' AND probe = 'forward_close') AS spy_forward_close,
         max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'now') AS spy_microprice,
         max(microprice) FILTER (WHERE source = 'SPY' AND probe = 'back_5') AS spy_microprice_5,
@@ -650,6 +786,7 @@ COPY (
             market_now.cumulative_dollars - coalesce(market_30.cumulative_dollars, 0) AS market_dollars_30,
             ranks.dollar_volume_rank, previous_close.close AS previous_close,
             daily.beta, daily.daily_volatility_20, daily.previous_return, daily.beta_days, universe.industry,
+            resting.* EXCLUDE (ticker, kind, key),
             epoch_ns(quotes_wide.arrival - {open}) / 6e10 AS minutes_since_open
         FROM quotes_wide JOIN trades_wide USING (ticker, kind, key)
         LEFT JOIN (SELECT * FROM quote_events_back WHERE window_length = 10) quote_10 USING (ticker, kind, key)
@@ -658,7 +795,8 @@ COPY (
         LEFT JOIN (SELECT * FROM market_probed WHERE probe = 'now') market_now USING (ticker, kind, key)
         LEFT JOIN (SELECT * FROM market_probed WHERE probe = 'back_30') market_30 USING (ticker, kind, key)
         LEFT JOIN ranks USING (ticker) LEFT JOIN previous_close USING (ticker)
-        LEFT JOIN daily USING (ticker) LEFT JOIN universe USING (ticker))
+        LEFT JOIN daily USING (ticker) LEFT JOIN universe USING (ticker)
+        LEFT JOIN resting USING (ticker, kind, key))
     SELECT '{provider}' AS provider, '{session}' AS session, ticker, kind, key, arrival,
         -- book
         quote_imbalance,
@@ -670,8 +808,7 @@ COPY (
         epoch_ns(arrival - last_mid_change) / 1e9 AS seconds_since_mid_change,
         epoch_ns(arrival - quote_time) / 1e9 AS screen_quote_age, session_mean_spread AS screen_trailing_spread,
         bid AS screen_bid, ask AS screen_ask, bid_size AS screen_bid_size, ask_size AS screen_ask_size,
-        spread_forward_1 AS forward_spread_1, spread_forward_5 AS forward_spread_5, spread_forward_15 AS forward_spread_15,
-        spread_forward_30 AS forward_spread_30, spread_forward_60 AS forward_spread_60, spread_forward_close AS forward_spread_close,
+        {forward_spreads}spread_forward_close AS forward_spread_close,
         (quote_number - coalesce(quote_number_30, 0)) / 30.0 AS quote_rate,
         -- flow
         (flow_now - coalesce(flow_5, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_5, 0), 0) AS order_flow_seconds_5,
@@ -734,23 +871,33 @@ COPY (
         -- daily
         beta, daily_volatility_20, previous_return, beta_days, industry,
         -- targets
-        10000 * (mid_forward_1 / mid - 1) AS raw_1, 10000 * (mid_forward_5 / mid - 1) AS raw_5,
-        10000 * (mid_forward_15 / mid - 1) AS raw_15, 10000 * (mid_forward_30 / mid - 1) AS raw_30,
-        10000 * (mid_forward_60 / mid - 1) AS raw_60, 10000 * (mid_forward_close / mid - 1) AS raw_close,
-        raw_1 - 10000 * (spy_forward_1 / spy_mid - 1) AS net_1, raw_5 - 10000 * (spy_forward_5 / spy_mid - 1) AS net_5,
-        raw_15 - 10000 * (spy_forward_15 / spy_mid - 1) AS net_15, raw_30 - 10000 * (spy_forward_30 / spy_mid - 1) AS net_30,
-        raw_60 - 10000 * (spy_forward_60 / spy_mid - 1) AS net_60,
-        raw_close - 10000 * (spy_forward_close / spy_mid - 1) AS net_close,
-        10000 * (spy_forward_1 / spy_mid - 1) AS forward_spy_1, 10000 * (spy_forward_5 / spy_mid - 1) AS forward_spy_5,
-        10000 * (spy_forward_15 / spy_mid - 1) AS forward_spy_15, 10000 * (spy_forward_30 / spy_mid - 1) AS forward_spy_30,
-        10000 * (spy_forward_60 / spy_mid - 1) AS forward_spy_60,
-        10000 * (spy_forward_close / spy_mid - 1) AS forward_spy_close,
-        volatility_per_minute AS scale_per_root_minute
+        {raw}10000 * (mid_forward_close / mid - 1) AS raw_close,
+        {net}raw_close - 10000 * (spy_forward_close / spy_mid - 1) AS net_close,
+        {forward_spy}10000 * (spy_forward_close / spy_mid - 1) AS forward_spy_close,
+        volatility_per_minute AS scale_per_root_minute,
+        -- resting labels
+        {resting_columns}forward_bid_at_window, forward_ask_at_window
     FROM joined ORDER BY ticker, key
 ) TO 'table/rows_{provider}_{session}.parquet';
 "#
         ))
     }
+}
+
+/// The quote a resting `side` order stands at, the one it crosses to unfilled, and the comparison of a print to its
+/// limit that fills it under `bound`, spelling `FillBound::fills` in SQL.
+fn resting_spelling(side: Side, bound: FillBound) -> (&'static str, &'static str, &'static str) {
+    let (touch, cross) = match side {
+        Side::Buy => ("bid", "ask"),
+        Side::Sell => ("ask", "bid"),
+    };
+    let through = match (side, bound) {
+        (Side::Buy, FillBound::Conservative) => "<",
+        (Side::Buy, FillBound::Optimistic) => "<=",
+        (Side::Sell, FillBound::Conservative) => ">",
+        (Side::Sell, FillBound::Optimistic) => ">=",
+    };
+    (touch, cross, through)
 }
 
 /// `instant` as a DuckDB timestamp literal, read as UTC under the preamble's time zone.
@@ -1075,6 +1222,51 @@ mod tests {
                 .unwrap()
                 .contains("coalesce(\"update\", '') NOT IN ('corrected', 'canceled')")
         );
+    }
+
+    /// The default horizons spell today's minute targets, a horizon of whole minutes is named by its minutes and any
+    /// other by its seconds, and the resting window reaches every read of the window's end.
+    #[test]
+    fn test_horizons_and_the_resting_window_are_spelled_into_the_statements() {
+        let day = date(2025, 6, 16);
+        let calendar = calendar(date(2025, 11, 28));
+        let bars = held(&calendar, Provider::Massive, date(2025, 1, 1), day);
+        let build = |table: EventTable| {
+            table
+                .statements(&calendar, &named(day), &bars, date(2025, 6, 13))
+                .unwrap()
+        };
+        let defaults = build(table(TickProvider::Massive, 360));
+        for spelled in [
+            "('own', 'forward_1', 60), ('SPY', 'forward_1', 60), ('own', 'forward_5', 300)",
+            "('SPY', 'forward_60', 3600), \n",
+            "10000 * (mid_forward_60 / mid - 1) AS raw_60, 10000 * (mid_forward_close / mid - 1) AS raw_close",
+            "raw_15 - 10000 * (spy_forward_15 / spy_mid - 1) AS net_15",
+            "spread_forward_30 AS forward_spread_30",
+            "entries.arrival + INTERVAL 60 SECOND <= TIMESTAMP '2025-06-16 19:59:59'",
+            "forward_sell_entry_price_conservative,\n        forward_bid_at_window",
+        ] {
+            assert!(defaults.contains(spelled), "{spelled}");
+        }
+        let horizons = [10, 30, 60, 120, 300]
+            .into_iter()
+            .filter_map(NonZeroU32::new)
+            .collect();
+        let study = build(
+            table(TickProvider::Massive, 360)
+                .with_horizons(ForwardHorizons::from_seconds(horizons))
+                .with_resting_window(RestingWindow::from_seconds(NonZeroU32::new(15).unwrap())),
+        );
+        for spelled in [
+            "('own', 'forward_seconds_10', 10)",
+            "AS raw_seconds_30",
+            "AS net_2",
+            "AS forward_spy_5",
+            "started.arrival + INTERVAL 15 SECOND >= end_print.timestamp",
+        ] {
+            assert!(study.contains(spelled), "{spelled}");
+        }
+        assert!(!study.contains("raw_15"));
     }
 
     #[test]

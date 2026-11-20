@@ -232,6 +232,10 @@ impl Booster {
             .collect())
     }
 
+    pub fn loss(&self) -> Loss {
+        self.loss
+    }
+
     /// How many inputs each row it reads holds.
     pub fn width(&self) -> usize {
         self.width
