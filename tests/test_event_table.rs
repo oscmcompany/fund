@@ -6,13 +6,14 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::path::Path;
 use std::process::Command;
 
-use chrono::{NaiveDate, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use fund::common::book::Side;
 use fund::common::cost::FillBound;
 use fund::common::journal::RunId;
+use fund::common::laboratory::entry::{EventRow, ExitUnread, Resting, UnknownCause};
 use fund::common::laboratory::event_table::{
     DRAW_ORDER_MACROS, Draws, EntryWindow, EventClock, EventTable, EventTableRefusal,
-    ForwardHorizons, ReadDelay, RestingWindow, draw_order, draw_seed,
+    ForwardHorizons, Horizon, ReadDelay, RestingWindow, draw_order, draw_seed,
 };
 use fund::common::laboratory::universe::{Universe, UniverseSize, universe};
 use fund::common::market::aggregate::TradeTotals;
@@ -26,6 +27,7 @@ use fund::common::market::{DollarVolume, Price, Shares, StampedPrice, Symbol, Tr
 use fund::common::storage::{Key, Provider, ReferenceKey, ReferenceTable, TickProvider, TradesKey};
 use fund::common::time::calendar::{TradingCalendar, TradingSession};
 use fund::common::time::{SessionDate, SessionRange};
+use fund::laboratory::event_rows::{Untouched, event_rows};
 use fund::storage::provenance::{Provenance, Subscription};
 use fund::storage::reference::{
     decode_details_snapshot, encode_conditions, encode_security_details,
@@ -408,6 +410,18 @@ COPY (SELECT ticker, {grid_trade_columns} FROM names, range(7800) AS steps(step)
 
 /// Runs `table`'s statements over `provider`'s fixture, then `query`, and returns duckdb's output.
 fn run(table: EventTable, provider: TickProvider, probes: Probes, query: &str) -> (String, String) {
+    let (stdout, stderr, ()) = run_then(table, provider, probes, query, |_| ());
+    (stdout, stderr)
+}
+
+/// `run`, also returning what `read` takes from the run's directory before it is removed.
+fn run_then<T>(
+    table: EventTable,
+    provider: TickProvider,
+    probes: Probes,
+    query: &str,
+    read: impl FnOnce(&Path) -> T,
+) -> (String, String, T) {
     let directory = std::env::temp_dir().join(format!("fund-event-table-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
     let (month, day) = CONDITIONS_AS_OF;
@@ -428,11 +442,29 @@ fn run(table: EventTable, provider: TickProvider, probes: Probes, query: &str) -
         .args(["-csv", "-noheader", "-c", &script])
         .output()
         .expect("duckdb is on the path, as devenv provides it");
+    let read = read(&directory);
     std::fs::remove_dir_all(&directory).unwrap();
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
+        read,
     )
+}
+
+/// `table`'s rows over the Massive fixture with `probes`, read at `horizons` by the library's reader.
+fn read_rows(
+    table: EventTable,
+    probes: Probes,
+    horizons: &[Horizon],
+) -> Vec<Vec<Result<EventRow, Untouched>>> {
+    let (_, stderr, bytes) = run_then(table, TickProvider::Massive, probes, "", |directory| {
+        std::fs::read(directory.join("table/rows_massive_2025-06-16.parquet"))
+    });
+    let bytes = bytes::Bytes::from(bytes.unwrap_or_else(|error| panic!("{error}: {stderr}")));
+    horizons
+        .iter()
+        .map(|horizon| event_rows(bytes.clone(), *horizon).unwrap())
+        .collect()
 }
 
 /// Runs `clock`'s statements over the Massive fixture, drawing from minutes 100 to 110, and returns duckdb's output:
@@ -934,4 +966,144 @@ fn test_the_eligible_count_matches_a_window_counted_by_hand() {
         eligible(1, 3, 7800, (0, 1), 0),
         (1..=20).collect::<Vec<u64>>()
     );
+}
+
+/// A fixture price in ten-thousandths of a dollar as a `Price`.
+fn fixture_price(ten_thousandths: i64) -> Price {
+    Price::from_ticks(100 * ten_thousandths).unwrap()
+}
+
+/// Every quote update of minutes nine to eleven, read back through the library's reader at a one-minute horizon,
+/// carries the touch, the exit and the resting labels the fixture implies, with fills and misses on both sides.
+#[test]
+fn test_the_reader_reads_each_row_as_the_fixture_implies() {
+    let table = EventTable::new(
+        TickProvider::Massive,
+        EventClock::QuoteUpdates,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(100).unwrap()),
+        EntryWindow::new(9, 11).unwrap(),
+    );
+    let horizon = Horizon::After(NonZeroU32::new(60).unwrap());
+    let rows = read_rows(table, Probes::Dips, &[horizon]).remove(0);
+    assert_eq!(rows.len(), 120);
+    let open: DateTime<Utc> = "2025-06-16T13:30:00Z".parse().unwrap();
+    let (mut filled, mut unfilled) = (0, 0);
+    for row in &rows {
+        let row = row.as_ref().unwrap();
+        let milliseconds = (row.arrival() - open).num_milliseconds();
+        assert_eq!(row.session(), date(6, 16));
+        let (bid, ask) = touch_at(milliseconds);
+        let touch = row.touch();
+        assert_eq!(
+            (touch.bid(), touch.ask()),
+            (fixture_price(bid), fixture_price(ask))
+        );
+        assert_eq!(
+            (touch.bid_size(), touch.ask_size()),
+            (Shares::whole(100).unwrap(), Shares::whole(200).unwrap())
+        );
+        assert_eq!(
+            (touch.since() - open).num_milliseconds(),
+            milliseconds / 2000 * 2000
+        );
+        // Every quote is two cents wide on a mid rising from 100, so the session's mean relative spread, read at an
+        // arrival mid near 100.3, is a little over two cents.
+        assert!(
+            (20_000..=20_040).contains(&row.trailing_spread().ticks()),
+            "{:?}",
+            row.trailing_spread()
+        );
+        let (exit_bid, exit_ask) = touch_at(milliseconds + 60_000);
+        let exit = row.exit().unwrap();
+        assert_eq!(
+            (exit.bid(), exit.ask()),
+            (fixture_price(exit_bid), fixture_price(exit_ask))
+        );
+        let labels = resting_labels(row.symbol().as_str(), milliseconds, 60);
+        let pairs = Side::iter().flat_map(|side| FillBound::iter().map(move |bound| (side, bound)));
+        for ((side, bound), label) in pairs.zip(labels.chunks(3)) {
+            let ten_thousandths = (label[2].parse::<f64>().unwrap() * 10_000.0).round() as i64;
+            let expected = match label[0].as_str() {
+                "true" => Resting::Filled {
+                    after: TimeDelta::milliseconds(
+                        (label[1].parse::<f64>().unwrap() * 1000.0).round() as i64,
+                    ),
+                    price: fixture_price(ten_thousandths),
+                },
+                "false" => Resting::Unfilled {
+                    cross_at_window: fixture_price(ten_thousandths),
+                },
+                other => panic!("the oracle wrote {other}"),
+            };
+            assert_eq!(
+                row.resting(side, bound),
+                expected,
+                "{side} {bound} at {milliseconds}"
+            );
+            match expected {
+                Resting::Filled { .. } => filled += 1,
+                Resting::Unfilled { .. } | Resting::Unknown(_) => unfilled += 1,
+            }
+        }
+    }
+    assert!(
+        filled > 0 && unfilled > 0,
+        "{filled} filled, {unfilled} unfilled"
+    );
+}
+
+/// A print before its name's first quote reads as untouched, and a window and a one-minute horizon past the last
+/// read leave the labels unknown and the exit unread, while the close's exit is still read.
+#[test]
+fn test_the_reader_keeps_untouched_rows_and_unknown_labels_apart() {
+    let unquoted = EventTable::new(
+        TickProvider::Massive,
+        EventClock::Prints,
+        ReadDelay::from_milliseconds(500),
+        Draws::new(NonZeroU16::new(100).unwrap()),
+        EntryWindow::new(0, 5).unwrap(),
+    );
+    let rows = read_rows(unquoted, Probes::Unquoted, &[Horizon::Close]).remove(0);
+    let untouched: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| {
+            row.as_ref()
+                .err()
+                .map(|untouched| untouched.symbol.as_str())
+        })
+        .collect();
+    assert_eq!((rows.len(), untouched.len()), (200, 100));
+    assert!(untouched.iter().all(|symbol| *symbol == "BBB"));
+    let closing = EventTable::new(
+        TickProvider::Massive,
+        EventClock::QuoteUpdates,
+        ReadDelay::from_milliseconds(1500),
+        Draws::new(NonZeroU16::new(100).unwrap()),
+        EntryWindow::new(389, 390).unwrap(),
+    );
+    let read = read_rows(
+        closing,
+        Probes::Without,
+        &[Horizon::After(NonZeroU32::new(60).unwrap()), Horizon::Close],
+    );
+    let (minute, close) = (&read[0], &read[1]);
+    assert_eq!((minute.len(), close.len()), (58, 58));
+    for (minute, close) in minute.iter().zip(close) {
+        let (minute, close) = (minute.as_ref().unwrap(), close.as_ref().unwrap());
+        assert_eq!(minute.exit(), Err(ExitUnread::PastLastRead));
+        let (bid, ask) = touch_at(23_399_000);
+        assert_eq!(
+            close.exit().map(|exit| (exit.bid(), exit.ask())),
+            Ok((fixture_price(bid), fixture_price(ask)))
+        );
+        for (side, bound) in
+            Side::iter().flat_map(|side| FillBound::iter().map(move |bound| (side, bound)))
+        {
+            assert_eq!(
+                minute.resting(side, bound),
+                Resting::Unknown(UnknownCause::WindowPastLastRead)
+            );
+        }
+    }
 }

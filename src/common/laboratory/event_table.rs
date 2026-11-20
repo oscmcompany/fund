@@ -259,11 +259,28 @@ impl ForwardHorizons {
     fn named(&self) -> Vec<(String, u32)> {
         self.0
             .iter()
-            .map(|seconds| match seconds.get() % 60 {
-                0 => ((seconds.get() / 60).to_string(), seconds.get()),
-                _ => (format!("seconds_{seconds}"), seconds.get()),
-            })
+            .map(|seconds| (Horizon::After(*seconds).suffix(), seconds.get()))
             .collect()
+    }
+}
+
+/// A horizon the forward columns are read at: a delay after arrival, or the session's last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Horizon {
+    After(NonZeroU32),
+    Close,
+}
+
+impl Horizon {
+    /// The suffix of the horizon's forward columns: its whole minutes, else `seconds_` and its seconds, or `close`.
+    pub fn suffix(self) -> String {
+        match self {
+            Self::After(seconds) => match seconds.get() % 60 {
+                0 => (seconds.get() / 60).to_string(),
+                _ => format!("seconds_{seconds}"),
+            },
+            Self::Close => "close".to_string(),
+        }
     }
 }
 
