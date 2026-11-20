@@ -88,7 +88,9 @@ pub enum RowProblem {
     Exit(ExitCrossed),
     #[error("`{name}` is {value}, which no finite measurement is")]
     NotFinite { name: String, value: f64 },
-    #[error("the trailing spread is {basis_points} basis points, below zero")]
+    #[error(
+        "the trailing spread is {basis_points} basis points, below zero or beyond the largest spread"
+    )]
     TrailingSpread { basis_points: f64 },
 }
 
@@ -288,10 +290,10 @@ fn exit_quote(
 
 /// The session's mean relative spread so far in basis points, as millionths of the arrival mid rounded to the nearest.
 fn trailing_spread(basis_points: f64, doubled_arrival: i64) -> Result<Spread, RowProblem> {
-    match basis_points >= 0.0 {
-        true => Ok(Spread::from_ticks(
-            (basis_points * doubled_arrival as f64 / 20_000.0).round() as u64,
-        )),
+    let ticks = (basis_points * doubled_arrival as f64 / 20_000.0).round();
+    // `u64::MAX as f64` rounds up to 2^64, so the bound is strict.
+    match basis_points >= 0.0 && (0.0..u64::MAX as f64).contains(&ticks) {
+        true => Ok(Spread::from_ticks(ticks as u64)),
         false => Err(RowProblem::TrailingSpread { basis_points }),
     }
 }
@@ -466,6 +468,17 @@ mod tests {
         assert_eq!(
             trailing_spread(-0.5, 200_020_000),
             Err(RowProblem::TrailingSpread { basis_points: -0.5 })
+        );
+        assert_eq!(
+            trailing_spread(1e20, 200_000_000),
+            Err(RowProblem::TrailingSpread { basis_points: 1e20 })
+        );
+        // A negative spread too small to round to a tick is still refused.
+        assert_eq!(
+            trailing_spread(-1e-9, 200_000_000),
+            Err(RowProblem::TrailingSpread {
+                basis_points: -1e-9
+            })
         );
     }
 
