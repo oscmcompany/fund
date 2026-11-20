@@ -3,6 +3,7 @@
 
 pub mod boosting;
 pub mod component;
+pub mod execution;
 pub mod loss;
 pub mod matrix;
 pub mod registry;

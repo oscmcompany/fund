@@ -245,6 +245,49 @@ fn correlation(left: &[f64], right: &[f64]) -> f64 {
     (covariance / (squares(left) * squares(right)).sqrt()).clamp(-1.0, 1.0)
 }
 
+/// The linear correlation of outcome with forecast, undefined where either is constant.
+pub fn linear_correlation(pairs: &[Pair]) -> Result<f64, Undefined> {
+    let names = pairs.len();
+    let forecast: Vec<f64> = pairs.iter().map(|pair| pair.forecast.0).collect();
+    let outcome: Vec<f64> = pairs.iter().map(|pair| pair.outcome.0).collect();
+    match (deviations(&forecast), deviations(&outcome)) {
+        (None, None) | (None, Some(..)) => Err(Undefined::ForecastConstant { names }),
+        (Some(..), None) => Err(Undefined::OutcomeConstant { names }),
+        (Some(forecast), Some(outcome)) => Ok(correlation(&forecast, &outcome)),
+    }
+}
+
+/// Why outcomes split into positives and negatives have no area under the curve, with the count of the one class held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AreaUndefined {
+    #[error("none of {negatives} outcomes was positive")]
+    NoPositives { negatives: usize },
+    #[error("all {positives} outcomes were positive")]
+    NoNegatives { positives: usize },
+}
+
+/// The chance a positive's forecast outranks a negative's, a tie counting half: the area under the receiver operating
+/// characteristic curve, read from the positives' average ranks.
+pub fn area_under_curve(scored: &[(Forecast, bool)]) -> Result<f64, AreaUndefined> {
+    let positives = scored.iter().filter(|(_, positive)| *positive).count();
+    match (positives, scored.len() - positives) {
+        (0, negatives) => Err(AreaUndefined::NoPositives { negatives }),
+        (positives, 0) => Err(AreaUndefined::NoNegatives { positives }),
+        (positives, negatives) => {
+            let ranks = average_ranks(scored.iter().map(|(forecast, _)| forecast.0));
+            let ranked: f64 = ranks
+                .iter()
+                .zip(scored)
+                .filter(|(_, (_, positive))| *positive)
+                .map(|(rank, _)| rank)
+                .sum();
+            let (positives, negatives) = (positives as f64, negatives as f64);
+            let area = (ranked - positives * (positives + 1.0) / 2.0) / (positives * negatives);
+            Ok(area.clamp(0.0, 1.0))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
@@ -570,6 +613,81 @@ mod tests {
             let original = Measure::HitRate.score(&pairs(&forecast, &outcome)).unwrap();
             let reversed = Measure::HitRate.score(&pairs(&negated, &outcome)).unwrap();
             prop_assert!((original + reversed - 1.0).abs() < 1e-12);
+        }
+    }
+
+    fn scored(forecasts: &[f64], positives: &[bool]) -> Vec<(Forecast, bool)> {
+        forecasts
+            .iter()
+            .zip(positives)
+            .map(|(forecast, positive)| (Forecast::new(*forecast).unwrap(), *positive))
+            .collect()
+    }
+
+    /// The area matches pairs counted by hand: three of four positive-negative pairs ordered, and a tie counting half.
+    #[test]
+    fn test_the_area_under_the_curve_counts_ordered_pairs_and_halves_ties() {
+        let area = |forecasts: &[f64], positives: &[bool]| {
+            area_under_curve(&scored(forecasts, positives)).unwrap()
+        };
+        assert_eq!(
+            area(&[0.1, 0.4, 0.35, 0.8], &[false, false, true, true]),
+            0.75
+        );
+        assert_eq!(
+            area(&[0.5, 0.5, 0.2, 0.9], &[true, false, false, true]),
+            0.875
+        );
+        assert_eq!(
+            area_under_curve(&scored(&[0.1, 0.2], &[false, false])),
+            Err(AreaUndefined::NoPositives { negatives: 2 })
+        );
+        assert_eq!(
+            area_under_curve(&scored(&[0.3], &[true])),
+            Err(AreaUndefined::NoNegatives { positives: 1 })
+        );
+        assert_eq!(
+            linear_correlation(&pairs(&[1.0, 2.0, 3.0], &[2.0, 4.0, 7.0]))
+                .map(|value| (value * 1e6).round()),
+            Ok(993_399.0)
+        );
+        assert_eq!(
+            linear_correlation(&pairs(&[1.0, 1.0], &[2.0, 4.0])),
+            Err(Undefined::ForecastConstant { names: 2 })
+        );
+    }
+
+    proptest! {
+        /// A perfect ranking scores one and its reverse zero, negating the forecast complements the area, and a
+        /// strictly increasing map of the forecast leaves it unchanged.
+        #[test]
+        fn test_the_area_reads_only_order(
+            values in prop::collection::vec((0_i32..20, any::<bool>()), 2..60),
+        ) {
+            let (forecasts, positives): (Vec<f64>, Vec<bool>) =
+                values.iter().map(|(forecast, positive)| (f64::from(*forecast), *positive)).unzip();
+            let area = |forecasts: &[f64]| area_under_curve(&scored(forecasts, &positives));
+            let perfect: Vec<f64> = positives.iter().map(|positive| f64::from(u8::from(*positive))).collect();
+            let reversed: Vec<f64> = perfect.iter().map(|value| -value).collect();
+            let stretched: Vec<f64> = forecasts.iter().map(|value| (value / 3.0).exp() * 2.5 - 7.0).collect();
+            let negated: Vec<f64> = forecasts.iter().map(|value| -value).collect();
+            let held = positives.iter().filter(|positive| **positive).count();
+            match (held, positives.len() - held) {
+                (0, negatives) => {
+                    prop_assert_eq!(area(&forecasts), Err(AreaUndefined::NoPositives { negatives }));
+                }
+                (held, 0) => {
+                    prop_assert_eq!(area(&stretched), Err(AreaUndefined::NoNegatives { positives: held }));
+                }
+                (_, _) => {
+                    let original = area(&forecasts).unwrap();
+                    prop_assert!((original - area(&stretched).unwrap()).abs() < 1e-12);
+                    prop_assert!((original + area(&negated).unwrap() - 1.0).abs() < 1e-12);
+                    prop_assert!((0.0..=1.0).contains(&original));
+                    prop_assert_eq!(area(&perfect), Ok(1.0));
+                    prop_assert_eq!(area(&reversed), Ok(0.0));
+                }
+            }
         }
     }
 
