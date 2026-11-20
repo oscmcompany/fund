@@ -227,12 +227,16 @@ pub(super) fn equal_up_to_rounding(left: f64, right: f64) -> bool {
 
 /// Each value less the mean, or `None` where every value is the same.
 fn deviations(values: &[f64]) -> Option<Vec<f64>> {
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let deviations: Vec<f64> = values.iter().map(|value| value - mean).collect();
-    deviations
+    let first = values.first()?;
+    // Judged on the values themselves: a rounded mean leaves residuals beside a constant.
+    if values
         .iter()
-        .any(|deviation| *deviation != 0.0)
-        .then_some(deviations)
+        .all(|value| equal_up_to_rounding(*value, *first))
+    {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    Some(values.iter().map(|value| value - mean).collect())
 }
 
 fn correlation(left: &[f64], right: &[f64]) -> f64 {
@@ -654,6 +658,26 @@ mod tests {
         assert_eq!(
             linear_correlation(&pairs(&[1.0, 1.0], &[2.0, 4.0])),
             Err(Undefined::ForecastConstant { names: 2 })
+        );
+    }
+
+    #[test]
+    fn test_a_constant_inexact_decimal_leaves_linear_correlation_undefined() {
+        assert_eq!(
+            linear_correlation(&pairs(&[0.1, 0.1, 0.1], &[1.0, 2.0, 3.0])),
+            Err(Undefined::ForecastConstant { names: 3 })
+        );
+        assert_eq!(
+            linear_correlation(&pairs(&[1.0, 2.0, 3.0], &[0.1, 0.1, 0.1])),
+            Err(Undefined::OutcomeConstant { names: 3 })
+        );
+        assert_eq!(
+            linear_correlation(&pairs(&[0.1, 0.1, 0.1], &[0.1, 0.1, 0.1])),
+            Err(Undefined::ForecastConstant { names: 3 })
+        );
+        assert_eq!(
+            linear_correlation(&pairs(&[0.5, 0.5_f64.next_up(), 0.5], &[1.0, 2.0, 3.0])),
+            Err(Undefined::ForecastConstant { names: 3 })
         );
     }
 
