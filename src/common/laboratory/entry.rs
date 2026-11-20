@@ -87,10 +87,15 @@ impl RestingLabels {
         for side in Side::iter() {
             for bound in FillBound::iter() {
                 let after = fill(side, bound);
-                if let Some(after) = after
-                    && after < TimeDelta::zero()
-                {
-                    return Err(RestingLabelsRefusal::FilledBeforeArrival { side, bound, after });
+                match after {
+                    Some(after) if after < TimeDelta::zero() => {
+                        return Err(RestingLabelsRefusal::FilledBeforeArrival {
+                            side,
+                            bound,
+                            after,
+                        });
+                    }
+                    Some(_) | None => {}
                 }
                 fills[side_index(side)][bound_index(bound)] = after;
             }
