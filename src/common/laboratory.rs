@@ -20,8 +20,10 @@ pub mod series;
 pub mod share;
 pub mod sharpe;
 pub mod synthetic;
+pub mod time_of_day;
 pub mod universe;
 pub mod verdict;
+pub mod volatility;
 
 /// The largest reading magnitude a series admits; no measured quantity comes near it, and below it every sum, square
 /// and Welch term stays finite.
