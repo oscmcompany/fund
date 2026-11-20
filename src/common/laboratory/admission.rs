@@ -122,6 +122,12 @@ impl Expected {
     pub fn admit(self) -> Result<PerShare, AdmissionRefusal> {
         self.priced.admit(self.edge)
     }
+
+    /// Whether the net is admitted and lies strictly above `threshold`'s share of the mid.
+    pub fn clears(self, threshold: Threshold) -> bool {
+        self.admit()
+            .is_ok_and(|net| threshold.clears(net, self.mid))
+    }
 }
 
 /// The trade `forecast` per share implies for `symbol`: entered by taking `touch`, exited by taking its other side,
@@ -160,7 +166,7 @@ pub fn expect(
     })
 }
 
-/// What one threshold admits: every row whose net clears it, and the band of those no tighter threshold admitted.
+/// What one threshold admits: every admitted row whose net clears it, and the band of those no tighter threshold admitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted<'a, T> {
     threshold: Threshold,
@@ -182,22 +188,22 @@ impl<'a, T> Admitted<'a, T> {
     }
 }
 
-/// Each threshold's admissions from tight to loose, each row's net read against the bar at its own mid.
+/// Each threshold's admissions from tight to loose, each row admitted past its cost floor and its net read against
+/// the bar at its own mid.
 pub fn sweep<'a, T>(thresholds: &Thresholds, rows: &'a [(Expected, T)]) -> Vec<Admitted<'a, T>> {
     let mut tighter: Option<Threshold> = None;
     thresholds
         .thresholds()
         .iter()
         .map(|threshold| {
-            let clears = |bar: Threshold, (expected, _): &(Expected, T)| {
-                bar.clears(expected.net(), expected.mid())
-            };
-            let cumulative: Vec<&'a (Expected, T)> =
-                rows.iter().filter(|row| clears(*threshold, row)).collect();
+            let cumulative: Vec<&'a (Expected, T)> = rows
+                .iter()
+                .filter(|(expected, _)| expected.clears(*threshold))
+                .collect();
             let band = cumulative
                 .iter()
                 .copied()
-                .filter(|row| tighter.is_none_or(|bar| !clears(bar, row)))
+                .filter(|(expected, _)| tighter.is_none_or(|bar| !expected.clears(bar)))
                 .collect();
             tighter = Some(*threshold);
             Admitted {
@@ -413,6 +419,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_a_sweep_admits_nothing_inside_the_cost_floor() {
+        let touch = quote(49_990_000, 50_010_000);
+        let rows: Vec<(Expected, Price)> = [13_601, 13_900, 13_901]
+            .map(|forecast| (expected(forecast, &touch).unwrap(), price(50_000_000)))
+            .into();
+        // Nets of 1, 300 and 301 millionths against the model's floor of 300, all above a bar of zero.
+        let thresholds = Thresholds::new(vec![threshold(0), threshold(-100)]).unwrap();
+        let read: Vec<Vec<usize>> = sweep(&thresholds, &rows)
+            .iter()
+            .map(|admission| positions(&rows, admission.cumulative()))
+            .collect();
+        assert_eq!(read, [vec![2], vec![2]]);
+    }
+
     fn rows() -> impl Strategy<Value = Vec<(Expected, Price)>> {
         let row = (
             (-200_000i64..200_000)
@@ -438,7 +459,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn property_a_sweep_grows_by_its_bands_and_admits_exactly_what_clears(
+        fn property_a_sweep_grows_by_its_bands_and_admits_exactly_what_clears_past_the_floor(
             rows in rows(),
             thresholds in thresholds(),
         ) {
@@ -463,8 +484,10 @@ mod tests {
                     .iter()
                     .enumerate()
                     .filter(|(_, (expected, mid))| {
-                        i128::from(expected.net().millionths()) * 1_000_000
-                            > i128::from(admission.threshold().hundredths()) * i128::from(mid.ticks())
+                        let net = expected.net().millionths();
+                        net > expected.priced().floor().millionths()
+                            && i128::from(net) * 1_000_000
+                                > i128::from(admission.threshold().hundredths()) * i128::from(mid.ticks())
                     })
                     .map(|(index, _)| index)
                     .collect();

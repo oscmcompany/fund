@@ -736,11 +736,16 @@ mod tests {
         ) {
             let pairs: Vec<(u8, Pair)> =
                 rows.iter().map(|(fold, forecast, outcome)| (*fold, pair(*forecast, *outcome))).collect();
-            // Both the held fold's forecasts and its outcomes are replanted, since either could leak into its slope.
+            // Both the held fold's forecasts and its outcomes are replanted, since either could leak into its slope;
+            // two forecasts alternate so the other folds' training sets do not turn constant.
+            let mut alternate = 0.0;
             let replanted: Vec<(u8, Pair)> = rows
                 .iter()
                 .map(|(fold, forecast, outcome)| match *fold == held {
-                    true => (*fold, pair(planted_forecast, planted)),
+                    true => {
+                        alternate = 1.0 - alternate;
+                        (*fold, pair(planted_forecast + alternate, planted))
+                    }
                     false => (*fold, pair(*forecast, *outcome)),
                 })
                 .collect();

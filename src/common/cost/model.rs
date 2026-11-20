@@ -212,35 +212,39 @@ impl SpreadDeciles {
     }
 }
 
-/// The fewest observations that give each decile one, when their spreads are distinct.
-pub const MINIMUM_DECILE_OBSERVATIONS: usize = 10;
-
-/// Why deciles were not fit, with the observations offered.
+/// Why deciles were not fit: a decile that cannot be priced, with the refusal of its estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DecileFitRefusal {
-    #[error(
-        "{observations} observation(s) cannot open ten deciles; {MINIMUM_DECILE_OBSERVATIONS} are needed"
-    )]
-    TooFew { observations: usize },
+#[error("decile {} is unmeasured: {refusal}", .decile.number())]
+pub struct DecileFitRefusal {
+    pub decile: Decile,
+    pub refusal: EstimateRefusal,
 }
 
 impl SpreadDeciles {
-    /// Deciles bounded at the tenths of the realized spreads, each estimate folded from the costs realized in it.
+    /// Deciles bounded at the tenths of the realized spreads, each estimate folded from the costs realized in it,
+    /// refused unless every decile measures an error; tied spreads can leave a decile short or empty.
     pub fn fit(realized: &[(Spread, PerShare)]) -> Result<Self, DecileFitRefusal> {
-        if realized.len() < MINIMUM_DECILE_OBSERVATIONS {
-            return Err(DecileFitRefusal::TooFew {
-                observations: realized.len(),
-            });
-        }
         let mut spreads: Vec<Spread> = realized.iter().map(|(spread, _)| *spread).collect();
         spreads.sort_unstable();
+        // With no spreads every bound is a placeholder, and the empty narrowest decile refuses the fit.
         let mut deciles = Self {
-            lower_bounds: std::array::from_fn(|index| spreads[(index + 1) * spreads.len() / 10]),
+            lower_bounds: std::array::from_fn(|index| {
+                spreads
+                    .get((index + 1) * spreads.len() / 10)
+                    .copied()
+                    .unwrap_or(Spread::from_ticks(0))
+            }),
             estimates: [CostEstimate::empty(); 10],
         };
         for (spread, cost) in realized {
             let slot = usize::from(deciles.decile(*spread).number() - 1);
             deciles.estimates[slot] = deciles.estimates[slot].combine(CostEstimate::of(*cost));
+        }
+        for (index, estimate) in deciles.estimates.iter().enumerate() {
+            estimate.error().map_err(|refusal| DecileFitRefusal {
+                decile: Decile(index as u8 + 1),
+                refusal,
+            })?;
         }
         Ok(deciles)
     }
@@ -804,9 +808,9 @@ mod tests {
         }
     }
 
-    /// Twenty observations at 1 to 20 ticks, each costing a hundred millionths a tick, in `fold`.
+    /// Two hundred observations at 1 to 200 ticks, each costing a hundred millionths a tick, in `fold`.
     fn realized(fold: u8) -> Vec<(u8, Spread, PerShare)> {
-        (1..=20)
+        (1..=200)
             .map(|ticks| (fold, spread(ticks), per_share(100 * ticks as i64)))
             .collect()
     }
@@ -818,17 +822,37 @@ mod tests {
             .map(|(_, spread, cost)| (spread, cost))
             .collect();
         let deciles = SpreadDeciles::fit(&rows).unwrap();
-        let numbers = [1, 2, 3, 18, 19, 20].map(|ticks| deciles.decile(spread(ticks)).number());
+        let numbers =
+            [1, 20, 21, 180, 181, 200].map(|ticks| deciles.decile(spread(ticks)).number());
         assert_eq!(numbers, [1, 1, 2, 9, 10, 10]);
         let narrowest = deciles.estimate(spread(1));
         assert_eq!(
             (narrowest.fills(), narrowest.point()),
-            (2, Ok(per_share(150)))
+            (20, Ok(per_share(1_050)))
         );
-        assert_eq!(deciles.estimate(spread(20)).point(), Ok(per_share(1_950)));
+        assert_eq!(deciles.estimate(spread(200)).point(), Ok(per_share(19_050)));
+        // One fewer leaves the narrowest decile 19 fills, one short of an error.
         assert_eq!(
-            SpreadDeciles::fit(&rows[..9]),
-            Err(DecileFitRefusal::TooFew { observations: 9 })
+            SpreadDeciles::fit(&rows[..199]),
+            Err(DecileFitRefusal {
+                decile: Decile(1),
+                refusal: EstimateRefusal::TooFewFills { fills: 19 },
+            })
+        );
+    }
+
+    #[test]
+    fn test_clustered_spreads_that_leave_a_decile_unmeasured_are_refused() {
+        let clustered: Vec<(Spread, PerShare)> = (0..200)
+            .map(|index| (spread(5), per_share(100 * index)))
+            .collect();
+        // Every bound ties at 5 ticks, so all 200 land in decile 10 and decile 1 is empty.
+        assert_eq!(
+            SpreadDeciles::fit(&clustered),
+            Err(DecileFitRefusal {
+                decile: Decile(1),
+                refusal: EstimateRefusal::TooFewFills { fills: 0 },
+            })
         );
     }
 
@@ -849,41 +873,46 @@ mod tests {
         };
         assert_eq!(
             (estimate(1), estimate(2)),
-            (Ok(per_share(157)), Ok(per_share(150)))
+            (Ok(per_share(1_057)), Ok(per_share(1_050)))
         );
         assert_eq!(
             held_out(&realized(1), free()),
-            Err(DecileFitRefusal::TooFew { observations: 0 })
+            Err(DecileFitRefusal {
+                decile: Decile(1),
+                refusal: EstimateRefusal::TooFewFills { fills: 0 },
+            })
         );
     }
 
     proptest! {
         #[test]
         fn property_a_held_out_model_never_reads_its_own_fold(
-            rows in prop::collection::vec((0u8..4, 0u64..1_000, -50_000i64..50_000), 40..120),
+            rows in prop::collection::vec((0u8..4, 0u64..100_000, -50_000i64..50_000), 600..900),
             held in 0u8..4,
-            planted_ticks in 0u64..1_000,
-            planted in -1_000_000i64..1_000_000,
+            planted in prop::collection::vec((0u64..100_000, -1_000_000i64..1_000_000), 900),
         ) {
             let rows: Vec<(u8, Spread, PerShare)> =
                 rows.into_iter().map(|(fold, ticks, cost)| (fold, spread(ticks), per_share(cost))).collect();
             // Both the held fold's spreads and its costs are replanted, since either could leak into its model.
+            let mut planted = planted.into_iter();
             let replanted: Vec<(u8, Spread, PerShare)> = rows
                 .iter()
-                .map(|(fold, ticks, cost)| match *fold == held {
-                    true => (*fold, spread(planted_ticks), per_share(planted)),
-                    false => (*fold, *ticks, *cost),
+                .map(|(fold, ticks, cost)| match (*fold == held, planted.next()) {
+                    (true, Some((planted_ticks, planted_cost))) => {
+                        (*fold, spread(planted_ticks), per_share(planted_cost))
+                    }
+                    (true, None) | (false, _) => (*fold, *ticks, *cost),
                 })
                 .collect();
-            match (held_out(&rows, free()), held_out(&replanted, free())) {
-                (Ok(models), Ok(replanted_models)) => {
-                    let folds: BTreeSet<u8> = rows.iter().map(|(fold, _, _)| *fold).collect();
-                    prop_assert_eq!(models.keys().copied().collect::<BTreeSet<_>>(), folds);
-                    prop_assert_eq!(models.get(&held), replanted_models.get(&held));
-                }
-                (Err(refusal), Err(replanted_refusal)) => prop_assert_eq!(refusal, replanted_refusal),
-                (left, right) => prop_assert!(false, "{left:?} against {right:?}"),
-            }
+            // Replanting can tie another fold's spreads under a decile's minimum, which says nothing of the held
+            // fold's model; with these sizes both fits all but always succeed.
+            let (Ok(models), Ok(replanted_models)) = (held_out(&rows, free()), held_out(&replanted, free())) else {
+                return Err(TestCaseError::reject("a fold other than the held one could not be fit"));
+            };
+            let folds: BTreeSet<u8> = rows.iter().map(|(fold, _, _)| *fold).collect();
+            prop_assert_eq!(models.keys().copied().collect::<BTreeSet<_>>(), folds);
+            prop_assert!(models.contains_key(&held));
+            prop_assert_eq!(models.get(&held), replanted_models.get(&held));
         }
     }
 }
