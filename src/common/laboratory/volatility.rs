@@ -78,6 +78,9 @@ pub enum DailyVolatilityRefusal {
         previous: SessionDate,
         next: SessionDate,
     },
+    /// The first bar's session is a holiday or outside the calendar, so the next bar's return cannot be placed.
+    #[error("{session} is not a trading day on the calendar")]
+    NotTradingDay { session: SessionDate },
     #[error("{days} daily returns are fewer than the {MINIMUM_DAYS} a volatility needs")]
     TooFewDays { days: usize },
     #[error("the {estimator} estimator read no movement over {days} days")]
@@ -166,6 +169,13 @@ fn days(bars: &[Bar], calendar: &TradingCalendar) -> Result<Vec<Day>, DailyVolat
                 found: bar.symbol().clone(),
             });
         }
+    }
+    // Each later session is checked as the next trading day after this one, so only this one needs checking here.
+    let first_session = SessionDate::at(first.timestamp());
+    if !calendar.is_trading_day(first_session) {
+        return Err(DailyVolatilityRefusal::NotTradingDay {
+            session: first_session,
+        });
     }
     bars.windows(2)
         .map(|pair| {
@@ -278,14 +288,19 @@ pub(super) mod tests {
 
     /// Every calendar day for 400 days from the first session trades, except those in `holidays`.
     fn calendar(holidays: &[i64]) -> TradingCalendar {
+        calendar_from(0, holidays)
+    }
+
+    /// Every calendar day from session `first` through session 399 trades, except those in `holidays`.
+    fn calendar_from(first: i64, holidays: &[i64]) -> TradingCalendar {
         let time = |hour| NaiveTime::from_hms_opt(hour, 0, 0).unwrap();
-        let sessions = (0..400)
+        let sessions = (first..400)
             .filter(|day| !holidays.contains(day))
             .map(|day| TradingSession::new(session(day), time(9), time(16)).unwrap())
             .collect();
         TradingCalendar::new(
             sessions,
-            SessionRange::new(session(0), session(399)).unwrap(),
+            SessionRange::new(session(first), session(399)).unwrap(),
         )
         .unwrap()
     }
@@ -394,6 +409,30 @@ pub(super) mod tests {
             DailyVolatility::measure(&intraday, &calendar(&[])),
             Err(DailyVolatilityRefusal::NotDaily {
                 interval: BarInterval::FiveMinute
+            })
+        );
+    }
+
+    /// The first bar's session anchors every later one, so a holiday there would pass the next trading day's bar as
+    /// one daily return over two overnights.
+    #[test]
+    fn test_a_first_bar_on_a_holiday_is_refused() {
+        assert_eq!(
+            DailyVolatility::measure(&daily(&HAND), &calendar(&[0])),
+            Err(DailyVolatilityRefusal::NotTradingDay {
+                session: session(0)
+            })
+        );
+    }
+
+    /// A first bar before the calendar's range is as unplaceable as a holiday, since the calendar's first session
+    /// would read as its successor.
+    #[test]
+    fn test_a_first_bar_before_the_calendar_is_refused() {
+        assert_eq!(
+            DailyVolatility::measure(&daily(&HAND), &calendar_from(1, &[])),
+            Err(DailyVolatilityRefusal::NotTradingDay {
+                session: session(0)
             })
         );
     }
