@@ -130,6 +130,13 @@ impl Expected {
     }
 }
 
+/// Half of `touch`'s spread per share, rounded up to the millionth: what taking it costs over its mid.
+pub fn half_spread(touch: &StandingQuote) -> PerShare {
+    // An uncrossed quote's difference is nonnegative, so adding one before halving rounds up.
+    PerShare::from_millionths((touch.ask().ticks() - touch.bid().ticks() + 1) / 2)
+        .expect("half an uncrossed quote's spread lies within a price")
+}
+
 /// The trade `forecast` per share implies for `symbol`: entered by taking `touch`, exited by taking its other side,
 /// the exit priced by `model` at the `trailing` spread.
 pub fn expect(
@@ -144,9 +151,7 @@ pub fn expect(
         std::cmp::Ordering::Less => (Side::Sell, touch.bid(), Side::Buy, touch.ask()),
         std::cmp::Ordering::Equal => return Err(ExpectRefusal::Flat { forecast }),
     };
-    // An uncrossed quote's difference is nonnegative, so adding one before halving rounds up.
-    let half_spread =
-        PerShare::from_millionths((touch.ask().ticks() - touch.bid().ticks() + 1) / 2)?;
+    let half_spread = half_spread(touch);
     let entry_fees = model
         .fees()
         .per_share(Liquidity::Removing, side, entry)
