@@ -3,6 +3,7 @@
 
 pub mod compare;
 pub mod dataset;
+pub mod event_rows;
 pub mod recovery;
 pub mod registry;
 pub mod replay;
