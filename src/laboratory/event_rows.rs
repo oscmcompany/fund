@@ -483,6 +483,40 @@ mod tests {
     }
 
     #[test]
+    fn test_a_non_finite_double_is_refused() {
+        use arrow_array::ArrayRef;
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "screen_bid",
+                Arc::new(Float64Array::from(vec![f64::INFINITY, f64::NAN])) as ArrayRef,
+            ),
+            (
+                "arrival",
+                Arc::new(TimestampMicrosecondArray::from(vec![0_i64, 0])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let columns = Columns {
+            batch: &batch,
+            arrivals: Arrivals::Microseconds(typed(&batch, "arrival", "a timestamp").unwrap()),
+            horizon: Horizon::Close,
+        };
+        assert_eq!(
+            columns.float("screen_bid", 0),
+            Err(RowProblem::NotFinite {
+                name: "screen_bid".into(),
+                value: f64::INFINITY,
+            })
+        );
+        // NaN never equals itself, so the NaN row is matched by shape.
+        assert!(matches!(
+            columns.float("screen_bid", 1),
+            Err(RowProblem::NotFinite { value, .. }) if value.is_nan()
+        ));
+    }
+
+    #[test]
     fn test_the_exit_is_rebuilt_from_its_return_and_spread() {
         // A 100.00 by 100.02 arrival, a mid up ten basis points to 100.11 and a two-cent spread on it.
         let raw = 10_000.0 * (100.11 / 100.01 - 1.0);

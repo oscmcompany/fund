@@ -453,6 +453,9 @@ impl EventTable {
 "
         );
         let horizons = self.horizons.named();
+        // The reader derives `raw_` and `forward_spread_` plus `Horizon::Close.suffix()`, so the writer names
+        // those two columns through the same suffix.
+        let close_suffix = Horizon::Close.suffix();
         // Each horizon's spelling of `template`, each followed by a comma, so no horizon spells nothing.
         let each = |template: &dyn Fn(&str, u32) -> String| -> String {
             horizons
@@ -825,7 +828,7 @@ COPY (
         epoch_ns(arrival - last_mid_change) / 1e9 AS seconds_since_mid_change,
         epoch_ns(arrival - quote_time) / 1e9 AS screen_quote_age, session_mean_spread AS screen_trailing_spread,
         bid AS screen_bid, ask AS screen_ask, bid_size AS screen_bid_size, ask_size AS screen_ask_size,
-        {forward_spreads}spread_forward_close AS forward_spread_close,
+        {forward_spreads}spread_forward_close AS forward_spread_{close_suffix},
         (quote_number - coalesce(quote_number_30, 0)) / 30.0 AS quote_rate,
         -- flow
         (flow_now - coalesce(flow_5, 0)) / nullif(absolute_flow_now - coalesce(absolute_flow_5, 0), 0) AS order_flow_seconds_5,
@@ -888,8 +891,8 @@ COPY (
         -- daily
         beta, daily_volatility_20, previous_return, beta_days, industry,
         -- targets
-        {raw}10000 * (mid_forward_close / mid - 1) AS raw_close,
-        {net}raw_close - 10000 * (spy_forward_close / spy_mid - 1) AS net_close,
+        {raw}10000 * (mid_forward_close / mid - 1) AS raw_{close_suffix},
+        {net}raw_{close_suffix} - 10000 * (spy_forward_close / spy_mid - 1) AS net_close,
         {forward_spy}10000 * (spy_forward_close / spy_mid - 1) AS forward_spy_close,
         volatility_per_minute AS scale_per_root_minute,
         -- resting labels
