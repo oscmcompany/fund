@@ -372,10 +372,10 @@ mod tests {
                 EstimateRefusal::TooFewFills { fills: 0 }
             )))
         );
-        // A credit of ten million dollars a share pushes the net past the bound.
+        // A credit near ten million dollars a share pushes the net past the bound.
         let bound = 10_000_000_000_000;
         let credited = CostModel::new(
-            CostBasis::ByName(BTreeMap::from([(symbol(), estimate(-bound, 0))])),
+            CostBasis::ByName(BTreeMap::from([(symbol(), estimate(-(bound - 5), 1))])),
             model(0).fees(),
         );
         assert!(matches!(

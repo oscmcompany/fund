@@ -8,26 +8,28 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, Utc};
 
 use crate::common::book::{Cash, ValuationRefusal};
-use crate::common::laboratory::blocks::{Coarsening, Observations, coarsen};
+use crate::common::laboratory::blocks::{BlocksRefusal, Coarsening, Observations, coarsen};
 use crate::common::laboratory::estimate::{
-    Control, Estimate, Treatment, flipped_share, paired, summarize,
+    Control, Estimate, EstimateRefusal, Treatment, flipped_share, paired, summarize,
 };
 use crate::common::laboratory::experiment::{ExperimentRefusal, Metric, Name, Outputs, Parameters};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::laboratory::sharpe::{
     IndexReading, IndexUnread, Targets, beside_index, index_returns,
 };
+use crate::common::laboratory::trades::{Booked, BookingError, Borrows, Terms, Trade, book};
 use crate::common::laboratory::verdict::{Cause, Checks, NullReading};
 use crate::common::market::Symbol;
 use crate::common::market::record::{BarInterval, Partition};
 use crate::common::monoid::Monoid;
 use crate::common::replay::{Controls, FillModel, Replay, Replayer};
 use crate::common::strategy::Strategy;
+use crate::common::time::SessionDate;
 use crate::common::time::calendar::TradingCalendar;
-use crate::laboratory::Study;
 use crate::laboratory::dataset::Dataset;
 use crate::laboratory::replay::{Opening, ReplayStudyError, beside, metrics, run, settings};
 use crate::laboratory::risk_free::RiskFree;
+use crate::laboratory::{Study, StudyError};
 
 /// The estimate a comparison's paired difference is journaled under.
 const DIFFERENCE: &str = "session_return_difference";
@@ -52,26 +54,23 @@ enum ArmSide {
     Baseline,
 }
 
-/// One side of a comparison: a strategy and the name that says what it is and the settings that make it so.
+/// One side of a comparison: what it runs (a strategy, or a list of trades) and the name that says what it is and
+/// the settings that make it so.
 pub struct Arm<S> {
-    strategy: S,
+    payload: S,
     name: Name,
 }
 
-impl<S: Strategy> Arm<S> {
+impl<S> Arm<S> {
     /// Named `kind("setting"="value",...)`, each quoted and escaped, so two arms of one kind are told apart by their settings in the journal.
-    pub fn new(
-        strategy: S,
-        kind: &str,
-        parameters: &Parameters,
-    ) -> Result<Self, ExperimentRefusal> {
+    pub fn new(payload: S, kind: &str, parameters: &Parameters) -> Result<Self, ExperimentRefusal> {
         let settings: Vec<String> = parameters
             .settings()
             .iter()
             .map(|(name, value)| format!("{:?}={value:?}", name.as_str()))
             .collect();
         Ok(Self {
-            strategy,
+            payload,
             name: Name::new(format!("{kind}({})", settings.join(",")))?,
         })
     }
@@ -137,23 +136,24 @@ impl<'a> Benchmark<'a> {
     }
 }
 
-/// Both arms' replays and what the comparison journaled from them.
+/// Both arms' runs and what the comparison journaled from them: `R` is a `Replay` when the arms are strategies and
+/// a `Booked` when they are trade lists.
 #[derive(Debug)]
-pub struct Comparison {
-    candidate: Replay,
-    baseline: Replay,
+pub struct Comparison<R> {
+    candidate: R,
+    baseline: R,
     difference: Estimate,
     checks: Checks,
     coarsening: Coarsening,
     index: IndexReading,
 }
 
-impl Comparison {
-    pub fn candidate(&self) -> &Replay {
+impl<R> Comparison<R> {
+    pub fn candidate(&self) -> &R {
         &self.candidate
     }
 
-    pub fn baseline(&self) -> &Replay {
+    pub fn baseline(&self) -> &R {
         &self.baseline
     }
 
@@ -200,7 +200,7 @@ pub fn compare<C: Strategy, B: Strategy>(
     opening: Opening,
     controls: Controls,
     benchmark: &Benchmark,
-) -> Result<Comparison, ReplayStudyError> {
+) -> Result<Comparison<Replay>, ReplayStudyError> {
     let parameters = beside(
         [
             (
@@ -222,13 +222,13 @@ pub fn compare<C: Strategy, B: Strategy>(
     )?;
     let candidate_replay = run(
         dataset,
-        &Replayer::controlled(candidate.strategy, fill_model, decision, controls.clone())
+        &Replayer::controlled(candidate.payload, fill_model, decision, controls.clone())
             .map_err(ReplayStudyError::Controls)?,
         opening,
     )?;
     let baseline_replay = run(
         dataset,
-        &Replayer::controlled(baseline.strategy, fill_model, decision, controls.clone())
+        &Replayer::controlled(baseline.payload, fill_model, decision, controls.clone())
             .map_err(ReplayStudyError::Controls)?,
         opening,
     )?;
@@ -294,22 +294,40 @@ pub fn compare<C: Strategy, B: Strategy>(
     })
 }
 
+/// Why a comparison's checks could not be assembled.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckRefusal {
+    #[error("the difference series was refused: {0}")]
+    Series(SeriesRefusal),
+    #[error("the checks were refused: {0}")]
+    Experiment(ExperimentRefusal),
+}
+
+impl From<CheckRefusal> for ReplayStudyError {
+    fn from(refusal: CheckRefusal) -> Self {
+        match refusal {
+            CheckRefusal::Series(refusal) => Self::Series(refusal),
+            CheckRefusal::Experiment(refusal) => Self::Experiment(refusal),
+        }
+    }
+}
+
 /// The difference's sessions as its population, those it could not read as undefined, and the share of sign flips of
 /// its session readings at least as far from zero as its own, unmeasured with its cause below two readings.
 fn checks(
     candidate: &Series,
     baseline: &Series,
     difference: Estimate,
-) -> Result<Checks, ReplayStudyError> {
+) -> Result<Checks, CheckRefusal> {
     let differences = candidate
         .zip_with(baseline, |candidate, baseline| candidate - baseline)
-        .map_err(ReplayStudyError::Series)?;
+        .map_err(CheckRefusal::Series)?;
     let null = match flipped_share(&differences, NULL_SEED, NULL_PERMUTATIONS) {
         Ok(share) => {
             NullReading::Measured(Metric::new(share).expect("a share of permutations is finite"))
         }
         Err(refusal) => NullReading::Unmeasured {
-            cause: Cause::new(refusal.to_string()).map_err(ReplayStudyError::Experiment)?,
+            cause: Cause::new(refusal.to_string()).map_err(CheckRefusal::Experiment)?,
         },
     };
     Checks::new(
@@ -317,7 +335,179 @@ fn checks(
         difference.undefined(),
         null,
     )
-    .map_err(ReplayStudyError::Experiment)
+    .map_err(CheckRefusal::Experiment)
+}
+
+/// The coarsening a trade comparison's paired gains are journaled under.
+const TRADE_DIFFERENCE: &str = "trade_gain_difference";
+
+/// Why a trade comparison was not read.
+#[derive(Debug, thiserror::Error)]
+pub enum CompareTradesError {
+    #[error("a trade comparison needs at least one session to read")]
+    NoSessions,
+    #[error("the {arm} arm could not be booked: {cause}")]
+    Booking {
+        arm: &'static str,
+        cause: BookingError,
+    },
+    #[error("neither arm took a trade, so there is nothing to coarsen")]
+    NothingTaken,
+    #[error("the returns were refused: {0}")]
+    Series(SeriesRefusal),
+    #[error("the estimate was refused: {0}")]
+    Estimate(EstimateRefusal),
+    #[error("the block errors were refused: {0}")]
+    Blocks(BlocksRefusal),
+    #[error("{0}")]
+    Checks(#[from] CheckRefusal),
+    #[error("the experiment was refused: {0}")]
+    Experiment(ExperimentRefusal),
+    #[error("{0}")]
+    Study(StudyError),
+}
+
+/// Candidate less baseline in each trade's gain over the opening, at every instant and name either arm entered; an
+/// arm without a trade there gained nothing, since a trade arm trades its list and nothing else.
+fn trade_differences(
+    candidate: &Booked,
+    baseline: &Booked,
+) -> Vec<(DateTime<Utc>, Symbol, Option<f64>)> {
+    let keyed = |booked: &Booked| {
+        let mut gains: BTreeMap<(DateTime<Utc>, Symbol), f64> = BTreeMap::new();
+        for (at, symbol, gain) in booked.gains() {
+            if let Some(gain) = gain {
+                *gains.entry((at, symbol)).or_insert(0.0) += gain;
+            }
+        }
+        gains
+    };
+    let (candidate, baseline) = (keyed(candidate), keyed(baseline));
+    let keys: BTreeSet<(DateTime<Utc>, Symbol)> =
+        candidate.keys().chain(baseline.keys()).cloned().collect();
+    keys.into_iter()
+        .map(|(at, symbol)| {
+            let gain = |gains: &BTreeMap<(DateTime<Utc>, Symbol), f64>| {
+                gains.get(&(at, symbol.clone())).copied().unwrap_or(0.0)
+            };
+            let difference = gain(&candidate) - gain(&baseline);
+            (at, symbol, Some(difference))
+        })
+        .collect()
+}
+
+/// Books both trade lists through the one account `terms` describes, so the arms differ only in their trades, and
+/// journals them as one experiment naming both arms, the borrow provenance and the terms, with the candidate set
+/// beside `benchmark`. Both arms close every one of `sessions`, the study's own population, so a session neither
+/// arm traded still reads as a session of nothing and the paired difference reads on one series.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one condition both arms share, named at the call so none is mistaken for another"
+)]
+pub fn compare_trades(
+    study: &mut Study,
+    candidate: Arm<Vec<Trade>>,
+    baseline: Arm<Vec<Trade>>,
+    terms: &Terms,
+    calendar: &TradingCalendar,
+    borrows: &Borrows,
+    sessions: &BTreeSet<SessionDate>,
+    benchmark: &Benchmark,
+) -> Result<Comparison<Booked>, CompareTradesError> {
+    if sessions.is_empty() {
+        return Err(CompareTradesError::NoSessions);
+    }
+    let parameters = Parameters::new(
+        [
+            (
+                <&str>::from(ArmSide::Candidate),
+                candidate.name.as_str().to_string(),
+            ),
+            (
+                <&str>::from(ArmSide::Baseline),
+                baseline.name.as_str().to_string(),
+            ),
+            (INDEX, benchmark.symbol.as_str().to_string()),
+            ("borrow", borrows.provenance().flag()),
+        ]
+        .into_iter()
+        .chain(
+            benchmark
+                .risk_free
+                .settings()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone())),
+        )
+        .chain(terms.settings()),
+    )
+    .map_err(CompareTradesError::Experiment)?;
+    let booked = |arm: Arm<Vec<Trade>>, side: ArmSide| {
+        book(terms, calendar, borrows, sessions, arm.payload).map_err(|cause| {
+            CompareTradesError::Booking {
+                arm: side.into(),
+                cause,
+            }
+        })
+    };
+    let candidate_booked = booked(candidate, ArmSide::Candidate)?;
+    let baseline_booked = booked(baseline, ArmSide::Baseline)?;
+    let returns = |booked: &Booked| booked.returns().map_err(CompareTradesError::Series);
+    let (candidate_returns, baseline_returns) =
+        (returns(&candidate_booked)?, returns(&baseline_booked)?);
+    let difference = paired(Treatment(&candidate_returns), Control(&baseline_returns))
+        .map_err(CompareTradesError::Estimate)?;
+    let checks = checks(&candidate_returns, &baseline_returns, difference)?;
+    let differences = trade_differences(&candidate_booked, &baseline_booked);
+    if differences.is_empty() {
+        return Err(CompareTradesError::NothingTaken);
+    }
+    let observations = Observations::new(differences).map_err(CompareTradesError::Blocks)?;
+    let coarsening = coarsen(&observations).map_err(CompareTradesError::Blocks)?;
+    let index = IndexReading::from(beside_index(
+        &candidate_returns,
+        &benchmark.returns,
+        benchmark.risk_free.rates(),
+    ));
+    let mut outputs = Outputs::default()
+        .estimate(DIFFERENCE, difference)
+        .map_err(CompareTradesError::Experiment)?;
+    for (side, booked, returns) in [
+        (ArmSide::Candidate, &candidate_booked, &candidate_returns),
+        (ArmSide::Baseline, &baseline_booked, &baseline_returns),
+    ] {
+        let own =
+            Estimate::from_summary(summarize(returns)).map_err(CompareTradesError::Estimate)?;
+        outputs = outputs
+            .estimate(format!("{side}_session_return"), own)
+            .map_err(CompareTradesError::Experiment)?;
+        let (taken, trimmed, refused) = booked.counts();
+        for (metric, value) in [
+            ("trades_taken", taken as f64),
+            ("trades_trimmed", trimmed as f64),
+            ("trades_refused", refused as f64),
+            ("net_return", booked.net_return()),
+        ] {
+            outputs = outputs
+                .metric(format!("{side}_{metric}"), value)
+                .map_err(CompareTradesError::Experiment)?;
+        }
+    }
+    let outputs = outputs
+        .checks(checks.clone())
+        .and_then(|outputs| outputs.coarsening(TRADE_DIFFERENCE, coarsening.clone()))
+        .and_then(|outputs| outputs.index(index))
+        .map_err(CompareTradesError::Experiment)?;
+    study
+        .experiment(parameters, &[benchmark.dataset.lineage()], outputs)
+        .map_err(CompareTradesError::Study)?;
+    Ok(Comparison {
+        candidate: candidate_booked,
+        baseline: baseline_booked,
+        difference,
+        checks,
+        coarsening,
+        index,
+    })
 }
 
 /// Each arm's gain at each decision mark over `opening`, from the mark before it or `start` before the first.
@@ -509,6 +699,13 @@ pub(crate) mod tests {
 
     /// The one `experiment_ran` the study in `directory` journaled.
     pub(crate) fn journaled(directory: &std::path::Path) -> ExperimentRan {
+        let mut ran = experiments(directory);
+        assert_eq!(ran.len(), 1);
+        ran.remove(0)
+    }
+
+    /// Every `experiment_ran` the study in `directory` journaled.
+    fn experiments(directory: &std::path::Path) -> Vec<ExperimentRan> {
         let mut ran = Vec::new();
         let files = std::fs::read_dir(directory)
             .unwrap()
@@ -550,8 +747,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(ran.len(), 1);
-        ran.remove(0)
+        ran
     }
 
     /// One share bought at session 1's $10 open for 5bp and marked at the $11 closes gains 0.995% in session 1 and
@@ -1317,6 +1513,286 @@ pub(crate) mod tests {
             Err(ReplayStudyError::Study(crate::laboratory::StudyError::ReadByAnotherRun { run }))
                 if run == elsewhere
         ));
+    }
+
+    use crate::common::laboratory::entry::{
+        Entry as EventEntry, EventRow, ExitUnread, UnknownCause, enter,
+    };
+    use crate::common::laboratory::ledger::Leverage;
+    use crate::common::laboratory::trades::BorrowProvenance;
+    use crate::common::market::borrow::Borrow;
+    use crate::common::market::quote_bars::{Spread, StandingQuote};
+    use crate::common::market::{Price, SHARE_SCALE};
+
+    /// An instant `minutes` past 10:00 Eastern on the dataset fixtures' session `day`, all in early March, so no
+    /// daylight transition sits between midnight and the open.
+    fn trade_at(day: i64, minutes: i64) -> DateTime<Utc> {
+        crate::laboratory::dataset::tests::session(day).midnight()
+            + chrono::TimeDelta::hours(10)
+            + chrono::TimeDelta::minutes(minutes)
+    }
+
+    /// A crossed round trip of `whole` shares at a $49.99 by $50.01 touch, exiting at `exit` dollars 5 minutes in.
+    fn round_trip(name: &str, whole: f64, exit: f64, day: i64, minutes: i64) -> Trade {
+        let at = trade_at(day, minutes);
+        let price = |dollars: f64| Price::from_ticks((dollars * 1e6).round() as i64).unwrap();
+        let size = Shares::whole(1_000).unwrap();
+        let touch = StandingQuote::new(
+            at - chrono::TimeDelta::seconds(1),
+            price(49.99),
+            price(50.01),
+            size,
+            size,
+        )
+        .unwrap();
+        let row = EventRow::new(
+            Symbol::new(name).unwrap(),
+            at,
+            touch,
+            Spread::from_ticks(10_000),
+            Err(ExitUnread::PastLastRead),
+            Err(UnknownCause::WindowPastLastRead),
+        )
+        .unwrap();
+        let entered = enter(&row, crate::common::book::Side::Buy, EventEntry::Cross).unwrap();
+        Trade::new(
+            Symbol::new(name).unwrap(),
+            crate::common::book::Side::Buy,
+            Shares::from_units((whole * SHARE_SCALE as f64).round() as u64),
+            at,
+            entered,
+            at + chrono::TimeDelta::minutes(5),
+            price(exit),
+        )
+        .unwrap()
+    }
+
+    fn terms() -> Terms {
+        let dollar = 1_000_000_000_000;
+        let limits = crate::common::risk::Limits::new(
+            Cash::from_units(40_000 * dollar),
+            Cash::from_units(5_000 * dollar),
+            Cash::from_units(100_000 * dollar),
+            Cash::from_units(100_000 * dollar),
+            chrono::TimeDelta::minutes(10),
+        )
+        .unwrap();
+        Terms::new(
+            Cash::from_units(20_000 * dollar),
+            limits,
+            Leverage::new(std::num::NonZeroU8::new(2).unwrap()),
+            crate::common::cost::fees::FeeRegime::CommissionFree {
+                regulatory: crate::common::cost::fees::RegulatoryFees::new(
+                    crate::common::market::Dollars::from_millionths(0),
+                    crate::common::cost::PerShare::ZERO,
+                )
+                .unwrap(),
+            },
+        )
+    }
+
+    fn snapshot_borrows() -> Borrows {
+        Borrows::new(
+            BorrowProvenance::Snapshot {
+                fetched: crate::laboratory::dataset::tests::session(0),
+            },
+            BTreeMap::from([(Symbol::new("AAA").unwrap(), Borrow::Available)]),
+        )
+    }
+
+    fn trade_arm(name: &str, trades: Vec<Trade>) -> Arm<Vec<Trade>> {
+        Arm::new(trades, name, &Parameters::default()).unwrap()
+    }
+
+    fn fit_sessions() -> BTreeSet<SessionDate> {
+        (0..3)
+            .map(crate::laboratory::dataset::tests::session)
+            .collect()
+    }
+
+    /// A $45 candidate round trip against a $5 baseline one on the first of three sessions reads a difference of
+    /// exactly 0.002 on the $20,000 opening over the one traded session, journaled with both arms' names, the
+    /// borrow flag and the account terms.
+    #[test]
+    fn test_a_trade_comparison_is_journaled_with_the_borrow_flag() {
+        let (mut study, directory) = study();
+        let closes: Vec<f64> = (0..3).map(|day| 100.0 + day as f64).collect();
+        let dataset = daily_dataset(study.run_id(), 0, &[("SPY", closes)]);
+        let risk_free = zero_rate(&sessions(&dataset));
+        let benchmark = Benchmark::new(
+            &dataset,
+            Symbol::new("SPY").unwrap(),
+            &calendar_between(0, 2),
+            &risk_free,
+        )
+        .unwrap();
+        let comparison = compare_trades(
+            &mut study,
+            trade_arm(
+                "candidate_trades",
+                vec![round_trip("AAA", 90.0, 50.51, 0, 0)],
+            ),
+            trade_arm(
+                "baseline_trades",
+                vec![round_trip("BBB", 10.0, 50.51, 0, 10)],
+            ),
+            &terms(),
+            &calendar_between(0, 2),
+            &snapshot_borrows(),
+            &fit_sessions(),
+            &benchmark,
+        )
+        .unwrap();
+        let ran = journaled(&directory);
+        std::fs::remove_dir_all(&directory).unwrap();
+        let difference = comparison.difference();
+        assert!(
+            (difference.mean() - 0.002 / 3.0).abs() < 1e-15,
+            "{difference:?}"
+        );
+        assert_eq!((difference.sessions(), difference.undefined()), (3, 0));
+        let settings: BTreeMap<&str, &str> = ran
+            .parameters()
+            .settings()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(settings["candidate"], "candidate_trades()");
+        assert_eq!(settings["baseline"], "baseline_trades()");
+        assert_eq!(
+            settings["borrow"],
+            "snapshot(fetched=2026-03-02, not point in time)"
+        );
+        assert_eq!(settings["opening_cash_units"], "20000000000000000");
+        assert_eq!(settings["leverage"], "2");
+        assert_eq!(settings["gross_limit_units"], "40000000000000000");
+        assert_eq!(settings["per_name_limit_units"], "5000000000000000");
+        assert_eq!(settings["daily_loss_limit_units"], "100000000000000000");
+        assert_eq!(settings["per_name_loss_limit_units"], "100000000000000000");
+        assert_eq!(settings["flat_before_close_seconds"], "600");
+        assert_eq!(settings["index"], "SPY");
+        assert!(settings.contains_key("fees"));
+        let metrics: BTreeMap<&str, f64> = ran
+            .metrics()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.value()))
+            .collect();
+        assert_eq!(metrics["candidate_trades_taken"], 1.0);
+        assert_eq!(metrics["baseline_trades_taken"], 1.0);
+        assert_eq!(metrics["candidate_trades_refused"], 0.0);
+        assert!((metrics["candidate_net_return"] - 45.0 / 20_000.0).abs() < 1e-15);
+        // The candidate's $45 gain at its entry and the baseline's $5 at its own, each paired against nothing.
+        let coarsening = &ran.coarsenings()[TRADE_DIFFERENCE];
+        assert_eq!((coarsening.measured(), coarsening.undefined()), (2, 0));
+        assert!((coarsening.mean() - (0.00225 - 0.00025) / 2.0).abs() < 1e-15);
+        assert_eq!(ran.fingerprints(), [dataset.fingerprint().unwrap().clone()]);
+    }
+
+    /// A trade arm against itself differs by nothing in every session and at every trade.
+    #[test]
+    fn test_a_trade_arm_against_itself_differs_by_nothing() {
+        let (mut study, directory) = study();
+        let closes: Vec<f64> = (0..3).map(|day| 100.0 + day as f64).collect();
+        let dataset = daily_dataset(study.run_id(), 0, &[("SPY", closes)]);
+        let risk_free = zero_rate(&sessions(&dataset));
+        let benchmark = Benchmark::new(
+            &dataset,
+            Symbol::new("SPY").unwrap(),
+            &calendar_between(0, 2),
+            &risk_free,
+        )
+        .unwrap();
+        let trades = || {
+            vec![
+                round_trip("AAA", 50.0, 50.51, 0, 0),
+                round_trip("AAA", 20.0, 49.51, 2, 0),
+            ]
+        };
+        let comparison = compare_trades(
+            &mut study,
+            trade_arm("same", trades()),
+            trade_arm("same", trades()),
+            &terms(),
+            &calendar_between(0, 2),
+            &snapshot_borrows(),
+            &fit_sessions(),
+            &benchmark,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let difference = comparison.difference();
+        // Three sessions close: the two traded ones and the eventless one between them.
+        assert_eq!(
+            (
+                difference.mean(),
+                difference.standard_error(),
+                difference.sessions()
+            ),
+            (0.0, 0.0, 3)
+        );
+        assert_eq!(comparison.coarsening().mean(), 0.0);
+        assert_eq!(comparison.candidate(), comparison.baseline());
+    }
+
+    /// Two empty arms have no session to read, and two arms whose every trade is refused have nothing to coarsen;
+    /// neither journals an experiment.
+    #[test]
+    fn test_trade_arms_with_nothing_to_read_are_refused() {
+        let (mut study, directory) = study();
+        let closes: Vec<f64> = (0..3).map(|day| 100.0 + day as f64).collect();
+        let dataset = daily_dataset(study.run_id(), 0, &[("SPY", closes)]);
+        let risk_free = zero_rate(&sessions(&dataset));
+        let benchmark = Benchmark::new(
+            &dataset,
+            Symbol::new("SPY").unwrap(),
+            &calendar_between(0, 2),
+            &risk_free,
+        )
+        .unwrap();
+        assert!(matches!(
+            compare_trades(
+                &mut study,
+                trade_arm("candidate_trades", vec![]),
+                trade_arm("baseline_trades", vec![]),
+                &terms(),
+                &calendar_between(0, 2),
+                &snapshot_borrows(),
+                &BTreeSet::new(),
+                &benchmark,
+            ),
+            Err(CompareTradesError::NoSessions)
+        ));
+        // A half-share short opens nothing, so both arms book but neither takes a trade.
+        let refused = || {
+            let built = round_trip("AAA", 90.0, 50.51, 0, 0);
+            vec![
+                Trade::new(
+                    built.symbol().clone(),
+                    crate::common::book::Side::Sell,
+                    Shares::from_units(SHARE_SCALE / 2),
+                    built.entered_at(),
+                    built.entered(),
+                    built.exited_at(),
+                    built.exit(),
+                )
+                .unwrap(),
+            ]
+        };
+        assert!(matches!(
+            compare_trades(
+                &mut study,
+                trade_arm("candidate_trades", refused()),
+                trade_arm("baseline_trades", refused()),
+                &terms(),
+                &calendar_between(0, 2),
+                &snapshot_borrows(),
+                &fit_sessions(),
+                &benchmark,
+            ),
+            Err(CompareTradesError::NothingTaken)
+        ));
+        assert!(experiments(&directory).is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// A comparison with no bar to decide on is refused before anything is journaled.

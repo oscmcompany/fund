@@ -36,6 +36,9 @@ pub enum EstimateRefusal {
         "{fills} fill(s) cannot measure a cost: a point takes one and an error {MINIMUM_FILLS}"
     )]
     TooFewFills { fills: u64 },
+    /// Identical fills read an error of zero, which would admit any edge above the point as a floor of nothing.
+    #[error("the {fills} fills are identical, which measures no error")]
+    IdenticalFills { fills: u64 },
     #[error("the cost of {fills} fills is not representable per share")]
     Unrepresentable { fills: u64 },
     #[error("the sums of {fills} fills overflowed")]
@@ -83,7 +86,8 @@ impl CostEstimate {
     }
 
     /// The standard error of the mean, `sqrt((n * squares - sum^2) / (n^2 * (n - 1)))`, computed in integers and
-    /// rounded up, refused below `MINIMUM_FILLS`.
+    /// rounded up, refused below `MINIMUM_FILLS` and refused at exactly zero, since identical fills measure no error
+    /// and a floor of nothing would admit any edge above the point.
     pub fn error(self) -> Result<PerShare, EstimateRefusal> {
         let (sum, sum_of_squares) = self.exact()?;
         if self.fills < MINIMUM_FILLS {
@@ -95,6 +99,10 @@ impl CostEstimate {
             .checked_mul(sum_of_squares)
             .and_then(|scaled| scaled.checked_sub(sum.unsigned_abs().checked_pow(2)?))
             .ok_or(unrepresentable)?;
+        // The error rounds up, so only identical fills read zero.
+        if spread == 0 {
+            return Err(EstimateRefusal::IdenticalFills { fills: self.fills });
+        }
         // Successive ceilings equal the ceiling of the whole quotient, and the root of a ceiling rounds up the same.
         let variance = spread.div_ceil(fills).div_ceil(fills).div_ceil(fills - 1);
         let root = variance.isqrt();
@@ -222,7 +230,8 @@ pub struct DecileFitRefusal {
 
 impl SpreadDeciles {
     /// Deciles bounded at the tenths of the realized spreads, each estimate folded from the costs realized in it,
-    /// refused unless every decile measures an error; tied spreads can leave a decile short or empty.
+    /// refused unless every decile measures an error; tied spreads can leave a decile short or empty, and a decile
+    /// of identical costs measures none.
     pub fn fit(realized: &[(Spread, PerShare)]) -> Result<Self, DecileFitRefusal> {
         let mut spreads: Vec<Spread> = realized.iter().map(|(spread, _)| *spread).collect();
         spreads.sort_unstable();
@@ -491,7 +500,10 @@ mod tests {
             nineteen.error(),
             Err(EstimateRefusal::TooFewFills { fills: 19 })
         );
-        assert_eq!(fills(&[4_000; 20]).error(), Ok(per_share(0)));
+        assert_eq!(
+            fills(&[4_000; 20]).error(),
+            Err(EstimateRefusal::IdenticalFills { fills: 20 })
+        );
         assert_eq!(estimate(4_000, 500).point(), Ok(per_share(4_000)));
         assert_eq!(estimate(4_000, 500).error(), Ok(per_share(500)));
     }
@@ -551,7 +563,10 @@ mod tests {
         );
         assert_eq!(fills(&[-1, -2]).point(), Ok(per_share(-1)));
         assert_eq!(fills(&[1, 2]).point(), Ok(per_share(2)));
-        assert_eq!(fills(&[7; 20]).error(), Ok(per_share(0)));
+        assert_eq!(
+            fills(&[7; 20]).error(),
+            Err(EstimateRefusal::IdenticalFills { fills: 20 })
+        );
     }
 
     #[test]
@@ -852,6 +867,26 @@ mod tests {
             Err(DecileFitRefusal {
                 decile: Decile(1),
                 refusal: EstimateRefusal::TooFewFills { fills: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_decile_of_identical_costs_measures_no_error_and_refuses_the_fit() {
+        let identical: Vec<(Spread, PerShare)> = (1..=200)
+            .map(|ticks| {
+                let cost = match ticks <= 20 {
+                    true => 1_000,
+                    false => 100 * ticks as i64,
+                };
+                (spread(ticks), per_share(cost))
+            })
+            .collect();
+        assert_eq!(
+            SpreadDeciles::fit(&identical),
+            Err(DecileFitRefusal {
+                decile: Decile(1),
+                refusal: EstimateRefusal::IdenticalFills { fills: 20 },
             })
         );
     }
