@@ -1669,7 +1669,10 @@ pub(crate) mod tests {
         assert_eq!(settings["per_name_limit_units"], "5000000000000000");
         assert_eq!(settings["daily_loss_limit_units"], "100000000000000000");
         assert_eq!(settings["per_name_loss_limit_units"], "100000000000000000");
-        assert_eq!(settings["flat_before_close_seconds"], "600");
+        assert_eq!(
+            settings["flat_before_close"],
+            "TimeDelta { secs: 600, nanos: 0 }"
+        );
         assert_eq!(settings["index"], "SPY");
         assert!(settings.contains_key("fees"));
         let metrics: BTreeMap<&str, f64> = ran

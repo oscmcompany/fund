@@ -9,7 +9,9 @@ use crate::common::book::{Cash, Fill, FillRefusal, Position, Side, ValuationRefu
 use crate::common::cost::PerShare;
 use crate::common::cost::fees::{ChargeRefusal, FeeRegime, Liquidity};
 use crate::common::laboratory::entry::{Entered, How};
-use crate::common::laboratory::ledger::{Binding, Ledger, LedgerRefusal, Leverage, TradeRefusal};
+use crate::common::laboratory::ledger::{
+    Binding, Bound, Ledger, LedgerRefusal, Leverage, TradeRefusal,
+};
 use crate::common::laboratory::series::{Series, SeriesRefusal};
 use crate::common::market::borrow::Borrow;
 use crate::common::market::{DollarVolume, Price, SHARE_SCALE, Shares, Symbol};
@@ -197,9 +199,10 @@ impl Terms {
             ("per_name_limit_units", limit(Limit::PerName)),
             ("daily_loss_limit_units", limit(Limit::DailyLoss)),
             ("per_name_loss_limit_units", limit(Limit::PerNameLoss)),
+            // Debug spells the seconds and nanoseconds, so two windows differing below a second are told apart.
             (
-                "flat_before_close_seconds",
-                self.limits.flat_before_close().num_seconds().to_string(),
+                "flat_before_close",
+                format!("{:?}", self.limits.flat_before_close()),
             ),
         ]
     }
@@ -275,6 +278,15 @@ pub enum BookingError {
     NoSessions,
     #[error("a trade on {session} falls outside the sessions the booking closes")]
     OutsideSessions { session: SessionDate },
+    #[error("{session} is not a trading day on the calendar")]
+    NotTradingDay { session: SessionDate },
+    /// A holding past the close booked as a flat session would be fiction, so the trade list is refused whole.
+    #[error("the exit of {symbol} at {exited_at} falls after the session's close at {close}")]
+    ExitPastClose {
+        symbol: Symbol,
+        exited_at: DateTime<Utc>,
+        close: DateTime<Utc>,
+    },
     #[error("the ledger was refused: {0}")]
     Ledger(#[from] LedgerRefusal),
     #[error("a holding could not be marked: {0}")]
@@ -388,6 +400,54 @@ fn net_units(side: Side, shares: Shares, entry: Price, exit: Price, fees: u128) 
     swing - i128::try_from(fees).expect("two fees at most their notionals fit an i128")
 }
 
+/// The largest entry that fits buying power net of its own fee, rebuilt from the refusal's numbers: the gross
+/// beside this entry stays fixed while equity loses the fee, so the units solve
+/// `ticks x units + others <= leverage x (equity - fee x units)` exactly; `None` when nothing fits.
+fn resized(
+    trade: &Trade,
+    fill: &Fill,
+    terms: &Terms,
+    exposure: Cash,
+    allowed: Cash,
+) -> Option<Fill> {
+    let ticks = i128::from(trade.entered.price().ticks());
+    let units = i128::from(fill.shares().units());
+    let leverage = i128::from(terms.leverage.multiple().get());
+    let fee = terms
+        .fees
+        .per_share(
+            liquidity(trade.entered.how()),
+            trade.side,
+            trade.entered.price(),
+        )
+        .ok()?;
+    let fee = i128::from(fee.millionths().max(0));
+    let others = exposure.units() - ticks * units;
+    let numerator = allowed.units() + leverage * fee * units - others;
+    let fitting = numerator.div_euclid(ticks + leverage * fee);
+    let fitting = match trade.side {
+        Side::Buy => fitting,
+        Side::Sell => fitting - fitting.rem_euclid(i128::from(SHARE_SCALE)),
+    };
+    // A resize only shrinks; anything else says the refusal was not the fee's doing.
+    if fitting <= 0 || fitting >= units {
+        return None;
+    }
+    let shares = Shares::from_units(u64::try_from(fitting).ok()?);
+    Fill::new(
+        fill.filled_against(),
+        trade.symbol.clone(),
+        trade.side,
+        shares,
+        trade.entered.price(),
+        fee_units(
+            PerShare::from_millionths(i64::try_from(fee).ok()?).ok()?,
+            shares,
+        ),
+    )
+    .ok()
+}
+
 /// One leg of a trade in the event order; exits sort before entries at one instant, so a closed trade frees its
 /// room for an entry arriving as it ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -406,7 +466,8 @@ struct OpenEntry {
 /// Books `trades` through one ledger under `terms`, closing every session of `sessions` in order, eventless ones
 /// included, so two arms booked over the same sessions read on the same series. An entry against the name's net
 /// holding is refused rather than allowed to reduce other trades' exposure, so every exit only reduces and the book
-/// is flat at each close.
+/// is flat at each close. A trade on a day the calendar does not trade, or exiting after its session's close,
+/// refuses the whole booking before anything is booked.
 pub fn book(
     terms: &Terms,
     calendar: &TradingCalendar,
@@ -423,6 +484,21 @@ pub fn book(
         .find(|session| !sessions.contains(session))
     {
         return Err(BookingError::OutsideSessions { session: outside });
+    }
+    for trade in &trades {
+        let Some(hours) = calendar.session(trade.session()) else {
+            return Err(BookingError::NotTradingDay {
+                session: trade.session(),
+            });
+        };
+        let (_, close) = hours.hours();
+        if trade.exited_at > close {
+            return Err(BookingError::ExitPastClose {
+                symbol: trade.symbol.clone(),
+                exited_at: trade.exited_at,
+                close,
+            });
+        }
     }
     let mut ledger = Ledger::open(terms.opening, terms.limits, terms.leverage)?;
     let mut events: Vec<(DateTime<Utc>, Leg, usize)> = (0..trades.len())
@@ -445,31 +521,72 @@ pub fn book(
             let trade = &trades[index];
             let phase = calendar.phase_at(at);
             let borrow = borrows.availability(&trade.symbol);
+            // Either leg's price is an observation of the tape whichever way the booking goes, so it marks the
+            // name for later risk checks, a refused entry's and a skipped exit's included.
+            marks.insert(
+                trade.symbol.clone(),
+                match leg {
+                    Leg::Entry => trade.entered.price(),
+                    Leg::Exit => trade.exit,
+                },
+            );
             match leg {
                 Leg::Entry => match take(&ledger, trade, phase, borrow, terms.fees, &marks)? {
                     Entry::Filled { fill, trimmed } => {
+                        let mut accept = |fill: &Fill, trimmed| {
+                            open.insert(
+                                index,
+                                OpenEntry {
+                                    shares: fill.shares(),
+                                    trimmed,
+                                    fee: fill.cost(),
+                                },
+                            );
+                        };
+                        let mut refuse = |cause| {
+                            outcomes.insert(
+                                index,
+                                Outcome::Refused {
+                                    cause: RefusalCause::Trade(cause),
+                                },
+                            );
+                        };
                         match ledger.trade(&fill, phase, borrow, |held| marks.get(held).copied()) {
                             Ok(next) => {
                                 ledger = next;
-                                open.insert(
-                                    index,
-                                    OpenEntry {
-                                        shares: fill.shares(),
-                                        trimmed,
-                                        fee: fill.cost(),
-                                    },
-                                );
+                                accept(&fill, trimmed);
                             }
-                            Err(cause) => {
-                                outcomes.insert(
-                                    index,
-                                    Outcome::Refused {
-                                        cause: RefusalCause::Trade(cause),
-                                    },
-                                );
-                            }
+                            // The room was read before the fee, which only buying power feels through equity, so
+                            // the entry is resized once to fit net of its own fee and tried again.
+                            Err(TradeRefusal::Exceeds {
+                                bound: Bound::BuyingPower,
+                                exposure,
+                                allowed,
+                            }) => match resized(trade, &fill, terms, exposure, allowed) {
+                                Some(smaller) => {
+                                    match ledger.trade(&smaller, phase, borrow, |held| {
+                                        marks.get(held).copied()
+                                    }) {
+                                        Ok(next) => {
+                                            ledger = next;
+                                            accept(
+                                                &smaller,
+                                                Some(Trimmed::Room(Binding::Bound(
+                                                    Bound::BuyingPower,
+                                                ))),
+                                            );
+                                        }
+                                        Err(cause) => refuse(cause),
+                                    }
+                                }
+                                None => refuse(TradeRefusal::Exceeds {
+                                    bound: Bound::BuyingPower,
+                                    exposure,
+                                    allowed,
+                                }),
+                            },
+                            Err(cause) => refuse(cause),
                         }
-                        marks.insert(trade.symbol.clone(), trade.entered.price());
                     }
                     Entry::Refused { cause } => {
                         outcomes.insert(index, Outcome::Refused { cause });
@@ -514,7 +631,6 @@ pub fn book(
                             symbol: trade.symbol.clone(),
                             cause,
                         })?;
-                    marks.insert(trade.symbol.clone(), trade.exit);
                     let fees = entry.fee.units() + cost.units();
                     let net = net_units(
                         trade.side,
@@ -658,9 +774,8 @@ mod proofs {
     use super::*;
 
     /// Any valid round trip's net is computed without overflow: any two prices, any share count and any fee pair
-    /// bounded by the notionals, as `Fill` bounds each leg's cost. The net's sign is not proven here — relating the
-    /// two symbolic products did not solve in reasonable time, like the ledger bound in `prove-rust`'s history —
-    /// and is pinned instead by the conservation proptest, which checks every taken net against the ledger's cash.
+    /// bounded by the notionals, as `Fill` bounds each leg's cost. The net's sign is not proven here; the
+    /// conservation proptest checks every taken net against the ledger's cash.
     #[kani::proof]
     fn a_round_trips_net_never_overflows() {
         let entry = Price::from_ticks(kani::any());
@@ -880,9 +995,7 @@ mod tests {
                 assert_eq!(shares.units(), 39_980_003);
                 assert_eq!(
                     *trimmed,
-                    Some(Trimmed::Room(Binding::Bound(
-                        crate::common::laboratory::ledger::Bound::PerName
-                    )))
+                    Some(Trimmed::Room(Binding::Bound(Bound::PerName)))
                 );
             }
             Outcome::Refused { cause } => panic!("{cause}"),
@@ -1198,6 +1311,147 @@ mod tests {
             );
             prop_assert!(booked.ledger().book().positions().is_empty());
         }
+    }
+
+    /// Terms with every dollar limit wide, so only `leverage` binds.
+    fn wide_terms(leverage: u8, fees: FeeRegime) -> Terms {
+        let wide = Cash::from_units(1_000_000 * DOLLAR);
+        let limits = Limits::new(wide, wide, wide, wide, TimeDelta::minutes(10)).unwrap();
+        Terms::new(
+            Cash::from_units(20_000 * DOLLAR),
+            limits,
+            Leverage::new(NonZeroU8::new(leverage).unwrap()),
+            fees,
+        )
+    }
+
+    /// The room is read before fees, so an entry sized to it can breach buying power by its own fee; the entry is
+    /// resized to the largest size whose exposure fits equity net of that fee, exactly.
+    #[test]
+    fn test_an_entry_at_the_buying_power_edge_is_resized_for_its_fee() {
+        // A one-cent commission a share and nothing else.
+        let schedule = PassThroughSchedule::new(
+            PerShare::from_millionths(10_000).unwrap(),
+            PerShare::ZERO,
+            PerShare::ZERO,
+        )
+        .unwrap();
+        let fees = FeeRegime::PassThrough {
+            regulatory: RegulatoryFees::new(Dollars::from_millionths(0), PerShare::ZERO).unwrap(),
+            schedule,
+        };
+        let booked = book(
+            &wide_terms(1, fees),
+            &calendar(),
+            &borrows(&[]),
+            &sessions(&[2]),
+            vec![trade("AAA", Side::Buy, 400.0, 50.0, 50.01, 2, 0)],
+        )
+        .unwrap();
+        match booked.bookings()[0].outcome() {
+            Outcome::Taken {
+                shares, trimmed, ..
+            } => {
+                // floor(20,000e12 / (50,010,000 ticks + 10,000 fee)) millionths of a share.
+                assert_eq!(shares.units(), 399_840_063);
+                assert_eq!(
+                    *trimmed,
+                    Some(Trimmed::Room(Binding::Bound(Bound::BuyingPower)))
+                );
+            }
+            Outcome::Refused { cause } => panic!("{cause}"),
+        }
+    }
+
+    /// A refused entry's and a skipped exit's prices are still observations of the tape, so they update the marks
+    /// later risk checks value other holdings at.
+    #[test]
+    fn test_a_refused_trades_prices_still_mark_the_name() {
+        // The long holds from minute 0 to minute 50, so both later entries meet it on the book.
+        let held = trade("AAA", Side::Buy, 90.0, 50.0, 50.01, 2, 0);
+        let held = Trade::new(
+            held.symbol().clone(),
+            held.side(),
+            held.shares(),
+            held.entered_at(),
+            held.entered(),
+            at(2, 50),
+            held.exit(),
+        )
+        .unwrap();
+        let booked = book(
+            &wide_terms(2, free()),
+            &calendar(),
+            &borrows(&["AAA"]),
+            &sessions(&[2]),
+            vec![
+                held,
+                // Opposes the long, so it is refused; its $39.99 entry and $39.00 exit still mark AAA.
+                trade("AAA", Side::Sell, 10.0, 40.0, 39.0, 2, 2),
+                trade("BBB", Side::Buy, 800.0, 50.0, 50.01, 2, 20),
+            ],
+        )
+        .unwrap();
+        let (taken, trimmed, refused) = booked.counts();
+        assert_eq!((taken, trimmed, refused), (2, 1, 1));
+        match booked.bookings()[2].outcome() {
+            Outcome::Taken {
+                shares, trimmed, ..
+            } => {
+                // With AAA marked at the observed $39, equity is $19,009.10: twice that less the $3,510 gross
+                // leaves $34,508.20 of buying power at the $50.01 ask.
+                assert_eq!(shares.units(), 690_025_994);
+                assert_eq!(
+                    *trimmed,
+                    Some(Trimmed::Room(Binding::Bound(Bound::BuyingPower)))
+                );
+            }
+            Outcome::Refused { cause } => panic!("{cause}"),
+        }
+    }
+
+    /// An exit after the session's close would report a holding past the close as a flat session, so it refuses
+    /// the booking; a trade on a day the calendar does not trade is refused the same way.
+    #[test]
+    fn test_an_exit_past_the_close_refuses_the_booking() {
+        let built = trade("AAA", Side::Buy, 1.0, 50.0, 50.01, 2, 0);
+        let late = Trade::new(
+            built.symbol().clone(),
+            built.side(),
+            built.shares(),
+            built.entered_at(),
+            built.entered(),
+            // 370 minutes after 10:00 Eastern is 16:10, past the 16:00 close.
+            at(2, 370),
+            built.exit(),
+        )
+        .unwrap();
+        assert_eq!(
+            book(
+                &terms(free()),
+                &calendar(),
+                &borrows(&[]),
+                &sessions(&[2]),
+                vec![late],
+            ),
+            Err(BookingError::ExitPastClose {
+                symbol: symbol("AAA"),
+                exited_at: at(2, 370),
+                close: at(2, 360),
+            })
+        );
+        assert_eq!(
+            book(
+                &terms(free()),
+                &calendar(),
+                &borrows(&[]),
+                &sessions(&[7]),
+                vec![trade("AAA", Side::Buy, 1.0, 50.0, 50.01, 7, 0)],
+            ),
+            Err(BookingError::NotTradingDay {
+                session: session(7)
+            })
+        );
     }
 
     /// A rested fill is charged adding liquidity, a crossed one removing, and a rebate past the fee books as free
