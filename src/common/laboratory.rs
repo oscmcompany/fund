@@ -23,6 +23,7 @@ pub mod share;
 pub mod sharpe;
 pub mod synthetic;
 pub mod time_of_day;
+pub mod trades;
 pub mod universe;
 pub mod verdict;
 pub mod volatility;
